@@ -214,9 +214,8 @@ fn rust_module_items_in_range(
                 is_external: false,
                 name: tokens[cursor + 1].text.clone(),
             });
-            if attributes
-                .iter()
-                .any(|attribute| cfg_attribute_requires_test(attribute))
+            if cfg_attributes_test_requirement(attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
             {
                 start = close + 1;
                 continue;
@@ -244,14 +243,154 @@ fn rust_module_items(text: &str) -> Vec<RustModuleItem> {
     items
 }
 
-fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+#[derive(Clone, Debug)]
+enum CfgPredicate {
+    Test,
+    Atom(String),
+    All(Vec<CfgPredicate>),
+    Any(Vec<CfgPredicate>),
+    Not(Box<CfgPredicate>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CfgSatisfiability {
+    Satisfiable,
+    Unsatisfiable,
+    Unproven,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CfgTestRequirement {
+    RequiresTest,
+    ProductionPossible,
+    Unproven,
+}
+
+const CFG_SAT_WORK_BUDGET: usize = 256;
+
+impl CfgPredicate {
+    fn collect_atoms(&self, atoms: &mut BTreeSet<String>) {
+        match self {
+            Self::Test => {}
+            Self::Atom(atom) => {
+                atoms.insert(atom.clone());
+            }
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.collect_atoms(atoms);
+                }
+            }
+            Self::Not(child) => child.collect_atoms(atoms),
+        }
+    }
+
+    fn evaluate_partial(&self, assignments: &BTreeMap<String, bool>) -> Option<bool> {
+        match self {
+            Self::Test => Some(false),
+            Self::Atom(atom) => assignments.get(atom).copied(),
+            Self::All(children) => {
+                if children
+                    .iter()
+                    .any(|child| child.evaluate_partial(assignments) == Some(false))
+                {
+                    Some(false)
+                } else if children
+                    .iter()
+                    .all(|child| child.evaluate_partial(assignments) == Some(true))
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Self::Any(children) => {
+                if children
+                    .iter()
+                    .any(|child| child.evaluate_partial(assignments) == Some(true))
+                {
+                    Some(true)
+                } else if children
+                    .iter()
+                    .all(|child| child.evaluate_partial(assignments) == Some(false))
+                {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Self::Not(child) => child.evaluate_partial(assignments).map(|value| !value),
+        }
+    }
+
+    fn can_be_true_bounded(
+        &self,
+        atoms: &[String],
+        assignments: &mut BTreeMap<String, bool>,
+        memo: &mut BTreeMap<Vec<Option<bool>>, CfgSatisfiability>,
+        work_budget: &mut usize,
+    ) -> CfgSatisfiability {
+        let key = atoms
+            .iter()
+            .map(|atom| assignments.get(atom).copied())
+            .collect::<Vec<_>>();
+        if let Some(result) = memo.get(&key) {
+            return *result;
+        }
+        if *work_budget == 0 {
+            return CfgSatisfiability::Unproven;
+        }
+        *work_budget -= 1;
+        if let Some(value) = self.evaluate_partial(assignments) {
+            let result = if value {
+                CfgSatisfiability::Satisfiable
+            } else {
+                CfgSatisfiability::Unsatisfiable
+            };
+            memo.insert(key, result);
+            return result;
+        }
+        let Some(atom) = atoms
+            .iter()
+            .find(|atom| !assignments.contains_key(atom.as_str()))
+        else {
+            memo.insert(key, CfgSatisfiability::Unsatisfiable);
+            return CfgSatisfiability::Unsatisfiable;
+        };
+        let atom = atom.clone();
+        let mut unproven = false;
+        for value in [false, true] {
+            assignments.insert(atom.clone(), value);
+            match self.can_be_true_bounded(atoms, assignments, memo, work_budget) {
+                CfgSatisfiability::Satisfiable => {
+                    assignments.remove(&atom);
+                    memo.insert(key, CfgSatisfiability::Satisfiable);
+                    return CfgSatisfiability::Satisfiable;
+                }
+                CfgSatisfiability::Unproven => unproven = true,
+                CfgSatisfiability::Unsatisfiable => {}
+            }
+        }
+        assignments.remove(&atom);
+        let result = if unproven {
+            CfgSatisfiability::Unproven
+        } else {
+            CfgSatisfiability::Unsatisfiable
+        };
+        if result != CfgSatisfiability::Unproven {
+            memo.insert(key, result);
+        }
+        result
+    }
+}
+
+fn cfg_parse_predicate(tokens: &[String], start: usize) -> Option<(CfgPredicate, usize)> {
     let owner = tokens.get(start)?;
     if owner == "test"
         && tokens
             .get(start + 1)
             .is_none_or(|token| matches!(token.as_str(), "," | ")"))
     {
-        return Some((true, start + 1));
+        return Some((CfgPredicate::Test, start + 1));
     }
     if !matches!(owner.as_str(), "all" | "any" | "not")
         || tokens.get(start + 1).is_none_or(|token| token != "(")
@@ -263,42 +402,199 @@ fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool,
         {
             cursor += 1;
         }
-        return Some((false, cursor));
+        return Some((
+            CfgPredicate::Atom(tokens[start..cursor].join("\u{1f}")),
+            cursor,
+        ));
     }
 
     let mut children = Vec::new();
     let mut cursor = start + 2;
     while tokens.get(cursor).is_some_and(|token| token != ")") {
-        let (requires_test, next) = cfg_predicate_requires_test(tokens, cursor)?;
-        children.push(requires_test);
+        let (predicate, next) = cfg_parse_predicate(tokens, cursor)?;
+        children.push(predicate);
         cursor = next;
         if tokens.get(cursor).is_some_and(|token| token == ",") {
             cursor += 1;
         }
     }
     let end = (tokens.get(cursor)? == ")").then_some(cursor + 1)?;
-    let requires_test = match owner.as_str() {
-        "all" => children.into_iter().any(|child| child),
-        "any" => !children.is_empty() && children.into_iter().all(|child| child),
-        "not" => false,
+    let predicate = match owner.as_str() {
+        "all" => CfgPredicate::All(children),
+        "any" => CfgPredicate::Any(children),
+        "not" if children.len() == 1 => CfgPredicate::Not(Box::new(children.remove(0))),
+        "not" => return None,
         _ => unreachable!(),
     };
-    Some((requires_test, end))
+    Some((predicate, end))
+}
+
+fn cfg_predicate_test_requirement_with_budget(
+    tokens: &[String],
+    start: usize,
+    work_budget: usize,
+) -> Option<(CfgTestRequirement, usize)> {
+    let (predicate, end) = cfg_parse_predicate(tokens, start)?;
+    Some((
+        cfg_test_requirement_for_predicate(&predicate, work_budget),
+        end,
+    ))
+}
+
+fn cfg_test_requirement_for_predicate(
+    predicate: &CfgPredicate,
+    mut work_budget: usize,
+) -> CfgTestRequirement {
+    let mut atoms = BTreeSet::new();
+    predicate.collect_atoms(&mut atoms);
+    let atoms = atoms.into_iter().collect::<Vec<_>>();
+    let satisfiability = predicate.can_be_true_bounded(
+        &atoms,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+        &mut work_budget,
+    );
+    match satisfiability {
+        CfgSatisfiability::Satisfiable => CfgTestRequirement::ProductionPossible,
+        CfgSatisfiability::Unsatisfiable => CfgTestRequirement::RequiresTest,
+        CfgSatisfiability::Unproven => CfgTestRequirement::Unproven,
+    }
+}
+
+fn cfg_predicate_test_requirement(
+    tokens: &[String],
+    start: usize,
+) -> Option<(CfgTestRequirement, usize)> {
+    cfg_predicate_test_requirement_with_budget(tokens, start, CFG_SAT_WORK_BUDGET)
+}
+
+fn cfg_predicate_requires_test(tokens: &[String], start: usize) -> Option<(bool, usize)> {
+    cfg_predicate_test_requirement(tokens, start)
+        .map(|(requirement, end)| (requirement == CfgTestRequirement::RequiresTest, end))
+}
+
+fn cfg_attribute_test_requirement(attribute: &str) -> Option<CfgTestRequirement> {
+    let tokens = rust_use_tokens(attribute);
+    let open = tokens.iter().position(|token| token == "[")?;
+    let cfg = open + 1;
+    if tokens.get(cfg).is_none_or(|token| token != "cfg")
+        || tokens.get(cfg + 1).is_none_or(|token| token != "(")
+    {
+        return None;
+    }
+    cfg_predicate_test_requirement(&tokens, cfg + 2).map(|(requirement, _)| requirement)
 }
 
 fn cfg_attribute_requires_test(attribute: &str) -> bool {
-    let tokens = rust_use_tokens(&rust_lexically_sanitized(attribute));
-    let Some(open) = tokens.iter().position(|token| token == "[") else {
-        return false;
-    };
-    let cfg = open + 1;
-    if tokens.get(cfg).is_none_or(|token| token != "cfg") {
-        return false;
+    cfg_attribute_test_requirement(attribute) == Some(CfgTestRequirement::RequiresTest)
+}
+
+fn cfg_meta_end(tokens: &[String], start: usize, limit: usize) -> Option<usize> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    for index in start..limit {
+        match tokens[index].as_str() {
+            "(" => paren_depth += 1,
+            ")" => paren_depth = paren_depth.checked_sub(1)?,
+            "[" => bracket_depth += 1,
+            "]" => bracket_depth = bracket_depth.checked_sub(1)?,
+            "{" => brace_depth += 1,
+            "}" => brace_depth = brace_depth.checked_sub(1)?,
+            "," if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                return Some(index);
+            }
+            _ => {}
+        }
     }
-    if tokens.get(cfg + 1).is_none_or(|token| token != "(") {
-        return false;
+    Some(limit)
+}
+
+fn cfg_generated_meta_presence_predicate(
+    tokens: &[String],
+    start: usize,
+    limit: usize,
+) -> Option<(Option<CfgPredicate>, usize)> {
+    match tokens.get(start)?.as_str() {
+        "cfg" => {
+            if tokens.get(start + 1).is_none_or(|token| token != "(") {
+                return None;
+            }
+            let close = runtime_filter_matching_delimiter(tokens, start + 1, "(", ")")?;
+            if close >= limit {
+                return None;
+            }
+            let (predicate, end) = cfg_parse_predicate(tokens, start + 2)?;
+            (end == close).then_some((Some(predicate), close + 1))
+        }
+        "cfg_attr" => {
+            if tokens.get(start + 1).is_none_or(|token| token != "(") {
+                return None;
+            }
+            let close = runtime_filter_matching_delimiter(tokens, start + 1, "(", ")")?;
+            if close >= limit {
+                return None;
+            }
+            let (condition, mut cursor) = cfg_parse_predicate(tokens, start + 2)?;
+            if tokens.get(cursor).is_none_or(|token| token != ",") {
+                return None;
+            }
+            cursor += 1;
+            let mut generated = Vec::new();
+            while cursor < close {
+                let (predicate, end) = cfg_generated_meta_presence_predicate(tokens, cursor, close)
+                    .or_else(|| cfg_meta_end(tokens, cursor, close).map(|end| (None, end)))?;
+                if let Some(predicate) = predicate {
+                    generated.push(predicate);
+                }
+                cursor = end;
+                if tokens.get(cursor).is_some_and(|token| token == ",") {
+                    cursor += 1;
+                }
+            }
+            let presence = CfgPredicate::Any(vec![
+                CfgPredicate::Not(Box::new(condition)),
+                CfgPredicate::All(generated),
+            ]);
+            Some((Some(presence), close + 1))
+        }
+        _ => cfg_meta_end(tokens, start, limit).map(|end| (None, end)),
     }
-    cfg_predicate_requires_test(&tokens, cfg + 2).is_some_and(|(required, _)| required)
+}
+
+fn cfg_attribute_presence_predicate(attribute: &str) -> Result<Option<CfgPredicate>, ()> {
+    let tokens = rust_use_tokens(attribute);
+    let open = tokens.iter().position(|token| token == "[").ok_or(())?;
+    let head = open + 1;
+    match tokens.get(head).map(String::as_str) {
+        Some("cfg") => {
+            if tokens.get(head + 1).is_none_or(|token| token != "(") {
+                return Err(());
+            }
+            let close = runtime_filter_matching_delimiter(&tokens, head + 1, "(", ")").ok_or(())?;
+            let (predicate, end) = cfg_parse_predicate(&tokens, head + 2).ok_or(())?;
+            (end == close).then_some(Some(predicate)).ok_or(())
+        }
+        Some("cfg_attr") => cfg_generated_meta_presence_predicate(&tokens, head, tokens.len())
+            .and_then(|(predicate, _)| predicate)
+            .map(Some)
+            .ok_or(()),
+        _ => Ok(None),
+    }
+}
+
+fn cfg_attributes_test_requirement<'a>(
+    attributes: impl IntoIterator<Item = &'a str>,
+) -> CfgTestRequirement {
+    let mut predicates = Vec::new();
+    for attribute in attributes {
+        match cfg_attribute_presence_predicate(attribute) {
+            Ok(Some(predicate)) => predicates.push(predicate),
+            Ok(None) => {}
+            Err(()) => return CfgTestRequirement::Unproven,
+        }
+    }
+    cfg_test_requirement_for_predicate(&CfgPredicate::All(predicates), CFG_SAT_WORK_BUDGET)
 }
 
 fn decode_rust_string_literal(literal: &str) -> Option<String> {
@@ -578,10 +874,8 @@ fn production_rs_files_from_entries(root: &Path, entries: &[PathBuf]) -> Vec<Pat
             .into_iter()
             .filter(|item| item.is_external)
         {
-            if item
-                .attributes
-                .iter()
-                .any(|attribute| cfg_attribute_requires_test(attribute))
+            if cfg_attributes_test_requirement(item.attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
             {
                 continue;
             }
@@ -2465,9 +2759,8 @@ fn rust_test_only_item_spans(text: &str) -> Vec<std::ops::Range<usize>> {
             attributes.push(text[tokens[cursor].start..tokens[close].end].to_string());
             cursor = close + 1;
         }
-        if !attributes
-            .iter()
-            .any(|attribute| cfg_attribute_requires_test(attribute))
+        if cfg_attributes_test_requirement(attributes.iter().map(String::as_str))
+            != CfgTestRequirement::RequiresTest
         {
             start += 1;
             continue;
@@ -7646,13 +7939,23 @@ fn runtime_filter_path_is_allowlisted(canonical: &[String], allowed_prefixes: &[
     })
 }
 
+fn runtime_filter_path_is_exactly_allowlisted(
+    canonical: &[String],
+    allowed_paths: &[&[&str]],
+) -> bool {
+    allowed_paths.iter().any(|allowed| {
+        canonical.len() == allowed.len()
+            && canonical
+                .iter()
+                .zip(allowed.iter())
+                .all(|(actual, expected)| actual == expected)
+    })
+}
+
 fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
     let allowed_prefixes: &[&[&str]] = match source_rel {
         "src/runtime_filter/model/mod.rs" => &[],
-        "src/runtime_filter/model/contract.rs" => &[
-            &["arrow", "datatypes", "DataType"],
-            &["std", "num", "NonZeroU32"],
-        ],
+        "src/runtime_filter/model/contract.rs" => &[&["arrow", "datatypes", "DataType"]],
         "src/runtime_filter/model/coverage.rs" => &[
             &["std", "collections", "BTreeSet"],
             &["crate", "runtime_filter", "model", "contract"],
@@ -7675,6 +7978,13 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
         _ => return vec![format!("{source_rel}: unrecognized model source")],
     };
     let local_roots = runtime_filter_model_local_roots(text);
+    let allowed_exact: &[&[&str]] = match source_rel {
+        "src/runtime_filter/model/contract.rs" => &[
+            &["std", "num", "NonZeroU32"],
+            &["std", "num", "NonZeroU32", "new"],
+        ],
+        _ => &[],
+    };
 
     let mut violations = rust_production_canonical_paths(text, source_rel)
         .into_iter()
@@ -7684,13 +7994,17 @@ fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_allowlisted(canonical, allowed_prefixes)
+                && !runtime_filter_path_is_exactly_allowlisted(canonical, allowed_exact)
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
     violations.extend(
         runtime_filter_external_paths(text)
             .into_iter()
-            .filter(|path| !runtime_filter_path_is_allowlisted(path, allowed_prefixes))
+            .filter(|path| {
+                !runtime_filter_path_is_allowlisted(path, allowed_prefixes)
+                    && !runtime_filter_path_is_exactly_allowlisted(path, allowed_exact)
+            })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
     violations.into_iter().collect()
@@ -7779,6 +8093,1693 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
     violations
 }
 
+fn runtime_filter_task4_whole_exact_inventory(source_rel: &str) -> Option<&'static str> {
+    let exact_inventory = match source_rel {
+        "src/runtime_filter/core/ordered_reducer.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::estimated_retained_bytes
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/core/topk_reducer.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain::new
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::TopKSummary
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/materializer/range.rs" => Some(
+            r#"
+crate::runtime_filter::materializer::codec::ArtifactCodecError
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ContractViolation
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ResourceLimit
+crate::runtime_filter::materializer::codec::ArtifactCodecError::ResourceUnavailable
+crate::runtime_filter::materializer::codec::encode_range_leaf
+crate::runtime_filter::materializer::codec::encoded_range_leaf_len
+crate::runtime_filter::port::artifact::ArtifactBundle
+crate::runtime_filter::port::artifact::ArtifactBundle::accounted_range_resident_overhead
+crate::runtime_filter::port::artifact::ArtifactBundle::canonical_encoded_len_for_single_artifact
+crate::runtime_filter::port::artifact::ArtifactBundle::new_retained
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::PhysicalArtifact
+crate::runtime_filter::port::artifact::PhysicalArtifact::accounted_range_resident_component_bytes_for_layout
+crate::runtime_filter::port::artifact::PhysicalArtifact::from_range_shared_retained
+crate::runtime_filter::port::artifact::RangeArtifactData
+crate::runtime_filter::port::artifact::RangeArtifactData::new
+crate::runtime_filter::port::artifact::RangeArtifactResidentLayout
+crate::runtime_filter::port::artifact::RangeArtifactResidentLayout::from_data
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::support::ArtifactRetainedBudget
+crate::runtime_filter::port::support::ArtifactRetention
+crate::runtime_filter::port::support::ArtifactRetention::try_new
+crate::runtime_filter::port::support::ArtifactScratchBudget
+crate::runtime_filter::port::support::ArtifactScratchReservation
+crate::runtime_filter::port::support::ArtifactScratchReservation::try_new
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::value_domain::LogicalSnapshot
+std::collections::BTreeSet::from
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/port/final_domain.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::CompletionFenceKind
+crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen
+crate::runtime_filter::model::contract::NullSemantics
+crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::identity::DeploymentEpoch
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::InvalidPartition
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedBinding
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedFragmentInstance
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::new
+std::error::Error
+std::fmt
+std::fmt::Display
+std::fmt::Formatter
+std::fmt::Result
+std::sync::Arc
+"#,
+        ),
+        "src/runtime_filter/port/ordered_bound.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+crate::common::largeint::LARGEINT_BYTE_WIDTH
+crate::runtime_filter::model::contract::ComparatorDigest
+crate::runtime_filter::model::contract::ComparatorDigest::new
+crate::runtime_filter::model::contract::NullOrder
+crate::runtime_filter::model::contract::NullOrder::First
+crate::runtime_filter::model::contract::NullOrder::Last
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::OrderKeyContract
+crate::runtime_filter::model::contract::SortDirection
+crate::runtime_filter::model::contract::SortDirection::Ascending
+crate::runtime_filter::model::contract::SortDirection::Descending
+crate::runtime_filter::port::artifact::encode_schema
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::digest
+sha2::Sha256::new
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::sync::Arc
+"#,
+        ),
+        "src/runtime_filter/port/topk_summary.rs" => Some(
+            r#"
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::TopKSummaryRequirement
+crate::runtime_filter::port::ordered_bound::OrderContractError
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTupleError
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+sha2::Digest
+sha2::Sha256
+sha2::Sha256::new
+std::cmp::Ordering
+std::cmp::Ordering::Greater
+std::num::NonZeroU32
+std::sync::Arc
+std::sync::Arc::new
+"#,
+        ),
+        "src/runtime_filter/service/m3a_tests.rs" => Some(
+            r#"
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::BindingId::new
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::ChannelId::new
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::identity::LogicalVersion::FIRST
+crate::runtime_filter::port::identity::LogicalVersion::new
+crate::runtime_filter::port::identity::PartitionId
+crate::runtime_filter::port::identity::PartitionId::new
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::producer::ProducerFailureReason
+crate::runtime_filter::port::producer::ProducerFailureReason::ExecutionFailed
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::CompletedWithoutArtifact
+crate::runtime_filter::port::producer::SubmitOutcome::CoverageStillPossible
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome
+crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome::Unavailable
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::CompletedWithoutArtifact
+crate::runtime_filter::port::subscription::LiveTerminal::DegradedArtifact
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Blocking
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::BlockingSnapshot
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::ProducerFailed
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::subscription::UnavailableReason::RouteUnavailable
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::tests::installed_ordered_service_fixture
+crate::runtime_filter::service::tests::installed_ordered_service_with_account
+crate::runtime_filter::service::tests::ordered_update
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicUsize
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::Mutex
+std::sync::Mutex::new
+std::thread::spawn
+std::time::Duration
+std::time::Duration::from_millis
+std::time::Duration::from_secs
+"#,
+        ),
+        "src/runtime_filter/service/m3b_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+ArtifactCapability::OrderedRange
+BindingId::new
+ChannelId::new
+CompletionRequirement::ProducerClosed
+ConsumerActivation::NonBlockingLive
+ConsumerDeployment::with_profile
+ContributionKind::OrderedBoundUpdate
+ContributionKind::ProducerClosed
+ContributionKind::TopKSummary
+CoverageWitnessId::new
+crate::common::types::UniqueId
+crate::runtime_filter::model::contract::*
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new_ordered_range
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEvent::ArtifactPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::LogicalVersionPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::LoopbackDelivered
+crate::runtime_filter::port::events::RuntimeFilterEvent::OrderedGlobalTightened
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKStreamUpdated
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryApplied
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryEqual
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryRejected
+crate::runtime_filter::port::events::RuntimeFilterEvent::TopKSummaryStale
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::identity::*
+crate::runtime_filter::port::install::*
+crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION
+crate::runtime_filter::port::ordered_bound::comparator_digest_for_test
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_new
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerHandle::TopKSummary
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::Membership
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingTerminalSequence
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::InvalidPartition
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedBoundLoosened
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::OrderedContractMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ProducerPortMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SequenceOutsideTerminalRange
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Applied
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Duplicate
+crate::runtime_filter::port::producer::SubmitOutcome::PendingFinalSnapshot
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::producer::SubmitOutcome::StreamAcceptedNoGlobalChange
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::producer::TopKSummaryProducerAdapter
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::DegradedLogical
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::support::TemporaryContributionLease
+crate::runtime_filter::port::support::TemporaryContributionLease::new
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+DeploymentEpoch::new
+LateApplyGranularity::Batch
+LogicalVersion::FIRST
+LogicalVersion::new
+MaterializationPolicy::for_test
+NullOrder::Last
+PartitionId::new
+ProducerDeployment::new
+ProducerSequence::new
+ReductionRequirement::MergeTopKSummary
+ReductionRequirement::TightenOrderedBound
+RouteEdgeId::new
+RuntimeFilterChannelDeployment::new
+RuntimeFilterCoreBudget::new
+RuntimeFilterInstallView::new
+RuntimeFilterLifecycle::MonotonicUpdates
+RuntimeFilterLogicalDomain::OrderedBound
+RuntimeFilterParticipantId::new
+SortDirection::Ascending
+SortDirection::Descending
+std::collections::BTreeMap
+std::collections::BTreeMap::from
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::Arc::ptr_eq
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicBool::new
+std::sync::atomic::AtomicUsize
+std::sync::atomic::AtomicUsize::new
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::Barrier::new
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::Mutex
+std::sync::Mutex::new
+std::sync::Weak
+std::sync::Weak::upgrade
+std::thread::spawn
+std::thread::yield_now
+std::time::Duration
+std::time::Duration::from_secs
+std::time::Instant
+std::time::Instant::now
+TopKSummaryRequirement::try_new
+"#,
+        ),
+        "src/runtime_filter/service/m3c_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+ArtifactCapability::EmptyDomain
+ArtifactCapability::Membership
+BindingId::new
+ChannelId::new
+CompletionFenceKind::CommittedDomainFrozen
+CompletionRequirement::FencedFinalDomain
+ConsumerActivation::NonBlockingLive
+ConsumerDeployment::with_profile
+ContributionKind::FinalDomainShard
+ContributionKind::ProducerClosed
+CoverageWitnessId::new
+crate::common::types::UniqueId
+crate::runtime_filter::core::channel::ChannelAction
+crate::runtime_filter::core::channel::ChannelAction::Cancelled
+crate::runtime_filter::core::channel::ChannelAction::Completed
+crate::runtime_filter::core::channel::ChannelAction::Unavailable
+crate::runtime_filter::model::contract::*
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::EmptyDomain
+crate::runtime_filter::port::artifact::ArtifactKind::ValueSet
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new
+crate::runtime_filter::port::events::FinalDomainRejectionKind
+crate::runtime_filter::port::events::FinalDomainRejectionKind::Contract
+crate::runtime_filter::port::events::FinalDomainRejectionKind::ResourceLimit
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEvent::ArtifactPublished
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelCancelled
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelCompleted
+crate::runtime_filter::port::events::RuntimeFilterEvent::ChannelUnavailable
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardAccepted
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardDuplicate
+crate::runtime_filter::port::events::RuntimeFilterEvent::FinalDomainShardRejected
+crate::runtime_filter::port::events::RuntimeFilterEvent::LoopbackDelivered
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Collecting
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Frozen
+crate::runtime_filter::port::final_domain::FrozenFinalDomainTestIssuer
+crate::runtime_filter::port::identity::*
+crate::runtime_filter::port::install::*
+crate::runtime_filter::port::producer::FinalDomainProducerAdapter
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::FinalDomain
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ConflictingReplay
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::UnauthorizedBinding
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Applied
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Duplicate
+crate::runtime_filter::port::producer::SubmitOutcome::PendingGap
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Cancelled
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::IncompleteCoverage
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+DeploymentEpoch::new
+LateApplyGranularity::Batch
+LogicalVersion::FIRST
+MaterializationPolicy::for_test
+NullSemantics::NullSafeEqual
+PartitionId::new
+ProducerDeployment::new
+ProducerSequence::new
+ProducerStreamId::new
+ReductionRequirement::SetUnion
+RouteEdgeId::new
+RuntimeFilterChannelDeployment::new
+RuntimeFilterCoreBudget::new
+RuntimeFilterInstallView::new
+RuntimeFilterLifecycle::CompleteOnce
+RuntimeFilterLogicalDomain::Membership
+RuntimeFilterParticipantId::new
+std::collections::BTreeMap
+std::collections::BTreeMap::from
+std::collections::BTreeMap::new
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::collections::BTreeSet::new
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Arc::new
+std::sync::atomic::AtomicBool
+std::sync::atomic::AtomicUsize
+std::sync::atomic::AtomicUsize::new
+std::sync::atomic::Ordering
+std::sync::atomic::Ordering::SeqCst
+std::sync::Barrier
+std::sync::Barrier::new
+std::sync::mpsc
+std::sync::mpsc::channel
+std::sync::mpsc::Receiver
+std::sync::mpsc::Sender
+std::sync::Mutex
+std::sync::Mutex::new
+std::sync::Weak
+std::sync::Weak::upgrade
+std::thread::sleep
+std::thread::spawn
+std::thread::yield_now
+std::time::Duration
+std::time::Duration::from_millis
+std::time::Duration::from_secs
+std::time::Instant
+std::time::Instant::now
+"#,
+        ),
+        "src/runtime_filter/service/m4_conformance_tests.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Int64
+crate::common::types::UniqueId
+crate::coordinator::scheduler::FragmentInstancePlacement
+crate::coordinator::scheduler::LiveBackendSnapshot
+crate::coordinator::scheduler::LiveBackendSnapshot::from_endpoints
+crate::coordinator::scheduler::SchedulingPlan
+crate::runtime_filter::deployment::compiler
+crate::runtime_filter::deployment::compiler::compile
+crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy
+crate::runtime_filter::materializer::codec::ArtifactDecodeExpectations
+crate::runtime_filter::materializer::codec::decode_leaf
+crate::runtime_filter::materializer::codec::encode_physical_leaf
+crate::runtime_filter::model::contract::ArtifactCapability
+crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain
+crate::runtime_filter::model::contract::ArtifactCapability::Membership
+crate::runtime_filter::model::contract::ArtifactCapability::OrderedRange
+crate::runtime_filter::model::contract::BindingId
+crate::runtime_filter::model::contract::BindingId::new
+crate::runtime_filter::model::contract::ChannelId
+crate::runtime_filter::model::contract::ChannelId::new
+crate::runtime_filter::model::contract::CompletionFenceKind
+crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen
+crate::runtime_filter::model::contract::CompletionRequirement
+crate::runtime_filter::model::contract::CompletionRequirement::FencedFinalDomain
+crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed
+crate::runtime_filter::model::contract::ConsumerActivation
+crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot
+crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive
+crate::runtime_filter::model::contract::ContributionKind
+crate::runtime_filter::model::contract::ContributionKind::FinalDomainShard
+crate::runtime_filter::model::contract::ContributionKind::OrderedBoundUpdate
+crate::runtime_filter::model::contract::ContributionKind::ProducerClosed
+crate::runtime_filter::model::contract::ContributionKind::TopKSummary
+crate::runtime_filter::model::contract::ContributionKind::ValueDomainDelta
+crate::runtime_filter::model::contract::CoverageWitnessId
+crate::runtime_filter::model::contract::CoverageWitnessId::new
+crate::runtime_filter::model::contract::LateApplyGranularity
+crate::runtime_filter::model::contract::LateApplyGranularity::Batch
+crate::runtime_filter::model::contract::NullOrder
+crate::runtime_filter::model::contract::NullOrder::First
+crate::runtime_filter::model::contract::NullOrder::Last
+crate::runtime_filter::model::contract::NullSemantics
+crate::runtime_filter::model::contract::NullSemantics::NeverMatches
+crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual
+crate::runtime_filter::model::contract::OrderContract
+crate::runtime_filter::model::contract::OrderKeyContract
+crate::runtime_filter::model::contract::PlanFragmentId
+crate::runtime_filter::model::contract::PlanFragmentId::new
+crate::runtime_filter::model::contract::PlanNodeId
+crate::runtime_filter::model::contract::PlanNodeId::new
+crate::runtime_filter::model::contract::ReductionRequirement
+crate::runtime_filter::model::contract::ReductionRequirement::MergeTopKSummary
+crate::runtime_filter::model::contract::ReductionRequirement::SetUnion
+crate::runtime_filter::model::contract::ReductionRequirement::TightenOrderedBound
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle::CompleteOnce
+crate::runtime_filter::model::contract::RuntimeFilterLifecycle::MonotonicUpdates
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::Membership
+crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound
+crate::runtime_filter::model::contract::RuntimeFilterPolicyRequirement
+crate::runtime_filter::model::contract::SortDirection
+crate::runtime_filter::model::contract::SortDirection::Ascending
+crate::runtime_filter::model::contract::SortDirection::Descending
+crate::runtime_filter::model::contract::TopKSummaryRequirement
+crate::runtime_filter::model::contract::TopKSummaryRequirement::try_new
+crate::runtime_filter::model::coverage::Coverage
+crate::runtime_filter::model::coverage::Coverage::AllOf
+crate::runtime_filter::model::coverage::Coverage::AnyOf
+crate::runtime_filter::model::coverage::Coverage::Leaf
+crate::runtime_filter::model::graph::ApplyPoint
+crate::runtime_filter::model::graph::ApplyPoint::NodeInput
+crate::runtime_filter::model::graph::ApplyPoint::NodeOutput
+crate::runtime_filter::model::graph::ConsumerRequirement
+crate::runtime_filter::model::graph::PlanLocation
+crate::runtime_filter::model::graph::ProducerRequirement
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer
+crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Producer
+crate::runtime_filter::model::graph::RuntimeFilterBindingSpec
+crate::runtime_filter::model::graph::RuntimeFilterChannelSpec
+crate::runtime_filter::model::graph::RuntimeFilterGraph
+crate::runtime_filter::model::graph::RuntimeFilterGraph::default
+crate::runtime_filter::port::artifact::ArtifactBundle
+crate::runtime_filter::port::artifact::ArtifactBundle::new
+crate::runtime_filter::port::artifact::ArtifactKind
+crate::runtime_filter::port::artifact::ArtifactKind::EmptyDomain
+crate::runtime_filter::port::artifact::ArtifactKind::Range
+crate::runtime_filter::port::artifact::ArtifactKind::ValueSet
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile
+crate::runtime_filter::port::artifact::ConsumerArtifactProfile::new
+crate::runtime_filter::port::artifact::PhysicalArtifact
+crate::runtime_filter::port::artifact::PhysicalArtifact::accounted_resident_bytes
+crate::runtime_filter::port::events::RuntimeFilterEvent
+crate::runtime_filter::port::events::RuntimeFilterEventSink
+crate::runtime_filter::port::final_domain::CollectingFinalDomainTestIssuer
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Collecting
+crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition::Frozen
+crate::runtime_filter::port::final_domain::FrozenFinalDomainTestIssuer
+crate::runtime_filter::port::identity::DeploymentEpoch
+crate::runtime_filter::port::identity::DeploymentEpoch::new
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::identity::LogicalVersion::checked_next
+crate::runtime_filter::port::identity::LogicalVersion::FIRST
+crate::runtime_filter::port::identity::LogicalVersion::new
+crate::runtime_filter::port::identity::PartitionId
+crate::runtime_filter::port::identity::PartitionId::new
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerSequence::new
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::identity::ProducerStreamId::new
+crate::runtime_filter::port::identity::RuntimeFilterParticipantId
+crate::runtime_filter::port::identity::RuntimeFilterParticipantId::new
+crate::runtime_filter::port::install::MaterializationPolicy
+crate::runtime_filter::port::install::MaterializationPolicy::for_test
+crate::runtime_filter::port::install::RuntimeFilterCoreBudget
+crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new
+crate::runtime_filter::port::install::RuntimeFilterInstallView
+crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION
+crate::runtime_filter::port::ordered_bound::comparator_digest_for_test
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_new
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::producer::FinalDomainProducerAdapter
+crate::runtime_filter::port::producer::InstallOutcome
+crate::runtime_filter::port::producer::InstallOutcome::Installed
+crate::runtime_filter::port::producer::OrderedBoundProducerAdapter
+crate::runtime_filter::port::producer::ProducerAdapter
+crate::runtime_filter::port::producer::ProducerHandle
+crate::runtime_filter::port::producer::ProducerHandle::FinalDomain
+crate::runtime_filter::port::producer::ProducerHandle::Membership
+crate::runtime_filter::port::producer::ProducerHandle::OrderedBound
+crate::runtime_filter::port::producer::ProducerHandle::TopKSummary
+crate::runtime_filter::port::producer::ProducerPortKind
+crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain
+crate::runtime_filter::port::producer::ProducerPortKind::Membership
+crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound
+crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::ProducerPortMismatch
+crate::runtime_filter::port::producer::SubmitOutcome
+crate::runtime_filter::port::producer::SubmitOutcome::Completed
+crate::runtime_filter::port::producer::SubmitOutcome::Published
+crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop
+crate::runtime_filter::port::producer::TopKSummaryProducerAdapter
+crate::runtime_filter::port::subscription::BlockingSnapshotSubscription
+crate::runtime_filter::port::subscription::LivePollOutcome
+crate::runtime_filter::port::subscription::LivePollOutcome::Idle
+crate::runtime_filter::port::subscription::LivePollOutcome::Updated
+crate::runtime_filter::port::subscription::LiveTerminal
+crate::runtime_filter::port::subscription::LiveTerminal::Completed
+crate::runtime_filter::port::subscription::LiveTerminal::Unavailable
+crate::runtime_filter::port::subscription::NonBlockingLiveSubscription
+crate::runtime_filter::port::subscription::SubscriptionHandle
+crate::runtime_filter::port::subscription::SubscriptionHandle::Blocking
+crate::runtime_filter::port::subscription::SubscriptionHandle::Live
+crate::runtime_filter::port::subscription::SubscriptionKind
+crate::runtime_filter::port::subscription::SubscriptionKind::BlockingSnapshot
+crate::runtime_filter::port::subscription::SubscriptionKind::NonBlockingLive
+crate::runtime_filter::port::subscription::UnavailableReason
+crate::runtime_filter::port::subscription::UnavailableReason::ResourceLimit
+crate::runtime_filter::port::support::ArtifactRetainedBudget
+crate::runtime_filter::port::support::ArtifactRetainedBudget::new
+crate::runtime_filter::port::support::MemoryAccountError
+crate::runtime_filter::port::support::MemoryAccountError::CapacityExceeded
+crate::runtime_filter::port::support::RuntimeFilterClock
+crate::runtime_filter::port::support::RuntimeFilterMemoryAccount
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount
+crate::runtime_filter::service::memory::MemTrackerMemoryAccount::new_root_for_test
+crate::runtime_filter::service::RuntimeFilterService
+crate::runtime_filter::service::RuntimeFilterService::new_with_dependencies
+crate::runtime::endpoint::RuntimeEndpoint
+crate::runtime::endpoint::RuntimeEndpoint::from_socket_addr
+crate::sql::analysis::ExprKind
+crate::sql::analysis::ExprKind::Literal
+crate::sql::analysis::LiteralValue
+crate::sql::analysis::LiteralValue::Int
+crate::sql::analysis::TypedExpr
+crate::sql::planner::distributed::DataPartition
+crate::sql::planner::distributed::DataPartition::unpartitioned
+crate::sql::planner::distributed::FragmentEdge
+crate::sql::planner::distributed::FragmentEdgeKind
+crate::sql::planner::distributed::FragmentEdgeKind::Stream
+crate::sql::planner::distributed::FragmentStreamKind
+crate::sql::planner::distributed::FragmentStreamKind::Gather
+std::cmp::Ordering
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::collections::BTreeMap
+std::collections::BTreeMap::new
+std::collections::BTreeSet
+std::collections::BTreeSet::from
+std::collections::BTreeSet::new
+std::net::SocketAddr
+std::slice::from_ref
+std::sync::Arc
+std::sync::Arc::new
+std::sync::Arc::ptr_eq
+std::sync::Mutex
+std::time::Instant
+std::time::Instant::now
+"#,
+        ),
+        _ => None,
+    };
+    exact_inventory
+}
+
+fn runtime_filter_task4_bare_path_inventory(source_rel: &str) -> Option<&'static str> {
+    match source_rel {
+        "src/runtime_filter/service/m3b_tests.rs" => Some(
+            r#"
+Applied
+Arc
+ArmableMemoryAccount
+ArtifactPublished
+Ascending
+AtomicBool
+AtomicUsize
+BindingId
+COMPARATOR_ALGORITHM_VERSION
+CONSUMER
+Cancelled
+ChannelId
+Clock
+Completed
+ConflictingReplay
+ConflictingTerminalSequence
+CoverageWitnessId
+CrossChannelTopKEvents
+DataType
+DegradedLogical
+Descending
+Duplicate
+Duration
+Err
+Events
+FIRST
+Fixture
+Fn
+Idle
+Instant
+Int64
+InvalidPartition
+Last
+LivePollOutcome
+LiveTerminal
+LogicalVersion
+LogicalVersionPublished
+LoopbackDelivered
+MemoryAccountError
+Mutex
+None
+NullOrder
+Ok
+Option
+OrderContract
+OrderKeyContract
+OrderedBound
+OrderedBoundLoosened
+OrderedContractMismatch
+OrderedGlobalTightened
+Ordering
+PRODUCER_A
+PRODUCER_B
+PartitionId
+PendingFinalSnapshot
+ProducerHandle
+ProducerPortKind
+ProducerPortMismatch
+ProducerSequence
+Published
+ResourceLimit
+Result
+RouteEdgeId
+RuntimeContractViolationKind
+RuntimeFilterChannelDeployment
+RuntimeFilterClock
+RuntimeFilterEvent
+RuntimeFilterEventSink
+RuntimeFilterMemoryAccount
+RuntimeFilterPolicyRequirement
+RuntimeFilterService
+RuntimeTopKSummaryContract
+Self
+SeqCst
+SequenceOutsideTerminalRange
+Some
+SortDirection
+StreamAcceptedNoGlobalChange
+SubmitOutcome
+TerminalNoop
+TopKReentrantEvents
+TopKStreamUpdated
+TopKSummary
+TopKSummaryApplied
+TopKSummaryEqual
+TopKSummaryRejected
+TopKSummaryRequirement
+TopKSummaryStale
+Unavailable
+UnavailableReason
+UniqueId
+Vec
+_
+accepted
+accepted_bytes
+accepted_summary
+account
+active
+after
+after_account
+after_live
+any
+applied
+artifact
+assert
+assert_eq
+assert_ne
+before
+before_account
+before_live
+before_producer
+binding
+binding_id
+bool
+bundle
+bytes
+channel
+channel_id
+close_partition
+comparator_digest_for_test
+conflict
+conflicting
+consumer
+contract
+contract_for_submit
+count
+coverage
+crate
+current
+data_type
+deadline
+deployment
+derive
+direct
+direct_again
+direct_deployment
+direct_live
+direct_witness
+direction
+done_rx
+done_tx
+drop
+entered_rx
+entered_tx
+error
+event
+events
+filter
+fired
+first
+fixture
+fixture_with_account
+fragment_instance_id
+from_secs
+i64
+identity
+if
+installed_service_with_sink
+instance
+is_empty
+is_none
+iter
+keys
+kind
+latest_version
+live
+lo
+load
+lock
+matches
+memory
+nested_applied
+nested_first
+nested_published
+nested_second
+new
+now
+null_order
+open_producer
+outcome
+outer_applied
+outer_first
+outer_published
+outer_second
+outer_summary
+outer_tightened
+outside_terminal
+panic
+panicked
+partition_id
+pending
+pending_producer
+plan
+poll_after
+port
+position
+predicate
+preflight
+previous
+producer
+producer_a
+producer_b
+ptr_eq
+published
+range_contract
+range_value
+recv_timeout
+reentered
+rejected
+release_rx
+release_tx
+replay
+replayed
+requirement
+retained_before_failure
+runtime_filter
+runtime_order
+satisfied
+satisfied_producer
+second
+second_summary
+self
+sequence
+service
+sink
+start
+stream
+submit
+submit_summary
+submits
+subscription
+summary
+summary_producer
+terminal
+test
+tightened
+topk
+topk_again
+topk_contract
+topk_deployment
+topk_deployment_with_ids
+topk_live
+typed
+uid
+unauthorized
+unwrap
+unwrap_err
+upgrade
+usize
+value
+values
+vec
+version
+violation
+weak_dispatcher
+weak_registry
+weak_service
+witnesses
+wrong
+wrong_contract
+wrong_plan
+"#,
+        ),
+        "src/runtime_filter/service/m3c_tests.rs" => Some(
+            r#"
+AdversarialEvents
+Applied
+Arc
+ArmableMemoryAccount
+ArtifactKind
+ArtifactPublished
+AtomicBool
+AtomicUsize
+BindingId
+BlockingCallMemoryAccount
+CHANNEL
+CONSUMER
+Cancelled
+ChannelAction
+ChannelCancelled
+ChannelCompleted
+ChannelId
+ChannelUnavailable
+Clock
+Completed
+ConflictingReplay
+Contract
+ContributionIdentity
+CoverageWitnessId
+DeploymentEpoch
+Duplicate
+Duration
+EmptyDomain
+Err
+Events
+FIRST
+FinalDomainProducerAdapter
+FinalDomainRejectionKind
+FinalDomainShardAccepted
+FinalDomainShardDuplicate
+FinalDomainShardRejected
+Fn
+FrozenFinalDomainTestIssuer
+Idle
+Instant
+LivePollOutcome
+LiveTerminal
+LogicalVersion
+LoopbackDelivered
+MemoryAccountError
+Mutex
+None
+Ok
+Option
+Ordering
+PRODUCER_A
+PRODUCER_B
+PartitionId
+PendingGap
+ProducerSequence
+ResourceLimit
+Result
+RuntimeContractViolationKind
+RuntimeFilterChannelDeployment
+RuntimeFilterClock
+RuntimeFilterEvent
+RuntimeFilterEventSink
+RuntimeFilterMemoryAccount
+RuntimeFilterParticipantId
+RuntimeFilterPolicyRequirement
+RuntimeFilterService
+Self
+SeqCst
+Some
+SubmitOutcome
+TerminalNoop
+UnauthorizedBinding
+Unavailable
+UnavailableReason
+UniqueId
+ValueSet
+Vec
+Weak
+accepted
+artifacts
+assert
+assert_coordinate
+assert_eq
+assert_ne
+barrier
+binding
+binding_id
+block_call
+blocking_memory_account
+bool
+bundle
+bytes
+call
+calls
+cancel_entered
+cancel_input
+cancel_issuer
+cancel_memory
+cancel_producer
+cancel_release
+cancel_rx
+cancel_service
+cancel_started_rx
+cancel_started_tx
+cancel_thread
+cancel_tx
+cancel_worker
+cancelled
+cancelling_service
+channel
+channel_id
+channels
+clone
+close_outcome
+close_partition
+close_worker
+collecting
+complete
+complete_outcome
+complete_rx
+complete_tx
+complete_worker
+count
+coverage
+current
+deadline
+deployment_for
+derive
+dispatcher
+drop
+duplicate_entered
+duplicate_input
+duplicate_issuer
+duplicate_memory
+duplicate_producer
+duplicate_release
+duplicate_rx
+duplicate_service
+duplicate_tx
+duplicate_worker
+empty_bundle
+empty_events
+empty_issuer
+empty_live
+empty_producer
+empty_service
+empty_terminal
+entered
+entered_rx
+entered_tx
+epoch
+event
+event_count
+events
+expect
+expected
+expected_losing_terminal
+filter
+fragment_instance_id
+from_secs
+frozen
+frozen_issuer
+i64
+identity
+input
+installation_for_dispatch
+installed_service
+installed_service_for
+instance
+instances
+invalid
+is_none
+issuer
+issuer_a
+issuer_a0
+issuer_a1
+issuer_b
+iter
+iteration
+kind
+late_valid
+latest_version
+len
+live
+lo
+load
+local_partition_count
+map
+matches
+memory
+memory_calls_before
+new
+next
+next_dispatch_order
+now
+observed
+observed_next_order
+observed_public
+open_drivers
+open_final
+open_final_with_partitions
+order
+outcome
+outcomes
+outer_cancel_producer
+outer_input
+outer_producer
+outer_rx
+outer_temporary_bytes
+outer_tx
+outer_worker
+panic
+panicked
+participant_id
+partition
+partition_id
+pending_action_count
+permutations
+poll_after
+position
+predicate
+previous
+producer
+producer_a
+producer_a0
+producer_a1
+producer_b
+producer_instances
+producers
+query_id
+reason
+recorded
+recv_timeout
+registry
+reject_blocked
+rejected
+rejected_producer
+rejection
+rejection_thread
+release
+release_rx
+release_tx
+resource_events
+resource_producer
+resource_service
+result_rx
+result_tx
+retained_after_inner
+retained_before
+self
+sequence
+service
+service_weak
+shard
+shard_at
+snapshot
+snapshot_before
+stream
+submission_index
+submissions
+terminal
+terminal_action
+terminal_case
+terminal_rx
+terminal_tx
+terminal_worker
+test
+transition
+typed
+u32
+u64
+uid
+unavailable
+unavailable_events
+unavailable_issuer
+unavailable_live
+unavailable_memory
+unavailable_producer
+unavailable_service
+unreachable
+unwrap
+unwrap_err
+upgrade
+usize
+valid_a
+values
+version
+weak
+witness
+wrong
+wrong_channel_issuer
+wrong_channel_service
+wrong_epoch_issuer
+wrong_epoch_service
+wrong_inputs
+"#,
+        ),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterBarePathAudit {
+    paths: BTreeSet<String>,
+}
+
+impl RuntimeFilterBarePathAudit {
+    fn visit_macro_tokens(&mut self, tokens: &str) {
+        for token in rust_source_tokens(tokens) {
+            if token
+                .text
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                && token
+                    .text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                self.paths.insert(token.text);
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBarePathAudit {
+    fn visit_item_use(&mut self, _item: &'ast syn::ItemUse) {}
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none()
+            && path.segments.len() == 1
+            && let Some(segment) = path.segments.first()
+        {
+            self.paths.insert(segment.ident.to_string());
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if item.path.leading_colon.is_none()
+            && item.path.segments.len() == 1
+            && let Some(segment) = item.path.segments.first()
+        {
+            self.paths.insert(segment.ident.to_string());
+        }
+        self.visit_macro_tokens(&item.tokens.to_string());
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn runtime_filter_task4_bare_paths(text: &str) -> Result<BTreeSet<String>, syn::Error> {
+    let file = syn::parse_file(text)?;
+    let mut audit = RuntimeFilterBarePathAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.paths)
+}
+
+fn runtime_filter_task4_bare_path_inventory_violations(
+    source_rel: &str,
+    actual: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(inventory) = runtime_filter_task4_bare_path_inventory(source_rel) else {
+        return Vec::new();
+    };
+    let expected = inventory
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    expected
+        .difference(actual)
+        .map(|path| format!("{source_rel}: stale exact bare path {path}"))
+        .chain(
+            actual
+                .difference(&expected)
+                .map(|path| format!("{source_rel}: unexpected exact bare path {path}")),
+        )
+        .collect()
+}
+
+fn runtime_filter_task4_added_dependency_prefixes(source_rel: &str) -> &'static [&'static str] {
+    match source_rel {
+        "src/runtime_filter/core/channel.rs" => &[
+            "crate::runtime_filter::core::ordered_reducer",
+            "crate::runtime_filter::core::topk_reducer",
+            "crate::runtime_filter::port::artifact::ArtifactMembershipSchema",
+            "crate::runtime_filter::port::events::FinalDomainRejectionKind",
+            "crate::runtime_filter::port::final_domain",
+            "crate::runtime_filter::port::install::RuntimeFilterChannelDeployment",
+            "crate::runtime_filter::port::ordered_bound",
+            "crate::runtime_filter::port::topk_summary",
+        ],
+        "src/runtime_filter/core/state.rs" => {
+            &["crate::runtime_filter::port::subscription::UnavailableReason"]
+        }
+        "src/runtime_filter/materializer/codec.rs" => &[
+            "std::mem::size_of",
+            "arrow::datatypes::DECIMAL128_MAX_SCALE",
+            "arrow::datatypes::DataType",
+            "arrow::datatypes::TimeUnit",
+            "crate::runtime_filter::port::ordered_bound",
+        ],
+        "src/runtime_filter/port/artifact.rs" => &["crate::runtime_filter::port::ordered_bound"],
+        "src/runtime_filter/port/events.rs" => &[
+            "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
+            "crate::runtime_filter::port::subscription::LiveTerminal",
+        ],
+        "src/runtime_filter/port/producer.rs" => &[
+            "std::sync::Arc",
+            "std::sync::Weak",
+            "crate::runtime_filter::port::final_domain::FinalDomainShard",
+            "crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate",
+            "crate::runtime_filter::port::topk_summary::TopKSummary",
+        ],
+        "src/runtime_filter/port/subscription.rs" => &[
+            "std::fmt",
+            "crate::runtime_filter::port::identity::LogicalVersion",
+            "crate::runtime_filter::port::producer::RuntimeContractViolation",
+            "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
+        ],
+        "src/runtime_filter/port/value_domain.rs" => {
+            &["crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain"]
+        }
+        "src/runtime_filter/service/subscription.rs" => {
+            &["crate::runtime_filter::model::contract::ConsumerActivation"]
+        }
+        _ => &[],
+    }
+}
+
+fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]) -> Option<bool> {
+    if let Some(exact_inventory) = runtime_filter_task4_whole_exact_inventory(source_rel) {
+        let dependency = canonical.join("::");
+        return Some(exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    let dependency = canonical.join("::");
+    let added_prefixes = runtime_filter_task4_added_dependency_prefixes(source_rel);
+    if added_prefixes.iter().any(|prefix| {
+        dependency == *prefix
+            || dependency
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    }) {
+        return runtime_filter_task4_added_exact_inventory(source_rel)
+            .map(|exact_inventory| exact_inventory.lines().any(|allowed| allowed == dependency));
+    }
+    None
+}
+
+fn runtime_filter_task4_added_exact_inventory(source_rel: &str) -> Option<&'static str> {
+    let exact_added_inventory = match source_rel {
+        "src/runtime_filter/core/channel.rs" => {
+            r#"
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::Duplicate
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::GlobalTightened
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::SequenceAdvancedEqual
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::Stale
+crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::StreamTightened
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::Duplicate
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::PendingFinalSnapshot
+crate::runtime_filter::core::ordered_reducer::OrderedCloseOutcome::Satisfied
+crate::runtime_filter::core::ordered_reducer::OrderedReducer
+crate::runtime_filter::core::ordered_reducer::OrderedReducer::new
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::Duplicate
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::GlobalTightened
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::SequenceAdvancedEqual
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::Stale
+crate::runtime_filter::core::topk_reducer::TopKApplyOutcome::StreamUpdated
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::Duplicate
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::PendingFinalSnapshot
+crate::runtime_filter::core::topk_reducer::TopKCloseOutcome::Satisfied
+crate::runtime_filter::core::topk_reducer::TopKSummaryReducer
+crate::runtime_filter::core::topk_reducer::TopKSummaryReducer::new
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new
+crate::runtime_filter::port::events::FinalDomainRejectionKind
+crate::runtime_filter::port::events::FinalDomainRejectionKind::Contract
+crate::runtime_filter::port::events::FinalDomainRejectionKind::ResourceLimit
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract::try_from_install
+crate::runtime_filter::port::install::RuntimeFilterChannelDeployment
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract::try_from_plan
+crate::runtime_filter::port::topk_summary::TopKSummary
+"#
+        }
+        "src/runtime_filter/core/state.rs" => {
+            r#"
+crate::runtime_filter::port::subscription::UnavailableReason
+"#
+        }
+        "src/runtime_filter/materializer/codec.rs" => {
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+arrow::datatypes::DECIMAL128_MAX_SCALE
+arrow::datatypes::TimeUnit
+arrow::datatypes::TimeUnit::Microsecond
+arrow::datatypes::TimeUnit::Millisecond
+arrow::datatypes::TimeUnit::Nanosecond
+arrow::datatypes::TimeUnit::Second
+crate::runtime_filter::port::ordered_bound::OrderContractDigest
+crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::validate_codec_contract_digest
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::from_codec
+std::mem::size_of
+"#
+        }
+        "src/runtime_filter/port/artifact.rs" => {
+            r#"
+crate::runtime_filter::port::ordered_bound::OrderContractDigest
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::ordered_bound::RuntimeOrderKey
+"#
+        }
+        "src/runtime_filter/port/events.rs" => {
+            r#"
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::subscription::LiveTerminal
+"#
+        }
+        "src/runtime_filter/port/producer.rs" => {
+            r#"
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::topk_summary::TopKSummary
+std::sync::Arc
+std::sync::Arc::downgrade
+std::sync::Weak
+"#
+        }
+        "src/runtime_filter/port/subscription.rs" => {
+            r#"
+crate::runtime_filter::port::identity::LogicalVersion
+crate::runtime_filter::port::producer::RuntimeContractViolation
+crate::runtime_filter::port::producer::RuntimeContractViolation::new
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::SubscriptionActivationMismatch
+std::fmt::Debug
+std::fmt::Formatter
+std::fmt::Result
+"#
+        }
+        "src/runtime_filter/port/value_domain.rs" => {
+            r#"
+crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain
+"#
+        }
+        "src/runtime_filter/service/subscription.rs" => {
+            r#"
+crate::runtime_filter::model::contract::ConsumerActivation
+crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot
+crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive
+"#
+        }
+        _ => "",
+    };
+    Some(exact_added_inventory).filter(|inventory| !inventory.is_empty())
+}
+
+fn runtime_filter_runtime_dependencies_are_allowed(source_rel: &str, text: &str) -> bool {
+    let Some(allowed_prefixes) = runtime_filter_runtime_dependency_allowlist(source_rel) else {
+        return false;
+    };
+    let local_roots = runtime_filter_runtime_local_roots(text);
+    let canonical_allowed = rust_production_canonical_paths(text, source_rel)
+        .into_iter()
+        .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
+        .filter(|canonical| {
+            !canonical
+                .first()
+                .is_some_and(|root| local_roots.contains(root))
+                && !runtime_filter_path_is_rust_prelude(canonical)
+        })
+        .all(|canonical| {
+            runtime_filter_task4_exact_path_ledger(source_rel, &canonical).unwrap_or_else(|| {
+                runtime_filter_path_is_allowlisted(&canonical, &allowed_prefixes)
+            })
+        });
+    canonical_allowed
+        && runtime_filter_runtime_extern_crates(text)
+            .into_iter()
+            .all(|path| {
+                runtime_filter_task4_exact_path_ledger(source_rel, &path)
+                    .unwrap_or_else(|| runtime_filter_path_is_allowlisted(&path, &allowed_prefixes))
+            })
+        && runtime_filter_task4_bare_path_inventory(source_rel).is_none_or(|_| {
+            runtime_filter_task4_bare_paths(text).is_ok_and(|actual| {
+                runtime_filter_task4_bare_path_inventory_violations(source_rel, &actual).is_empty()
+            })
+        })
+}
+
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
     if !source_rel.starts_with("src/runtime_filter/") {
         let production = rust_sanitized_production_text(text);
@@ -7801,7 +9802,25 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
             "LogicalSnapshot",
         ]
         .into_iter()
-        .any(|owner| production.contains(owner));
+        .any(|owner| {
+            if owner != "ValueDomainDelta" {
+                return production.contains(owner);
+            }
+            canonical.iter().any(|path| {
+                path.last().is_some_and(|segment| segment == owner)
+                    && !runtime_filter_path_is_exactly_allowlisted(
+                        path,
+                        &[&[
+                            "crate",
+                            "runtime_filter",
+                            "model",
+                            "contract",
+                            "ContributionKind",
+                            "ValueDomainDelta",
+                        ]],
+                    )
+            })
+        });
         let references_concrete_event_sink = production.contains("RegistryRuntimeFilterEventSink")
             || canonical.iter().any(|path| {
                 path.last()
@@ -7866,7 +9885,7 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
         )];
     };
     let local_roots = runtime_filter_runtime_local_roots(text);
-    let mut violations = rust_production_canonical_paths(text, source_rel)
+    let canonical_dependencies = rust_production_canonical_paths(text, source_rel)
         .into_iter()
         .map(|canonical| runtime_filter_dependency_path(&canonical, source_rel))
         .filter(|canonical| {
@@ -7874,16 +9893,58 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
                 .first()
                 .is_some_and(|root| local_roots.contains(root))
                 && !runtime_filter_path_is_rust_prelude(canonical)
-                && !runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes)
+        })
+        .collect::<BTreeSet<_>>();
+    let external_dependencies = runtime_filter_runtime_extern_crates(text);
+    let mut violations = canonical_dependencies
+        .iter()
+        .filter(|canonical| {
+            !runtime_filter_task4_exact_path_ledger(source_rel, canonical)
+                .unwrap_or_else(|| runtime_filter_path_is_allowlisted(canonical, &allowed_prefixes))
         })
         .map(|canonical| format!("{source_rel}: {}", canonical.join("::")))
         .collect::<BTreeSet<_>>();
     violations.extend(
-        runtime_filter_runtime_extern_crates(text)
-            .into_iter()
-            .filter(|path| !runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+        external_dependencies
+            .iter()
+            .filter(|path| {
+                !runtime_filter_task4_exact_path_ledger(source_rel, path)
+                    .unwrap_or_else(|| runtime_filter_path_is_allowlisted(path, &allowed_prefixes))
+            })
             .map(|path| format!("{source_rel}: external {}", path.join("::"))),
     );
+    if let Some(exact_inventory) = runtime_filter_task4_whole_exact_inventory(source_rel)
+        .or_else(|| runtime_filter_task4_added_exact_inventory(source_rel))
+    {
+        let expected = exact_inventory
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let actual = canonical_dependencies
+            .iter()
+            .chain(external_dependencies.iter())
+            .map(|path| path.join("::"))
+            .collect::<BTreeSet<_>>();
+        violations.extend(
+            expected
+                .difference(&actual)
+                .map(|path| format!("{source_rel}: stale exact dependency {path}")),
+        );
+    }
+    if runtime_filter_task4_bare_path_inventory(source_rel).is_some() {
+        match runtime_filter_task4_bare_paths(text) {
+            Ok(actual) => violations.extend(runtime_filter_task4_bare_path_inventory_violations(
+                source_rel, &actual,
+            )),
+            Err(error) => {
+                violations.insert(format!(
+                    "{source_rel}: whole-exact bare path source must parse: {error}"
+                ));
+            }
+        }
+    }
     let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
     let production_source_tokens = rust_source_tokens(&rust_sanitized_production_text(text));
     let has_path_attribute = production_source_tokens
@@ -8001,8 +10062,120 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "core", "coverage"],
             &["crate", "runtime_filter", "core", "error"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedApplyOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedCloseOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedReducer",
+            ],
             &["crate", "runtime_filter", "core", "reducer"],
             &["crate", "runtime_filter", "core", "state"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKApplyOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKCloseOutcome",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "topk_reducer",
+                "TopKSummaryReducer",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactMembershipSchema",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "events",
+                "FinalDomainRejectionKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "FinalDomainShard",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "RuntimeCompletionFenceContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "install",
+                "RuntimeFilterChannelDeployment",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "RuntimeTopKSummaryContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
         ],
         "src/runtime_filter/core/coverage.rs" => vec![
             &["std", "collections", "BTreeMap"],
@@ -8032,6 +10205,62 @@ fn runtime_filter_runtime_dependency_allowlist(
             ],
             &["crate", "runtime_filter", "port", "value_domain"],
         ],
+        "src/runtime_filter/core/ordered_reducer.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync", "Arc"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerSequence",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerStreamId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+        ],
         "src/runtime_filter/core/state.rs" => vec![
             &["std", "collections", "BTreeMap"],
             &["crate", "runtime_filter", "port", "identity"],
@@ -8041,6 +10270,83 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "port",
                 "value_domain",
                 "ContributionFingerprint",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "UnavailableReason",
+            ],
+        ],
+        "src/runtime_filter/core/topk_reducer.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "sync", "Arc"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerSequence",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "ProducerStreamId",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "RuntimeTopKSummaryContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
             ],
         ],
         "src/runtime_filter/materializer/mod.rs" => vec![
@@ -8069,15 +10375,143 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "cmp", "Ordering"],
             &["std", "error", "Error"],
             &["std", "fmt"],
+            &["std", "mem", "size_of"],
             &["std", "str", "from_utf8"],
             &["std", "sync", "Arc"],
             &["arrow", "datatypes", "DECIMAL128_MAX_PRECISION"],
+            &["arrow", "datatypes", "DECIMAL128_MAX_SCALE"],
+            &["arrow", "datatypes", "DataType"],
+            &["arrow", "datatypes", "TimeUnit"],
             &["crate", "runtime_filter", "model", "contract"],
             &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderContractDigest",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedScalar",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedTuple",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderContract",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "RuntimeOrderKey",
+            ],
             &["crate", "runtime_filter", "port", "support"],
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "materializer", "bloom"],
+        ],
+        "src/runtime_filter/materializer/range.rs" => vec![
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "Arc"],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "encode_range_leaf",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "encoded_range_leaf_len",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "materializer",
+                "codec",
+                "ArtifactCodecError",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactBundle",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ConsumerArtifactProfile",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "PhysicalArtifact",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "RangeArtifactData",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "RangeArtifactResidentLayout",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &["crate", "runtime_filter", "port", "support"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "LogicalSnapshot",
+            ],
         ],
         "src/runtime_filter/port/mod.rs" => vec![],
         "src/runtime_filter/port/artifact.rs" => vec![
@@ -8091,6 +10525,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["sha2"],
             &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
             &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
             &["crate", "runtime_filter", "port", "identity"],
             &["crate", "runtime_filter", "port", "support"],
         ],
@@ -8120,6 +10555,44 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "subscription",
                 "ArtifactUnsupportedReason",
             ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "subscription",
+                "LiveTerminal",
+            ],
+        ],
+        "src/runtime_filter/port/final_domain.rs" => vec![
+            &["std", "error", "Error"],
+            &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["sha2"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactMembershipSchema",
+            ],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "value_domain",
+                "ValueDomainDelta",
+            ],
         ],
         "src/runtime_filter/port/identity.rs" => vec![
             &["crate", "common", "types", "UniqueId"],
@@ -8133,12 +10606,50 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "artifact"],
             &["crate", "runtime_filter", "port", "identity"],
         ],
+        "src/runtime_filter/port/ordered_bound.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "sync", "Arc"],
+            &["arrow", "datatypes", "DataType"],
+            &["sha2"],
+            &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "encode_schema",
+            ],
+        ],
         "src/runtime_filter/port/producer.rs" => vec![
             &["std", "error", "Error"],
             &["std", "fmt"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Weak"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "FinalDomainShard",
+            ],
             &["crate", "runtime_filter", "port", "identity"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "ordered_bound",
+                "OrderedBoundUpdate",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "topk_summary",
+                "TopKSummary",
+            ],
             &[
                 "crate",
                 "runtime_filter",
@@ -8148,6 +10659,7 @@ fn runtime_filter_runtime_dependency_allowlist(
             ],
         ],
         "src/runtime_filter/port/subscription.rs" => vec![
+            &["std", "fmt"],
             &["std", "sync", "Arc"],
             &["std", "time", "Duration"],
             &["crate", "common", "types", "UniqueId"],
@@ -8160,6 +10672,27 @@ fn runtime_filter_runtime_dependency_allowlist(
                 "ArtifactBundle",
             ],
             &["crate", "runtime_filter", "port", "identity", "RouteEdgeId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "identity",
+                "LogicalVersion",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolation",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "producer",
+                "RuntimeContractViolationKind",
+            ],
         ],
         "src/runtime_filter/port/support.rs" => vec![
             &["std", "error", "Error"],
@@ -8167,6 +10700,14 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["std", "sync", "Arc"],
             &["std", "sync", "atomic"],
             &["std", "time", "Instant"],
+        ],
+        "src/runtime_filter/port/topk_summary.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "num", "NonZeroU32"],
+            &["std", "sync", "Arc"],
+            &["sha2"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
         ],
         "src/runtime_filter/port/value_domain.rs" => vec![
             &["std", "cmp", "Ordering"],
@@ -8178,6 +10719,13 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["sha2"],
             &["crate", "common", "largeint", "LARGEINT_BYTE_WIDTH"],
             &["crate", "runtime_filter", "model", "contract"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "ordered_reducer",
+                "OrderedBoundDomain",
+            ],
             &[
                 "crate",
                 "runtime_filter",
@@ -8301,12 +10849,231 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "runtime_filter", "port", "value_domain"],
             &["crate", "runtime_filter", "service", "registry"],
         ],
+        "src/runtime_filter/service/m3a_tests.rs" => vec![
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "spawn"],
+            &["std", "time", "Duration"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+            &["crate", "runtime_filter", "service", "tests"],
+        ],
+        "src/runtime_filter/service/m3b_tests.rs" => vec![
+            &["ArtifactCapability"],
+            &["BindingId"],
+            &["ChannelId"],
+            &["CompletionRequirement"],
+            &["ConsumerActivation"],
+            &["ConsumerDeployment"],
+            &["ContributionKind"],
+            &["CoverageWitnessId"],
+            &["DeploymentEpoch"],
+            &["LateApplyGranularity"],
+            &["LogicalVersion"],
+            &["MaterializationPolicy"],
+            &["NullOrder"],
+            &["PartitionId"],
+            &["ProducerDeployment"],
+            &["ProducerSequence"],
+            &["ReductionRequirement"],
+            &["RouteEdgeId"],
+            &["RuntimeFilterChannelDeployment"],
+            &["RuntimeFilterCoreBudget"],
+            &["RuntimeFilterInstallView"],
+            &["RuntimeFilterLifecycle"],
+            &["RuntimeFilterLogicalDomain"],
+            &["RuntimeFilterParticipantId"],
+            &["SortDirection"],
+            &["TopKSummaryRequirement"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Barrier"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "Weak"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "spawn"],
+            &["std", "thread", "yield_now"],
+            &["std", "time", "Duration"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ConsumerArtifactProfile",
+            ],
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "artifact",
+                "ArtifactKind",
+            ],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "topk_summary"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
+        "src/runtime_filter/service/m3c_tests.rs" => vec![
+            &["ArtifactCapability"],
+            &["BindingId"],
+            &["ChannelId"],
+            &["CompletionFenceKind"],
+            &["CompletionRequirement"],
+            &["ConsumerActivation"],
+            &["ConsumerDeployment"],
+            &["ContributionKind"],
+            &["CoverageWitnessId"],
+            &["DeploymentEpoch"],
+            &["LateApplyGranularity"],
+            &["LogicalVersion"],
+            &["MaterializationPolicy"],
+            &["NullSemantics"],
+            &["PartitionId"],
+            &["ProducerDeployment"],
+            &["ProducerSequence"],
+            &["ProducerStreamId"],
+            &["ReductionRequirement"],
+            &["RouteEdgeId"],
+            &["RuntimeFilterChannelDeployment"],
+            &["RuntimeFilterCoreBudget"],
+            &["RuntimeFilterInstallView"],
+            &["RuntimeFilterLifecycle"],
+            &["RuntimeFilterLogicalDomain"],
+            &["RuntimeFilterParticipantId"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "sync", "atomic"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Barrier"],
+            &["std", "sync", "Mutex"],
+            &["std", "sync", "Weak"],
+            &["std", "sync", "mpsc"],
+            &["std", "thread", "sleep"],
+            &["std", "thread", "spawn"],
+            &["std", "thread", "yield_now"],
+            &["std", "time", "Duration"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "core",
+                "channel",
+                "ChannelAction",
+            ],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "final_domain"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
+        "src/runtime_filter/service/m4_conformance_tests.rs" => vec![
+            &["std", "cmp", "Ordering"],
+            &["std", "collections", "BTreeMap"],
+            &["std", "collections", "BTreeSet"],
+            &["std", "net", "SocketAddr"],
+            &["std", "slice", "from_ref"],
+            &["std", "sync", "Arc"],
+            &["std", "sync", "Mutex"],
+            &["std", "time", "Instant"],
+            &["arrow", "datatypes", "DataType"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "coordinator", "scheduler"],
+            &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
+            &[
+                "crate",
+                "runtime_filter",
+                "deployment",
+                "RuntimeFilterDeploymentPolicy",
+            ],
+            &["crate", "runtime_filter", "deployment", "compiler"],
+            &["crate", "runtime_filter", "materializer", "codec"],
+            &["crate", "runtime_filter", "model", "contract"],
+            &["crate", "runtime_filter", "model", "coverage", "Coverage"],
+            &["crate", "runtime_filter", "model", "graph"],
+            &["crate", "runtime_filter", "port", "artifact"],
+            &["crate", "runtime_filter", "port", "events"],
+            &["crate", "runtime_filter", "port", "final_domain"],
+            &["crate", "runtime_filter", "port", "identity"],
+            &["crate", "runtime_filter", "port", "install"],
+            &["crate", "runtime_filter", "port", "ordered_bound"],
+            &["crate", "runtime_filter", "port", "producer"],
+            &["crate", "runtime_filter", "port", "subscription"],
+            &["crate", "runtime_filter", "port", "support"],
+            &["crate", "runtime_filter", "port", "topk_summary"],
+            &["crate", "runtime_filter", "port", "value_domain"],
+            &["crate", "sql", "analysis"],
+            &["crate", "sql", "planner", "distributed"],
+            &["crate", "runtime_filter", "service", "RuntimeFilterService"],
+            &[
+                "crate",
+                "runtime_filter",
+                "service",
+                "memory",
+                "MemTrackerMemoryAccount",
+            ],
+        ],
         "src/runtime_filter/service/subscription.rs" => vec![
             &["std", "collections", "BTreeMap"],
             &["std", "sync"],
             &["std", "time", "Duration"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &[
+                "crate",
+                "runtime_filter",
+                "model",
+                "contract",
+                "ConsumerActivation",
+            ],
             &["crate", "runtime_filter", "port"],
             &["crate", "runtime_filter", "service", "EventBatchCompletion"],
         ],
@@ -8968,9 +11735,707 @@ fn runtime_filter_query_context_lock_discipline_violations(text: &str) -> Vec<St
     violations
 }
 
+#[derive(Debug, Default)]
+struct RuntimeFilterReachableAudit {
+    allow_nested_conditional_body: bool,
+    allow_topn_nested_rows_loop: bool,
+    allowed_owned_for_iterators: BTreeSet<String>,
+    allowed_shared_for_iterators: BTreeSet<String>,
+    calls: BTreeSet<Vec<String>>,
+    direct_calls: BTreeSet<Vec<String>>,
+    methods: BTreeSet<String>,
+    paths: BTreeSet<Vec<String>>,
+    reachable_for_depth: usize,
+    topn_case_loop_active: bool,
+    topn_rows_loop_active: bool,
+}
+
+impl RuntimeFilterReachableAudit {
+    fn has_method(&self, method: &str) -> bool {
+        self.methods.contains(method)
+    }
+
+    fn has_call(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.calls, expected)
+    }
+
+    fn has_direct_call(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.direct_calls, expected)
+    }
+
+    fn has_path(&self, expected: &[&str]) -> bool {
+        Self::has_exact_path(&self.paths, expected)
+    }
+
+    fn has_exact_path(paths: &BTreeSet<Vec<String>>, expected: &[&str]) -> bool {
+        paths.iter().any(|path| {
+            path.len() == expected.len()
+                && path
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual == expected)
+        })
+    }
+
+    fn path_segments(path: &syn::Path) -> Vec<String> {
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect()
+    }
+
+    fn literal_bool(expression: &syn::Expr) -> Option<bool> {
+        match expression {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Bool(value),
+                ..
+            }) => Some(value.value),
+            syn::Expr::Paren(paren) => Self::literal_bool(&paren.expr),
+            syn::Expr::Group(group) => Self::literal_bool(&group.expr),
+            _ => None,
+        }
+    }
+
+    fn self_field(expression: &syn::Expr, field: &str) -> bool {
+        matches!(expression, syn::Expr::Field(access)
+            if matches!(access.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self"))
+                && matches!(&access.member, syn::Member::Named(member) if member == field))
+    }
+
+    fn audit_reachable_block(&mut self, block: &syn::Block) {
+        syn::visit::Visit::visit_block(self, block);
+    }
+}
+
+fn runtime_filter_expr_definitely_terminates(expression: &syn::Expr) -> bool {
+    match expression {
+        syn::Expr::Return(_) => true,
+        syn::Expr::Block(block) => runtime_filter_block_definitely_terminates(&block.block),
+        syn::Expr::Group(group) => runtime_filter_expr_definitely_terminates(&group.expr),
+        syn::Expr::Paren(paren) => runtime_filter_expr_definitely_terminates(&paren.expr),
+        syn::Expr::Try(expression) => runtime_filter_expr_definitely_terminates(&expression.expr),
+        syn::Expr::If(expression) => {
+            if runtime_filter_expr_definitely_terminates(&expression.cond) {
+                return true;
+            }
+            let then_terminates =
+                runtime_filter_block_definitely_terminates(&expression.then_branch);
+            let else_terminates = expression
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, fallback)| runtime_filter_expr_definitely_terminates(fallback));
+            match RuntimeFilterReachableAudit::literal_bool(&expression.cond) {
+                Some(true) => then_terminates,
+                Some(false) => else_terminates,
+                None => then_terminates && else_terminates,
+            }
+        }
+        syn::Expr::Call(call) => {
+            runtime_filter_expr_definitely_terminates(&call.func)
+                || call
+                    .args
+                    .iter()
+                    .any(runtime_filter_expr_definitely_terminates)
+        }
+        syn::Expr::MethodCall(call) => {
+            runtime_filter_expr_definitely_terminates(&call.receiver)
+                || call
+                    .args
+                    .iter()
+                    .any(runtime_filter_expr_definitely_terminates)
+        }
+        syn::Expr::Assign(assign) => {
+            runtime_filter_expr_definitely_terminates(&assign.left)
+                || runtime_filter_expr_definitely_terminates(&assign.right)
+        }
+        syn::Expr::Binary(binary) => {
+            if runtime_filter_expr_definitely_terminates(&binary.left) {
+                return true;
+            }
+            match binary.op {
+                syn::BinOp::And(_) => {
+                    RuntimeFilterReachableAudit::literal_bool(&binary.left) == Some(true)
+                        && runtime_filter_expr_definitely_terminates(&binary.right)
+                }
+                syn::BinOp::Or(_) => {
+                    RuntimeFilterReachableAudit::literal_bool(&binary.left) == Some(false)
+                        && runtime_filter_expr_definitely_terminates(&binary.right)
+                }
+                _ => runtime_filter_expr_definitely_terminates(&binary.right),
+            }
+        }
+        syn::Expr::Array(array) => array
+            .elems
+            .iter()
+            .any(runtime_filter_expr_definitely_terminates),
+        syn::Expr::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .any(runtime_filter_expr_definitely_terminates),
+        syn::Expr::Index(index) => {
+            runtime_filter_expr_definitely_terminates(&index.expr)
+                || runtime_filter_expr_definitely_terminates(&index.index)
+        }
+        syn::Expr::Field(field) => runtime_filter_expr_definitely_terminates(&field.base),
+        syn::Expr::Reference(reference) => {
+            runtime_filter_expr_definitely_terminates(&reference.expr)
+        }
+        syn::Expr::Unary(unary) => runtime_filter_expr_definitely_terminates(&unary.expr),
+        syn::Expr::Cast(cast) => runtime_filter_expr_definitely_terminates(&cast.expr),
+        syn::Expr::Await(awaited) => runtime_filter_expr_definitely_terminates(&awaited.base),
+        syn::Expr::Match(expression) => runtime_filter_expr_definitely_terminates(&expression.expr),
+        _ => false,
+    }
+}
+
+fn runtime_filter_statement_definitely_terminates(statement: &syn::Stmt) -> bool {
+    match statement {
+        syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|initializer| {
+            runtime_filter_expr_definitely_terminates(&initializer.expr)
+        }),
+        syn::Stmt::Expr(expression, _) => runtime_filter_expr_definitely_terminates(expression),
+        syn::Stmt::Item(_) | syn::Stmt::Macro(_) => false,
+    }
+}
+
+fn runtime_filter_block_definitely_terminates(block: &syn::Block) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(runtime_filter_statement_definitely_terminates)
+}
+
+fn runtime_filter_for_iterator_is_definitely_empty(expression: &syn::Expr) -> bool {
+    match expression {
+        syn::Expr::Array(array) => array.elems.is_empty(),
+        syn::Expr::Group(group) => runtime_filter_for_iterator_is_definitely_empty(&group.expr),
+        syn::Expr::Paren(paren) => runtime_filter_for_iterator_is_definitely_empty(&paren.expr),
+        syn::Expr::Range(range) if matches!(range.limits, syn::RangeLimits::HalfOpen(_)) => {
+            let integer = |expression: &syn::Expr| match expression {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(value),
+                    ..
+                }) => value.base10_parse::<i128>().ok(),
+                _ => None,
+            };
+            match (range.start.as_deref(), range.end.as_deref()) {
+                (Some(start), Some(end)) => integer(start)
+                    .zip(integer(end))
+                    .is_some_and(|(start, end)| start >= end),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn runtime_filter_pat_is_immutable_ident(pattern: &syn::Pat, expected: &str) -> bool {
+    matches!(pattern, syn::Pat::Ident(binding)
+        if binding.ident == expected
+            && binding.by_ref.is_none()
+            && binding.mutability.is_none()
+            && binding.subpat.is_none())
+}
+
+fn runtime_filter_topn_rows_loop_is_exact(expression: &syn::ExprForLoop) -> bool {
+    let syn::Pat::Tuple(pattern) = expression.pat.as_ref() else {
+        return false;
+    };
+    if pattern.elems.len() != 2
+        || !runtime_filter_pat_is_immutable_ident(&pattern.elems[0], "index")
+        || !runtime_filter_pat_is_immutable_ident(&pattern.elems[1], "row")
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(skip) = expression.expr.as_ref() else {
+        return false;
+    };
+    if skip.method != "skip"
+        || skip.turbofish.is_some()
+        || skip.args.len() != 1
+        || !matches!(skip.args.first(), Some(syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(value),
+            ..
+        })) if value.base10_parse::<usize>().ok() == Some(2))
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(enumerate) = skip.receiver.as_ref() else {
+        return false;
+    };
+    if enumerate.method != "enumerate"
+        || enumerate.turbofish.is_some()
+        || !enumerate.args.is_empty()
+    {
+        return false;
+    }
+    let syn::Expr::MethodCall(into_iter) = enumerate.receiver.as_ref() else {
+        return false;
+    };
+    if into_iter.method != "into_iter"
+        || into_iter.turbofish.is_some()
+        || !into_iter.args.is_empty()
+    {
+        return false;
+    }
+    matches!(into_iter.receiver.as_ref(), syn::Expr::Field(field)
+        if matches!(&field.member, syn::Member::Named(member) if member == "rows")
+            && matches!(field.base.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident("case")))
+}
+
+#[derive(Default)]
+struct RuntimeFilterDirectCallAudit {
+    calls: BTreeSet<Vec<String>>,
+}
+
+impl RuntimeFilterDirectCallAudit {
+    fn audit_statement(&mut self, statement: &syn::Stmt) -> bool {
+        match statement {
+            syn::Stmt::Local(local) => {
+                if let Some(initializer) = &local.init {
+                    return self.audit_call_tree(&initializer.expr);
+                }
+            }
+            syn::Stmt::Expr(expression, _) => return self.audit_call_tree(expression),
+            syn::Stmt::Item(_) | syn::Stmt::Macro(_) => {}
+        }
+        false
+    }
+
+    fn audit_call_tree(&mut self, expression: &syn::Expr) -> bool {
+        match expression {
+            syn::Expr::Call(call) => {
+                if self.audit_call_tree(&call.func) {
+                    return true;
+                }
+                for argument in &call.args {
+                    if self.audit_call_tree(argument) {
+                        return true;
+                    }
+                }
+                if let syn::Expr::Path(path) = call.func.as_ref()
+                    && path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                {
+                    self.calls
+                        .insert(RuntimeFilterReachableAudit::path_segments(&path.path));
+                }
+                false
+            }
+            syn::Expr::MethodCall(call) => {
+                if self.audit_call_tree(&call.receiver) {
+                    return true;
+                }
+                for argument in &call.args {
+                    if self.audit_call_tree(argument) {
+                        return true;
+                    }
+                }
+                false
+            }
+            syn::Expr::Assign(assign) => {
+                self.audit_call_tree(&assign.left) || self.audit_call_tree(&assign.right)
+            }
+            syn::Expr::Block(block) => {
+                for statement in &block.block.stmts {
+                    if self.audit_statement(statement)
+                        || runtime_filter_statement_definitely_terminates(statement)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            syn::Expr::Group(group) => self.audit_call_tree(&group.expr),
+            syn::Expr::Paren(paren) => self.audit_call_tree(&paren.expr),
+            syn::Expr::Try(expression) => self.audit_call_tree(&expression.expr),
+            _ => runtime_filter_expr_definitely_terminates(expression),
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterReachableAudit {
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        for statement in &block.stmts {
+            syn::visit::Visit::visit_stmt(self, statement);
+            if runtime_filter_statement_definitely_terminates(statement) {
+                break;
+            }
+        }
+    }
+
+    fn visit_expr_async(&mut self, _expression: &'ast syn::ExprAsync) {}
+
+    fn visit_expr_closure(&mut self, expression: &'ast syn::ExprClosure) {
+        for input in &expression.inputs {
+            syn::visit::Visit::visit_pat(self, input);
+        }
+    }
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        syn::visit::Visit::visit_expr(self, &expression.cond);
+        match Self::literal_bool(&expression.cond) {
+            Some(true) => syn::visit::Visit::visit_block(self, &expression.then_branch),
+            Some(false) => {
+                if let Some((_, fallback)) = &expression.else_branch {
+                    syn::visit::Visit::visit_expr(self, fallback);
+                }
+            }
+            None if self.reachable_for_depth > 0 && self.allow_nested_conditional_body => {
+                syn::visit::Visit::visit_block(self, &expression.then_branch);
+                if let Some((_, fallback)) = &expression.else_branch {
+                    syn::visit::Visit::visit_expr(self, fallback);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        syn::visit::Visit::visit_expr(self, &expression.cond);
+        if Self::literal_bool(&expression.cond) == Some(true) {
+            syn::visit::Visit::visit_block(self, &expression.body);
+        }
+    }
+
+    fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+        syn::visit::Visit::visit_expr(self, &expression.left);
+        let short_circuits = matches!(expression.op, syn::BinOp::And(_))
+            && Self::literal_bool(&expression.left) == Some(false)
+            || matches!(expression.op, syn::BinOp::Or(_))
+                && Self::literal_bool(&expression.left) == Some(true);
+        if !short_circuits {
+            syn::visit::Visit::visit_expr(self, &expression.right);
+        }
+    }
+
+    fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+    }
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        syn::visit::Visit::visit_expr(self, &expression.expr);
+        let allowed_owned = self.reachable_for_depth == 0
+            && self
+                .allowed_owned_for_iterators
+                .iter()
+                .any(|binding| runtime_filter_expr_is_binding_path(&expression.expr, binding));
+        let allowed_shared = self.reachable_for_depth == 0
+            && self.allowed_shared_for_iterators.iter().any(|binding| {
+                runtime_filter_expr_is_shared_binding_reference(&expression.expr, binding)
+            });
+        let topn_outer = allowed_owned
+            && self.allow_topn_nested_rows_loop
+            && runtime_filter_expr_is_binding_path(&expression.expr, "cases")
+            && runtime_filter_pat_is_immutable_ident(&expression.pat, "case");
+        let topn_nested = self.allow_topn_nested_rows_loop
+            && self.topn_case_loop_active
+            && !self.topn_rows_loop_active
+            && runtime_filter_topn_rows_loop_is_exact(expression);
+        let allowed = allowed_owned || allowed_shared || topn_nested;
+        if allowed && !runtime_filter_for_iterator_is_definitely_empty(&expression.expr) {
+            syn::visit::Visit::visit_pat(self, &expression.pat);
+            self.reachable_for_depth += 1;
+            let previous_topn_case = self.topn_case_loop_active;
+            let previous_topn_rows = self.topn_rows_loop_active;
+            if topn_outer {
+                self.topn_case_loop_active = true;
+            }
+            if topn_nested {
+                self.topn_rows_loop_active = true;
+            }
+            syn::visit::Visit::visit_block(self, &expression.body);
+            self.topn_case_loop_active = previous_topn_case;
+            self.topn_rows_loop_active = previous_topn_rows;
+            self.reachable_for_depth -= 1;
+        }
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && path.qself.is_none()
+            && path.path.leading_colon.is_none()
+        {
+            let path = Self::path_segments(&path.path);
+            self.calls.insert(path.clone());
+            self.paths.insert(path);
+        } else {
+            syn::visit::Visit::visit_expr(self, &call.func);
+        }
+        for argument in &call.args {
+            syn::visit::Visit::visit_expr(self, argument);
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.methods.insert(call.method.to_string());
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() && path.path.leading_colon.is_none() {
+            self.paths.insert(Self::path_segments(&path.path));
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() {
+            self.paths.insert(Self::path_segments(path));
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        let supported = item.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "assert" | "assert_eq" | "assert_ne"
+            )
+        });
+        if supported
+            && let Ok(tuple) = syn::parse_str::<syn::ExprTuple>(&format!("({})", item.tokens))
+        {
+            for expression in &tuple.elems {
+                syn::visit::Visit::visit_expr(self, expression);
+            }
+        }
+    }
+}
+
+fn runtime_filter_is_exact_action_dispatch(call: &syn::ExprMethodCall) -> bool {
+    call.method == "dispatch"
+        && RuntimeFilterReachableAudit::self_field(&call.receiver, "dispatcher")
+        && call.args.len() == 2
+        && call
+            .args
+            .first()
+            .is_some_and(|argument| RuntimeFilterReachableAudit::self_field(argument, "channel_id"))
+        && matches!(call.args.last(), Some(syn::Expr::Path(path)) if path.path.is_ident("action"))
+}
+
+fn runtime_filter_syn_expr_attributes(expression: &syn::Expr) -> Result<&[syn::Attribute], ()> {
+    let attributes = match expression {
+        syn::Expr::Array(expression) => &expression.attrs,
+        syn::Expr::Assign(expression) => &expression.attrs,
+        syn::Expr::Async(expression) => &expression.attrs,
+        syn::Expr::Await(expression) => &expression.attrs,
+        syn::Expr::Binary(expression) => &expression.attrs,
+        syn::Expr::Block(expression) => &expression.attrs,
+        syn::Expr::Break(expression) => &expression.attrs,
+        syn::Expr::Call(expression) => &expression.attrs,
+        syn::Expr::Cast(expression) => &expression.attrs,
+        syn::Expr::Closure(expression) => &expression.attrs,
+        syn::Expr::Const(expression) => &expression.attrs,
+        syn::Expr::Continue(expression) => &expression.attrs,
+        syn::Expr::Field(expression) => &expression.attrs,
+        syn::Expr::ForLoop(expression) => &expression.attrs,
+        syn::Expr::Group(expression) => &expression.attrs,
+        syn::Expr::If(expression) => &expression.attrs,
+        syn::Expr::Index(expression) => &expression.attrs,
+        syn::Expr::Infer(expression) => &expression.attrs,
+        syn::Expr::Let(expression) => &expression.attrs,
+        syn::Expr::Lit(expression) => &expression.attrs,
+        syn::Expr::Loop(expression) => &expression.attrs,
+        syn::Expr::Macro(expression) => &expression.attrs,
+        syn::Expr::Match(expression) => &expression.attrs,
+        syn::Expr::MethodCall(expression) => &expression.attrs,
+        syn::Expr::Paren(expression) => &expression.attrs,
+        syn::Expr::Path(expression) => &expression.attrs,
+        syn::Expr::Range(expression) => &expression.attrs,
+        syn::Expr::RawAddr(expression) => &expression.attrs,
+        syn::Expr::Reference(expression) => &expression.attrs,
+        syn::Expr::Repeat(expression) => &expression.attrs,
+        syn::Expr::Return(expression) => &expression.attrs,
+        syn::Expr::Struct(expression) => &expression.attrs,
+        syn::Expr::Try(expression) => &expression.attrs,
+        syn::Expr::TryBlock(expression) => &expression.attrs,
+        syn::Expr::Tuple(expression) => &expression.attrs,
+        syn::Expr::Unary(expression) => &expression.attrs,
+        syn::Expr::Unsafe(expression) => &expression.attrs,
+        syn::Expr::While(expression) => &expression.attrs,
+        syn::Expr::Yield(expression) => &expression.attrs,
+        syn::Expr::Verbatim(_) => return Err(()),
+        _ => return Err(()),
+    };
+    Ok(attributes)
+}
+
+fn runtime_filter_expr_is_top_level_action_dispatch(expression: &syn::Expr) -> Result<bool, ()> {
+    match runtime_filter_syn_attributes_test_requirement(runtime_filter_syn_expr_attributes(
+        expression,
+    )?) {
+        CfgTestRequirement::RequiresTest => return Ok(false),
+        CfgTestRequirement::Unproven => return Err(()),
+        CfgTestRequirement::ProductionPossible => {}
+    }
+    match expression {
+        syn::Expr::MethodCall(call) => Ok(runtime_filter_is_exact_action_dispatch(call)),
+        syn::Expr::Group(group) => runtime_filter_expr_is_top_level_action_dispatch(&group.expr),
+        syn::Expr::Paren(paren) => runtime_filter_expr_is_top_level_action_dispatch(&paren.expr),
+        syn::Expr::Try(expression) => {
+            runtime_filter_expr_is_top_level_action_dispatch(&expression.expr)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterFinishBindingAudit {
+    all_exact_dispatches: usize,
+    shadows_action: bool,
+    cfg_unproven: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterFinishBindingAudit {
+    fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+        let attributes = match statement {
+            syn::Stmt::Local(local) => &local.attrs,
+            syn::Stmt::Item(syn::Item::Verbatim(_)) => {
+                self.cfg_unproven = true;
+                return;
+            }
+            syn::Stmt::Item(item) => runtime_filter_syn_item_attributes(item),
+            syn::Stmt::Expr(expression, _) => {
+                syn::visit::Visit::visit_expr(self, expression);
+                return;
+            }
+            syn::Stmt::Macro(statement) => &statement.attrs,
+        };
+        match runtime_filter_syn_attributes_test_requirement(attributes) {
+            CfgTestRequirement::RequiresTest => {}
+            CfgTestRequirement::Unproven => self.cfg_unproven = true,
+            CfgTestRequirement::ProductionPossible => syn::visit::visit_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        let Ok(attributes) = runtime_filter_syn_expr_attributes(expression) else {
+            self.cfg_unproven = true;
+            return;
+        };
+        match runtime_filter_syn_attributes_test_requirement(attributes) {
+            CfgTestRequirement::RequiresTest => {}
+            CfgTestRequirement::Unproven => self.cfg_unproven = true,
+            CfgTestRequirement::ProductionPossible => syn::visit::visit_expr(self, expression),
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if runtime_filter_is_exact_action_dispatch(call) {
+            self.all_exact_dispatches += 1;
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == "action" {
+            self.shadows_action = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+}
+
+fn runtime_filter_finish_statement_test_requirement(statement: &syn::Stmt) -> CfgTestRequirement {
+    let attributes = match statement {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Item(syn::Item::Verbatim(_)) => return CfgTestRequirement::Unproven,
+        syn::Stmt::Item(item) => runtime_filter_syn_item_attributes(item),
+        syn::Stmt::Expr(expression, _) => {
+            return runtime_filter_syn_expr_attributes(expression)
+                .map(runtime_filter_syn_attributes_test_requirement)
+                .unwrap_or(CfgTestRequirement::Unproven);
+        }
+        syn::Stmt::Macro(statement) => &statement.attrs,
+    };
+    runtime_filter_syn_attributes_test_requirement(attributes)
+}
+
+fn runtime_filter_finish_binding_audit(block: &syn::Block) -> (bool, usize, usize, bool) {
+    let mut full = RuntimeFilterFinishBindingAudit::default();
+    syn::visit::Visit::visit_block(&mut full, block);
+    let mut top_level_dispatches = 0usize;
+    for statement in &block.stmts {
+        match runtime_filter_finish_statement_test_requirement(statement) {
+            CfgTestRequirement::RequiresTest => continue,
+            CfgTestRequirement::Unproven => {
+                full.cfg_unproven = true;
+                continue;
+            }
+            CfgTestRequirement::ProductionPossible => {}
+        }
+        if let syn::Stmt::Expr(expression, _) = statement {
+            match runtime_filter_expr_is_top_level_action_dispatch(expression) {
+                Ok(true) => top_level_dispatches += 1,
+                Ok(false) => {}
+                Err(()) => full.cfg_unproven = true,
+            }
+        }
+        if runtime_filter_statement_definitely_terminates(statement) {
+            break;
+        }
+    }
+    (
+        full.shadows_action,
+        full.all_exact_dispatches,
+        top_level_dispatches,
+        full.cfg_unproven,
+    )
+}
+
 fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(producer);
     let mut violations = Vec::new();
+    let mut parsed = match syn::parse_file(&production) {
+        Ok(file) => file,
+        Err(production_error) => match syn::parse_file(producer) {
+            Ok(file) => file,
+            Err(raw_error) => {
+                return vec![format!(
+                    "Service producer production source must parse for action audit: sanitized={production_error}; raw={raw_error}"
+                )];
+            }
+        },
+    };
+    if runtime_filter_filter_cfg_file(&mut parsed).is_err() {
+        return vec![
+            "Service producer bounded cfg analysis was unproven; action audit fails closed"
+                .to_string(),
+        ];
+    }
+    let mut finish_audits = Vec::new();
+    for item in &parsed.items {
+        match item {
+            syn::Item::Fn(function) if function.sig.ident == "finish" => {
+                finish_audits.push(runtime_filter_finish_binding_audit(&function.block));
+            }
+            syn::Item::Impl(item_impl) => {
+                for item in &item_impl.items {
+                    if let syn::ImplItem::Fn(method) = item
+                        && method.sig.ident == "finish"
+                    {
+                        finish_audits.push(runtime_filter_finish_binding_audit(&method.block));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if finish_audits.iter().any(|audit| audit.3) {
+        violations.push(
+            "Service producer bounded cfg analysis was unproven inside finish; action audit fails closed"
+                .to_string(),
+        );
+    }
+    if !matches!(finish_audits.as_slice(), [(false, 1, 1, false)]) {
+        violations.push(
+            "Service producer finish must dispatch its input action without shadowing or rebinding"
+                .to_string(),
+        );
+    }
     let finish_tokens = runtime_filter_function_tokens(&production, "finish").unwrap_or_default();
     if runtime_filter_token_sequence(
         &finish_tokens,
@@ -9004,11 +12469,43 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
         .windows(4)
         .filter(|window| window == &["dispatcher", ".", "dispatch", "("])
         .count();
-    if !finish_tokens
-        .windows(4)
-        .any(|window| window == ["dispatcher", ".", "dispatch", "("])
-        || dispatch_count != 1
-    {
+    let exact_dispatch = [
+        "dispatcher",
+        ".",
+        "dispatch",
+        "(",
+        "self",
+        ".",
+        "channel_id",
+        ",",
+        "action",
+        ")",
+    ];
+    let finish_dispatch_count = finish_tokens
+        .windows(exact_dispatch.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(exact_dispatch)
+                .all(|(actual, expected)| actual == expected)
+        })
+        .count();
+    let owned_dispatch_count = ["finish", "finish_ordered", "finish_topk", "finish_final"]
+        .into_iter()
+        .filter_map(|function| runtime_filter_function_tokens(&production, function))
+        .map(|tokens| {
+            tokens
+                .windows(exact_dispatch.len())
+                .filter(|window| {
+                    window
+                        .iter()
+                        .zip(exact_dispatch)
+                        .all(|(actual, expected)| actual == expected)
+                })
+                .count()
+        })
+        .sum::<usize>();
+    if finish_dispatch_count != 1 || dispatch_count != owned_dispatch_count {
         violations.push("Service producer must dispatch the returned ChannelAction".to_string());
     }
 
@@ -9219,13 +12716,210 @@ fn runtime_filter_type_is_option_arc_artifact_bundle(ty: &syn::Type) -> bool {
         )
 }
 
+fn runtime_filter_syn_item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn runtime_filter_syn_attributes_test_requirement(
+    attributes: &[syn::Attribute],
+) -> CfgTestRequirement {
+    let mut cfg_attributes = Vec::new();
+    for attribute in attributes {
+        let name = if attribute.path().is_ident("cfg") {
+            "cfg"
+        } else if attribute.path().is_ident("cfg_attr") {
+            "cfg_attr"
+        } else {
+            continue;
+        };
+        let syn::Meta::List(list) = &attribute.meta else {
+            return CfgTestRequirement::Unproven;
+        };
+        cfg_attributes.push(format!("#[{name}({})]", list.tokens));
+    }
+    cfg_attributes_test_requirement(cfg_attributes.iter().map(String::as_str))
+}
+
+fn runtime_filter_cfg_node_is_kept(attributes: &[syn::Attribute]) -> Result<bool, ()> {
+    match runtime_filter_syn_attributes_test_requirement(attributes) {
+        CfgTestRequirement::RequiresTest => Ok(false),
+        CfgTestRequirement::ProductionPossible => Ok(true),
+        CfgTestRequirement::Unproven => Err(()),
+    }
+}
+
+fn runtime_filter_filter_cfg_fields(
+    fields: &mut syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
+) -> Result<(), ()> {
+    let mut retained = syn::punctuated::Punctuated::new();
+    for field in std::mem::take(fields) {
+        if runtime_filter_cfg_node_is_kept(&field.attrs)? {
+            retained.push(field);
+        }
+    }
+    *fields = retained;
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_field_set(fields: &mut syn::Fields) -> Result<(), ()> {
+    match fields {
+        syn::Fields::Named(fields) => runtime_filter_filter_cfg_fields(&mut fields.named),
+        syn::Fields::Unnamed(fields) => runtime_filter_filter_cfg_fields(&mut fields.unnamed),
+        syn::Fields::Unit => Ok(()),
+    }
+}
+
+fn runtime_filter_trait_item_attributes(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_impl_item_attributes(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_foreign_item_attributes(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_filter_filter_cfg_item_members(item: &mut syn::Item) -> Result<(), ()> {
+    match item {
+        syn::Item::Enum(item) => {
+            let mut retained = syn::punctuated::Punctuated::new();
+            for mut variant in std::mem::take(&mut item.variants) {
+                if runtime_filter_cfg_node_is_kept(&variant.attrs)? {
+                    runtime_filter_filter_cfg_field_set(&mut variant.fields)?;
+                    retained.push(variant);
+                }
+            }
+            item.variants = retained;
+        }
+        syn::Item::Struct(item) => runtime_filter_filter_cfg_field_set(&mut item.fields)?,
+        syn::Item::Union(item) => runtime_filter_filter_cfg_fields(&mut item.fields.named)?,
+        syn::Item::Trait(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_trait_item_attributes(&member))? {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::Impl(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_impl_item_attributes(&member))? {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::ForeignMod(item) => {
+            let mut retained = Vec::new();
+            for member in std::mem::take(&mut item.items) {
+                if runtime_filter_cfg_node_is_kept(runtime_filter_foreign_item_attributes(&member))?
+                {
+                    retained.push(member);
+                }
+            }
+            item.items = retained;
+        }
+        syn::Item::Mod(item) => {
+            if let Some((_, items)) = &mut item.content {
+                runtime_filter_filter_cfg_items(items)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_items(items: &mut Vec<syn::Item>) -> Result<(), ()> {
+    let mut retained = Vec::new();
+    for mut item in std::mem::take(items) {
+        if runtime_filter_cfg_node_is_kept(runtime_filter_syn_item_attributes(&item))? {
+            runtime_filter_filter_cfg_item_members(&mut item)?;
+            retained.push(item);
+        }
+    }
+    *items = retained;
+    Ok(())
+}
+
+fn runtime_filter_filter_cfg_file(file: &mut syn::File) -> Result<(), ()> {
+    runtime_filter_filter_cfg_items(&mut file.items)
+}
+
 fn runtime_filter_subscription_artifact_surface_violations(text: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(text);
-    let Ok(file) = syn::parse_file(&production) else {
-        return vec!["artifact subscription production source must parse".to_string()];
+    let mut file = match syn::parse_file(&production) {
+        Ok(file) => file,
+        Err(production_error) => match syn::parse_file(text) {
+            Ok(file) => file,
+            Err(raw_error) => {
+                return vec![format!(
+                    "artifact subscription production source must parse: sanitized={production_error}; raw={raw_error}"
+                )];
+            }
+        },
     };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![
+            "artifact subscription bounded cfg analysis was unproven; raw fallback fails closed"
+                .to_string(),
+        ];
+    }
     let mut violations = Vec::new();
-    let local_roots = runtime_filter_model_local_roots(text);
+    let local_roots = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Enum(item) => Some(item.ident.to_string()),
+            syn::Item::Mod(item) => Some(item.ident.to_string()),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Trait(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for shadowed in ["Arc", "ArtifactBundle", "LogicalSnapshot"] {
         if local_roots.contains(shadowed) {
             violations.push(format!(
@@ -9578,6 +13272,105 @@ fn runtime_filter_materializer_has_exact_range_rejection(source_rel: &str, text:
     }
 }
 
+fn runtime_filter_materializer_allowed_range_count(source_rel: &str, text: &str) -> usize {
+    let production = rust_sanitized_production_text(text);
+    let tokens = rust_use_tokens(&production);
+    match source_rel {
+        "src/runtime_filter/materializer/mod.rs"
+            if runtime_filter_materializer_has_exact_range_rejection(source_rel, text) =>
+        {
+            1
+        }
+        "src/runtime_filter/materializer/codec.rs"
+            if runtime_filter_materializer_has_exact_range_rejection(source_rel, text)
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "encoded",
+                        ".",
+                        "push",
+                        "(",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                        ".",
+                        "tag",
+                        "(",
+                        ")",
+                        ")",
+                    ],
+                )
+                .is_some()
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "header",
+                        ".",
+                        "kind",
+                        "!",
+                        "=",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                    ],
+                )
+                .is_some() =>
+        {
+            3
+        }
+        "src/runtime_filter/materializer/range.rs"
+            if runtime_filter_token_sequence(
+                &tokens,
+                &[
+                    "profile",
+                    ".",
+                    "accepted_kinds",
+                    "(",
+                    ")",
+                    "!",
+                    "=",
+                    "&",
+                    "std",
+                    "::",
+                    "collections",
+                    "::",
+                    "BTreeSet",
+                    "::",
+                    "from",
+                    "(",
+                    "[",
+                    "ArtifactKind",
+                    "::",
+                    "Range",
+                    "]",
+                    ")",
+                ],
+            )
+            .is_some()
+                && runtime_filter_token_sequence(
+                    &tokens,
+                    &[
+                        "vec",
+                        "!",
+                        "[",
+                        "(",
+                        "ArtifactKind",
+                        "::",
+                        "Range",
+                        ",",
+                        "artifact",
+                        ")",
+                        "]",
+                    ],
+                )
+                .is_some() =>
+        {
+            2
+        }
+        _ => 0,
+    }
+}
+
 fn runtime_filter_eval_const_u128(expr: &syn::Expr) -> Option<u128> {
     match expr {
         syn::Expr::Lit(syn::ExprLit {
@@ -9735,9 +13528,7 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
         .filter(|window| window == &["ArtifactKind", "::", "Range"])
         .count();
     let range_count = canonical_range_count.max(direct_range_count);
-    let allowed_range_count = usize::from(runtime_filter_materializer_has_exact_range_rejection(
-        source_rel, text,
-    ));
+    let allowed_range_count = runtime_filter_materializer_allowed_range_count(source_rel, text);
     if range_count != allowed_range_count {
         violations.push(format!(
             "{source_rel}: Membership must not materialize ArtifactKind::Range"
@@ -9746,6 +13537,1500 @@ fn runtime_filter_materializer_semantic_violations(source_rel: &str, text: &str)
     violations.extend(runtime_filter_global_registry_violations(source_rel, text));
     violations.extend(runtime_filter_any_dead_code_violations(source_rel, text));
     violations
+}
+
+type RuntimeFilterManifestBodyAudit = RuntimeFilterReachableAudit;
+
+fn runtime_filter_direct_calls_in_block(block: &syn::Block) -> BTreeSet<Vec<String>> {
+    let mut direct = RuntimeFilterDirectCallAudit::default();
+    for statement in &block.stmts {
+        direct.audit_statement(statement);
+        if runtime_filter_statement_definitely_terminates(statement) {
+            break;
+        }
+    }
+    direct.calls
+}
+
+fn runtime_filter_expr_is_binding_path(expression: &syn::Expr, binding: &str) -> bool {
+    matches!(expression, syn::Expr::Path(path)
+        if path.qself.is_none()
+            && path.path.leading_colon.is_none()
+            && path.path.is_ident(binding))
+}
+
+fn runtime_filter_expr_is_shared_binding_reference(expression: &syn::Expr, binding: &str) -> bool {
+    matches!(expression, syn::Expr::Reference(reference)
+        if reference.mutability.is_none()
+            && runtime_filter_expr_is_binding_path(&reference.expr, binding))
+}
+
+fn runtime_filter_expr_is_exact_call(expression: &syn::Expr, callee: &str) -> bool {
+    matches!(expression, syn::Expr::Call(call)
+        if call.args.is_empty()
+            && matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident(callee)))
+}
+
+fn runtime_filter_local_is_immutable_exact_call(
+    statement: &syn::Stmt,
+    binding: &str,
+    callee: &str,
+) -> bool {
+    matches!(statement, syn::Stmt::Local(local)
+        if matches!(&local.pat, syn::Pat::Ident(pattern)
+            if pattern.ident == binding
+                && pattern.by_ref.is_none()
+                && pattern.mutability.is_none()
+                && pattern.subpat.is_none())
+            && local.init.as_ref().is_some_and(|initializer|
+                runtime_filter_expr_is_exact_call(&initializer.expr, callee)))
+}
+
+fn runtime_filter_statement_expression(statement: &syn::Stmt) -> Option<&syn::Expr> {
+    match statement {
+        syn::Stmt::Expr(expression, _) => Some(expression),
+        syn::Stmt::Local(_) | syn::Stmt::Item(_) | syn::Stmt::Macro(_) => None,
+    }
+}
+
+fn runtime_filter_top_level_for_loop(statement: &syn::Stmt) -> Option<&syn::ExprForLoop> {
+    match runtime_filter_statement_expression(statement) {
+        Some(syn::Expr::ForLoop(loop_expression)) => Some(loop_expression),
+        _ => None,
+    }
+}
+
+fn runtime_filter_call_has_exact_binding_reference(
+    statement: &syn::Stmt,
+    callee: &str,
+    binding: &str,
+) -> bool {
+    matches!(runtime_filter_statement_expression(statement), Some(syn::Expr::Call(call))
+        if matches!(call.func.as_ref(), syn::Expr::Path(path)
+            if path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.is_ident(callee))
+            && matches!(call.args.first(), Some(argument)
+                if runtime_filter_expr_is_shared_binding_reference(argument, binding)))
+}
+
+fn runtime_filter_asserts_binding_directly(
+    statement: &syn::Stmt,
+    assertion: &str,
+    binding: &str,
+) -> bool {
+    matches!(runtime_filter_statement_expression(statement), Some(syn::Expr::Call(call))
+        if call.args.len() == 1
+            && matches!(call.func.as_ref(), syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && path.path.leading_colon.is_none()
+                    && path.path.is_ident(assertion))
+            && matches!(call.args.first(), Some(argument)
+                if runtime_filter_expr_is_shared_binding_reference(argument, binding)))
+}
+
+#[derive(Default)]
+struct RuntimeFilterBindingCount {
+    binding: String,
+    count: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBindingCount {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == self.binding {
+            self.count += 1;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+}
+
+fn runtime_filter_function_has_one_binding(function: &syn::ItemFn, binding: &str) -> bool {
+    let mut audit = RuntimeFilterBindingCount {
+        binding: binding.to_string(),
+        ..RuntimeFilterBindingCount::default()
+    };
+    syn::visit::Visit::visit_item_fn(&mut audit, function);
+    audit.count == 1
+}
+
+fn runtime_filter_function_has_one_binding_loop(function: &syn::ItemFn, binding: &str) -> bool {
+    struct BindingLoopCount<'a> {
+        binding: &'a str,
+        count: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BindingLoopCount<'_> {
+        fn visit_expr_for_loop(&mut self, loop_expression: &'ast syn::ExprForLoop) {
+            if runtime_filter_expr_mentions_binding(&loop_expression.expr, self.binding) {
+                self.count += 1;
+            }
+            syn::visit::visit_expr_for_loop(self, loop_expression);
+        }
+    }
+    let mut audit = BindingLoopCount { binding, count: 0 };
+    syn::visit::Visit::visit_item_fn(&mut audit, function);
+    audit.count == 1
+}
+
+#[derive(Default)]
+struct RuntimeFilterLocalBindingInvalidationAudit {
+    binding: String,
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterLocalBindingInvalidationAudit {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == self.binding {
+            self.invalid = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if runtime_filter_expr_is_binding_path(&reference.expr, &self.binding) {
+            if reference.mutability.is_some() {
+                self.invalid = true;
+            }
+            return;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() && path.path.is_ident(&self.binding) {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+}
+
+fn runtime_filter_local_binding_is_preserved(statements: &[syn::Stmt], binding: &str) -> bool {
+    let mut audit = RuntimeFilterLocalBindingInvalidationAudit {
+        binding: binding.to_string(),
+        ..RuntimeFilterLocalBindingInvalidationAudit::default()
+    };
+    for statement in statements {
+        syn::visit::Visit::visit_stmt(&mut audit, statement);
+    }
+    !audit.invalid
+}
+
+fn runtime_filter_expr_mentions_binding(expression: &syn::Expr, binding: &str) -> bool {
+    struct BindingUse<'a> {
+        binding: &'a str,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for BindingUse<'_> {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.qself.is_none() && path.path.is_ident(self.binding) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+    }
+    let mut audit = BindingUse {
+        binding,
+        found: false,
+    };
+    syn::visit::Visit::visit_expr(&mut audit, expression);
+    audit.found
+}
+
+#[derive(Default)]
+struct RuntimeFilterSharedBindingInvalidationAudit {
+    binding: String,
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterSharedBindingInvalidationAudit {
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if runtime_filter_expr_mentions_binding(&assignment.left, &self.binding) {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_assign(self, assignment);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if reference.mutability.is_some()
+            && runtime_filter_expr_mentions_binding(&reference.expr, &self.binding)
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if runtime_filter_expr_mentions_binding(&call.receiver, &self.binding)
+            && call.method != "len"
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn runtime_filter_shared_binding_is_preserved(statements: &[syn::Stmt], binding: &str) -> bool {
+    let mut audit = RuntimeFilterSharedBindingInvalidationAudit {
+        binding: binding.to_string(),
+        ..RuntimeFilterSharedBindingInvalidationAudit::default()
+    };
+    for statement in statements {
+        syn::visit::Visit::visit_stmt(&mut audit, statement);
+    }
+    !audit.invalid
+}
+
+#[derive(Default)]
+struct RuntimeFilterTopnCaseIdentityAudit {
+    invalid: bool,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterTopnCaseIdentityAudit {
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        if pattern.ident == "case" {
+            self.invalid = true;
+        }
+        syn::visit::visit_pat_ident(self, pattern);
+    }
+
+    fn visit_expr_assign(&mut self, assignment: &'ast syn::ExprAssign) {
+        if runtime_filter_expr_mentions_binding(&assignment.left, "case") {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_assign(self, assignment);
+    }
+
+    fn visit_expr_reference(&mut self, reference: &'ast syn::ExprReference) {
+        if reference.mutability.is_some()
+            && runtime_filter_expr_mentions_binding(&reference.expr, "case")
+        {
+            self.invalid = true;
+        }
+        syn::visit::visit_expr_reference(self, reference);
+    }
+}
+
+fn runtime_filter_topn_case_identity_is_preserved(loop_expression: &syn::ExprForLoop) -> bool {
+    let mut audit = RuntimeFilterTopnCaseIdentityAudit::default();
+    syn::visit::Visit::visit_block(&mut audit, &loop_expression.body);
+    !audit.invalid
+}
+
+fn runtime_filter_topn_loop_is_controlled(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(
+            statement,
+            "cases",
+            "topn_cases_with_fixed_seed",
+        )
+    }) else {
+        return false;
+    };
+    let Some(assertion) = statements.get(binding_index + 1) else {
+        return false;
+    };
+    let Some(loop_expression) = statements
+        .get(binding_index + 2)
+        .and_then(runtime_filter_top_level_for_loop)
+    else {
+        return false;
+    };
+    runtime_filter_function_has_one_binding(function, "cases")
+        && runtime_filter_function_has_one_binding(function, "case")
+        && runtime_filter_function_has_one_binding_loop(function, "cases")
+        && runtime_filter_asserts_binding_directly(
+            assertion,
+            "assert_fixed_seed_case_diversity",
+            "cases",
+        )
+        && runtime_filter_expr_is_binding_path(&loop_expression.expr, "cases")
+        && runtime_filter_pat_is_immutable_ident(&loop_expression.pat, "case")
+        && runtime_filter_topn_case_identity_is_preserved(loop_expression)
+}
+
+fn runtime_filter_join_loop_is_controlled(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(statement, "producers", "producer_fixtures")
+    }) else {
+        return false;
+    };
+    let loops = statements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            runtime_filter_top_level_for_loop(statement)
+                .filter(|loop_expression| {
+                    runtime_filter_expr_is_shared_binding_reference(
+                        &loop_expression.expr,
+                        "producers",
+                    )
+                })
+                .map(|loop_expression| (index, loop_expression))
+        })
+        .collect::<Vec<_>>();
+    let [(loop_index, _)] = loops.as_slice() else {
+        return false;
+    };
+    binding_index < *loop_index
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_function_has_one_binding_loop(function, "producers")
+        && runtime_filter_local_binding_is_preserved(
+            &statements[binding_index + 1..*loop_index],
+            "producers",
+        )
+}
+
+fn runtime_filter_producer_fixtures_are_fixed_nonempty(function: &syn::ItemFn) -> bool {
+    let fixed_len = match &function.sig.output {
+        syn::ReturnType::Type(_, output) => match output.as_ref() {
+            syn::Type::Array(array) => match &array.len {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(length),
+                    ..
+                }) => length.base10_parse::<usize>().ok(),
+                _ => None,
+            },
+            _ => None,
+        },
+        syn::ReturnType::Default => None,
+    };
+    let tail_len = function.block.stmts.last().and_then(|statement| {
+        runtime_filter_statement_expression(statement).and_then(|expression| match expression {
+            syn::Expr::Array(array) => Some(array.elems.len()),
+            _ => None,
+        })
+    });
+    fixed_len
+        .zip(tail_len)
+        .is_some_and(|(fixed, tail)| fixed > 0 && fixed == tail)
+}
+
+fn runtime_filter_aggregate_caller_binds_live_producers(function: &syn::ItemFn) -> bool {
+    let statements = &function.block.stmts;
+    let Some(binding_index) = statements.iter().position(|statement| {
+        runtime_filter_local_is_immutable_exact_call(statement, "producers", "producer_fixtures")
+    }) else {
+        return false;
+    };
+    let calls = statements
+        .iter()
+        .enumerate()
+        .filter(|(_, statement)| {
+            runtime_filter_call_has_exact_binding_reference(
+                statement,
+                "aggregate_harness_with_memory",
+                "producers",
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [call_index] = calls.as_slice() else {
+        return false;
+    };
+    binding_index < *call_index
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_local_binding_is_preserved(
+            &statements[binding_index + 1..*call_index],
+            "producers",
+        )
+}
+
+fn runtime_filter_aggregate_loop_is_controlled(file: &syn::File, function: &syn::ItemFn) -> bool {
+    let producers_parameter = function.sig.inputs.first().is_some_and(|argument| {
+        matches!(argument, syn::FnArg::Typed(argument)
+            if matches!(argument.pat.as_ref(), syn::Pat::Ident(pattern)
+                if pattern.ident == "producers"
+                    && pattern.by_ref.is_none()
+                    && pattern.mutability.is_none()
+                    && pattern.subpat.is_none())
+                && matches!(argument.ty.as_ref(), syn::Type::Reference(reference)
+                    if reference.mutability.is_none()
+                        && matches!(reference.elem.as_ref(), syn::Type::Slice(_))))
+    });
+    let statements = &function.block.stmts;
+    let loops = statements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| {
+            runtime_filter_top_level_for_loop(statement)
+                .filter(|loop_expression| {
+                    runtime_filter_expr_is_binding_path(&loop_expression.expr, "producers")
+                })
+                .map(|loop_expression| (index, loop_expression))
+        })
+        .collect::<Vec<_>>();
+    let [(loop_index, _)] = loops.as_slice() else {
+        return false;
+    };
+    let producer_fixtures = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "producer_fixtures" => Some(function),
+        _ => None,
+    });
+    let aggregate_caller = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "aggregate_allof_harness" => {
+            Some(function)
+        }
+        _ => None,
+    });
+    producers_parameter
+        && runtime_filter_function_has_one_binding(function, "producers")
+        && runtime_filter_function_has_one_binding_loop(function, "producers")
+        && runtime_filter_shared_binding_is_preserved(&statements[..*loop_index], "producers")
+        && producer_fixtures.is_some_and(runtime_filter_producer_fixtures_are_fixed_nonempty)
+        && aggregate_caller.is_some_and(runtime_filter_aggregate_caller_binds_live_producers)
+}
+
+fn runtime_filter_manifest_function_audit(
+    file: &syn::File,
+    name: &str,
+) -> Option<RuntimeFilterManifestBodyAudit> {
+    let functions = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == name => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [function] = functions.as_slice() else {
+        return None;
+    };
+    let direct_calls = runtime_filter_direct_calls_in_block(&function.block);
+    let controlled_topn_loop = name
+        == "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds"
+        && runtime_filter_topn_loop_is_controlled(function);
+    let controlled_membership_loop =
+        name == "join_harness" && runtime_filter_join_loop_is_controlled(function);
+    let controlled_aggregate_loop = name == "aggregate_harness_with_memory"
+        && runtime_filter_aggregate_loop_is_controlled(file, function);
+    let mut allowed_owned_for_iterators = BTreeSet::new();
+    let mut allowed_shared_for_iterators = BTreeSet::new();
+    if controlled_topn_loop {
+        allowed_owned_for_iterators.insert("cases".to_string());
+    }
+    if controlled_membership_loop {
+        allowed_shared_for_iterators.insert("producers".to_string());
+    }
+    if controlled_aggregate_loop {
+        allowed_owned_for_iterators.insert("producers".to_string());
+    }
+    let mut audit = RuntimeFilterManifestBodyAudit {
+        allow_nested_conditional_body: controlled_topn_loop,
+        allow_topn_nested_rows_loop: controlled_topn_loop,
+        allowed_owned_for_iterators,
+        allowed_shared_for_iterators,
+        ..RuntimeFilterManifestBodyAudit::default()
+    };
+    audit.audit_reachable_block(&function.block);
+    audit.direct_calls = direct_calls;
+    Some(audit)
+}
+
+fn runtime_filter_manifest_method_audit(
+    file: &syn::File,
+    owner: &str,
+    name: &str,
+) -> Option<RuntimeFilterManifestBodyAudit> {
+    let methods = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item_impl)
+                if item_impl.trait_.is_none()
+                    && matches!(item_impl.self_ty.as_ref(), syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == owner)) =>
+            {
+                Some(item_impl)
+            }
+            _ => None,
+        })
+        .flat_map(|item_impl| &item_impl.items)
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == name => Some(method),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [method] = methods.as_slice() else {
+        return None;
+    };
+    let mut audit = RuntimeFilterManifestBodyAudit::default();
+    audit.audit_reachable_block(&method.block);
+    Some(audit)
+}
+
+fn runtime_filter_manifest_body_has(
+    audit: Option<RuntimeFilterManifestBodyAudit>,
+    methods: &[&str],
+    calls: &[&[&str]],
+) -> bool {
+    audit.is_some_and(|audit| {
+        methods.iter().all(|method| audit.has_method(method))
+            && calls.iter().all(|call| audit.has_call(call))
+    })
+}
+
+fn runtime_filter_manifest_body_has_paths(
+    audit: Option<RuntimeFilterManifestBodyAudit>,
+    methods: &[&str],
+    paths: &[&[&str]],
+) -> bool {
+    audit.is_some_and(|audit| {
+        methods.iter().all(|method| audit.has_method(method))
+            && paths.iter().all(|path| audit.has_path(path))
+    })
+}
+
+fn runtime_filter_rewrite_function_body(
+    source: &str,
+    function: &str,
+    prefix: &str,
+    suffix: &str,
+) -> String {
+    let tokens = rust_source_tokens(source);
+    let name = tokens
+        .windows(2)
+        .position(|window| window[0].text == "fn" && window[1].text == function)
+        .expect("fixture function must exist")
+        + 1;
+    let open = (name + 1..tokens.len())
+        .find(|index| tokens[*index].text == "{")
+        .expect("fixture function must have a body");
+    let close = rust_matching_token(&tokens, open, "{", "}")
+        .expect("fixture function body must be balanced");
+    let mut rewritten = String::with_capacity(source.len() + prefix.len() + suffix.len());
+    rewritten.push_str(&source[..tokens[open].end]);
+    rewritten.push_str(prefix);
+    rewritten.push_str(&source[tokens[open].end..tokens[close].start]);
+    rewritten.push_str(suffix);
+    rewritten.push_str(&source[tokens[close].start..]);
+    rewritten
+}
+
+fn runtime_filter_replace_in_function_body(
+    source: &str,
+    function: &str,
+    from: &str,
+    to: &str,
+) -> String {
+    let tokens = rust_source_tokens(source);
+    let name = tokens
+        .windows(2)
+        .position(|window| window[0].text == "fn" && window[1].text == function)
+        .expect("fixture function must exist")
+        + 1;
+    let open = (name + 1..tokens.len())
+        .find(|index| tokens[*index].text == "{")
+        .expect("fixture function must have a body");
+    let close = rust_matching_token(&tokens, open, "{", "}")
+        .expect("fixture function body must be balanced");
+    let body = &source[tokens[open].end..tokens[close].start];
+    assert!(
+        body.contains(from),
+        "fixture function body must contain {from}"
+    );
+    let rewritten_body = body.replacen(from, to, 1);
+    format!(
+        "{}{}{}",
+        &source[..tokens[open].end],
+        rewritten_body,
+        &source[tokens[close].start..]
+    )
+}
+
+fn runtime_filter_conformance_manifest_violations(
+    service_root: &str,
+    harness: &str,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let registrations = rust_module_items(service_root)
+        .into_iter()
+        .filter(|item| item.name == "m4_conformance_tests")
+        .collect::<Vec<_>>();
+    let exact_cfg_test = matches!(
+        registrations.as_slice(),
+        [registration]
+            if registration.attributes == ["#[cfg(test)]"]
+                && registration.inline_modules.is_empty()
+                && registration.is_external
+    );
+    if !exact_cfg_test {
+        violations.push(
+            "Service must register exactly one external #[cfg(test)] mod m4_conformance_tests"
+                .to_string(),
+        );
+    }
+
+    let wrapped = format!("#[cfg(test)]\nmod m4_conformance_tests {{\n{harness}\n}}\n");
+    if !rust_use_tokens(&rust_sanitized_production_text(&wrapped)).is_empty() {
+        violations.push("M4 conformance harness must sanitize to no production source".to_string());
+    }
+
+    let file = match syn::parse_file(harness) {
+        Ok(file) => file,
+        Err(error) => {
+            violations.push(format!("M4 conformance harness must parse: {error}"));
+            return violations;
+        }
+    };
+    let tokens = rust_use_tokens(&rust_lexically_sanitized(harness));
+
+    let stable_tests = [
+        (
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            &["producer", "submit_values", "close", "snapshot"][..],
+            &[
+                &["join_allof_harness"][..],
+                &["assert_membership_values"][..],
+                &["assert_fixture_remote_equivalent"][..],
+                &["join_anyof_harness"][..],
+                &["publish_membership"][..],
+            ][..],
+        ),
+        (
+            "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+            &["push", "published_versions"][..],
+            &[
+                &["topn_cases_with_fixed_seed"][..],
+                &["assert_fixed_seed_case_diversity"][..],
+                &["direct_topn_harness"][..],
+                &["TopNHeapAdapter", "new"][..],
+                &["assert_bound_is_sound_for_final_topn"][..],
+                &["assert_immutable_version_history"][..],
+            ][..],
+        ),
+        (
+            "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+            &["submit_summary", "poll_after", "close_all"][..],
+            &[
+                &["topk_allof_harness"][..],
+                &["expect_live_update"][..],
+                &["assert_sound_topk_bound"][..],
+                &["assert_completed_without_new_unsound_version"][..],
+            ][..],
+        ),
+        (
+            "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+            &["collecting_issuer", "freeze", "complete", "close"][..],
+            &[
+                &["aggregate_allof_harness"][..],
+                &["expect_collecting"][..],
+                &["expect_frozen"][..],
+                &["expect_live_completed"][..],
+                &["assert_explicit_empty_is_empty_domain"][..],
+                &["assert_resource_failure_is_unavailable"][..],
+            ][..],
+        ),
+    ];
+    for (test_name, methods, paths) in stable_tests {
+        let definitions = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == test_name => Some(function),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let exact_test = matches!(
+            definitions.as_slice(),
+            [function]
+                if matches!(function.attrs.as_slice(), [attribute]
+                    if matches!(&attribute.meta, syn::Meta::Path(path) if path.is_ident("test")))
+        );
+        let audit = runtime_filter_manifest_function_audit(&file, test_name);
+        let audit_debug = format!("{audit:?}");
+        if !exact_test || !runtime_filter_manifest_body_has(audit, methods, paths) {
+            violations.push(format!(
+                "M4 conformance harness must define one substantive #[test] fn {test_name}: {audit_debug}"
+            ));
+        }
+    }
+
+    for (label, audit, methods, paths) in [
+        (
+            "compiler/install helper",
+            runtime_filter_manifest_function_audit(&file, "compile_install_view"),
+            &[][..],
+            &[&["compiler", "compile"][..]][..],
+        ),
+        (
+            "Service install helper",
+            runtime_filter_manifest_function_audit(&file, "install_service_with_memory"),
+            &["install"][..],
+            &[&["RuntimeFilterService", "new_with_dependencies"][..]][..],
+        ),
+        (
+            "Membership submit adapter",
+            runtime_filter_manifest_method_audit(&file, "MembershipProducer", "submit_values"),
+            &["submit"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Membership close adapter",
+            runtime_filter_manifest_method_audit(&file, "MembershipProducer", "close"),
+            &["close_partition"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Ordered TopN adapter",
+            runtime_filter_manifest_method_audit(&file, "TopNHeapAdapter", "push"),
+            &["submit_bound"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "TopK submit adapter",
+            runtime_filter_manifest_method_audit(&file, "TopKSummaryHarness", "submit_summary"),
+            &["submit_summary"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "TopK close adapter",
+            runtime_filter_manifest_method_audit(&file, "TopKSummaryHarness", "close_all"),
+            &["close_partition"][..],
+            &[][..],
+        ),
+        (
+            "Final-domain complete adapter",
+            runtime_filter_manifest_method_audit(&file, "AggregateHarness", "complete"),
+            &["complete"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+        (
+            "Final-domain close adapter",
+            runtime_filter_manifest_method_audit(&file, "AggregateHarness", "close"),
+            &["close_partition"][..],
+            &[&["ProducerSequence", "new"][..]][..],
+        ),
+    ] {
+        let audit_debug = format!("{audit:?}");
+        if !runtime_filter_manifest_body_has(audit, methods, paths) {
+            violations.push(format!(
+                "M4 conformance harness is missing substantive {label}: {audit_debug}"
+            ));
+        }
+    }
+
+    for (label, function, methods, paths) in [
+        (
+            "Membership public ports",
+            "join_harness",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "Membership"][..],
+                &["ProducerPortKind", "Membership"][..],
+            ][..],
+        ),
+        (
+            "OrderedBound public ports",
+            "direct_topn_harness",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "OrderedBound"][..],
+                &["ProducerPortKind", "OrderedBound"][..],
+            ][..],
+        ),
+        (
+            "TopKSummary public ports",
+            "topk_allof_harness",
+            &["subscribe"][..],
+            &[][..],
+        ),
+        (
+            "FinalDomain public ports",
+            "aggregate_harness_with_memory",
+            &["open_producer", "subscribe"][..],
+            &[
+                &["ProducerHandle", "FinalDomain"][..],
+                &["ProducerPortKind", "FinalDomain"][..],
+            ][..],
+        ),
+    ] {
+        if !runtime_filter_manifest_body_has_paths(
+            runtime_filter_manifest_function_audit(&file, function),
+            methods,
+            paths,
+        ) {
+            violations.push(format!("M4 conformance harness is missing {label}"));
+        }
+    }
+    for (label, owner, paths) in [
+        (
+            "Membership typed producer",
+            "MembershipHarness",
+            &[
+                &["ProducerHandle", "Membership"][..],
+                &["ProducerPortKind", "Membership"][..],
+            ][..],
+        ),
+        (
+            "TopKSummary typed producer",
+            "TopKSummaryHarness",
+            &[
+                &["ProducerHandle", "TopKSummary"][..],
+                &["ProducerPortKind", "TopKSummary"][..],
+            ][..],
+        ),
+    ] {
+        if !runtime_filter_manifest_body_has_paths(
+            runtime_filter_manifest_method_audit(&file, owner, "producer"),
+            &["open_producer"],
+            paths,
+        ) {
+            violations.push(format!("M4 conformance harness is missing {label}"));
+        }
+    }
+
+    for (owner, required_callees) in [
+        ("join_allof_harness", &["join_harness"][..]),
+        ("join_anyof_harness", &["join_harness"][..]),
+        (
+            "join_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "direct_topn_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "topk_allof_harness",
+            &["compile_install_view", "install_service"][..],
+        ),
+        (
+            "aggregate_allof_harness",
+            &["aggregate_harness_with_memory"][..],
+        ),
+        (
+            "aggregate_harness_with_memory",
+            &["compile_install_view", "install_service_with_memory"][..],
+        ),
+        ("install_service", &["install_service_with_memory"][..]),
+    ] {
+        let audit = runtime_filter_manifest_function_audit(&file, owner);
+        if audit.as_ref().is_none_or(|audit| {
+            required_callees
+                .iter()
+                .any(|callee| !audit.has_direct_call(&[callee]))
+        }) {
+            violations.push(format!(
+                "M4 conformance helper call graph is missing reachable edge from {owner}"
+            ));
+        }
+    }
+
+    let canonical = rust_all_source_canonical_paths(
+        harness,
+        "src/runtime_filter/service/m4_conformance_tests.rs",
+    );
+    for required in [
+        &["crate", "runtime_filter", "deployment", "compiler"][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "artifact",
+            "ArtifactBundle",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "identity",
+            "LogicalVersion",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "identity",
+            "ProducerSequence",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "producer",
+            "ProducerHandle",
+        ][..],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "producer",
+            "ProducerPortKind",
+        ][..],
+    ] {
+        if !canonical
+            .iter()
+            .any(|path| runtime_filter_path_is_exactly_allowlisted(path, &[required]))
+        {
+            violations.push(format!(
+                "M4 conformance harness must depend on canonical {}",
+                required.join("::")
+            ));
+        }
+    }
+
+    const PROTECTED_NAMES: &[&str] = &[
+        "ArtifactBundle",
+        "LogicalVersion",
+        "ProducerHandle",
+        "ProducerPortKind",
+        "ProducerSequence",
+    ];
+    #[derive(Default)]
+    struct ProtectedShadowAudit {
+        names: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ProtectedShadowAudit {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if PROTECTED_NAMES.contains(&item.ident.to_string().as_str()) {
+                self.names.insert(item.ident.to_string());
+            }
+            syn::visit::visit_item_union(self, item);
+        }
+    }
+    let mut shadow_audit = ProtectedShadowAudit::default();
+    syn::visit::Visit::visit_file(&mut shadow_audit, &file);
+    if !shadow_audit.names.is_empty() {
+        violations.push(format!(
+            "M4 conformance harness must not shadow canonical contract types: {}",
+            shadow_audit
+                .names
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    for declaration in tokens.windows(2).filter(|pair| {
+        matches!(
+            pair[0].as_str(),
+            "enum" | "struct" | "trait" | "type" | "union"
+        )
+    }) {
+        let name = &declaration[1];
+        if name.ends_with("Channel")
+            || name.ends_with("Reducer")
+            || name.contains("Transport")
+            || name.contains("Envelope")
+            || matches!(name.as_str(), "Ack" | "Retry")
+        {
+            violations.push(format!(
+                "M4 conformance harness must not define Channel/reducer/transport surface {name}"
+            ));
+        }
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "RuntimeFilterHub" | "shared_version"))
+    {
+        violations.push("M4 conformance harness must not use Hub shared version state".to_string());
+    }
+    if tokens.iter().any(|token| {
+        token.eq_ignore_ascii_case("thrift")
+            || token.contains("Thrift")
+            || (token.starts_with('T') && token.contains("Filter"))
+    }) {
+        violations.push("M4 conformance harness must not use compat Thrift surfaces".to_string());
+    }
+
+    violations
+}
+
+#[test]
+fn runtime_filter_producer_conformance_gate_is_complete() {
+    let repo = Path::new(manifest_dir());
+    let service_root = fs::read_to_string(repo.join("src/runtime_filter/service/mod.rs")).unwrap();
+    let harness =
+        fs::read_to_string(repo.join("src/runtime_filter/service/m4_conformance_tests.rs"))
+            .unwrap();
+    let violations = runtime_filter_conformance_manifest_violations(&service_root, &harness);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn runtime_filter_conformance_manifest_rejects_missing_or_fake_surfaces() {
+    let valid_root = "#[cfg(test)] mod m4_conformance_tests;";
+    for invalid in [
+        "fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}",
+        "struct RuntimeFilterChannel; struct OrderedReducer;",
+        "fn route() { RuntimeFilterHub::shared_version(); }",
+        "fn compat() { let _: TPublishFilterParams; }",
+    ] {
+        assert!(!runtime_filter_conformance_manifest_violations(valid_root, invalid).is_empty());
+    }
+
+    let repo = Path::new(manifest_dir());
+    let harness =
+        fs::read_to_string(repo.join("src/runtime_filter/service/m4_conformance_tests.rs"))
+            .unwrap();
+    for forbidden in [
+        "struct FixtureChannel;",
+        "struct FixtureReducer;",
+        "struct FixtureTransport;",
+        "fn route() { RuntimeFilterHub::shared_version(); }",
+        "fn compat() { let _: TPublishFilterParams; }",
+    ] {
+        let invalid = format!("{harness}\n{forbidden}\n");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "manifest detector must reject {forbidden}"
+        );
+    }
+    for (test_name, disabling_attribute) in [
+        (
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            "#[cfg(any())]",
+        ),
+        (
+            "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+            "#[ignore]",
+        ),
+        (
+            "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+            "#[cfg_attr(test, ignore)]",
+        ),
+        (
+            "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+            "#[should_panic]",
+        ),
+    ] {
+        let signature = format!("#[test]\nfn {test_name}");
+        let disabled_signature = format!("#[test]\n{disabling_attribute}\nfn {test_name}");
+        let invalid = harness.replacen(&signature, &disabled_signature, 1);
+        assert_ne!(invalid, harness, "stable owner fixture must be rewritten");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "stable owner {test_name} must reject {disabling_attribute}"
+        );
+    }
+    for missing in [
+        "compiler::compile(",
+        ".install(",
+        ".open_producer(",
+        ".subscribe(",
+        ".submit(",
+        ".submit_bound(",
+        ".submit_summary(",
+        ".complete(",
+        ".close_partition(",
+        "ProducerHandle::Membership",
+        "ProducerHandle::OrderedBound",
+        "ProducerHandle::TopKSummary",
+        "ProducerHandle::FinalDomain",
+        "ProducerPortKind::Membership",
+        "ProducerPortKind::OrderedBound",
+        "ProducerPortKind::TopKSummary",
+        "ProducerPortKind::FinalDomain",
+        "ProducerSequence",
+        "LogicalVersion",
+        "ArtifactBundle",
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+    ] {
+        let invalid = harness.replace(missing, "removed_surface");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "manifest detector must reject missing {missing}"
+        );
+    }
+
+    let relocated = harness.replace(
+        "fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts()",
+        "fn decoy_m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts()",
+    ) + "\n#[test]\nfn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}\n";
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &relocated).is_empty(),
+        "stable test names must not be relocated onto empty decoys"
+    );
+
+    let centralized_decoy = r#"
+fn centralized_decoy() {
+    compiler::compile();
+    service.install();
+    service.open_producer();
+    service.subscribe();
+    producer.submit();
+    producer.submit_bound();
+    producer.submit_summary();
+    producer.complete();
+    producer.close_partition();
+    let _ = ProducerHandle::Membership;
+    let _ = ProducerHandle::OrderedBound;
+    let _ = ProducerHandle::TopKSummary;
+    let _ = ProducerHandle::FinalDomain;
+    let _ = ProducerPortKind::Membership;
+    let _ = ProducerPortKind::OrderedBound;
+    let _ = ProducerPortKind::TopKSummary;
+    let _ = ProducerPortKind::FinalDomain;
+    let _: ProducerSequence;
+    let _: LogicalVersion;
+    let _: ArtifactBundle;
+}
+#[test]
+fn m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts() {}
+#[test]
+fn m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds() {}
+#[test]
+fn m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof() {}
+#[test]
+fn m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable() {}
+"#;
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, centralized_decoy).is_empty(),
+        "centralized token decoys must not satisfy the per-test manifest"
+    );
+
+    let shadowed = format!(
+        "{harness}\n\
+         enum ProducerHandle {{ Membership(()), OrderedBound(()), TopKSummary(()), FinalDomain(()) }}\n\
+         enum ProducerPortKind {{ Membership, OrderedBound, TopKSummary, FinalDomain }}\n\
+         struct ProducerSequence;\n\
+         struct LogicalVersion;\n\
+         struct ArtifactBundle;\n"
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &shadowed).is_empty(),
+        "local contract-type shadows must not satisfy the canonical manifest"
+    );
+
+    for test_name in [
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+        "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+    ] {
+        let unreachable =
+            runtime_filter_rewrite_function_body(&harness, test_name, "\nif false {", "\n}\n");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &unreachable).is_empty(),
+            "literal-false stable test body must not satisfy manifest: {test_name}"
+        );
+        let early_return =
+            runtime_filter_rewrite_function_body(&harness, test_name, "\nreturn;\n", "");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &early_return).is_empty(),
+            "unconditional early return must make stable test calls unreachable: {test_name}"
+        );
+    }
+
+    let closure_hidden = runtime_filter_rewrite_function_body(
+        &harness,
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "\nlet _hidden = || {",
+        "\n};\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &closure_hidden).is_empty(),
+        "required stable-test calls must not be accepted only inside a closure"
+    );
+    let helper_closure_hidden = runtime_filter_rewrite_function_body(
+        &harness,
+        "compile_install_view",
+        "\n(|| {",
+        "\n})()\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &helper_closure_hidden)
+            .is_empty(),
+        "required helper-owner calls must not be accepted only inside a closure"
+    );
+    for (label, prefix, suffix) in [
+        ("while false", "\nwhile false {", "\n}\n"),
+        ("literal-true else", "\nif true {} else {", "\n}\n"),
+        (
+            "literal-true terminating branch",
+            "\nif true { return; }\n",
+            "",
+        ),
+        ("local initializer return", "\nlet _: () = return;\n", ""),
+        (
+            "nested local initializer return",
+            "\nlet _: () = consume((if true { return; } else { () }));\n",
+            "",
+        ),
+        (
+            "assignment return",
+            "\nlet mut sink = (); sink = return;\n",
+            "",
+        ),
+        ("empty array for-loop", "\nfor _ in [] {", "\n}\n"),
+        ("empty range for-loop", "\nfor _ in 0..0 {", "\n}\n"),
+        (
+            "unreachable match arm",
+            "\nmatch 0 { 1 => {",
+            "\n}, _ => {} }\n",
+        ),
+        ("unpolled async", "\nlet _future = async {", "\n};\n"),
+        (
+            "short-circuit false RHS",
+            "\nlet _never = false && {",
+            "\ntrue };\n",
+        ),
+    ] {
+        let hidden = runtime_filter_rewrite_function_body(
+            &harness,
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            prefix,
+            suffix,
+        );
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &hidden).is_empty(),
+            "required stable-test calls must not be accepted from {label}"
+        );
+    }
+    let function_value_only = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "install_service(removed_compile_call(",
+            1,
+        ),
+        "join_harness",
+        "\nlet _ = compile_install_view;\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &function_value_only)
+            .is_empty(),
+        "function-value ExprPath must not satisfy a required call edge"
+    );
+    let nested_owner_edges = runtime_filter_rewrite_function_body(
+        &harness,
+        "join_harness",
+        "\nif true {",
+        "\n}\npanic!(\"nested owner-edge decoy\")\n",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &nested_owner_edges).is_empty(),
+        "key helper call edges must be direct top-level calls"
+    );
+    let local_shadow = runtime_filter_rewrite_function_body(
+        &harness,
+        "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+        "\nstruct ProducerHandle;\nstruct ProducerPortKind;\nstruct ProducerSequence;\nstruct LogicalVersion;\nstruct ArtifactBundle;\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &local_shadow).is_empty(),
+        "owner-local protected type shadows must be rejected recursively"
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations("mod m4_conformance_tests;", &harness)
+            .is_empty(),
+        "M4 conformance registration must remain test-only"
+    );
+}
+
+#[test]
+fn runtime_filter_manifest_direct_call_rejects_short_circuit_decoy() {
+    let valid_root = "#[cfg(test)] mod m4_conformance_tests;";
+    let harness = fs::read_to_string(
+        Path::new(manifest_dir()).join("src/runtime_filter/service/m4_conformance_tests.rs"),
+    )
+    .unwrap();
+    let short_circuit_owner_edges = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "removed_install(removed_compile(",
+            1,
+        ),
+        "join_harness",
+        "\nlet _ = false && discard(install_service(compile_install_view()));\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(valid_root, &short_circuit_owner_edges)
+            .is_empty(),
+        "short-circuit RHS must not satisfy a direct helper call edge"
+    );
+    let terminating_argument_owner_edges = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "removed_install(removed_compile(",
+            1,
+        ),
+        "join_harness",
+        "\nlet _ = install_service(compile_install_view(return fallback));\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(
+            valid_root,
+            &terminating_argument_owner_edges,
+        )
+        .is_empty(),
+        "a terminating call argument must prevent recording the inner and outer callees"
+    );
+    let assignment_terminating_owner_edges = runtime_filter_rewrite_function_body(
+        &harness.replacen(
+            "install_service(compile_install_view(",
+            "removed_install(removed_compile(",
+            1,
+        ),
+        "join_harness",
+        "\nlet mut sink = (); sink = return;\nlet _ = install_service(compile_install_view(fallback));\n",
+        "",
+    );
+    assert!(
+        !runtime_filter_conformance_manifest_violations(
+            valid_root,
+            &assignment_terminating_owner_edges,
+        )
+        .is_empty(),
+        "an assignment with a terminating RHS must prevent recording later direct callees"
+    );
+}
+
+#[test]
+fn runtime_filter_manifest_controlled_loops_require_live_immutable_bindings() {
+    let valid_root = "#[cfg(test)] mod m4_conformance_tests;";
+    let harness = fs::read_to_string(
+        Path::new(manifest_dir()).join("src/runtime_filter/service/m4_conformance_tests.rs"),
+    )
+    .unwrap();
+    let topn_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "let cases = topn_cases_with_fixed_seed();\n    assert_fixed_seed_case_diversity(&cases);",
+        "let mut cases = topn_cases_with_fixed_seed();\n    assert_fixed_seed_case_diversity(&cases);\n    cases.clear();",
+    );
+    let topn_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "assert_fixed_seed_case_diversity(&cases);\n    for case in cases {",
+        "assert_fixed_seed_case_diversity(&cases);\n    let cases = Vec::new();\n    for case in cases {",
+    );
+    let topn_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for case in cases {",
+        "for case in cases.into_iter().filter(|_| false) {",
+    );
+    let topn_nested_empty = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "for _ in std::iter::empty::<()>() {",
+    );
+    let topn_nested_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2).filter(|_| false) {",
+    );
+    let topn_case_shadowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let case = TopNCase { rows: Vec::new(), ..case };\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_assigned = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "case = empty_topn_case();\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_mutably_borrowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let _case_mut = &mut case;\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let topn_case_closure_shadowed = runtime_filter_replace_in_function_body(
+        &harness,
+        "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+        "for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+        "let _shadow = |case| case;\n        for (index, row) in case.rows.into_iter().enumerate().skip(2) {",
+    );
+    let join_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "let producers = producer_fixtures();",
+        "let mut producers = producer_fixtures();\n    producers.clear();",
+    );
+    let join_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "for producer in &producers {",
+        "let producers = Vec::new();\n    for producer in &producers {",
+    );
+    let join_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "join_harness",
+        "for producer in &producers {",
+        "for producer in producers.iter().filter(|_| false) {",
+    );
+    let aggregate_clear = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_allof_harness",
+        "let producers = producer_fixtures();",
+        "let mut producers = producer_fixtures();\n    producers.clear();",
+    );
+    let aggregate_rebound = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_allof_harness",
+        "aggregate_harness_with_memory(\n        &producers,",
+        "let producers = Vec::new();\n    aggregate_harness_with_memory(\n        &producers,",
+    );
+    let aggregate_filtered = runtime_filter_replace_in_function_body(
+        &harness,
+        "aggregate_harness_with_memory",
+        "for producer in producers {",
+        "for producer in producers.iter().filter(|_| false) {",
+    );
+    let accepted = [
+        ("topn clear", topn_clear),
+        ("topn rebound", topn_rebound),
+        ("topn filter-to-empty", topn_filtered),
+        ("topn nested empty iterator", topn_nested_empty),
+        ("topn nested filter-to-empty", topn_nested_filtered),
+        ("topn case shadow", topn_case_shadowed),
+        ("topn case assignment", topn_case_assigned),
+        ("topn case mutable borrow", topn_case_mutably_borrowed),
+        ("topn case closure shadow", topn_case_closure_shadowed),
+        ("join clear", join_clear),
+        ("join rebound", join_rebound),
+        ("join filter-to-empty", join_filtered),
+        ("aggregate clear", aggregate_clear),
+        ("aggregate rebound", aggregate_rebound),
+        ("aggregate filter-to-empty", aggregate_filtered),
+    ]
+    .into_iter()
+    .filter_map(|(label, source)| {
+        runtime_filter_conformance_manifest_violations(valid_root, &source)
+            .is_empty()
+            .then_some(label)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        accepted.is_empty(),
+        "controlled loops must reject invalidated producer evidence: {accepted:?}"
+    );
 }
 
 #[test]
@@ -9866,10 +15151,19 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
         "src/runtime_filter/materializer/bloom.rs".to_string(),
         "src/runtime_filter/materializer/codec.rs".to_string(),
         "src/runtime_filter/materializer/mod.rs".to_string(),
+        "src/runtime_filter/materializer/range.rs".to_string(),
     ]);
     assert_eq!(
         actual_materializer_sources, expected_materializer_sources,
         "materializer source inventory is explicit and unknown files default-deny"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(
+            "src/runtime_filter/service/unknown.rs",
+            "use std::sync::Arc;",
+        )
+        .is_empty(),
+        "unknown runtime-filter source must remain default-deny"
     );
 
     let src = repo.join("src");
@@ -9986,6 +15280,14 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
         "contract vocabulary may use NonZeroU32 to make zero-valued requirements unrepresentable"
     );
     assert!(
+        !runtime_filter_model_dependency_violations(
+            source_rel,
+            "fn unused() { let _ = std::num::NonZeroU32::MIN; }",
+        )
+        .is_empty(),
+        "model contract must allow NonZeroU32/new only, not arbitrary associated surfaces"
+    );
+    assert!(
         runtime_filter_model_dependency_violations(
             source_rel,
             "mod arrow {} use ::arrow::datatypes::DataType;"
@@ -10002,6 +15304,150 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
             runtime_filter_model_dependency_violations(source_rel, source).is_empty(),
             "file-top-level local type/module path must remain allowed: {source}"
         );
+    }
+}
+
+#[test]
+fn runtime_filter_task4_exact_dependency_ledger_rejects_unused_children() {
+    for (source_rel, source) in [
+        (
+            "src/runtime_filter/materializer/range.rs",
+            "use crate::runtime_filter::port::support::ArtifactRetainedLease;",
+        ),
+        (
+            "src/runtime_filter/port/artifact.rs",
+            "use crate::runtime_filter::port::ordered_bound::FutureOrderedSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::coordinator::scheduler::FragmentScheduler;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::model::graph::FutureGraphFixture;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::port::artifact::FutureArtifactSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::sql::analysis::FutureAnalysisSurface;",
+        ),
+        (
+            "src/runtime_filter/service/m3a_tests.rs",
+            "use crate::runtime_filter::port::identity::RouteEdgeId;",
+        ),
+        (
+            "src/runtime_filter/service/m3b_tests.rs",
+            "use crate::runtime_filter::port::producer::FinalDomainProducerAdapter;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::deployment::compiler::FutureApi;",
+        ),
+        (
+            "src/runtime_filter/materializer/range.rs",
+            "use crate::runtime_filter::port::support::ArtifactRetention::FutureApi;",
+        ),
+        (
+            "src/runtime_filter/service/m4_conformance_tests.rs",
+            "use crate::runtime_filter::port::producer::ProducerHandle::FutureVariant;",
+        ),
+        (
+            "src/runtime_filter/core/channel.rs",
+            "use crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome::FutureVariant;",
+        ),
+        (
+            "src/runtime_filter/port/artifact.rs",
+            "use crate::runtime_filter::port::ordered_bound::OrderedScalar::FutureVariant;",
+        ),
+    ] {
+        assert!(
+            !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            "Task 4 exact dependency ledger must reject {source_rel}: {source}"
+        );
+    }
+}
+
+#[test]
+fn runtime_filter_task4_exact_dependency_ledger_rejects_stale_entries() {
+    let repo = Path::new(manifest_dir());
+    let source_rel = "src/runtime_filter/service/m3a_tests.rs";
+    let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+    let removed_dependency = source.replace(
+        "    let weak_service = Arc::downgrade(&service);\n\
+         \x20   drop(service);\n\
+         \x20   assert!(weak_service.upgrade().is_none());",
+        "    drop(service);",
+    );
+    assert_ne!(
+        removed_dependency, source,
+        "fixture must remove Arc::downgrade"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(source_rel, &removed_dependency).is_empty(),
+        "removing a frozen dependency must report stale exact-ledger entries"
+    );
+
+    let source_rel = "src/runtime_filter/core/state.rs";
+    let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+    let removed_added_dependency = source
+        .replace(
+            "use crate::runtime_filter::port::subscription::UnavailableReason;\n",
+            "",
+        )
+        .replace("DegradedLogical(UnavailableReason)", "DegradedLogical")
+        .replace("Unavailable(UnavailableReason)", "Unavailable");
+    assert_ne!(
+        removed_added_dependency, source,
+        "fixture must remove UnavailableReason"
+    );
+    assert!(
+        !runtime_filter_runtime_boundary_violations(source_rel, &removed_added_dependency)
+            .is_empty(),
+        "removing a Task 4 added dependency must report stale exact-ledger entries"
+    );
+}
+
+#[test]
+fn runtime_filter_task4_glob_bare_path_inventory_rejects_future_children() {
+    let repo = Path::new(manifest_dir());
+    for source_rel in [
+        "src/runtime_filter/service/m3b_tests.rs",
+        "src/runtime_filter/service/m3c_tests.rs",
+    ] {
+        let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+        assert!(
+            runtime_filter_runtime_boundary_violations(source_rel, &source).is_empty(),
+            "real whole-exact source must establish a clean baseline: {source_rel}"
+        );
+        let mut missing_actual = runtime_filter_task4_bare_paths(&source).unwrap();
+        let removed = missing_actual
+            .iter()
+            .next()
+            .cloned()
+            .expect("whole-exact bare path inventory must not be empty");
+        missing_actual.remove(&removed);
+        assert!(
+            runtime_filter_task4_bare_path_inventory_violations(source_rel, &missing_actual)
+                .iter()
+                .any(|violation| violation.contains("stale exact bare path")),
+            "removing expected bare path {removed} must report stale inventory for {source_rel}"
+        );
+        for future_child in [
+            "fn use_future_glob_child() { FutureGlobChild::new(); }",
+            "fn call_future_glob_child() { future_glob_child(); }",
+            "fn match_future_glob_child(value: usize) { let FutureGlobChild { .. } = value; }",
+            "fn assert_future_glob_child() { assert!(future_glob_child()); }",
+            "fn matches_future_glob_child(value: usize) { assert!(matches!(value, FutureGlobChild)); }",
+        ] {
+            let invalid = format!("{source}\n{future_child}\n");
+            assert!(
+                !runtime_filter_runtime_boundary_violations(source_rel, &invalid).is_empty(),
+                "whole-exact bare path inventory must reject {source_rel}: {future_child}"
+            );
+        }
     }
 }
 
@@ -10048,27 +15494,18 @@ fn runtime_filter_runtime_boundary_detector_defaults_model_dependencies_to_deny(
         );
     }
 
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::contract::ChannelId;"
-        )
-        .is_empty()
-    );
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::coverage::Coverage;"
-        )
-        .is_empty()
-    );
-    assert!(
-        runtime_filter_runtime_boundary_violations(
-            source_rel,
-            "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
-        )
-        .is_empty()
-    );
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::contract::ChannelId;"
+    ));
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::coverage::Coverage;"
+    ));
+    assert!(runtime_filter_runtime_dependencies_are_allowed(
+        source_rel,
+        "use crate::runtime_filter::model::contract as owner; use owner::ChannelId;"
+    ));
 }
 
 #[test]
@@ -10148,7 +15585,7 @@ fn runtime_filter_materializer_boundary_detector_rejects_synthetic_bypasses() {
         ),
     ] {
         assert!(
-            runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
+            runtime_filter_runtime_dependencies_are_allowed(source_rel, source),
             "materializer detector must allow neutral/pure contract dependency: {source}"
         );
     }
@@ -10283,6 +15720,178 @@ trait BlockingSnapshotSubscription {
         );
     }
 
+    let cfg_test_only = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+#[cfg(test)]
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(test)]
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(test)]
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        syn::parse_file(cfg_test_only).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(cfg_test_only)).is_err(),
+        "fixture must exercise the sanitizer parse-failure fallback"
+    );
+    assert!(
+        !runtime_filter_subscription_artifact_surface_violations(cfg_test_only).is_empty(),
+        "cfg(test)-only contract items must not satisfy the production subscription surface"
+    );
+
+    let cfg_contradictory_items = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+#[cfg(feature = "x")]
+#[cfg(not(feature = "x"))]
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        syn::parse_file(cfg_contradictory_items).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(cfg_contradictory_items)).is_err(),
+        "contradictory CFG fixture must exercise the raw fallback"
+    );
+    let cfg_test_only_variant = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome { #[cfg(test)] Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { #[cfg(test)] Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let cfg_test_only_snapshot = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    #[cfg(test)]
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let cfg_attr_test_only_variant = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome {
+    #[cfg_attr(not(test), cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+enum ArtifactDeliveryOutcome {
+    #[cfg_attr(not(test), cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let accepted_cfg_fallbacks = [
+        (
+            "contradictory item CFG conjunction",
+            cfg_contradictory_items,
+        ),
+        ("cfg(test) Published variant", cfg_test_only_variant),
+        ("cfg(test) snapshot method", cfg_test_only_snapshot),
+        (
+            "cfg_attr-generated test-only variant",
+            cfg_attr_test_only_variant,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, source)| {
+        assert!(
+            syn::parse_file(source).is_ok()
+                && syn::parse_file(&rust_sanitized_production_text(source)).is_err(),
+            "{label} fixture must exercise the raw fallback"
+        );
+        runtime_filter_subscription_artifact_surface_violations(source)
+            .is_empty()
+            .then_some(label)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        accepted_cfg_fallbacks.is_empty(),
+        "raw fallback must reject cfg-hidden subscription evidence: {accepted_cfg_fallbacks:?}"
+    );
+
+    let cfg_attr_production_possible = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+enum ArtifactAcquireOutcome {
+    #[cfg_attr(feature = "x", cfg(test))]
+    Published(Arc<ArtifactBundle>)
+}
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        runtime_filter_subscription_artifact_surface_violations(cfg_attr_production_possible)
+            .is_empty(),
+        "a cfg_attr member that remains possible in production must stay visible"
+    );
+
+    let cfg_not_test_shadow = r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle as CanonicalArtifactBundle;
+#[cfg(not(test))]
+struct ArtifactBundle;
+enum ArtifactAcquireOutcome { Published(Arc<ArtifactBundle>) }
+enum ArtifactDeliveryOutcome { Published(Arc<ArtifactBundle>) }
+trait BlockingSnapshotSubscription {
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}
+fn force_sanitizer_failure() {
+    let _ = core::mem::size_of::<CanonicalArtifactBundle>();
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    let raw_parse = syn::parse_file(cfg_not_test_shadow);
+    assert!(
+        raw_parse.is_ok(),
+        "raw fallback fixture must parse: {:?}",
+        raw_parse.as_ref().err()
+    );
+    let sanitized_parse = syn::parse_file(&rust_sanitized_production_text(cfg_not_test_shadow));
+    assert!(
+        sanitized_parse.is_err(),
+        "fixture must exercise filtered raw fallback"
+    );
+    assert!(
+        !runtime_filter_subscription_artifact_surface_violations(cfg_not_test_shadow).is_empty(),
+        "cfg(not(test)) protected shadow must remain production-visible"
+    );
+
     const GOOD_ROUTER: &str = r#"
 use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
 struct LoopbackRouter;
@@ -10308,6 +15917,154 @@ impl LoopbackRouter {
             "router surface must reject logical/action/shadow decoy:\n{bad}"
         );
     }
+}
+
+#[test]
+fn runtime_filter_cfg_requires_test_handles_nested_boolean_predicates() {
+    for attribute in [
+        "#[cfg(test)]",
+        "#[cfg(not(not(test)))]",
+        "#[cfg(all(feature = \"x\", not(not(test))))]",
+        "#[cfg(not(any(not(test), feature = \"x\")))]",
+        "#[cfg(all(any(feature = \"x\", test), not(not(test))))]",
+        "#[cfg(all(feature = \"x\", not(feature = \"x\")))]",
+        "#[cfg(all(any(test, feature = \"x\"), not(feature = \"x\")))]",
+        "#[cfg(not(any(feature = \"x\", not(feature = \"x\"))))]",
+    ] {
+        assert!(
+            cfg_attribute_requires_test(attribute),
+            "predicate cannot be true when test=false: {attribute}"
+        );
+    }
+    for attribute in [
+        "#[cfg(not(test))]",
+        "#[cfg(any(test, feature = \"x\"))]",
+        "#[cfg(all(not(test), feature = \"x\"))]",
+        "#[cfg(not(any(test, feature = \"x\")))]",
+        "#[cfg(any(feature = \"x\", not(feature = \"x\")))]",
+    ] {
+        assert!(
+            !cfg_attribute_requires_test(attribute),
+            "predicate can be true when test=false: {attribute}"
+        );
+    }
+    let over_cap_unsatisfiable = format!(
+        "#[cfg(all({}, feature = \"x0\", not(feature = \"x0\")))]",
+        (0..13)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(
+        cfg_attribute_requires_test(&over_cap_unsatisfiable),
+        "over-cap correlated contradiction still requires test"
+    );
+    let over_cap_with_test = format!(
+        "#[cfg(all(test, {}))]",
+        (0..13)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(
+        cfg_attribute_requires_test(&over_cap_with_test),
+        "over-cap predicate with test conjunction still requires test"
+    );
+    let over_cap_production_possible = format!(
+        "#[cfg(all(any(feature = \"x0\", not(feature = \"x0\")), any({})))]",
+        (1..14)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(
+        !cfg_attribute_requires_test(&over_cap_production_possible),
+        "over-cap satisfiable predicate remains production-visible"
+    );
+}
+
+#[test]
+fn runtime_filter_cfg_solver_is_bounded_and_raw_fallback_fails_closed() {
+    let tautologies = (0..12)
+        .map(|index| format!("any(feature = \"x{index}\", not(feature = \"x{index}\"))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hard_unsatisfiable =
+        format!("#[cfg(all({tautologies}, feature = \"zz\", not(feature = \"zz\")))]");
+    let hard_tokens = rust_use_tokens(&hard_unsatisfiable);
+    let hard_start = hard_tokens
+        .iter()
+        .position(|token| token == "cfg")
+        .expect("hard CFG fixture must contain cfg")
+        + 2;
+    assert_eq!(
+        cfg_predicate_test_requirement(&hard_tokens, hard_start).map(|result| result.0),
+        Some(CfgTestRequirement::Unproven),
+        "the default work budget must bound the adversarial predicate"
+    );
+    assert_eq!(
+        cfg_predicate_test_requirement_with_budget(&hard_tokens, hard_start, 16_384)
+            .map(|result| result.0),
+        Some(CfgTestRequirement::RequiresTest),
+        "with enough explicit work, the bounded solver must preserve predicate semantics"
+    );
+    let production_possible = format!("#[cfg(all({tautologies}, feature = \"zz\"))]");
+    assert_eq!(
+        cfg_attribute_test_requirement(&production_possible),
+        Some(CfgTestRequirement::ProductionPossible),
+        "a satisfiable multi-atom predicate must remain production-visible"
+    );
+    let source = format!(
+        r#"
+use std::sync::Arc;
+use crate::runtime_filter::port::artifact::ArtifactBundle;
+{hard_unsatisfiable}
+enum ArtifactAcquireOutcome {{ Published(Arc<ArtifactBundle>) }}
+{hard_unsatisfiable}
+enum ArtifactDeliveryOutcome {{ Published(Arc<ArtifactBundle>) }}
+{hard_unsatisfiable}
+trait BlockingSnapshotSubscription {{
+    fn snapshot(&self) -> Option<Arc<ArtifactBundle>>;
+}}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    assert!(
+        syn::parse_file(&source).is_ok()
+            && syn::parse_file(&rust_sanitized_production_text(&source)).is_err(),
+        "fixture must exercise the filtered raw fallback"
+    );
+    let violations = runtime_filter_subscription_artifact_surface_violations(&source);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven CFG predicate must fail the raw fallback closed: {violations:#?}"
+    );
+
+    let action_source = format!(
+        r#"
+{hard_unsatisfiable}
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {{
+    self.dispatcher.dispatch(self.channel_id, action);
+}}
+fn submit(&self) {{ self.channel.submit().map(|action| self.finish(action)); }}
+fn close_partition(&self) {{ self.channel.close_partition().map(|action| self.finish(action)); }}
+fn fail(&self) {{ self.channel.fail_instance().map(|action| self.finish(action)); }}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    let action_violations = runtime_filter_action_dispatch_boundary_violations(&action_source);
+    assert!(
+        action_violations
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven CFG predicate must fail the action raw fallback closed: {action_violations:#?}"
+    );
 }
 
 #[test]
@@ -10581,6 +16338,10 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
             "src/service/grpc_client.rs",
             "fn wire(subscription: &dyn BlockingSnapshotSubscription) { service.subscribe(subscription); }",
         ),
+        (
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "use crate::runtime_filter::port::value_domain::ValueDomainDelta; fn wire(_: ValueDomainDelta) {}",
+        ),
     ] {
         assert!(
             !runtime_filter_runtime_boundary_violations(source_rel, source).is_empty(),
@@ -10653,6 +16414,25 @@ fn runtime_filter_harness_only_detector_rejects_alias_reexports_and_call_decoys(
         )
         .is_empty(),
         "an unrelated private type alias stays legal"
+    );
+}
+
+#[test]
+fn runtime_filter_harness_only_detector_allows_model_value_domain_contributions() {
+    let source = r#"
+use crate::runtime_filter::model::contract::ContributionKind;
+
+fn accepts(contribution: ContributionKind) -> bool {
+    matches!(contribution, ContributionKind::ValueDomainDelta)
+}
+"#;
+    assert!(
+        runtime_filter_runtime_boundary_violations(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            source,
+        )
+        .is_empty(),
+        "model ContributionKind::ValueDomainDelta is not the data-plane ValueDomainDelta port"
     );
 }
 
@@ -10824,11 +16604,163 @@ fn close_partition(&self) { self.channel.close_partition().map(|action| self.fin
 fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
 "#;
     assert!(runtime_filter_action_dispatch_boundary_violations(good).is_empty());
+    let try_wrapped = good.replace(
+        "self.dispatcher.dispatch(self.channel_id, action);",
+        "self.dispatcher.dispatch(self.channel_id, action)?;",
+    );
+    assert!(
+        runtime_filter_action_dispatch_boundary_violations(&try_wrapped).is_empty(),
+        "finish may use a top-level try wrapper around the exact dispatch"
+    );
+    let cfg_test_only_impl_finish = r#"
+macro_rules! finish_token_decoy {
+    () => {
+        fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+            self.dispatcher.dispatch(self.channel_id, action);
+        }
+    };
+}
+struct Producer;
+impl Producer {
+    #[cfg(test)]
+    fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+        self.dispatcher.dispatch(self.channel_id, action);
+    }
+}
+fn submit(&self) { self.channel.submit().map(|action| self.finish(action)); }
+fn close_partition(&self) { self.channel.close_partition().map(|action| self.finish(action)); }
+fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(cfg_test_only_impl_finish).is_empty(),
+        "a cfg(test)-only impl finish must not satisfy the raw action fallback"
+    );
+    let cfg_test_only_body_dispatch = r#"
+macro_rules! finish_token_decoy {
+    () => {
+        fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+            self.dispatcher.dispatch(self.channel_id, action);
+        }
+    };
+}
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+    #[cfg(test)]
+    self.dispatcher.dispatch(self.channel_id, action);
+}
+fn submit(&self) { self.channel.submit().map(|action| self.finish(action)); }
+fn close_partition(&self) { self.channel.close_partition().map(|action| self.finish(action)); }
+fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(cfg_test_only_body_dispatch).is_empty(),
+        "a cfg(test)-only finish body dispatch must not satisfy the raw action fallback"
+    );
+    let nested_cfg_test_only_body_dispatch = cfg_test_only_body_dispatch.replace(
+        "    #[cfg(test)]\n    self.dispatcher.dispatch(self.channel_id, action);",
+        "    {\n        #[cfg(test)]\n        self.dispatcher.dispatch(self.channel_id, action);\n    }",
+    );
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(&nested_cfg_test_only_body_dispatch)
+            .is_empty(),
+        "a nested cfg(test)-only finish body dispatch must not satisfy the raw action fallback"
+    );
+    let tautologies = (0..12)
+        .map(|index| format!("any(feature = \"x{index}\", not(feature = \"x{index}\"))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hard_unsatisfiable =
+        format!("#[cfg(all({tautologies}, feature = \"zz\", not(feature = \"zz\")))]");
+    let unproven_body_dispatch = format!(
+        r#"
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {{
+    {hard_unsatisfiable}
+    self.dispatcher.dispatch(self.channel_id, action);
+}}
+fn submit(&self) {{ self.channel.submit().map(|action| self.finish(action)); }}
+fn close_partition(&self) {{ self.channel.close_partition().map(|action| self.finish(action)); }}
+fn fail(&self) {{ self.channel.fail_instance().map(|action| self.finish(action)); }}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    assert!(
+        runtime_filter_action_dispatch_boundary_violations(&unproven_body_dispatch)
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven finish body expression must fail the raw action fallback closed"
+    );
     for bad in [
         good.replace("ChannelAction", "SubmitOutcome"),
         good.replace(
             "self.dispatcher.dispatch(self.channel_id, action);",
             "self.dispatcher.flush();",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let action = crate::runtime_filter::core::channel::ChannelAction::None; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _shadow = |action| action; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "match action { action => self.dispatcher.dispatch(self.channel_id, action) }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _dispatch = || { self.dispatcher.dispatch(self.channel_id, action); };",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _dispatch = async { self.dispatcher.dispatch(self.channel_id, action); };",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "if false { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "while false { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "return; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "if true { return; } self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _: () = return; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let _: () = consume((if true { return; } else { () })); self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "let mut sink = (); sink = return; self.dispatcher.dispatch(self.channel_id, action);",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "if true {} else { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "for _ in [] { self.dispatcher.dispatch(self.channel_id, action); }",
+        ),
+        good.replace(
+            "self.dispatcher.dispatch(self.channel_id, action);",
+            "for _ in 0..0 { self.dispatcher.dispatch(self.channel_id, action); }",
         ),
         good.replace(
             "self.channel.submit().map(|action| self.finish(action))",
@@ -10845,7 +16777,7 @@ fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action));
     ] {
         assert!(
             !runtime_filter_action_dispatch_boundary_violations(&bad).is_empty(),
-            "dispatch detector must reject mutation-callback or action-free dispatch"
+            "dispatch detector must reject mutation-callback or action-free dispatch:\n{bad}"
         );
     }
 }
