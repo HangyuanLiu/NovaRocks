@@ -9954,20 +9954,24 @@ fn runtime_filter_transport_ingress_boundary_violations(
     let mut export_violations = Vec::new();
     if matches!(source_rel, ADAPTER | SERVICE_INJECTION_OWNER) {
         export_violations.extend(
-            rust_production_use_statements(text)
+            rust_production_scoped_use_statements(text)
                 .into_iter()
-                .filter(|import| runtime_filter_transport_use_expands_visibility(import))
                 .filter(|import| {
-                    rust_use_path(import)
+                    runtime_filter_transport_use_expands_visibility(&import.import)
+                })
+                .filter(|import| {
+                    rust_use_path(&import.import)
                         .split("::")
                         .eq(["crate", "runtime_filter", "port", "transport"])
-                        || rust_use_path(import)
+                        || rust_use_path(&import.import)
                             .strip_prefix("crate::runtime_filter::port::transport::")
                             .is_some()
                 })
                 .map(|import| {
                     format!(
-                        "{source_rel}: native runtime-filter transport surface must not be re-exported: {import}"
+                        "{source_rel}: native runtime-filter transport surface must not be re-exported from inline scope {}: {}",
+                        import.inline_modules.join("::"),
+                        import.import
                     )
                 }),
         );
@@ -16831,6 +16835,10 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             adapter,
             "mod leak { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope; pub(crate) type Hidden = PrivateEnvelope; }",
         ),
+        (
+            adapter,
+            "mod leak { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Shared; pub(crate) use Shared as Hidden; }",
+        ),
     ] {
         assert!(
             !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
@@ -16860,6 +16868,7 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "use std::sync::Arc; pub(crate) type Unrelated = Arc<usize>;",
         "pub(self) type PrivateEnvelope = crate::runtime_filter::port::transport::RuntimeFilterEnvelope;",
         "pub(self) use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as PrivateEnvelope;",
+        "mod a { use crate::runtime_filter::port::transport::RuntimeFilterEnvelope as Shared; } mod b { use crate::local::Thing as Shared; pub(crate) use Shared as Hidden; }",
     ] {
         assert!(
             runtime_filter_transport_ingress_boundary_violations(adapter, source).is_empty(),
