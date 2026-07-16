@@ -26,14 +26,17 @@ use super::{StateStoreError, StateStoreErrorKind};
 use super::mysql::client::delayed_active_readiness as mysql_delayed_active_readiness;
 #[cfg(feature = "mysql-state-store-provider")]
 use {
+    super::limits::MYSQL_MAX_KEY_BYTES,
+    super::mysql::MysqlStateStore,
     super::mysql::client::{
         PoolLifecycle, ResolvedMysqlClient, active_readiness as mysql_active_readiness,
         checkout_hygienic_connection, pollute_session as mysql_pollute_session,
     },
     super::mysql::test_support::{
-        MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner, MysqlTestHandle,
+        MysqlHeldAdvisoryLock, MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner,
+        MysqlSchemaMutation, MysqlSchemaSnapshot, MysqlStoreReadinessSnapshot, MysqlTestHandle,
     },
-    super::{FeDeploymentView, MySqlClientConfig, StateStore, StateStoreConfig},
+    super::{FeDeploymentView, MySqlClientConfig, StateStore, StateStoreConfig, StateStoreLimits},
     std::collections::HashMap,
     std::sync::Arc,
     std::sync::Mutex,
@@ -178,17 +181,11 @@ impl StateStoreRuntime {
     #[cfg(feature = "mysql-state-store-provider")]
     pub(crate) async fn open_mysql_store(
         &self,
-        _config: &StateStoreConfig,
-        _deployment: FeDeploymentView,
+        config: &StateStoreConfig,
+        deployment: FeDeploymentView,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
         match &self.inner {
-            RuntimeInner::Mysql(runtime) => {
-                runtime.validate_process_and_context()?;
-                Err(StateStoreError::new(
-                    StateStoreErrorKind::ProviderUnavailable,
-                    "MySQL state store runtime is not implemented",
-                ))
-            }
+            RuntimeInner::Mysql(runtime) => runtime.open_store(config, deployment).await,
             _ => Err(mysql_runtime_mismatch()),
         }
     }
@@ -321,6 +318,105 @@ impl StateStoreRuntime {
         }
     }
 
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_schema_snapshot(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlSchemaSnapshot, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => runtime.schema_snapshot(database, deadline).await,
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_apply_schema_mutation(
+        &self,
+        database: &str,
+        mutation: MysqlSchemaMutation,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .apply_schema_mutation(database, mutation, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_acquire_schema_advisory_lock(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlHeldAdvisoryLock, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .acquire_schema_advisory_lock(database, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_is_schema_advisory_lock_free(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .is_schema_advisory_lock_free(database, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_store_readiness_snapshot(
+        &self,
+        database: &str,
+        cluster_id: &str,
+        deadline: Duration,
+    ) -> Result<MysqlStoreReadinessSnapshot, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .store_readiness_snapshot(database, cluster_id, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_schema_timeout_connection_is_destroyed(
+        &self,
+        database: &str,
+        timeout_deadline: Duration,
+        checkout_deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .schema_timeout_connection_is_destroyed(
+                        database,
+                        timeout_deadline,
+                        checkout_deadline,
+                    )
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
     #[cfg(all(
         feature = "mysql-state-store-provider",
         feature = "state-store-test-hooks"
@@ -432,6 +528,42 @@ impl MysqlRuntime {
             ));
         }
         Ok(())
+    }
+
+    async fn open_store(
+        &self,
+        config: &StateStoreConfig,
+        _deployment: FeDeploymentView,
+    ) -> Result<Arc<dyn StateStore>, StateStoreError> {
+        self.validate_process_and_context()?;
+        config.validate().map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL state store configuration is invalid",
+            )
+        })?;
+        let database = match &config.provider {
+            super::StateStoreProviderConfig::Mysql { database } => database.clone(),
+            _ => return Err(mysql_runtime_mismatch()),
+        };
+        let limits =
+            StateStoreLimits::from_overrides_with_max_key(&config.limits, MYSQL_MAX_KEY_BYTES)
+                .map_err(|_| {
+                    StateStoreError::new(
+                        StateStoreErrorKind::InvalidConfiguration,
+                        "MySQL state store limits are invalid",
+                    )
+                })?;
+        let opening = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(&database)?;
+        let deadline = Instant::now() + limits.transaction_deadline;
+        mysql_active_readiness(Arc::clone(&pool), deadline).await?;
+        let lease = MysqlProviderHandle::new(Arc::clone(&self.shared), pool)?;
+        let store =
+            MysqlStateStore::open(lease, database, config.cluster_id.clone(), limits, deadline)
+                .await?;
+        drop(opening);
+        Ok(Arc::new(store))
     }
 
     async fn prepare_pool(&self, database: &str) -> Result<(), StateStoreError> {
@@ -564,6 +696,104 @@ impl MysqlRuntime {
         ))
     }
 
+    async fn schema_snapshot(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<MysqlSchemaSnapshot, StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::schema::snapshot_for_test(pool, Instant::now() + total_deadline).await
+    }
+
+    async fn apply_schema_mutation(
+        &self,
+        database: &str,
+        mutation: MysqlSchemaMutation,
+        total_deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::schema::apply_mutation_for_test(
+            pool,
+            mutation,
+            Instant::now() + total_deadline,
+        )
+        .await
+    }
+
+    async fn acquire_schema_advisory_lock(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<MysqlHeldAdvisoryLock, StateStoreError> {
+        self.validate_process_and_context()?;
+        let operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        let (connection, lock_name) = super::mysql::schema::acquire_lock_for_test(
+            pool,
+            database,
+            Instant::now() + total_deadline,
+        )
+        .await?;
+        Ok(MysqlHeldAdvisoryLock::new(
+            connection,
+            MysqlTestHandle::new(move || drop(operation)),
+            lock_name,
+        ))
+    }
+
+    async fn is_schema_advisory_lock_free(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::schema::is_lock_free_for_test(pool, database, Instant::now() + total_deadline)
+            .await
+    }
+
+    async fn store_readiness_snapshot(
+        &self,
+        database: &str,
+        cluster_id: &str,
+        total_deadline: Duration,
+    ) -> Result<MysqlStoreReadinessSnapshot, StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        let (_, readiness) = super::mysql::schema::validate_store_readiness(
+            pool,
+            database,
+            cluster_id,
+            MYSQL_MAX_KEY_BYTES,
+            Instant::now() + total_deadline,
+        )
+        .await?;
+        Ok(readiness)
+    }
+
+    async fn schema_timeout_connection_is_destroyed(
+        &self,
+        database: &str,
+        timeout_deadline: Duration,
+        checkout_deadline: Duration,
+    ) -> Result<bool, StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::schema::timeout_connection_is_destroyed_for_test(
+            pool,
+            Instant::now() + timeout_deadline,
+            Instant::now() + checkout_deadline,
+        )
+        .await
+    }
+
     #[cfg(feature = "state-store-test-hooks")]
     async fn run_sleep_until_deadline(
         &self,
@@ -682,7 +912,37 @@ enum MysqlGuardKind {
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
-struct MysqlRuntimeGuard {
+pub(super) struct MysqlProviderHandle {
+    _provider: MysqlRuntimeGuard,
+    pool: Arc<dyn PoolLifecycle>,
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+impl MysqlProviderHandle {
+    fn new(
+        shared: Arc<MysqlRuntimeShared>,
+        pool: Arc<dyn PoolLifecycle>,
+    ) -> Result<Self, StateStoreError> {
+        Ok(Self {
+            _provider: MysqlRuntimeGuard::acquire(shared, MysqlGuardKind::Provider)?,
+            pool,
+        })
+    }
+
+    pub(super) fn pool(&self) -> Arc<dyn PoolLifecycle> {
+        Arc::clone(&self.pool)
+    }
+
+    pub(super) fn acquire_operation(&self) -> Result<MysqlRuntimeGuard, StateStoreError> {
+        MysqlRuntimeGuard::acquire(
+            Arc::clone(&self._provider.shared),
+            MysqlGuardKind::Operation,
+        )
+    }
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+pub(super) struct MysqlRuntimeGuard {
     shared: Arc<MysqlRuntimeShared>,
     kind: MysqlGuardKind,
 }

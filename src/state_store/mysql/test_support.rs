@@ -19,6 +19,12 @@ use super::super::{StateStoreError, StateStoreErrorKind, StateStoreRuntime};
 use super::client::MysqlPoolConnection;
 use std::time::Duration;
 
+pub use super::schema::{
+    SchemaColumnSnapshot as MysqlSchemaColumnSnapshot, SchemaMutation as MysqlSchemaMutation,
+    SchemaSnapshot as MysqlSchemaSnapshot, SchemaTableSnapshot as MysqlSchemaTableSnapshot,
+    StoreReadinessSnapshot as MysqlStoreReadinessSnapshot,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MysqlRuntimeOwner {
     pub pid: u32,
@@ -44,6 +50,12 @@ pub struct MysqlReadinessSnapshot {
 pub struct MysqlHeldConnection {
     connection: Option<MysqlPoolConnection>,
     operation: Option<MysqlTestHandle>,
+}
+
+pub struct MysqlHeldAdvisoryLock {
+    connection: Option<MysqlPoolConnection>,
+    operation: Option<MysqlTestHandle>,
+    lock_name: String,
 }
 
 pub fn runtime_owner(runtime: &StateStoreRuntime) -> Result<MysqlRuntimeOwner, StateStoreError> {
@@ -174,6 +186,75 @@ pub async fn restart_mysql_fixture() -> Result<(), StateStoreError> {
     .map_err(|_| fixture_control_error())?
 }
 
+pub fn advisory_lock_name(database: &str) -> String {
+    super::identity::advisory_lock_name(database)
+}
+
+pub async fn schema_snapshot(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    deadline: Duration,
+) -> Result<MysqlSchemaSnapshot, StateStoreError> {
+    runtime.mysql_test_schema_snapshot(database, deadline).await
+}
+
+pub async fn apply_schema_mutation(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    mutation: MysqlSchemaMutation,
+    deadline: Duration,
+) -> Result<(), StateStoreError> {
+    runtime
+        .mysql_test_apply_schema_mutation(database, mutation, deadline)
+        .await
+}
+
+pub async fn acquire_schema_advisory_lock(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    deadline: Duration,
+) -> Result<MysqlHeldAdvisoryLock, StateStoreError> {
+    runtime
+        .mysql_test_acquire_schema_advisory_lock(database, deadline)
+        .await
+}
+
+pub async fn is_schema_advisory_lock_free(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    deadline: Duration,
+) -> Result<bool, StateStoreError> {
+    runtime
+        .mysql_test_is_schema_advisory_lock_free(database, deadline)
+        .await
+}
+
+pub async fn store_readiness_snapshot(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    cluster_id: &str,
+    deadline: Duration,
+) -> Result<MysqlStoreReadinessSnapshot, StateStoreError> {
+    runtime
+        .mysql_test_store_readiness_snapshot(database, cluster_id, deadline)
+        .await
+}
+
+pub async fn schema_timeout_connection_is_destroyed(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    timeout_deadline: Duration,
+    checkout_deadline: Duration,
+) -> Result<bool, StateStoreError> {
+    runtime
+        .mysql_test_schema_timeout_connection_is_destroyed(
+            database,
+            timeout_deadline,
+            checkout_deadline,
+        )
+        .await
+}
+
 #[cfg(feature = "state-store-test-hooks")]
 pub async fn run_sleep_until_deadline(
     runtime: &StateStoreRuntime,
@@ -232,6 +313,52 @@ impl MysqlHeldConnection {
 impl Drop for MysqlHeldConnection {
     fn drop(&mut self) {
         drop(self.connection.take());
+        drop(self.operation.take());
+    }
+}
+
+impl MysqlHeldAdvisoryLock {
+    pub(crate) fn new(
+        connection: MysqlPoolConnection,
+        operation: MysqlTestHandle,
+        lock_name: String,
+    ) -> Self {
+        Self {
+            connection: Some(connection),
+            operation: Some(operation),
+            lock_name,
+        }
+    }
+
+    pub async fn release(mut self, deadline: Duration) -> Result<(), StateStoreError> {
+        let connection = self.connection.take().ok_or_else(|| {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "MySQL advisory lock connection is missing",
+            )
+        })?;
+        let result = super::schema::release_lock_for_test(
+            connection,
+            &self.lock_name,
+            tokio::time::Instant::now() + deadline,
+        )
+        .await;
+        drop(self.operation.take());
+        result
+    }
+}
+
+impl std::fmt::Debug for MysqlHeldAdvisoryLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MysqlHeldAdvisoryLock")
+    }
+}
+
+impl Drop for MysqlHeldAdvisoryLock {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            tokio::spawn(connection.destroy());
+        }
         drop(self.operation.take());
     }
 }
