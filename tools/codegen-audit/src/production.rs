@@ -22,7 +22,7 @@ use syn::{
     GenericParam, ImplItem, Item, Pat, Receiver, Stmt, TraitItem, Variadic, Variant,
 };
 
-use crate::cfg::production_possible;
+use crate::cfg::{CfgExpr, analyze_attrs, production_possible};
 
 pub(crate) fn item_attrs(item: &Item) -> Option<&[Attribute]> {
     match item {
@@ -165,9 +165,12 @@ pub(crate) fn generic_param_attrs(param: &GenericParam) -> &[Attribute] {
     }
 }
 
-pub(crate) fn node_is_production(attrs: Option<&[Attribute]>) -> bool {
-    production_possible(attrs.unwrap_or_default())
-        .expect("production attributes were validated before traversal")
+pub(crate) fn combined_condition(parent: &CfgExpr, attrs: Option<&[Attribute]>) -> CfgExpr {
+    parent.clone().and(
+        analyze_attrs(attrs.unwrap_or_default())
+            .expect("production attributes were validated before traversal")
+            .item_condition,
+    )
 }
 
 #[derive(Default)]
@@ -375,106 +378,239 @@ pub(crate) fn validate_file(file: &syn::File) -> Result<()> {
 macro_rules! production_pruning_methods {
     () => {
         fn visit_item(&mut self, node: &'ast syn::Item) {
-            if crate::production::node_is_production(crate::production::item_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::item_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_item(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if crate::production::node_is_production(crate::production::impl_item_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::impl_item_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_impl_item(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
-            if crate::production::node_is_production(crate::production::trait_item_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::trait_item_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_trait_item(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
-            if crate::production::node_is_production(crate::production::foreign_item_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::foreign_item_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_foreign_item(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
-            if crate::production::node_is_production(crate::production::stmt_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::stmt_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_stmt(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_expr(&mut self, node: &'ast syn::Expr) {
-            if crate::production::node_is_production(crate::production::expr_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::expr_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_expr(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_pat(&mut self, node: &'ast syn::Pat) {
-            if crate::production::node_is_production(crate::production::pat_attrs(node)) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                crate::production::pat_attrs(node),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_pat(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_arm(&mut self, node: &'ast syn::Arm) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_arm(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_field(&mut self, node: &'ast syn::Field) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_field(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_variant(&mut self, node: &'ast syn::Variant) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_variant(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_generic_param(&mut self, node: &'ast syn::GenericParam) {
-            if crate::production::node_is_production(Some(crate::production::generic_param_attrs(
-                node,
-            ))) {
+            let condition = crate::production::combined_condition(
+                &self.condition,
+                Some(crate::production::generic_param_attrs(node)),
+            );
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_generic_param(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_field_value(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_field_pat(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_bare_fn_arg(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_bare_variadic(&mut self, node: &'ast syn::BareVariadic) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_bare_variadic(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_receiver(self, node);
+                self.condition = parent;
             }
         }
 
         fn visit_variadic(&mut self, node: &'ast syn::Variadic) {
-            if crate::production::node_is_production(Some(&node.attrs)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, Some(&node.attrs));
+            if condition
+                .production_possible()
+                .expect("production attributes were validated before traversal")
+            {
+                let parent = std::mem::replace(&mut self.condition, condition);
                 syn::visit::visit_variadic(self, node);
+                self.condition = parent;
             }
         }
     };

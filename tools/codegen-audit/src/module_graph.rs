@@ -24,11 +24,13 @@ use syn::{Item, ItemMod};
 
 use crate::cfg::{CfgExpr, analyze_attrs};
 use crate::production::validate_file;
+use crate::tokens::ident_text;
 
 #[derive(Clone)]
 pub(crate) struct SourceUnit {
     pub(crate) path: PathBuf,
     pub(crate) scope: Vec<String>,
+    pub(crate) condition: CfgExpr,
     pub(crate) file: syn::File,
 }
 
@@ -59,7 +61,13 @@ impl Builder<'_> {
         Ok(canonical)
     }
 
-    fn visit_file(&mut self, path: &Path, scope: Vec<String>, module_dir: PathBuf) -> Result<()> {
+    fn visit_file(
+        &mut self,
+        path: &Path,
+        scope: Vec<String>,
+        module_dir: PathBuf,
+        condition: CfgExpr,
+    ) -> Result<()> {
         let canonical = self.canonical_in_boundary(path)?;
         if !self.active.insert(canonical.clone()) {
             bail!("module graph cycle at {}", path.display());
@@ -79,9 +87,10 @@ impl Builder<'_> {
         self.units.push(SourceUnit {
             path: canonical.clone(),
             scope: scope.clone(),
+            condition: condition.clone(),
             file: file.clone(),
         });
-        self.walk_items(&file.items, &canonical, &module_dir, &scope, CfgExpr::True)?;
+        self.walk_items(&file.items, &canonical, &module_dir, &scope, condition)?;
         self.active.remove(&canonical);
         Ok(())
     }
@@ -103,7 +112,7 @@ impl Builder<'_> {
             if !condition.production_possible()? {
                 continue;
             }
-            let name = module.ident.to_string();
+            let name = ident_text(&module.ident);
             let mut child_scope = scope.to_vec();
             child_scope.push(name.clone());
             if let Some((_, content)) = &module.content {
@@ -156,7 +165,7 @@ impl Builder<'_> {
         }
 
         let candidates = if production_paths.is_empty() {
-            let name = module.ident.to_string();
+            let name = ident_text(&module.ident);
             vec![
                 module_dir.join(format!("{name}.rs")),
                 module_dir.join(&name).join("mod.rs"),
@@ -186,9 +195,9 @@ impl Builder<'_> {
             child
                 .parent()
                 .unwrap_or(module_dir)
-                .join(module.ident.to_string())
+                .join(ident_text(&module.ident))
         };
-        self.visit_file(child, child_scope.to_vec(), child_dir)
+        self.visit_file(child, child_scope.to_vec(), child_dir, item_condition)
     }
 }
 
@@ -212,7 +221,7 @@ pub(crate) fn build_module_graph(
             continue;
         }
         let module_dir = entry.parent().unwrap_or(&boundary).to_path_buf();
-        builder.visit_file(entry, scope.clone(), module_dir)?;
+        builder.visit_file(entry, scope.clone(), module_dir, CfgExpr::True)?;
     }
     if builder.units.is_empty() {
         bail!("production module graph is empty");

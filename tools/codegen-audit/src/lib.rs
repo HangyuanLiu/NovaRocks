@@ -52,6 +52,7 @@ impl fmt::Display for Violation {
 }
 
 struct NativeDependencyVisitor {
+    condition: crate::cfg::CfgExpr,
     violations: Vec<Violation>,
     source: String,
 }
@@ -63,7 +64,7 @@ impl<'ast> Visit<'ast> for NativeDependencyVisitor {
         let joined = path
             .segments
             .iter()
-            .map(|segment| segment.ident.to_string())
+            .map(|segment| crate::tokens::ident_text(&segment.ident))
             .collect::<Vec<_>>()
             .join("::");
         for forbidden in [
@@ -82,12 +83,24 @@ impl<'ast> Visit<'ast> for NativeDependencyVisitor {
     }
 
     fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        self.check_tokens(item.tokens.clone());
+        syn::visit::visit_macro(self, item);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.check_tokens(quote::quote!(#item));
+        syn::visit::visit_item_use(self, item);
+    }
+}
+
+impl NativeDependencyVisitor {
+    fn check_tokens(&mut self, tokens: proc_macro2::TokenStream) {
         for forbidden in [
             &["OptimizerPhysicalNode"][..],
             &["optimizer", "operator", "Operator"][..],
             &["optimizer", "physical_tree"][..],
         ] {
-            if crate::tokens::contains_path(item.tokens.clone(), forbidden) {
+            if crate::tokens::contains_path(tokens.clone(), forbidden) {
                 self.violations.push(Violation::new(
                     &self.source,
                     format!(
@@ -97,7 +110,6 @@ impl<'ast> Visit<'ast> for NativeDependencyVisitor {
                 ));
             }
         }
-        syn::visit::visit_macro(self, item);
     }
 }
 
@@ -121,6 +133,7 @@ pub fn audit_native_encoder(repo: &Path) -> Result<Vec<Violation>> {
     let mut violations = Vec::new();
     for unit in graph.units {
         let mut visitor = NativeDependencyVisitor {
+            condition: unit.condition,
             violations: Vec::new(),
             source: unit.path.display().to_string(),
         };
@@ -199,19 +212,7 @@ fn audit_reachable_sql_retirement(repo: &Path) -> Result<Vec<Violation>> {
 }
 
 fn physical_retirement_violations(repo: &Path) -> Result<Vec<Violation>> {
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        !needle.is_empty()
-            && haystack
-                .windows(needle.len())
-                .any(|window| window == needle)
-    }
-
-    fn visit(
-        path: &Path,
-        repo: &Path,
-        patterns: &[String],
-        violations: &mut Vec<Violation>,
-    ) -> Result<()> {
+    fn visit(path: &Path, repo: &Path, violations: &mut Vec<Violation>) -> Result<()> {
         for entry in fs::read_dir(path)
             .with_context(|| format!("read physical audit directory {}", path.display()))?
         {
@@ -224,36 +225,47 @@ fn physical_retirement_violations(repo: &Path) -> Result<Vec<Violation>> {
                 ) {
                     continue;
                 }
-                visit(&path, repo, patterns, violations)?;
+                visit(&path, repo, violations)?;
                 continue;
             }
             let bytes = fs::read(&path)
                 .with_context(|| format!("read physical audit source {}", path.display()))?;
-            for pattern in patterns {
-                if contains(&bytes, pattern.as_bytes()) {
-                    violations.push(Violation::new(
-                        path.strip_prefix(repo)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string(),
-                        "contains a physical reference to the retired SQL encoder owner",
-                    ));
-                }
+            let found = if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::str::from_utf8(&bytes)
+                    .with_context(|| format!("decode Rust source {}", path.display()))?;
+                let file = syn::parse_file(source)
+                    .with_context(|| format!("parse physical Rust source {}", path.display()))?;
+                retirement::physical_rust_source_mentions_retired(&file)
+            } else {
+                let normalized = String::from_utf8_lossy(&bytes)
+                    .replace('\\', "/")
+                    .replace("r#", "");
+                [
+                    ["crate", "sql", "codegen"].join("::"),
+                    ["sql", "codegen"].join("::"),
+                    ["src", "sql", "codegen"].join("/"),
+                ]
+                .iter()
+                .any(|pattern| normalized.contains(pattern))
+            };
+            if found {
+                violations.push(Violation::new(
+                    path.strip_prefix(repo)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                    "contains a physical reference to the retired SQL encoder owner",
+                ));
             }
         }
         Ok(())
     }
 
-    let patterns = vec![
-        ["crate", "sql", "codegen"].join("::"),
-        ["sql", "codegen"].join("::"),
-        ["src", "sql", "codegen"].join("/"),
-    ];
     let mut violations = Vec::new();
     for root in ["src", "tools"] {
         let path = repo.join(root);
         if path.is_dir() {
-            visit(&path, repo, &patterns, &mut violations)?;
+            visit(&path, repo, &mut violations)?;
         }
     }
     violations.sort();
@@ -674,6 +686,49 @@ fn owner() {
         );
     }
 
+    let fixture = tempfile::tempdir()?;
+    write_native_fixture(
+        fixture.path(),
+        r#"
+#[cfg(feature = "owner")]
+mod hidden;
+"#,
+    )?;
+    fs::write(
+        fixture.path().join("src/protocol/native/encode/hidden.rs"),
+        r#"
+#[cfg(not(feature = "owner"))]
+fn hidden(_: OptimizerPhysicalNode) {}
+"#,
+    )?;
+    assert!(
+        audit_native_encoder(fixture.path())?.is_empty(),
+        "external module ancestor cfg was not propagated"
+    );
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        r#"
+#[cfg(feature = "owner")]
+mod hidden;
+"#,
+    )?;
+    fs::write(
+        fixture.path().join("src/hidden.rs"),
+        format!(
+            r#"
+#[cfg(not(feature = "owner"))]
+fn hidden(_: {}::Legacy) {{}}
+"#,
+            retired_rust_path()
+        ),
+    )?;
+    assert!(
+        audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+        "external retirement module ancestor cfg was not propagated"
+    );
+
     for source in [
         r#"macro_rules! hidden { () => { type Leak = OptimizerPhysicalNode; }; }"#,
         r#"macro_rules! hidden { () => { type Leak = r#OptimizerPhysicalNode; }; }"#,
@@ -810,6 +865,204 @@ unknown_wrapper!(self::loader);
         );
     }
 
+    for source in [
+        r#"
+use crate::later as loader;
+pub use crate::inject as later;
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+loader!(crate::source_loader);
+"#,
+        r#"
+pub use crate::{inject as later};
+use self::later as loader;
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+loader!(crate::source_loader);
+"#,
+        r#"
+use crate::middle as loader;
+pub use crate::later as middle;
+pub use crate::inject as later;
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+loader!(crate::source_loader);
+"#,
+        r#"
+use self::right as left;
+use self::left as right;
+left!(println);
+"#,
+        r#"
+mod helpers {
+    #[macro_export]
+    macro_rules! source_loader { () => { include!("codegen/mod.rs"); }; }
+    #[macro_export]
+    macro_rules! inject { ($m:path) => { $m!(); }; }
+}
+mod sql {
+    use super::{later as loader};
+    pub use crate::inject as later;
+    loader!(crate::source_loader);
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), source)?;
+        assert!(
+            !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "order-independent alias graph escaped audit: {source}"
+        );
+    }
+
+    for source in [
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    #[cfg(not(feature = "owner"))]
+    let _: OptimizerPhysicalNode = unreachable!();
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+impl Owner {
+    #[cfg_attr(feature = "owner", cfg(not(feature = "owner")))]
+    fn hidden(_: OptimizerPhysicalNode) {}
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+trait OwnerTrait {
+    #[cfg(not(feature = "owner"))]
+    fn hidden(_: OptimizerPhysicalNode);
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    #[cfg(not(feature = "owner"))]
+    { let _: OptimizerPhysicalNode = unreachable!(); }
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    match 0 {
+        #[cfg(not(feature = "owner"))]
+        _ => { let _: OptimizerPhysicalNode = unreachable!(); }
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            audit_native_encoder(fixture.path())?.is_empty(),
+            "ancestor cfg conjunction was not propagated: {source}"
+        );
+    }
+
+    for template in [
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    #[cfg(not(feature = "owner"))]
+    let _: PATH::Legacy = unreachable!();
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+impl Owner {
+    #[cfg_attr(feature = "owner", cfg(not(feature = "owner")))]
+    fn hidden(_: PATH::Legacy) {}
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+trait OwnerTrait {
+    #[cfg(not(feature = "owner"))]
+    fn hidden(_: PATH::Legacy);
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    #[cfg(not(feature = "owner"))]
+    { let _: PATH::Legacy = unreachable!(); }
+}
+"#,
+        r#"
+#[cfg(feature = "owner")]
+fn owner() {
+    match 0 {
+        #[cfg(not(feature = "owner"))]
+        _ => { let _: PATH::Legacy = unreachable!(); }
+    }
+}
+"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(
+            fixture.path(),
+            &template.replace("PATH", &retired_rust_path()),
+        )?;
+        assert!(
+            audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+            "ancestor retirement cfg conjunction was not propagated: {template}"
+        );
+    }
+
+    for source in [
+        r#"fn forbidden(_: r#OptimizerPhysicalNode) {}"#,
+        r#"fn forbidden(_: r#optimizer::r#operator::r#Operator) {}"#,
+        r#"use r#optimizer::r#physical_tree::Leak;"#,
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_native_fixture(fixture.path(), source)?;
+        assert!(
+            !audit_native_encoder(fixture.path())?.is_empty(),
+            "raw native identifier escaped audit: {source}"
+        );
+    }
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        &format!(
+            "use {}::Legacy;",
+            ["crate", "r#sql", "r#codegen"].join("::")
+        ),
+    )?;
+    assert!(
+        !audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+        "raw retirement namespace escaped AST audit"
+    );
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        r#"
+use std::include as r#loader;
+unknown_wrapper!(r#loader);
+"#,
+    )?;
+    assert!(
+        !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+        "raw include alias escaped restricted macro audit"
+    );
+
     let fixture = tempfile::tempdir()?;
     write_retirement_fixture(
         fixture.path(),
@@ -829,13 +1082,44 @@ mod owner;
         write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
         let path = fixture.path().join(relative);
         fs::create_dir_all(path.parent().unwrap())?;
-        fs::write(
-            &path,
-            format!("# unreachable physical reference: {}", retired_rust_path()),
-        )?;
+        let source = if path.extension().is_some_and(|extension| extension == "rs") {
+            format!("use {}::Legacy;", retired_rust_path())
+        } else {
+            format!("# unreachable physical reference: {}", retired_rust_path())
+        };
+        fs::write(&path, source)?;
         assert!(
             !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
             "physical retirement inventory missed {relative}"
+        );
+    }
+
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+    fs::write(
+        fixture.path().join("src/orphan.rs"),
+        format!(
+            "use {}::Legacy;",
+            ["crate", "r#sql", "r#codegen"].join("::")
+        ),
+    )?;
+    assert!(
+        !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+        "raw unreachable Rust namespace escaped physical inventory"
+    );
+
+    for source in [
+        ["src", "sql", "codegen"].join("\\"),
+        ["src", "r#sql", "r#codegen"].join("/"),
+        ["crate", "r#sql", "r#codegen"].join("::"),
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+        fs::create_dir_all(fixture.path().join("tools"))?;
+        fs::write(fixture.path().join("tools/audit_helper.txt"), source)?;
+        assert!(
+            !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "normalized non-Rust retirement source escaped physical inventory"
         );
     }
 

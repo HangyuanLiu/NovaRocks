@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::quote;
 use syn::visit::Visit;
@@ -26,46 +26,105 @@ use syn::{Item, ItemMacro, ItemMod, ItemUse, Macro, UseTree};
 use crate::Violation;
 use crate::cfg::analyze_attrs;
 use crate::module_graph::{ModuleGraph, SourceUnit};
-use crate::production::{item_attrs, node_is_production};
+use crate::production::item_attrs;
+use crate::tokens::ident_text;
 
 type Scope = Vec<String>;
-type AliasMap = BTreeMap<(Scope, String), Vec<String>>;
+type AliasKey = (Scope, String);
+type AliasGraph = BTreeMap<AliasKey, Vec<String>>;
 
 fn path_segments(path: &syn::Path) -> Vec<String> {
     path.segments
         .iter()
-        .map(|segment| segment.ident.to_string())
+        .map(|segment| ident_text(&segment.ident))
         .collect()
 }
 
-fn canonicalize(path: &[String], scope: &[String], aliases: &AliasMap) -> Vec<String> {
-    if path.is_empty() {
-        return Vec::new();
-    }
-    let mut index = 0usize;
-    let mut base = if path[0] == "crate" {
-        index = 1;
-        vec!["crate".to_string()]
-    } else {
-        let mut owner_scope = scope.to_vec();
-        while path.get(index).is_some_and(|segment| segment == "self") {
-            index += 1;
+struct ResolvedPath {
+    segments: Vec<String>,
+    used_alias: bool,
+}
+
+fn resolve_path(path: &[String], scope: &[String], aliases: &AliasGraph) -> Result<ResolvedPath> {
+    fn resolve(
+        path: &[String],
+        scope: &[String],
+        aliases: &AliasGraph,
+        active: &mut BTreeSet<AliasKey>,
+        depth: usize,
+        alias_target: bool,
+    ) -> Result<ResolvedPath> {
+        if depth > 64 {
+            bail!("alias resolution exceeded maximum depth");
         }
-        while path.get(index).is_some_and(|segment| segment == "super") {
-            owner_scope.pop();
-            index += 1;
+        if path.is_empty() {
+            return Ok(ResolvedPath {
+                segments: Vec::new(),
+                used_alias: false,
+            });
         }
-        if let Some(owner) = path.get(index) {
-            if let Some(target) = aliases.get(&(owner_scope.clone(), owner.clone())) {
-                let mut resolved = target.clone();
-                resolved.extend_from_slice(&path[index + 1..]);
-                return canonicalize(&resolved, &owner_scope, aliases);
+        let mut index = 0usize;
+        let explicitly_scoped = matches!(path[0].as_str(), "crate" | "self" | "super");
+        let mut owner_scope = if path[0] == "crate" {
+            index = 1;
+            vec!["crate".to_string()]
+        } else {
+            let mut owner_scope = if alias_target && !explicitly_scoped {
+                vec!["crate".to_string()]
+            } else {
+                scope.to_vec()
+            };
+            while path.get(index).is_some_and(|segment| segment == "self") {
+                index += 1;
             }
+            while path.get(index).is_some_and(|segment| segment == "super") {
+                if owner_scope.len() <= 1 {
+                    bail!("alias path escapes crate root");
+                }
+                owner_scope.pop();
+                index += 1;
+            }
+            owner_scope
+        };
+        let Some(owner) = path.get(index) else {
+            return Ok(ResolvedPath {
+                segments: owner_scope,
+                used_alias: false,
+            });
+        };
+        let key = (owner_scope.clone(), owner.clone());
+        if let Some(target) = aliases.get(&key) {
+            if active.contains(&key) && alias_target && !explicitly_scoped {
+                owner_scope.extend_from_slice(&path[index..]);
+                return Ok(ResolvedPath {
+                    segments: owner_scope,
+                    used_alias: false,
+                });
+            }
+            if !active.insert(key.clone()) {
+                bail!("alias resolution cycle at {}", owner);
+            }
+            let mut resolved = resolve(target, &owner_scope, aliases, active, depth + 1, true)?;
+            active.remove(&key);
+            resolved.segments.extend_from_slice(&path[index + 1..]);
+            resolved.used_alias = true;
+            return Ok(resolved);
         }
-        owner_scope
-    };
-    base.extend_from_slice(&path[index..]);
-    base
+        owner_scope.extend_from_slice(&path[index..]);
+        Ok(ResolvedPath {
+            segments: owner_scope,
+            used_alias: false,
+        })
+    }
+
+    resolve(path, scope, aliases, &mut BTreeSet::new(), 0, false)
+}
+
+fn canonicalize(path: &[String], scope: &[String], aliases: &AliasGraph) -> Result<Vec<String>> {
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(resolve_path(path, scope, aliases)?.segments)
 }
 
 fn expand_use_tree(
@@ -75,23 +134,23 @@ fn expand_use_tree(
 ) {
     match tree {
         UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(ident_text(&path.ident));
             expand_use_tree(&path.tree, prefix, output);
             prefix.pop();
         }
         UseTree::Name(name) => {
             let mut path = prefix.clone();
             if name.ident != "self" {
-                path.push(name.ident.to_string());
+                path.push(ident_text(&name.ident));
             }
-            output.push((path, name.ident.to_string()));
+            output.push((path, ident_text(&name.ident)));
         }
         UseTree::Rename(rename) => {
             let mut path = prefix.clone();
             if rename.ident != "self" {
-                path.push(rename.ident.to_string());
+                path.push(ident_text(&rename.ident));
             }
-            output.push((path, rename.rename.to_string()));
+            output.push((path, ident_text(&rename.rename)));
         }
         UseTree::Group(group) => {
             for item in &group.items {
@@ -103,40 +162,48 @@ fn expand_use_tree(
 }
 
 struct AliasCollector<'a> {
+    condition: crate::cfg::CfgExpr,
     scope: Scope,
-    aliases: &'a mut AliasMap,
+    aliases: &'a mut AliasGraph,
 }
 
 impl AliasCollector<'_> {
     fn visit_items(&mut self, items: &[Item]) {
         for item in items {
-            if !node_is_production(item_attrs(item)) {
+            let condition =
+                crate::production::combined_condition(&self.condition, item_attrs(item));
+            if !condition
+                .production_possible()
+                .expect("production attributes were validated before alias collection")
+            {
                 continue;
             }
+            let parent = std::mem::replace(&mut self.condition, condition);
             match item {
                 Item::Use(item) => self.record_use(item),
                 Item::ExternCrate(item) => {
                     let local = item
                         .rename
                         .as_ref()
-                        .map(|(_, ident)| ident.to_string())
-                        .unwrap_or_else(|| item.ident.to_string());
+                        .map(|(_, ident)| ident_text(ident))
+                        .unwrap_or_else(|| ident_text(&item.ident));
                     let target = if item.ident == "self" {
                         vec!["crate".to_string()]
                     } else {
-                        vec![item.ident.to_string()]
+                        vec![ident_text(&item.ident)]
                     };
                     self.aliases.insert((self.scope.clone(), local), target);
                 }
                 Item::Mod(module) => {
                     if let Some((_, items)) = &module.content {
-                        self.scope.push(module.ident.to_string());
+                        self.scope.push(ident_text(&module.ident));
                         self.visit_items(items);
                         self.scope.pop();
                     }
                 }
                 _ => {}
             }
+            self.condition = parent;
         }
     }
 
@@ -144,8 +211,7 @@ impl AliasCollector<'_> {
         let mut expanded = Vec::new();
         expand_use_tree(&item.tree, &mut Vec::new(), &mut expanded);
         for (path, local) in expanded {
-            let target = canonicalize(&path, &self.scope, self.aliases);
-            self.aliases.insert((self.scope.clone(), local), target);
+            self.aliases.insert((self.scope.clone(), local), path);
         }
     }
 }
@@ -258,7 +324,7 @@ fn matcher_is_structurally_supported(tokens: TokenStream) -> bool {
             || !matches!(&tokens[index + 1], TokenTree::Ident(_))
             || !matches!(&tokens[index + 2], TokenTree::Punct(punct) if punct.as_char() == ':')
             || !matches!(&tokens[index + 3], TokenTree::Ident(fragment)
-                if matches!(fragment.to_string().as_str(), "ident" | "path" | "tt"))
+                if matches!(ident_text(fragment).as_str(), "ident" | "path" | "tt"))
         {
             return false;
         }
@@ -303,8 +369,8 @@ fn match_tokens(
         let TokenTree::Ident(fragment) = &matcher[matcher_index + 3] else {
             unreachable!()
         };
-        let name = name.to_string();
-        let fragment = fragment.to_string();
+        let name = ident_text(name);
+        let fragment = ident_text(fragment);
         let lengths = match fragment.as_str() {
             "ident" if matches!(arguments.get(argument_index), Some(TokenTree::Ident(_))) => {
                 vec![1]
@@ -396,7 +462,7 @@ fn substitute(tokens: TokenStream, bindings: &BTreeMap<String, TokenStream>) -> 
             let TokenTree::Ident(ident) = &tokens[index + 1] else {
                 unreachable!()
             };
-            if let Some(replacement) = bindings.get(&ident.to_string()) {
+            if let Some(replacement) = bindings.get(&ident_text(ident)) {
                 output.extend(replacement.clone());
                 index += 2;
                 continue;
@@ -423,7 +489,7 @@ fn token_path(tokens: &[TokenTree]) -> Option<Vec<String>> {
         let TokenTree::Ident(ident) = &tokens[index] else {
             return None;
         };
-        path.push(ident.to_string());
+        path.push(ident_text(ident));
         index += 1;
         if index == tokens.len() {
             break;
@@ -439,39 +505,54 @@ fn token_path(tokens: &[TokenTree]) -> Option<Vec<String>> {
     (!path.is_empty()).then_some(path)
 }
 
+enum MacroDefinitionLookup {
+    Found(Vec<String>),
+    NotFound,
+    Unresolved,
+}
+
 fn macro_definition_key(
     inventory: &MacroInventory,
     scope: &[String],
     path: &[String],
-    aliases: &AliasMap,
-) -> Option<Vec<String>> {
-    let canonical = canonicalize(path, scope, aliases);
-    if inventory.definitions.contains_key(&canonical) {
-        return Some(canonical);
+    aliases: &AliasGraph,
+) -> MacroDefinitionLookup {
+    let resolved = match resolve_path(path, scope, aliases) {
+        Ok(resolved) => resolved,
+        Err(_) => return MacroDefinitionLookup::Unresolved,
+    };
+    if inventory.definitions.contains_key(&resolved.segments) {
+        return MacroDefinitionLookup::Found(resolved.segments);
     }
     if path.len() == 1 {
-        let name = path.first()?;
+        let Some(name) = path.first() else {
+            return MacroDefinitionLookup::NotFound;
+        };
         for depth in (1..=scope.len()).rev() {
             let mut key = scope[..depth].to_vec();
             key.push(name.clone());
             if inventory.definitions.contains_key(&key) {
-                return Some(key);
+                return MacroDefinitionLookup::Found(key);
             }
         }
     }
-    None
+    if resolved.used_alias {
+        MacroDefinitionLookup::Unresolved
+    } else {
+        MacroDefinitionLookup::NotFound
+    }
 }
 
-fn path_is_include(path: &[String], scope: &[String], aliases: &AliasMap) -> bool {
-    canonicalize(path, scope, aliases)
+fn path_is_include(path: &[String], scope: &[String], aliases: &AliasGraph) -> Result<bool> {
+    Ok(canonicalize(path, scope, aliases)?
         .last()
-        .is_some_and(|segment| segment == "include")
+        .is_some_and(|segment| segment == "include"))
 }
 
 fn token_stream_mentions_include_argument(
     tokens: TokenStream,
     scope: &[String],
-    aliases: &AliasMap,
+    aliases: &AliasGraph,
 ) -> bool {
     let tokens = tokens.into_iter().collect::<Vec<_>>();
     for (index, token) in tokens.iter().enumerate() {
@@ -487,7 +568,7 @@ fn token_stream_mentions_include_argument(
             let Some(path) = token_path(&tokens[index..end]) else {
                 continue;
             };
-            if path_is_include(&path, scope, aliases) {
+            if path_is_include(&path, scope, aliases).unwrap_or(true) {
                 return true;
             }
         }
@@ -498,7 +579,7 @@ fn token_stream_mentions_include_argument(
 fn expanded_tokens_reach_include(
     tokens: TokenStream,
     scope: &[String],
-    aliases: &AliasMap,
+    aliases: &AliasGraph,
     inventory: &MacroInventory,
     active: &mut BTreeSet<Vec<String>>,
 ) -> bool {
@@ -528,14 +609,16 @@ fn expanded_tokens_reach_include(
         let Some(path) = token_path(&tokens[start..index]) else {
             continue;
         };
-        if path_is_include(&path, scope, aliases) {
+        if path_is_include(&path, scope, aliases).unwrap_or(true) {
             return true;
         }
         if token_stream_mentions_include_argument(arguments.stream(), scope, aliases) {
             return true;
         }
-        let Some(key) = macro_definition_key(inventory, scope, &path, aliases) else {
-            continue;
+        let key = match macro_definition_key(inventory, scope, &path, aliases) {
+            MacroDefinitionLookup::Found(key) => key,
+            MacroDefinitionLookup::NotFound => continue,
+            MacroDefinitionLookup::Unresolved => return true,
         };
         if !active.insert(key.clone()) {
             continue;
@@ -566,7 +649,7 @@ fn expanded_tokens_reach_include(
 
 fn invocation_reaches_include(
     invocation: &MacroInvocation,
-    aliases: &AliasMap,
+    aliases: &AliasGraph,
     inventory: &MacroInventory,
 ) -> bool {
     if token_stream_mentions_include_argument(
@@ -576,9 +659,10 @@ fn invocation_reaches_include(
     ) {
         return true;
     }
-    let Some(key) = macro_definition_key(inventory, &invocation.scope, &invocation.path, aliases)
-    else {
-        return false;
+    let key = match macro_definition_key(inventory, &invocation.scope, &invocation.path, aliases) {
+        MacroDefinitionLookup::Found(key) => key,
+        MacroDefinitionLookup::NotFound => return false,
+        MacroDefinitionLookup::Unresolved => return true,
     };
     let definition = &inventory.definitions[&key];
     for arm in &definition.arms {
@@ -602,6 +686,7 @@ fn invocation_reaches_include(
 }
 
 struct InventoryVisitor<'a> {
+    condition: crate::cfg::CfgExpr,
     scope: Scope,
     inventory: &'a mut MacroInventory,
 }
@@ -623,7 +708,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
     crate::production::production_pruning_methods!();
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
-        self.scope.push(item.ident.to_string());
+        self.scope.push(ident_text(&item.ident));
         syn::visit::visit_item_mod(self, item);
         self.scope.pop();
     }
@@ -638,7 +723,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
                 arms: macro_arms(item.mac.tokens.clone()),
             };
             let mut key = self.scope.clone();
-            key.push(name.to_string());
+            key.push(ident_text(name));
             self.inventory.definitions.insert(key, definition.clone());
             if item
                 .attrs
@@ -647,7 +732,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
             {
                 self.inventory
                     .definitions
-                    .insert(vec!["crate".to_string(), name.to_string()], definition);
+                    .insert(vec!["crate".to_string(), ident_text(name)], definition);
             }
         } else {
             self.record_macro(&item.mac);
@@ -661,9 +746,10 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
 }
 
 struct RetirementVisitor<'a> {
+    condition: crate::cfg::CfgExpr,
     source: String,
     scope: Scope,
-    aliases: &'a AliasMap,
+    aliases: &'a AliasGraph,
     violations: &'a mut Vec<Violation>,
 }
 
@@ -676,7 +762,10 @@ impl RetirementVisitor<'_> {
     }
 
     fn check_path(&mut self, path: &syn::Path) {
-        let canonical = canonicalize(&path_segments(path), &self.scope, self.aliases);
+        let canonical = match canonicalize(&path_segments(path), &self.scope, self.aliases) {
+            Ok(canonical) => canonical,
+            Err(_) => return,
+        };
         if canonical.starts_with(&[
             "crate".to_string(),
             "sql".to_string(),
@@ -718,13 +807,13 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
                 ),
             ));
         }
-        if self.scope == ["crate", "sql"] && item.ident == "codegen" {
+        if self.scope == ["crate", "sql"] && ident_text(&item.ident) == "codegen" {
             self.violations.push(Violation::new(
                 &self.source,
                 "declares retired codegen module",
             ));
         }
-        self.scope.push(item.ident.to_string());
+        self.scope.push(ident_text(&item.ident));
         syn::visit::visit_item_mod(self, item);
         self.scope.pop();
     }
@@ -739,7 +828,10 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
                     "restores retired codegen module binding",
                 ));
             }
-            let canonical = canonicalize(&path, &self.scope, self.aliases);
+            let canonical = match canonicalize(&path, &self.scope, self.aliases) {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
             if canonical.starts_with(&[
                 "crate".to_string(),
                 "sql".to_string(),
@@ -758,8 +850,8 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
         let local = item
             .rename
             .as_ref()
-            .map(|(_, ident)| ident.to_string())
-            .unwrap_or_else(|| item.ident.to_string());
+            .map(|(_, ident)| ident_text(ident))
+            .unwrap_or_else(|| ident_text(&item.ident));
         if self.scope == ["crate", "sql"] && local == "codegen" {
             self.violations.push(Violation::new(
                 &self.source,
@@ -789,7 +881,7 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
                     value if value == normalized(&quote!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs")))
                         || value == normalized(&quote!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs")))
                 );
-            if path_is_include(&path, &self.scope, self.aliases) && !known_safe {
+            if path_is_include(&path, &self.scope, self.aliases).unwrap_or(true) && !known_safe {
                 self.violations.push(Violation::new(
                     &self.source,
                     "uses production include! at crate root or inside SQL namespace",
@@ -801,9 +893,10 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
 }
 
 pub(crate) fn audit_graph(graph: &ModuleGraph) -> Result<Vec<Violation>> {
-    let mut aliases = AliasMap::new();
+    let mut aliases = AliasGraph::new();
     for unit in &graph.units {
         AliasCollector {
+            condition: unit.condition.clone(),
             scope: unit.scope.clone(),
             aliases: &mut aliases,
         }
@@ -814,6 +907,7 @@ pub(crate) fn audit_graph(graph: &ModuleGraph) -> Result<Vec<Violation>> {
     for unit in &graph.units {
         let source = unit.path.display().to_string();
         RetirementVisitor {
+            condition: unit.condition.clone(),
             source,
             scope: unit.scope.clone(),
             aliases: &aliases,
@@ -823,8 +917,15 @@ pub(crate) fn audit_graph(graph: &ModuleGraph) -> Result<Vec<Violation>> {
     }
 
     let mut inventory = MacroInventory::default();
-    for SourceUnit { scope, file, .. } in &graph.units {
+    for SourceUnit {
+        scope,
+        condition,
+        file,
+        ..
+    } in &graph.units
+    {
         InventoryVisitor {
+            condition: condition.clone(),
             scope: scope.clone(),
             inventory: &mut inventory,
         }
@@ -849,4 +950,48 @@ pub(crate) fn audit_graph(graph: &ModuleGraph) -> Result<Vec<Violation>> {
     violations.sort();
     violations.dedup();
     Ok(violations)
+}
+
+pub(crate) fn physical_rust_source_mentions_retired(file: &syn::File) -> bool {
+    struct PhysicalVisitor {
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for PhysicalVisitor {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path_segments(path);
+            if segments
+                .windows(2)
+                .any(|window| window == ["sql", "codegen"])
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_macro(&mut self, item: &'ast Macro) {
+            if crate::tokens::contains_path(item.tokens.clone(), &["sql", "codegen"]) {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast ItemUse) {
+            if crate::tokens::contains_path(quote!(#item), &["sql", "codegen"]) {
+                self.found = true;
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            let normalized = literal.value().replace('\\', "/").replace("r#", "");
+            if normalized.contains(&["src", "sql", "codegen"].join("/")) {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut visitor = PhysicalVisitor { found: false };
+    visitor.visit_file(file);
+    visitor.found
 }

@@ -103,7 +103,7 @@ pub(crate) fn cfg_expr(meta: &Meta) -> Result<CfgExpr> {
         Meta::Path(path) => Ok(CfgExpr::Atom(
             path.segments
                 .iter()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| crate::tokens::ident_text(&segment.ident))
                 .collect::<Vec<_>>()
                 .join("::"),
         )),
