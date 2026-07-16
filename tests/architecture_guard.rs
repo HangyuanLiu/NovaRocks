@@ -36388,6 +36388,37 @@ fn rfd4_m2b1_type_idents(ty: &syn::Type) -> BTreeSet<String> {
     audit.idents
 }
 
+fn rfd4_m2b1_type_contains_unborrowed_ident(ty: &syn::Type, expected: &str) -> bool {
+    struct UnborrowedIdentAudit<'a> {
+        expected: &'a str,
+        reference_depth: usize,
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for UnborrowedIdentAudit<'_> {
+        fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+            self.reference_depth += 1;
+            syn::visit::visit_type_reference(self, reference);
+            self.reference_depth -= 1;
+        }
+
+        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+            if self.reference_depth == 0 && segment.ident == self.expected {
+                self.found = true;
+            }
+            syn::visit::visit_path_segment(self, segment);
+        }
+    }
+
+    let mut audit = UnborrowedIdentAudit {
+        expected,
+        reference_depth: 0,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut audit, ty);
+    audit.found
+}
+
 fn rfd4_m2b1_type_is_named(ty: &syn::Type, expected: &str) -> bool {
     matches!(
         ty,
@@ -36425,6 +36456,7 @@ fn rfd4_m2b1_type_is_arc_of(ty: &syn::Type, expected: &str) -> bool {
 #[derive(Default)]
 struct Rfd4M2b1AstAudit {
     composite_fields_are_exact: Option<bool>,
+    current_impl_owner: Option<String>,
     installed_deployment_has_router: Option<bool>,
     role_router_storage: BTreeSet<String>,
     split_routing_activation: BTreeSet<String>,
@@ -36433,25 +36465,22 @@ struct Rfd4M2b1AstAudit {
 }
 
 impl Rfd4M2b1AstAudit {
-    fn audit_signature(&mut self, signature: &syn::Signature) {
+    fn audit_signature(&mut self, signature: &syn::Signature, private_free_helper: bool) {
         let name = signature.ident.to_string();
-        let lower = name.to_ascii_lowercase();
-        if lower != "install"
-            && lower != "install_view"
-            && !lower.starts_with("install_core")
-            && !lower.starts_with("install_runtime_filter")
-            && !lower.ends_with("_install")
-        {
-            return;
-        }
         let mut parameter_types = BTreeSet::new();
+        let mut has_unborrowed_view = false;
         for input in &signature.inputs {
             if let syn::FnArg::Typed(input) = input {
                 parameter_types.extend(rfd4_m2b1_type_idents(&input.ty));
+                has_unborrowed_view |=
+                    rfd4_m2b1_type_contains_unborrowed_ident(&input.ty, "RuntimeFilterInstallView");
             }
         }
+        let exempt_private_helper = private_free_helper && !has_unborrowed_view;
         if parameter_types.contains("RuntimeFilterInstallView")
             && !parameter_types.contains("RuntimeFilterParticipantInstall")
+            && self.current_impl_owner.as_deref() != Some("RuntimeFilterParticipantInstall")
+            && !exempt_private_helper
         {
             self.view_only_installs.insert(name);
         }
@@ -36478,6 +36507,20 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
             return;
         }
         syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let previous = self.current_impl_owner.take();
+        self.current_impl_owner = match item.self_ty.as_ref() {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string()),
+            _ => None,
+        };
+        syn::visit::visit_item_impl(self, item);
+        self.current_impl_owner = previous;
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
@@ -36573,7 +36616,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
             self.split_routing_activation.insert(name);
         }
-        self.audit_signature(&item.sig);
+        self.audit_signature(&item.sig, matches!(item.vis, syn::Visibility::Inherited));
         syn::visit::visit_item_fn(self, item);
     }
 
@@ -36583,7 +36626,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
             self.split_routing_activation.insert(name);
         }
-        self.audit_signature(&item.sig);
+        self.audit_signature(&item.sig, false);
         syn::visit::visit_impl_item_fn(self, item);
     }
 
@@ -36593,7 +36636,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
             self.split_routing_activation.insert(name);
         }
-        self.audit_signature(&item.sig);
+        self.audit_signature(&item.sig, false);
         syn::visit::visit_trait_item_fn(self, item);
     }
 
@@ -36738,10 +36781,7 @@ fn rfd4_m2b1_atomic_install_violations(sources: &[Rfd4M2b1GuardSource]) -> Vec<S
                 source.path
             ));
         }
-        if matches!(
-            source.path.as_str(),
-            "src/runtime_filter/service/registry.rs" | "src/runtime_filter/service/mod.rs"
-        ) {
+        if source.path.starts_with("src/runtime_filter/service/") && source.path.ends_with(".rs") {
             for banned in ["RoutingRegistry", "routing_registry", "install_routing"] {
                 if rust_use_tokens(&production)
                     .iter()
@@ -36920,6 +36960,49 @@ fn rfd4_m2b1_detector_rejects_view_only_install_surfaces() {
 }
 
 #[test]
+fn rfd4_m2b1_detector_rejects_arbitrarily_named_view_only_install_authorities() {
+    for (path, source) in [
+        (
+            "src/runtime_filter/service/mod.rs",
+            "fn install_deployment(view: RuntimeFilterInstallView) {}",
+        ),
+        (
+            "src/runtime_filter/service/registry.rs",
+            "pub(crate) fn publish_deployment(view: &RuntimeFilterInstallView) {}",
+        ),
+        (
+            "src/runtime_filter/port/install.rs",
+            "pub trait RuntimeFilterInstallPort { \
+             fn publish_deployment(&self, view: RuntimeFilterInstallView); \
+             }",
+        ),
+    ] {
+        let violations =
+            rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(path, source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "{path} must reject a production install authority that accepts only \
+             RuntimeFilterInstallView, independent of API naming: {violations:?}"
+        );
+    }
+
+    let private_comparison = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "fn install_views_equivalent( \
+         left: &RuntimeFilterInstallView, right: &RuntimeFilterInstallView \
+         ) -> bool { todo!() }",
+    )]);
+    assert!(
+        !private_comparison
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "private borrowed comparison helpers are not install authorities: {private_comparison:?}"
+    );
+}
+
+#[test]
 fn rfd4_m2b1_detector_rejects_split_routing_activation() {
     for source in [
         "struct RoutingRegistry;",
@@ -36939,6 +37022,22 @@ fn rfd4_m2b1_detector_rejects_split_routing_activation() {
             "service registry must reject independent routing activation: {source}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn rfd4_m2b1_detector_rejects_split_routing_activation_in_service_submodules() {
+    let source = "struct RoutingRegistry; fn install_routing() {}";
+    let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/router_state.rs",
+        source,
+    )]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("split-routing-activation")),
+        "every production runtime_filter/service submodule must reject independent routing \
+         activation authority: {violations:?}"
+    );
 }
 
 #[test]
@@ -37052,9 +37151,9 @@ fn rfd4_m2b1_detector_allows_atomic_domain_and_install_owners() {
         ),
         Rfd4M2b1GuardSource::new(
             "src/runtime_filter/deployment/extension.rs",
-            "fn participant_installs(view: RuntimeFilterInstallView, \
-             routing_shard: RuntimeFilterRoutingShard) { \
-             let _ = RuntimeFilterParticipantInstall::new(view, routing_shard); }",
+            "fn participant_installs(plan: &RuntimeFilterDeploymentPlan) { \
+             let _ = RuntimeFilterParticipantInstall::new( \
+             plan.install_view(), plan.routing_shard()); }",
         ),
         Rfd4M2b1GuardSource::new(
             "src/runtime_filter/service/registry.rs",
