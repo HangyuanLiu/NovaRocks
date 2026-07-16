@@ -235,18 +235,9 @@ fn physical_retirement_violations(repo: &Path) -> Result<Vec<Violation>> {
                     .with_context(|| format!("decode Rust source {}", path.display()))?;
                 let file = syn::parse_file(source)
                     .with_context(|| format!("parse physical Rust source {}", path.display()))?;
-                retirement::physical_rust_source_mentions_retired(&file)
+                retirement::physical_rust_source_mentions_retired(source, &file)
             } else {
-                let normalized = String::from_utf8_lossy(&bytes)
-                    .replace('\\', "/")
-                    .replace("r#", "");
-                [
-                    ["crate", "sql", "codegen"].join("::"),
-                    ["sql", "codegen"].join("::"),
-                    ["src", "sql", "codegen"].join("/"),
-                ]
-                .iter()
-                .any(|pattern| normalized.contains(pattern))
+                retirement::normalized_text_mentions_retired(&String::from_utf8_lossy(&bytes))
             };
             if found {
                 violations.push(Violation::new(
@@ -729,6 +720,27 @@ fn hidden(_: {}::Legacy) {{}}
         "external retirement module ancestor cfg was not propagated"
     );
 
+    let fixture = tempfile::tempdir()?;
+    write_retirement_fixture(
+        fixture.path(),
+        r#"
+#[cfg(feature = "owner")]
+mod outer {
+    #[cfg_attr(not(feature = "owner"), path = "codegen.rs")]
+    mod hidden;
+}
+"#,
+    )?;
+    fs::create_dir_all(fixture.path().join("src/outer"))?;
+    fs::write(
+        fixture.path().join("src/outer/hidden.rs"),
+        "pub struct Hidden;",
+    )?;
+    assert!(
+        audit_reachable_sql_retirement(fixture.path())?.is_empty(),
+        "ancestor cfg must make the nested retired path activation impossible"
+    );
+
     for source in [
         r#"macro_rules! hidden { () => { type Leak = OptimizerPhysicalNode; }; }"#,
         r#"macro_rules! hidden { () => { type Leak = r#OptimizerPhysicalNode; }; }"#,
@@ -1107,6 +1119,44 @@ mod owner;
         !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
         "raw unreachable Rust namespace escaped physical inventory"
     );
+
+    for source in [
+        format!("unknown!({});", ["crate", "r#sql", "r#codegen"].join(" / ")),
+        format!("unknown!({});", ["r#sql", "r#codegen"].join(" / ")),
+        format!(
+            "include!(r\"{}\");",
+            ["src", "r#sql", "r#codegen", "mod.rs"].join("\\")
+        ),
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+        fs::write(fixture.path().join("src/orphan.rs"), &source)?;
+        assert!(
+            !audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "normalized Rust physical source escaped inventory: {source}"
+        );
+    }
+
+    for source in [
+        format!(
+            "// {} {}",
+            retired_rust_path(),
+            ["src", "r#sql", "r#codegen"].join("\\")
+        ),
+        format!(
+            "const NOTE: &str = r\"{} {}\";",
+            retired_rust_path(),
+            ["src", "r#sql", "r#codegen"].join("\\")
+        ),
+    ] {
+        let fixture = tempfile::tempdir()?;
+        write_retirement_fixture(fixture.path(), "pub struct Owner;")?;
+        fs::write(fixture.path().join("src/orphan.rs"), &source)?;
+        assert!(
+            audit_sql_codegen_retirement(fixture.path())?.is_empty(),
+            "Rust comment or ordinary string must not count as physical ownership: {source}"
+        );
+    }
 
     for source in [
         ["src", "sql", "codegen"].join("\\"),

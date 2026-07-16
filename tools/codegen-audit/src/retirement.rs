@@ -790,8 +790,7 @@ impl<'ast> Visit<'ast> for RetirementVisitor<'_> {
             .iter()
             .zip(&analysis.path_conditions)
             .any(|(path, activation)| {
-                analysis
-                    .item_condition
+                self.condition
                     .clone()
                     .and(activation.clone())
                     .production_possible()
@@ -952,7 +951,160 @@ pub(crate) fn audit_graph(graph: &ModuleGraph) -> Result<Vec<Violation>> {
     Ok(violations)
 }
 
-pub(crate) fn physical_rust_source_mentions_retired(file: &syn::File) -> bool {
+fn rust_char_literal_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let first = *bytes.get(start + 1)?;
+    let mut cursor = start + 1;
+    if first == b'\\' {
+        cursor += 1;
+        match *bytes.get(cursor)? {
+            b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                cursor += 2;
+                while bytes.get(cursor) != Some(&b'}') {
+                    cursor += 1;
+                }
+                cursor += 1;
+            }
+            b'x' => cursor += 3,
+            _ => cursor += 1,
+        }
+    } else {
+        cursor += source.get(cursor..)?.chars().next()?.len_utf8();
+    }
+    (bytes.get(cursor) == Some(&b'\'')).then_some(cursor)
+}
+
+fn rust_raw_string_open(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if bytes.get(start) != Some(&b'r') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some((cursor - start - 1, cursor - start + 1))
+}
+
+#[derive(Clone, Copy)]
+enum RustLexicalState {
+    Code,
+    LineComment,
+    BlockComment(usize),
+    String { escaped: bool },
+    RawString { hashes: usize },
+}
+
+fn rust_lexically_sanitized(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut state = RustLexicalState::Code;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match state {
+            RustLexicalState::Code => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::LineComment;
+                } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(1);
+                } else if let Some((hashes, opening_len)) = rust_raw_string_open(bytes, index) {
+                    output.extend(std::iter::repeat_n(b' ', opening_len));
+                    index += opening_len;
+                    state = RustLexicalState::RawString { hashes };
+                } else if bytes[index] == b'"' {
+                    output.push(b' ');
+                    index += 1;
+                    state = RustLexicalState::String { escaped: false };
+                } else if bytes[index] == b'\''
+                    && let Some(end) = rust_char_literal_end(source, index)
+                {
+                    output.extend(std::iter::repeat_n(b' ', end - index + 1));
+                    index = end + 1;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            RustLexicalState::LineComment => {
+                output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                if bytes[index] == b'\n' {
+                    state = RustLexicalState::Code;
+                }
+                index += 1;
+            }
+            RustLexicalState::BlockComment(depth) => {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = RustLexicalState::BlockComment(depth + 1);
+                } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    output.extend_from_slice(b"  ");
+                    index += 2;
+                    state = if depth == 1 {
+                        RustLexicalState::Code
+                    } else {
+                        RustLexicalState::BlockComment(depth - 1)
+                    };
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+            RustLexicalState::String { escaped } => {
+                let byte = bytes[index];
+                output.push(if byte == b'\n' { b'\n' } else { b' ' });
+                index += 1;
+                state = if escaped {
+                    RustLexicalState::String { escaped: false }
+                } else if byte == b'\\' {
+                    RustLexicalState::String { escaped: true }
+                } else if byte == b'"' {
+                    RustLexicalState::Code
+                } else {
+                    RustLexicalState::String { escaped: false }
+                };
+            }
+            RustLexicalState::RawString { hashes } => {
+                let closes = bytes[index] == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'));
+                if closes {
+                    output.extend(std::iter::repeat_n(b' ', hashes + 1));
+                    index += hashes + 1;
+                    state = RustLexicalState::Code;
+                } else {
+                    output.push(if bytes[index] == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+        }
+    }
+    String::from_utf8(output).expect("Rust lexical sanitizer must preserve valid UTF-8")
+}
+
+pub(crate) fn normalized_text_mentions_retired(source: &str) -> bool {
+    let normalized = source
+        .replace('\\', "/")
+        .replace("r#", "")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    [
+        ["crate", "sql", "codegen"].join("::"),
+        ["sql", "codegen"].join("::"),
+        ["crate", "sql", "codegen"].join("/"),
+        ["sql", "codegen"].join("/"),
+        ["src", "sql", "codegen"].join("/"),
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
+}
+
+pub(crate) fn physical_rust_source_mentions_retired(source: &str, file: &syn::File) -> bool {
     struct PhysicalVisitor {
         found: bool,
     }
@@ -973,6 +1125,19 @@ pub(crate) fn physical_rust_source_mentions_retired(file: &syn::File) -> bool {
             if crate::tokens::contains_path(item.tokens.clone(), &["sql", "codegen"]) {
                 self.found = true;
             }
+            let macro_name = item
+                .path
+                .segments
+                .last()
+                .map(|segment| ident_text(&segment.ident));
+            if matches!(
+                macro_name.as_deref(),
+                Some("include" | "include_str" | "include_bytes")
+            ) && syn::parse2::<syn::LitStr>(item.tokens.clone())
+                .is_ok_and(|literal| normalized_text_mentions_retired(&literal.value()))
+            {
+                self.found = true;
+            }
             syn::visit::visit_macro(self, item);
         }
 
@@ -983,15 +1148,28 @@ pub(crate) fn physical_rust_source_mentions_retired(file: &syn::File) -> bool {
             syn::visit::visit_item_use(self, item);
         }
 
-        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-            let normalized = literal.value().replace('\\', "/").replace("r#", "");
-            if normalized.contains(&["src", "sql", "codegen"].join("/")) {
+        fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+            let path_value = match &attribute.meta {
+                syn::Meta::NameValue(value) if value.path.is_ident("path") => match &value.value {
+                    syn::Expr::Lit(expression) => match &expression.lit {
+                        syn::Lit::Str(literal) => Some(literal.value()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            if path_value
+                .as_deref()
+                .is_some_and(normalized_text_mentions_retired)
+            {
                 self.found = true;
             }
+            syn::visit::visit_attribute(self, attribute);
         }
     }
 
     let mut visitor = PhysicalVisitor { found: false };
     visitor.visit_file(file);
-    visitor.found
+    visitor.found || normalized_text_mentions_retired(&rust_lexically_sanitized(source))
 }
