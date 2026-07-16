@@ -36370,53 +36370,180 @@ impl Rfd4M2b1GuardSource {
     }
 }
 
-fn rfd4_m2b1_type_idents(ty: &syn::Type) -> BTreeSet<String> {
-    #[derive(Default)]
-    struct TypeIdentAudit {
-        idents: BTreeSet<String>,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for TypeIdentAudit {
-        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
-            self.idents.insert(segment.ident.to_string());
-            syn::visit::visit_path_segment(self, segment);
-        }
-    }
-
-    let mut audit = TypeIdentAudit::default();
-    syn::visit::Visit::visit_type(&mut audit, ty);
-    audit.idents
+#[derive(Clone, Debug, Default)]
+struct Rfd4M2b1TypeResolver {
+    bindings: BTreeMap<String, BTreeSet<String>>,
+    shadows: BTreeSet<String>,
 }
 
-fn rfd4_m2b1_type_contains_unborrowed_ident(ty: &syn::Type, expected: &str) -> bool {
-    struct UnborrowedIdentAudit<'a> {
-        expected: &'a str,
-        reference_depth: usize,
-        found: bool,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for UnborrowedIdentAudit<'_> {
-        fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
-            self.reference_depth += 1;
-            syn::visit::visit_type_reference(self, reference);
-            self.reference_depth -= 1;
-        }
-
-        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
-            if self.reference_depth == 0 && segment.ident == self.expected {
-                self.found = true;
+impl Rfd4M2b1TypeResolver {
+    fn from_source(source_rel: &str, production: &str, file: &syn::File) -> Self {
+        let mut resolver = Self::default();
+        for item in &file.items {
+            let ident = match item {
+                syn::Item::Struct(item) => Some(item.ident.to_string()),
+                syn::Item::Enum(item) => Some(item.ident.to_string()),
+                syn::Item::Union(item) => Some(item.ident.to_string()),
+                syn::Item::Trait(item) => Some(item.ident.to_string()),
+                syn::Item::Mod(item) => Some(item.ident.to_string()),
+                _ => None,
+            };
+            if let Some(ident) = ident {
+                resolver.shadows.insert(ident);
             }
-            syn::visit::visit_path_segment(self, segment);
         }
+
+        let aliases = rust_scoped_aliases(production);
+        for raw in rust_raw_use_statements(production)
+            .into_iter()
+            .filter(|raw| raw.inline_modules.is_empty())
+        {
+            let local = match raw.path.alias.as_deref() {
+                Some("_") => None,
+                Some(alias) => Some(alias.to_string()),
+                None => raw
+                    .path
+                    .segments
+                    .last()
+                    .filter(|segment| segment.as_str() != "*")
+                    .cloned(),
+            };
+            let Some(local) = local else {
+                continue;
+            };
+            let resolved = rust_resolve_scoped_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments,
+                    inline_modules: raw.inline_modules,
+                }]
+            });
+            for path in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    source_rel,
+                    &path.inline_modules,
+                ) else {
+                    continue;
+                };
+                for symbol in [
+                    "RuntimeFilterInstallView",
+                    "RuntimeFilterParticipantInstall",
+                    "RoleRouter",
+                ] {
+                    if rfd4_m2b1_canonical_symbol_path(&canonical, symbol) {
+                        resolver
+                            .bindings
+                            .entry(local.clone())
+                            .or_default()
+                            .insert(symbol.to_string());
+                    }
+                }
+            }
+            resolver.shadows.remove(&local);
+        }
+
+        let type_aliases = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Type(item) if !nfe_4_syn_attrs_require_test(&item.attrs) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..=type_aliases.len() {
+            let before = resolver.bindings.clone();
+            for alias in &type_aliases {
+                for symbol in [
+                    "RuntimeFilterInstallView",
+                    "RuntimeFilterParticipantInstall",
+                    "RoleRouter",
+                ] {
+                    if resolver.type_contains_symbol(&alias.ty, symbol) {
+                        resolver
+                            .bindings
+                            .entry(alias.ident.to_string())
+                            .or_default()
+                            .insert(symbol.to_string());
+                    }
+                }
+            }
+            if resolver.bindings == before {
+                break;
+            }
+        }
+        resolver
     }
 
-    let mut audit = UnborrowedIdentAudit {
-        expected,
-        reference_depth: 0,
-        found: false,
+    fn path_is_symbol(&self, path: &syn::Path, symbol: &str) -> bool {
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        let Some(first) = segments.first() else {
+            return false;
+        };
+        if rfd4_m2b1_canonical_symbol_path(&segments, symbol) {
+            return true;
+        }
+        if self
+            .bindings
+            .get(first)
+            .is_some_and(|symbols| symbols.contains(symbol))
+        {
+            return true;
+        }
+        first == symbol && !self.shadows.contains(first)
+    }
+
+    fn type_contains_symbol(&self, ty: &syn::Type, symbol: &str) -> bool {
+        struct SymbolAudit<'a> {
+            resolver: &'a Rfd4M2b1TypeResolver,
+            symbol: &'a str,
+            found: bool,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for SymbolAudit<'_> {
+            fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                if path.qself.is_none() && self.resolver.path_is_symbol(&path.path, self.symbol) {
+                    self.found = true;
+                }
+                syn::visit::visit_type_path(self, path);
+            }
+        }
+
+        let mut audit = SymbolAudit {
+            resolver: self,
+            symbol,
+            found: false,
+        };
+        syn::visit::Visit::visit_type(&mut audit, ty);
+        audit.found
+    }
+}
+
+fn rfd4_m2b1_canonical_symbol_path(path: &[String], symbol: &str) -> bool {
+    let owner = match symbol {
+        "RuntimeFilterInstallView" | "RuntimeFilterParticipantInstall" => {
+            &["crate", "runtime_filter", "port", "install"][..]
+        }
+        "RoleRouter" => &["crate", "runtime_filter", "router", "role_graph"][..],
+        _ => return false,
     };
-    syn::visit::Visit::visit_type(&mut audit, ty);
-    audit.found
+    path.len() == owner.len() + 1
+        && path
+            .iter()
+            .map(String::as_str)
+            .zip(owner.iter().copied())
+            .all(|(actual, expected)| actual == expected)
+        && path.last().is_some_and(|member| member == symbol)
 }
 
 fn rfd4_m2b1_type_is_named(ty: &syn::Type, expected: &str) -> bool {
@@ -36430,7 +36557,11 @@ fn rfd4_m2b1_type_is_named(ty: &syn::Type, expected: &str) -> bool {
     )
 }
 
-fn rfd4_m2b1_type_is_arc_of(ty: &syn::Type, expected: &str) -> bool {
+fn rfd4_m2b1_type_is_arc_of_symbol(
+    ty: &syn::Type,
+    expected: &str,
+    resolver: &Rfd4M2b1TypeResolver,
+) -> bool {
     let syn::Type::Path(path) = ty else {
         return false;
     };
@@ -36449,42 +36580,113 @@ fn rfd4_m2b1_type_is_arc_of(ty: &syn::Type, expected: &str) -> bool {
     });
     types
         .next()
-        .is_some_and(|inner| rfd4_m2b1_type_is_named(inner, expected))
+        .is_some_and(|inner| resolver.type_contains_symbol(inner, expected))
         && types.next().is_none()
 }
 
-#[derive(Default)]
+fn rfd4_m2b1_split_routing_phase_name(lower: &str) -> bool {
+    ["routing", "router", "route", "topology"]
+        .into_iter()
+        .any(|authority| lower.contains(authority))
+        && ["install", "activat", "publish"]
+            .into_iter()
+            .any(|phase| lower.contains(phase))
+}
+
 struct Rfd4M2b1AstAudit {
+    source_path: String,
+    type_resolver: Rfd4M2b1TypeResolver,
     composite_fields_are_exact: Option<bool>,
     current_impl_owner: Option<String>,
     installed_deployment_has_router: Option<bool>,
     role_router_storage: BTreeSet<String>,
+    role_router_authorities: BTreeSet<String>,
     split_routing_activation: BTreeSet<String>,
     view_only_installs: BTreeSet<String>,
     aggregator_shortcuts: BTreeSet<String>,
 }
 
 impl Rfd4M2b1AstAudit {
-    fn audit_signature(&mut self, signature: &syn::Signature, private_free_helper: bool) {
-        let name = signature.ident.to_string();
-        let mut parameter_types = BTreeSet::new();
-        let mut has_unborrowed_view = false;
-        for input in &signature.inputs {
-            if let syn::FnArg::Typed(input) = input {
-                parameter_types.extend(rfd4_m2b1_type_idents(&input.ty));
-                has_unborrowed_view |=
-                    rfd4_m2b1_type_contains_unborrowed_ident(&input.ty, "RuntimeFilterInstallView");
-            }
-        }
-        let exempt_private_helper = private_free_helper && !has_unborrowed_view;
-        if parameter_types.contains("RuntimeFilterInstallView")
-            && !parameter_types.contains("RuntimeFilterParticipantInstall")
-            && self.current_impl_owner.as_deref() != Some("RuntimeFilterParticipantInstall")
-            && !exempt_private_helper
-        {
-            self.view_only_installs.insert(name);
+    fn new(source_path: impl Into<String>, type_resolver: Rfd4M2b1TypeResolver) -> Self {
+        Self {
+            source_path: source_path.into(),
+            type_resolver,
+            composite_fields_are_exact: None,
+            current_impl_owner: None,
+            installed_deployment_has_router: None,
+            role_router_storage: BTreeSet::new(),
+            role_router_authorities: BTreeSet::new(),
+            split_routing_activation: BTreeSet::new(),
+            view_only_installs: BTreeSet::new(),
+            aggregator_shortcuts: BTreeSet::new(),
         }
     }
+
+    fn audit_signature(&mut self, signature: &syn::Signature, allow_borrowed_view_helper: bool) {
+        let name = signature.ident.to_string();
+        let mut has_view = false;
+        let mut has_participant_install = false;
+        let mut has_role_router_input = false;
+        for input in &signature.inputs {
+            if let syn::FnArg::Typed(input) = input {
+                has_view |= self
+                    .type_resolver
+                    .type_contains_symbol(&input.ty, "RuntimeFilterInstallView");
+                has_participant_install |= self
+                    .type_resolver
+                    .type_contains_symbol(&input.ty, "RuntimeFilterParticipantInstall");
+                has_role_router_input |= self
+                    .type_resolver
+                    .type_contains_symbol(&input.ty, "RoleRouter");
+            }
+        }
+        if has_view
+            && !has_participant_install
+            && self.current_impl_owner.as_deref() != Some("RuntimeFilterParticipantInstall")
+            && !allow_borrowed_view_helper
+        {
+            self.view_only_installs.insert(name.clone());
+        }
+        let has_role_router_output = match &signature.output {
+            syn::ReturnType::Default => false,
+            syn::ReturnType::Type(_, output) => self
+                .type_resolver
+                .type_contains_symbol(output, "RoleRouter"),
+        };
+        if (has_role_router_input || has_role_router_output)
+            && !(self.source_path == "src/runtime_filter/service/registry.rs"
+                && self.current_impl_owner.as_deref() == Some("InstalledDeployment")
+                && name == "role_router"
+                && !has_role_router_input
+                && has_role_router_output)
+        {
+            self.role_router_authorities.insert(name);
+        }
+    }
+}
+
+fn rfd4_m2b1_allowed_borrowed_view_helper(path: &str, name: &str) -> bool {
+    matches!(
+        (path, name),
+        (
+            "src/runtime_filter/deployment/extension.rs",
+            "validate_core_view_identity"
+        ) | ("src/runtime_filter/service/registry.rs", "validate_view")
+            | (
+                "src/runtime_filter/service/registry.rs",
+                "validate_view_with_routing"
+            )
+            | ("src/runtime_filter/service/registry.rs", "build_routing")
+            | (
+                "src/runtime_filter/service/registry.rs",
+                "compute_deadlines"
+            )
+            | ("src/runtime_filter/service/registry.rs", "build_channels")
+            | (
+                "src/runtime_filter/service/registry.rs",
+                "install_views_equivalent"
+            )
+    )
 }
 
 impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
@@ -36543,11 +36745,13 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
             if field_name == "routing_registry" {
                 self.split_routing_activation.insert(field_name.clone());
             }
-            let type_idents = rfd4_m2b1_type_idents(&field.ty);
-            if type_idents.contains("RoleRouter") {
+            if self
+                .type_resolver
+                .type_contains_symbol(&field.ty, "RoleRouter")
+            {
                 if owner == "InstalledDeployment"
                     && field_name == "role_router"
-                    && rfd4_m2b1_type_is_arc_of(&field.ty, "RoleRouter")
+                    && rfd4_m2b1_type_is_arc_of_symbol(&field.ty, "RoleRouter", &self.type_resolver)
                 {
                     installed_router = true;
                 } else {
@@ -36582,7 +36786,10 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
                 if nfe_4_syn_attrs_require_test(&field.attrs) {
                     continue;
                 }
-                if rfd4_m2b1_type_idents(&field.ty).contains("RoleRouter") {
+                if self
+                    .type_resolver
+                    .type_contains_symbol(&field.ty, "RoleRouter")
+                {
                     let field = field
                         .ident
                         .as_ref()
@@ -36597,14 +36804,20 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     }
 
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        if rfd4_m2b1_type_idents(&item.ty).contains("RoleRouter") {
+        if self
+            .type_resolver
+            .type_contains_symbol(&item.ty, "RoleRouter")
+        {
             self.role_router_storage.insert(item.ident.to_string());
         }
         syn::visit::visit_item_type(self, item);
     }
 
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-        if rfd4_m2b1_type_idents(&item.ty).contains("RoleRouter") {
+        if self
+            .type_resolver
+            .type_contains_symbol(&item.ty, "RoleRouter")
+        {
             self.role_router_storage.insert(item.ident.to_string());
         }
         syn::visit::visit_item_static(self, item);
@@ -36613,17 +36826,22 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         let name = item.sig.ident.to_string();
         let lower = name.to_ascii_lowercase();
-        if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
+        if rfd4_m2b1_split_routing_phase_name(&lower) {
             self.split_routing_activation.insert(name);
         }
-        self.audit_signature(&item.sig, matches!(item.vis, syn::Visibility::Inherited));
+        let allow_borrowed_view_helper = matches!(item.vis, syn::Visibility::Inherited)
+            && rfd4_m2b1_allowed_borrowed_view_helper(
+                &self.source_path,
+                &item.sig.ident.to_string(),
+            );
+        self.audit_signature(&item.sig, allow_borrowed_view_helper);
         syn::visit::visit_item_fn(self, item);
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         let name = item.sig.ident.to_string();
         let lower = name.to_ascii_lowercase();
-        if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
+        if rfd4_m2b1_split_routing_phase_name(&lower) {
             self.split_routing_activation.insert(name);
         }
         self.audit_signature(&item.sig, false);
@@ -36633,7 +36851,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
         let name = item.sig.ident.to_string();
         let lower = name.to_ascii_lowercase();
-        if lower.contains("routing") && (lower.contains("install") || lower.contains("activat")) {
+        if rfd4_m2b1_split_routing_phase_name(&lower) {
             self.split_routing_activation.insert(name);
         }
         self.audit_signature(&item.sig, false);
@@ -36641,18 +36859,23 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        if expression.method == "unwrap_or"
-            && expression.args.len() == 1
-            && expression
+        let method = expression.method.to_string().to_ascii_lowercase();
+        let default_is_one = match method.as_str() {
+            "unwrap_or" | "map_or" => expression
                 .args
                 .first()
-                .is_some_and(|arg| runtime_filter_eval_const_u128(arg) == Some(1))
-        {
+                .is_some_and(|arg| runtime_filter_eval_const_u128(arg) == Some(1)),
+            "unwrap_or_else" | "map_or_else" => expression
+                .args
+                .first()
+                .is_some_and(rfd4_m2b1_closure_returns_one),
+            _ => false,
+        };
+        if default_is_one {
             self.aggregator_shortcuts
                 .insert("default producer cardinality 1".to_string());
         }
-        let method = expression.method.to_string().to_ascii_lowercase();
-        if method.contains("register") && method.contains("producer") {
+        if rfd4_m2b1_producer_mutation_name(&method) {
             self.aggregator_shortcuts
                 .insert(expression.method.to_string());
         }
@@ -36665,7 +36888,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         {
             let callee = callee.ident.to_string();
             let lower = callee.to_ascii_lowercase();
-            if lower.contains("register") && lower.contains("producer") {
+            if rfd4_m2b1_producer_mutation_name(&lower) {
                 self.aggregator_shortcuts.insert(callee);
             }
         }
@@ -36673,13 +36896,22 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     }
 }
 
+fn rfd4_m2b1_closure_returns_one(expression: &syn::Expr) -> bool {
+    matches!(
+        expression,
+        syn::Expr::Closure(closure)
+            if runtime_filter_eval_const_u128(&closure.body) == Some(1)
+    )
+}
+
+fn rfd4_m2b1_producer_mutation_name(lower: &str) -> bool {
+    lower.contains("producer")
+        && ["add", "insert", "register"]
+            .into_iter()
+            .any(|verb| lower.contains(verb))
+}
+
 fn rfd4_m2b1_authority_reference(source_rel: &str, production: &str, symbol: &str) -> bool {
-    if rust_use_tokens(production)
-        .iter()
-        .any(|token| token == symbol)
-    {
-        return true;
-    }
     rust_canonical_paths(production, source_rel)
         .into_iter()
         .any(|path| {
@@ -36699,6 +36931,11 @@ fn rfd4_m2b1_authority_reference(source_rel: &str, production: &str, symbol: &st
                     .last()
                     .is_some_and(|member| member == symbol || member == "*")
         })
+}
+
+fn rfd4_m2b1_service_owner(path: &str) -> bool {
+    path == "src/runtime_filter/service.rs"
+        || (path.starts_with("src/runtime_filter/service/") && path.ends_with(".rs"))
 }
 
 fn rfd4_m2b1_live_ingress_owner(path: &str) -> bool {
@@ -36734,7 +36971,8 @@ fn rfd4_m2b1_atomic_install_violations(sources: &[Rfd4M2b1GuardSource]) -> Vec<S
                 continue;
             }
         };
-        let mut audit = Rfd4M2b1AstAudit::default();
+        let type_resolver = Rfd4M2b1TypeResolver::from_source(&source.path, &production, &parsed);
+        let mut audit = Rfd4M2b1AstAudit::new(&source.path, type_resolver);
         syn::visit::Visit::visit_file(&mut audit, &parsed);
 
         let composite = rfd4_m2b1_authority_reference(
@@ -36781,7 +37019,7 @@ fn rfd4_m2b1_atomic_install_violations(sources: &[Rfd4M2b1GuardSource]) -> Vec<S
                 source.path
             ));
         }
-        if source.path.starts_with("src/runtime_filter/service/") && source.path.ends_with(".rs") {
+        if rfd4_m2b1_service_owner(&source.path) {
             for banned in ["RoutingRegistry", "routing_registry", "install_routing"] {
                 if rust_use_tokens(&production)
                     .iter()
@@ -36790,6 +37028,9 @@ fn rfd4_m2b1_atomic_install_violations(sources: &[Rfd4M2b1GuardSource]) -> Vec<S
                     audit.split_routing_activation.insert(banned.to_string());
                 }
             }
+            audit
+                .split_routing_activation
+                .extend(audit.role_router_authorities);
             for split in audit.split_routing_activation {
                 violations.insert(format!(
                     "{}: split-routing-activation: `{split}` creates a second routing \
@@ -36881,14 +37122,19 @@ fn rfd4_m2b1_atomic_install_and_routing_authority_stay_single_snapshot() {
     let install_owner = by_path
         .get("src/runtime_filter/port/install.rs")
         .expect("domain composite owner must remain in production inventory");
-    let mut install_audit = Rfd4M2b1AstAudit::default();
     let install_production = rust_sanitized_production_text(install_owner);
-    syn::visit::Visit::visit_file(
-        &mut install_audit,
-        &syn::parse_file(&install_production)
-            .or_else(|_| syn::parse_file(install_owner))
-            .expect("domain composite owner must parse"),
+    let install_parsed = syn::parse_file(&install_production)
+        .or_else(|_| syn::parse_file(install_owner))
+        .expect("domain composite owner must parse");
+    let mut install_audit = Rfd4M2b1AstAudit::new(
+        "src/runtime_filter/port/install.rs",
+        Rfd4M2b1TypeResolver::from_source(
+            "src/runtime_filter/port/install.rs",
+            &install_production,
+            &install_parsed,
+        ),
     );
+    syn::visit::Visit::visit_file(&mut install_audit, &install_parsed);
     assert_eq!(
         install_audit.composite_fields_are_exact,
         Some(true),
@@ -36917,14 +37163,19 @@ fn rfd4_m2b1_atomic_install_and_routing_authority_stay_single_snapshot() {
     let registry = by_path
         .get("src/runtime_filter/service/registry.rs")
         .expect("service registry must remain in production inventory");
-    let mut registry_audit = Rfd4M2b1AstAudit::default();
     let registry_production = rust_sanitized_production_text(registry);
-    syn::visit::Visit::visit_file(
-        &mut registry_audit,
-        &syn::parse_file(&registry_production)
-            .or_else(|_| syn::parse_file(registry))
-            .expect("service registry production source must parse"),
+    let registry_parsed = syn::parse_file(&registry_production)
+        .or_else(|_| syn::parse_file(registry))
+        .expect("service registry production source must parse");
+    let mut registry_audit = Rfd4M2b1AstAudit::new(
+        "src/runtime_filter/service/registry.rs",
+        Rfd4M2b1TypeResolver::from_source(
+            "src/runtime_filter/service/registry.rs",
+            &registry_production,
+            &registry_parsed,
+        ),
     );
+    syn::visit::Visit::visit_file(&mut registry_audit, &registry_parsed);
     assert_eq!(
         registry_audit.installed_deployment_has_router,
         Some(true),
@@ -37003,6 +37254,67 @@ fn rfd4_m2b1_detector_rejects_arbitrarily_named_view_only_install_authorities() 
 }
 
 #[test]
+fn rfd4_m2b1_detector_resolves_view_aliases_and_defaults_borrowed_authorities_to_deny() {
+    for source in [
+        "use crate::runtime_filter::port::install::RuntimeFilterInstallView as View; \
+         pub(crate) fn install(view: View) {}",
+        "use crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         type View = RuntimeFilterInstallView; \
+         pub(crate) fn publish_deployment(view: &View) {}",
+        "fn publish_deployment(view: &RuntimeFilterInstallView) { publish(view.clone()); }",
+        "pub(crate) fn validate_view(view: &RuntimeFilterInstallView) { publish(view.clone()); }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "aliased or borrowed raw-view production authorities must default-deny: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_allows_only_inventoried_borrowed_view_helpers() {
+    for (path, name) in [
+        (
+            "src/runtime_filter/deployment/extension.rs",
+            "validate_core_view_identity",
+        ),
+        ("src/runtime_filter/service/registry.rs", "validate_view"),
+        (
+            "src/runtime_filter/service/registry.rs",
+            "validate_view_with_routing",
+        ),
+        ("src/runtime_filter/service/registry.rs", "build_routing"),
+        (
+            "src/runtime_filter/service/registry.rs",
+            "compute_deadlines",
+        ),
+        ("src/runtime_filter/service/registry.rs", "build_channels"),
+        (
+            "src/runtime_filter/service/registry.rs",
+            "install_views_equivalent",
+        ),
+    ] {
+        let source = format!("fn {name}(view: &RuntimeFilterInstallView) {{ inspect(view); }}");
+        let violations =
+            rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(path, source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "only the current pure borrowed-view helper inventory remains allowed: \
+             {path}::{name}: {violations:?}"
+        );
+    }
+}
+
+#[test]
 fn rfd4_m2b1_detector_rejects_split_routing_activation() {
     for source in [
         "struct RoutingRegistry;",
@@ -37041,6 +37353,53 @@ fn rfd4_m2b1_detector_rejects_split_routing_activation_in_service_submodules() {
 }
 
 #[test]
+fn rfd4_m2b1_detector_rejects_role_router_authority_across_all_service_paths() {
+    for (path, source) in [
+        (
+            "src/runtime_filter/service/registry.rs",
+            "use crate::runtime_filter::router::role_graph::RoleRouter; \
+             fn publish_router(router: RoleRouter) {}",
+        ),
+        (
+            "src/runtime_filter/service/router_state.rs",
+            "use crate::runtime_filter::router::role_graph::RoleRouter; \
+             fn install_route(router: &RoleRouter) {}",
+        ),
+        (
+            "src/runtime_filter/service.rs",
+            "use crate::runtime_filter::router::role_graph::RoleRouter; \
+             fn publish_topology() -> RoleRouter { todo!() }",
+        ),
+    ] {
+        let violations =
+            rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(path, source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("split-routing-activation")),
+            "service-owned RoleRouter parameter/return or phase authority must be rejected: \
+             {path}: {violations:?}"
+        );
+    }
+
+    let allowed = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "use crate::runtime_filter::router::role_graph::RoleRouter; \
+         struct InstalledDeployment { role_router: Arc<RoleRouter> } \
+         impl InstalledDeployment { fn role_router(&self) -> &RoleRouter { &self.role_router } } \
+         fn build_candidate(shard: RuntimeFilterRoutingShard) { \
+         let _ = RoleRouter::new(shard); }",
+    )]);
+    assert!(
+        !allowed
+            .iter()
+            .any(|violation| violation.contains("split-routing-activation")),
+        "the exact InstalledDeployment getter and RoleRouter candidate construction stay legal: \
+         {allowed:?}"
+    );
+}
+
+#[test]
 fn rfd4_m2b1_detector_rejects_live_ingress_authority_leaks() {
     for path in [
         "src/service/grpc_server.rs",
@@ -37050,7 +37409,12 @@ fn rfd4_m2b1_detector_rejects_live_ingress_authority_leaks() {
         "src/coordinator/execution.rs",
     ] {
         for symbol in ["RuntimeFilterParticipantInstall", "RoleRouter"] {
-            let source = format!("use crate::runtime_filter::port::install::{symbol};");
+            let owner = match symbol {
+                "RuntimeFilterParticipantInstall" => "port::install",
+                "RoleRouter" => "router::role_graph",
+                _ => unreachable!(),
+            };
+            let source = format!("use crate::runtime_filter::{owner}::{symbol};");
             let violations =
                 rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(path, source)]);
             assert!(
@@ -37060,6 +37424,32 @@ fn rfd4_m2b1_detector_rejects_live_ingress_authority_leaks() {
                 "{path} must reject premature {symbol} ownership: {violations:?}"
             );
         }
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_role_router_storage_aliases() {
+    for source in [
+        "use crate::runtime_filter::router::role_graph::RoleRouter as R; \
+         struct RoutingState { router: Arc<R> }",
+        "use crate::runtime_filter::router::role_graph::RoleRouter; \
+         type R = RoleRouter; enum RegistryState { Routing(Arc<R>) }",
+        "use crate::runtime_filter::router::role_graph::RoleRouter as R; \
+         type RoutingState = Arc<R>;",
+        "use crate::runtime_filter::router::role_graph::RoleRouter as R; \
+         static ROUTER: Option<Arc<R>> = None;",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("role-router-storage")),
+            "RoleRouter import/type aliases must not bypass storage ownership: \
+             {source}: {violations:?}"
+        );
     }
 }
 
@@ -37110,6 +37500,42 @@ fn rfd4_m2b1_detector_rejects_aggregator_projection_shortcuts() {
 }
 
 #[test]
+fn rfd4_m2b1_detector_rejects_dynamic_aggregator_defaults_and_producer_mutations() {
+    for source in [
+        "fn project(count: Option<u32>) { let _ = count.unwrap_or_else(|| 1); }",
+        "fn project(count: Option<u32>) { let _ = count.map_or(1, |value| value); }",
+        "fn project(count: Option<u32>) { \
+         let _ = count.map_or_else(|| 1, |value| value); }",
+        "fn project() { add_runtime_producer(); }",
+        "fn project() { insert_runtime_producer(); }",
+        "fn project() { register_producer(); }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/deployment/shard.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("aggregator-projection-shortcut")),
+            "dynamic producer defaults and mutation authorities must be rejected: \
+             {source}: {violations:?}"
+        );
+    }
+
+    let ordinary_insert = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/deployment/shard.rs",
+        "fn project(routes: &mut BTreeMap<u32, u32>) { routes.insert(1, 2); }",
+    )]);
+    assert!(
+        !ordinary_insert
+            .iter()
+            .any(|violation| violation.contains("aggregator-projection-shortcut")),
+        "ordinary BTreeMap insertion is not producer authority mutation: {ordinary_insert:?}"
+    );
+}
+
+#[test]
 fn rfd4_m2b1_detector_rejects_role_router_storage_outside_installed_deployment() {
     for (path, source) in [
         (
@@ -37138,6 +37564,30 @@ fn rfd4_m2b1_detector_rejects_role_router_storage_outside_installed_deployment()
             "{path} must not store RoleRouter outside InstalledDeployment: {violations:?}"
         );
     }
+}
+
+#[test]
+fn rfd4_m2b1_authority_reference_ignores_local_shadows_but_catches_real_aliases() {
+    let local_shadow = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime/query_context.rs",
+        "struct RoleRouter; fn local_router(router: RoleRouter) {}",
+    )]);
+    assert!(
+        local_shadow.is_empty(),
+        "a local same-name type is not the protected RoleRouter authority: {local_shadow:?}"
+    );
+
+    let real_alias = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime/query_context.rs",
+        "use crate::runtime_filter::router::role_graph::RoleRouter as R; \
+         fn leak(router: R) {}",
+    )]);
+    assert!(
+        real_alias
+            .iter()
+            .any(|violation| violation.contains("live-ingress-authority-leak")),
+        "a canonical RoleRouter import alias must remain protected: {real_alias:?}"
+    );
 }
 
 #[test]
