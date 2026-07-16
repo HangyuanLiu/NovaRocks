@@ -9943,6 +9943,20 @@ fn runtime_filter_transport_extern_self_alias_violations(
             syn::visit::visit_item(self, item);
         }
 
+        fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+                return;
+            }
+            syn::visit::visit_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expression)) {
+                return;
+            }
+            syn::visit::visit_expr(self, expression);
+        }
+
         fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
             if extern_crate.ident.to_string() == "self" {
                 self.aliases.push(
@@ -16932,6 +16946,18 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             "fn leak() { { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
         ),
         (
+            adapter,
+            "fn leak() { let _ = async { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }; }",
+        ),
+        (
+            adapter,
+            "fn leak() { #[cfg(any(test, feature = \"compat\"))] { extern crate self as root; } }",
+        ),
+        (
+            adapter,
+            "fn leak() { #[cfg_attr(test, allow(dead_code))] { extern crate self as root; } }",
+        ),
+        (
             "src/service/grpc_server.rs",
             "fn leak() { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }",
         ),
@@ -16942,6 +16968,10 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         (
             "src/service/grpc_server.rs",
             "fn leak() { { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
+        ),
+        (
+            "src/service/grpc_server.rs",
+            "fn leak() { let _ = async { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }; }",
         ),
     ] {
         assert!(
@@ -16981,6 +17011,9 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "fn fixture() { #[cfg(test)] extern crate self as root; }",
         "#[cfg(test)] const _: () = { extern crate self as root; };",
         "#[cfg(test)] mod tests { fn fixture() { extern crate self as root; let _: Option<root::runtime_filter::router::loopback::LoopbackRouter> = None; } }",
+        "fn f() { #[cfg(test)] { extern crate self as root; } }",
+        "fn f() { #[cfg(test)] async { extern crate self as root; }; }",
+        "fn f() { #[cfg(test)] let _alias = async { extern crate self as root; }; }",
         "extern crate reqwest;",
         "extern crate reqwest as network;",
     ] {
