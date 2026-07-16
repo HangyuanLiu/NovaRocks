@@ -688,9 +688,7 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "src/connector/starrocks/table/catalog.rs",
         &[
             "crate::engine::catalog::InMemoryCatalog",
-            "crate::engine::catalog::PhysicalTableLayout",
             "crate::engine::catalog::ScanSource",
-            "crate::engine::catalog::StarRocksTabletRef",
             "crate::engine::catalog::TableDef",
         ],
     ),
@@ -1264,9 +1262,7 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
 
 const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/catalog.rs|crate::engine::catalog|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
-    "src/engine/catalog.rs|crate::engine::catalog|pub|PhysicalTableLayout|crate::sql::catalog::PhysicalTableLayout",
     "src/engine/catalog.rs|crate::engine::catalog|pub|ScanSource|crate::sql::catalog::ScanSource",
-    "src/engine/catalog.rs|crate::engine::catalog|pub|StarRocksTabletRef|crate::sql::catalog::StarRocksTabletRef",
     "src/engine/catalog.rs|crate::engine::catalog|pub|TableDef|crate::sql::catalog::TableDef",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryOwner|crate::sql::common::dictionary::DictionaryOwner",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionarySnapshot|crate::sql::common::dictionary::DictionarySnapshot",
@@ -6982,7 +6978,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 221, 58, 15];
+    let expected_counts = [88, 86, 219, 58, 13];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7884,7 +7880,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 221, 58, 15];
+    let expected_counts = [88, 86, 219, 58, 13];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7894,6 +7890,928 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
     assert!(
         violations.is_empty(),
         "EBD-4B2B catalog ColumnDef owner failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+const EBD_4B3A_CONNECTOR_CATALOG: &str = "src/connector/starrocks/table/catalog.rs";
+const EBD_4B3A_SCAN_PLANNER: &str = "src/connector/starrocks/table/scan_planner.rs";
+const EBD_4B3A_GLOBAL_LEGACY_IDENTIFIERS: &[&str] = &[
+    "PhysicalTableLayout",
+    "StarRocksTabletRef",
+    "starrocks_table_physical_layout",
+];
+const EBD_4B3A_CATALOG_SHADOW_IDENTIFIERS: &[&str] = &[
+    "get_physical_layout",
+    "physical_layouts",
+    "register_starrocks_table",
+];
+
+fn ebd_4b3a_identifiers(source: &GuardSource) -> BTreeSet<String> {
+    rust_source_tokens(&source.text)
+        .into_iter()
+        .filter(|token| {
+            token
+                .text
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        })
+        .map(|token| token.text)
+        .collect()
+}
+
+fn ebd_4b3a_is_pub_super(visibility: &syn::Visibility) -> bool {
+    matches!(
+        visibility,
+        syn::Visibility::Restricted(restricted)
+            if restricted.path.is_ident("super")
+    )
+}
+
+fn ebd_4b3a_is_i64(ty: &syn::Type) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.len() == 1
+                && path.path.is_ident("i64")
+    )
+}
+
+fn ebd_4b3a_is_runtime_reference(ty: &syn::Type) -> bool {
+    let syn::Type::Reference(reference) = ty else {
+        return false;
+    };
+    let syn::Type::Path(path) = reference.elem.as_ref() else {
+        return false;
+    };
+    reference.mutability.is_none()
+        && path.qself.is_none()
+        && path.path.segments.len() == 1
+        && path.path.is_ident("StarRocksTableRuntime")
+}
+
+fn ebd_4b3a_is_scan_tablet_vec(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some()
+        || !(path.path.segments.len() == 1
+            || ebd_4b3a_path_is_exact(&path.path, &["std", "vec", "Vec"]))
+    {
+        return false;
+    }
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Vec" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    let mut args = arguments.args.iter();
+    let Some(syn::GenericArgument::Type(syn::Type::Path(inner))) = args.next() else {
+        return false;
+    };
+    args.next().is_none()
+        && inner.qself.is_none()
+        && inner.path.segments.len() == 1
+        && inner.path.is_ident("StarRocksScanTablet")
+}
+
+fn ebd_4b3a_defines_scan_tablet_selector(source: &GuardSource) -> bool {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return false;
+    };
+    struct DefinitionVisitor {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for DefinitionVisitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            self.found |= item.sig.ident == "starrocks_scan_tablets";
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            self.found |= item.sig.ident == "starrocks_scan_tablets";
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            self.found |= item
+                .mac
+                .tokens
+                .to_string()
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| token == "starrocks_scan_tablets");
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+    let mut visitor = DefinitionVisitor { found: false };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.found
+}
+
+fn ebd_4b3a_audit_legacy_catalog_layout(sources: &[GuardSource]) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/") || source.path.starts_with("tests/"))
+    {
+        let identifiers = ebd_4b3a_identifiers(source);
+        for legacy in EBD_4B3A_GLOBAL_LEGACY_IDENTIFIERS {
+            if identifiers.contains(*legacy) {
+                violations.insert(format!(
+                    "catalog-physical-layout-legacy-surface: {}|{}",
+                    source.path, legacy
+                ));
+            }
+        }
+        if source.path == "src/sql/catalog.rs" || source.path.starts_with("src/engine/") {
+            for legacy in EBD_4B3A_CATALOG_SHADOW_IDENTIFIERS {
+                if identifiers.contains(*legacy) {
+                    violations.insert(format!(
+                        "catalog-physical-layout-shadow-surface: {}|{}",
+                        source.path, legacy
+                    ));
+                }
+            }
+        }
+        if source.path != EBD_4B3A_CONNECTOR_CATALOG && identifiers.contains("StarRocksScanTablet")
+        {
+            violations.insert(format!(
+                "catalog-physical-layout-scan-tablet-owner-escape: {}",
+                source.path
+            ));
+        }
+        if !source.path.starts_with("src/connector/starrocks/table/")
+            && identifiers.contains("starrocks_scan_tablets")
+        {
+            violations.insert(format!(
+                "catalog-physical-layout-selector-owner-escape: {}",
+                source.path
+            ));
+        }
+        if source.path != EBD_4B3A_CONNECTOR_CATALOG
+            && ebd_4b3a_defines_scan_tablet_selector(source)
+        {
+            violations.insert(format!(
+                "catalog-physical-layout-selector-definition-escape: {}",
+                source.path
+            ));
+        }
+    }
+    violations
+}
+
+fn ebd_4b3a_audit_connector_owner(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-physical-layout-connector-owner: {}|parse-failed",
+            source.path
+        )]);
+    };
+
+    #[derive(Default)]
+    struct OwnerVisitor<'ast> {
+        structs: Vec<&'ast syn::ItemStruct>,
+        functions: Vec<&'ast syn::ItemFn>,
+        impl_function_count: usize,
+        macro_owner_mention: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for OwnerVisitor<'ast> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "StarRocksScanTablet" {
+                self.structs.push(item);
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if item.sig.ident == "starrocks_scan_tablets" {
+                self.functions.push(item);
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if item.sig.ident == "starrocks_scan_tablets" {
+                self.impl_function_count += 1;
+            }
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            self.macro_owner_mention |= item
+                .mac
+                .tokens
+                .to_string()
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| matches!(token, "StarRocksScanTablet" | "starrocks_scan_tablets"));
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    let mut owner = OwnerVisitor::default();
+    syn::visit::Visit::visit_file(&mut owner, &file);
+    let mut violations = BTreeSet::new();
+    if owner.macro_owner_mention {
+        violations.insert(format!(
+            "catalog-physical-layout-connector-owner: {}|macro-owner-mention",
+            source.path
+        ));
+    }
+    if owner.structs.len() != 1 {
+        violations.insert(format!(
+            "catalog-physical-layout-connector-owner: {}|StarRocksScanTablet-count={}",
+            source.path,
+            owner.structs.len()
+        ));
+    } else {
+        let item = owner.structs[0];
+        let expected_derives = BTreeSet::from([
+            "Clone".to_string(),
+            "Debug".to_string(),
+            "Eq".to_string(),
+            "PartialEq".to_string(),
+        ]);
+        let syn::Fields::Named(fields) = &item.fields else {
+            violations.insert(format!(
+                "catalog-physical-layout-connector-owner: {}|named-fields-required",
+                source.path
+            ));
+            return violations;
+        };
+        let expected_fields = BTreeSet::from([
+            "tablet_id".to_string(),
+            "partition_id".to_string(),
+            "version".to_string(),
+        ]);
+        let actual_names = fields
+            .named
+            .iter()
+            .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+            .collect::<BTreeSet<_>>();
+        if !ebd_4b3a_is_pub_super(&item.vis)
+            || !ebd_4b2b_struct_derive_set(item)
+                .is_some_and(|derives| derives.is_superset(&expected_derives))
+            || actual_names != expected_fields
+            || fields.named.len() != expected_fields.len()
+            || fields
+                .named
+                .iter()
+                .any(|field| !ebd_4b3a_is_pub_super(&field.vis) || !ebd_4b3a_is_i64(&field.ty))
+        {
+            violations.insert(format!(
+                "catalog-physical-layout-connector-owner: {}|StarRocksScanTablet-shape",
+                source.path
+            ));
+        }
+    }
+
+    let function_count = owner.functions.len() + owner.impl_function_count;
+    if function_count != 1 {
+        violations.insert(format!(
+            "catalog-physical-layout-connector-owner: {}|starrocks_scan_tablets-count={}",
+            source.path, function_count
+        ));
+    } else {
+        let Some(function) = owner.functions.first().copied() else {
+            violations.insert(format!(
+                "catalog-physical-layout-connector-owner: {}|starrocks_scan_tablets-free-function-required",
+                source.path
+            ));
+            return violations;
+        };
+        let valid_input = function.sig.inputs.len() == 1
+            && matches!(
+                function.sig.inputs.first(),
+                Some(syn::FnArg::Typed(argument)) if ebd_4b3a_is_runtime_reference(&argument.ty)
+            );
+        let valid_output = matches!(
+            &function.sig.output,
+            syn::ReturnType::Type(_, ty) if ebd_4b3a_is_scan_tablet_vec(ty)
+        );
+        if !ebd_4b3a_is_pub_super(&function.vis)
+            || !function.sig.generics.params.is_empty()
+            || function.sig.generics.where_clause.is_some()
+            || !valid_input
+            || !valid_output
+        {
+            violations.insert(format!(
+                "catalog-physical-layout-connector-owner: {}|starrocks_scan_tablets-signature",
+                source.path
+            ));
+        }
+    }
+    violations
+}
+
+fn ebd_4b3a_path_ends_with(path: &syn::Path, suffix: &[&str]) -> bool {
+    path.segments.len() >= suffix.len()
+        && path
+            .segments
+            .iter()
+            .rev()
+            .zip(suffix.iter().rev())
+            .all(|(segment, expected)| segment.ident == *expected)
+}
+
+fn ebd_4b3a_path_is_exact(path: &syn::Path, segments: &[&str]) -> bool {
+    path.segments.len() == segments.len()
+        && path
+            .segments
+            .iter()
+            .zip(segments)
+            .all(|(segment, expected)| segment.ident == *expected)
+}
+
+fn ebd_4b3a_is_runtime_selector_call(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(function) = call.func.as_ref() else {
+        return false;
+    };
+    let Some(syn::Expr::Path(argument)) = call.args.first() else {
+        return false;
+    };
+    call.args.len() == 1
+        && ebd_4b3a_path_is_exact(
+            &function.path,
+            &["super", "catalog", "starrocks_scan_tablets"],
+        )
+        && argument.path.is_ident("runtime")
+}
+
+fn ebd_4b3a_closure_maps_all_split_fields(closure: &syn::ExprClosure) -> bool {
+    let Some(syn::Pat::Ident(parameter)) = closure.inputs.first() else {
+        return false;
+    };
+    if closure.inputs.len() != 1 {
+        return false;
+    }
+    let returned = match closure.body.as_ref() {
+        syn::Expr::Block(block) => match block.block.stmts.last() {
+            Some(syn::Stmt::Expr(expr, None)) => expr,
+            _ => return false,
+        },
+        expr => expr,
+    };
+    let syn::Expr::Call(call) = returned else {
+        return false;
+    };
+    let syn::Expr::Path(function) = call.func.as_ref() else {
+        return false;
+    };
+    let Some(syn::Expr::Path(connector_id)) = call.args.first() else {
+        return false;
+    };
+    let Some(syn::Expr::Struct(split)) = call.args.iter().nth(1) else {
+        return false;
+    };
+    let expected = ["tablet_id", "partition_id", "version"];
+    call.args.len() == 2
+        && ebd_4b3a_path_is_exact(&function.path, &["Split", "new"])
+        && connector_id.path.is_ident("CONNECTOR_ID")
+        && ebd_4b3a_path_is_exact(&split.path, &["StarRocksSplit"])
+        && split.rest.is_none()
+        && split.fields.len() == expected.len()
+        && expected.iter().all(|expected_field| {
+            split.fields.iter().any(|field| {
+                let syn::Member::Named(member) = &field.member else {
+                    return false;
+                };
+                let syn::Expr::Field(value) = &field.expr else {
+                    return false;
+                };
+                let syn::Expr::Path(base) = value.base.as_ref() else {
+                    return false;
+                };
+                let syn::Member::Named(value_member) = &value.member else {
+                    return false;
+                };
+                member == expected_field
+                    && value_member == expected_field
+                    && base.path.is_ident(&parameter.ident)
+            })
+        })
+}
+
+fn ebd_4b3a_plan_splits_uses_live_selector(block: &syn::Block) -> bool {
+    #[derive(Default)]
+    struct BindingAudit {
+        pattern_counts: BTreeMap<String, usize>,
+        assigned: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for BindingAudit {
+        fn visit_pat_ident(&mut self, item: &'ast syn::PatIdent) {
+            *self
+                .pattern_counts
+                .entry(item.ident.to_string())
+                .or_default() += 1;
+            syn::visit::visit_pat_ident(self, item);
+        }
+
+        fn visit_expr_assign(&mut self, item: &'ast syn::ExprAssign) {
+            if let syn::Expr::Path(left) = item.left.as_ref()
+                && let Some(ident) = left.path.get_ident()
+            {
+                self.assigned.insert(ident.to_string());
+            }
+            syn::visit::visit_expr_assign(self, item);
+        }
+
+        fn visit_expr_binary(&mut self, item: &'ast syn::ExprBinary) {
+            if matches!(
+                item.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+                    | syn::BinOp::BitXorAssign(_)
+                    | syn::BinOp::BitAndAssign(_)
+                    | syn::BinOp::BitOrAssign(_)
+                    | syn::BinOp::ShlAssign(_)
+                    | syn::BinOp::ShrAssign(_)
+            ) && let syn::Expr::Path(left) = item.left.as_ref()
+                && let Some(ident) = left.path.get_ident()
+            {
+                self.assigned.insert(ident.to_string());
+            }
+            syn::visit::visit_expr_binary(self, item);
+        }
+    }
+
+    let mut binding_audit = BindingAudit::default();
+    syn::visit::Visit::visit_block(&mut binding_audit, block);
+    let mut binding_counts = BTreeMap::<String, usize>::new();
+    let mut selector_bindings = BTreeSet::new();
+    for statement in &block.stmts {
+        let syn::Stmt::Local(local) = statement else {
+            continue;
+        };
+        let syn::Pat::Ident(binding) = &local.pat else {
+            continue;
+        };
+        if binding.mutability.is_some() || binding.by_ref.is_some() || binding.subpat.is_some() {
+            continue;
+        }
+        let name = binding.ident.to_string();
+        *binding_counts.entry(name.clone()).or_default() += 1;
+        if local
+            .init
+            .as_ref()
+            .is_some_and(|init| ebd_4b3a_is_runtime_selector_call(init.expr.as_ref()))
+        {
+            selector_bindings.insert(name);
+        }
+    }
+    selector_bindings.retain(|name| {
+        binding_counts.get(name) == Some(&1)
+            && binding_audit.pattern_counts.get(name) == Some(&1)
+            && !binding_audit.assigned.contains(name)
+    });
+
+    struct ReturnAudit {
+        count: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ReturnAudit {
+        fn visit_expr_return(&mut self, item: &'ast syn::ExprReturn) {
+            self.count += 1;
+            syn::visit::visit_expr_return(self, item);
+        }
+
+        fn visit_expr_closure(&mut self, _item: &'ast syn::ExprClosure) {}
+
+        fn visit_item_fn(&mut self, _item: &'ast syn::ItemFn) {}
+    }
+    let tail_is_explicit_return = matches!(
+        block.stmts.last(),
+        Some(syn::Stmt::Expr(syn::Expr::Return(_), None))
+    );
+    let mut return_audit = ReturnAudit { count: 0 };
+    syn::visit::Visit::visit_block(&mut return_audit, block);
+    if return_audit.count != usize::from(tail_is_explicit_return) {
+        return false;
+    }
+
+    let returned = match block.stmts.last() {
+        Some(syn::Stmt::Expr(syn::Expr::Return(returned), None)) => {
+            let Some(expr) = returned.expr.as_deref() else {
+                return false;
+            };
+            expr
+        }
+        Some(syn::Stmt::Expr(expr, None)) => expr,
+        _ => return false,
+    };
+    let syn::Expr::Call(ok) = returned else {
+        return false;
+    };
+    let syn::Expr::Path(ok_path) = ok.func.as_ref() else {
+        return false;
+    };
+    let Some(syn::Expr::MethodCall(collect)) = ok.args.first() else {
+        return false;
+    };
+    let syn::Expr::MethodCall(map) = collect.receiver.as_ref() else {
+        return false;
+    };
+    let syn::Expr::MethodCall(into_iter) = map.receiver.as_ref() else {
+        return false;
+    };
+    let selector_value = ebd_4b3a_is_runtime_selector_call(into_iter.receiver.as_ref())
+        || matches!(
+            into_iter.receiver.as_ref(),
+            syn::Expr::Path(binding)
+                if binding.path.get_ident().is_some_and(|ident| {
+                    selector_bindings.contains(&ident.to_string())
+                })
+        );
+    ok.args.len() == 1
+        && ebd_4b3a_path_is_exact(&ok_path.path, &["Ok"])
+        && collect.method == "collect"
+        && collect.args.is_empty()
+        && map.method == "map"
+        && map.args.len() == 1
+        && into_iter.method == "into_iter"
+        && into_iter.args.is_empty()
+        && selector_value
+        && matches!(
+            map.args.first(),
+            Some(syn::Expr::Closure(closure))
+                if ebd_4b3a_closure_maps_all_split_fields(closure)
+        )
+}
+
+fn ebd_4b3a_audit_scan_planner(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-physical-layout-scan-planner-binding: {}|parse-failed",
+            source.path
+        )]);
+    };
+
+    struct PlannerVisitor {
+        plan_splits_count: usize,
+        valid_plan_splits_count: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for PlannerVisitor {
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let connector_impl = item.trait_.as_ref().is_some_and(|(_, path, _)| {
+                ebd_4b3a_path_ends_with(path, &["ConnectorScanPlanner"])
+            }) && matches!(
+                item.self_ty.as_ref(),
+                syn::Type::Path(path)
+                    if ebd_4b3a_path_ends_with(&path.path, &["StarRocksTableScanPlanner"])
+            );
+            if connector_impl {
+                for impl_item in &item.items {
+                    let syn::ImplItem::Fn(function) = impl_item else {
+                        continue;
+                    };
+                    if function.sig.ident == "plan_splits" {
+                        self.plan_splits_count += 1;
+                        if ebd_4b3a_plan_splits_uses_live_selector(&function.block) {
+                            self.valid_plan_splits_count += 1;
+                        }
+                    }
+                }
+            }
+            syn::visit::visit_item_impl(self, item);
+        }
+    }
+
+    let mut visitor = PlannerVisitor {
+        plan_splits_count: 0,
+        valid_plan_splits_count: 0,
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    if visitor.plan_splits_count == 1 && visitor.valid_plan_splits_count == 1 {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([format!(
+            "catalog-physical-layout-scan-planner-binding: {}|plan_splits={} valid={}",
+            source.path, visitor.plan_splits_count, visitor.valid_plan_splits_count
+        )])
+    }
+}
+
+#[test]
+fn ebd_4b3a_detector_rejects_catalog_physical_layout_state() {
+    let allowed = [
+        GuardSource::new(
+            "src/sql/catalog.rs",
+            r###"
+// PhysicalTableLayout get_physical_layout physical_layouts
+const TEXT: &str = "StarRocksTabletRef register_starrocks_table";
+pub enum ScanSource { StarRocks { db_id: i64, table_id: i64 } }
+"###,
+        ),
+        GuardSource::new(
+            EBD_4B3A_CONNECTOR_CATALOG,
+            "pub(super) struct StarRocksScanTablet { pub(super) tablet_id: i64, pub(super) partition_id: i64, pub(super) version: i64 }",
+        ),
+        GuardSource::new(
+            "src/coordinator/layout.rs",
+            "struct LayoutCache { physical_layouts: usize } fn get_physical_layout() {} fn register_starrocks_table() {}",
+        ),
+    ];
+    assert!(ebd_4b3a_audit_legacy_catalog_layout(&allowed).is_empty());
+
+    for source in [
+        GuardSource::new(
+            "src/sql/catalog.rs",
+            "#[cfg(test)] mod tests { struct PhysicalTableLayout; }",
+        ),
+        GuardSource::new(
+            "src/engine/catalog.rs",
+            "type Layout = StarRocksTabletRef; struct Db { physical_layouts: usize }",
+        ),
+        GuardSource::new(
+            "src/engine/catalog.rs",
+            "macro_rules! legacy { () => { fn get_physical_layout() {} } } legacy!();",
+        ),
+        GuardSource::new(
+            "src/sql/forward.rs",
+            "pub use crate::connector::starrocks::table::catalog::StarRocksScanTablet;",
+        ),
+        GuardSource::new("src/engine/selector.rs", "fn starrocks_scan_tablets() {}"),
+        GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            "fn starrocks_scan_tablets(runtime: &Runtime) { let _ = runtime; }",
+        ),
+        GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            "macro_rules! duplicate { () => { fn starrocks_scan_tablets() {} } }",
+        ),
+    ] {
+        assert!(
+            !ebd_4b3a_audit_legacy_catalog_layout(&[source.clone()]).is_empty(),
+            "legacy fixture was missed: {}",
+            source.path
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3a_detector_requires_connector_owned_scan_tablet_selection() {
+    let owner = GuardSource::new(
+        EBD_4B3A_CONNECTOR_CATALOG,
+        r#"
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StarRocksScanTablet {
+    pub(super) tablet_id: i64,
+    pub(super) partition_id: i64,
+    pub(super) version: i64,
+}
+pub(super) fn starrocks_scan_tablets(
+    runtime: &StarRocksTableRuntime,
+) -> Vec<StarRocksScanTablet> { let _ = runtime; Vec::new() }
+"#,
+    );
+    assert!(ebd_4b3a_audit_connector_owner(&owner).is_empty());
+    let equivalent_owner = GuardSource::new(
+        EBD_4B3A_CONNECTOR_CATALOG,
+        r#"
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in super) struct StarRocksScanTablet {
+    pub(in super) version: i64,
+    pub(in super) tablet_id: i64,
+    pub(in super) partition_id: i64,
+}
+pub(in super) fn starrocks_scan_tablets(
+    runtime: &StarRocksTableRuntime,
+) -> std::vec::Vec<StarRocksScanTablet> { let _ = runtime; std::vec::Vec::new() }
+"#,
+    );
+    assert!(
+        ebd_4b3a_audit_connector_owner(&equivalent_owner).is_empty(),
+        "semantically equivalent private owner spelling must remain allowed"
+    );
+    let planner = GuardSource::new(
+        EBD_4B3A_SCAN_PLANNER,
+        r#"
+impl ConnectorScanPlanner for StarRocksTableScanPlanner {
+    fn plan_splits(&self) {
+        let runtime = runtime();
+        Ok(super::catalog::starrocks_scan_tablets(runtime)
+            .into_iter()
+            .map(|tablet| {
+                Split::new(
+                    CONNECTOR_ID,
+                    StarRocksSplit {
+                        tablet_id: tablet.tablet_id,
+                        partition_id: tablet.partition_id,
+                        version: tablet.version,
+                    },
+                )
+            })
+            .collect::<Vec<_>>())
+    }
+}
+"#,
+    );
+    assert!(ebd_4b3a_audit_scan_planner(&planner).is_empty());
+    let extracted_planner = GuardSource::new(
+        EBD_4B3A_SCAN_PLANNER,
+        r#"
+impl ConnectorScanPlanner for StarRocksTableScanPlanner {
+    fn plan_splits(&self) {
+        let runtime = runtime();
+        let tablets = super::catalog::starrocks_scan_tablets(runtime);
+        Ok(tablets
+            .into_iter()
+            .map(|tablet| Split::new(CONNECTOR_ID, StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            }))
+            .collect::<Vec<_>>())
+    }
+}
+"#,
+    );
+    assert!(
+        ebd_4b3a_audit_scan_planner(&extracted_planner).is_empty(),
+        "a single immutable selector binding must remain allowed"
+    );
+
+    for invalid in [
+        owner
+            .text
+            .replacen("pub(super) struct", "pub(crate) struct", 1),
+        owner
+            .text
+            .replacen("pub(super) tablet_id", "pub(crate) tablet_id", 1),
+        owner.text.replacen("version: i64", "version: u64", 1),
+        owner.text.replacen("pub(super) fn", "pub(crate) fn", 1),
+        owner.text.replacen(
+            "Vec<StarRocksScanTablet>",
+            "Result<Vec<StarRocksScanTablet>, String>",
+            1,
+        ),
+        format!("{0}\nmod duplicate {{ {0} }}", owner.text),
+        format!(
+            "{}\nmacro_rules! duplicate {{ () => {{ struct StarRocksScanTablet; fn starrocks_scan_tablets() {{}} }} }}",
+            owner.text
+        ),
+        equivalent_owner.text.replace(
+            "std::vec::Vec<StarRocksScanTablet>",
+            "custom::Vec<StarRocksScanTablet>",
+        ),
+    ] {
+        assert!(
+            !ebd_4b3a_audit_connector_owner(&GuardSource::new(
+                EBD_4B3A_CONNECTOR_CATALOG,
+                &invalid,
+            ))
+            .is_empty(),
+            "connector owner mutation was missed: {invalid}"
+        );
+    }
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            r#"
+#[cfg(test)]
+fn decoy(runtime: &Runtime) {
+    let _ = starrocks_scan_tablets(runtime);
+    let _ = StarRocksSplit { tablet_id: 1, partition_id: 2, version: 3 };
+}
+impl ConnectorScanPlanner for StarRocksTableScanPlanner {
+    fn plan_splits(&self) { let _ = runtime.tablets.iter(); }
+}
+"#,
+        ))
+        .is_empty()
+    );
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            &planner
+                .text
+                .replace("version: tablet.version", "version: tablet.tablet_id"),
+        ))
+        .is_empty(),
+        "split field rewiring must fail closed"
+    );
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            &planner.text.replace(
+                "super::catalog::starrocks_scan_tablets",
+                "starrocks_scan_tablets"
+            ),
+        ))
+        .is_empty(),
+        "a local same-name selector must not satisfy the canonical owner call"
+    );
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            r#"
+impl ConnectorScanPlanner for StarRocksTableScanPlanner {
+    fn plan_splits(&self) {
+        let runtime = runtime();
+        let _unused = super::catalog::starrocks_scan_tablets(runtime)
+            .into_iter()
+            .map(|tablet| Split::new(CONNECTOR_ID, StarRocksSplit {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                version: tablet.version,
+            }))
+            .collect::<Vec<_>>();
+        Ok(fake_tablets().into_iter().map(fake_split).collect::<Vec<_>>())
+    }
+}
+"#,
+        ))
+        .is_empty(),
+        "an unused in-method selector decoy must not satisfy the returned pipeline"
+    );
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            &extracted_planner.text.replace(
+                "let tablets = super::catalog::starrocks_scan_tablets(runtime);",
+                "let mut tablets = super::catalog::starrocks_scan_tablets(runtime); tablets = fake_tablets();",
+            ),
+        ))
+        .is_empty(),
+        "a mutable or reassigned selector binding must fail closed"
+    );
+    assert!(
+        !ebd_4b3a_audit_scan_planner(&GuardSource::new(
+            EBD_4B3A_SCAN_PLANNER,
+            &planner.text.replace(
+                "let runtime = runtime();",
+                "let runtime = runtime(); if use_fake() { return Ok(fake_splits()); }",
+            ),
+        ))
+        .is_empty(),
+        "an early returned split path must fail closed"
+    );
+}
+
+#[test]
+fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let mut violations = ebd_4b3a_audit_legacy_catalog_layout(&sources);
+    if let Some(owner) = sources
+        .iter()
+        .find(|source| source.path == EBD_4B3A_CONNECTOR_CATALOG)
+    {
+        violations.extend(ebd_4b3a_audit_connector_owner(owner));
+    } else {
+        violations.insert(format!(
+            "catalog-physical-layout-connector-owner-missing: {EBD_4B3A_CONNECTOR_CATALOG}"
+        ));
+    }
+    if let Some(planner) = sources
+        .iter()
+        .find(|source| source.path == EBD_4B3A_SCAN_PLANNER)
+    {
+        violations.extend(ebd_4b3a_audit_scan_planner(planner));
+    } else {
+        violations.insert(format!(
+            "catalog-physical-layout-scan-planner-missing: {EBD_4B3A_SCAN_PLANNER}"
+        ));
+    }
+
+    let actual = current_source_tree_snapshot();
+    let actual_counts = [
+        actual.engine_files.len(),
+        actual.engine_module_declarations.len(),
+        actual
+            .external_engine_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual
+            .standalone_state_dependencies
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        actual.forwarding_reexports.len(),
+    ];
+    let expected_counts = [88, 86, 219, 58, 13];
+    if actual_counts != expected_counts {
+        violations.insert(format!(
+            "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3A catalog physical layout retirement failed:\n{}",
         violations.into_iter().collect::<Vec<_>>().join("\n")
     );
 }

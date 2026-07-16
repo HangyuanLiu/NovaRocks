@@ -311,26 +311,11 @@ impl IcebergDataFileInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StarRocksTabletRef {
-    pub tablet_id: i64,
-    pub partition_id: i64,
-    pub version: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PhysicalTableLayout {
-    pub db_id: i64,
-    pub table_id: i64,
-    pub schema_id: i64,
-    pub tablets: Vec<StarRocksTabletRef>,
-}
-
 /// Plan-time description of how the scan operator enumerates physical
 /// inputs for a table. Each variant covers a different lane:
 ///
-/// - `StarRocks`: StarRocks table; the actual tablet/version
-///   layout flows separately through `PhysicalTableLayout`.
+/// - `StarRocks`: StarRocks table identity; the connector scan planner reads
+///   the current tablet/version layout from the live StarRocks runtime.
 /// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
 ///   parquet files — a concrete list of data files plus table identity,
 ///   optional cloud-store credentials, and scan-binding provenance.
@@ -343,14 +328,11 @@ pub struct PhysicalTableLayout {
 pub enum ScanSource {
     /// StarRocks table: data lives in object storage (s3:// or
     /// file://) and metadata lives in a `MetaStoreProvider` (currently
-    /// SQLite). The per-table physical layout (tablet/partition/version
-    /// list) is carried separately on `PhysicalTableLayout`; the
-    /// `(db_id, table_id)` identity carried here lets plan-time consumers
+    /// SQLite). The `(db_id, table_id)` identity carried here lets plan-time consumers
     /// (e.g. `DictionaryQueryProvider::owner_for`) resolve the StarRocks
     /// dictionary owner without taking `state.starrocks_table.read()` on
-    /// every Scan column. The two fields must always agree with the
-    /// matching `PhysicalTableLayout` entry; `InMemoryCatalog::register_starrocks_table`
-    /// enforces this invariant in debug builds.
+    /// every Scan column. The connector scan planner validates this planned
+    /// identity against the live runtime before producing splits.
     StarRocks { db_id: i64, table_id: i64 },
     IcebergDataFiles {
         table: IcebergTableInfo,
@@ -488,14 +470,6 @@ pub trait CatalogProvider {
         _table: &str,
         _partition: &str,
     ) -> Result<Option<LegacyRangePartition>, String> {
-        Ok(None)
-    }
-
-    fn get_physical_layout(
-        &self,
-        _database: &str,
-        _table: &str,
-    ) -> Result<Option<PhysicalTableLayout>, String> {
         Ok(None)
     }
 }

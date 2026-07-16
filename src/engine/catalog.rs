@@ -17,24 +17,22 @@
 
 //! In-memory database/table catalog and shared catalog utilities.
 //!
-//! Holds the logical `InMemoryCatalog` (databases -> tables + physical
-//! layouts). Everything here is backend-agnostic — the
-//! StarRocks table and iceberg subsystems both query this catalog for
-//! table metadata.
+//! Holds the logical `InMemoryCatalog` (databases -> tables). Everything here
+//! is backend-agnostic — the StarRocks table and iceberg subsystems both query
+//! this catalog for table metadata.
 
 use std::collections::HashMap;
 
 use crate::catalog::identifier::normalize_identifier;
-// Transitional catalog-model re-exports remain until EBD-4B3.
+// Transitional catalog-model re-exports remain until EBD-4B3C.
 use crate::sql::catalog::LegacyRangePartition;
-pub use crate::sql::catalog::{
-    CatalogProvider, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
-};
+#[cfg(any(test, feature = "compat"))]
+pub use crate::sql::catalog::ScanSource;
+pub use crate::sql::catalog::{CatalogProvider, TableDef};
 
 #[derive(Clone, Debug)]
 struct DatabaseDef {
     tables: HashMap<String, TableDef>,
-    physical_layouts: HashMap<String, PhysicalTableLayout>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +50,6 @@ impl Default for InMemoryCatalog {
             DEFAULT_DATABASE.to_string(),
             DatabaseDef {
                 tables: HashMap::new(),
-                physical_layouts: HashMap::new(),
             },
         );
         Self {
@@ -72,7 +69,6 @@ impl InMemoryCatalog {
             key,
             DatabaseDef {
                 tables: HashMap::new(),
-                physical_layouts: HashMap::new(),
             },
         );
         Ok(())
@@ -107,50 +103,8 @@ impl InMemoryCatalog {
             .get_mut(&db_key)
             .ok_or_else(|| format!("unknown database: {database_name}"))?;
         let table_key = normalize_identifier(&table.name)?;
-        if db.tables.contains_key(&table_key) {
-            // Allow re-registration (overwrite) — callers use this to update storage
-            db.physical_layouts.remove(&table_key);
-            db.tables.insert(table_key, table);
-            return Ok(());
-        }
-        db.physical_layouts.remove(&table_key);
+        // Allow re-registration (overwrite) — callers use this to update storage.
         db.tables.insert(table_key, table);
-        Ok(())
-    }
-
-    pub(crate) fn register_starrocks_table(
-        &mut self,
-        database_name: &str,
-        table: TableDef,
-        physical_layout: PhysicalTableLayout,
-    ) -> Result<(), String> {
-        // Invariant: TableDef::source for a StarRocks table must carry the
-        // same (db_id, table_id) as the PhysicalTableLayout. The dict provider
-        // resolves identity from ScanSource::StarRocks; the rest of the
-        // execution layer still uses PhysicalTableLayout. If they disagree,
-        // dict snapshots will silently miss. Asserted in debug builds only —
-        // release builds skip to keep the registration path tight.
-        debug_assert!(
-            matches!(
-                &table.source,
-                ScanSource::StarRocks { db_id, table_id }
-                    if *db_id == physical_layout.db_id && *table_id == physical_layout.table_id
-            ),
-            "StarRocks TableDef.source must agree with PhysicalTableLayout on (db_id, table_id); \
-             got source={:?} layout=(db_id={}, table_id={})",
-            table.source,
-            physical_layout.db_id,
-            physical_layout.table_id,
-        );
-
-        let db_key = normalize_identifier(database_name)?;
-        let db = self
-            .databases
-            .get_mut(&db_key)
-            .ok_or_else(|| format!("unknown database: {database_name}"))?;
-        let table_key = normalize_identifier(&table.name)?;
-        db.tables.insert(table_key.clone(), table);
-        db.physical_layouts.insert(table_key, physical_layout);
         Ok(())
     }
 
@@ -168,7 +122,6 @@ impl InMemoryCatalog {
         db.tables
             .remove(&table_key)
             .ok_or_else(|| format!("unknown table: {table_name}"))?;
-        db.physical_layouts.remove(&table_key);
         self.legacy_range_partitions.remove(&(db_key, table_key));
         Ok(())
     }
@@ -194,22 +147,6 @@ impl InMemoryCatalog {
             .get(&table_key)
             .cloned()
             .ok_or_else(|| format!("unknown table: {table_name}"))
-    }
-
-    pub(crate) fn get_physical_layout(
-        &self,
-        database_name: &str,
-        table_name: &str,
-    ) -> Result<Option<PhysicalTableLayout>, String> {
-        let db_key = normalize_identifier(database_name)?;
-        let table_key = normalize_identifier(table_name)?;
-        Ok(self
-            .databases
-            .get(&db_key)
-            .ok_or_else(|| format!("unknown database: {database_name}"))?
-            .physical_layouts
-            .get(&table_key)
-            .cloned())
     }
 
     pub(crate) fn set_legacy_range_partitions(
@@ -320,14 +257,6 @@ impl CatalogProvider for InMemoryCatalog {
                     .cloned()
             }))
     }
-
-    fn get_physical_layout(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Result<Option<PhysicalTableLayout>, String> {
-        self.get_physical_layout(database, table)
-    }
 }
 
 #[cfg(test)]
@@ -348,9 +277,6 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            // Must match the PhysicalTableLayout used by tests in this module
-            // (db_id: 10, table_id: 20) so the debug_assert in
-            // register_starrocks_table is satisfied.
             source: ScanSource::StarRocks {
                 db_id: 10,
                 table_id: 20,
@@ -359,41 +285,23 @@ mod tests {
     }
 
     #[test]
-    fn register_starrocks_table_tracks_and_clears_physical_layout() {
+    fn register_overwrites_starrocks_logical_table() {
         let mut catalog = InMemoryCatalog::default();
-        let layout = PhysicalTableLayout {
-            db_id: 10,
-            table_id: 20,
-            schema_id: 30,
-            tablets: vec![StarRocksTabletRef {
-                tablet_id: 40,
-                partition_id: 50,
-                version: 60,
-            }],
-        };
-
-        catalog
-            .register_starrocks_table(
-                DEFAULT_DATABASE,
-                test_table("starrocks_tbl"),
-                layout.clone(),
-            )
-            .expect("register StarRocks table");
-        assert_eq!(
-            catalog
-                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
-                .expect("physical layout lookup"),
-            Some(layout.clone())
-        );
-
         catalog
             .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
+            .expect("register StarRocks table");
+        let mut replacement = test_table("starrocks_tbl");
+        replacement.columns[0].nullable = true;
+
+        catalog
+            .register(DEFAULT_DATABASE, replacement)
             .expect("overwrite with logical table");
-        assert_eq!(
+        assert!(
             catalog
-                .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
-                .expect("physical layout cleared"),
-            None
+                .get(DEFAULT_DATABASE, "starrocks_tbl")
+                .expect("overwritten logical table")
+                .columns[0]
+                .nullable
         );
     }
 }

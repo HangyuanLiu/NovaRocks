@@ -39,9 +39,7 @@ use super::model::{
 use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::schema::ColumnDef;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
-use crate::engine::catalog::{
-    InMemoryCatalog, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
-};
+use crate::engine::catalog::{InMemoryCatalog, ScanSource, TableDef};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StarRocksTableCatalog {
@@ -591,8 +589,7 @@ pub(crate) fn register_starrocks_table_in_catalog(
     runtime: &StarRocksTableRuntime,
 ) -> Result<(), String> {
     let table = starrocks_table_def(runtime)?;
-    let layout = starrocks_table_physical_layout(runtime)?;
-    catalog.register_starrocks_table(&runtime.database_name, table, layout)
+    catalog.register(&runtime.database_name, table)
 }
 
 pub(crate) fn register_starrocks_tables_in_catalog(
@@ -643,9 +640,14 @@ fn starrocks_table_def(runtime: &StarRocksTableRuntime) -> Result<TableDef, Stri
     })
 }
 
-pub(crate) fn starrocks_table_physical_layout(
-    runtime: &StarRocksTableRuntime,
-) -> Result<PhysicalTableLayout, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StarRocksScanTablet {
+    pub(super) tablet_id: i64,
+    pub(super) partition_id: i64,
+    pub(super) version: i64,
+}
+
+pub(super) fn starrocks_scan_tablets(runtime: &StarRocksTableRuntime) -> Vec<StarRocksScanTablet> {
     let active_partition_versions = runtime
         .partitions
         .iter()
@@ -659,7 +661,7 @@ pub(crate) fn starrocks_table_physical_layout(
         .map(|index| index.index_id)
         .collect::<HashSet<_>>();
 
-    let tablets = runtime
+    runtime
         .tablets
         .iter()
         .filter(|tablet| active_index_ids.contains(&tablet.index_id))
@@ -667,19 +669,13 @@ pub(crate) fn starrocks_table_physical_layout(
             active_partition_versions
                 .get(&tablet.partition_id)
                 .copied()
-                .map(|version| StarRocksTabletRef {
+                .map(|version| StarRocksScanTablet {
                     tablet_id: tablet.tablet_id,
                     partition_id: tablet.partition_id,
                     version,
                 })
         })
-        .collect();
-    Ok(PhysicalTableLayout {
-        db_id: runtime.table.db_id,
-        table_id: runtime.table.table_id,
-        schema_id: runtime.table.current_schema_id,
-        tablets,
-    })
+        .collect()
 }
 
 fn visible_tablet_columns_by_name(
@@ -847,7 +843,7 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
 
     #[test]
-    fn register_starrocks_tables_in_catalog_populates_logical_table_and_layout() {
+    fn register_starrocks_tables_in_catalog_populates_logical_table_and_selects_live_tablets() {
         let runtime = StarRocksTableRuntime {
             database_name: DEFAULT_DATABASE.to_string(),
             table: StoredStarRocksTable {
@@ -940,14 +936,31 @@ mod tests {
                     next_version: 10,
                     state: StarRocksPartitionState::Active,
                 },
+                StoredStarRocksPartition {
+                    partition_id: 102,
+                    table_id: 20,
+                    name: "retired".to_string(),
+                    visible_version: 11,
+                    next_version: 12,
+                    state: StarRocksPartitionState::Retired,
+                },
             ],
-            indexes: vec![StoredStarRocksIndex {
-                index_id: 200,
-                table_id: 20,
-                partition_id: 100,
-                index_type: "BASE".to_string(),
-                state: StarRocksIndexState::Active,
-            }],
+            indexes: vec![
+                StoredStarRocksIndex {
+                    index_id: 200,
+                    table_id: 20,
+                    partition_id: 100,
+                    index_type: "BASE".to_string(),
+                    state: StarRocksIndexState::Active,
+                },
+                StoredStarRocksIndex {
+                    index_id: 201,
+                    table_id: 20,
+                    partition_id: 100,
+                    index_type: "ROLLUP".to_string(),
+                    state: StarRocksIndexState::Retired,
+                },
+            ],
             tablets: vec![
                 StoredStarRocksTablet {
                     tablet_id: 300,
@@ -962,6 +975,20 @@ mod tests {
                     index_id: 200,
                     bucket_seq: 1,
                     tablet_root_path: "s3://warehouse/db_10/table_20/tablet_301".to_string(),
+                },
+                StoredStarRocksTablet {
+                    tablet_id: 302,
+                    partition_id: 102,
+                    index_id: 200,
+                    bucket_seq: 2,
+                    tablet_root_path: "s3://warehouse/db_10/table_20/tablet_302".to_string(),
+                },
+                StoredStarRocksTablet {
+                    tablet_id: 303,
+                    partition_id: 100,
+                    index_id: 201,
+                    bucket_seq: 3,
+                    tablet_root_path: "s3://warehouse/db_10/table_20/tablet_303".to_string(),
                 },
             ],
         };
@@ -1001,31 +1028,31 @@ mod tests {
                 },
             ]
         );
-        assert!(matches!(table.source, ScanSource::StarRocks { .. }));
-
-        let layout = catalog
-            .get_physical_layout(DEFAULT_DATABASE, "starrocks_tbl")
-            .expect("physical layout")
-            .expect("StarRocks layout");
-        assert_eq!(
-            layout,
-            PhysicalTableLayout {
+        assert!(matches!(
+            table.source,
+            ScanSource::StarRocks {
                 db_id: 10,
                 table_id: 20,
-                schema_id: 30,
-                tablets: vec![
-                    StarRocksTabletRef {
-                        tablet_id: 300,
-                        partition_id: 100,
-                        version: 7,
-                    },
-                    StarRocksTabletRef {
-                        tablet_id: 301,
-                        partition_id: 101,
-                        version: 9,
-                    },
-                ],
             }
+        ));
+
+        let runtime = starrocks
+            .table(DEFAULT_DATABASE, "starrocks_tbl")
+            .expect("live StarRocks runtime");
+        assert_eq!(
+            starrocks_scan_tablets(runtime),
+            vec![
+                StarRocksScanTablet {
+                    tablet_id: 300,
+                    partition_id: 100,
+                    version: 7,
+                },
+                StarRocksScanTablet {
+                    tablet_id: 301,
+                    partition_id: 101,
+                    version: 9,
+                },
+            ]
         );
     }
 

@@ -625,9 +625,7 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
             &runtime_storage_columns,
             &runtime_tablet_schema,
         )?;
-        let layout = super::catalog::starrocks_table_physical_layout(runtime)?;
-        Ok(layout
-            .tablets
+        Ok(super::catalog::starrocks_scan_tablets(runtime)
             .into_iter()
             .map(|tablet| {
                 Split::new(
@@ -646,8 +644,143 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
+
+    use prost::Message;
+
     use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
+    use crate::connector::starrocks::table::catalog::StarRocksTableCatalog;
+    use crate::connector::starrocks::table::config::StarRocksTableConfig;
+    use crate::connector::starrocks::table::model::{
+        StarRocksGlobalMeta, StarRocksIndexState, StarRocksPartitionState, StarRocksTableKind,
+        StarRocksTableSnapshot, StarRocksTableState, StoredStarRocksDatabase, StoredStarRocksIndex,
+        StoredStarRocksPartition, StoredStarRocksSchema, StoredStarRocksTable,
+        StoredStarRocksTablet,
+    };
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
+
+    fn live_scan_test_state() -> Arc<StandaloneState> {
+        let tablet_schema = TabletSchemaPb {
+            id: Some(30),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 1,
+                name: Some("id".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_key: Some(true),
+                is_nullable: Some(false),
+                visible: Some(true),
+                ..Default::default()
+            }],
+            num_short_key_columns: Some(1),
+            sort_key_idxes: vec![0],
+            sort_key_unique_ids: vec![1],
+            ..Default::default()
+        };
+        let snapshot = StarRocksTableSnapshot {
+            global: StarRocksGlobalMeta {
+                warehouse_uri: "s3://warehouse".to_string(),
+                ..Default::default()
+            },
+            databases: vec![StoredStarRocksDatabase {
+                db_id: 10,
+                name: "default".to_string(),
+            }],
+            tables: vec![StoredStarRocksTable {
+                table_id: 20,
+                db_id: 10,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 30,
+                state: StarRocksTableState::Active,
+                kind: StarRocksTableKind::Table,
+            }],
+            schemas: vec![StoredStarRocksSchema {
+                schema_id: 30,
+                table_id: 20,
+                schema_version: 1,
+                tablet_schema_pb: tablet_schema.encode_to_vec(),
+            }],
+            partitions: vec![
+                StoredStarRocksPartition {
+                    partition_id: 100,
+                    table_id: 20,
+                    name: "active".to_string(),
+                    visible_version: 7,
+                    next_version: 8,
+                    state: StarRocksPartitionState::Active,
+                },
+                StoredStarRocksPartition {
+                    partition_id: 101,
+                    table_id: 20,
+                    name: "retired".to_string(),
+                    visible_version: 9,
+                    next_version: 10,
+                    state: StarRocksPartitionState::Retired,
+                },
+            ],
+            indexes: vec![
+                StoredStarRocksIndex {
+                    index_id: 200,
+                    table_id: 20,
+                    partition_id: 100,
+                    index_type: "BASE".to_string(),
+                    state: StarRocksIndexState::Active,
+                },
+                StoredStarRocksIndex {
+                    index_id: 201,
+                    table_id: 20,
+                    partition_id: 100,
+                    index_type: "ROLLUP".to_string(),
+                    state: StarRocksIndexState::Retired,
+                },
+            ],
+            tablets: vec![
+                StoredStarRocksTablet {
+                    tablet_id: 300,
+                    partition_id: 100,
+                    index_id: 200,
+                    bucket_seq: 0,
+                    tablet_root_path: "s3://warehouse/tablet_300".to_string(),
+                },
+                StoredStarRocksTablet {
+                    tablet_id: 301,
+                    partition_id: 101,
+                    index_id: 200,
+                    bucket_seq: 1,
+                    tablet_root_path: "s3://warehouse/tablet_301".to_string(),
+                },
+                StoredStarRocksTablet {
+                    tablet_id: 302,
+                    partition_id: 100,
+                    index_id: 201,
+                    bucket_seq: 2,
+                    tablet_root_path: "s3://warehouse/tablet_302".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let config = StarRocksTableConfig {
+            warehouse_uri: "s3://warehouse".to_string(),
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+            mv_default_storage_engine: "iceberg".to_string(),
+        };
+        let starrocks = StarRocksTableCatalog::rebuild(Some(config), snapshot)
+            .expect("rebuild live scan test catalog");
+        Arc::new(StandaloneState {
+            starrocks_table: RwLock::new(starrocks),
+            ..StandaloneState::default()
+        })
+    }
 
     #[test]
     fn downcasts_starrocks_scan_and_split() {
@@ -681,6 +814,41 @@ mod tests {
         validate_split_connectors(&scan, &splits).expect("same connector");
         assert_eq!(starrocks_scan_handle(&scan).expect("scan").schema_id, 30);
         assert_eq!(starrocks_split(&splits[0]).expect("split").tablet_id, 300);
+    }
+
+    #[test]
+    fn real_planner_reads_live_tablets_and_visible_version_after_begin_scan() {
+        let state = live_scan_test_state();
+        let planner = StarRocksTableScanPlanner::new(&state);
+        let table =
+            StarRocksTableScanPlanner::table_handle_from_source("default", "orders", 10, 20);
+        let scan = planner
+            .begin_scan(table, BeginScanContext::default())
+            .expect("begin real StarRocks scan");
+
+        state
+            .starrocks_table
+            .write()
+            .expect("StarRocks table catalog write lock")
+            .advance_partition_version(100, 8)
+            .expect("advance live visible version");
+
+        let splits = planner
+            .plan_splits(&scan, SplitPlanningContext::default())
+            .expect("plan live StarRocks splits");
+        assert_eq!(
+            splits.len(),
+            1,
+            "retired partition/index must stay filtered"
+        );
+        assert_eq!(
+            starrocks_split(&splits[0]).expect("StarRocks split"),
+            &StarRocksSplit {
+                tablet_id: 300,
+                partition_id: 100,
+                version: 8,
+            }
+        );
     }
 
     #[test]

@@ -137,14 +137,6 @@ impl CatalogProvider for CatalogMgrProvider<'_> {
         self.local
             .get_legacy_range_partition(database, table, partition)
     }
-
-    fn get_physical_layout(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> Result<Option<crate::sql::catalog::PhysicalTableLayout>, String> {
-        self.local.get_physical_layout(database, table)
-    }
 }
 
 #[cfg(test)]
