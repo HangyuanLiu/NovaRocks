@@ -36413,6 +36413,9 @@ impl Rfd4M2b1TypeResolver {
         );
         for (scope, local, target) in extern_crate_aliases {
             let destination = resolver.scopes.entry(scope).or_default();
+            if destination.shadows.contains(&local) {
+                continue;
+            }
             destination.shadows.insert(local.clone());
             destination
                 .namespaces
@@ -36936,6 +36939,15 @@ impl Rfd4M2b1TypeResolver {
         audit.found
     }
 
+    fn has_symbol_binding(&self, symbol: &str) -> bool {
+        self.scopes.values().any(|scope| {
+            scope
+                .bindings
+                .values()
+                .any(|symbols| symbols.contains(symbol))
+        })
+    }
+
     fn type_contains_unborrowed_symbol(
         &self,
         ty: &syn::Type,
@@ -37081,6 +37093,8 @@ struct Rfd4M2b1AstAudit {
     current_impl_owner: Option<String>,
     current_impl_is_canonical_composite: bool,
     installed_deployment_has_router: Option<bool>,
+    composite_authority_reference: bool,
+    role_router_authority_reference: bool,
     role_router_storage: BTreeSet<String>,
     role_router_authorities: BTreeSet<String>,
     split_routing_activation: BTreeSet<String>,
@@ -37090,6 +37104,9 @@ struct Rfd4M2b1AstAudit {
 
 impl Rfd4M2b1AstAudit {
     fn new(source_path: impl Into<String>, type_resolver: Rfd4M2b1TypeResolver) -> Self {
+        let composite_authority_reference =
+            type_resolver.has_symbol_binding("RuntimeFilterParticipantInstall");
+        let role_router_authority_reference = type_resolver.has_symbol_binding("RoleRouter");
         Self {
             source_path: source_path.into(),
             type_resolver,
@@ -37098,6 +37115,8 @@ impl Rfd4M2b1AstAudit {
             current_impl_owner: None,
             current_impl_is_canonical_composite: false,
             installed_deployment_has_router: None,
+            composite_authority_reference,
+            role_router_authority_reference,
             role_router_storage: BTreeSet::new(),
             role_router_authorities: BTreeSet::new(),
             split_routing_activation: BTreeSet::new(),
@@ -37349,6 +37368,20 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         syn::visit::visit_item_static(self, item);
     }
 
+    fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+        if path.qself.is_none() {
+            self.composite_authority_reference |= self.type_resolver.path_is_symbol(
+                &path.path,
+                "RuntimeFilterParticipantInstall",
+                &self.module_scope,
+            );
+            self.role_router_authority_reference |=
+                self.type_resolver
+                    .path_is_symbol(&path.path, "RoleRouter", &self.module_scope);
+        }
+        syn::visit::visit_type_path(self, path);
+    }
+
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         let name = item.sig.ident.to_string();
         let lower = name.to_ascii_lowercase();
@@ -37438,28 +37471,6 @@ fn rfd4_m2b1_producer_mutation_name(lower: &str) -> bool {
             .any(|verb| lower.contains(verb))
 }
 
-fn rfd4_m2b1_authority_reference(source_rel: &str, production: &str, symbol: &str) -> bool {
-    rust_canonical_paths(production, source_rel)
-        .into_iter()
-        .any(|path| {
-            let owner = match symbol {
-                "RuntimeFilterParticipantInstall" => {
-                    &["crate", "runtime_filter", "port", "install"][..]
-                }
-                "RoleRouter" => &["crate", "runtime_filter", "router", "role_graph"][..],
-                _ => return false,
-            };
-            path.iter()
-                .map(String::as_str)
-                .zip(owner.iter().copied())
-                .all(|(actual, expected)| actual == expected)
-                && path.len() > owner.len()
-                && path
-                    .last()
-                    .is_some_and(|member| member == symbol || member == "*")
-        })
-}
-
 fn rfd4_m2b1_service_owner(path: &str) -> bool {
     path == "src/runtime_filter/service.rs"
         || (path.starts_with("src/runtime_filter/service/") && path.ends_with(".rs"))
@@ -37502,12 +37513,8 @@ fn rfd4_m2b1_atomic_install_violations(sources: &[Rfd4M2b1GuardSource]) -> Vec<S
         let mut audit = Rfd4M2b1AstAudit::new(&source.path, type_resolver);
         syn::visit::Visit::visit_file(&mut audit, &parsed);
 
-        let composite = rfd4_m2b1_authority_reference(
-            &source.path,
-            &production,
-            "RuntimeFilterParticipantInstall",
-        );
-        let role_router = rfd4_m2b1_authority_reference(&source.path, &production, "RoleRouter");
+        let composite = audit.composite_authority_reference;
+        let role_router = audit.role_router_authority_reference;
         if rfd4_m2b1_live_ingress_owner(&source.path) && (composite || role_router) {
             let symbols = [
                 composite.then_some("RuntimeFilterParticipantInstall"),
@@ -38113,6 +38120,134 @@ fn rfd4_m2b1_detector_resolves_crate_root_authority_aliases() {
                 violation.contains("view-only-install") || violation.contains("role-router-storage")
             }),
             "unrelated crate and module aliases must remain outside authority detection: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_prefers_local_namespaces_over_extern_crate_aliases() {
+    for source in [
+        "extern crate self as nr; \
+         mod nr { \
+         pub(crate) mod runtime_filter { \
+         pub(crate) mod port { \
+         pub(crate) mod install { \
+         pub(crate) struct RuntimeFilterInstallView; \
+         } \
+         } \
+         } \
+         } \
+         pub(crate) fn inspect( \
+         view: nr::runtime_filter::port::install::RuntimeFilterInstallView \
+         ) {}",
+        "extern crate alloc as nr; \
+         mod nr { \
+         pub(crate) mod runtime_filter { \
+         pub(crate) mod router { \
+         pub(crate) mod role_graph { pub(crate) struct RoleRouter; } \
+         } \
+         } \
+         } \
+         struct State { \
+         router: Arc<nr::runtime_filter::router::role_graph::RoleRouter> \
+         }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            !violations.iter().any(|violation| {
+                violation.contains("view-only-install")
+                    || violation.contains("role-router-storage")
+                    || violation.contains("composite-owner")
+                    || violation.contains("role-router-owner")
+            }),
+            "a same-scope local namespace must shadow an extern-crate alias: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_applies_scope_aware_authority_refs_to_live_owners() {
+    for (source, symbol, owner_violation) in [
+        (
+            "use crate as nr; \
+             struct State { \
+             install: nr::runtime_filter::port::install::RuntimeFilterParticipantInstall \
+             }",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "extern crate self as nr; \
+             type Install = \
+             nr::runtime_filter::port::install::RuntimeFilterParticipantInstall;",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "mod facade { pub(crate) use crate::runtime_filter::port::*; } \
+             use self::facade::*; \
+             static INSTALL: Option<install::RuntimeFilterParticipantInstall> = None;",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall \
+             as Install;",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "use crate::runtime_filter::port::install::*;",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "use crate as nr; \
+             struct State { \
+             router: nr::runtime_filter::router::role_graph::RoleRouter \
+             }",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+        (
+            "mod facade { pub(crate) use crate::runtime_filter::router::*; } \
+             use self::facade::*; \
+             static ROUTER: Option<role_graph::RoleRouter> = None;",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+        (
+            "use crate::runtime_filter::router::role_graph::RoleRouter as Router;",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+        (
+            "use crate::runtime_filter::router::role_graph::*;",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime/query_context.rs",
+            source,
+        )]);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("live-ingress-authority-leak") && violation.contains(symbol)
+            }),
+            "live ingress must reject scope-resolved authority references to {symbol}: \
+             {source}: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(owner_violation)),
+            "live ingress must also enforce the {owner_violation} owner boundary: \
              {source}: {violations:?}"
         );
     }
