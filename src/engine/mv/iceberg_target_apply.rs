@@ -949,7 +949,7 @@ fn register_scoped_framework_locator_table_for_query(
 fn try_register_scoped_framework_locator_table(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     namespace: &str,
-    table_def: crate::sql::catalog::TableDef,
+    table_def: crate::sql::planner::table::TableDef,
 ) -> Result<Option<ScopedFrameworkLocatorTable>, String> {
     let table_name = table_def.name.clone();
     let mut catalog = state
@@ -991,7 +991,7 @@ struct FrameworkLocatorTableFingerprint {
 
 #[cfg(test)]
 impl FrameworkLocatorTableFingerprint {
-    fn from_table_def(table_def: &crate::sql::catalog::TableDef) -> Self {
+    fn from_table_def(table_def: &crate::sql::planner::table::TableDef) -> Self {
         Self {
             columns: table_def.columns.clone(),
             iceberg_row_lineage_metadata_columns: table_def
@@ -1001,7 +1001,7 @@ impl FrameworkLocatorTableFingerprint {
         }
     }
 
-    fn matches_table_def(&self, table_def: &crate::sql::catalog::TableDef) -> bool {
+    fn matches_table_def(&self, table_def: &crate::sql::planner::table::TableDef) -> bool {
         self.columns == table_def.columns
             && self.iceberg_row_lineage_metadata_columns
                 == table_def.iceberg_row_lineage_metadata_columns
@@ -1121,7 +1121,7 @@ fn build_locator_visible_target_table_def(
     target_table_name: &str,
     apply_key_column: &str,
     partition_filter: &TargetPartitionFilter,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     let entry = framework_locator_catalog_entry(state, target_catalog_name, target_table)?;
     let files = match target_table
         .metadata()
@@ -1325,10 +1325,10 @@ fn framework_locator_loaded_table(
 }
 
 pub(crate) fn expose_physical_apply_key_for_locator_registration(
-    mut table_def: crate::sql::catalog::TableDef,
+    mut table_def: crate::sql::planner::table::TableDef,
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     let has_file = table_def
         .iceberg_row_lineage_metadata_columns
         .iter()
@@ -2726,7 +2726,7 @@ mod tests {
     }
 
     fn assert_standard_mv_target_table_def_hides_physical_apply_key(
-        table_def: &crate::sql::catalog::TableDef,
+        table_def: &crate::sql::planner::table::TableDef,
     ) {
         assert!(
             table_def.columns.iter().all(|column| !column
@@ -2749,8 +2749,8 @@ mod tests {
     }
 
     fn expose_physical_apply_key_for_locator_test_registration(
-        mut table_def: crate::sql::catalog::TableDef,
-    ) -> crate::sql::catalog::TableDef {
+        mut table_def: crate::sql::planner::table::TableDef,
+    ) -> crate::sql::planner::table::TableDef {
         assert_standard_mv_target_table_def_hides_physical_apply_key(&table_def);
         table_def.columns.insert(
             0,
@@ -3558,7 +3558,7 @@ mod tests {
         );
     }
 
-    fn sentinel_collision_table_def(name: &str) -> crate::sql::catalog::TableDef {
+    fn sentinel_collision_table_def(name: &str) -> crate::sql::planner::table::TableDef {
         sentinel_framework_locator_table_def(name, "sentinel_collision_column", 9001, 9002)
     }
 
@@ -3567,8 +3567,8 @@ mod tests {
         column_name: &str,
         db_id: i64,
         table_id: i64,
-    ) -> crate::sql::catalog::TableDef {
-        crate::sql::catalog::TableDef {
+    ) -> crate::sql::planner::table::TableDef {
+        crate::sql::planner::table::TableDef {
             name: name.to_string(),
             columns: vec![crate::catalog::schema::ColumnDef {
                 name: column_name.to_string(),
@@ -3578,7 +3578,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::catalog::ScanSource::StarRocks { db_id, table_id },
+            source: crate::sql::planner::table::ScanSource::StarRocks { db_id, table_id },
         }
     }
 

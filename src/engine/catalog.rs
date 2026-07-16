@@ -24,11 +24,11 @@
 use std::collections::HashMap;
 
 use crate::catalog::identifier::normalize_identifier;
-// Transitional catalog-model re-exports remain until EBD-4B3C.
+pub use crate::sql::catalog::CatalogProvider;
 use crate::sql::catalog::LegacyRangePartition;
 #[cfg(any(test, feature = "compat"))]
-pub use crate::sql::catalog::ScanSource;
-pub use crate::sql::catalog::{CatalogProvider, TableDef};
+use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::TableDef;
 
 #[derive(Clone, Debug)]
 struct DatabaseDef {

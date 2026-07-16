@@ -2337,6 +2337,7 @@ fn planner_stage_first_boundaries_are_closed() {
             "mod.rs".to_string(),
             "ordering.rs".to_string(),
             "payload.rs".to_string(),
+            "table.rs".to_string(),
         ]),
         "planner root Rust files must remain the exact stage-first facade and neutral owners"
     );
@@ -2798,6 +2799,7 @@ pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
 pub(crate) mod pipeline;
+pub(crate) mod table;
 pub(crate) use logical::build::{plan_output_columns, plan_query};
 "#;
 
@@ -4933,6 +4935,7 @@ pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
 pub(crate) mod pipeline;
+pub(crate) mod table;
 pub(crate) use logical::build::{plan_output_columns, plan_query};
 
 #[cfg(test)]

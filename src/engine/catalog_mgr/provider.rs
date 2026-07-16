@@ -20,7 +20,8 @@
 use crate::connector::ConnectorRegistry;
 use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::catalog_mgr::CatalogMgr;
-use crate::sql::catalog::{CatalogProvider, TableDef, TableLookupMode};
+use crate::sql::catalog::{CatalogProvider, TableLookupMode};
+use crate::sql::planner::table::TableDef;
 
 pub(crate) struct CatalogMgrProvider<'a> {
     current_catalog: Option<&'a str>,
@@ -151,8 +152,9 @@ mod tests {
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableLookupMode};
+    use crate::sql::catalog::TableLookupMode;
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource};
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -234,7 +236,7 @@ mod tests {
                     "aws.s3.endpoint".to_string(),
                     "http://minio:9000".to_string(),
                 )]),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }

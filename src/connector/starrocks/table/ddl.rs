@@ -1615,7 +1615,7 @@ mod tests {
                 .expect("logical table before truncate");
             assert!(matches!(
                 table.source,
-                crate::engine::catalog::ScanSource::StarRocks {
+                crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 1,
                     table_id: 10,
                 }
@@ -1661,7 +1661,7 @@ mod tests {
             .expect("logical table after truncate");
         assert!(matches!(
             logical_after.source,
-            crate::engine::catalog::ScanSource::StarRocks {
+            crate::sql::planner::table::ScanSource::StarRocks {
                 db_id: 1,
                 table_id: 10,
             }

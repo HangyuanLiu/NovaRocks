@@ -12534,7 +12534,7 @@ fn build_iceberg_table_def_for_snapshot_scan(
     state: &Arc<StandaloneState>,
     base: &IcebergTableRef,
     snapshot_id: i64,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -12906,7 +12906,7 @@ fn validate_join_full_refresh_payload_columns(
 #[derive(Clone, Debug)]
 struct JoinFullRefreshBaseScan {
     output_columns: Vec<OutputColumn>,
-    schema_fields: Vec<crate::sql::catalog::IcebergSchemaFieldDef>,
+    schema_fields: Vec<crate::sql::planner::table::IcebergSchemaFieldDef>,
 }
 
 fn find_join_full_refresh_base_scan(
@@ -12951,16 +12951,16 @@ fn collect_join_full_refresh_base_scans(
 }
 
 fn iceberg_scan_table_info(
-    source: &crate::sql::catalog::ScanSource,
-) -> Option<&crate::sql::catalog::IcebergTableInfo> {
+    source: &crate::sql::planner::table::ScanSource,
+) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
     match source {
-        crate::sql::catalog::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::catalog::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::catalog::ScanSource::StarRocks { .. }
-        | crate::sql::catalog::ScanSource::IcebergMvTargetState(_)
-        | crate::sql::catalog::ScanSource::IcebergMvTargetLocator(_) => None,
+        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
+        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
+        crate::sql::planner::table::ScanSource::StarRocks { .. }
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetState(_)
+        | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator(_) => None,
     }
 }
 
@@ -14473,7 +14473,7 @@ fn build_join_delta_target_locator_table_def(
     target: &IcebergMvTarget,
     target_table: &iceberg::table::Table,
     target_snapshot_id: Option<i64>,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     let base = IcebergTableRef {
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
@@ -14495,7 +14495,7 @@ fn build_join_delta_target_locator_table_def(
 fn build_empty_join_delta_target_locator_table_def(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -16877,7 +16877,7 @@ mod tests {
             "locator metadata columns={:?}",
             locator.iceberg_row_lineage_metadata_columns
         );
-        let crate::sql::catalog::ScanSource::IcebergDataFiles {
+        let crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table,
             files,
             binding,
@@ -16891,7 +16891,7 @@ mod tests {
         assert_eq!(table.table, "mv_join");
         assert_eq!(
             *binding,
-            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles
+            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles
         );
         assert_eq!(files.len(), 1, "locator must use supplied snapshot files");
     }

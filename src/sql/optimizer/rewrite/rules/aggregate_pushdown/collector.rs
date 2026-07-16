@@ -358,7 +358,6 @@ mod tests {
 
     use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggStage, AggregateOutputLayout, FilterOp, LogicalAggregateOp, LogicalJoinOp, Operator,
@@ -367,6 +366,7 @@ mod tests {
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;

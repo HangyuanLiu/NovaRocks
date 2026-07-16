@@ -26,7 +26,6 @@
 //! predicates.
 
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
-use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -39,6 +38,7 @@ use crate::sql::planner::imv_rewrite::join_delta_shape::{
 use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::table::ScanSource;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -769,8 +769,8 @@ mod tests {
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::analysis::{JoinKind, LiteralValue};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 

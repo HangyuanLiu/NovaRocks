@@ -63,7 +63,7 @@ mod tests {
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
-    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::sync::{Arc, RwLock};
 

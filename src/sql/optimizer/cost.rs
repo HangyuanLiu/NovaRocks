@@ -1294,11 +1294,11 @@ mod tests {
     fn two_column_scan_op(required_columns: Option<Vec<&str>>) -> Operator {
         Operator::PhysicalScan(ScanOp {
             database: String::new(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },
@@ -1317,11 +1317,11 @@ mod tests {
     fn scan_op() -> Operator {
         Operator::PhysicalScan(ScanOp {
             database: String::new(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },
@@ -3238,11 +3238,11 @@ mod tests {
         let s = stats(1000.0, 100.0);
         let op = Operator::PhysicalScan(ScanOp {
             database: String::new(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },
@@ -3581,11 +3581,11 @@ mod tests {
         let s = stats(1000.0, 100.0);
         let op = Operator::LogicalScan(ScanOp {
             database: String::new(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },

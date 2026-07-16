@@ -488,7 +488,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -502,6 +501,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode, PlanValuesNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     // ---- Column ID constants --------------------------------------------------
     const T1_K: ColumnId = ColumnId(1); // left (outer) key column

@@ -114,8 +114,8 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
+pub use crate::sql::catalog::CatalogProvider;
 use crate::sql::catalog::LegacyRangePartition;
-pub use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 
 #[cfg(feature = "compat")]
@@ -4912,8 +4912,8 @@ path = "{metadata_path}"
             fn build_table_def(
                 &self,
                 table: &crate::connector::backend::ResolvedTable,
-            ) -> Result<crate::sql::catalog::TableDef, String> {
-                let iceberg = crate::sql::catalog::IcebergTableInfo {
+            ) -> Result<crate::sql::planner::table::TableDef, String> {
+                let iceberg = crate::sql::planner::table::IcebergTableInfo {
                     catalog: table.catalog.clone(),
                     namespace: table.namespace.clone(),
                     table: table.table.clone(),
@@ -4921,19 +4921,20 @@ path = "{metadata_path}"
                     current_snapshot_id: Some(1),
                     schema_id: 1,
                     location: "file:///ice/db/parted".to_string(),
-                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
                 };
-                Ok(crate::sql::catalog::TableDef {
+                Ok(crate::sql::planner::table::TableDef {
                     name: table.table.clone(),
                     columns: table.columns.clone(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+                    source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
                         table: iceberg,
                         files: Vec::new(),
                         cloud_properties: Default::default(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 })
             }
@@ -5366,8 +5367,8 @@ mysql_port = 47892
         Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
     ) {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{ScanSource, TableDef};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
+        use crate::sql::planner::table::{ScanSource, TableDef};
 
         let mut catalog = super::InMemoryCatalog::default();
         let table = TableDef {
@@ -5698,7 +5699,7 @@ mysql_port = 47892
         catalog
             .register(
                 "db",
-                crate::sql::catalog::TableDef {
+                crate::sql::planner::table::TableDef {
                     name: "b".to_string(),
                     columns: vec![
                         crate::catalog::schema::ColumnDef {
@@ -5717,8 +5718,8 @@ mysql_port = 47892
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::catalog::ScanSource::IcebergDataFiles {
-                        table: crate::sql::catalog::IcebergTableInfo {
+                    source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+                        table: crate::sql::planner::table::IcebergTableInfo {
                             catalog: "ice".to_string(),
                             namespace: "db".to_string(),
                             table: "b".to_string(),
@@ -5726,9 +5727,9 @@ mysql_port = 47892
                             current_snapshot_id: Some(22),
                             schema_id: 1,
                             location: "file:///ice/db/b".to_string(),
-                            schema: crate::sql::catalog::IcebergSchemaDef {
+                            schema: crate::sql::planner::table::IcebergSchemaDef {
                                 fields: vec![
-                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                    crate::sql::planner::table::IcebergSchemaFieldDef {
                                         field_id: 1,
                                         name: "k".to_string(),
                                         initial_default: None,
@@ -5737,7 +5738,7 @@ mysql_port = 47892
                                         write_default_json: None,
                                         children: Vec::new(),
                                     },
-                                    crate::sql::catalog::IcebergSchemaFieldDef {
+                                    crate::sql::planner::table::IcebergSchemaFieldDef {
                                         field_id: 2,
                                         name: "v".to_string(),
                                         initial_default: None,
@@ -5753,7 +5754,8 @@ mysql_port = 47892
                         },
                         files: Vec::new(),
                         cloud_properties: Default::default(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
             )
@@ -8959,9 +8961,10 @@ path = "meta/operations.sqlite"
 
     #[test]
     fn iceberg_write_root_shuffle_by_output_name_uses_logical_output_column_id() {
-        use crate::sql::catalog::{CatalogProvider, TableDef};
+        use crate::sql::catalog::CatalogProvider;
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        use crate::sql::planner::table::TableDef;
 
         struct EmptyCatalog;
         impl CatalogProvider for EmptyCatalog {

@@ -22,7 +22,6 @@ use arrow::datatypes::DataType;
 use crate::coordinator::profile::correlate::{ActualMetrics, DistributedProfileSummary};
 use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
-use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ScanVariantColumn;
 use crate::sql::explain::{
@@ -48,6 +47,7 @@ use crate::sql::planner::physical::{
     PhysicalPlanStats, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind as SetOpKind,
     PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
 };
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None, None)
@@ -1526,7 +1526,6 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::distributed::explain_distributed_plan;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
@@ -1553,6 +1552,7 @@ mod tests {
     use crate::sql::planner::physical::{
         PhysicalPlanStats, PlannerBroadcastDecision, PlannerConfidence,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn prepare_bridge2_test_props(node: &mut OptimizedOperatorNode) {
         for child in &mut node.children {

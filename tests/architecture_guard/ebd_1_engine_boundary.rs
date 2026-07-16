@@ -686,11 +686,7 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
     (
         "src/connector/starrocks/table/catalog.rs",
-        &[
-            "crate::engine::catalog::InMemoryCatalog",
-            "crate::engine::catalog::ScanSource",
-            "crate::engine::catalog::TableDef",
-        ],
+        &["crate::engine::catalog::InMemoryCatalog"],
     ),
     (
         "src/connector/starrocks/table/ddl.rs",
@@ -1262,8 +1258,6 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
 
 const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/catalog.rs|crate::engine::catalog|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
-    "src/engine/catalog.rs|crate::engine::catalog|pub|ScanSource|crate::sql::catalog::ScanSource",
-    "src/engine/catalog.rs|crate::engine::catalog|pub|TableDef|crate::sql::catalog::TableDef",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryOwner|crate::sql::common::dictionary::DictionaryOwner",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionarySnapshot|crate::sql::common::dictionary::DictionarySnapshot",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryState|crate::sql::common::dictionary::DictionaryState",
@@ -1272,8 +1266,6 @@ const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|QueryDictionarySelection|crate::sql::common::dictionary::QueryDictionarySelection",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
     "src/engine/mod.rs|crate::engine|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
-    "src/engine/mod.rs|crate::engine|pub|ScanSource|crate::sql::catalog::ScanSource",
-    "src/engine/mod.rs|crate::engine|pub|TableDef|crate::sql::catalog::TableDef",
 ];
 
 const CURRENT_ENGINE_BOUNDARY_BASELINE: EngineBoundaryBaseline = EngineBoundaryBaseline {
@@ -6978,7 +6970,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 219, 58, 13];
+    let expected_counts = [88, 86, 217, 58, 9];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7880,7 +7872,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 219, 58, 13];
+    let expected_counts = [88, 86, 217, 58, 9];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8802,7 +8794,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 219, 58, 13];
+    let expected_counts = [88, 86, 217, 58, 9];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8812,6 +8804,1081 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
     assert!(
         violations.is_empty(),
         "EBD-4B3A catalog physical layout retirement failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+const EBD_4B3C_OWNER: &str = "src/sql/planner/table.rs";
+const EBD_4B3C_CODEGEN_HELPER: &str = "src/sql/codegen/scan/connector.rs";
+const EBD_4B3C_COORDINATOR_ENTRY: &str = "src/coordinator/prepare/scan_preparation.rs";
+const EBD_4B3C_MODEL_SYMBOLS: &[&str] = &[
+    "IcebergColumnStats",
+    "IcebergPartitionValue",
+    "IcebergPartitionFieldValue",
+    "IcebergDeleteFileFormat",
+    "IcebergDeleteFileContent",
+    "IcebergDeleteFileInfo",
+    "IcebergSchemaFieldDef",
+    "IcebergSchemaDef",
+    "IcebergTableInfo",
+    "IcebergMvTargetStateScan",
+    "IcebergMvTargetLocatorScan",
+    "BranchScope",
+    "IcebergMvTargetStateRowFilter",
+    "IcebergMvTargetStatePartitionConstraint",
+    "IcebergDataFileInfo",
+    "ScanSource",
+    "IcebergDataFileBinding",
+    "TableDef",
+];
+
+#[derive(Clone, Copy)]
+struct Ebd4b3cOwnerSpec {
+    name: &'static str,
+    kind: &'static str,
+    visibility: &'static str,
+    derives: &'static [&'static str],
+    shape_hash: u64,
+}
+
+const EBD_4B3C_OWNER_SPECS: &[Ebd4b3cOwnerSpec] = &[
+    Ebd4b3cOwnerSpec {
+        name: "IcebergColumnStats",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug"],
+        shape_hash: 2056551809977803008,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergPartitionValue",
+        kind: "enum",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 17655657493373355219,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergPartitionFieldValue",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 5730817505100012193,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergDeleteFileFormat",
+        kind: "enum",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 17320865237198704987,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergDeleteFileContent",
+        kind: "enum",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 4721273103440761884,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergDeleteFileInfo",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 10349318917319020024,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergSchemaFieldDef",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 8686511160588708780,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergSchemaDef",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 16944456593516362218,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergTableInfo",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 9007559196177372905,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergMvTargetStateScan",
+        kind: "struct",
+        visibility: "pub(crate)",
+        derives: &["Clone", "Debug", "PartialEq"],
+        shape_hash: 13033557410242340071,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergMvTargetLocatorScan",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 13561036483016194962,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "BranchScope",
+        kind: "struct",
+        visibility: "pub(crate)",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 158761904751257978,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergMvTargetStateRowFilter",
+        kind: "enum",
+        visibility: "pub(crate)",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 336745192447927450,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergMvTargetStatePartitionConstraint",
+        kind: "enum",
+        visibility: "pub(crate)",
+        derives: &["Clone", "Debug", "Eq", "PartialEq"],
+        shape_hash: 16390858955688211517,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergDataFileInfo",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug"],
+        shape_hash: 9697454222230598461,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "ScanSource",
+        kind: "enum",
+        visibility: "pub",
+        derives: &["Clone", "Debug"],
+        shape_hash: 9708048268714969001,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "IcebergDataFileBinding",
+        kind: "enum",
+        visibility: "pub",
+        derives: &["Clone", "Copy", "Debug", "Eq", "PartialEq"],
+        shape_hash: 13307274270418829994,
+    },
+    Ebd4b3cOwnerSpec {
+        name: "TableDef",
+        kind: "struct",
+        visibility: "pub",
+        derives: &["Clone", "Debug"],
+        shape_hash: 13039605040232147,
+    },
+];
+
+fn ebd_4b3c_is_model_symbol(name: &str) -> bool {
+    EBD_4B3C_MODEL_SYMBOLS.contains(&name)
+}
+
+fn ebd_4b3c_visibility(visibility: &syn::Visibility) -> String {
+    match visibility {
+        syn::Visibility::Inherited => "private".to_string(),
+        syn::Visibility::Public(_) => "pub".to_string(),
+        syn::Visibility::Restricted(restricted)
+            if restricted.in_token.is_none() && restricted.path.is_ident("crate") =>
+        {
+            "pub(crate)".to_string()
+        }
+        syn::Visibility::Restricted(restricted) => format!(
+            "pub({})",
+            restricted
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        ),
+    }
+}
+
+fn ebd_4b3c_derive_set(attributes: &[syn::Attribute]) -> Option<BTreeSet<String>> {
+    let mut derives = BTreeSet::new();
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("derive"))
+    {
+        let paths = attribute
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            )
+            .ok()?;
+        derives.extend(paths.into_iter().map(|path| {
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        }));
+    }
+    Some(derives)
+}
+
+fn ebd_4b3c_fnv1a(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn ebd_4b3c_root_declaration_shapes(source: &str) -> BTreeMap<String, (String, u64)> {
+    let sanitized = rust_sanitized_production_text(source);
+    let tokens = rust_source_tokens(&sanitized);
+    let mut shapes = BTreeMap::new();
+    let mut brace_depth = 0usize;
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if brace_depth == 0
+            && matches!(token.text.as_str(), "struct" | "enum")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| ebd_4b3c_is_model_symbol(&next.text))
+        {
+            let name = tokens[index + 1].text.clone();
+            let kind = token.text.clone();
+            let mut end = index + 2;
+            let mut declaration_depth = 0usize;
+            while end < tokens.len() {
+                match tokens[end].text.as_str() {
+                    "{" => declaration_depth += 1,
+                    "}" => {
+                        declaration_depth = declaration_depth.saturating_sub(1);
+                        if declaration_depth == 0 {
+                            end += 1;
+                            break;
+                        }
+                    }
+                    ";" if declaration_depth == 0 => {
+                        end += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let shape = tokens[index..end]
+                .iter()
+                .map(|token| token.text.as_str())
+                .collect::<String>();
+            shapes.insert(name, (kind, ebd_4b3c_fnv1a(&shape)));
+            index = end;
+            continue;
+        }
+        match token.text.as_str() {
+            "{" => brace_depth += 1,
+            "}" => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    shapes
+}
+
+fn ebd_4b3c_audit_owner(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "planner-scan-model-owner-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let shapes = ebd_4b3c_root_declaration_shapes(&source.text);
+    let mut violations = BTreeSet::new();
+    for spec in EBD_4B3C_OWNER_SPECS {
+        let matching = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Struct(item) if item.ident == spec.name => {
+                    Some(("struct", &item.vis, &item.attrs))
+                }
+                syn::Item::Enum(item) if item.ident == spec.name => {
+                    Some(("enum", &item.vis, &item.attrs))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            violations.insert(format!(
+                "planner-scan-model-owner-count: {}|{}|expected=1 actual={}",
+                source.path,
+                spec.name,
+                matching.len()
+            ));
+            continue;
+        }
+        let (kind, visibility, attributes) = matching[0];
+        let actual_derives = ebd_4b3c_derive_set(attributes);
+        let expected_derives = spec
+            .derives
+            .iter()
+            .map(|derive| (*derive).to_string())
+            .collect::<BTreeSet<_>>();
+        let shape = shapes.get(spec.name);
+        if kind != spec.kind
+            || ebd_4b3c_visibility(visibility) != spec.visibility
+            || actual_derives.as_ref() != Some(&expected_derives)
+            || shape.is_none_or(|(shape_kind, hash)| {
+                shape_kind != spec.kind || *hash != spec.shape_hash
+            })
+        {
+            violations.insert(format!(
+                "planner-scan-model-owner-shape: {}|{}|kind={kind}|visibility={}|derives={actual_derives:?}|shape={shape:?}",
+                source.path,
+                spec.name,
+                ebd_4b3c_visibility(visibility),
+            ));
+        }
+    }
+    violations
+}
+
+fn ebd_4b3c_is_legacy_model_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    let roots = [
+        &["crate", "sql", "catalog"][..],
+        &["crate", "engine", "catalog"][..],
+        &["crate", "engine"][..],
+    ];
+    roots.iter().any(|root| {
+        segments.starts_with(root)
+            && segments
+                .get(root.len())
+                .is_some_and(|leaf| *leaf == "*" || ebd_4b3c_is_model_symbol(leaf))
+    })
+}
+
+fn ebd_4b3c_is_canonical_model_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    let root = ["crate", "sql", "planner", "table"];
+    segments.starts_with(&root)
+        && segments
+            .get(root.len())
+            .is_some_and(|leaf| *leaf == "*" || ebd_4b3c_is_model_symbol(leaf))
+}
+
+fn ebd_4b3c_type_contains_model_path(
+    ty: &syn::Type,
+    source: &GuardSource,
+    aliases: &RustScopedAliases,
+    inline_modules: &[String],
+) -> bool {
+    struct ModelPathAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: &'a [String],
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ModelPathAudit<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if let Some(resolved) = rust_resolve_scoped_paths(
+                &segments,
+                self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) {
+                self.found |= resolved.into_iter().any(|resolved| {
+                    rust_canonical_path_segments_in_scope(
+                        &resolved.segments,
+                        &self.source.path,
+                        &resolved.inline_modules,
+                    )
+                    .is_some_and(|canonical| {
+                        ebd_4b3c_is_legacy_model_path(&canonical)
+                            || ebd_4b3c_is_canonical_model_path(&canonical)
+                    })
+                });
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let mut audit = ModelPathAudit {
+        source,
+        aliases,
+        inline_modules,
+        found: false,
+    };
+    syn::visit::Visit::visit_type(&mut audit, ty);
+    audit.found
+}
+
+fn ebd_4b3c_macro_mentions_model(item: &syn::ItemMacro) -> bool {
+    rust_source_tokens(&item.mac.tokens.to_string())
+        .iter()
+        .any(|token| ebd_4b3c_is_model_symbol(&token.text))
+}
+
+fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> BTreeSet<String> {
+    struct DefinitionAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+    impl DefinitionAudit<'_> {
+        fn canonical_root(&self, name: &str) -> bool {
+            self.source.path == EBD_4B3C_OWNER
+                && self.inline_modules.is_empty()
+                && ebd_4b3c_is_model_symbol(name)
+        }
+
+        fn record_definition(&mut self, kind: &str, name: &str) {
+            let independent_homonym = self.source.path == "src/connector/iceberg/report.rs"
+                && kind == "struct"
+                && name == "IcebergColumnStats";
+            if ebd_4b3c_is_model_symbol(name) && !self.canonical_root(name) && !independent_homonym
+            {
+                self.violations.insert(format!(
+                    "planner-scan-model-secondary-owner: {}|{kind}|{name}",
+                    self.source.path
+                ));
+            }
+        }
+
+        fn record_wrapper<'a>(
+            &mut self,
+            visibility: &syn::Visibility,
+            name: &str,
+            fields: impl Iterator<Item = &'a syn::Field>,
+        ) {
+            let fields = fields.collect::<Vec<_>>();
+            // These are connector-owned runtime envelopes with their own behavior,
+            // not alternate planner-model owners or transparent forwarding aliases.
+            let semantic_connector_wrapper = matches!(
+                (self.source.path.as_str(), name),
+                (
+                    "src/connector/iceberg/file_pruning.rs",
+                    "IcebergFilePruningMetadata"
+                ) | ("src/connector/iceberg/scan_planner.rs", "IcebergSplit")
+            );
+            if ebd_4b3c_visibility(visibility) != "private"
+                && fields.len() == 1
+                && !semantic_connector_wrapper
+                && fields.iter().any(|field| {
+                    ebd_4b3c_type_contains_model_path(
+                        &field.ty,
+                        self.source,
+                        self.aliases,
+                        &self.inline_modules,
+                    )
+                })
+            {
+                self.violations.insert(format!(
+                    "planner-scan-model-forwarding-wrapper: {}|{}",
+                    self.source.path, name
+                ));
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for DefinitionAudit<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            self.record_definition("struct", &item.ident.to_string());
+            if !self.canonical_root(&item.ident.to_string()) {
+                self.record_wrapper(&item.vis, &item.ident.to_string(), item.fields.iter());
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            self.record_definition("enum", &item.ident.to_string());
+            if !self.canonical_root(&item.ident.to_string())
+                && item.variants.len() == 1
+                && item.variants[0].fields.len() == 1
+            {
+                self.record_wrapper(
+                    &item.vis,
+                    &item.ident.to_string(),
+                    item.variants[0].fields.iter(),
+                );
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            self.record_definition("union", &item.ident.to_string());
+            syn::visit::visit_item_union(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            self.record_definition("trait", &item.ident.to_string());
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.record_definition("type", &item.ident.to_string());
+            if ebd_4b3c_type_contains_model_path(
+                &item.ty,
+                self.source,
+                self.aliases,
+                &self.inline_modules,
+            ) {
+                self.violations.insert(format!(
+                    "planner-scan-model-forwarding-alias: {}|{}",
+                    self.source.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if ebd_4b3c_macro_mentions_model(item) {
+                self.violations.insert(format!(
+                    "planner-scan-model-macro-surface: {}",
+                    self.source.path
+                ));
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            self.record_definition("module", &item.ident.to_string());
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        for path in remove_redundant_descendant_paths(
+            rust_production_canonical_paths(&source.text, &source.path)
+                .into_iter()
+                .filter(|path| ebd_4b3c_is_legacy_model_path(path))
+                .collect(),
+        ) {
+            violations.insert(format!(
+                "planner-scan-model-legacy-path: {}|{}",
+                source.path,
+                path.join("::")
+            ));
+        }
+
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "planner-scan-model-source-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+        let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+        let mut definitions = DefinitionAudit {
+            source,
+            aliases: &aliases,
+            inline_modules: Vec::new(),
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut definitions, &file);
+        violations.extend(definitions.violations);
+
+        for import in imports {
+            if import.inline_modules.iter().any(|module| module == "tests") {
+                continue;
+            }
+            let Some(resolved) = resolve_forwarding_paths(
+                &import.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if ebd_4b3c_is_legacy_model_path(&canonical) {
+                    violations.insert(format!(
+                        "planner-scan-model-legacy-import: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                } else if import.visibility != "private"
+                    && source.path != EBD_4B3C_OWNER
+                    && ebd_4b3c_is_canonical_model_path(&canonical)
+                {
+                    violations.insert(format!(
+                        "planner-scan-model-forwarding-reexport: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+#[derive(Default)]
+struct Ebd4b3cDynamicSnapshot {
+    violations: BTreeSet<String>,
+    helper_definitions: usize,
+    helper_begin_scan_calls: usize,
+    helper_plan_splits_calls: usize,
+    coordinator_helper_calls: usize,
+}
+
+fn ebd_4b3c_audit_dynamic_seam(sources: &[GuardSource]) -> Ebd4b3cDynamicSnapshot {
+    fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attribute| {
+            if attribute.path().is_ident("test") {
+                return true;
+            }
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
+            };
+            if !list.path.is_ident("cfg") {
+                return false;
+            }
+            cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+        })
+    }
+
+    struct DynamicVisitor<'a> {
+        source: &'a str,
+        functions: Vec<String>,
+        snapshot: &'a mut Ebd4b3cDynamicSnapshot,
+    }
+    impl DynamicVisitor<'_> {
+        fn current_function(&self) -> &str {
+            self.functions
+                .last()
+                .map(String::as_str)
+                .unwrap_or("<module>")
+        }
+
+        fn enter_function(&mut self, name: String, block: &syn::Block) {
+            if self.source == EBD_4B3C_CODEGEN_HELPER && name == "plan_native_starrocks_scan_node" {
+                self.snapshot.helper_definitions += 1;
+            }
+            self.functions.push(name);
+            syn::visit::Visit::visit_block(self, block);
+            self.functions.pop();
+        }
+
+        fn record_dynamic_call(&mut self, method: &str) {
+            let in_helper = self.source == EBD_4B3C_CODEGEN_HELPER
+                && self.current_function() == "plan_native_starrocks_scan_node";
+            let in_coordinator = self.source == EBD_4B3C_COORDINATOR_ENTRY;
+            let in_connector = self.source.starts_with("src/connector/");
+            if in_helper {
+                if method == "begin_scan" {
+                    self.snapshot.helper_begin_scan_calls += 1;
+                } else {
+                    self.snapshot.helper_plan_splits_calls += 1;
+                }
+            } else if !in_coordinator && !in_connector {
+                self.snapshot.violations.insert(format!(
+                    "planner-scan-dynamic-orchestration: {}|{}|{}",
+                    self.source,
+                    self.current_function(),
+                    method
+                ));
+            }
+        }
+
+        fn record_encoder_lookup(&mut self, method: &str) {
+            if self.source.starts_with("src/sql/codegen/proto_encode/")
+                && matches!(
+                    method,
+                    "get_table"
+                        | "get_table_in_catalog"
+                        | "get_table_with_mode"
+                        | "catalog_backend"
+                        | "table_source"
+                        | "scan_planner"
+                        | "load_table"
+                        | "load_table_for_read"
+                )
+            {
+                self.snapshot.violations.insert(format!(
+                    "planner-scan-encoder-requery: {}|{}|{}",
+                    self.source,
+                    self.current_function(),
+                    method
+                ));
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for DynamicVisitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.enter_function(item.sig.ident.to_string(), &item.block);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.enter_function(item.sig.ident.to_string(), &item.block);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            syn::visit::visit_item_mod(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            syn::visit::visit_item_impl(self, item);
+        }
+
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            let method = item.method.to_string();
+            if matches!(method.as_str(), "begin_scan" | "plan_splits") {
+                self.record_dynamic_call(&method);
+            }
+            self.record_encoder_lookup(&method);
+            syn::visit::visit_expr_method_call(self, item);
+        }
+
+        fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = item.func.as_ref()
+                && let Some(method) = function.path.segments.last()
+            {
+                let method = method.ident.to_string();
+                if matches!(method.as_str(), "begin_scan" | "plan_splits") {
+                    self.record_dynamic_call(&method);
+                }
+                self.record_encoder_lookup(&method);
+                if method == "plan_native_starrocks_scan_node" {
+                    if self.source == EBD_4B3C_COORDINATOR_ENTRY
+                        && self.current_function() == "prepare_scan_node"
+                    {
+                        self.snapshot.coordinator_helper_calls += 1;
+                    } else {
+                        self.snapshot.violations.insert(format!(
+                            "planner-scan-helper-call-escape: {}|{}",
+                            self.source,
+                            self.current_function()
+                        ));
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, item);
+        }
+    }
+
+    let mut snapshot = Ebd4b3cDynamicSnapshot::default();
+    for source in sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/"))
+    {
+        let Ok(file) = syn::parse_file(&source.text) else {
+            snapshot.violations.insert(format!(
+                "planner-scan-dynamic-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+        let mut visitor = DynamicVisitor {
+            source: &source.path,
+            functions: Vec::new(),
+            snapshot: &mut snapshot,
+        };
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+
+        if source.path.starts_with("src/sql/analyzer/")
+            || source.path.starts_with("src/sql/optimizer/")
+        {
+            for path in rust_production_canonical_paths(&source.text, &source.path) {
+                let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+                if segments.starts_with(&["crate", "connector", "scan_planning"])
+                    && segments.get(3).is_some_and(|name| {
+                        matches!(
+                            *name,
+                            "ConnectorScanPlanner" | "ScanHandle" | "Split" | "TableHandle"
+                        )
+                    })
+                {
+                    snapshot.violations.insert(format!(
+                        "planner-scan-static-layer-dynamic-type: {}|{}",
+                        source.path,
+                        path.join("::")
+                    ));
+                }
+            }
+        }
+
+        if source.path.starts_with("src/sql/codegen/proto_encode/") {
+            for path in rust_production_canonical_paths(&source.text, &source.path) {
+                let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+                if segments.starts_with(&["crate", "sql", "catalog"])
+                    && segments
+                        .get(3)
+                        .is_some_and(|name| *name == "CatalogProvider")
+                    || segments.starts_with(&["crate", "connector"])
+                        && segments.iter().any(|name| {
+                            matches!(
+                                *name,
+                                "ConnectorRegistry"
+                                    | "CatalogBackend"
+                                    | "TableSource"
+                                    | "ConnectorScanPlanner"
+                            )
+                        })
+                {
+                    snapshot.violations.insert(format!(
+                        "planner-scan-encoder-requery-dependency: {}|{}",
+                        source.path,
+                        path.join("::")
+                    ));
+                }
+            }
+        }
+
+        if source.path.starts_with("src/connector/")
+            && rust_source_tokens(&rust_sanitized_production_text(&source.text))
+                .iter()
+                .any(|token| token.text == "ConnectorScanPlanner")
+        {
+            for path in rust_production_canonical_paths(&source.text, &source.path) {
+                if path
+                    == ["crate", "sql", "catalog", "CatalogProvider"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                {
+                    snapshot.violations.insert(format!(
+                        "planner-scan-connector-catalog-provider: {}",
+                        source.path
+                    ));
+                }
+            }
+        }
+    }
+    snapshot
+}
+
+fn ebd_4b3c_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B3C_OWNER) {
+        violations.extend(ebd_4b3c_audit_owner(owner));
+    } else {
+        violations.insert(format!(
+            "planner-scan-model-owner-missing: {EBD_4B3C_OWNER}"
+        ));
+    }
+    let audited_sources = sources
+        .iter()
+        .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
+        .cloned()
+        .collect::<Vec<_>>();
+    violations.extend(ebd_4b3c_audit_paths_definitions_and_forwarding(
+        &audited_sources,
+    ));
+    let dynamic = ebd_4b3c_audit_dynamic_seam(&audited_sources);
+    violations.extend(dynamic.violations);
+    for (surface, actual, expected) in [
+        ("helper-definition", dynamic.helper_definitions, 1),
+        ("helper-begin-scan", dynamic.helper_begin_scan_calls, 1),
+        ("helper-plan-splits", dynamic.helper_plan_splits_calls, 1),
+        (
+            "coordinator-helper-call",
+            dynamic.coordinator_helper_calls,
+            1,
+        ),
+    ] {
+        if actual != expected {
+            violations.insert(format!(
+                "planner-scan-dynamic-seam-count: {surface}|expected={expected} actual={actual}"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn ebd_4b3c_detector_covers_owner_paths_forwarding_and_noise() {
+    let allowed = [
+        GuardSource::new(
+            "src/sql/analyzer/allowed.rs",
+            r###"
+use crate::sql::planner::table::{ScanSource, TableDef};
+use crate::sql::catalog::TableLookupMode;
+fn lookup(mode: TableLookupMode) {
+    let _ = TableLookupMode::IcebergMetadata { metadata_table_type: kind() };
+    let _: crate::proto::plan::TableDef = protobuf();
+    let _: plan::ScanSource = protobuf();
+}
+"###,
+        ),
+        GuardSource::new(
+            "tests/fixtures/ebd_4b3c_noise.rs",
+            r###"
+// crate::sql::catalog::TableDef
+const TEXT: &str = "crate::engine::ScanSource";
+const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
+"###,
+        ),
+        GuardSource::new(
+            EBD_4B3C_COORDINATOR_ENTRY,
+            "fn prepare_scan_node() { let _ = plan_native_starrocks_scan_node(); planner.begin_scan(); planner.plan_splits(); }",
+        ),
+        GuardSource::new(
+            EBD_4B3C_CODEGEN_HELPER,
+            "fn plan_native_starrocks_scan_node() { planner.begin_scan(); planner.plan_splits(); }",
+        ),
+    ];
+    assert!(
+        ebd_4b3c_audit_paths_definitions_and_forwarding(&allowed).is_empty(),
+        "legal canonical imports, lookup mode, protobuf paths, and lexical noise must remain allowed"
+    );
+    let dynamic = ebd_4b3c_audit_dynamic_seam(&allowed);
+    assert!(
+        dynamic.violations.is_empty()
+            && dynamic.helper_definitions == 1
+            && dynamic.helper_begin_scan_calls == 1
+            && dynamic.helper_plan_splits_calls == 1
+            && dynamic.coordinator_helper_calls == 1,
+        "the coordinator entry and its one allowlisted helper must remain legal: {:?}",
+        dynamic.violations
+    );
+
+    let invalid = [
+        GuardSource::new("src/sql/direct.rs", "use crate::sql::catalog::TableDef;"),
+        GuardSource::new(
+            "src/sql/grouped.rs",
+            "use crate::sql::catalog::{ScanSource, TableDef as Legacy};",
+        ),
+        GuardSource::new(
+            "src/sql/module_alias.rs",
+            "use crate::sql::catalog as legacy; type Local = legacy::TableDef;",
+        ),
+        GuardSource::new("src/sql/glob.rs", "use crate::sql::catalog::*;"),
+        GuardSource::new(
+            "src/sql/catalog/nested/relative.rs",
+            "use super::super::TableDef;",
+        ),
+        GuardSource::new(
+            "src/engine/forward.rs",
+            "pub use crate::sql::planner::table::ScanSource;",
+        ),
+        GuardSource::new(
+            "src/sql/alias.rs",
+            "pub type Legacy = crate::sql::planner::table::TableDef;",
+        ),
+        GuardSource::new(
+            "src/sql/secondary.rs",
+            "pub struct TableDef { pub name: String }",
+        ),
+        GuardSource::new(
+            "src/sql/test_owner.rs",
+            "#[cfg(test)] mod tests { pub enum ScanSource { Fake } }",
+        ),
+        GuardSource::new(
+            "src/sql/macro_owner.rs",
+            "macro_rules! owner { () => { struct TableDef; } } owner!();",
+        ),
+        GuardSource::new(
+            "src/sql/wrapper.rs",
+            "pub struct LegacyTable(pub crate::sql::planner::table::TableDef);",
+        ),
+        GuardSource::new(
+            "src/sql/named_wrapper.rs",
+            "pub struct LegacyTable { pub inner: crate::sql::planner::table::TableDef }",
+        ),
+    ];
+    let violations = ebd_4b3c_audit_paths_definitions_and_forwarding(&invalid);
+    for fixture in [
+        "direct.rs",
+        "grouped.rs",
+        "module_alias.rs",
+        "glob.rs",
+        "relative.rs",
+        "forward.rs",
+        "alias.rs",
+        "secondary.rs",
+        "test_owner.rs",
+        "macro_owner.rs",
+        "wrapper.rs",
+        "named_wrapper.rs",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture)),
+            "planner model detector missed {fixture}: {violations:?}"
+        );
+    }
+
+    let dynamic_invalid = [
+        GuardSource::new(
+            "src/sql/analyzer/bad.rs",
+            "fn analyze() { planner.begin_scan(); }",
+        ),
+        GuardSource::new(
+            "src/sql/optimizer/bad.rs",
+            "fn optimize() { planner.plan_splits(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/bad.rs",
+            "fn encode() { ConnectorScanPlanner::begin_scan(planner); plan_native_starrocks_scan_node(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/proto_encode/requery.rs",
+            "use crate::connector::ConnectorRegistry; use crate::sql::catalog::CatalogProvider; fn encode() { registry.scan_planner(); catalog.get_table(\"db\", \"t\"); }",
+        ),
+        GuardSource::new(
+            "src/connector/bad.rs",
+            "use crate::sql::catalog::CatalogProvider; impl ConnectorScanPlanner for Bad {}",
+        ),
+    ];
+    let dynamic = ebd_4b3c_audit_dynamic_seam(&dynamic_invalid);
+    for fixture in [
+        "analyzer/bad.rs",
+        "optimizer/bad.rs",
+        "codegen/bad.rs",
+        "proto_encode/requery.rs",
+        "connector/bad.rs",
+    ] {
+        assert!(
+            dynamic
+                .violations
+                .iter()
+                .any(|violation| violation.contains(fixture)),
+            "dynamic seam detector missed {fixture}: {:?}",
+            dynamic.violations
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3c_planner_scan_model_owner_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_4b3c_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3C planner scan model owner cutover failed:\n{}",
         violations.into_iter().collect::<Vec<_>>().join("\n")
     );
 }

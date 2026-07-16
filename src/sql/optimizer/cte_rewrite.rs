@@ -387,13 +387,13 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         CTEAnchorOp, CTEConsumeOp, CTEProduceOp, Operator, ScanOp, UnionOp, ValuesOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn scan_plan() -> OptExpr {

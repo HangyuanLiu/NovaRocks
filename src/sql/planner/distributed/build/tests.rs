@@ -17,7 +17,6 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
-use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -40,6 +39,7 @@ use crate::sql::planner::physical::{
     PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
     PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
 };
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[test]
 fn build_distributed_plan_values_shapes_root_fragment() {

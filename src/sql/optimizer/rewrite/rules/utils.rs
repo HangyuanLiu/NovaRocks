@@ -853,10 +853,10 @@ mod column_id_helper_tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::*;
     use crate::sql::planner::payload::*;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     // -----------------------------------------------------------------------

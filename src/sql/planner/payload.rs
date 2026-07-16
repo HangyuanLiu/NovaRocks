@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
-use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ScanVariantColumn;
+use crate::sql::planner::table::TableDef;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

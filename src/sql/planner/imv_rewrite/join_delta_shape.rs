@@ -20,10 +20,10 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem};
-use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+use crate::sql::planner::table::ScanSource;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JoinDeltaOrientation {
@@ -292,12 +292,12 @@ mod tests {
 
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
-    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::LogicalPlanKind;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
+    };
 
     fn table_info(table: &str) -> IcebergTableInfo {
         IcebergTableInfo {

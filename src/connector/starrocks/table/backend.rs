@@ -32,8 +32,8 @@ use crate::engine::mv::lifecycle::{
     MvBaseRef, MvListRow, MvStorageEngine, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome,
     RefreshPlan, RefreshRequest, StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
-use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::{Literal, ObjectName};
+use crate::sql::planner::table::TableDef;
 
 pub(crate) struct StarRocksTableBackend {
     state: Weak<StandaloneState>,

@@ -1235,18 +1235,18 @@ fn load_delete_visibility_from_data_files(
             .zip(data_file.delete_files.iter())
             .map(|(resolved, original)| {
                 let file_format = match original.file_format {
-                    crate::sql::catalog::IcebergDeleteFileFormat::Parquet => {
+                    crate::sql::planner::table::IcebergDeleteFileFormat::Parquet => {
                         crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet
                     }
-                    crate::sql::catalog::IcebergDeleteFileFormat::Puffin => {
+                    crate::sql::planner::table::IcebergDeleteFileFormat::Puffin => {
                         crate::connector::iceberg::delete_file::IcebergFileFormat::Puffin
                     }
                 };
                 let file_content = match original.file_content {
-                    crate::sql::catalog::IcebergDeleteFileContent::Position => {
+                    crate::sql::planner::table::IcebergDeleteFileContent::Position => {
                         crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes
                     }
-                    crate::sql::catalog::IcebergDeleteFileContent::Equality => {
+                    crate::sql::planner::table::IcebergDeleteFileContent::Equality => {
                         crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes
                     }
                 };

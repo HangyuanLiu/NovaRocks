@@ -357,13 +357,13 @@ pub(crate) fn literal_signature(arena: &ScalarArena, literal: ScalarId) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::common::LiteralValue;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{
         FilterOp, JoinDistribution, LogicalJoinOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
         ScanOp,
     };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, false)

@@ -63,7 +63,7 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
     SetOpKind, SortItem, TypedExpr,
 };
-use crate::sql::catalog::ScanSource;
+use crate::sql::planner::table::ScanSource;
 
 /// The row-identity contract synthesized for a refresh fragment. This describes
 /// *what a single output row is identified by* so the apply path can compute a
@@ -1851,9 +1851,9 @@ fn join_key_side(
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
-    use crate::sql::catalog::{
-        CatalogProvider, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource,
-        TableDef,
+    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use arrow::datatypes::DataType;
 

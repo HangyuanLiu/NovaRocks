@@ -178,7 +178,7 @@ pub(crate) struct LogicalExceptNode {
 pub(crate) struct LogicalImvDeltaNode {
     pub is_root: bool,
     pub action_column: Option<ColumnId>,
-    pub branch_scope: Option<crate::sql::catalog::BranchScope>,
+    pub branch_scope: Option<crate::sql::planner::table::BranchScope>,
 }
 
 #[allow(dead_code)]
@@ -387,11 +387,11 @@ mod plan_tests {
 
     #[test]
     fn logical_plan_kind_scan_carries_mv_rewrite_source() {
-        let table = crate::sql::catalog::TableDef {
+        let table = crate::sql::planner::table::TableDef {
             name: "mv_orders".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::catalog::ScanSource::StarRocks {
+            source: crate::sql::planner::table::ScanSource::StarRocks {
                 db_id: 1,
                 table_id: 2,
             },

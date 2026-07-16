@@ -136,9 +136,9 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };
-    use crate::sql::catalog::{
-        CatalogProvider, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource,
-        TableDef,
+    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use arrow::datatypes::DataType;
 

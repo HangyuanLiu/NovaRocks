@@ -88,11 +88,11 @@ fn ndv_for_group_expr(
 mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     use crate::sql::optimizer::statistics::{
         ColumnStatistic, Confidence, DistinctValueCount, TableStatistics,

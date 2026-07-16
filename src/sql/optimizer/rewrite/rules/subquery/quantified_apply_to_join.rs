@@ -178,7 +178,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -189,6 +188,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalApplyNode, LogicalJoinNode, LogicalPlanKind};
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     const OUTER_A: ColumnId = ColumnId(1);
     const OUTER_K: ColumnId = ColumnId(2);

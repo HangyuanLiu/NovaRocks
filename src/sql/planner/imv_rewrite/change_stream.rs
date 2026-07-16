@@ -24,7 +24,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
-use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -37,6 +36,7 @@ use crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescri
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImvChangeStreamDescriptor {
@@ -527,9 +527,6 @@ mod tests {
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
-    };
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;
     use crate::sql::planner::logical::{
@@ -537,6 +534,9 @@ mod tests {
     };
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
+    };
+    use crate::sql::planner::table::{
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
     };
 
     fn output_column(id: u32, name: &str, data_type: DataType, is_internal: bool) -> OutputColumn {

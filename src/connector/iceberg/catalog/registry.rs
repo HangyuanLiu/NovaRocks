@@ -1262,26 +1262,26 @@ pub(crate) struct DataFileWithStats {
     pub path: String,
     pub size: i64,
     pub record_count: Option<i64>,
-    pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+    pub column_stats: Option<HashMap<String, crate::sql::planner::table::IcebergColumnStats>>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
     pub partition_values: Option<iceberg::spec::Struct>,
     pub manifest_path: Option<String>,
-    pub partition_field_values: Vec<crate::sql::catalog::IcebergPartitionFieldValue>,
+    pub partition_field_values: Vec<crate::sql::planner::table::IcebergPartitionFieldValue>,
     /// Iceberg v3 row-lineage: first row id assigned to this data file.
     pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
     /// file belongs to.  Falls back to the manifest file's sequence number when
     /// the entry itself does not carry one (e.g. V1/V2 manifests).
     pub data_sequence_number: Option<i64>,
-    pub delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
+    pub delete_files: Vec<crate::sql::planner::table::IcebergDeleteFileInfo>,
 }
 
 fn iceberg_partition_field_values(
     metadata: &TableMetadata,
     spec_id: i32,
     partition: &iceberg::spec::Struct,
-) -> Result<Vec<crate::sql::catalog::IcebergPartitionFieldValue>, String> {
+) -> Result<Vec<crate::sql::planner::table::IcebergPartitionFieldValue>, String> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(format!(
             "iceberg table metadata missing partition spec id {spec_id}"
@@ -1299,7 +1299,7 @@ fn iceberg_partition_field_values(
             .get(idx)
             .and_then(|literal| literal.as_ref())
             .and_then(iceberg_partition_value_from_literal);
-        values.push(crate::sql::catalog::IcebergPartitionFieldValue {
+        values.push(crate::sql::planner::table::IcebergPartitionFieldValue {
             source_column,
             field_name: field.name.clone(),
             transform: iceberg_partition_transform_name(&field.transform),
@@ -1318,26 +1318,32 @@ fn iceberg_partition_transform_name(transform: &Transform) -> String {
 
 fn iceberg_partition_value_from_literal(
     literal: &IcebergLiteral,
-) -> Option<crate::sql::catalog::IcebergPartitionValue> {
+) -> Option<crate::sql::planner::table::IcebergPartitionValue> {
     let IcebergLiteral::Primitive(value) = literal else {
         return None;
     };
     match value {
-        PrimitiveLiteral::Boolean(v) => {
-            Some(crate::sql::catalog::IcebergPartitionValue::Boolean(*v))
+        PrimitiveLiteral::Boolean(v) => Some(
+            crate::sql::planner::table::IcebergPartitionValue::Boolean(*v),
+        ),
+        PrimitiveLiteral::Int(v) => {
+            Some(crate::sql::planner::table::IcebergPartitionValue::Int32(*v))
         }
-        PrimitiveLiteral::Int(v) => Some(crate::sql::catalog::IcebergPartitionValue::Int32(*v)),
-        PrimitiveLiteral::Long(v) => Some(crate::sql::catalog::IcebergPartitionValue::Int64(*v)),
-        PrimitiveLiteral::Float(v) => Some(crate::sql::catalog::IcebergPartitionValue::Float(v.0)),
-        PrimitiveLiteral::Double(v) => {
-            Some(crate::sql::catalog::IcebergPartitionValue::Double(v.0))
+        PrimitiveLiteral::Long(v) => {
+            Some(crate::sql::planner::table::IcebergPartitionValue::Int64(*v))
         }
-        PrimitiveLiteral::String(v) => Some(crate::sql::catalog::IcebergPartitionValue::String(
-            v.clone(),
-        )),
-        PrimitiveLiteral::Binary(v) => Some(crate::sql::catalog::IcebergPartitionValue::Binary(
-            v.clone(),
-        )),
+        PrimitiveLiteral::Float(v) => Some(
+            crate::sql::planner::table::IcebergPartitionValue::Float(v.0),
+        ),
+        PrimitiveLiteral::Double(v) => Some(
+            crate::sql::planner::table::IcebergPartitionValue::Double(v.0),
+        ),
+        PrimitiveLiteral::String(v) => Some(
+            crate::sql::planner::table::IcebergPartitionValue::String(v.clone()),
+        ),
+        PrimitiveLiteral::Binary(v) => Some(
+            crate::sql::planner::table::IcebergPartitionValue::Binary(v.clone()),
+        ),
         PrimitiveLiteral::Int128(_)
         | PrimitiveLiteral::UInt128(_)
         | PrimitiveLiteral::AboveMax
@@ -1493,8 +1499,8 @@ pub(crate) fn extract_data_files_with_stats(
 
 fn read_delete_to_catalog_delete(
     delete_file: crate::connector::iceberg::read::IcebergReadDeleteFile,
-) -> Result<crate::sql::catalog::IcebergDeleteFileInfo, String> {
-    use crate::sql::catalog::{
+) -> Result<crate::sql::planner::table::IcebergDeleteFileInfo, String> {
+    use crate::sql::planner::table::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
 
@@ -3161,7 +3167,7 @@ mod read_delete_conversion_tests {
     use crate::connector::iceberg::read::{
         IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
     };
-    use crate::sql::catalog::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
+    use crate::sql::planner::table::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
 
     fn read_delete(
         file_format: IcebergReadDeleteFormat,

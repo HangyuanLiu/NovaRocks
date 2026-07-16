@@ -24,10 +24,10 @@ use std::fmt::Write;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
 };
-use crate::sql::catalog::ScanSource;
 use crate::sql::common::ApplyKind;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanAssertOneRowNode, PlanRowCountAssertion};
+use crate::sql::planner::table::ScanSource;
 
 /// Detail level for EXPLAIN output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,15 +639,15 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        IcebergMvTargetLocatorScan, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
     use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::payload::{
         PlanAssertOneRowNode, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
         PlanWindowNode, WindowExpr,
+    };
+    use crate::sql::planner::table::{
+        IcebergMvTargetLocatorScan, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
 
     fn empty_values_for_test() -> LogicalPlanNode {

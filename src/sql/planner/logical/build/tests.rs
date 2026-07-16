@@ -21,10 +21,11 @@ use super::query::*;
 use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
-use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+use crate::sql::catalog::CatalogProvider;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
+use crate::sql::planner::table::{ScanSource, TableDef};
 use arrow::datatypes::DataType;
 
 struct TestCatalog;

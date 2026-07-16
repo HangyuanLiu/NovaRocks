@@ -28,8 +28,8 @@ use crate::engine::backend_resolver::resolve_table_target;
 use crate::engine::statement::parse_add_files_sql;
 use crate::runtime::query_result::build_string_query_result;
 use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
-use crate::sql::catalog::{ScanSource, TableDef};
 use crate::sql::parser::ast::ObjectName;
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFileForQuery {
@@ -758,7 +758,7 @@ fn stamp_delta_table_def_change_ops(
 #[cfg(test)]
 mod tests {
     use crate::engine::query_prep::IcebergFileForQuery;
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -882,7 +882,7 @@ mod tests {
         ) -> Result<TableDef, String> {
             Ok(table_def_with_binding(
                 table,
-                crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+                crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
             ))
         }
 
@@ -892,14 +892,14 @@ mod tests {
         ) -> Result<TableDef, String> {
             Ok(table_def_with_binding(
                 table,
-                crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             ))
         }
     }
 
     fn table_def_with_binding(
         table: &crate::connector::backend::ResolvedTable,
-        binding: crate::sql::catalog::IcebergDataFileBinding,
+        binding: crate::sql::planner::table::IcebergDataFileBinding,
     ) -> TableDef {
         let mut iceberg = test_iceberg_table_info();
         iceberg.catalog = table.catalog.clone();
@@ -929,7 +929,7 @@ mod tests {
         };
         let table_def = table_def_with_binding(
             &table,
-            crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
         );
 
         super::register_synthetic_table_for_query(&state, "scratch", table_def)
@@ -1066,7 +1066,7 @@ mod tests {
             iceberg_row_lineage_metadata_columns: vec![],
             source: ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info(),
-                files: vec![crate::sql::catalog::IcebergDataFileInfo {
+                files: vec![crate::sql::planner::table::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -1082,7 +1082,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1139,7 +1139,7 @@ mod tests {
             ],
             source: ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info(),
-                files: vec![crate::sql::catalog::IcebergDataFileInfo {
+                files: vec![crate::sql::planner::table::IcebergDataFileInfo {
                     path: "file:///tmp/data.parquet".to_string(),
                     size: 10,
                     row_count: Some(1),
@@ -1155,7 +1155,7 @@ mod tests {
                     partition_values: vec![],
                 }],
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 
@@ -1202,7 +1202,7 @@ mod tests {
                 table: test_iceberg_table_info(),
                 files: Vec::new(),
                 cloud_properties: Default::default(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles,
             },
         };
 

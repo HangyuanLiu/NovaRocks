@@ -573,19 +573,25 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ScanVariantColumn;
     use crate::sql::optimizer::cascades_rules::implement::ScanToPhysical;
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::memo_copy::opt_expr_to_memo;
+    use crate::sql::optimizer::optimized_tree::{
+        OptimizedOperatorNode, OptimizerExplainStats, PlanExecutionProps,
+    };
     use crate::sql::optimizer::rule::Rule;
+    use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::optimizer::stats_input::StatsRef;
     use crate::sql::planner::logical::*;
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalUnionNode};
     use crate::sql::planner::payload::*;
     use crate::sql::planner::payload::{PlanFilterNode, PlanScanNode, PlanValuesNode};
+    use crate::sql::planner::physical::PhysicalPlanKind;
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
+    use std::sync::Arc;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
         let opt_expr =
@@ -884,6 +890,56 @@ mod tests {
         assert_eq!(actual.canonical_path, variant_descriptor.canonical_path);
         assert_eq!(actual.requested_type, variant_descriptor.requested_type);
         assert_eq!(actual.strict, variant_descriptor.strict);
+    }
+
+    #[test]
+    fn scan_source_identity_survives_logical_optimizer_physical_roundtrip() {
+        let mut table = dummy_table_def();
+        table.source = ScanSource::StarRocks {
+            db_id: 17,
+            table_id: 23,
+        };
+        let scan = LogicalPlanNode::new(
+            LogicalPlanKind::Scan(PlanScanNode {
+                database: "db".to_string(),
+                table,
+                alias: None,
+                columns: dummy_output_columns(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        );
+
+        let mut memo = Memo::new();
+        let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
+        let logical_expr = memo.groups[gid].logical_exprs[0].clone();
+        let mut physical = ScanToPhysical.apply(&logical_expr, &mut memo);
+        assert_eq!(physical.len(), 1);
+
+        let mut execution_props = PlanExecutionProps::default();
+        execution_props.scalar_arena = Some(Arc::new(memo.scalars));
+        let optimized = OptimizedOperatorNode {
+            op: physical.remove(0).op,
+            children: vec![],
+            stats: Statistics::default(),
+            explain_stats: OptimizerExplainStats::default(),
+            output_columns: dummy_output_columns(),
+            execution_props,
+        };
+        let materialized = super::super::physical::materialize_physical_plan(&optimized)
+            .expect("physical scan bridge");
+        let PhysicalPlanKind::Scan(scan) = materialized.kind else {
+            panic!("expected physical scan");
+        };
+        let ScanSource::StarRocks { db_id, table_id } = scan.table.source else {
+            panic!("expected StarRocks scan source");
+        };
+        assert_eq!(db_id, 17);
+        assert_eq!(table_id, 23);
     }
 
     #[test]

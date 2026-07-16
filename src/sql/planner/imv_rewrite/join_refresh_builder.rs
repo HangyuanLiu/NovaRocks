@@ -23,7 +23,6 @@ use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
-use crate::sql::catalog::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,
@@ -32,6 +31,7 @@ use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
 };
 use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
+use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
 
 pub(crate) fn build_join_apply_key_project(
     input: LogicalPlanNode,
@@ -1639,9 +1639,9 @@ mod tests {
 
     fn find_target_locator_scan(
         plan: &LogicalPlanNode,
-    ) -> Option<&crate::sql::catalog::IcebergMvTargetLocatorScan> {
+    ) -> Option<&crate::sql::planner::table::IcebergMvTargetLocatorScan> {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
-            && let crate::sql::catalog::ScanSource::IcebergMvTargetLocator(locator) =
+            && let crate::sql::planner::table::ScanSource::IcebergMvTargetLocator(locator) =
                 &scan.table.source
         {
             return Some(locator);

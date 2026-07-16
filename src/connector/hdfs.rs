@@ -841,7 +841,7 @@ mod tests {
         AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterSnapshot,
         RuntimeFilterUnavailableReason,
     };
-    use crate::sql::catalog::IcebergColumnStats;
+    use crate::sql::planner::table::IcebergColumnStats;
 
     use super::{
         HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp,

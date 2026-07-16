@@ -453,7 +453,6 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -464,6 +463,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     #[test]
     fn matches_root_delta_over_aggregate_over_source_union() {
@@ -894,7 +894,8 @@ mod tests {
                         },
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

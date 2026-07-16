@@ -4608,7 +4608,7 @@ enable_path_style_access = true
     /// The `ScanSource` path is unused during analysis-only calls.
     fn state_with_orders_table() -> Arc<crate::engine::StandaloneState> {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{ScanSource, TableDef};
+        use crate::sql::planner::table::{ScanSource, TableDef};
         let state = Arc::new(crate::engine::StandaloneState::default());
         {
             let mut catalog = state.catalog.write().expect("catalog write lock");

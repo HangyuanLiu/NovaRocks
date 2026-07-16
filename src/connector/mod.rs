@@ -307,7 +307,7 @@ mod scan_planning_registry_tests {
                 "missing_catalog",
                 "db",
                 "t",
-                crate::sql::catalog::IcebergTableInfo {
+                crate::sql::planner::table::IcebergTableInfo {
                     catalog: "missing_catalog".to_string(),
                     namespace: "db".to_string(),
                     table: "t".to_string(),
@@ -315,7 +315,7 @@ mod scan_planning_registry_tests {
                     current_snapshot_id: None,
                     schema_id: 0,
                     location: "s3://bucket/t".to_string(),
-                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
                 },

@@ -21,12 +21,12 @@ use std::sync::Arc;
 use crate::connector::stats::{
     ScanSourceIdentity, TableSnapshotRef, TableStatsProvider, TableStatsRequest,
 };
-use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::stats_input::{
     BaseTableStatistics, QueryStatsSnapshot, StatsMissingReason, StatsRef,
 };
+use crate::sql::planner::table::ScanSource;
 
 #[derive(Clone, Default)]
 pub(crate) struct QueryStatsProviders {
@@ -138,7 +138,7 @@ impl QueryStatsCollector {
 pub(super) fn collect_table_stats(
     providers: &QueryStatsProviders,
     database: &str,
-    table_def: &crate::sql::catalog::TableDef,
+    table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
     if let Some(stats) = collect_standalone_catalog_stats(providers, database, table_def, &label) {
@@ -178,7 +178,7 @@ pub(super) fn collect_table_stats(
 fn collect_standalone_catalog_stats(
     providers: &QueryStatsProviders,
     database: &str,
-    table_def: &crate::sql::catalog::TableDef,
+    table_def: &crate::sql::planner::table::TableDef,
     label: &str,
 ) -> Option<BaseTableStatistics> {
     if matches!(
@@ -216,7 +216,7 @@ fn standalone_stats_source(source: &ScanSource) -> crate::sql::optimizer::stats_
     }
 }
 
-fn table_label(database: &str, table_def: &crate::sql::catalog::TableDef) -> String {
+fn table_label(database: &str, table_def: &crate::sql::planner::table::TableDef) -> String {
     match &table_def.source {
         ScanSource::IcebergDataFiles { table, .. }
         | ScanSource::IcebergVersionTable { table, .. }
@@ -229,7 +229,7 @@ fn table_label(database: &str, table_def: &crate::sql::catalog::TableDef) -> Str
 
 fn table_stats_request(
     database: &str,
-    table_def: &crate::sql::catalog::TableDef,
+    table_def: &crate::sql::planner::table::TableDef,
 ) -> Option<TableStatsRequest> {
     match &table_def.source {
         ScanSource::IcebergDataFiles { table, .. } => Some(TableStatsRequest {
@@ -285,15 +285,15 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::stats::StatsProviderError;
-    use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::column_id::ColumnRefFactory;
     use crate::sql::common::{JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ScanOp};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
 
     #[test]
     fn collector_binds_each_scan_in_the_same_opt_expr_traversal() {

@@ -30,4 +30,5 @@ pub(crate) mod ordering;
 pub(crate) mod payload;
 pub(crate) mod physical;
 pub(crate) mod pipeline;
+pub(crate) mod table;
 pub(crate) use logical::build::{plan_output_columns, plan_query};

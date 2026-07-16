@@ -118,7 +118,7 @@ mod tests {
 
     use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
     use crate::fs::access::FsScheme;
-    use crate::sql::catalog::IcebergColumnStats;
+    use crate::sql::planner::table::IcebergColumnStats;
 
     fn range(path: &str) -> FileScanRange {
         FileScanRange {

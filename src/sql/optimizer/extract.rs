@@ -352,11 +352,11 @@ mod tests {
     fn scan_op(table: &str) -> Operator {
         Operator::PhysicalScan(ScanOp {
             database: "db".into(),
-            table: crate::sql::catalog::TableDef {
+            table: crate::sql::planner::table::TableDef {
                 name: table.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },

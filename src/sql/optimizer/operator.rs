@@ -23,11 +23,11 @@
 
 use std::collections::HashSet;
 
-use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn, WindowFrame};
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::optimizer::stats_input::StatsRef;
+use crate::sql::planner::table::{BranchScope, TableDef};
 
 pub(crate) use crate::sql::common::ScanVariantColumn;
 

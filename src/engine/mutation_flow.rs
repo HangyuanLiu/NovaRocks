@@ -1476,7 +1476,7 @@ struct CowFileRewritePlan {
     old_file: String,
     namespace: String,
     synthetic_table_name: String,
-    synthetic_table_def: crate::sql::catalog::TableDef,
+    synthetic_table_def: crate::sql::planner::table::TableDef,
     rewrite_query: sqlparser::ast::Query,
     matched_row_ids: Vec<i64>,
 }
@@ -1590,7 +1590,7 @@ fn build_cow_rewrite_synthetic_table_def(
     target: &crate::engine::backend_resolver::TargetBackend,
     synthetic_table_name: &str,
     data_file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
-) -> Result<crate::sql::catalog::TableDef, String> {
+) -> Result<crate::sql::planner::table::TableDef, String> {
     if data_file.first_row_id.is_none() {
         return Err(format!(
             "COW UPDATE requires first_row_id for iceberg data file `{}`",
@@ -1622,7 +1622,7 @@ fn build_cow_rewrite_synthetic_table_def(
             target.namespace, target.table
         ));
     }
-    Ok(crate::sql::catalog::TableDef {
+    Ok(crate::sql::planner::table::TableDef {
         name: synthetic_table_name.to_string(),
         ..table_def
     })

@@ -26,7 +26,6 @@ use crate::meta::repository::mv_contract::{
 use crate::sql::analysis::{
     ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
-use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ImvVersionRef;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -55,6 +54,7 @@ use crate::sql::planner::logical::{
     LogicalUnionNode,
 };
 use crate::sql::planner::payload::PlanProjectNode;
+use crate::sql::planner::table::ScanSource;
 
 pub(crate) struct RewriteJoinDeltaRule;
 
@@ -675,7 +675,7 @@ fn collect_branch_base_identities(
 }
 
 fn plan_base_identity(
-    table: &crate::sql::catalog::IcebergTableInfo,
+    table: &crate::sql::planner::table::IcebergTableInfo,
     source_kind: BranchSourceKind,
 ) -> Result<PlanBaseIdentity, String> {
     let table_uuid = table.table_uuid.clone().ok_or_else(|| {
@@ -1528,7 +1528,6 @@ mod tests {
     use crate::catalog::schema::ColumnDef;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -1544,6 +1543,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
 
     #[test]
     fn supported_join_delta_kinds_are_inner_and_cross_only() {
@@ -2275,7 +2275,8 @@ mod tests {
                         },
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
-                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                        binding:
+                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

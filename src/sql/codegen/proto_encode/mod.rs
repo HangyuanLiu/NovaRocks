@@ -567,7 +567,7 @@ mod tests {
         }
     }
 
-    fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::catalog::TableDef {
+    fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table::TableDef {
         let columns = names
             .iter()
             .map(|name| crate::catalog::schema::ColumnDef {
@@ -578,22 +578,24 @@ mod tests {
                 logical_type: None,
             })
             .collect::<Vec<_>>();
-        let schema = crate::sql::catalog::IcebergSchemaDef {
+        let schema = crate::sql::planner::table::IcebergSchemaDef {
             fields: names
                 .iter()
                 .enumerate()
-                .map(|(idx, name)| crate::sql::catalog::IcebergSchemaFieldDef {
-                    field_id: i32::try_from(idx + 1).expect("field id"),
-                    name: (*name).to_string(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                })
+                .map(
+                    |(idx, name)| crate::sql::planner::table::IcebergSchemaFieldDef {
+                        field_id: i32::try_from(idx + 1).expect("field id"),
+                        name: (*name).to_string(),
+                        initial_default: None,
+                        write_default: None,
+                        initial_default_json: None,
+                        write_default_json: None,
+                        children: Vec::new(),
+                    },
+                )
                 .collect(),
         };
-        let iceberg_table = crate::sql::catalog::IcebergTableInfo {
+        let iceberg_table = crate::sql::planner::table::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "sc2".to_string(),
@@ -605,15 +607,15 @@ mod tests {
             serialized_metadata: None,
             serialized_metadata_rows: None,
         };
-        crate::sql::catalog::TableDef {
+        crate::sql::planner::table::TableDef {
             name: "sc2".to_string(),
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
                 table: iceberg_table,
                 files: Vec::new(),
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -1222,8 +1224,8 @@ mod tests {
 
     #[test]
     fn native_scan_encoder_preserves_iceberg_write_defaults() {
-        let schema = crate::sql::catalog::IcebergSchemaDef {
-            fields: vec![crate::sql::catalog::IcebergSchemaFieldDef {
+        let schema = crate::sql::planner::table::IcebergSchemaDef {
+            fields: vec![crate::sql::planner::table::IcebergSchemaFieldDef {
                 field_id: 1,
                 name: "amount".to_string(),
                 initial_default: Some(iceberg::spec::Literal::Primitive(
@@ -1237,7 +1239,7 @@ mod tests {
                 children: vec![],
             }],
         };
-        let iceberg_table = crate::sql::catalog::IcebergTableInfo {
+        let iceberg_table = crate::sql::planner::table::IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),
@@ -1249,7 +1251,7 @@ mod tests {
             serialized_metadata: None,
             serialized_metadata_rows: None,
         };
-        let table = crate::sql::catalog::TableDef {
+        let table = crate::sql::planner::table::TableDef {
             name: "orders".to_string(),
             columns: vec![crate::catalog::schema::ColumnDef {
                 name: "amount".to_string(),
@@ -1263,11 +1265,11 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
+            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
                 table: iceberg_table,
                 files: vec![],
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let scan = crate::sql::planner::distributed::DistributedNode {
@@ -1338,7 +1340,7 @@ mod tests {
                 "4".to_string(),
             )])),
         ));
-        let table = crate::sql::catalog::TableDef {
+        let table = crate::sql::planner::table::TableDef {
             name: "orders".to_string(),
             columns: vec![crate::catalog::schema::ColumnDef {
                 name: "tags".to_string(),
@@ -1348,8 +1350,8 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::catalog::ScanSource::IcebergDataFiles {
-                table: crate::sql::catalog::IcebergTableInfo {
+            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+                table: crate::sql::planner::table::IcebergTableInfo {
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "orders".to_string(),
@@ -1357,13 +1359,13 @@ mod tests {
                     current_snapshot_id: Some(10),
                     schema_id: 1,
                     location: "s3://warehouse/db/orders".to_string(),
-                    schema: crate::sql::catalog::IcebergSchemaDef { fields: vec![] },
+                    schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
                     serialized_metadata: None,
                     serialized_metadata_rows: None,
                 },
                 files: vec![],
                 cloud_properties: std::collections::BTreeMap::new(),
-                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
         let scan = crate::sql::planner::distributed::DistributedNode {
@@ -1417,11 +1419,11 @@ mod tests {
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
-                    table: crate::sql::catalog::TableDef {
+                    table: crate::sql::planner::table::TableDef {
                         name: "sr_table".to_string(),
                         columns: Vec::new(),
                         iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::catalog::ScanSource::StarRocks {
+                        source: crate::sql::planner::table::ScanSource::StarRocks {
                             db_id: 1,
                             table_id: 2,
                         },
@@ -1535,11 +1537,11 @@ mod tests {
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
-                    table: crate::sql::catalog::TableDef {
+                    table: crate::sql::planner::table::TableDef {
                         name: "sr_table".to_string(),
                         columns: Vec::new(),
                         iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::catalog::ScanSource::StarRocks {
+                        source: crate::sql::planner::table::ScanSource::StarRocks {
                             db_id: 1,
                             table_id: 2,
                         },
@@ -1600,11 +1602,11 @@ mod tests {
             payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
                 crate::sql::planner::payload::PlanScanNode {
                     database: "db".to_string(),
-                    table: crate::sql::catalog::TableDef {
+                    table: crate::sql::planner::table::TableDef {
                         name: "sr_table".to_string(),
                         columns: Vec::new(),
                         iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::catalog::ScanSource::StarRocks {
+                        source: crate::sql::planner::table::ScanSource::StarRocks {
                             db_id: 1,
                             table_id: 2,
                         },

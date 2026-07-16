@@ -1516,11 +1516,11 @@ mod eq_pair_tests {
 mod join_demotion_tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::scalar::ScalarId;
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::{DataType, Field};

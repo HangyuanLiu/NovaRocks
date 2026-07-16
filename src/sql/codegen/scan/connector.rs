@@ -24,7 +24,7 @@ use crate::connector::iceberg::scan_planner::{
 };
 use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
 use crate::runtime::scan_range;
-use crate::sql::catalog::{
+use crate::sql::planner::table::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 use arrow::datatypes::DataType;
@@ -217,7 +217,7 @@ pub(crate) fn plan_native_starrocks_scan_node(
         use crate::connector::starrocks::table::scan_planner::{
             StarRocksTableScanPlanner, starrocks_scan_handle, starrocks_split,
         };
-        use crate::sql::catalog::ScanSource;
+        use crate::sql::planner::table::ScanSource;
 
         let ScanSource::StarRocks { db_id, table_id } = &scan.table.source else {
             return Err(format!(
@@ -444,9 +444,9 @@ fn native_file_pruning_min_max_values(
 }
 
 fn find_column_stats<'a>(
-    stats: &'a HashMap<String, crate::sql::catalog::IcebergColumnStats>,
+    stats: &'a HashMap<String, crate::sql::planner::table::IcebergColumnStats>,
     column: &str,
-) -> Option<&'a crate::sql::catalog::IcebergColumnStats> {
+) -> Option<&'a crate::sql::planner::table::IcebergColumnStats> {
     stats.get(column).or_else(|| {
         stats
             .iter()
@@ -456,7 +456,7 @@ fn find_column_stats<'a>(
 }
 
 fn native_min_max_value_from_stats(
-    stats: &crate::sql::catalog::IcebergColumnStats,
+    stats: &crate::sql::planner::table::IcebergColumnStats,
     data_type: &DataType,
 ) -> Option<scan_range::FilePruningMinMaxValue> {
     let has_null = stats.null_count.unwrap_or(0) > 0;

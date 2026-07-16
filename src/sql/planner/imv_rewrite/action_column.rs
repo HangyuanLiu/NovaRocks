@@ -31,7 +31,6 @@ use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
 };
 use crate::sql::analysis::OutputColumn;
-use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -51,6 +50,7 @@ use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
+use crate::sql::planner::table::ScanSource;
 
 pub(crate) struct ImvActionColumn;
 
@@ -426,7 +426,6 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::imv_rewrite::change_stream::{
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
@@ -436,6 +435,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalUnionNode};
     use crate::sql::planner::payload::PlanProjectNode;
     use crate::sql::planner::payload::*;
+    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, TableDef};
 
     #[test]
     fn output_column_has_expected_shape() {

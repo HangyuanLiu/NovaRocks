@@ -5299,7 +5299,7 @@ mod tests {
             &self,
             _database: &str,
             table: &str,
-        ) -> Result<crate::sql::catalog::TableDef, String> {
+        ) -> Result<crate::sql::planner::table::TableDef, String> {
             Err(format!("table not found: {table}"))
         }
     }
@@ -5311,11 +5311,11 @@ mod tests {
             &self,
             _database: &str,
             table: &str,
-        ) -> Result<crate::sql::catalog::TableDef, String> {
+        ) -> Result<crate::sql::planner::table::TableDef, String> {
             if table != "offsets" {
                 return Err(format!("table not found: {table}"));
             }
-            Ok(crate::sql::catalog::TableDef {
+            Ok(crate::sql::planner::table::TableDef {
                 name: table.to_string(),
                 columns: vec![crate::catalog::schema::ColumnDef {
                     name: "offset".to_string(),
@@ -5325,7 +5325,7 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::catalog::ScanSource::StarRocks {
+                source: crate::sql::planner::table::ScanSource::StarRocks {
                     db_id: 0,
                     table_id: 0,
                 },

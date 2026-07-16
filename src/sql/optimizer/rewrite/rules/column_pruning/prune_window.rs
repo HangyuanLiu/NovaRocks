@@ -197,11 +197,11 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ScalarWindowSpec, ScanOp, WindowOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 

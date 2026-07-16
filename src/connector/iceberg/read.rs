@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::sql::catalog::IcebergColumnStats;
+use crate::sql::planner::table::IcebergColumnStats;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergReadDeleteFormat {

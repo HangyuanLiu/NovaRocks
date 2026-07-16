@@ -22,7 +22,6 @@ use crate::coordinator::prepare::scan::{
     ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
 };
-use crate::sql::catalog::{IcebergDataFileBinding, ScanSource};
 use crate::sql::codegen::scan::connector::{
     ConnectorScanContext, PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
     to_native_file_scan,
@@ -32,6 +31,7 @@ use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
 use crate::sql::planner::payload::PlanScanNode;
+use crate::sql::planner::table::{IcebergDataFileBinding, ScanSource};
 
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -233,7 +233,7 @@ fn reject_target_equality_deletes(
     };
     if files.files.iter().any(|file| {
         file.delete_files.iter().any(|delete| {
-            delete.file_content == crate::sql::catalog::IcebergDeleteFileContent::Equality
+            delete.file_content == crate::sql::planner::table::IcebergDeleteFileContent::Equality
         })
     }) {
         return Err(format!(
@@ -372,7 +372,7 @@ fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
 }
 
 pub(crate) fn projected_target_state_column_names(
-    scan: &crate::sql::catalog::IcebergMvTargetStateScan,
+    scan: &crate::sql::planner::table::IcebergMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
     push_unique_projected_name(&mut names, &scan.row_id_column_name);
@@ -383,7 +383,7 @@ pub(crate) fn projected_target_state_column_names(
     {
         push_unique_projected_name(&mut names, name);
     }
-    if let crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+    if let crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
     } = &scan.row_filter
@@ -402,7 +402,7 @@ pub(crate) fn projected_target_state_column_names(
 }
 
 pub(crate) fn projected_target_locator_column_names(
-    scan: &crate::sql::catalog::IcebergMvTargetLocatorScan,
+    scan: &crate::sql::planner::table::IcebergMvTargetLocatorScan,
 ) -> Vec<String> {
     let mut names = vec![scan.apply_key_column.clone()];
     if let Some(branch_id_column) = &scan.branch_id_column {
@@ -607,7 +607,7 @@ fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) ->
 }
 
 pub(crate) fn equality_delete_required_columns(
-    table: &crate::sql::catalog::IcebergTableInfo,
+    table: &crate::sql::planner::table::IcebergTableInfo,
     splits: &[crate::connector::scan_planning::Split],
 ) -> Result<Vec<String>, String> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -641,7 +641,8 @@ pub(crate) fn equality_delete_required_columns(
     for split in splits {
         let file = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
         for delete in &file.data_file.delete_files {
-            if delete.file_content != crate::sql::catalog::IcebergDeleteFileContent::Equality {
+            if delete.file_content != crate::sql::planner::table::IcebergDeleteFileContent::Equality
+            {
                 continue;
             }
 
@@ -931,10 +932,6 @@ mod tests {
     };
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
-        IcebergTableInfo, ScanSource, TableDef,
-    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
@@ -942,6 +939,10 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanScanNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::table::{
+        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
+        IcebergTableInfo, ScanSource, TableDef,
+    };
 
     #[derive(Debug)]
     struct PlannedIcebergFiles {
@@ -1121,7 +1122,7 @@ mod tests {
         let mut file = data_file(path);
         file.column_stats = Some(HashMap::from([(
             "id".to_string(),
-            crate::sql::catalog::IcebergColumnStats {
+            crate::sql::planner::table::IcebergColumnStats {
                 null_count: Some(0),
                 value_count: Some(10),
                 column_size: None,
@@ -1135,11 +1136,11 @@ mod tests {
     fn equality_delete_file(
         equality_column_names: Vec<&str>,
         equality_field_ids: Vec<i32>,
-    ) -> crate::sql::catalog::IcebergDeleteFileInfo {
-        crate::sql::catalog::IcebergDeleteFileInfo {
+    ) -> crate::sql::planner::table::IcebergDeleteFileInfo {
+        crate::sql::planner::table::IcebergDeleteFileInfo {
             path: "s3://bucket/eq-delete.parquet".to_string(),
-            file_format: crate::sql::catalog::IcebergDeleteFileFormat::Parquet,
-            file_content: crate::sql::catalog::IcebergDeleteFileContent::Equality,
+            file_format: crate::sql::planner::table::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::sql::planner::table::IcebergDeleteFileContent::Equality,
             length: Some(1),
             content_offset: None,
             content_size_in_bytes: None,
@@ -1604,8 +1605,8 @@ mod tests {
             column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
             column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
         ];
-        scan.table.source =
-            ScanSource::IcebergMvTargetLocator(crate::sql::catalog::IcebergMvTargetLocatorScan {
+        scan.table.source = ScanSource::IcebergMvTargetLocator(
+            crate::sql::planner::table::IcebergMvTargetLocatorScan {
                 catalog: "test_catalog".to_string(),
                 database: "test_db".to_string(),
                 table: "test_table".to_string(),
@@ -1613,7 +1614,8 @@ mod tests {
                 target_snapshot_id: Some(6),
                 apply_key_column: "id".to_string(),
                 branch_id_column: None,
-            });
+            },
+        );
         let resolver = StaticResolver {
             execution: resolved_files(vec![data_file("s3://bucket/target-6.parquet")]),
         };
@@ -1699,7 +1701,7 @@ mod tests {
             column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
         ];
         scan.table.source =
-            ScanSource::IcebergMvTargetState(crate::sql::catalog::IcebergMvTargetStateScan {
+            ScanSource::IcebergMvTargetState(crate::sql::planner::table::IcebergMvTargetStateScan {
                 catalog: "test_catalog".to_string(),
                 database: "test_db".to_string(),
                 table: "test_table".to_string(),
@@ -1711,12 +1713,12 @@ mod tests {
                 aggregate_state_names: vec!["agg".to_string()],
                 physical_column_names: vec!["id".to_string(), "agg".to_string()],
                 row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
-                row_filter: crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_filter: crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                     row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                     branch_scope: None,
                 },
                 partition_constraint:
-                    crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                    crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
             });
         let resolver = StaticResolver {
             execution: resolved_files(vec![data_file("s3://bucket/target-state-6.parquet")]),
@@ -1896,7 +1898,7 @@ mod tests {
         let sources = [
             (
                 ScanSource::IcebergMvTargetLocator(
-                    crate::sql::catalog::IcebergMvTargetLocatorScan {
+                    crate::sql::planner::table::IcebergMvTargetLocatorScan {
                         catalog: "test_catalog".to_string(),
                         database: "test_db".to_string(),
                         table: "test_table".to_string(),
@@ -1909,7 +1911,7 @@ mod tests {
                 "target-locator",
             ),
             (
-                ScanSource::IcebergMvTargetState(crate::sql::catalog::IcebergMvTargetStateScan {
+                ScanSource::IcebergMvTargetState(crate::sql::planner::table::IcebergMvTargetStateScan {
                     catalog: "test_catalog".to_string(),
                     database: "test_db".to_string(),
                     table: "test_table".to_string(),
@@ -1922,12 +1924,12 @@ mod tests {
                     physical_column_names: vec!["id".to_string()],
                     row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                     row_filter:
-                        crate::sql::catalog::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                        crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
                             row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                             branch_scope: None,
                         },
                     partition_constraint:
-                        crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                        crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
                 }),
                 "target-state",
             ),

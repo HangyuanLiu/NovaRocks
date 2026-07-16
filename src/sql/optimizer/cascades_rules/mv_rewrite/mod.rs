@@ -26,9 +26,9 @@ pub(crate) mod descriptor;
 pub(crate) mod predicate_split;
 pub(crate) mod rule;
 
-use crate::sql::catalog::TableDef;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::stats_input::StatsRef;
+use crate::sql::planner::table::TableDef;
 use descriptor::SpjgDescriptor;
 
 pub(crate) const RULE_NAME: &str = "MvRewrite";

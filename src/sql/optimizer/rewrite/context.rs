@@ -22,12 +22,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::common::DictionarySnapshot;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
+use crate::sql::planner::table::TableDef;
 
 /// Loads dictionary snapshots for scan-time low-cardinality string columns.
 /// Implemented by the engine layer (production) and by tests (fakes).
@@ -327,7 +327,7 @@ mod tests {
         // Trigger load_active_snapshot to extract the embedded label.
         // We have no `TableDef::dummy()` helper handy, so reach for the
         // engine layer's dictionary model and synthesize one inline.
-        use crate::sql::catalog::{ScanSource, TableDef};
+        use crate::sql::planner::table::{ScanSource, TableDef};
         let table = TableDef {
             name: "probe".to_string(),
             columns: vec![],
