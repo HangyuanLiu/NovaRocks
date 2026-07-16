@@ -9927,6 +9927,51 @@ fn runtime_filter_transport_use_expands_visibility(import: &str) -> bool {
     )
 }
 
+fn runtime_filter_transport_extern_self_alias_violations(
+    source_rel: &str,
+    text: &str,
+) -> Vec<String> {
+    fn collect(items: &[syn::Item], aliases: &mut Vec<String>) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::ExternCrate(extern_crate)
+                    if extern_crate.ident.to_string() == "self" =>
+                {
+                    aliases.push(
+                        extern_crate
+                            .rename
+                            .as_ref()
+                            .map_or_else(|| "self".to_string(), |(_, alias)| alias.to_string()),
+                    );
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        collect(items, aliases);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(text) else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    collect(&file.items, &mut aliases);
+    aliases
+        .into_iter()
+        .map(|alias| {
+            format!(
+                "{source_rel}: native runtime-filter transport owner must not declare production crate-root alias {alias}"
+            )
+        })
+        .collect()
+}
+
 fn runtime_filter_transport_ingress_boundary_violations(
     source_rel: &str,
     text: &str,
@@ -9953,6 +9998,9 @@ fn runtime_filter_transport_ingress_boundary_violations(
 
     let mut export_violations = Vec::new();
     if matches!(source_rel, ADAPTER | SERVICE_INJECTION_OWNER) {
+        export_violations.extend(runtime_filter_transport_extern_self_alias_violations(
+            source_rel, text,
+        ));
         export_violations.extend(
             rust_production_scoped_use_statements(text)
                 .into_iter()
@@ -16860,6 +16908,18 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             adapter,
             "mod leak { use crate::runtime_filter::port as ports; pub(super) use self::ports::transport::RuntimeFilterEnvelope as Hidden; }",
         ),
+        (
+            adapter,
+            "extern crate self as root; pub use root::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "extern crate self as root; pub(crate) use root::runtime_filter::port::transport::RuntimeFilterEnvelope as Hidden;",
+        ),
+        (
+            adapter,
+            "extern crate self as root; pub(in crate::service) type Hidden = root::runtime_filter::port::transport::RuntimeFilterEnvelope;",
+        ),
     ] {
         assert!(
             !runtime_filter_transport_ingress_boundary_violations(source_rel, source).is_empty(),
@@ -16893,6 +16953,9 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "struct Local; pub(crate) use self::Local as Hidden;",
         "struct Local; mod nested { pub(crate) use super::Local as Hidden; }",
         "pub(crate) use super::super::super::local::Thing as Hidden;",
+        "#[cfg(test)] extern crate self as root;",
+        "extern crate reqwest;",
+        "extern crate reqwest as network;",
     ] {
         assert!(
             runtime_filter_transport_ingress_boundary_violations(adapter, source).is_empty(),
