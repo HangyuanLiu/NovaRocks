@@ -364,6 +364,12 @@ impl FoundationDbRuntime {
                     "FoundationDB runtime cannot open a SQLite state store",
                 ));
             }
+            super::StateStoreProviderConfig::Mysql { .. } => {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "FoundationDB runtime cannot open a MySQL state store",
+                ));
+            }
         };
         let limits = StateStoreLimits::from_overrides(&config.limits).map_err(|_| {
             StateStoreError::new(

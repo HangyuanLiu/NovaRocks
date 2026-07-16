@@ -311,6 +311,16 @@ fn mysql_client_config_rejects_invalid_non_secret_shape() -> anyhow::Result<()> 
     fixtures.push(("host", client));
     let mut client = valid_mysql_client();
     client.tls_mode = MySqlTlsMode::VerifyIdentity;
+    client.host = "::1".to_owned();
+    client.tls_ca_path = Some(ca.clone());
+    fixtures.push(("host", client));
+    let mut client = valid_mysql_client();
+    client.tls_mode = MySqlTlsMode::VerifyIdentity;
+    client.host = "[::1]".to_owned();
+    client.tls_ca_path = Some(ca.clone());
+    fixtures.push(("host", client));
+    let mut client = valid_mysql_client();
+    client.tls_mode = MySqlTlsMode::VerifyIdentity;
     fixtures.push(("tls_ca_path", client));
     let mut client = valid_mysql_client();
     client.tls_cert_path = Some(cert);

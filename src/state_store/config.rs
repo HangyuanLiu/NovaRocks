@@ -21,7 +21,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
 use super::limits::{MYSQL_MAX_KEY_BYTES, StateStoreLimitOverrides, StateStoreLimits};
@@ -254,7 +254,7 @@ impl MySqlClientConfig {
                     "InvalidStateStoreConfig: mysql_client.tls_ca_path is required for verify_identity"
                 );
             }
-            if self.host.parse::<IpAddr>().is_ok() {
+            if mysql_host_is_ip_address(&self.host) {
                 bail!(
                     "InvalidStateStoreConfig: mysql_client.host must be a DNS hostname for verify_identity"
                 );
@@ -306,6 +306,14 @@ impl fmt::Debug for MySqlClientConfig {
             )
             .finish()
     }
+}
+
+fn mysql_host_is_ip_address(host: &str) -> bool {
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    normalized.parse::<IpAddr>().is_ok()
 }
 
 fn valid_environment_variable_name(name: &str) -> bool {
