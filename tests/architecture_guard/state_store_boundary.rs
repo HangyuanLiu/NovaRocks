@@ -750,6 +750,75 @@ fn state_store_foundationdb_provider_variant_is_feature_independent() {
 }
 
 #[test]
+fn foundationdb_workflow_covers_each_gate_owner_exactly_once() {
+    let workflow_path = src_dir()
+        .parent()
+        .expect("workspace root")
+        .join(".github/workflows/foundationdb-state-store.yml");
+    let workflow = fs::read_to_string(&workflow_path).expect("read FoundationDB workflow");
+
+    assert_eq!(
+        workflow.matches("runs-on: ubuntu-24.04").count(),
+        1,
+        "FoundationDB must have one dedicated Linux production gate"
+    );
+    assert_eq!(
+        workflow
+            .matches("run: tools/ci/foundationdb-provider.sh")
+            .count(),
+        1,
+        "the dedicated workflow must invoke the production gate exactly once"
+    );
+
+    for owner in [
+        "src/common/app_config.rs",
+        "novarocks.toml.example",
+        "tests/common/mod.rs",
+        "tests/architecture_guard/state_store_boundary.rs",
+        "tests/cluster_mvp.rs",
+    ] {
+        let trigger = format!("      - \"{owner}\"");
+        assert_eq!(
+            workflow.lines().filter(|line| *line == trigger).count(),
+            1,
+            "FoundationDB gate owner `{owner}` must trigger the unique Linux gate exactly once"
+        );
+    }
+}
+
+#[test]
+fn foundationdb_operator_readme_matches_structured_commit_log_contract() {
+    let readme_path = src_dir()
+        .parent()
+        .expect("workspace root")
+        .join("docker/foundationdb/README.md");
+    let readme = fs::read_to_string(&readme_path).expect("read FoundationDB operator guide");
+    let normalized = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for field in [
+        "`transaction_id`",
+        "`phase`",
+        "`native_error_code`",
+        "`category`",
+    ] {
+        assert!(
+            readme.contains(field),
+            "FoundationDB operator log allowlist must name exact commit field {field}"
+        );
+    }
+    for forbidden in [
+        "logical keys or values",
+        "cluster-file contents",
+        "raw keyspace UUID",
+    ] {
+        assert!(
+            normalized.contains(forbidden),
+            "FoundationDB operator log denylist must retain `{forbidden}`"
+        );
+    }
+}
+
+#[test]
 fn state_store_boundary_detector_ignores_non_production_noise() {
     let sources = [
         GuardSource::new(

@@ -40,6 +40,20 @@ const RUNTIME_PID_ERROR: &str = "state store runtime belongs to a different proc
 #[cfg(feature = "foundationdb-provider")]
 const FOUNDATIONDB_API_VERSION: i32 = 730;
 
+#[cfg(feature = "foundationdb-provider")]
+struct ShutdownDeferredLogFields {
+    lifecycle: &'static str,
+    reason: &'static str,
+}
+
+#[cfg(feature = "foundationdb-provider")]
+const fn shutdown_deferred_log_fields() -> ShutdownDeferredLogFields {
+    ShutdownDeferredLogFields {
+        lifecycle: "shutdown_deferred",
+        reason: "handles_not_drained",
+    }
+}
+
 pub struct StateStoreRuntime {
     inner: RuntimeInner,
 }
@@ -407,6 +421,16 @@ impl FoundationDbRuntime {
                 .is_err()
             {
                 self.shared.accepting.store(true, Ordering::Release);
+                let fields = shutdown_deferred_log_fields();
+                tracing::warn!(
+                    provider = "foundationdb",
+                    lifecycle = fields.lifecycle,
+                    reason = fields.reason,
+                    process_id = self.shared.pid,
+                    in_flight = self.shared.in_flight.load(Ordering::Acquire),
+                    provider_handles = self.shared.provider_handles.load(Ordering::Acquire),
+                    "FoundationDB state store runtime shutdown deferred"
+                );
                 return Err(StateStoreError::new(
                     StateStoreErrorKind::DeadlineExceeded,
                     "FoundationDB runtime handles did not drain within five seconds",
@@ -940,6 +964,32 @@ mod tests {
         );
         let error = foundationdb_api_versions(729).expect_err("old client must fail closed");
         assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_is_logged_as_deferred_not_failed() {
+        let fields = shutdown_deferred_log_fields();
+        assert_eq!(fields.lifecycle, "shutdown_deferred");
+        assert_eq!(fields.reason, "handles_not_drained");
+
+        let source = include_str!("runtime.rs");
+        let timeout_branch = source
+            .split("\"FoundationDB runtime handles did not drain within five seconds\"")
+            .next()
+            .expect("shutdown timeout branch");
+        let timeout_branch = timeout_branch
+            .rsplit("if timeout_at")
+            .next()
+            .expect("shutdown timeout conditional");
+        assert!(
+            timeout_branch.contains("tracing::warn!")
+                && timeout_branch.contains("shutdown_deferred_log_fields"),
+            "shutdown timeout must emit a structured deferred lifecycle warning"
+        );
+        assert!(
+            !timeout_branch.contains("stop_failed"),
+            "a retryable drain timeout must not be logged as a terminal stop failure"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

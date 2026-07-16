@@ -26,9 +26,12 @@ server and client 7.3.69, Rust API 730, macOS arm64 asset SHA-256
 `6bfbd48ac21356de0baa0c1e84c6e33d15d95d0b9d022c35a7625e5d9293b71e`,
 and Linux x86_64 asset SHA-256
 `ea59d1708519798c7bc4f514cd29af1ac8e41dccbec4371f22d86b713ea81cbf`.
-The executable fixture scripts remain the source of truth used by CI; the
-workflow and production gate consume their generated environment instead of
-copying these constants.
+The executable fixture scripts remain the source of truth used by CI. The
+workflow invokes `docker/foundationdb/up.sh`, whose exact self-check verifies
+the pinned version, API, and platform-specific asset SHA. The production gate
+then consumes the generated environment and validates its existence, Linux
+x86_64 platform, and required client artifacts; it does not duplicate those
+pinned constants.
 
 Prepare the client and generated environment without starting Docker:
 
@@ -77,10 +80,13 @@ overrides the stock image entrypoint to publish a host-reachable address.
 
 Treat the cluster file, TLS private key, TLS password, and deployment
 credentials as secrets. Do not print their contents or copy them into test
-output. NovaRocks structured logs expose only lifecycle state, the maximum and
-selected API versions, client readiness, and a one-way keyspace hash. They do
-not log the cluster-file contents, credential values, certificate/private-key
-contents, logical keys or values, or the raw keyspace UUID.
+output. NovaRocks structured logs expose lifecycle state (including retryable
+`shutdown_deferred`), the maximum and selected API versions, client readiness,
+and a one-way keyspace hash. Commit-state native error warnings additionally
+expose `transaction_id` as a canonical UUID, `phase`, `native_error_code`, and
+`category`. They do not log cluster-file contents, credential values,
+certificate/private-key contents, logical keys or values, secrets, or the raw
+keyspace UUID.
 
 Remove only this worktree's generated runtime while leaving Docker untouched:
 

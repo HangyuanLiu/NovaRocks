@@ -49,6 +49,11 @@ docker/foundationdb/up.sh
 tools/ci/foundationdb-provider.sh
 ```
 
+The workflow calls `docker/foundationdb/up.sh`; that fixture's exact self-check
+validates the pinned version, API, and platform-specific asset SHA. The gate
+only consumes the generated environment and validates that it exists, targets
+Linux x86_64, and contains the required client artifacts.
+
 The pinned official client assets are
 `FoundationDB-7.3.69_arm64.pkg` with SHA-256
 `6bfbd48ac21356de0baa0c1e84c6e33d15d95d0b9d022c35a7625e5d9293b71e`
@@ -66,8 +71,11 @@ deployment. `cross_process_three_be_state_store_baseline` remains the real
 1FE+3BE query baseline, but it intentionally leaves FoundationDB disabled; its
 role is regression and no-fallback evidence.
 
-Never put cluster-file contents, TLS passwords, private-key/certificate
-contents, credentials, logical keys/values, or the raw keyspace UUID in logs or
+Commit-state native error logs may contain only the canonical UUID
+`transaction_id`, `phase`, `native_error_code`, and `category` in addition to
+the documented lifecycle/API/readiness/keyspace-hash fields. Never put
+cluster-file contents, TLS passwords, private-key/certificate contents,
+credentials, logical keys/values, secrets, or the raw keyspace UUID in logs or
 goldens. Finish tests by dropping transaction and store handles, then call
 `StateStoreRuntime::shutdown()`, and only after successful runtime shutdown run
 `docker/foundationdb/down.sh --docker`.
