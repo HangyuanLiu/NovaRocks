@@ -37619,6 +37619,13 @@ struct Coor3bRuntimeFilterProjectionSource {
     audit: Coor3bRuntimeFilterProjectionAudit,
 }
 
+fn coor_3b_may_contain_projection_module_use(source: &Cgo8GuardSource) -> bool {
+    source.text.contains("runtime_filter")
+        && (source.path.starts_with("src/sql/planner/distributed/")
+            || (source.path.starts_with("src/sql/planner/") && source.text.contains("distributed"))
+            || (source.text.contains("planner") && source.text.contains("distributed")))
+}
+
 fn coor_3b_projection_use_audit(source: &Cgo8GuardSource) -> (Vec<(String, bool)>, Vec<String>) {
     const TARGET_MODULE: &[&str] = &["crate", "sql", "planner", "distributed", "runtime_filter"];
 
@@ -37694,6 +37701,19 @@ fn coor_3b_projection_use_audit(source: &Cgo8GuardSource) -> (Vec<(String, bool)
                 continue;
             };
             let target = canonical.iter().map(String::as_str).collect::<Vec<_>>();
+            if target == *TARGET_MODULE {
+                let binding = raw
+                    .path
+                    .alias
+                    .clone()
+                    .or_else(|| raw.path.segments.last().cloned())
+                    .unwrap_or_default();
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {}: projection module alias `{binding}` is forbidden",
+                    source.path
+                ));
+                continue;
+            }
             if target.len() != TARGET_MODULE.len() + 1
                 || target[..TARGET_MODULE.len()] != *TARGET_MODULE
                 || !matches!(
@@ -37722,6 +37742,7 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
         && !sources.iter().any(|source| {
             source.text.contains(COOR_3B_RF_PROJECTION_FN)
                 || (source.text.contains("runtime_filter") && source.text.contains('*'))
+                || coor_3b_may_contain_projection_module_use(source)
         })
     {
         return violations;
@@ -37735,7 +37756,11 @@ fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource
         );
         let may_contain_projection_glob =
             source.text.contains("runtime_filter") && source.text.contains('*');
-        if !owner && !source.text.contains(COOR_3B_RF_PROJECTION_FN) && !may_contain_projection_glob
+        let may_contain_projection_module_use = coor_3b_may_contain_projection_module_use(source);
+        if !owner
+            && !source.text.contains(COOR_3B_RF_PROJECTION_FN)
+            && !may_contain_projection_glob
+            && !may_contain_projection_module_use
         {
             continue;
         }
@@ -38957,7 +38982,7 @@ fn coordinator_runtime_filter_guard_scopes_sibling_inline_aliases() {
         "src/coordinator/projection_escape.rs",
         r#"
 mod left {
-    use crate::sql::planner::distributed::runtime_filter as rf;
+    use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection as rf;
 }
 mod right {
     use crate::connector as rf;
@@ -38967,7 +38992,7 @@ mod right {
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
-        "a sibling module's runtime-filter alias must not contaminate a safe glob"
+        "a sibling module's non-projector item alias must not contaminate a safe glob"
     );
 }
 
@@ -38993,6 +39018,48 @@ fn coordinator_runtime_filter_guard_fails_closed_on_super_escape() {
         "src/sql/planner/distributed/projection_escape.rs",
         "pub(crate) use super::super::super::super::super::runtime_filter::*;",
         "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_cross_file_projection_module_alias() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/mod.rs",
+            "pub(crate) use runtime_filter as rf;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/projection_escape.rs",
+            "use crate::sql::planner::distributed::rf::project_runtime_filters as run; fn escape(plan: &DistributedPlan) { run(plan); }",
+        ),
+    ];
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("runtime-filter-projection-owner")
+                && violation.contains("src/sql/planner/distributed/mod.rs")
+                && violation.contains("module alias")
+        }),
+        "the parent projection-module alias must be rejected explicitly: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_allows_direct_non_projector_item_import() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/scheduler/runtime_filter.rs",
+            "use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection; fn consume(_: RuntimeFilterGraphProjection) {}",
+        ),
+    ];
+    let violations = coor_3b_runtime_filter_projection_owner_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a direct import of a non-projector item must remain allowed: {violations:?}"
     );
 }
 
