@@ -18,17 +18,21 @@
 pub(crate) mod compiler;
 pub(crate) mod extension;
 pub(crate) mod role_graph;
+pub(crate) mod routing_shard;
 pub(crate) mod shard;
 pub(crate) mod wait_for;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::role_graph::RoleGraph;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, PlanFragmentId};
 use crate::runtime_filter::model::validation::GraphValidationError;
 use crate::runtime_filter::port::artifact::ArtifactContractError;
-use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+use crate::runtime_filter::port::identity::{
+    DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+};
 use crate::runtime_filter::port::install::{
     MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
@@ -47,6 +51,9 @@ pub(crate) struct RuntimeFilterDeploymentPolicy {
     pub materialization: MaterializationPolicy,
 }
 
+pub(crate) type BindingInstanceIndex =
+    BTreeMap<(ChannelId, BindingId, RuntimeFilterParticipantId), BTreeSet<UniqueId>>;
+
 /// Static contract failures. Every variant is caught before fragment submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeploymentError {
@@ -56,6 +63,22 @@ pub(crate) enum DeploymentError {
     MissingPlacement { fragment: PlanFragmentId },
     /// A placement referenced a backend id absent from the live snapshot.
     UnknownBackend { backend_idx: usize },
+    /// The live backend snapshot contains the same backend id more than once.
+    DuplicateBackend { backend_idx: usize },
+    /// A routing participant has no endpoint in the live backend snapshot.
+    UnknownRouteParticipant {
+        participant: RuntimeFilterParticipantId,
+    },
+    /// A route-edge id is reused anywhere in the query-global role graph.
+    DuplicateRouteEdge { edge_id: RouteEdgeId },
+    /// One producer fragment instance is assigned to multiple participants.
+    AmbiguousProducerInstance {
+        channel: ChannelId,
+        binding: BindingId,
+        fragment_instance_id: UniqueId,
+    },
+    /// A projected routing shard violates the native routing DTO contract.
+    InvalidRoutingShard { detail: String },
     /// The fragment edges supplied to the compiler formed a cycle; the
     /// execution dependency graph could not be built.
     FragmentCycle,
@@ -83,6 +106,35 @@ impl fmt::Display for DeploymentError {
             }
             Self::UnknownBackend { backend_idx } => {
                 write!(f, "unknown backend index {backend_idx}")
+            }
+            Self::DuplicateBackend { backend_idx } => {
+                write!(f, "duplicate backend index {backend_idx}")
+            }
+            Self::UnknownRouteParticipant { participant } => {
+                write!(
+                    f,
+                    "runtime filter route participant {} has no live endpoint",
+                    participant.get()
+                )
+            }
+            Self::DuplicateRouteEdge { edge_id } => {
+                write!(f, "duplicate runtime filter route edge {}", edge_id.get())
+            }
+            Self::AmbiguousProducerInstance {
+                channel,
+                binding,
+                fragment_instance_id,
+            } => {
+                write!(
+                    f,
+                    "runtime filter producer instance {} for binding {} on channel {} maps to multiple participants",
+                    fragment_instance_id,
+                    binding.get(),
+                    channel.get()
+                )
+            }
+            Self::InvalidRoutingShard { detail } => {
+                write!(f, "invalid runtime filter routing shard: {detail}")
             }
             Self::FragmentCycle => {
                 write!(f, "fragment execution dependency graph contains a cycle")

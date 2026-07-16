@@ -17,9 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::common::types::UniqueId;
-use crate::runtime_filter::deployment::DeploymentError;
 use crate::runtime_filter::deployment::role_graph::{RoleGraph, RouteKind};
+use crate::runtime_filter::deployment::{BindingInstanceIndex, DeploymentError};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
     ContributionKind, CoverageWitnessId, ReductionRequirement, RuntimeFilterLifecycle,
@@ -59,9 +58,6 @@ pub(crate) struct ConsumerBindingFacts {
     pub activation: ConsumerActivation,
     pub capabilities: BTreeSet<ArtifactCapability>,
 }
-
-type InstanceIndex =
-    BTreeMap<(ChannelId, BindingId, RuntimeFilterParticipantId), BTreeSet<UniqueId>>;
 
 /// Lower a consumer's semantic `ArtifactCapability` set into the physical
 /// `ConsumerArtifactProfile` the M2 install contract requires (RFD-3/M2 §159-162):
@@ -115,7 +111,7 @@ pub(crate) fn project_install_views(
     role_graph: &RoleGraph,
     channel_specs: &BTreeMap<ChannelId, ChannelProjectionSpec>,
     consumer_facts: &BTreeMap<BindingId, ConsumerBindingFacts>,
-    instances: &InstanceIndex,
+    instances: &BindingInstanceIndex,
     core_budget: RuntimeFilterCoreBudget,
     materialization: MaterializationPolicy,
 ) -> Result<BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>, DeploymentError> {
