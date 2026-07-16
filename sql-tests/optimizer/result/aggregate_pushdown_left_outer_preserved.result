@@ -1,4 +1,8 @@
 Explain String
+RUNTIME FILTER GRAPH
+  runtime filter channel 0
+    producer binding 0, fragment = 1, node = 7, expr = (a.k)
+    consumer binding 1, fragment = 2, node = 1, expr = (b.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -14,8 +18,6 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 8
     PARTITION: UNPARTITIONED
 7:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [b.k = a.k]) stats={rows=100}
-  build runtime filters:
-  - filter_id = 0, build_expr = (a.k)
   2:HASH EXCHANGE stats={rows=50}
   6:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
     aggregations: sum(a.v)
@@ -42,5 +44,3 @@ PLAN FRAGMENT 3
      TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
      columns: k
      min-max stats
-    probe runtime filters:
-    - filter_id = 0, probe_expr = (b.k)

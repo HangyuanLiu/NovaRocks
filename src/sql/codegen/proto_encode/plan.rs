@@ -16,9 +16,12 @@
 // under the License.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
+
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 use arrow::datatypes::{DataType, Field};
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
@@ -30,10 +33,6 @@ use crate::coordinator::prepare::scan::{
 };
 use crate::proto::{common, plan};
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
-// Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
-// encoding reads finalized planner types, not these analysis constructors).
-#[cfg(test)]
-use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::catalog;
 use crate::sql::codegen::scan::connector::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksScanSourceDescriptor,
@@ -42,7 +41,8 @@ use crate::sql::codegen::scan::connector::{
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::parser::ast::SqlType;
 use crate::sql::planner::distributed::runtime_filter::{
-    BoundRuntimeFilterBuild, BoundRuntimeFilterProbe,
+    GraphRuntimeFilterBuild, GraphRuntimeFilterProbe, RuntimeFilterGraphProjection,
+    project_runtime_filters,
 };
 use crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding;
 use crate::sql::planner::distributed::write::sink::{
@@ -83,6 +83,7 @@ pub(crate) struct NativePlanEncodeContext<'a> {
     /// `None` only in bare-node/bare-fragment encoder unit tests, which never
     /// encode a write or router fragment.
     pub(crate) write_contracts: Option<&'a WriteContractCatalog>,
+    pub(crate) runtime_filter_projection: Option<&'a RuntimeFilterGraphProjection>,
 }
 
 #[cfg(test)]
@@ -97,6 +98,7 @@ pub(crate) fn encode_distributed_plan(
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
+            runtime_filter_projection: None,
         },
     )
 }
@@ -109,11 +111,20 @@ pub(crate) fn encode_distributed_plan_with_context(
     // node, so bind it here: all fragment/node encoding then reads each covered
     // node's execution output from it instead of re-deriving or repairing it,
     // regardless of how the incoming context was constructed.
+    let owned_runtime_filter_projection;
+    let runtime_filter_projection = match ctx.runtime_filter_projection {
+        Some(projection) => projection,
+        None => {
+            owned_runtime_filter_projection = project_runtime_filters(src)?;
+            &owned_runtime_filter_projection
+        }
+    };
     let ctx = NativePlanEncodeContext {
         scan_bindings: ctx.scan_bindings,
         node_outputs: Some(src.node_outputs()),
         fragment_edge_outputs: Some(src.fragment_edge_outputs()),
         write_contracts: Some(src.write_contracts()),
+        runtime_filter_projection: Some(runtime_filter_projection),
     };
     let mut fragments = src
         .fragments()
@@ -336,6 +347,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
+            runtime_filter_projection: None,
         },
     )
 }
@@ -381,15 +393,19 @@ pub(crate) fn encode_node_with_context(
         tuple_ids: src.tuple_ids.clone(),
         nullable_tuple_ids: src.nullable_tuple_ids.clone(),
         limit: src.limit,
-        build_runtime_filters: src
-            .build_runtime_filters
+        build_runtime_filters: ctx
+            .runtime_filter_projection
+            .map(|projection| projection.builds_for(src.fragment_id, src.node_id))
+            .unwrap_or_default()
             .iter()
-            .map(encode_bound_runtime_filter_build)
+            .map(encode_graph_runtime_filter_build)
             .collect::<Result<Vec<_>, _>>()?,
-        probe_runtime_filters: src
-            .probe_runtime_filters
+        probe_runtime_filters: ctx
+            .runtime_filter_projection
+            .map(|projection| projection.probes_for(src.fragment_id, src.node_id))
+            .unwrap_or_default()
             .iter()
-            .map(encode_bound_runtime_filter_probe)
+            .map(encode_graph_runtime_filter_probe)
             .collect::<Result<Vec<_>, _>>()?,
         children,
         payload: Some(payload),
@@ -761,8 +777,10 @@ fn encode_physical_node(
                 other_condition: node.other_condition.as_ref().map(encode_expr).transpose()?,
                 distribution: encode_join_distribution(&node.distribution),
                 execution_mode: node.execution_mode.map(encode_join_execution_mode),
-                build_runtime_filters: node
-                    .build_runtime_filters
+                build_runtime_filters: ctx
+                    .runtime_filter_projection
+                    .map(|projection| projection.builds_for_node(node_id))
+                    .unwrap_or_default()
                     .iter()
                     .map(|rf| {
                         Ok(plan::RuntimeFilterBuildIntent {
@@ -1189,26 +1207,26 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
     }
 }
 
-fn encode_bound_runtime_filter_build(
-    src: &BoundRuntimeFilterBuild,
+fn encode_graph_runtime_filter_build(
+    src: &GraphRuntimeFilterBuild,
 ) -> Result<plan::RuntimeFilterBuild, String> {
     Ok(plan::RuntimeFilterBuild {
-        filter_id: src.intent.filter_id,
-        build_expr: Some(encode_expr(&src.intent.build_expr)?),
-        probe_expr: Some(encode_expr(&src.intent.probe_expr)?),
-        expr_order: usize_to_u32(src.intent.expr_order)?,
-        execution_mode: encode_join_execution_mode(src.intent.execution_mode),
+        filter_id: src.filter_id,
+        build_expr: Some(encode_expr(&src.build_expr)?),
+        probe_expr: Some(encode_expr(&src.probe_expr)?),
+        expr_order: usize_to_u32(src.expr_order)?,
+        execution_mode: encode_join_execution_mode(src.execution_mode),
         source_fragment_id: src.source_fragment_id,
         target_fragment_ids: src.target_fragment_ids.clone(),
     })
 }
 
-fn encode_bound_runtime_filter_probe(
-    src: &BoundRuntimeFilterProbe,
+fn encode_graph_runtime_filter_probe(
+    src: &GraphRuntimeFilterProbe,
 ) -> Result<plan::RuntimeFilterProbe, String> {
     Ok(plan::RuntimeFilterProbe {
-        filter_id: src.intent.filter_id,
-        probe_expr: Some(encode_expr(&src.intent.probe_expr)?),
+        filter_id: src.filter_id,
+        probe_expr: Some(encode_expr(&src.probe_expr)?),
         source_fragment_id: src.source_fragment_id,
     })
 }
@@ -1224,6 +1242,7 @@ fn encode_table_def(src: &catalog::TableDef) -> Result<plan::TableDef, String> {
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
+            runtime_filter_projection: None,
         },
     )
 }
@@ -2575,8 +2594,6 @@ fn usize_to_u32(value: usize) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use arrow::datatypes::DataType;
 
     use super::*;
@@ -2586,19 +2603,9 @@ mod tests {
         ScanExecutionBindings,
     };
     use crate::proto::expr::expr;
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
-        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
-    };
-    use crate::sql::analysis::OutputColumn;
+    use crate::runtime_filter::model::contract::ChannelId;
+    use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::DataPartition;
@@ -2611,210 +2618,157 @@ mod tests {
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
     #[test]
-    fn nonempty_runtime_filter_graph_is_wire_neutral_and_bound_node_filters_still_encode() {
-        let source = two_fragment_stream_plan_for_test();
-        let mut source =
-            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&source);
-        let mut second_target = source.fragments()[1].clone();
-        second_target.fragment_id = 2;
-        second_target.root.fragment_id = 2;
-        second_target.root.node_id = 21;
-        // The clone inherits the root consumer's `Result` sink, but fragment 2 is
-        // a non-root fragment; seal only accepts a noop or Iceberg-write sink
-        // there. This fixture exists to exercise runtime-filter encoding, not
-        // sink placement, so give it a structurally valid noop sink.
-        second_target.sink = DataSink::Noop;
-        source.fragments_mut().push(second_target);
-        // CGO-9B/Task 2 seals a `TopologyContract` that rejects a plan with more
-        // than one non-write terminal fragment. Fragment 2 must therefore be an
-        // interior fragment, not a second disconnected terminal. Wire it into a
-        // linear chain fragment 1 -> fragment 2 -> fragment 0 so fragment 0 is the
-        // single execution anchor while fragment 2 stays in the plan (keeping the
-        // build filter's multi-fragment target `[0, 2]` meaningful for multi-target
-        // encoding coverage). Fragment 2 keeps its cloned exchange receiver
-        // (source_fragment_id 1, node 21) to consume fragment 1's stream; repoint
-        // fragment 0's receiver (node 20) to consume fragment 2's stream instead.
-        let DistributedNodeKind::Exchange(anchor_receiver) =
-            &mut source.fragments_mut()[1].root.payload
-        else {
-            panic!("fragment 0 root must be an exchange receiver");
-        };
-        anchor_receiver.source_fragment_id = 2;
-        // Retarget the original 1 -> 0 stream edge to 1 -> 2 (fragment 2's receiver
-        // node 21), then add the 2 -> 0 stream edge into fragment 0's receiver
-        // node 20. Both edges keep the base fixture's unpartitioned/gather shape and
-        // `[delta, old]` slot order.
-        source.edges_mut()[0].target_fragment_id = 2;
-        source.edges_mut()[0].target_exchange_node_id = 21;
-        source.edges_mut().push(FragmentEdge {
-            source_fragment_id: 2,
-            target_fragment_id: 0,
-            target_exchange_node_id: 20,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: vec![2, 1],
-        });
+    fn rfd_5a_graph_projection_encodes_native_runtime_filter_wire_fields() {
         let build_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(2),
-                qualifier: None,
-                column: "delta".to_string(),
+                column_id: ColumnId::new_for_test(1),
+                qualifier: Some("build".to_string()),
+                column: "k".to_string(),
             },
             data_type: DataType::Int64,
             nullable: false,
         };
         let probe_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(1),
-                qualifier: None,
-                column: "old".to_string(),
+                column_id: ColumnId::new_for_test(2),
+                qualifier: Some("probe".to_string()),
+                column: "k".to_string(),
             },
             data_type: DataType::Int64,
             nullable: false,
         };
-        source.fragments_mut()[0]
-            .root
-            .build_runtime_filters
-            .push(BoundRuntimeFilterBuild {
-                intent: RuntimeFilterBuildIntent {
-                    filter_id: 41,
-                    build_expr: build_expr.clone(),
-                    probe_expr: probe_expr.clone(),
-                    expr_order: 2,
-                    execution_mode: JoinExecutionMode::Partitioned,
-                },
-                source_fragment_id: 1,
-                target_fragment_ids: vec![0, 2],
-            });
-        source.fragments_mut()[0]
-            .root
-            .probe_runtime_filters
-            .push(BoundRuntimeFilterProbe {
-                intent: RuntimeFilterProbeIntent {
-                    filter_id: 41,
-                    probe_expr: probe_expr.clone(),
-                },
-                source_fragment_id: 1,
-            });
+        let build = GraphRuntimeFilterBuild {
+            filter_id: 7,
+            channel_id: ChannelId::new(7),
+            build_expr: build_expr.clone(),
+            probe_expr: probe_expr.clone(),
+            expr_order: 3,
+            execution_mode: JoinExecutionMode::Partitioned,
+            source_fragment_id: 4,
+            target_fragment_ids: vec![1, 2],
+        };
+        let probe = GraphRuntimeFilterProbe {
+            filter_id: 7,
+            channel_id: ChannelId::new(7),
+            probe_expr,
+            source_fragment_id: 4,
+        };
 
-        let empty_graph = source.seal().expect("seal empty graph fixture");
-        assert!(empty_graph.runtime_filter_graph().is_empty());
-        let encoded_empty = encode_distributed_plan(&empty_graph).expect("encode empty graph plan");
+        let encoded_build = encode_graph_runtime_filter_build(&build).expect("encode build");
+        let encoded_probe = encode_graph_runtime_filter_probe(&probe).expect("encode probe");
 
-        let mut nonempty_graph =
-            crate::sql::planner::distributed::test_support::draft_builder_from_plan(&empty_graph);
-        nonempty_graph
-            .runtime_filter_graph_mut()
-            .insert_channel(RuntimeFilterChannelSpec {
-                channel_id: ChannelId::new(1),
-                logical_domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
-                terminal_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
-                reduction_requirement: ReductionRequirement::SetUnion,
-                allowed_contribution_kinds: BTreeSet::from([
-                    ContributionKind::ValueDomainDelta,
-                    ContributionKind::ProducerClosed,
-                ]),
-                required_consumer_capabilities: BTreeSet::from([
-                    ArtifactCapability::Membership,
-                    ArtifactCapability::EmptyDomain,
-                ]),
-                policy: RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
-                    max_artifact_bytes: 4096,
-                    deadline_ms: 30_000,
-                    max_retries: 3,
-                },
-            })
-            .expect("insert channel");
-        nonempty_graph
-            .runtime_filter_graph_mut()
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: BindingId::new(1),
-                channel_id: ChannelId::new(1),
-                coverage_witness_id: Some(CoverageWitnessId::new(1)),
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(1),
-                    node_id: PlanNodeId::new(21),
-                },
-                expression: build_expr.clone(),
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                    contribution_kinds: BTreeSet::from([
-                        ContributionKind::ValueDomainDelta,
-                        ContributionKind::ProducerClosed,
-                    ]),
-                    completion_requirement: CompletionRequirement::ProducerClosed,
-                }),
-            })
-            .expect("insert producer binding");
-        nonempty_graph
-            .runtime_filter_graph_mut()
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: BindingId::new(2),
-                channel_id: ChannelId::new(1),
-                coverage_witness_id: None,
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(0),
-                    node_id: PlanNodeId::new(0),
-                },
-                expression: probe_expr.clone(),
-                apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-                    capabilities: BTreeSet::from([
-                        ArtifactCapability::Membership,
-                        ArtifactCapability::EmptyDomain,
-                    ]),
-                    activation: ConsumerActivation::BlockingSnapshot,
-                }),
-            })
-            .expect("insert consumer binding");
-        nonempty_graph
-            .runtime_filter_graph_mut()
-            .validate()
-            .expect("nonempty graph fixture must be structurally valid");
-        let nonempty_graph = nonempty_graph.seal().expect("seal nonempty graph fixture");
-        assert!(!nonempty_graph.runtime_filter_graph().is_empty());
-        // RFD-1 keeps the graph planner-only until RFD-5A/CGO-13 defines wire lowering.
-        let encoded_nonempty =
-            encode_distributed_plan(&nonempty_graph).expect("encode nonempty graph plan");
+        assert_eq!(encoded_build.filter_id, 7);
+        assert_eq!(encoded_build.expr_order, 3);
+        assert_eq!(encoded_build.source_fragment_id, 4);
+        assert_eq!(encoded_build.target_fragment_ids, vec![1, 2]);
+        assert!(encoded_build.build_expr.is_some());
+        assert!(encoded_build.probe_expr.is_some());
+        assert_eq!(encoded_probe.filter_id, 7);
+        assert_eq!(encoded_probe.source_fragment_id, 4);
+        assert!(encoded_probe.probe_expr.is_some());
+    }
 
-        assert_eq!(encoded_nonempty, encoded_empty);
-        let root = encoded_nonempty.fragments[0]
-            .root
-            .as_ref()
-            .expect("root node");
+    #[test]
+    fn populated_runtime_filter_graph_is_the_only_source_of_native_wire_filters() {
+        let probe_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(1),
+                qualifier: Some("probe".to_string()),
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let build_expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(2),
+                qualifier: Some("build".to_string()),
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let probe_output = vec![output_column(1, "probe", DataType::Int64)];
+        let build_output = vec![output_column(2, "build", DataType::Int64)];
+        let probe = crate::sql::planner::physical::PhysicalPlanNode {
+            kind: PhysicalPlanKind::Values(crate::sql::planner::payload::PlanValuesNode {
+                rows: Vec::new(),
+                columns: probe_output.clone(),
+            }),
+            children: Vec::new(),
+            output_columns: probe_output,
+            stats: stats(),
+            probe_runtime_filters: vec![RuntimeFilterProbeIntent {
+                filter_id: 41,
+                probe_expr: probe_expr.clone(),
+            }],
+        };
+        let build = crate::sql::planner::physical::PhysicalPlanNode {
+            kind: PhysicalPlanKind::Values(crate::sql::planner::payload::PlanValuesNode {
+                rows: Vec::new(),
+                columns: build_output.clone(),
+            }),
+            children: Vec::new(),
+            output_columns: build_output,
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let physical = crate::sql::planner::physical::PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashJoin(Box::new(
+                crate::sql::planner::physical::PhysicalHashJoinNode {
+                    join_type: JoinKind::Inner,
+                    eq_conditions: vec![
+                        crate::sql::planner::physical::PhysicalHashJoinEqCondition {
+                            left: probe_expr.clone(),
+                            right: build_expr.clone(),
+                            null_safe: false,
+                        },
+                    ],
+                    other_condition: None,
+                    distribution: JoinDistribution::Broadcast,
+                    execution_mode: Some(JoinExecutionMode::Broadcast),
+                    build_runtime_filters: vec![RuntimeFilterBuildIntent {
+                        filter_id: 41,
+                        build_expr,
+                        probe_expr,
+                        expr_order: 0,
+                        execution_mode: JoinExecutionMode::Broadcast,
+                    }],
+                    output_columns: vec![
+                        output_column(1, "probe", DataType::Int64),
+                        output_column(2, "build", DataType::Int64),
+                    ],
+                },
+            )),
+            children: vec![probe, build],
+            output_columns: vec![
+                output_column(1, "probe", DataType::Int64),
+                output_column(2, "build", DataType::Int64),
+            ],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let distributed =
+            crate::sql::planner::distributed::build::build_distributed_plan(&physical)
+                .expect("build Graph-owned RF plan");
+        assert_eq!(distributed.runtime_filter_graph().channel_count(), 1);
+        let encoded = encode_distributed_plan(&distributed).expect("encode Graph-owned RF plan");
+        let root = encoded.fragments[0].root.as_ref().expect("encoded root");
         assert_eq!(root.build_runtime_filters.len(), 1);
-        let encoded_build = &root.build_runtime_filters[0];
-        assert_eq!(encoded_build.filter_id, 41);
-        assert_eq!(
-            encoded_build.build_expr,
-            Some(encode_expr(&build_expr).expect("encode expected build expr"))
-        );
-        assert_eq!(
-            encoded_build.probe_expr,
-            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
-        );
-        assert_eq!(encoded_build.expr_order, 2);
-        assert_eq!(
-            encoded_build.execution_mode,
-            plan::JoinExecutionMode::Partitioned as i32
-        );
-        assert_eq!(encoded_build.source_fragment_id, 1);
-        assert_eq!(encoded_build.target_fragment_ids, vec![0, 2]);
-        assert_eq!(root.probe_runtime_filters.len(), 1);
-        let encoded_probe = &root.probe_runtime_filters[0];
-        assert_eq!(encoded_probe.filter_id, 41);
-        assert_eq!(
-            encoded_probe.probe_expr,
-            Some(encode_expr(&probe_expr).expect("encode expected probe expr"))
-        );
-        assert_eq!(encoded_probe.source_fragment_id, 1);
+        assert_eq!(root.build_runtime_filters[0].filter_id, 0);
+        assert_eq!(root.build_runtime_filters[0].expr_order, 0);
+        assert_eq!(root.children[0].probe_runtime_filters.len(), 1);
+        assert_eq!(root.children[0].probe_runtime_filters[0].filter_id, 0);
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
+        else {
+            panic!("expected physical HashJoin root");
+        };
+        let Some(plan::plan_node::Kind::HashJoin(join)) = physical.kind.as_ref() else {
+            panic!("expected HashJoin payload");
+        };
+        assert_eq!(join.build_runtime_filters.len(), 1);
+        assert_eq!(join.build_runtime_filters[0].filter_id, 0);
     }
 
     #[test]
@@ -2975,8 +2929,7 @@ mod tests {
                     tuple_ids: vec![1],
                     nullable_tuple_ids: Vec::new(),
                     limit: -1,
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                     children: vec![
                         DistributedNode {
                             node_id: 2,
@@ -2984,8 +2937,7 @@ mod tests {
                             tuple_ids: vec![2],
                             nullable_tuple_ids: Vec::new(),
                             limit: -1,
-                            build_runtime_filters: Vec::new(),
-                            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                             children: Vec::new(),
                             stats: stats(),
                             payload: DistributedNodeKind::Values(
@@ -3001,8 +2953,7 @@ mod tests {
                             tuple_ids: vec![3],
                             nullable_tuple_ids: Vec::new(),
                             limit: -1,
-                            build_runtime_filters: Vec::new(),
-                            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                             children: Vec::new(),
                             stats: stats(),
                             payload: DistributedNodeKind::Values(
@@ -3127,6 +3078,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect("encode prepared delta binding");
@@ -3214,6 +3166,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect("encode ordinary Iceberg binding");
@@ -3330,6 +3283,7 @@ mod tests {
                     node_outputs: None,
                     fragment_edge_outputs: None,
                     write_contracts: None,
+                    runtime_filter_projection: None,
                 },
             )
             .expect("encode refresh binding");
@@ -3402,6 +3356,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect_err("delta source without prepared binding must fail");
@@ -3421,6 +3376,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect_err("binding at another node id must not be reused");
@@ -3448,6 +3404,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect_err("delta source with file binding must fail");
@@ -3513,6 +3470,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
+                runtime_filter_projection: None,
             },
         )
         .expect("encode bound VARIANT scan");
@@ -3653,8 +3611,7 @@ mod tests {
                     tuple_ids: vec![10],
                     nullable_tuple_ids: Vec::new(),
                     limit: -1,
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                     children: Vec::new(),
                     stats: stats(),
                     payload: DistributedNodeKind::Scan(
@@ -3781,16 +3738,14 @@ mod tests {
             tuple_ids: vec![30],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![DistributedNode {
                 node_id: 29,
                 fragment_id: 0,
                 tuple_ids: vec![29],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Values(
@@ -3874,8 +3829,7 @@ mod tests {
             tuple_ids: vec![32],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![child],
             stats: stats(),
             payload: DistributedNodeKind::TopN(crate::sql::planner::physical::PhysicalTopNNode {
@@ -3922,8 +3876,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Values(crate::sql::planner::payload::PlanValuesNode {
@@ -3937,8 +3890,7 @@ mod tests {
             tuple_ids: vec![1, 2],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![
                 child(41, output_column(1, "l_k", DataType::Int64)),
                 child(42, output_column(2, "r_k", DataType::Int64)),
@@ -4016,8 +3968,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Values(crate::sql::planner::payload::PlanValuesNode {
@@ -4031,8 +3982,7 @@ mod tests {
             tuple_ids: vec![1, 2],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![
                 child(42, output_column(1, "l_k", DataType::Int64)),
                 child(43, output_column(2, "r_k", DataType::Int64)),
@@ -4106,16 +4056,14 @@ mod tests {
             tuple_ids: vec![1],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![DistributedNode {
                 node_id: 43,
                 fragment_id: 0,
                 tuple_ids: vec![1],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Values(
@@ -4179,16 +4127,14 @@ mod tests {
             tuple_ids: vec![1],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![DistributedNode {
                 node_id: 41,
                 fragment_id: 0,
                 tuple_ids: vec![1],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Values(
@@ -4257,8 +4203,7 @@ mod tests {
                         tuple_ids: vec![10],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
@@ -4284,8 +4229,7 @@ mod tests {
                         tuple_ids: vec![20],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -4336,8 +4280,7 @@ mod tests {
                         tuple_ids: vec![10],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
@@ -4363,8 +4306,7 @@ mod tests {
                         tuple_ids: vec![20],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -4409,8 +4351,7 @@ mod tests {
                         tuple_ids: vec![10],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Values(
@@ -4436,8 +4377,7 @@ mod tests {
                         tuple_ids: vec![20],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -4483,8 +4423,7 @@ mod tests {
                         tuple_ids: vec![10],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::GenerateSeries(
@@ -4514,8 +4453,7 @@ mod tests {
                         tuple_ids: vec![20],
                         nullable_tuple_ids: Vec::new(),
                         limit: -1,
-                        build_runtime_filters: Vec::new(),
-                        probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                         children: Vec::new(),
                         stats: stats(),
                         payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -4564,8 +4502,7 @@ mod tests {
                     tuple_ids: vec![10],
                     nullable_tuple_ids: Vec::new(),
                     limit: -1,
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
                     children: Vec::new(),
                     stats: stats(),
                     payload: DistributedNodeKind::Values(

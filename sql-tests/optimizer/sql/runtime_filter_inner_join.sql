@@ -28,10 +28,10 @@ INSERT INTO ${case_db}.rf_probe
 ANALYZE TABLE ${case_db}.customer_demographics;
 ANALYZE TABLE ${case_db}.rf_probe;
 
--- @explain_contains=build runtime filters:
--- @explain_contains=build_expr = (b.k)
--- @explain_contains=probe runtime filters:
--- @explain_contains=probe_expr = (p.k)
+-- @explain_contains=producer binding
+-- @explain_contains=expr = (b.k)
+-- @explain_contains=consumer binding
+-- @explain_contains=expr = (p.k)
 SELECT count(*)
 FROM ${case_db}.rf_probe p
 JOIN ${case_db}.customer_demographics b ON p.k = b.k;

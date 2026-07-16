@@ -30,15 +30,13 @@ use super::output::{
     build_write_contract_catalog,
 };
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
-use super::validation::{self, DistributedPlanValidationError};
+use super::validation::{self, DistributedPlanValidationError, RuntimeFilterPlanValidationError};
 
 #[derive(Clone, Debug)]
 struct DistributedPlanData {
     fragments: Vec<PlanFragment>,
     root_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
-    // RFD-5A will populate and consume this slot; remove the allowance at that cutover.
-    #[allow(dead_code)]
     runtime_filter_graph: RuntimeFilterGraph,
     // Authoritative boundary membership catalog derived at seal time.
     boundaries: BoundaryCatalog,
@@ -129,6 +127,7 @@ pub(in crate::sql::planner::distributed) enum DistributedPlanSealError {
     RootFragmentNotFound { root_fragment_id: FragmentId },
     Structural(DistributedPlanValidationError),
     RuntimeFilterGraph(GraphValidationError),
+    RuntimeFilterPlan(RuntimeFilterPlanValidationError),
     Boundary(BoundaryError),
     Topology(TopologyError),
     NodeOutput(NodeOutputError),
@@ -148,6 +147,7 @@ impl fmt::Display for DistributedPlanSealError {
             ),
             Self::Structural(error) => error.fmt(formatter),
             Self::RuntimeFilterGraph(error) => error.fmt(formatter),
+            Self::RuntimeFilterPlan(error) => error.fmt(formatter),
             Self::Boundary(error) => error.fmt(formatter),
             Self::Topology(error) => error.fmt(formatter),
             Self::NodeOutput(error) => error.fmt(formatter),
@@ -186,13 +186,13 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
     // the runtime-filter graph check.
     let topology = build_topology_contract(&fragments, root_fragment_id, &edges)
         .map_err(DistributedPlanSealError::Topology)?;
-    // RFD-1 read-only structural validation of the runtime filter graph, run after
-    // non-RF structural validation and before immutable construction. The graph is
-    // validated here, never populated; CGO-9A stays agnostic to whether nodes still
-    // carry build/probe runtime filters (RFD-5A owns population and exact binding).
+    // Validate the query-global graph first, then its bidirectional ownership
+    // relation with the distributed nodes. No node carries a semantic RF DTO.
     runtime_filter_graph
         .validate()
         .map_err(DistributedPlanSealError::RuntimeFilterGraph)?;
+    validation::validate_runtime_filter_graph_against_plan(&runtime_filter_graph, &fragments)
+        .map_err(DistributedPlanSealError::RuntimeFilterPlan)?;
     // Finalize logical boundary membership and occurrence identity. This only
     // derives from the now known-valid fragments/edges/sinks; it fails fast on
     // any unresolved column reference and never repairs or guesses. The final
@@ -265,8 +265,7 @@ pub(super) mod test_support {
                     tuple_ids: Vec::new(),
                     nullable_tuple_ids: Vec::new(),
                     limit: -1,
-                    build_runtime_filters: Vec::new(),
-                    probe_runtime_filters: Vec::new(),
+                    runtime_filter_binding_ids: Vec::new(),
                     children: Vec::new(),
                     stats: PhysicalPlanStats {
                         output_row_count: 0.0,
@@ -318,8 +317,7 @@ mod tests {
     use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
-    use crate::sql::planner::distributed::runtime_filter::BoundRuntimeFilterProbe;
-    use crate::sql::planner::physical::runtime_filter::RuntimeFilterProbeIntent;
+    use crate::sql::planner::distributed::validation::RuntimeFilterPlanValidationError;
 
     use super::{DistributedPlanSealError, seal_draft};
 
@@ -397,7 +395,7 @@ mod tests {
             coverage_witness_id: None,
             location: PlanLocation {
                 fragment_id: PlanFragmentId::new(0),
-                node_id: PlanNodeId::new(2),
+                node_id: PlanNodeId::new(1),
             },
             expression: expression(),
             apply_point: ApplyPoint::NodeInput,
@@ -511,6 +509,8 @@ mod tests {
     fn seal_validates_and_accepts_a_valid_non_empty_runtime_filter_graph() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
         draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.fragments[0].root.runtime_filter_binding_ids =
+            vec![BindingId::new(1), BindingId::new(2)];
 
         let plan =
             seal_draft(draft).expect("a structurally valid non-empty graph must seal successfully");
@@ -552,28 +552,63 @@ mod tests {
     }
 
     #[test]
-    fn seal_is_agnostic_to_node_carried_runtime_filters() {
-        // Transitional form: plan nodes still carry build/probe runtime filters
-        // while the top-level graph is empty. The CGO-9A seal must not read,
-        // require, or freeze that node-carried shape; it seals fine and does not
-        // require the graph to be populated to mirror them (RFD-5A owns that).
+    fn seal_rejects_a_graph_binding_that_is_not_attached_to_its_node() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
-        draft.fragments[0]
-            .root
-            .probe_runtime_filters
-            .push(BoundRuntimeFilterProbe {
-                intent: RuntimeFilterProbeIntent {
-                    filter_id: 1,
-                    probe_expr: expression(),
-                },
-                source_fragment_id: 0,
-            });
-        assert!(draft.runtime_filter_graph.is_empty());
+        draft.runtime_filter_graph = valid_non_empty_graph();
 
-        let plan = seal_draft(draft)
-            .expect("node-carried runtime filters must not block sealing with an empty graph");
+        let error = seal_draft(draft).expect_err("unattached graph bindings must fail sealing");
 
-        assert!(plan.runtime_filter_graph().is_empty());
-        assert_eq!(plan.fragments()[0].root.probe_runtime_filters.len(), 1);
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::RuntimeFilterPlan(
+                RuntimeFilterPlanValidationError::BindingNotAttached(binding_id)
+            ) if binding_id == BindingId::new(1)
+        ));
+    }
+
+    #[test]
+    fn seal_rejects_an_attached_binding_with_a_mismatched_location() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.fragments[0].root.runtime_filter_binding_ids =
+            vec![BindingId::new(1), BindingId::new(2)];
+        draft
+            .runtime_filter_graph
+            .binding_mut_for_test(BindingId::new(2))
+            .expect("consumer binding")
+            .location
+            .node_id = PlanNodeId::new(99);
+
+        let error = seal_draft(draft).expect_err("location mismatch must fail sealing");
+
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::RuntimeFilterPlan(
+                RuntimeFilterPlanValidationError::BindingLocationMismatch(binding_id)
+            ) if binding_id == BindingId::new(2)
+        ));
+    }
+
+    #[test]
+    fn seal_rejects_a_binding_expression_type_that_disagrees_with_its_channel() {
+        let mut draft = super::test_support::single_fragment_draft(Some(0));
+        draft.runtime_filter_graph = valid_non_empty_graph();
+        draft.fragments[0].root.runtime_filter_binding_ids =
+            vec![BindingId::new(1), BindingId::new(2)];
+        draft
+            .runtime_filter_graph
+            .binding_mut_for_test(BindingId::new(2))
+            .expect("consumer binding")
+            .expression
+            .data_type = DataType::Utf8;
+
+        let error = seal_draft(draft).expect_err("type mismatch must fail sealing");
+
+        assert!(matches!(
+            error,
+            DistributedPlanSealError::RuntimeFilterPlan(
+                RuntimeFilterPlanValidationError::ExpressionTypeMismatch(binding_id)
+            ) if binding_id == BindingId::new(2)
+        ));
     }
 }

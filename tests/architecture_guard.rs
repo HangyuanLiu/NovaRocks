@@ -7035,8 +7035,11 @@ fn planner_distributed_build_has_pass_owners() {
         ("lower_fragment_local_node", &lowering_path),
         ("distributed_node_ordering", &lowering_path),
         ("record", &runtime_filter_binding_path),
-        ("bind_runtime_filters", &runtime_filter_binding_path),
-        ("attach_runtime_filters", &runtime_filter_binding_path),
+        (
+            "populate_runtime_filter_graph",
+            &runtime_filter_binding_path,
+        ),
+        ("attach_binding_ids", &runtime_filter_binding_path),
     ] {
         let declarations = rust_named_declaration_owners(
             &planner_sources,
@@ -7378,7 +7381,11 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         ),
         (
             &distributed_owner,
-            &["BoundRuntimeFilterBuild", "BoundRuntimeFilterProbe"][..],
+            &[
+                "GraphRuntimeFilterBuild",
+                "GraphRuntimeFilterProbe",
+                "RuntimeFilterGraphProjection",
+            ][..],
         ),
         (&codegen_owner, &["PlannedRuntimeFilter"][..]),
     ] {
@@ -7401,8 +7408,9 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let lifecycle_items = BTreeSet::from([
         "RuntimeFilterBuildIntent",
         "RuntimeFilterProbeIntent",
-        "BoundRuntimeFilterBuild",
-        "BoundRuntimeFilterProbe",
+        "GraphRuntimeFilterBuild",
+        "GraphRuntimeFilterProbe",
+        "RuntimeFilterGraphProjection",
         "PlannedRuntimeFilter",
     ]);
     for path in rs_files(&src_dir()) {
@@ -7446,13 +7454,11 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     );
     let distributed_uses = rust_production_use_statements(&distributed_mod);
     assert!(
-        !distributed_uses.iter().any(|import| {
-            matches!(
-                rust_use_path(import).split("::").last(),
-                Some("BoundRuntimeFilterBuild" | "BoundRuntimeFilterProbe")
-            )
-        }),
-        "distributed/mod.rs must not flat re-export bound runtime-filter types: {distributed_uses:?}"
+        !distributed_uses.iter().any(|import| rust_use_path(import)
+            .split("::")
+            .last()
+            .is_some_and(|item| lifecycle_items.contains(item))),
+        "distributed/mod.rs must not flat re-export runtime-filter projection types: {distributed_uses:?}"
     );
 
     let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/mod.rs")).unwrap();
@@ -7461,55 +7467,45 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         "codegen/fragment/mod.rs must declare its Planned runtime-filter owner"
     );
 
-    let distributed_text = fs::read_to_string(&distributed_owner).unwrap();
-    for (bound, intent_type) in [
-        ("BoundRuntimeFilterBuild", "RuntimeFilterBuildIntent"),
-        ("BoundRuntimeFilterProbe", "RuntimeFilterProbeIntent"),
-    ] {
-        let header = format!("pub(crate) struct {bound} {{");
-        let fields = nidl_e4_struct_code_span(&distributed_text, &header)
-            .unwrap_or_else(|| panic!("missing distributed runtime-filter struct {bound}"))
-            .into_iter()
-            .map(|(_, line)| line)
-            .collect::<Vec<_>>();
-        assert!(
-            fields
-                .iter()
-                .any(|line| line == &format!("pub intent: {intent_type},")),
-            "{bound} must compose its physical intent: {fields:?}"
-        );
-        for duplicated in [
-            "filter_id",
-            "build_expr",
-            "probe_expr",
-            "expr_order",
-            "execution_mode",
-        ] {
-            assert!(
-                !fields
-                    .iter()
-                    .any(|line| line.starts_with(&format!("pub {duplicated}:"))),
-                "{bound} must not redeclare physical intent field {duplicated}: {fields:?}"
-            );
-        }
-    }
-
     let builder_path = planner.join("distributed/build/runtime_filter_binding.rs");
     let builder_text = fs::read_to_string(&builder_path).unwrap();
     assert!(
         nidl_e4_function_signature_contains(
             &builder_text,
-            "bind_runtime_filters",
-            "bindings: RuntimeFilterBindings"
+            "populate_runtime_filter_graph",
+            "graph: &mut RuntimeFilterGraph"
         ),
-        "runtime_filter_binding::bind_runtime_filters must consume owned RuntimeFilterBindings"
+        "runtime_filter_binding::populate_runtime_filter_graph must populate the query-global graph"
     );
     let builder_production = rust_sanitized_production_text(&builder_text);
     assert!(
-        builder_production.contains("for build in bindings.builds {")
-            && builder_production.contains("for probe in bindings.probes {"),
-        "runtime_filter_binding::bind_runtime_filters must consume both owned binding Vecs"
+        builder_production.contains("insert_channel")
+            && builder_production.contains("insert_binding")
+            && builder_production.contains("runtime_filter_binding_ids"),
+        "runtime-filter population must write only Graph contracts plus node BindingIds"
     );
+    for forbidden in ["BoundRuntimeFilterBuild", "BoundRuntimeFilterProbe"] {
+        assert!(
+            !rs_files(&src_dir())
+                .iter()
+                .any(
+                    |path| rust_sanitized_production_text(&fs::read_to_string(path).unwrap())
+                        .contains(forbidden)
+                ),
+            "retired node-carried runtime-filter DTO `{forbidden}` must not return"
+        );
+    }
+    let node_text = fs::read_to_string(planner.join("distributed/node.rs")).unwrap();
+    assert!(
+        node_text.contains("pub runtime_filter_binding_ids: Vec<BindingId>"),
+        "DistributedNode must carry only runtime-filter BindingIds"
+    );
+    for forbidden in ["pub build_runtime_filters", "pub probe_runtime_filters"] {
+        assert!(
+            !rust_sanitized_production_text(&node_text).contains(forbidden),
+            "DistributedNode must not restore semantic RF field `{forbidden}`"
+        );
+    }
 }
 
 fn runtime_filter_dependency_path(canonical: &[String], source_rel: &str) -> Vec<String> {
@@ -7653,7 +7649,10 @@ fn runtime_filter_path_is_allowlisted(canonical: &[String], allowed_prefixes: &[
 fn runtime_filter_model_dependency_violations(source_rel: &str, text: &str) -> Vec<String> {
     let allowed_prefixes: &[&[&str]] = match source_rel {
         "src/runtime_filter/model/mod.rs" => &[],
-        "src/runtime_filter/model/contract.rs" => &[&["arrow", "datatypes", "DataType"]],
+        "src/runtime_filter/model/contract.rs" => &[
+            &["arrow", "datatypes", "DataType"],
+            &["std", "num", "NonZeroU32"],
+        ],
         "src/runtime_filter/model/coverage.rs" => &[
             &["std", "collections", "BTreeSet"],
             &["crate", "runtime_filter", "model", "contract"],
@@ -9804,17 +9803,12 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     assert!(!contract_text.contains("crate::sql"));
     assert!(!graph_text.contains("crate::sql::planner"));
     assert!(fragment_text.contains("runtime_filter_graph: RuntimeFilterGraph"));
-    // The staged graph slot moved from the draft (fragment.rs) into the sealed
-    // `DistributedPlanData` (seal.rs) when distributed plans became sealed at
-    // construction. The draft field is consumed (and, since CGO-9A Task 4,
-    // validated) by `seal_draft`, so it is live and carries no allowance; the
-    // sealed field is only read through the test-only accessor, so it keeps the
-    // documented, removable dead_code allowance for RFD-5A to retire at cutover.
+    // RFD-5A makes the sealed graph a production semantic owner consumed by
+    // codegen and EXPLAIN, so neither the draft nor sealed field may retain the
+    // former staged dead-code allowance.
     assert!(
-        seal_source.contains("RFD-5A")
-            && seal_source
-                .contains("#[allow(dead_code)]\n    runtime_filter_graph: RuntimeFilterGraph"),
-        "the sealed DistributedPlan staged graph slot needs a field-local dead_code allowance"
+        !seal_source.contains("#[allow(dead_code)]\n    runtime_filter_graph: RuntimeFilterGraph"),
+        "the live sealed RuntimeFilterGraph field must not retain a dead_code allowance"
     );
     assert!(!proto_text.contains("runtime_filter_graph"));
 
@@ -9985,6 +9979,11 @@ fn runtime_filter_model_dependency_allowlist_rejects_forbidden_synthetic_imports
     assert!(
         runtime_filter_model_dependency_violations(source_rel, "use arrow::datatypes::DataType;")
             .is_empty()
+    );
+    assert!(
+        runtime_filter_model_dependency_violations(source_rel, "use std::num::NonZeroU32;")
+            .is_empty(),
+        "contract vocabulary may use NonZeroU32 to make zero-valued requirements unrepresentable"
     );
     assert!(
         runtime_filter_model_dependency_violations(
@@ -16820,22 +16819,26 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
     for (symbol, expected_owner) in [
         (
-            "BoundRuntimeFilterBuild",
+            "GraphRuntimeFilterBuild",
             "src/sql/planner/distributed/runtime_filter.rs",
         ),
         (
-            "BoundRuntimeFilterProbe",
+            "GraphRuntimeFilterProbe",
             "src/sql/planner/distributed/runtime_filter.rs",
         ),
         (
-            "bind_runtime_filters",
+            "RuntimeFilterGraphProjection",
+            "src/sql/planner/distributed/runtime_filter.rs",
+        ),
+        (
+            "populate_runtime_filter_graph",
             "src/sql/planner/distributed/build/runtime_filter_binding.rs",
         ),
     ] {
         let declarations = sql_sources
             .iter()
             .filter_map(|(source, text)| {
-                let count = if symbol == "bind_runtime_filters" {
+                let count = if symbol == "populate_runtime_filter_graph" {
                     rust_named_function_declaration_count(text, symbol)
                 } else {
                     rust_named_type_declaration_count(text, symbol)

@@ -27,6 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use crate::runtime_filter::model::contract::{
+    BindingId, PlanFragmentId, PlanNodeId, RuntimeFilterLogicalDomain,
+};
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -50,6 +54,160 @@ impl fmt::Display for DistributedPlanValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::sql::planner::distributed) enum RuntimeFilterPlanValidationError {
+    UnknownFragment(PlanFragmentId),
+    UnknownNode {
+        fragment_id: PlanFragmentId,
+        node_id: PlanNodeId,
+    },
+    BindingNotAttached(BindingId),
+    AttachedBindingUnknown(BindingId),
+    BindingLocationMismatch(BindingId),
+    ExpressionTypeMismatch(BindingId),
+    DuplicateNodeBinding(BindingId),
+}
+
+impl fmt::Display for RuntimeFilterPlanValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownFragment(fragment_id) => write!(
+                formatter,
+                "runtime filter binding references unknown fragment id={}",
+                fragment_id.get()
+            ),
+            Self::UnknownNode {
+                fragment_id,
+                node_id,
+            } => write!(
+                formatter,
+                "runtime filter binding references unknown node id={} in fragment id={}",
+                node_id.get(),
+                fragment_id.get()
+            ),
+            Self::BindingNotAttached(binding_id) => write!(
+                formatter,
+                "runtime filter binding id={} is not attached to its plan node",
+                binding_id.get()
+            ),
+            Self::AttachedBindingUnknown(binding_id) => write!(
+                formatter,
+                "plan node references unknown runtime filter binding id={}",
+                binding_id.get()
+            ),
+            Self::BindingLocationMismatch(binding_id) => write!(
+                formatter,
+                "runtime filter binding id={} is attached outside its declared location",
+                binding_id.get()
+            ),
+            Self::ExpressionTypeMismatch(binding_id) => write!(
+                formatter,
+                "runtime filter binding id={} expression type does not match its channel domain",
+                binding_id.get()
+            ),
+            Self::DuplicateNodeBinding(binding_id) => write!(
+                formatter,
+                "runtime filter binding id={} is attached more than once",
+                binding_id.get()
+            ),
+        }
+    }
+}
+
+pub(in crate::sql::planner::distributed) fn validate_runtime_filter_graph_against_plan(
+    graph: &RuntimeFilterGraph,
+    fragments: &[PlanFragment],
+) -> Result<(), RuntimeFilterPlanValidationError> {
+    let fragments_by_id = fragments
+        .iter()
+        .map(|fragment| (fragment.fragment_id, fragment))
+        .collect::<BTreeMap<_, _>>();
+    let mut attachments = BTreeMap::<BindingId, (FragmentId, i32)>::new();
+
+    fn collect_attachments(
+        node: &DistributedNode,
+        fragment_id: FragmentId,
+        attachments: &mut BTreeMap<BindingId, (FragmentId, i32)>,
+    ) -> Result<(), RuntimeFilterPlanValidationError> {
+        let mut local = BTreeSet::new();
+        for binding_id in &node.runtime_filter_binding_ids {
+            if !local.insert(*binding_id) || attachments.contains_key(binding_id) {
+                return Err(RuntimeFilterPlanValidationError::DuplicateNodeBinding(
+                    *binding_id,
+                ));
+            }
+            attachments.insert(*binding_id, (fragment_id, node.node_id));
+        }
+        for child in &node.children {
+            collect_attachments(child, fragment_id, attachments)?;
+        }
+        Ok(())
+    }
+
+    for fragment in fragments {
+        collect_attachments(&fragment.root, fragment.fragment_id, &mut attachments)?;
+    }
+
+    for (binding_id, (fragment_id, node_id)) in &attachments {
+        let Some(binding) = graph.binding(*binding_id) else {
+            return Err(RuntimeFilterPlanValidationError::AttachedBindingUnknown(
+                *binding_id,
+            ));
+        };
+        if binding.location.fragment_id.get() != *fragment_id
+            || binding.location.node_id.get() != *node_id
+        {
+            return Err(RuntimeFilterPlanValidationError::BindingLocationMismatch(
+                *binding_id,
+            ));
+        }
+    }
+
+    for binding in graph.bindings() {
+        let fragment_id = binding.location.fragment_id.get();
+        let Some(fragment) = fragments_by_id.get(&fragment_id) else {
+            return Err(RuntimeFilterPlanValidationError::UnknownFragment(
+                binding.location.fragment_id,
+            ));
+        };
+        fn contains_node(node: &DistributedNode, node_id: i32) -> bool {
+            node.node_id == node_id
+                || node
+                    .children
+                    .iter()
+                    .any(|child| contains_node(child, node_id))
+        }
+        if !contains_node(&fragment.root, binding.location.node_id.get()) {
+            return Err(RuntimeFilterPlanValidationError::UnknownNode {
+                fragment_id: binding.location.fragment_id,
+                node_id: binding.location.node_id,
+            });
+        }
+        if !attachments.contains_key(&binding.binding_id) {
+            return Err(RuntimeFilterPlanValidationError::BindingNotAttached(
+                binding.binding_id,
+            ));
+        }
+        let channel = graph
+            .channel(binding.channel_id)
+            .expect("structural graph validation guarantees channel ownership");
+        let type_matches = match &channel.logical_domain {
+            RuntimeFilterLogicalDomain::Membership { value_type, .. } => {
+                value_type == &binding.expression.data_type
+            }
+            RuntimeFilterLogicalDomain::OrderedBound(order) => {
+                order.keys.len() == 1 && order.keys[0].data_type == binding.expression.data_type
+            }
+        };
+        if !type_matches {
+            return Err(RuntimeFilterPlanValidationError::ExpressionTypeMismatch(
+                binding.binding_id,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Enforce the distributed-plan structural invariants over a draft's fragments,
@@ -808,8 +966,7 @@ mod tests {
             tuple_ids: vec![node_id],
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             stats: stats(),
             payload: DistributedNodeKind::Values(PlanValuesNode {
@@ -843,8 +1000,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -948,8 +1104,7 @@ mod tests {
                 tuple_ids: vec![exchange_node_id],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Exchange(ExchangeReceiver {
@@ -1003,8 +1158,7 @@ mod tests {
                 tuple_ids: Vec::new(),
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: stats(),
                 payload: DistributedNodeKind::Values(PlanValuesNode {

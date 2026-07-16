@@ -61,8 +61,8 @@ WHERE b.flag = 'Y';
 
 SET disable_optimizer_rules = '';
 -- @explain_contains=HASH JOIN (PARTITIONED
--- @explain_contains=build runtime filters:
--- @explain_contains=probe runtime filters:
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT 'rf_on' AS mode, COUNT(*) AS row_count, COALESCE(SUM(p.payload), 0) AS payload_sum
 FROM ${case_db}.rf_dist_lc_probe p
 JOIN ${case_db}.rf_dist_lc_build b ON p.status = b.status

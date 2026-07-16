@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
@@ -27,7 +28,6 @@ use crate::sql::optimizer::optimized_tree::{
 };
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::Statistics;
-use crate::sql::planner::distributed::DistributedNode;
 use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 use crate::sql::planner::payload::{PlanSortNode, PlanValuesNode};
 use crate::sql::planner::physical::{
@@ -147,14 +147,6 @@ fn physical_sort_node(
 
 fn plan_snapshot(plan: &PhysicalPlanNode) -> String {
     format!("{plan:#?}")
-}
-
-fn has_build_rf(node: &DistributedNode) -> bool {
-    !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_rf)
-}
-
-fn has_probe_rf(node: &DistributedNode) -> bool {
-    !node.probe_runtime_filters.is_empty() || node.children.iter().any(has_probe_rf)
 }
 
 fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizedOperatorNode {
@@ -282,15 +274,17 @@ fn pipeline_places_runtime_filters_before_distributed_build() {
     let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimizer)
         .expect("convert optimizer physical plan");
     let distributed = build_distributed_plan(physical).expect("build DistributedPlan");
-    let root = &distributed.fragments()[distributed.root_fragment_id() as usize].root;
+    let graph = distributed.runtime_filter_graph();
 
     assert!(
-        has_build_rf(root),
-        "distributed plan should contain build RF"
+        graph
+            .bindings()
+            .any(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
     );
     assert!(
-        has_probe_rf(root),
-        "distributed plan should contain probe RF"
+        graph
+            .bindings()
+            .any(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
     );
 }
 

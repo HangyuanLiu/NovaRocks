@@ -33,7 +33,11 @@ pub(in crate::sql::planner::distributed) fn build_distributed_plan_draft(
     plan: &PhysicalPlanNode,
 ) -> Result<DistributedPlanDraft, String> {
     let mut cut = fragment_cut::cut(plan)?;
-    runtime_filter_binding::bind_runtime_filters(&mut cut.plan.fragments, cut.bindings);
+    runtime_filter_binding::populate_runtime_filter_graph(
+        &mut cut.plan.fragments,
+        &mut cut.plan.runtime_filter_graph,
+        &cut.bindings,
+    )?;
     Ok(cut.plan)
 }
 

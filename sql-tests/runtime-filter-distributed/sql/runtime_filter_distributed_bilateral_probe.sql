@@ -116,9 +116,10 @@ SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- and must appear as a probe on both t1's scan AND t2's scan below.
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=HASH_PARTITIONED (k)
--- @explain_contains=filter_id = 1, build_expr = (t3.k)
--- @explain_contains=filter_id = 1, probe_expr = (t1.k)
--- @explain_contains=filter_id = 1, probe_expr = (t2.k)
+-- @explain_contains=runtime filter channel 1
+-- @explain_contains=expr = (t3.k)
+-- @explain_contains=expr = (t1.k)
+-- @explain_contains=expr = (t2.k)
 SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,
        COALESCE(SUM(t1.v), 0) AS t1_sum, COALESCE(SUM(t2.v), 0) AS t2_sum
 FROM ${case_db}.rf_dist_bi_t1 t1
