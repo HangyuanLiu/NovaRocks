@@ -9813,7 +9813,7 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
                     "IcebergFilePruningMetadata"
                 ) | ("src/connector/iceberg/scan_planner.rs", "IcebergSplit")
                     | ("src/engine/catalog.rs", "DatabaseDef")
-                    | ("src/sql/codegen/fragment/build.rs", "PlannedIcebergFiles")
+                    | ("src/protocol/native/encode/build.rs", "PlannedIcebergFiles")
             );
             let tuple_wrapper = fields.iter().any(|field| field.ident.is_none());
             let named_wrapper = fields.iter().any(|field| {
