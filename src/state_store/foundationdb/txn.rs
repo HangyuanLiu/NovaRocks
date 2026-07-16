@@ -513,13 +513,13 @@ fn classify_commit_error(error: FdbError) -> CommitOutcome {
             StateStoreErrorKind::Conflict,
             "FoundationDB transaction conflicted",
         ))
-    } else if error.is_maybe_committed() || error.code() == 1031 {
+    } else if error.is_retryable_not_committed() {
+        CommitOutcome::TransientBeforeCommit(provider_error())
+    } else {
         CommitOutcome::CommitUnknown(StateStoreError::new(
             StateStoreErrorKind::Transient,
             "FoundationDB transaction commit outcome is unknown",
         ))
-    } else {
-        CommitOutcome::TransientBeforeCommit(provider_error())
     }
 }
 
@@ -771,5 +771,35 @@ mod tests {
                 .kind(),
             StateStoreErrorKind::PreconditionFailed
         );
+    }
+
+    #[test]
+    fn post_dispatch_commit_errors_fail_closed_unless_known_not_committed() {
+        assert!(matches!(
+            classify_commit_error(FdbError::from_code(1020)),
+            CommitOutcome::Conflict(_)
+        ));
+
+        let retryable_not_committed = FdbError::from_code(1007);
+        assert!(retryable_not_committed.is_retryable_not_committed());
+        assert!(matches!(
+            classify_commit_error(retryable_not_committed),
+            CommitOutcome::TransientBeforeCommit(_)
+        ));
+
+        let maybe_committed = FdbError::from_code(1021);
+        assert!(maybe_committed.is_maybe_committed());
+        assert!(matches!(
+            classify_commit_error(maybe_committed),
+            CommitOutcome::CommitUnknown(_)
+        ));
+        assert!(matches!(
+            classify_commit_error(FdbError::from_code(1031)),
+            CommitOutcome::CommitUnknown(_)
+        ));
+        assert!(matches!(
+            classify_commit_error(FdbError::from_code(9999)),
+            CommitOutcome::CommitUnknown(_)
+        ));
     }
 }

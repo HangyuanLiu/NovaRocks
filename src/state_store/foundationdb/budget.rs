@@ -80,7 +80,7 @@ impl TransactionBudget {
 
     pub(super) fn charge_get_conflict(&mut self, key_len: usize) -> Result<(), StateStoreError> {
         let physical_key = checked_add(checked_add(self.root_len, RECORD_TAG_BYTES)?, key_len)?;
-        self.charge_bytes(checked_mul(physical_key, 2)?)
+        self.charge_bytes(exact_conflict_bytes(physical_key)?)
     }
 
     pub(super) fn charge_range_conflict(
@@ -132,14 +132,14 @@ fn fixed_envelope_bytes(root_len: usize) -> Result<usize, StateStoreError> {
     // Reservation read/write plus exact read/write conflict endpoints.
     bytes = checked_add(bytes, commit_key)?;
     bytes = checked_add(bytes, PENDING_VALUE_BYTES)?;
-    bytes = checked_add(bytes, checked_mul(commit_key, 4)?)?;
+    bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(commit_key)?, 2)?)?;
     // Data transaction terminal state and versionstamped high-watermark mutations.
     bytes = checked_add(bytes, commit_key)?;
     bytes = checked_add(bytes, COMMITTED_VALUE_OPERAND_BYTES)?;
-    bytes = checked_add(bytes, checked_mul(commit_key, 2)?)?;
+    bytes = checked_add(bytes, exact_conflict_bytes(commit_key)?)?;
     bytes = checked_add(bytes, high_watermark_key)?;
     bytes = checked_add(bytes, HIGH_WATERMARK_OPERAND_BYTES)?;
-    bytes = checked_add(bytes, checked_mul(high_watermark_key, 2)?)?;
+    bytes = checked_add(bytes, exact_conflict_bytes(high_watermark_key)?)?;
     Ok(bytes)
 }
 
@@ -161,7 +161,7 @@ fn accounted_put_bytes(
     bytes = checked_add(bytes, change_key_operand)?;
     bytes = checked_add(bytes, key_len)?;
     // Non-snapshot precondition read and ordinary set exact conflicts.
-    bytes = checked_add(bytes, checked_mul(record_key, 4)?)?;
+    bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(record_key)?, 2)?)?;
     Ok(bytes)
 }
 
@@ -179,7 +179,7 @@ fn accounted_delete_bytes(
     bytes = checked_add(bytes, record_key)?;
     bytes = checked_add(bytes, change_key_operand)?;
     bytes = checked_add(bytes, key_len)?;
-    bytes = checked_add(bytes, checked_mul(record_key, 4)?)?;
+    bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(record_key)?, 2)?)?;
     Ok(bytes)
 }
 
@@ -205,6 +205,10 @@ fn checked_add(left: usize, right: usize) -> Result<usize, StateStoreError> {
 fn checked_mul(left: usize, right: usize) -> Result<usize, StateStoreError> {
     left.checked_mul(right)
         .ok_or_else(|| limit_error("transaction byte limit exceeded"))
+}
+
+fn exact_conflict_bytes(key_len: usize) -> Result<usize, StateStoreError> {
+    checked_add(checked_mul(key_len, 2)?, 1)
 }
 
 fn limit_error(message: &'static str) -> StateStoreError {
@@ -235,6 +239,86 @@ mod tests {
         let bytes = accounted_put_bytes(22, 3, 5, &precondition).expect("put accounting");
         assert!(bytes > 3 + 5 + b"persisted-version".len());
         assert!(fixed_envelope_bytes(22).expect("fixed accounting") > 0);
+    }
+
+    #[test]
+    fn foundationdb_budget_counts_exact_point_conflict_endpoints() {
+        let root_len = 22;
+        let key_len = 3;
+        let value_len = 5;
+        let physical_key_len = root_len + RECORD_TAG_BYTES + key_len;
+
+        assert_eq!(
+            fixed_envelope_bytes(root_len).expect("fixed accounting"),
+            434
+        );
+        assert_eq!(
+            accounted_put_bytes(root_len, key_len, value_len, &Precondition::Any)
+                .expect("put accounting"),
+            208
+        );
+        assert_eq!(
+            accounted_delete_bytes(root_len, key_len, &Precondition::Any)
+                .expect("delete accounting"),
+            181
+        );
+
+        let fixed = fixed_envelope_bytes(root_len).expect("fixed accounting");
+        let mut budget =
+            TransactionBudget::new(limits(fixed + 2 * physical_key_len + 1, 1), root_len)
+                .expect("exact get budget");
+        budget
+            .charge_get_conflict(key_len)
+            .expect("exact point read conflict fits");
+        assert_eq!(budget.accounted_bytes(), fixed + 2 * physical_key_len + 1);
+    }
+
+    #[test]
+    fn foundationdb_budget_rejects_one_byte_below_each_exact_boundary() {
+        let root_len = 22;
+        let key = b"key";
+        let value = b"value";
+        let fixed = 434;
+        let put = 208;
+        let delete = 181;
+        let get = 2 * (root_len + RECORD_TAG_BYTES + key.len()) + 1;
+
+        assert_eq!(
+            TransactionBudget::new(limits(fixed - 1, 1), root_len)
+                .expect_err("fixed envelope must include exact conflict ends")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+
+        let mut get_budget =
+            TransactionBudget::new(limits(fixed + get - 1, 1), root_len).expect("fixed budget");
+        assert_eq!(
+            get_budget
+                .charge_get_conflict(key.len())
+                .expect_err("point read conflict end exceeds boundary")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+
+        let mut put_budget =
+            TransactionBudget::new(limits(fixed + put - 1, 1), root_len).expect("fixed budget");
+        assert_eq!(
+            put_budget
+                .stage_put(key, value, &Precondition::Any)
+                .expect_err("put point conflict ends exceed boundary")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+
+        let mut delete_budget =
+            TransactionBudget::new(limits(fixed + delete - 1, 1), root_len).expect("fixed budget");
+        assert_eq!(
+            delete_budget
+                .stage_delete(key, &Precondition::Any)
+                .expect_err("delete point conflict ends exceed boundary")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
     }
 
     #[test]
