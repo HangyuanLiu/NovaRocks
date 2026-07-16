@@ -36,6 +36,22 @@ use crate::state_store::{
 const AUXILIARY_MAX_ATTEMPTS: usize = 5;
 const AUXILIARY_DEADLINE: Duration = Duration::from_secs(4);
 const NOT_COMMITTED_ERROR_CODE: i32 = 1020;
+const DETERMINISTIC_COMMIT_ERROR_CODES: &[i32] = &[
+    2000, // client_invalid_operation (including malformed versionstamp operands)
+    2002, // commit_read_incomplete
+    2004, // key_outside_legal_range
+    2006, // invalid_option_value
+    2007, // invalid_option
+    2018, // invalid_mutation_type
+    2020, // transaction_invalid_version
+    2023, // transaction_read_only
+    2101, // transaction_too_large
+    2102, // key_too_large
+    2103, // value_too_large
+    2108, // unsupported_operation
+    2109, // too_many_tags
+    2110, // tag_too_long
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ReservationDecision {
@@ -58,7 +74,83 @@ enum PreDispatchFailureDecision {
 enum NativeCommitDisposition {
     ConflictNotCommitted,
     RetryableNotCommitted,
+    DefiniteNotCommitted,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuxiliaryMetricEvent {
+    Attempt,
+    Deadline,
+    BlockingFailure,
+}
+
+#[derive(Debug)]
+struct AuxiliaryAttemptBudget {
+    attempts: usize,
+}
+
+impl AuxiliaryAttemptBudget {
+    fn new() -> Self {
+        Self { attempts: 0 }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        if self.attempts == AUXILIARY_MAX_ATTEMPTS {
+            return false;
+        }
+        self.attempts += 1;
+        true
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.attempts < AUXILIARY_MAX_ATTEMPTS
+    }
+}
+
+fn record_auxiliary_metric(metrics: &StateStoreMetrics, event: AuxiliaryMetricEvent) {
+    match event {
+        AuxiliaryMetricEvent::Attempt => metrics.record_retry(),
+        AuxiliaryMetricEvent::Deadline => metrics.record_deadline(),
+        AuxiliaryMetricEvent::BlockingFailure => metrics.record_blocking_failure(),
+    }
+}
+
+fn begin_auxiliary_attempt(
+    budget: &mut AuxiliaryAttemptBudget,
+    deadline: Instant,
+    metrics: &StateStoreMetrics,
+) -> Result<(), StateStoreError> {
+    if Instant::now() >= deadline {
+        record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+        return Err(deadline_error());
+    }
+    if !budget.try_consume() {
+        return Err(auxiliary_attempts_exhausted());
+    }
+    record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Attempt);
+    Ok(())
+}
+
+fn record_auxiliary_error(metrics: &StateStoreMetrics, error: &StateStoreError) {
+    match error.kind() {
+        StateStoreErrorKind::DeadlineExceeded => {
+            record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+        }
+        StateStoreErrorKind::Transient | StateStoreErrorKind::ProviderUnavailable => {
+            record_auxiliary_metric(metrics, AuxiliaryMetricEvent::BlockingFailure);
+        }
+        _ => {}
+    }
+}
+
+fn is_retryable_auxiliary_error(error: &StateStoreError) -> bool {
+    matches!(
+        error.kind(),
+        StateStoreErrorKind::Transient
+            | StateStoreErrorKind::ProviderUnavailable
+            | StateStoreErrorKind::DeadlineExceeded
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,8 +180,62 @@ fn classify_native_commit_error(error: FdbError) -> NativeCommitDisposition {
         NativeCommitDisposition::ConflictNotCommitted
     } else if error.is_retryable_not_committed() {
         NativeCommitDisposition::RetryableNotCommitted
+    } else if DETERMINISTIC_COMMIT_ERROR_CODES.contains(&error.code()) {
+        NativeCommitDisposition::DefiniteNotCommitted
     } else {
         NativeCommitDisposition::Unknown
+    }
+}
+
+fn should_retry_auxiliary_commit(error: FdbError) -> bool {
+    error.code() == NOT_COMMITTED_ERROR_CODE
+        || error.code() == 1031
+        || error.is_retryable_not_committed()
+        || error.is_maybe_committed()
+}
+
+fn classify_auxiliary_native_error(error: FdbError) -> StateStoreError {
+    if error.code() == 1031 {
+        deadline_error()
+    } else if DETERMINISTIC_COMMIT_ERROR_CODES.contains(&error.code()) {
+        deterministic_commit_error(error.code())
+    } else if error.is_retryable() || error.is_maybe_committed() {
+        provider_error()
+    } else {
+        StateStoreError::new(
+            StateStoreErrorKind::Internal,
+            "FoundationDB auxiliary transaction returned an unclassified native error",
+        )
+    }
+}
+
+fn should_record_native_blocking_failure(disposition: NativeCommitDisposition) -> bool {
+    matches!(
+        disposition,
+        NativeCommitDisposition::RetryableNotCommitted | NativeCommitDisposition::Unknown
+    )
+}
+
+fn native_error_metric_event(
+    error: FdbError,
+    disposition: NativeCommitDisposition,
+) -> Option<AuxiliaryMetricEvent> {
+    if error.code() == 1031 {
+        Some(AuxiliaryMetricEvent::Deadline)
+    } else if should_record_native_blocking_failure(disposition) {
+        Some(AuxiliaryMetricEvent::BlockingFailure)
+    } else {
+        None
+    }
+}
+
+fn record_native_error(
+    metrics: &StateStoreMetrics,
+    error: FdbError,
+    disposition: NativeCommitDisposition,
+) {
+    if let Some(event) = native_error_metric_event(error, disposition) {
+        record_auxiliary_metric(metrics, event);
     }
 }
 
@@ -188,23 +334,36 @@ async fn persist_pre_dispatch_failure(
     local_outcome: CommitOutcome,
 ) -> CommitOutcome {
     let deadline = auxiliary_deadline(prepared.deadline);
+    let mut budget = AuxiliaryAttemptBudget::new();
     let state_key = prepared
         .codec
         .commit_state_key(*prepared.transaction_id.as_uuid().as_bytes());
-    for attempt in 0..AUXILIARY_MAX_ATTEMPTS {
-        if attempt > 0 {
-            prepared.metrics.record_retry();
-        }
-        let transaction =
-            match create_raw_transaction(prepared.database.as_ref(), &prepared.limits, deadline) {
-                Ok(transaction) => transaction,
-                Err(error) => return CommitOutcome::CommitUnknown(error),
-            };
-        let state =
-            match load_commit_state(&transaction, &prepared.codec, &state_key, deadline).await {
-                Ok(state) => state,
-                Err(error) => return CommitOutcome::CommitUnknown(error),
-            };
+    loop {
+        let transaction = match create_auxiliary_transaction(
+            prepared.database.as_ref(),
+            &prepared.limits,
+            deadline,
+            &mut budget,
+            prepared.metrics.as_ref(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(_) => return CommitOutcome::CommitUnknown(provider_unknown()),
+        };
+        let state = match load_commit_state(
+            &transaction,
+            &prepared.codec,
+            &state_key,
+            deadline,
+            prepared.metrics.as_ref(),
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                continue;
+            }
+            Err(error) => return CommitOutcome::CommitUnknown(error),
+        };
         match decide_pre_dispatch_failure(state.as_ref()) {
             PreDispatchFailureDecision::ReturnCommitted(revision) => {
                 return committed(prepared.transaction_id, revision);
@@ -220,42 +379,29 @@ async fn persist_pre_dispatch_failure(
                         drop(committed);
                         return local_outcome;
                     }
-                    Ok(Err(error))
-                        if (error.code() == NOT_COMMITTED_ERROR_CODE
-                            || error.is_retryable_not_committed())
-                            && attempt + 1 < AUXILIARY_MAX_ATTEMPTS
-                            && Instant::now() < deadline =>
-                    {
-                        continue;
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        match authoritative_state(
-                            prepared.database.as_ref(),
-                            &prepared.codec,
-                            &prepared.limits,
-                            &state_key,
-                            deadline,
-                        )
-                        .await
+                    Ok(Err(error)) => {
+                        let error = *error;
+                        let disposition = classify_native_commit_error(error);
+                        record_native_error(prepared.metrics.as_ref(), error, disposition);
+                        if should_retry_auxiliary_commit(error)
+                            && budget.has_remaining()
+                            && Instant::now() < deadline
                         {
-                            Ok(Some(DurableCommitState::Committed(revision))) => {
-                                return committed(prepared.transaction_id, revision);
-                            }
-                            Ok(Some(DurableCommitState::NotCommitted)) => return local_outcome,
-                            Ok(Some(DurableCommitState::Pending(_))) => {
-                                return CommitOutcome::CommitUnknown(foreign_pending());
-                            }
-                            Ok(None) => {
-                                return CommitOutcome::CommitUnknown(provider_unknown());
-                            }
-                            Err(error) => return CommitOutcome::CommitUnknown(error),
+                            continue;
                         }
+                        return CommitOutcome::CommitUnknown(provider_unknown());
+                    }
+                    Err(_) => {
+                        record_auxiliary_metric(
+                            prepared.metrics.as_ref(),
+                            AuxiliaryMetricEvent::Deadline,
+                        );
+                        return CommitOutcome::CommitUnknown(deadline_unknown());
                     }
                 }
             }
         }
     }
-    CommitOutcome::CommitUnknown(provider_unknown())
 }
 
 async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
@@ -298,16 +444,31 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
                     }),
                     Err(error) => CommitOutcome::CommitUnknown(error),
                 },
-                Ok(Err(_)) => CommitOutcome::CommitUnknown(provider_unknown()),
-                Err(_) => CommitOutcome::CommitUnknown(deadline_unknown()),
+                Ok(Err(error)) => {
+                    record_native_error(
+                        prepared.metrics.as_ref(),
+                        error,
+                        classify_native_commit_error(error),
+                    );
+                    CommitOutcome::CommitUnknown(provider_unknown())
+                }
+                Err(_) => {
+                    record_auxiliary_metric(
+                        prepared.metrics.as_ref(),
+                        AuxiliaryMetricEvent::Deadline,
+                    );
+                    CommitOutcome::CommitUnknown(deadline_unknown())
+                }
             }
         }
         Ok(Err(error)) => {
             let error = *error;
             let disposition = classify_native_commit_error(error);
+            record_native_error(prepared.metrics.as_ref(), error, disposition);
             match disposition {
                 NativeCommitDisposition::ConflictNotCommitted
-                | NativeCommitDisposition::RetryableNotCommitted => {
+                | NativeCommitDisposition::RetryableNotCommitted
+                | NativeCommitDisposition::DefiniteNotCommitted => {
                     let terminalized = terminalize_matching_pending(
                         prepared.database.as_ref(),
                         &prepared.codec,
@@ -322,6 +483,8 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
                         CommitOutcome::CommitUnknown(provider_unknown())
                     } else if disposition == NativeCommitDisposition::ConflictNotCommitted {
                         CommitOutcome::Conflict(conflict_error())
+                    } else if disposition == NativeCommitDisposition::DefiniteNotCommitted {
+                        CommitOutcome::DefiniteFailure(deterministic_commit_error(error.code()))
                     } else {
                         CommitOutcome::TransientBeforeCommit(provider_transient())
                     }
@@ -331,7 +494,10 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
                 }
             }
         }
-        Err(_) => CommitOutcome::CommitUnknown(deadline_unknown()),
+        Err(_) => {
+            record_auxiliary_metric(prepared.metrics.as_ref(), AuxiliaryMetricEvent::Deadline);
+            CommitOutcome::CommitUnknown(deadline_unknown())
+        }
     };
 
     #[cfg(feature = "state-store-test-hooks")]
@@ -357,30 +523,33 @@ async fn reserve_commit_state(
     metrics: &StateStoreMetrics,
 ) -> ReservationResult {
     let deadline = auxiliary_deadline(public_deadline);
+    let mut budget = AuxiliaryAttemptBudget::new();
+    let mut reservation_may_exist = false;
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
-    for attempt in 0..AUXILIARY_MAX_ATTEMPTS {
-        if attempt > 0 {
-            metrics.record_retry();
-        }
-        let transaction = match create_raw_transaction(database, limits, deadline) {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                return ReservationResult::Outcome(classify_reservation_read_error(error, false));
-            }
-        };
-        let observed = match load_commit_state(&transaction, codec, &state_key, deadline).await {
-            Ok(observed) => observed,
-            Err(error) => {
-                let outcome = classify_reservation_read_error(error, false);
-                if matches!(outcome, CommitOutcome::TransientBeforeCommit(_))
-                    && attempt + 1 < AUXILIARY_MAX_ATTEMPTS
-                    && Instant::now() < deadline
-                {
-                    continue;
+    loop {
+        let transaction =
+            match create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    return ReservationResult::Outcome(classify_reservation_read_error(
+                        error,
+                        reservation_may_exist,
+                    ));
                 }
-                return ReservationResult::Outcome(outcome);
-            }
-        };
+            };
+        let observed =
+            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
+                Ok(observed) => observed,
+                Err(error) => {
+                    if is_retryable_auxiliary_error(&error) && Instant::now() < deadline {
+                        continue;
+                    }
+                    return ReservationResult::Outcome(classify_reservation_read_error(
+                        error,
+                        reservation_may_exist,
+                    ));
+                }
+            };
         match decide_reservation(observed.as_ref(), reservation_token) {
             ReservationDecision::Dispatch => return ReservationResult::Dispatch,
             ReservationDecision::ReturnCommitted(revision) => {
@@ -399,59 +568,33 @@ async fn reserve_commit_state(
                         drop(committed);
                         return ReservationResult::Dispatch;
                     }
-                    Ok(Err(error))
-                        if (error.code() == NOT_COMMITTED_ERROR_CODE
-                            || error.is_retryable_not_committed())
-                            && attempt + 1 < AUXILIARY_MAX_ATTEMPTS
-                            && Instant::now() < deadline =>
-                    {
-                        continue;
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        match authoritative_state(database, codec, limits, &state_key, deadline)
-                            .await
-                        {
-                            Ok(Some(DurableCommitState::Pending(token)))
-                                if token == reservation_token =>
-                            {
-                                return ReservationResult::Dispatch;
-                            }
-                            Ok(Some(DurableCommitState::Committed(revision))) => {
-                                return ReservationResult::Committed(revision);
-                            }
-                            Ok(Some(DurableCommitState::NotCommitted)) => {
-                                return ReservationResult::Outcome(CommitOutcome::DefiniteFailure(
-                                    invalid_reuse(),
-                                ));
-                            }
-                            Ok(Some(DurableCommitState::Pending(_))) => {
-                                return ReservationResult::Outcome(CommitOutcome::CommitUnknown(
-                                    foreign_pending(),
-                                ));
-                            }
-                            Ok(None)
-                                if attempt + 1 < AUXILIARY_MAX_ATTEMPTS
-                                    && Instant::now() < deadline =>
-                            {
-                                continue;
-                            }
-                            Ok(None) => {
-                                return ReservationResult::Outcome(
-                                    CommitOutcome::TransientBeforeCommit(provider_transient()),
-                                );
-                            }
-                            Err(error) => {
-                                return ReservationResult::Outcome(
-                                    classify_reservation_read_error(error, true),
-                                );
-                            }
+                    Ok(Err(error)) => {
+                        let error = *error;
+                        let disposition = classify_native_commit_error(error);
+                        record_native_error(metrics, error, disposition);
+                        if disposition == NativeCommitDisposition::DefiniteNotCommitted {
+                            return ReservationResult::Outcome(CommitOutcome::DefiniteFailure(
+                                deterministic_commit_error(error.code()),
+                            ));
                         }
+                        reservation_may_exist |= disposition == NativeCommitDisposition::Unknown;
+                        if budget.has_remaining() && Instant::now() < deadline {
+                            continue;
+                        }
+                        return ReservationResult::Outcome(CommitOutcome::TransientBeforeCommit(
+                            provider_transient(),
+                        ));
+                    }
+                    Err(_) => {
+                        record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+                        return ReservationResult::Outcome(CommitOutcome::TransientBeforeCommit(
+                            deadline_error(),
+                        ));
                     }
                 }
             }
         }
     }
-    ReservationResult::Outcome(CommitOutcome::TransientBeforeCommit(provider_transient()))
 }
 
 pub(super) async fn resolve_commit(
@@ -462,13 +605,19 @@ pub(super) async fn resolve_commit(
     metrics: &StateStoreMetrics,
 ) -> Result<CommitResolution, StateStoreError> {
     let deadline = Instant::now() + limits.transaction_deadline.min(AUXILIARY_DEADLINE);
+    let mut budget = AuxiliaryAttemptBudget::new();
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
-    for attempt in 0..AUXILIARY_MAX_ATTEMPTS {
-        if attempt > 0 {
-            metrics.record_retry();
-        }
-        let transaction = create_raw_transaction(database, limits, deadline)?;
-        let state = load_commit_state(&transaction, codec, &state_key, deadline).await?;
+    loop {
+        let transaction =
+            create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics)?;
+        let state =
+            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
+                Ok(state) => state,
+                Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         match state {
             Some(DurableCommitState::Committed(revision)) => {
                 return Ok(CommitResolution::Committed(receipt(
@@ -485,21 +634,26 @@ pub(super) async fn resolve_commit(
                         drop(committed);
                         return Ok(CommitResolution::NotCommitted);
                     }
-                    Ok(Err(error))
-                        if (error.code() == NOT_COMMITTED_ERROR_CODE
-                            || error.is_retryable_not_committed())
-                            && attempt + 1 < AUXILIARY_MAX_ATTEMPTS
-                            && Instant::now() < deadline =>
-                    {
-                        continue;
+                    Ok(Err(error)) => {
+                        let error = *error;
+                        let disposition = classify_native_commit_error(error);
+                        record_native_error(metrics, error, disposition);
+                        if should_retry_auxiliary_commit(error)
+                            && budget.has_remaining()
+                            && Instant::now() < deadline
+                        {
+                            continue;
+                        }
+                        return Err(classify_auxiliary_native_error(error));
                     }
-                    Ok(Err(_)) => return Err(provider_error()),
-                    Err(_) => return Err(deadline_error()),
+                    Err(_) => {
+                        record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+                        return Err(deadline_error());
+                    }
                 }
             }
         }
     }
-    Err(provider_error())
 }
 
 async fn terminalize_matching_pending(
@@ -512,17 +666,22 @@ async fn terminalize_matching_pending(
     metrics: &StateStoreMetrics,
 ) -> bool {
     let deadline = auxiliary_deadline(public_deadline);
+    let mut budget = AuxiliaryAttemptBudget::new();
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
-    for attempt in 0..AUXILIARY_MAX_ATTEMPTS {
-        if attempt > 0 {
-            metrics.record_retry();
-        }
-        let Ok(transaction) = create_raw_transaction(database, limits, deadline) else {
-            return false;
-        };
-        let Ok(state) = load_commit_state(&transaction, codec, &state_key, deadline).await else {
-            continue;
-        };
+    loop {
+        let transaction =
+            match create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics) {
+                Ok(transaction) => transaction,
+                Err(_) => return false,
+            };
+        let state =
+            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
+                Ok(state) => state,
+                Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                    continue;
+                }
+                Err(_) => return false,
+            };
         match decide_terminalization(state.as_ref(), reservation_token) {
             TerminalizationDecision::WriteNotCommitted => {
                 transaction.set(&state_key, &codec.not_committed_value());
@@ -531,32 +690,28 @@ async fn terminalize_matching_pending(
                         drop(committed);
                         return true;
                     }
-                    Ok(Err(error))
-                        if (error.code() == NOT_COMMITTED_ERROR_CODE
-                            || error.is_retryable_not_committed())
-                            && attempt + 1 < AUXILIARY_MAX_ATTEMPTS =>
-                    {
-                        continue;
+                    Ok(Err(error)) => {
+                        let error = *error;
+                        let disposition = classify_native_commit_error(error);
+                        record_native_error(metrics, error, disposition);
+                        if should_retry_auxiliary_commit(error)
+                            && budget.has_remaining()
+                            && Instant::now() < deadline
+                        {
+                            continue;
+                        }
+                        return false;
                     }
-                    _ => return false,
+                    Err(_) => {
+                        record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+                        return false;
+                    }
                 }
             }
             TerminalizationDecision::AlreadyNotCommitted => return true,
             TerminalizationDecision::PreserveUnknown => return false,
         }
     }
-    false
-}
-
-async fn authoritative_state(
-    database: &Database,
-    codec: &KeyspaceCodec,
-    limits: &StateStoreLimits,
-    state_key: &[u8],
-    deadline: Instant,
-) -> Result<Option<DurableCommitState>, StateStoreError> {
-    let transaction = create_raw_transaction(database, limits, deadline)?;
-    load_commit_state(&transaction, codec, state_key, deadline).await
 }
 
 async fn load_commit_state(
@@ -564,31 +719,58 @@ async fn load_commit_state(
     codec: &KeyspaceCodec,
     state_key: &[u8],
     deadline: Instant,
+    metrics: &StateStoreMetrics,
 ) -> Result<Option<DurableCommitState>, StateStoreError> {
-    let value = timeout_at(deadline, transaction.get(state_key, false))
-        .await
-        .map_err(|_| deadline_error())?
-        .map_err(|_| provider_error())?;
+    let value = match timeout_at(deadline, transaction.get(state_key, false)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let error = classify_auxiliary_native_error(error);
+            record_auxiliary_error(metrics, &error);
+            return Err(error);
+        }
+        Err(_) => {
+            record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+            return Err(deadline_error());
+        }
+    };
     value
         .map(|value| codec.decode_commit_state(value.as_ref()))
         .transpose()
+}
+
+fn create_auxiliary_transaction(
+    database: &Database,
+    limits: &StateStoreLimits,
+    deadline: Instant,
+    budget: &mut AuxiliaryAttemptBudget,
+    metrics: &StateStoreMetrics,
+) -> Result<Transaction, StateStoreError> {
+    begin_auxiliary_attempt(budget, deadline, metrics)?;
+    create_raw_transaction(database, limits, deadline).inspect_err(|error| {
+        record_auxiliary_error(metrics, error);
+    })
 }
 
 fn auxiliary_deadline(public_deadline: Instant) -> Instant {
     public_deadline.min(Instant::now() + AUXILIARY_DEADLINE)
 }
 
+fn auxiliary_attempts_exhausted() -> StateStoreError {
+    StateStoreError::new(
+        StateStoreErrorKind::ProviderUnavailable,
+        "FoundationDB auxiliary transaction attempt budget was exhausted",
+    )
+}
+
 fn classify_reservation_read_error(
     error: StateStoreError,
     reservation_commit_unknown: bool,
 ) -> CommitOutcome {
-    if reservation_commit_unknown {
-        return CommitOutcome::CommitUnknown(error);
-    }
     match error.kind() {
         StateStoreErrorKind::Transient
         | StateStoreErrorKind::ProviderUnavailable
         | StateStoreErrorKind::DeadlineExceeded => CommitOutcome::TransientBeforeCommit(error),
+        _ if reservation_commit_unknown => CommitOutcome::CommitUnknown(error),
         _ => CommitOutcome::DefiniteFailure(error),
     }
 }
@@ -666,6 +848,18 @@ fn provider_transient() -> StateStoreError {
     )
 }
 
+fn deterministic_commit_error(code: i32) -> StateStoreError {
+    let kind = match code {
+        2101 | 2102 | 2103 | 2109 | 2110 => StateStoreErrorKind::LimitExceeded,
+        2006 | 2007 => StateStoreErrorKind::InvalidConfiguration,
+        _ => StateStoreErrorKind::InvalidRequest,
+    };
+    StateStoreError::new(
+        kind,
+        "FoundationDB rejected the transaction with a deterministic client or limit error",
+    )
+}
+
 fn provider_unknown() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Transient,
@@ -728,6 +922,10 @@ mod tests {
                 classify_reservation_read_error(StateStoreError::new(kind, "test"), false),
                 CommitOutcome::TransientBeforeCommit(_)
             ));
+            assert!(matches!(
+                classify_reservation_read_error(StateStoreError::new(kind, "test"), true),
+                CommitOutcome::TransientBeforeCommit(_)
+            ));
         }
         for kind in [
             StateStoreErrorKind::Corruption,
@@ -779,6 +977,15 @@ mod tests {
             classify_native_commit_error(retryable_not_committed),
             NativeCommitDisposition::RetryableNotCommitted
         );
+        for code in [
+            2000, 2002, 2004, 2006, 2007, 2018, 2020, 2023, 2101, 2102, 2103, 2108, 2109, 2110,
+        ] {
+            assert_eq!(
+                classify_native_commit_error(FdbError::from_code(code)),
+                NativeCommitDisposition::DefiniteNotCommitted,
+                "deterministic limit error {code} must be terminalized"
+            );
+        }
         for code in [1021, 1039, 1031, 9999] {
             assert_eq!(
                 classify_native_commit_error(FdbError::from_code(code)),
@@ -786,6 +993,141 @@ mod tests {
                 "error code {code} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn auxiliary_attempt_budget_allows_exactly_five_raw_transactions() {
+        let mut budget = AuxiliaryAttemptBudget::new();
+        let metrics = StateStoreMetrics::new("foundationdb");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for attempt in 1..=AUXILIARY_MAX_ATTEMPTS {
+            assert!(
+                begin_auxiliary_attempt(&mut budget, deadline, &metrics).is_ok(),
+                "attempt {attempt} must be available"
+            );
+        }
+        let error = begin_auxiliary_attempt(&mut budget, deadline, &metrics)
+            .expect_err("a sixth raw transaction must be rejected");
+        assert_eq!(error.kind(), StateStoreErrorKind::ProviderUnavailable);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.retry_count, 5);
+        assert_eq!(snapshot.deadline_count, 0);
+    }
+
+    #[test]
+    fn auxiliary_deadline_is_terminal_and_counted_once_before_creation() {
+        let mut budget = AuxiliaryAttemptBudget::new();
+        let metrics = StateStoreMetrics::new("foundationdb");
+        let error = begin_auxiliary_attempt(&mut budget, Instant::now(), &metrics)
+            .expect_err("expired deadline must reject before raw transaction creation");
+        assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.retry_count, 0);
+        assert_eq!(snapshot.deadline_count, 1);
+    }
+
+    #[test]
+    fn auxiliary_state_errors_retry_only_operational_blockers() {
+        for kind in [
+            StateStoreErrorKind::Transient,
+            StateStoreErrorKind::ProviderUnavailable,
+            StateStoreErrorKind::DeadlineExceeded,
+        ] {
+            assert!(is_retryable_auxiliary_error(&StateStoreError::new(
+                kind, "test"
+            )));
+        }
+        for kind in [
+            StateStoreErrorKind::Corruption,
+            StateStoreErrorKind::InvalidConfiguration,
+            StateStoreErrorKind::InvalidRequest,
+            StateStoreErrorKind::LimitExceeded,
+            StateStoreErrorKind::Internal,
+        ] {
+            assert!(!is_retryable_auxiliary_error(&StateStoreError::new(
+                kind, "test"
+            )));
+        }
+    }
+
+    #[test]
+    fn auxiliary_native_commits_retry_only_safe_operational_failures() {
+        for code in [1020, 1007, 1021, 1039, 1031] {
+            assert!(
+                should_retry_auxiliary_commit(FdbError::from_code(code)),
+                "auxiliary error {code} should retry"
+            );
+        }
+        for code in [2101, 2102, 2103, 9999] {
+            assert!(
+                !should_retry_auxiliary_commit(FdbError::from_code(code)),
+                "auxiliary error {code} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_native_errors_preserve_deterministic_and_internal_boundaries() {
+        assert_eq!(
+            classify_auxiliary_native_error(FdbError::from_code(2101)).kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            classify_auxiliary_native_error(FdbError::from_code(2006)).kind(),
+            StateStoreErrorKind::InvalidConfiguration
+        );
+        assert_eq!(
+            classify_auxiliary_native_error(FdbError::from_code(9999)).kind(),
+            StateStoreErrorKind::Internal
+        );
+    }
+
+    #[test]
+    fn auxiliary_metric_events_are_counted_without_public_commit_duplication() {
+        let metrics = StateStoreMetrics::new("foundationdb");
+        record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Attempt);
+        record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Attempt);
+        record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::Deadline);
+        record_auxiliary_metric(&metrics, AuxiliaryMetricEvent::BlockingFailure);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.retry_count, 2);
+        assert_eq!(snapshot.deadline_count, 1);
+        assert_eq!(snapshot.blocking_failure_count, 1);
+        assert_eq!(snapshot.commit_count, 0);
+        assert_eq!(
+            snapshot.operation_duration_observations(StateStoreOperation::Commit),
+            0
+        );
+    }
+
+    #[test]
+    fn native_error_metrics_distinguish_deadline_blocking_and_expected_failures() {
+        assert_eq!(
+            native_error_metric_event(
+                FdbError::from_code(1020),
+                NativeCommitDisposition::ConflictNotCommitted
+            ),
+            None
+        );
+        assert_eq!(
+            native_error_metric_event(
+                FdbError::from_code(1007),
+                NativeCommitDisposition::RetryableNotCommitted
+            ),
+            Some(AuxiliaryMetricEvent::BlockingFailure)
+        );
+        assert_eq!(
+            native_error_metric_event(FdbError::from_code(1031), NativeCommitDisposition::Unknown),
+            Some(AuxiliaryMetricEvent::Deadline)
+        );
+        assert_eq!(
+            native_error_metric_event(
+                FdbError::from_code(2101),
+                NativeCommitDisposition::DefiniteNotCommitted
+            ),
+            None
+        );
     }
 
     #[test]
