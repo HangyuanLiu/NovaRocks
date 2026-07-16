@@ -2284,10 +2284,8 @@ mod runtime_filter;
 }
 
 #[test]
-fn planner_distributed_and_codegen_do_not_import_optimizer() {
-    let mut checked = production_rs_files(&src_dir().join("sql/planner/distributed"));
-    checked.extend(production_rs_files(&src_dir().join("sql/codegen")));
-
+fn planner_distributed_does_not_import_optimizer() {
+    let checked = production_rs_files(&src_dir().join("sql/planner/distributed"));
     let mut violations = Vec::new();
     for file in &checked {
         for (line, text) in non_test_optimizer_refs(file) {
@@ -2307,7 +2305,7 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
 
     assert!(
         violations.is_empty(),
-        "planner distributed/codegen production paths must not reference optimizer types; \
+        "planner distributed production paths must not reference optimizer types; \
          optimizer_bridge/** is the conversion boundary. Violations:\n{}",
         violations.join("\n")
     );
@@ -3984,10 +3982,6 @@ fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise()
         ),
         (
             "src/sql/codegen/ir/mod.rs",
-            "use crate::sql::planner::distributed::DistributedPlan;\npub(crate) fn lower_distributed_plan() {}",
-        ),
-        (
-            "src/sql/codegen/ir/mod.rs",
             r#"
 #[cfg(test)]
 mod explain;
@@ -3995,21 +3989,6 @@ mod explain;
 use crate::sql::explain::distributed::explain_distributed_plan;
 #[cfg(test)]
 fn explain_distributed_plan_analyze() {}
-"#,
-        ),
-        (
-            "src/sql/codegen/ir/mod.rs",
-            r#"
-mod left {
-    use crate::sql as owner;
-}
-mod right {
-    mod safe {
-        pub mod presentation { pub struct X; }
-    }
-    use self::safe as owner;
-    use owner::presentation::X;
-}
 "#,
         ),
         (
@@ -4142,28 +4121,6 @@ fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<Stri
     }));
 
     violations
-}
-
-#[test]
-fn codegen_production_cannot_own_or_import_distributed_explain() {
-    assert!(
-        !src_dir().join("sql/codegen/ir/explain.rs").exists(),
-        "the retired codegen EXPLAIN owner source must stay deleted"
-    );
-
-    let mut violations = Vec::new();
-    for file in production_rs_files(&src_dir().join("sql/codegen")) {
-        let source_rel = rel(&file);
-        let text = fs::read_to_string(&file).unwrap();
-        for violation in codegen_explain_owner_violations_in(&source_rel, &text) {
-            violations.push(format!("{source_rel}: {violation}"));
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "codegen production must not own or import distributed EXPLAIN:\n{}",
-        violations.join("\n")
-    );
 }
 
 fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
@@ -6877,26 +6834,6 @@ fn planner_distributed_core_has_stage_namespace() {
             declarations,
             vec![format!("{} (1)", rel(&node_path))],
             "{function} must be uniquely declared in distributed/node.rs"
-        );
-    }
-
-    for item in [
-        "FragmentId",
-        "FragmentEdgeKind",
-        "FragmentStreamKind",
-        "FragmentEdge",
-    ] {
-        let declarations = rs_files(&repo.join("src/sql/codegen"))
-            .into_iter()
-            .filter_map(|path| {
-                let text = fs::read_to_string(&path).unwrap();
-                let count = rust_named_type_declaration_count(&text, item);
-                (count > 0).then(|| format!("{} ({count})", rel(&path)))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            declarations.is_empty(),
-            "codegen must not own distributed edge topology type {item}: {declarations:?}"
         );
     }
 
@@ -24557,23 +24494,12 @@ fn codegen_fragment_namespace_detector_covers_legacy_aliases_reexports_and_test_
 
     let valid = [
         (
-            "src/sql/codegen/fragment/mod.rs",
-            r#"
-mod build;
-mod request;
-mod result;
-pub(crate) use build::build;
-pub(crate) use request::FragmentBuildRequest;
-pub(crate) use result::MultiFragmentBuildResult;
-"#,
+            "src/protocol/native/encode/bundle.rs",
+            "use crate::coordinator::prepare::PreparedFragmentSet;",
         ),
         (
             "src/coordinator/execution.rs",
-            "use crate::sql::codegen::fragment::{FragmentBuildRequest, MultiFragmentBuildResult};",
-        ),
-        (
-            "src/engine/mod.rs",
-            "let result: crate::sql::codegen::fragment::MultiFragmentBuildResult = crate::sql::codegen::fragment::build(request)?;",
+            "use crate::protocol::native::encode::NativeFragmentBundle;",
         ),
         (
             "src/sql/codegen/fragment/mod.rs",
@@ -24606,35 +24532,223 @@ pub(crate) use crate::runtime::legacy_build as lower_distributed_plan;
     );
 }
 
-#[test]
-fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
-    let repo = Path::new(manifest_dir());
-    let mut violations = Vec::new();
+fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str) -> Vec<String> {
+    const RETIRED_ROOT: &[&str] = &["crate", "sql", "codegen"];
 
-    let codegen_root = repo.join("src/sql/codegen");
-    let codegen_mod = fs::read_to_string(codegen_root.join("mod.rs")).unwrap();
-    let actual_root_modules = rust_module_item_declarations(&codegen_mod);
-    let expected_root_modules = BTreeSet::new();
-    if actual_root_modules != expected_root_modules {
+    fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(actual, expected)| actual == expected)
+    }
+
+    fn scope_is_sql_root(source_rel: &str, inline_modules: &[String]) -> bool {
+        let Some(mut scope) = rust_source_module_segments(source_rel) else {
+            return false;
+        };
+        scope.extend(inline_modules.iter().cloned());
+        scope == ["crate", "sql"]
+    }
+
+    fn source_target_mentions_codegen(target: &str) -> bool {
+        target
+            .replace('\\', "/")
+            .split('/')
+            .any(|component| component.to_ascii_lowercase().contains("codegen"))
+    }
+
+    struct IncludeAudit<'a> {
+        source_rel: &'a str,
+        inline_modules: Vec<String>,
+        violations: Vec<String>,
+    }
+
+    impl IncludeAudit<'_> {
+        fn in_sql_namespace(&self) -> bool {
+            let Some(mut scope) = rust_source_module_segments(self.source_rel) else {
+                return false;
+            };
+            scope.extend(self.inline_modules.iter().cloned());
+            scope.starts_with(&["crate".to_string(), "sql".to_string()])
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for IncludeAudit<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
+        }
+
+        fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_foreign_item(self, item);
+        }
+
+        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+                return;
+            }
+            syn::visit::visit_stmt(self, stmt);
+        }
+
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+                return;
+            }
+            syn::visit::visit_expr(self, expr);
+        }
+
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            if nfe_4_syn_attrs_require_test(&arm.attrs) {
+                return;
+            }
+            syn::visit::visit_arm(self, arm);
+        }
+
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if nfe_4_syn_attrs_require_test(&module.attrs) {
+                return;
+            }
+            self.inline_modules.push(coor_3b_ident_text(&module.ident));
+            syn::visit::visit_item_mod(self, module);
+            self.inline_modules.pop();
+        }
+
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            if item.path.is_ident("include") && self.in_sql_namespace() {
+                self.violations.push(format!(
+                    "{} uses production include! inside the SQL namespace",
+                    self.source_rel
+                ));
+            }
+            syn::visit::visit_macro(self, item);
+        }
+    }
+
+    let source_rel = source_rel.replace('\\', "/");
+    let mut violations = Vec::new();
+    if rust_production_canonical_paths(text, &source_rel)
+        .iter()
+        .any(|path| path_starts_with(path, RETIRED_ROOT))
+    {
         violations.push(format!(
-            "src/sql/codegen/mod.rs: production modules must be exactly {expected_root_modules:?}, got {actual_root_modules:?}"
+            "{source_rel} reaches the retired crate::sql::codegen namespace"
         ));
     }
 
-    for retired in [
-        "src/sql/codegen/ir",
-        "src/sql/codegen/scan/mod.rs",
-        "src/sql/codegen/fragment_builder.rs",
-        "src/sql/codegen/scalar_materialize.rs",
-        "src/sql/codegen/fragment_request.rs",
-        "src/sql/codegen/boundary_schema.rs",
-        "src/sql/codegen/runtime_filter.rs",
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
-        "src/sql/codegen/iceberg_literal_json.rs",
-        "src/sql/codegen/fragment",
-        "src/sql/codegen/proto_encode",
-    ] {
+    for module in rust_module_items(text) {
+        if cfg_attributes_test_requirement(module.attributes.iter().map(String::as_str))
+            == CfgTestRequirement::RequiresTest
+        {
+            continue;
+        }
+        let Some(mut declared_path) = rust_source_module_segments(&source_rel) else {
+            continue;
+        };
+        declared_path.extend(
+            module
+                .inline_modules
+                .iter()
+                .map(|inline| inline.name.clone()),
+        );
+        declared_path.push(module.name.clone());
+        if path_starts_with(&declared_path, RETIRED_ROOT) {
+            violations.push(format!(
+                "{source_rel} declares the retired `codegen` module"
+            ));
+        }
+    }
+
+    for import in rust_raw_production_use_statements(text) {
+        let local_name = import
+            .path
+            .alias
+            .as_deref()
+            .filter(|alias| *alias != "_")
+            .or_else(|| import.path.segments.last().map(String::as_str));
+        if scope_is_sql_root(&source_rel, &import.inline_modules) && local_name == Some("codegen") {
+            violations.push(format!(
+                "{source_rel} restores the retired `codegen` module binding"
+            ));
+        }
+    }
+
+    let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    if production_tokens.windows(5).any(|window| {
+        window[0] == "extern" && window[1] == "crate" && window[3] == "as" && window[4] == "codegen"
+    }) {
+        violations.push(format!(
+            "{source_rel} restores the retired `codegen` extern-crate binding"
+        ));
+    }
+
+    for module in rust_module_items(text) {
+        if cfg_attributes_test_requirement(module.attributes.iter().map(String::as_str))
+            == CfgTestRequirement::RequiresTest
+        {
+            continue;
+        }
+        if module
+            .attributes
+            .iter()
+            .filter_map(|attribute| path_attribute_value(attribute))
+            .chain(
+                module
+                    .attributes
+                    .iter()
+                    .flat_map(|attribute| cfg_attr_generated_path_values(attribute)),
+            )
+            .any(|target| source_target_mentions_codegen(&target))
+        {
+            violations.push(format!(
+                "{source_rel} redirects module `{}` to a retired codegen source",
+                module.name
+            ));
+        }
+    }
+
+    match syn::parse_file(text) {
+        Ok(file) => {
+            let mut audit = IncludeAudit {
+                source_rel: &source_rel,
+                inline_modules: Vec::new(),
+                violations: Vec::new(),
+            };
+            syn::visit::Visit::visit_file(&mut audit, &file);
+            violations.extend(audit.violations);
+        }
+        Err(error) => violations.push(format!(
+            "{source_rel} cannot be parsed while checking codegen retirement: {error}"
+        )),
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn cgo_13_sql_codegen_retirement_violations(repo: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    for retired in ["src/sql/codegen", "src/sql/codegen.rs"] {
         match fs::symlink_metadata(repo.join(retired)) {
             Ok(_) => violations.push(format!("{retired}: retired path still exists")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -24644,6 +24758,154 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         }
     }
 
+    let src = repo.join("src");
+    for path in production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]) {
+        let source_rel = path
+            .strip_prefix(repo)
+            .expect("production source must stay under repository root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        violations.extend(cgo_13_sql_codegen_source_retirement_violations(
+            &source_rel,
+            &text,
+        ));
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn cgo_13_sql_codegen_retirement_detector_is_source_aware_and_non_vacuous() {
+    let invalid = [
+        (
+            "direct path",
+            "src/engine/mod.rs",
+            "use crate::sql::codegen::NativeFragmentBundle;",
+        ),
+        (
+            "grouped path",
+            "src/engine/mod.rs",
+            "use crate::sql::{codegen::NativeFragmentBundle, planner::DistributedPlan};",
+        ),
+        (
+            "module alias path",
+            "src/engine/mod.rs",
+            "use crate::sql as owner; use owner::codegen::NativeFragmentBundle;",
+        ),
+        (
+            "re-export",
+            "src/engine/mod.rs",
+            "pub(crate) use crate::sql::codegen as legacy;",
+        ),
+        (
+            "bare relative path",
+            "src/sql/mod.rs",
+            "fn consume(_: codegen::NativeFragmentBundle) {}",
+        ),
+        (
+            "self relative path",
+            "src/sql/mod.rs",
+            "use self::codegen::NativeFragmentBundle;",
+        ),
+        (
+            "super relative path",
+            "src/sql/planner.rs",
+            "use super::codegen::NativeFragmentBundle;",
+        ),
+        (
+            "module declaration",
+            "src/sql/mod.rs",
+            "pub(crate) mod codegen;",
+        ),
+        (
+            "inline module declaration",
+            "src/lib.rs",
+            "mod sql { pub(crate) mod codegen; }",
+        ),
+        (
+            "module binding alias",
+            "src/sql/mod.rs",
+            "pub(crate) use crate::protocol::native::encode as codegen;",
+        ),
+        (
+            "inline module binding alias",
+            "src/lib.rs",
+            "mod sql { pub(crate) use crate::protocol::native::encode as codegen; }",
+        ),
+        (
+            "extern-crate binding alias",
+            "src/sql/mod.rs",
+            "extern crate self as codegen;",
+        ),
+        (
+            "path source indirection",
+            "src/sql/mod.rs",
+            "#[path = \"codegen/mod.rs\"] mod legacy;",
+        ),
+        (
+            "include source indirection",
+            "src/sql/mod.rs",
+            "include!(concat!(\"code\", \"gen/mod.rs\"));",
+        ),
+    ];
+    for (case, source_rel, source) in invalid {
+        let violations = cgo_13_sql_codegen_source_retirement_violations(source_rel, source);
+        assert!(
+            !violations.is_empty(),
+            "{case} escaped the sql::codegen retirement guard"
+        );
+    }
+
+    let valid = r#"
+// use crate::sql::codegen::NativeFragmentBundle;
+const RETIRED: &str = "crate::sql::codegen";
+#[cfg(test)]
+pub(crate) mod codegen;
+#[cfg(test)]
+use crate::sql::codegen::NativeFragmentBundle;
+#[cfg(test)]
+pub(crate) use crate::protocol::native::encode as codegen;
+#[cfg(test)]
+#[path = "codegen/mod.rs"]
+mod legacy;
+#[cfg(test)]
+include!("codegen/mod.rs");
+use crate::protocol::native::encode::NativeFragmentBundle;
+"#;
+    assert_eq!(
+        cgo_13_sql_codegen_source_retirement_violations("src/sql/mod.rs", valid),
+        Vec::<String>::new(),
+        "comments, strings and cfg(test) fixtures must not fail production retirement"
+    );
+
+    let root = std::env::temp_dir().join(format!(
+        "cgo_13_sql_codegen_retirement_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("src/sql/codegen")).unwrap();
+    fs::write(root.join("src/lib.rs"), "mod sql;").unwrap();
+    fs::write(root.join("src/sql/mod.rs"), "").unwrap();
+    assert!(
+        cgo_13_sql_codegen_retirement_violations(&root)
+            .iter()
+            .any(|violation| violation.contains("retired path still exists")),
+        "a recreated physical directory must fail the retirement guard"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cgo_13_sql_codegen_namespace_is_physically_retired() {
+    let repo = Path::new(manifest_dir());
+    let mut violations = cgo_13_sql_codegen_retirement_violations(repo);
+
+    let codegen_root = repo.join("src/sql/codegen");
     let codegen_sources = rs_files(&codegen_root)
         .into_iter()
         .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
@@ -24755,7 +25017,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
 
     assert!(
         violations.is_empty(),
-        "NFE-1 Task 4 unique native builder guard failed:\n{}",
+        "CGO-13 retired sql::codegen namespace guard failed:\n{}",
         violations.join("\n")
     );
 }
@@ -33967,11 +34229,11 @@ fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
 // CGO-9A Task 3: distributed-plan structural validation lives in the planner
 // seal, never in the native encoder.
 //
-// Task 3 moved `validate_distributed_plan` (and its helpers) out of
-// `src/sql/codegen/fragment/build.rs` into
-// `crate::sql::planner::distributed::validation`, where it runs inside
-// `seal_draft`. These guards keep it there: the encoder must not (re)own the
-// structural validator, and the planner distributed module must define it.
+// Task 3 moved `validate_distributed_plan` (and its helpers) from the retired
+// SQL encoder owner into `crate::sql::planner::distributed::validation`, where
+// it runs inside `seal_draft`. These guards keep it there: the encoder must not
+// (re)own the structural validator, and the planner distributed module must
+// define it.
 //
 // The detector keys on function *definitions* (`fn validate_distributed_plan`
 // / `fn validate_distributed_structure`), so encoder helpers that legitimately
@@ -40526,17 +40788,10 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
             "missing CGO-13 owner {required}"
         );
     }
-    for retired in [
-        "src/sql/codegen/scan/mod.rs",
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
-    ] {
-        assert!(
-            !repo.join(retired).exists(),
-            "retired CGO-13 owner remains: {retired}"
-        );
-    }
+    assert!(
+        cgo_13_sql_codegen_retirement_violations(repo).is_empty(),
+        "the retired SQL namespace must not remain as a preparation owner"
+    );
     let projection =
         fs::read_to_string(repo.join("src/coordinator/prepare/projection.rs")).unwrap();
     assert!(projection.contains("runtime_filter_projection: RuntimeFilterGraphProjection"));
@@ -40562,11 +40817,6 @@ fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
     assert!(
         !repo.join("src/coordinator/prepare/native_scan.rs").exists(),
         "coordinator must not duplicate canonical connector scan models or planning"
-    );
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/mod.rs")).unwrap();
-    assert!(
-        !has_module_declaration(&codegen_mod, "scan"),
-        "retired codegen scan module shell must be absent"
     );
 }
 

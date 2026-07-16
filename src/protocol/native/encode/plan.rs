@@ -411,7 +411,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_projection: None,
+            runtime_filter_projection: Some(&RuntimeFilterGraphProjection::default()),
         },
     )
 }
@@ -2482,6 +2482,7 @@ mod tests {
     #[test]
     fn full_plan_encoding_requires_prepared_runtime_filter_projection() {
         let plan = iceberg_delta_distributed_plan_for_test();
+        let missing_projection = Option::default();
         let error = encode_distributed_plan_with_context(
             &plan,
             NativePlanEncodeContext {
@@ -2489,7 +2490,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: None,
+                runtime_filter_projection: missing_projection,
             },
         )
         .expect_err("full-plan encoding without prepared RF projection must fail");

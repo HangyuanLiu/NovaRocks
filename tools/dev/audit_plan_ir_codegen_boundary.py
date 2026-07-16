@@ -39,27 +39,29 @@ if "enum DistributedPlanKind" in planner_sources:
     fail("DistributedPlanKind must not be reintroduced")
 if "struct PlanNodeStats" in planner_sources:
     fail("migration PlanNodeStats must not be reintroduced")
-if "scalar_arena" in read("src/sql/planner/distributed_fragment.rs"):
+if "scalar_arena" in read("src/sql/planner/distributed/seal.rs"):
     fail("DistributedPlan must not carry scalar_arena")
 
-fragment_builder = read("src/sql/codegen/fragment_builder.rs")
-production_prefix = fragment_builder.split("#[cfg(test)]", 1)[0]
+native_encoder = "\n".join(
+    p.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
+    for p in (ROOT / "src/protocol/native/encode").rglob("*.rs")
+)
 blocked = [
     "OptimizerPhysicalNode",
     "optimizer::operator::Operator",
     "optimizer::physical_tree",
 ]
 for needle in blocked:
-    if needle in production_prefix:
-        fail(f"fragment_builder production code must not reference {needle}")
+    if needle in native_encoder:
+        fail(f"native encoder production code must not reference {needle}")
 
 if re.search(
-    r"fn\s+build_via_distributed_plan\s*\([^)]*OptimizerPhysicalNode",
-    fragment_builder,
+    r"fn\s+encode_native_fragment_bundle\s*\([^)]*OptimizerPhysicalNode",
+    native_encoder,
 ):
-    fail("build_via_distributed_plan must not accept OptimizerPhysicalNode")
+    fail("encode_native_fragment_bundle must not accept OptimizerPhysicalNode")
 
-if (ROOT / "src/sql/codegen/id_binding_verifier.rs").exists():
-    fail("id_binding_verifier must live under planner::optimizer_bridge, not codegen")
+if not (ROOT / "src/sql/planner/optimizer_bridge/id_binding.rs").is_file():
+    fail("id binding verification must remain under planner::optimizer_bridge")
 
 print("plan IR codegen boundary audit passed")

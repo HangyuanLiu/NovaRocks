@@ -3036,7 +3036,6 @@ mod tests {
             concat!("crate::", "proto"),
             concat!("crate::", "runtime::"),
             concat!("crate::", "thrift"),
-            concat!("crate::", "sql::codegen"),
         ] {
             assert!(
                 !source.contains(pattern),
