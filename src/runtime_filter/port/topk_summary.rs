@@ -26,6 +26,7 @@ use crate::runtime_filter::model::contract::{OrderContract, TopKSummaryRequireme
 use super::ordered_bound::{
     OrderContractError, OrderedTuple, OrderedTupleError, RuntimeOrderContract,
 };
+use super::value_domain::ContributionSizeError;
 
 const TOPK_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.top-k-summary-contract";
 const TOPK_CONTRACT_VERSION: u16 = 1;
@@ -162,6 +163,34 @@ impl TopKSummary {
             bytes = candidate_bytes?;
         }
         Some(bytes)
+    }
+
+    pub(crate) fn canonical_body_len(&self) -> Result<usize, ContributionSizeError> {
+        u64::try_from(self.candidates.len())
+            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+        self.candidates
+            .iter()
+            .try_fold(size_of::<u64>(), |bytes, candidate| {
+                bytes
+                    .checked_add(candidate.canonical_codec_len()?)
+                    .ok_or(ContributionSizeError::SizeOverflow)
+            })
+    }
+
+    pub(crate) fn encode_canonical_body_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        let exact_len = self.canonical_body_len()?;
+        let candidate_count = u64::try_from(self.candidates.len())
+            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+        let start = output.len();
+        output.extend_from_slice(&candidate_count.to_be_bytes());
+        for candidate in self.candidates.iter() {
+            candidate.encode_canonical_into(output)?;
+        }
+        debug_assert_eq!(output.len() - start, exact_len);
+        Ok(())
     }
 }
 
@@ -301,5 +330,17 @@ mod tests {
         assert_ne!(first.replay_digest(), deduplicated.replay_digest());
         assert_eq!(first.contract_digest(), contract.digest());
         assert_eq!(first.canonical_contribution_bytes(), Some(138));
+
+        let mut body = Vec::new();
+        first.encode_canonical_body_into(&mut body).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&3_u64.to_be_bytes());
+        for value in [1_i64, 1, 3] {
+            expected.extend_from_slice(&1_u64.to_be_bytes());
+            expected.push(1);
+            expected.extend_from_slice(&value.to_be_bytes());
+        }
+        assert_eq!(body, expected);
+        assert_eq!(first.canonical_body_len(), Ok(body.len()));
     }
 }

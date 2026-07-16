@@ -159,10 +159,15 @@ pub(crate) fn encoded_contribution_len(
             update.canonical_contribution_len()?
         }
         (
-            RuntimeFilterContribution::TopKSummary(_),
-            ContributionCodecExpectation::TopKSummary(_),
-        )
-        | (
+            RuntimeFilterContribution::TopKSummary(summary),
+            ContributionCodecExpectation::TopKSummary(contract),
+        ) => {
+            if summary.contract_digest() != contract.digest() {
+                return Err(ContributionCodecError::SchemaMismatch);
+            }
+            summary.canonical_body_len()?
+        }
+        (
             RuntimeFilterContribution::FinalDomain(_),
             ContributionCodecExpectation::FinalDomain { .. },
         )
@@ -236,6 +241,10 @@ pub(crate) fn decode_contribution(
             WireContributionKind::OrderedBound,
             ContributionCodecExpectation::OrderedBound(contract),
         ) => RuntimeFilterContribution::OrderedBound(decode_ordered_bound_body(body, contract)?),
+        (
+            WireContributionKind::TopKSummary,
+            ContributionCodecExpectation::TopKSummary(contract),
+        ) => RuntimeFilterContribution::TopKSummary(decode_topk_body(body, contract)?),
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let canonical = encode_contribution(&contribution, expectation, payload.len())?;
@@ -294,6 +303,19 @@ fn encode_contribution_with_allocator(
                 update.canonical_contribution_len()?,
             )
         }
+        (
+            RuntimeFilterContribution::TopKSummary(summary),
+            ContributionCodecExpectation::TopKSummary(contract),
+        ) => {
+            if summary.contract_digest() != contract.digest() {
+                return Err(ContributionCodecError::SchemaMismatch);
+            }
+            (
+                WireContributionKind::TopKSummary,
+                contract.digest().bytes(),
+                summary.canonical_body_len()?,
+            )
+        }
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let body_len = u64::try_from(body_len).map_err(|_| ContributionCodecError::LengthOverflow)?;
@@ -310,6 +332,9 @@ fn encode_contribution_with_allocator(
         }
         RuntimeFilterContribution::OrderedBound(update) => {
             update.encode_bound_canonical_into(&mut payload)?;
+        }
+        RuntimeFilterContribution::TopKSummary(summary) => {
+            summary.encode_canonical_body_into(&mut payload)?;
         }
         _ => return Err(ContributionCodecError::KindMismatch),
     }
@@ -520,6 +545,46 @@ fn decode_ordered_bound_body(
     contract: &RuntimeOrderContract,
 ) -> Result<OrderedBoundUpdate, ContributionCodecError> {
     let mut reader = Reader::new(body);
+    let tuple = decode_ordered_tuple(&mut reader, contract)?;
+    if !reader.is_empty() {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    OrderedBoundUpdate::new(contract, tuple)
+        .map_err(|_| ContributionCodecError::NonCanonicalPayload)
+}
+
+fn decode_topk_body(
+    body: &[u8],
+    contract: &RuntimeTopKSummaryContract,
+) -> Result<TopKSummary, ContributionCodecError> {
+    let mut reader = Reader::new(body);
+    let candidate_count =
+        usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
+    let installed_k =
+        usize::try_from(contract.k().get()).map_err(|_| ContributionCodecError::LengthOverflow)?;
+    if candidate_count > installed_k {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    let minimum_bytes =
+        minimum_topk_tuple_prefix_bytes(candidate_count, contract.order().keys().len())?;
+    if minimum_bytes > reader.remaining_len() {
+        return Err(ContributionCodecError::Truncated);
+    }
+    let mut candidates = reserve_values(candidate_count)?;
+    for _ in 0..candidate_count {
+        candidates.push(decode_ordered_tuple(&mut reader, contract.order())?);
+    }
+    if !reader.is_empty() {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    TopKSummary::try_new(contract, candidates)
+        .map_err(|_| ContributionCodecError::NonCanonicalPayload)
+}
+
+fn decode_ordered_tuple(
+    reader: &mut Reader<'_>,
+    contract: &RuntimeOrderContract,
+) -> Result<OrderedTuple, ContributionCodecError> {
     let arity =
         usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
     if arity != contract.keys().len() {
@@ -532,16 +597,11 @@ fn decode_ordered_bound_body(
     for key in contract.keys() {
         values.push(match reader.read_u8()? {
             0 => None,
-            1 => Some(decode_ordered_scalar(&mut reader, key.data_type())?),
+            1 => Some(decode_ordered_scalar(reader, key.data_type())?),
             _ => return Err(ContributionCodecError::NonCanonicalPayload),
         });
     }
-    if !reader.is_empty() {
-        return Err(ContributionCodecError::NonCanonicalPayload);
-    }
-    let tuple = OrderedTuple::try_from_codec(contract, values)
-        .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
-    OrderedBoundUpdate::new(contract, tuple)
+    OrderedTuple::try_from_codec(contract, values)
         .map_err(|_| ContributionCodecError::NonCanonicalPayload)
 }
 
@@ -614,6 +674,18 @@ fn ensure_count_bytes(
         return Err(ContributionCodecError::Truncated);
     }
     Ok(())
+}
+
+fn minimum_topk_tuple_prefix_bytes(
+    candidate_count: usize,
+    key_count: usize,
+) -> Result<usize, ContributionCodecError> {
+    let minimum_per_tuple = size_of::<u64>()
+        .checked_add(key_count)
+        .ok_or(ContributionCodecError::LengthOverflow)?;
+    candidate_count
+        .checked_mul(minimum_per_tuple)
+        .ok_or(ContributionCodecError::LengthOverflow)
 }
 
 fn reserve_values<T>(count: usize) -> Result<Vec<T>, ContributionCodecError> {
@@ -714,6 +786,7 @@ mod tests {
     use crate::common::largeint::LARGEINT_BYTE_WIDTH;
     use crate::runtime_filter::model::contract::{
         NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
+        TopKSummaryRequirement,
     };
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
@@ -855,6 +928,54 @@ mod tests {
             expected_len.as_ref().map(|len| *len)
         );
         let encoded = encoded.unwrap();
+        assert_eq!(encoded.schema_digest(), &contract.digest().bytes());
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                encoded.payload().len(),
+            ),
+            Ok(contribution)
+        );
+        encoded
+    }
+
+    fn topk_contract(keys: Vec<OrderKeyContract>, k: u32) -> RuntimeTopKSummaryContract {
+        let order = OrderContract {
+            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            keys,
+            inclusive: true,
+        };
+        RuntimeTopKSummaryContract::try_from_plan(
+            &order,
+            TopKSummaryRequirement::try_new(k).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn topk_summary(
+        contract: &RuntimeTopKSummaryContract,
+        candidates: impl IntoIterator<Item = Vec<Option<OrderedScalar>>>,
+    ) -> RuntimeFilterContribution {
+        let candidates = candidates
+            .into_iter()
+            .map(|values| OrderedTuple::try_new(contract.order(), values).unwrap())
+            .collect();
+        RuntimeFilterContribution::TopKSummary(TopKSummary::try_new(contract, candidates).unwrap())
+    }
+
+    fn assert_topk_round_trip(
+        contract: &RuntimeTopKSummaryContract,
+        candidates: impl IntoIterator<Item = Vec<Option<OrderedScalar>>>,
+    ) -> EncodedContribution {
+        let contribution = topk_summary(contract, candidates);
+        let expectation = ContributionCodecExpectation::TopKSummary(contract);
+        let encoded = encode_contribution(&contribution, expectation, usize::MAX).unwrap();
+        assert_eq!(
+            encoded_contribution_len(&contribution, expectation),
+            Ok(encoded.payload().len())
+        );
         assert_eq!(encoded.schema_digest(), &contract.digest().bytes());
         assert_eq!(
             decode_contribution(
@@ -1523,6 +1644,245 @@ mod tests {
         let exact = encoded_contribution_len(&contribution, expectation);
         assert_eq!(exact, Ok(HEADER_LEN + 8 + 1 + 8 + 5));
         let exact = exact.unwrap();
+
+        assert_eq!(
+            encode_contribution(&contribution, expectation, exact - 1),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        let encoded = encode_contribution(&contribution, expectation, exact).unwrap();
+        assert_eq!(encoded.payload().len(), exact);
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact - 1,
+            ),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact,
+            ),
+            Ok(contribution)
+        );
+    }
+
+    #[test]
+    fn topk_round_trip_accepts_empty_single_and_exact_k_candidates() {
+        let contract = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            3,
+        );
+
+        let empty = assert_topk_round_trip(&contract, []);
+        assert_eq!(empty.payload().len(), HEADER_LEN + 8);
+        let single = assert_topk_round_trip(&contract, [vec![Some(OrderedScalar::Int64(7))]]);
+        assert_eq!(single.payload().len(), HEADER_LEN + 8 + 8 + 1 + 8);
+        assert_topk_round_trip(
+            &contract,
+            [
+                vec![Some(OrderedScalar::Int64(1))],
+                vec![Some(OrderedScalar::Int64(2))],
+                vec![Some(OrderedScalar::Int64(3))],
+            ],
+        );
+    }
+
+    #[test]
+    fn topk_covers_desc_null_order_multikey_utf8_and_decimal() {
+        let descending = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Descending,
+                NullOrder::First,
+            )],
+            3,
+        );
+        assert_topk_round_trip(
+            &descending,
+            [
+                vec![None],
+                vec![Some(OrderedScalar::Int64(9))],
+                vec![Some(OrderedScalar::Int64(1))],
+            ],
+        );
+
+        let multikey = topk_contract(
+            vec![
+                order_key(DataType::Utf8, SortDirection::Ascending, NullOrder::Last),
+                order_key(
+                    DataType::Decimal128(6, 2),
+                    SortDirection::Descending,
+                    NullOrder::First,
+                ),
+            ],
+            3,
+        );
+        assert_topk_round_trip(
+            &multikey,
+            [
+                vec![
+                    Some(OrderedScalar::Utf8(Arc::from("a"))),
+                    Some(OrderedScalar::Decimal128(9999)),
+                ],
+                vec![
+                    Some(OrderedScalar::Utf8(Arc::from("a"))),
+                    Some(OrderedScalar::Decimal128(-9999)),
+                ],
+                vec![Some(OrderedScalar::Utf8(Arc::from("多键"))), None],
+            ],
+        );
+    }
+
+    #[test]
+    fn topk_rejects_over_k_unsorted_wrong_type_and_length_overflow() {
+        let contract = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            2,
+        );
+        let encoded = assert_topk_round_trip(
+            &contract,
+            [
+                vec![Some(OrderedScalar::Int64(1))],
+                vec![Some(OrderedScalar::Int64(2))],
+            ],
+        );
+        let expectation = ContributionCodecExpectation::TopKSummary(&contract);
+
+        let mut over_k = encoded.payload().to_vec();
+        over_k[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&3_u64.to_be_bytes());
+        assert_eq!(
+            decode_contribution(&over_k, encoded.schema_digest(), expectation, usize::MAX,),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let mut unsorted = encoded.payload().to_vec();
+        let first_value = HEADER_LEN + 8 + 8 + 1;
+        let second_value = first_value + 8 + 1 + 8;
+        let first = unsorted[first_value..first_value + 8].to_vec();
+        let second = unsorted[second_value..second_value + 8].to_vec();
+        unsorted[first_value..first_value + 8].copy_from_slice(&second);
+        unsorted[second_value..second_value + 8].copy_from_slice(&first);
+        assert_eq!(
+            decode_contribution(&unsorted, encoded.schema_digest(), expectation, usize::MAX,),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let boolean = topk_contract(
+            vec![order_key(
+                DataType::Boolean,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            1,
+        );
+        let boolean_encoded =
+            assert_topk_round_trip(&boolean, [vec![Some(OrderedScalar::Boolean(true))]]);
+        let mut wrong_type = boolean_encoded.payload().to_vec();
+        wrong_type[HEADER_LEN + 8 + 8 + 1] = 2;
+        assert_eq!(
+            decode_contribution(
+                &wrong_type,
+                boolean_encoded.schema_digest(),
+                ContributionCodecExpectation::TopKSummary(&boolean),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        assert_eq!(
+            minimum_topk_tuple_prefix_bytes(usize::MAX, 1),
+            Err(ContributionCodecError::LengthOverflow)
+        );
+
+        let mut missing_presence_markers =
+            encoded.payload()[..HEADER_LEN + 8 + (2 * (8 + 1)) - 1].to_vec();
+        let body_len = missing_presence_markers.len() - HEADER_LEN;
+        missing_presence_markers[40..48].copy_from_slice(&(body_len as u64).to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &missing_presence_markers,
+                encoded.schema_digest(),
+                expectation,
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::Truncated)
+        );
+    }
+
+    #[test]
+    fn topk_uses_install_frozen_k_and_digest() {
+        let installed = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            2,
+        );
+        let different_k = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            3,
+        );
+        let contribution = topk_summary(&installed, [vec![Some(OrderedScalar::Int64(7))]]);
+        assert_eq!(
+            encode_contribution(
+                &contribution,
+                ContributionCodecExpectation::TopKSummary(&different_k),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let encoded = encode_contribution(
+            &contribution,
+            ContributionCodecExpectation::TopKSummary(&installed),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                ContributionCodecExpectation::TopKSummary(&different_k),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn topk_exact_limit_succeeds_and_limit_minus_one_fails() {
+        let contract = topk_contract(
+            vec![order_key(
+                DataType::Utf8,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            1,
+        );
+        let contribution = topk_summary(
+            &contract,
+            [vec![Some(OrderedScalar::Utf8(Arc::from("exact")))]],
+        );
+        let expectation = ContributionCodecExpectation::TopKSummary(&contract);
+        let exact = encoded_contribution_len(&contribution, expectation).unwrap();
 
         assert_eq!(
             encode_contribution(&contribution, expectation, exact - 1),
