@@ -31,6 +31,9 @@ mod sqlite;
 #[cfg(feature = "foundationdb-provider")]
 mod foundationdb;
 
+#[cfg(feature = "mysql-state-store-provider")]
+pub mod mysql;
+
 #[cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 #[doc(hidden)]
 pub use foundationdb::test_support::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
@@ -75,13 +78,14 @@ pub async fn open_state_store(
             #[cfg(feature = "foundationdb-provider")]
             return runtime.open_foundationdb_store(&config).await;
         }
-        StateStoreProviderConfig::Mysql { .. } => Err(StateStoreError::new(
-            StateStoreErrorKind::InvalidConfiguration,
-            if cfg!(feature = "mysql-state-store-provider") {
-                "MySQL provider runtime is not implemented"
-            } else {
-                "MySQL provider is not compiled in"
-            },
-        )),
+        StateStoreProviderConfig::Mysql { .. } => {
+            #[cfg(not(feature = "mysql-state-store-provider"))]
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL provider is not compiled in",
+            ));
+            #[cfg(feature = "mysql-state-store-provider")]
+            return runtime.open_mysql_store(&config, deployment).await;
+        }
     }
 }
