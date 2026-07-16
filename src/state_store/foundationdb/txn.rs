@@ -92,6 +92,14 @@ enum CommitPreparation {
     Immediate(CommitOutcome),
 }
 
+enum PrepareErrorDecision {
+    DurableFallback(CommitOutcome),
+}
+
+fn decide_prepare_error(error: StateStoreError) -> PrepareErrorDecision {
+    PrepareErrorDecision::DurableFallback(classify_precommit_error(error))
+}
+
 impl FoundationDbStateStore {
     pub(super) fn begin_read_transaction(
         &self,
@@ -320,7 +328,21 @@ impl FoundationDbWriteTransaction {
                 Ok(record) => record,
                 Err(error) => {
                     record_provider_error_metric(self.metrics.as_ref(), &error);
-                    return CommitPreparation::Immediate(classify_precommit_error(error));
+                    let PrepareErrorDecision::DurableFallback(outcome) =
+                        decide_prepare_error(error);
+                    drop(transaction);
+                    return CommitPreparation::DurableFailure(
+                        PreparedFailure {
+                            database: self.database,
+                            codec: self.codec,
+                            limits: self.limits,
+                            deadline: self.deadline,
+                            metrics: self.metrics,
+                            _operation: self.operation,
+                            transaction_id: self.transaction_id,
+                        },
+                        outcome,
+                    );
                 }
             };
             base.insert(key.clone(), record);
@@ -814,6 +836,33 @@ mod tests {
                 matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
                 expect_transient,
                 "unexpected classification for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_errors_require_an_authoritative_durable_state_fallback() {
+        for kind in [
+            StateStoreErrorKind::Corruption,
+            StateStoreErrorKind::InvalidRequest,
+            StateStoreErrorKind::Internal,
+            StateStoreErrorKind::Transient,
+            StateStoreErrorKind::ProviderUnavailable,
+            StateStoreErrorKind::DeadlineExceeded,
+            StateStoreErrorKind::LimitExceeded,
+        ] {
+            let PrepareErrorDecision::DurableFallback(outcome) =
+                decide_prepare_error(StateStoreError::new(kind, "prepare error"))
+            else {
+                panic!("prepare errors must not bypass durable commit-state resolution");
+            };
+            assert_eq!(
+                matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
+                matches!(
+                    kind,
+                    StateStoreErrorKind::Transient | StateStoreErrorKind::ProviderUnavailable
+                ),
+                "unexpected local classification for {kind:?}"
             );
         }
     }

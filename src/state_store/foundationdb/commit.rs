@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -75,6 +76,7 @@ enum ReservationCommitFailureDecision {
         reservation_may_exist: bool,
         foreign_state_may_exist: bool,
     },
+    Cleanup(CommitOutcome),
     Outcome(CommitOutcome),
 }
 
@@ -249,6 +251,14 @@ enum TerminalizationDecision {
     PreserveUnknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndispatchedReservationCleanupDecision {
+    WriteNotCommitted,
+    AlreadyNotCommitted,
+    PreserveForeignPending,
+    PreserveCommitted,
+}
+
 fn decide_terminalization(
     observed: Option<&DurableCommitState>,
     reservation_token: [u8; 16],
@@ -260,6 +270,27 @@ fn decide_terminalization(
         Some(DurableCommitState::NotCommitted) => TerminalizationDecision::AlreadyNotCommitted,
         None | Some(DurableCommitState::Pending(_)) | Some(DurableCommitState::Committed(_)) => {
             TerminalizationDecision::PreserveUnknown
+        }
+    }
+}
+
+fn decide_undispatched_reservation_cleanup(
+    observed: Option<&DurableCommitState>,
+    reservation_token: [u8; 16],
+) -> UndispatchedReservationCleanupDecision {
+    match observed {
+        None => UndispatchedReservationCleanupDecision::WriteNotCommitted,
+        Some(DurableCommitState::Pending(token)) if *token == reservation_token => {
+            UndispatchedReservationCleanupDecision::WriteNotCommitted
+        }
+        Some(DurableCommitState::NotCommitted) => {
+            UndispatchedReservationCleanupDecision::AlreadyNotCommitted
+        }
+        Some(DurableCommitState::Pending(_)) => {
+            UndispatchedReservationCleanupDecision::PreserveForeignPending
+        }
+        Some(DurableCommitState::Committed(_)) => {
+            UndispatchedReservationCleanupDecision::PreserveCommitted
         }
     }
 }
@@ -344,6 +375,24 @@ fn decide_pre_dispatch_failure(
     }
 }
 
+fn immediate_pre_dispatch_failure_outcome(
+    observed: Option<&DurableCommitState>,
+    transaction_id: TransactionId,
+) -> Option<CommitOutcome> {
+    match decide_pre_dispatch_failure(observed) {
+        PreDispatchFailureDecision::PersistNotCommitted => None,
+        PreDispatchFailureDecision::RejectReuse => {
+            Some(CommitOutcome::DefiniteFailure(invalid_reuse()))
+        }
+        PreDispatchFailureDecision::ReturnCommitted(revision) => {
+            Some(committed(transaction_id, revision))
+        }
+        PreDispatchFailureDecision::PendingUnknown => {
+            Some(CommitOutcome::CommitUnknown(foreign_pending()))
+        }
+    }
+}
+
 fn decide_reservation_commit_failure(
     error: FdbError,
     has_remaining_attempt: bool,
@@ -368,7 +417,9 @@ fn decide_reservation_commit_failure(
             CommitOutcome::TransientBeforeCommit(provider_transient())
         }
         NativeCommitDisposition::Unknown => {
-            CommitOutcome::TransientBeforeCommit(provider_transient())
+            return ReservationCommitFailureDecision::Cleanup(CommitOutcome::CommitUnknown(
+                provider_unknown(),
+            ));
         }
         NativeCommitDisposition::DefiniteNotCommitted => unreachable!(),
     };
@@ -459,6 +510,17 @@ pub(super) async fn supervise_pre_dispatch_failure(
     })
 }
 
+fn spawn_provider_owned_cleanup<G, F>(operation_guard: G, cleanup: F) -> tokio::task::JoinHandle<()>
+where
+    G: Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _operation_guard = operation_guard;
+        cleanup.await;
+    })
+}
+
 async fn persist_pre_dispatch_failure(
     prepared: PreparedFailure,
     local_outcome: CommitOutcome,
@@ -498,49 +560,38 @@ async fn persist_pre_dispatch_failure(
             }
             Err(error) => return CommitOutcome::CommitUnknown(error),
         };
-        match decide_pre_dispatch_failure(state.as_ref()) {
-            PreDispatchFailureDecision::ReturnCommitted(revision) => {
-                return committed(prepared.transaction_id, revision);
+        if let Some(outcome) =
+            immediate_pre_dispatch_failure_outcome(state.as_ref(), prepared.transaction_id)
+        {
+            return outcome;
+        }
+        transaction.set(&state_key, &prepared.codec.not_committed_value());
+        match timeout_at(deadline, transaction.commit()).await {
+            Ok(Ok(committed)) => {
+                drop(committed);
+                return local_outcome;
             }
-            PreDispatchFailureDecision::PendingUnknown => {
-                return CommitOutcome::CommitUnknown(foreign_pending());
-            }
-            PreDispatchFailureDecision::RejectReuse => {
-                return CommitOutcome::DefiniteFailure(invalid_reuse());
-            }
-            PreDispatchFailureDecision::PersistNotCommitted => {
-                transaction.set(&state_key, &prepared.codec.not_committed_value());
-                match timeout_at(deadline, transaction.commit()).await {
-                    Ok(Ok(committed)) => {
-                        drop(committed);
-                        return local_outcome;
-                    }
-                    Ok(Err(error)) => {
-                        let error = *error;
-                        let disposition = classify_native_commit_error(error);
-                        record_native_error(
-                            prepared.metrics.as_ref(),
-                            prepared.transaction_id,
-                            CommitStatePhase::PreDispatchTombstone,
-                            error,
-                            disposition,
-                        );
-                        if should_retry_auxiliary_commit(error)
-                            && budget.has_remaining()
-                            && Instant::now() < deadline
-                        {
-                            continue;
-                        }
-                        return CommitOutcome::CommitUnknown(provider_unknown());
-                    }
-                    Err(_) => {
-                        record_auxiliary_metric(
-                            prepared.metrics.as_ref(),
-                            AuxiliaryMetricEvent::Deadline,
-                        );
-                        return CommitOutcome::CommitUnknown(deadline_unknown());
-                    }
+            Ok(Err(error)) => {
+                let error = *error;
+                let disposition = classify_native_commit_error(error);
+                record_native_error(
+                    prepared.metrics.as_ref(),
+                    prepared.transaction_id,
+                    CommitStatePhase::PreDispatchTombstone,
+                    error,
+                    disposition,
+                );
+                if should_retry_auxiliary_commit(error)
+                    && budget.has_remaining()
+                    && Instant::now() < deadline
+                {
+                    continue;
                 }
+                return CommitOutcome::CommitUnknown(provider_unknown());
+            }
+            Err(_) => {
+                record_auxiliary_metric(prepared.metrics.as_ref(), AuxiliaryMetricEvent::Deadline);
+                return CommitOutcome::CommitUnknown(deadline_unknown());
             }
         }
     }
@@ -562,6 +613,10 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
         ReservationResult::Dispatch => {}
         ReservationResult::Committed(revision) => {
             return committed(prepared.transaction_id, revision);
+        }
+        ReservationResult::Cleanup(outcome) => {
+            launch_undispatched_reservation_cleanup(prepared, reservation_token);
+            return outcome;
         }
         ReservationResult::Outcome(outcome) => return outcome,
     }
@@ -660,7 +715,34 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
 enum ReservationResult {
     Dispatch,
     Committed([u8; REVISION_BYTES]),
+    Cleanup(CommitOutcome),
     Outcome(CommitOutcome),
+}
+
+fn launch_undispatched_reservation_cleanup(prepared: PreparedCommit, reservation_token: [u8; 16]) {
+    let PreparedCommit {
+        database,
+        transaction,
+        codec,
+        limits,
+        metrics,
+        _operation,
+        transaction_id,
+        ..
+    } = prepared;
+    drop(transaction);
+    let cleanup = async move {
+        terminalize_undispatched_reservation(
+            database.as_ref(),
+            &codec,
+            &limits,
+            transaction_id,
+            reservation_token,
+            metrics.as_ref(),
+        )
+        .await;
+    };
+    let _cleanup_owner = spawn_provider_owned_cleanup(_operation, cleanup);
 }
 
 async fn reserve_commit_state(
@@ -689,11 +771,16 @@ async fn reserve_commit_state(
         ) {
             Ok(transaction) => transaction,
             Err(error) => {
-                return ReservationResult::Outcome(classify_reservation_read_error(
+                let outcome = classify_reservation_read_error(
                     error,
                     reservation_may_exist,
                     foreign_state_may_exist,
-                ));
+                );
+                return if reservation_may_exist && !foreign_state_may_exist {
+                    ReservationResult::Cleanup(outcome)
+                } else {
+                    ReservationResult::Outcome(outcome)
+                };
             }
         };
         let observed = match load_commit_state(
@@ -712,11 +799,16 @@ async fn reserve_commit_state(
                 if is_retryable_auxiliary_error(&error) && Instant::now() < deadline {
                     continue;
                 }
-                return ReservationResult::Outcome(classify_reservation_read_error(
+                let outcome = classify_reservation_read_error(
                     error,
                     reservation_may_exist,
                     foreign_state_may_exist,
-                ));
+                );
+                return if reservation_may_exist && !foreign_state_may_exist {
+                    ReservationResult::Cleanup(outcome)
+                } else {
+                    ReservationResult::Outcome(outcome)
+                };
             }
         };
         reservation_may_exist = false;
@@ -763,16 +855,99 @@ async fn reserve_commit_state(
                             ReservationCommitFailureDecision::Outcome(outcome) => {
                                 return ReservationResult::Outcome(outcome);
                             }
+                            ReservationCommitFailureDecision::Cleanup(outcome) => {
+                                return ReservationResult::Cleanup(outcome);
+                            }
                         }
                     }
                     Err(_) => {
                         record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
-                        return ReservationResult::Outcome(CommitOutcome::TransientBeforeCommit(
-                            deadline_error(),
+                        return ReservationResult::Cleanup(CommitOutcome::CommitUnknown(
+                            deadline_unknown(),
                         ));
                     }
                 }
             }
+        }
+    }
+}
+
+async fn terminalize_undispatched_reservation(
+    database: &Database,
+    codec: &KeyspaceCodec,
+    limits: &StateStoreLimits,
+    transaction_id: TransactionId,
+    reservation_token: [u8; 16],
+    metrics: &StateStoreMetrics,
+) {
+    let deadline = Instant::now() + AUXILIARY_DEADLINE;
+    let mut budget = AuxiliaryAttemptBudget::new();
+    let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
+    loop {
+        let transaction = match create_auxiliary_transaction(
+            database,
+            limits,
+            deadline,
+            &mut budget,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Terminalization,
+        ) {
+            Ok(transaction) => transaction,
+            Err(_) => return,
+        };
+        let state = match load_commit_state(
+            &transaction,
+            codec,
+            &state_key,
+            deadline,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Terminalization,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                continue;
+            }
+            Err(_) => return,
+        };
+        match decide_undispatched_reservation_cleanup(state.as_ref(), reservation_token) {
+            UndispatchedReservationCleanupDecision::WriteNotCommitted => {
+                transaction.set(&state_key, &codec.not_committed_value());
+                match timeout_at(deadline, transaction.commit()).await {
+                    Ok(Ok(committed)) => {
+                        drop(committed);
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        let error = *error;
+                        let disposition = classify_native_commit_error(error);
+                        record_native_error(
+                            metrics,
+                            transaction_id,
+                            CommitStatePhase::Terminalization,
+                            error,
+                            disposition,
+                        );
+                        if should_retry_auxiliary_commit(error)
+                            && budget.has_remaining()
+                            && Instant::now() < deadline
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        record_auxiliary_metric(metrics, AuxiliaryMetricEvent::Deadline);
+                        return;
+                    }
+                }
+            }
+            UndispatchedReservationCleanupDecision::AlreadyNotCommitted
+            | UndispatchedReservationCleanupDecision::PreserveForeignPending
+            | UndispatchedReservationCleanupDecision::PreserveCommitted => return,
         }
     }
 }
@@ -1009,14 +1184,13 @@ fn classify_reservation_read_error(
     reservation_commit_unknown: bool,
     foreign_state_may_exist: bool,
 ) -> CommitOutcome {
-    if foreign_state_may_exist {
+    if foreign_state_may_exist || reservation_commit_unknown {
         return CommitOutcome::CommitUnknown(error);
     }
     match error.kind() {
         StateStoreErrorKind::Transient
         | StateStoreErrorKind::ProviderUnavailable
         | StateStoreErrorKind::DeadlineExceeded => CommitOutcome::TransientBeforeCommit(error),
-        _ if reservation_commit_unknown => CommitOutcome::CommitUnknown(error),
         _ => CommitOutcome::DefiniteFailure(error),
     }
 }
@@ -1170,7 +1344,7 @@ mod tests {
             ));
             assert!(matches!(
                 classify_reservation_read_error(StateStoreError::new(kind, "test"), true, false),
-                CommitOutcome::TransientBeforeCommit(_)
+                CommitOutcome::CommitUnknown(_)
             ));
         }
         for kind in [
@@ -1243,6 +1417,41 @@ mod tests {
     }
 
     #[test]
+    fn prepare_error_durable_fallback_only_returns_a_committed_receipt_for_committed_state() {
+        let transaction_id = TransactionId::from(Uuid::from_bytes([0xa1; 16]));
+        let revision = [0xa2; REVISION_BYTES];
+        assert!(matches!(
+            immediate_pre_dispatch_failure_outcome(
+                Some(&DurableCommitState::Committed(revision)),
+                transaction_id
+            ),
+            Some(CommitOutcome::Committed(ref receipt))
+                if receipt.transaction_id == transaction_id
+                    && receipt.revision.as_bytes() == revision
+        ));
+        assert!(matches!(
+            immediate_pre_dispatch_failure_outcome(
+                Some(&DurableCommitState::NotCommitted),
+                transaction_id
+            ),
+            Some(CommitOutcome::DefiniteFailure(ref error))
+                if error.kind() == StateStoreErrorKind::InvalidRequest
+        ));
+        assert!(matches!(
+            immediate_pre_dispatch_failure_outcome(
+                Some(&DurableCommitState::Pending([0xa3; 16])),
+                transaction_id
+            ),
+            Some(CommitOutcome::CommitUnknown(ref error))
+                if error.kind() == StateStoreErrorKind::Conflict
+        ));
+        assert!(
+            immediate_pre_dispatch_failure_outcome(None, transaction_id).is_none(),
+            "an absent ledger must persist NotCommitted before returning the prepare error"
+        );
+    }
+
+    #[test]
     fn exhausted_reservation_conflict_fails_closed_without_widening_safe_transients() {
         let mut budget = AuxiliaryAttemptBudget::new();
         for _ in 0..AUXILIARY_MAX_ATTEMPTS {
@@ -1272,8 +1481,8 @@ mod tests {
                 FdbError::from_code(1021),
                 budget.has_remaining()
             ),
-            ReservationCommitFailureDecision::Outcome(
-                CommitOutcome::TransientBeforeCommit(ref error)
+            ReservationCommitFailureDecision::Cleanup(
+                CommitOutcome::CommitUnknown(ref error)
             ) if error.kind() == StateStoreErrorKind::Transient
         ));
         assert!(matches!(
@@ -1557,5 +1766,97 @@ mod tests {
                 TerminalizationDecision::PreserveUnknown
             );
         }
+    }
+
+    #[test]
+    fn undispatched_reservation_cleanup_never_steals_a_foreign_terminal_state() {
+        let ours = [0x91; 16];
+        assert_eq!(
+            decide_undispatched_reservation_cleanup(None, ours),
+            UndispatchedReservationCleanupDecision::WriteNotCommitted
+        );
+        assert_eq!(
+            decide_undispatched_reservation_cleanup(Some(&DurableCommitState::Pending(ours)), ours),
+            UndispatchedReservationCleanupDecision::WriteNotCommitted
+        );
+        assert_eq!(
+            decide_undispatched_reservation_cleanup(Some(&DurableCommitState::NotCommitted), ours),
+            UndispatchedReservationCleanupDecision::AlreadyNotCommitted
+        );
+        assert_eq!(
+            decide_undispatched_reservation_cleanup(
+                Some(&DurableCommitState::Pending([0x92; 16])),
+                ours
+            ),
+            UndispatchedReservationCleanupDecision::PreserveForeignPending
+        );
+        assert_eq!(
+            decide_undispatched_reservation_cleanup(
+                Some(&DurableCommitState::Committed([0x93; REVISION_BYTES])),
+                ours
+            ),
+            UndispatchedReservationCleanupDecision::PreserveCommitted
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_owned_cleanup_outlives_its_detached_waiter_and_holds_runtime_guard() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        struct TestOperationGuard {
+            in_flight: Arc<AtomicUsize>,
+        }
+
+        impl Drop for TestOperationGuard {
+            fn drop(&mut self) {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let cleanup_started = Arc::new(Notify::new());
+        let allow_cleanup = Arc::new(Notify::new());
+        let cleanup_completed = Arc::new(Notify::new());
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let owner = spawn_provider_owned_cleanup(
+            TestOperationGuard {
+                in_flight: Arc::clone(&in_flight),
+            },
+            {
+                let cleanup_started = Arc::clone(&cleanup_started);
+                let allow_cleanup = Arc::clone(&allow_cleanup);
+                let cleanup_completed = Arc::clone(&cleanup_completed);
+                let cleanup_finished = Arc::clone(&cleanup_finished);
+                async move {
+                    cleanup_started.notify_one();
+                    allow_cleanup.notified().await;
+                    cleanup_finished.store(true, Ordering::Release);
+                    cleanup_completed.notify_one();
+                }
+            },
+        );
+
+        cleanup_started.notified().await;
+        drop(owner);
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
+        assert!(!cleanup_finished.load(Ordering::Acquire));
+
+        allow_cleanup.notify_one();
+        timeout_at(
+            Instant::now() + Duration::from_secs(1),
+            cleanup_completed.notified(),
+        )
+        .await
+        .expect("detached cleanup owner must finish");
+        timeout_at(Instant::now() + Duration::from_secs(1), async {
+            while in_flight.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup owner must release the runtime guard");
+        assert!(cleanup_finished.load(Ordering::Acquire));
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 }
