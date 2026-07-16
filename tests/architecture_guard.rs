@@ -36373,7 +36373,20 @@ impl Rfd4M2b1GuardSource {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Rfd4M2b1TypeScope {
     bindings: BTreeMap<String, BTreeSet<String>>,
+    namespaces: BTreeMap<String, BTreeSet<Rfd4M2b1NamespaceTarget>>,
     shadows: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Rfd4M2b1NamespaceTarget {
+    path: Vec<String>,
+    scope: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Rfd4M2b1ResolvedNamespace {
+    Local(Vec<String>),
+    Canonical(Vec<String>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -36390,11 +36403,39 @@ impl Rfd4M2b1TypeResolver {
         };
         let mut type_aliases = Vec::new();
         let mut scoped_imports = Vec::new();
+        let mut scoped_globs = Vec::new();
         resolver.collect_items(&file.items, &mut Vec::new(), &mut type_aliases);
 
         let aliases = rust_scoped_aliases(production);
         for raw in rust_raw_use_statements(production) {
             let import_scope = raw.inline_modules.clone();
+            let is_glob = raw
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment == "*");
+            if is_glob {
+                let module_path = &raw.path.segments[..raw.path.segments.len() - 1];
+                let resolved = rust_resolve_scoped_paths(
+                    module_path,
+                    &raw.inline_modules,
+                    &aliases,
+                    &mut BTreeSet::new(),
+                    0,
+                )
+                .unwrap_or_else(|| {
+                    vec![RustScopedUsePath {
+                        segments: module_path.to_vec(),
+                        inline_modules: raw.inline_modules,
+                    }]
+                });
+                scoped_globs.extend(
+                    resolved
+                        .into_iter()
+                        .map(|path| (import_scope.clone(), path.segments)),
+                );
+                continue;
+            }
             let local = match raw.path.alias.as_deref() {
                 Some("_") => None,
                 Some(alias) => Some(alias.to_string()),
@@ -36423,6 +36464,17 @@ impl Rfd4M2b1TypeResolver {
             });
             for path in resolved {
                 scoped_imports.push((import_scope.clone(), local.clone(), path.segments.clone()));
+                resolver
+                    .scopes
+                    .entry(import_scope.clone())
+                    .or_default()
+                    .namespaces
+                    .entry(local.clone())
+                    .or_default()
+                    .insert(Rfd4M2b1NamespaceTarget {
+                        path: path.segments.clone(),
+                        scope: path.inline_modules.clone(),
+                    });
                 let Some(canonical) = rust_canonical_path_segments_in_scope(
                     &path.segments,
                     source_rel,
@@ -36455,7 +36507,7 @@ impl Rfd4M2b1TypeResolver {
                 .remove(&local);
         }
 
-        for _ in 0..=type_aliases.len() + scoped_imports.len() {
+        for _ in 0..=type_aliases.len() + scoped_imports.len() + scoped_globs.len() {
             let before = resolver.scopes.clone();
             for (scope, alias) in &type_aliases {
                 for symbol in [
@@ -36490,6 +36542,52 @@ impl Rfd4M2b1TypeResolver {
                             .entry(local.clone())
                             .or_default()
                             .insert(symbol.to_string());
+                    }
+                }
+            }
+            for (scope, module_path) in &scoped_globs {
+                let targets =
+                    resolver.resolve_namespace_path(module_path, scope, &mut BTreeSet::new(), 0);
+                for target in targets {
+                    match target {
+                        Rfd4M2b1ResolvedNamespace::Local(target_scope) => {
+                            let bindings = resolver
+                                .scopes
+                                .get(&target_scope)
+                                .map(|scope| scope.bindings.clone())
+                                .unwrap_or_default();
+                            for (name, symbols) in bindings {
+                                let destination = resolver.scopes.entry(scope.clone()).or_default();
+                                if !destination.shadows.contains(&name) {
+                                    destination
+                                        .bindings
+                                        .entry(name)
+                                        .or_default()
+                                        .extend(symbols);
+                                }
+                            }
+                        }
+                        Rfd4M2b1ResolvedNamespace::Canonical(module) => {
+                            for symbol in [
+                                "RuntimeFilterInstallView",
+                                "RuntimeFilterParticipantInstall",
+                                "RoleRouter",
+                            ] {
+                                let mut path = module.clone();
+                                path.push(symbol.to_string());
+                                if rfd4_m2b1_canonical_symbol_path(&path, symbol) {
+                                    let destination =
+                                        resolver.scopes.entry(scope.clone()).or_default();
+                                    if !destination.shadows.contains(symbol) {
+                                        destination
+                                            .bindings
+                                            .entry(symbol.to_string())
+                                            .or_default()
+                                            .insert(symbol.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -36561,16 +36659,66 @@ impl Rfd4M2b1TypeResolver {
         if rfd4_m2b1_canonical_symbol_path(&segments, symbol) {
             return true;
         }
+        let Some((owner, modules)) = segments.split_last() else {
+            return false;
+        };
+        for namespace in self.resolve_namespace_path(modules, scope, &mut BTreeSet::new(), 0) {
+            match namespace {
+                Rfd4M2b1ResolvedNamespace::Local(target_scope) => {
+                    let target = self.scopes.get(&target_scope);
+                    if target
+                        .and_then(|scope| scope.bindings.get(owner))
+                        .is_some_and(|symbols| symbols.contains(symbol))
+                    {
+                        return true;
+                    }
+                    if modules.is_empty()
+                        && owner == symbol
+                        && !target.is_some_and(|scope| scope.shadows.contains(owner))
+                    {
+                        return true;
+                    }
+                }
+                Rfd4M2b1ResolvedNamespace::Canonical(mut module) => {
+                    module.push(owner.clone());
+                    if rfd4_m2b1_canonical_symbol_path(&module, symbol) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_namespace_path(
+        &self,
+        segments: &[String],
+        scope: &[String],
+        resolving: &mut BTreeSet<(Vec<String>, String)>,
+        depth: usize,
+    ) -> BTreeSet<Rfd4M2b1ResolvedNamespace> {
+        if depth > self.scopes.len() {
+            return BTreeSet::new();
+        }
+        if segments.is_empty() {
+            return [Rfd4M2b1ResolvedNamespace::Local(scope.to_vec())]
+                .into_iter()
+                .collect();
+        }
+
         let mut target_scope = scope.to_vec();
         let mut owner_index = 0usize;
+        let mut crate_qualified = false;
         if segments
             .get(owner_index)
             .is_some_and(|segment| segment == "crate")
         {
+            crate_qualified = true;
             target_scope.clear();
             owner_index += 1;
             if segments[owner_index..].starts_with(&self.source_module) {
                 owner_index += self.source_module.len();
+                crate_qualified = false;
             }
         }
         while segments
@@ -36584,26 +36732,62 @@ impl Rfd4M2b1TypeResolver {
             .is_some_and(|segment| segment == "super")
         {
             if target_scope.pop().is_none() {
-                return false;
+                return BTreeSet::new();
             }
             owner_index += 1;
         }
         let remaining = &segments[owner_index..];
-        let Some((owner, modules)) = remaining.split_last() else {
-            return false;
-        };
-        target_scope.extend(modules.iter().cloned());
-        let scope = self.scopes.get(&target_scope);
-        if !modules.is_empty() && scope.is_none() {
-            return false;
+        if remaining.is_empty() {
+            return [Rfd4M2b1ResolvedNamespace::Local(target_scope)]
+                .into_iter()
+                .collect();
         }
-        if scope
-            .and_then(|scope| scope.bindings.get(owner))
-            .is_some_and(|symbols| symbols.contains(symbol))
+        if crate_qualified {
+            return [Rfd4M2b1ResolvedNamespace::Canonical(segments.to_vec())]
+                .into_iter()
+                .collect();
+        }
+
+        let owner = &remaining[0];
+        let key = (target_scope.clone(), owner.clone());
+        if let Some(targets) = self
+            .scopes
+            .get(&target_scope)
+            .and_then(|scope| scope.namespaces.get(owner))
+            && resolving.insert(key.clone())
         {
-            return true;
+            let mut resolved = BTreeSet::new();
+            for target in targets {
+                for namespace in
+                    self.resolve_namespace_path(&target.path, &target.scope, resolving, depth + 1)
+                {
+                    let suffix = &remaining[1..];
+                    match namespace {
+                        Rfd4M2b1ResolvedNamespace::Local(mut module) => {
+                            module.extend(suffix.iter().cloned());
+                            if self.scopes.contains_key(&module) {
+                                resolved.insert(Rfd4M2b1ResolvedNamespace::Local(module));
+                            }
+                        }
+                        Rfd4M2b1ResolvedNamespace::Canonical(mut module) => {
+                            module.extend(suffix.iter().cloned());
+                            resolved.insert(Rfd4M2b1ResolvedNamespace::Canonical(module));
+                        }
+                    }
+                }
+            }
+            resolving.remove(&key);
+            if !resolved.is_empty() {
+                return resolved;
+            }
         }
-        owner == symbol && !scope.is_some_and(|scope| scope.shadows.contains(owner))
+
+        target_scope.extend(remaining.iter().cloned());
+        self.scopes
+            .contains_key(&target_scope)
+            .then(|| Rfd4M2b1ResolvedNamespace::Local(target_scope))
+            .into_iter()
+            .collect()
     }
 
     fn type_is_exact_symbol(&self, ty: &syn::Type, symbol: &str, scope: &[String]) -> bool {
@@ -37616,6 +37800,82 @@ fn rfd4_m2b1_detector_resolves_qualified_inline_module_view_aliases() {
             .iter()
             .any(|violation| violation.contains("view-only-install")),
         "qualified module descent must preserve an unrelated sibling shadow: {shadowed:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_inline_module_namespace_aliases() {
+    let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         use self::hidden as install_types; \
+         pub(crate) fn publish(view: install_types::View) {}",
+    )]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "an inline-module namespace alias must preserve protected type authority: {violations:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_inline_and_external_authority_globs() {
+    for source in [
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         use self::hidden::*; \
+         pub(crate) fn publish(view: View) {}",
+        "use crate::runtime_filter::port::install::*; \
+         pub(crate) fn publish(view: RuntimeFilterInstallView) {}",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "authority globs must propagate protected raw-view types: {source}: {violations:?}"
+        );
+    }
+
+    let shadowed = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         use self::hidden::*; \
+         struct View; \
+         pub(crate) fn inspect(view: View) {}",
+    )]);
+    assert!(
+        !shadowed
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "an explicit local definition must shadow a protected glob import: {shadowed:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_canonical_authority_namespace_aliases() {
+    let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "use crate::runtime_filter::router::role_graph as routing; \
+         struct RoutingState { router: Arc<routing::RoleRouter> }",
+    )]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("role-router-storage")),
+        "a canonical module namespace alias must preserve RoleRouter authority: {violations:?}"
     );
 }
 
