@@ -10622,6 +10622,2024 @@ fn ebd_4b3c_planner_scan_model_owner_is_complete() {
     );
 }
 
+const EBD_4B3G_OWNER: &str = "src/connector/iceberg/scan_range.rs";
+const EBD_4B3G_COORDINATOR: &str = "src/coordinator/prepare/scan_preparation.rs";
+const EBD_4B3G_APIS: &[&str] = &[
+    "equality_delete_required_columns",
+    "plan_iceberg_scan_ranges",
+];
+const EBD_4B3G_CONCRETE_ADAPTER_INPUTS: &[&str] = &[
+    "ScanHandle",
+    "Split",
+    "IcebergScanHandle",
+    "IcebergSplit",
+    "IcebergDataFileInfo",
+    "IcebergDeleteFileInfo",
+];
+const EBD_4B3G_OPERATION_SYMBOLS: &[&str] = &[
+    "ConnectorScanContext",
+    "NativeFileScanPlan",
+    "PruningColumn",
+    "to_native_file_scan",
+    "iceberg_to_native_file_scan",
+    "build_iceberg_native_scan_ranges",
+    "pruning_columns_for_scan",
+    "build_native_file_scan_range_params_for_file",
+    "native_file_pruning_min_max_values",
+    "find_column_stats",
+    "native_min_max_value_from_stats",
+    "decode_bool_bound",
+    "decode_int_bound_for_type",
+    "decode_float_bound_for_type",
+    "plan_hdfs_file_splits",
+    "validate_iceberg_delete_apply_cost",
+    "build_native_file_scan_range_params",
+    "equality_delete_required_columns",
+    "IcebergScanRangeContext",
+    "PlannedIcebergScanRanges",
+    "plan_iceberg_scan_ranges",
+];
+const EBD_4B3G_REQUIRED_OWNER_SYMBOLS: &[&str] = &[
+    "IcebergScanRangeContext",
+    "PlannedIcebergScanRanges",
+    "equality_delete_required_columns",
+    "plan_iceberg_scan_ranges",
+];
+const EBD_4B3G_EXCLUSIVE_OWNER_SYMBOLS: &[&str] = &[
+    "ConnectorScanContext",
+    "NativeFileScanPlan",
+    "PruningColumn",
+    "to_native_file_scan",
+    "iceberg_to_native_file_scan",
+    "build_iceberg_native_scan_ranges",
+    "pruning_columns_for_scan",
+    "build_native_file_scan_range_params_for_file",
+    "native_file_pruning_min_max_values",
+    "plan_hdfs_file_splits",
+    "validate_iceberg_delete_apply_cost",
+    "build_native_file_scan_range_params",
+    "equality_delete_required_columns",
+    "IcebergScanRangeContext",
+    "PlannedIcebergScanRanges",
+    "plan_iceberg_scan_ranges",
+];
+
+fn ebd_4b3g_connector_scan_range_path(path: &[String]) -> bool {
+    path.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .starts_with(&["crate", "connector", "iceberg", "scan_range"])
+}
+
+fn ebd_4b3g_api_for_path(path: &[String]) -> Option<&'static str> {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    EBD_4B3G_APIS.iter().copied().find(|api| {
+        segments == ["crate", "connector", "iceberg", "scan_range", *api]
+            || (segments.len() == 1 && segments[0] == *api)
+    })
+}
+
+fn ebd_4b3g_concrete_adapter_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    (segments.starts_with(&["crate", "connector", "scan_planning"])
+        && segments
+            .get(3)
+            .is_some_and(|name| EBD_4B3G_CONCRETE_ADAPTER_INPUTS.contains(name)))
+        || (segments.starts_with(&["crate", "connector", "iceberg", "scan_planner"])
+            && segments
+                .get(4)
+                .is_some_and(|name| EBD_4B3G_CONCRETE_ADAPTER_INPUTS.contains(name)))
+        || (segments.starts_with(&["crate", "connector", "iceberg", "scan_model"])
+            && segments
+                .get(4)
+                .is_some_and(|name| EBD_4B3G_CONCRETE_ADAPTER_INPUTS.contains(name)))
+        || segments.starts_with(&["crate", "connector", "iceberg", "file_pruning"])
+}
+
+type Ebd4b3gForwardingMap = BTreeMap<Vec<String>, Vec<Vec<String>>>;
+
+fn ebd_4b3g_forwarding_map(sources: &[GuardSource]) -> Ebd4b3gForwardingMap {
+    let mut forwarding = Ebd4b3gForwardingMap::new();
+    for source in sources {
+        let aliases = rust_production_scoped_aliases(&source.text);
+        let Some(source_module) = rust_source_module_segments(&source.path) else {
+            continue;
+        };
+        for import in rust_raw_production_use_statements(&source.text)
+            .into_iter()
+            .filter(|import| import.visibility != "private")
+        {
+            let Some(export_name) =
+                forwarding_export_name(&import.path.segments, import.path.alias.as_deref())
+            else {
+                continue;
+            };
+            let Some(targets) = resolve_forwarding_paths(
+                &import.path.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            let mut export = source_module.clone();
+            export.extend(import.inline_modules.iter().cloned());
+            export.push(export_name);
+            for target in targets {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                let targets = forwarding.entry(export.clone()).or_default();
+                if !targets.contains(&canonical) {
+                    targets.push(canonical);
+                }
+            }
+        }
+    }
+    forwarding
+}
+
+fn ebd_4b3g_expand_forwarding_path(
+    path: &[String],
+    forwarding: &Ebd4b3gForwardingMap,
+    resolving: &mut BTreeSet<Vec<String>>,
+    depth: usize,
+) -> Vec<Vec<String>> {
+    if depth > forwarding.len() || !resolving.insert(path.to_vec()) {
+        return Vec::new();
+    }
+    let prefix = (1..=path.len())
+        .rev()
+        .find(|length| forwarding.contains_key(&path[..*length]));
+    let mut resolved = BTreeSet::new();
+    if let Some(prefix) = prefix {
+        for target in &forwarding[&path[..prefix]] {
+            let mut candidate = target.clone();
+            candidate.extend_from_slice(&path[prefix..]);
+            resolved.extend(ebd_4b3g_expand_forwarding_path(
+                &candidate,
+                forwarding,
+                resolving,
+                depth + 1,
+            ));
+        }
+    } else {
+        resolved.insert(path.to_vec());
+    }
+    resolving.remove(path);
+    resolved.into_iter().collect()
+}
+
+fn ebd_4b3g_resolve_source_path(
+    path: &[String],
+    source: &GuardSource,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+    local_aliases: &[BTreeMap<String, Vec<Vec<String>>>],
+    forwarding: &Ebd4b3gForwardingMap,
+) -> Vec<Vec<String>> {
+    if path.len() == 1 && EBD_4B3G_APIS.contains(&path[0].as_str()) {
+        return vec![path.to_vec()];
+    }
+    if let Some(targets) = local_aliases
+        .iter()
+        .rev()
+        .find_map(|scope| scope.get(&path[0]))
+    {
+        return targets
+            .iter()
+            .flat_map(|target| {
+                let mut target = target.clone();
+                target.extend_from_slice(&path[1..]);
+                ebd_4b3g_expand_forwarding_path(&target, forwarding, &mut BTreeSet::new(), 0)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    let resolved = resolve_forwarding_paths(
+        path,
+        &source.path,
+        inline_modules,
+        aliases,
+        &mut BTreeSet::new(),
+        0,
+    )
+    .unwrap_or_else(|| {
+        vec![RustScopedUsePath {
+            segments: path.to_vec(),
+            inline_modules: inline_modules.to_vec(),
+        }]
+    });
+    resolved
+        .into_iter()
+        .filter_map(|path| {
+            rust_canonical_path_segments_in_scope(
+                &path.segments,
+                &source.path,
+                &path.inline_modules,
+            )
+        })
+        .flat_map(|path| {
+            ebd_4b3g_expand_forwarding_path(&path, forwarding, &mut BTreeSet::new(), 0)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn ebd_4b3g_production_symbol_counts(source: &GuardSource) -> BTreeMap<String, usize> {
+    rust_source_tokens(&rust_sanitized_production_text(&source.text))
+        .into_iter()
+        .filter(|token| EBD_4B3G_OPERATION_SYMBOLS.contains(&token.text.as_str()))
+        .fold(BTreeMap::new(), |mut counts, token| {
+            *counts.entry(token.text).or_default() += 1;
+            counts
+        })
+}
+
+fn ebd_4b3g_owned_definitions(source: &GuardSource) -> BTreeMap<String, usize> {
+    fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attribute| {
+            if attribute.path().is_ident("test") {
+                return true;
+            }
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
+            };
+            list.path.is_ident("cfg")
+                && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+        })
+    }
+
+    struct DefinitionVisitor {
+        counts: BTreeMap<String, usize>,
+    }
+    impl DefinitionVisitor {
+        fn record(&mut self, name: String) {
+            if EBD_4B3G_OPERATION_SYMBOLS.contains(&name.as_str()) {
+                *self.counts.entry(name).or_default() += 1;
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for DefinitionVisitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if !attrs_are_test_only(&item.attrs) {
+                self.record(item.ident.to_string());
+                syn::visit::visit_item_struct(self, item);
+            }
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if !attrs_are_test_only(&item.attrs) {
+                self.record(item.ident.to_string());
+                syn::visit::visit_item_enum(self, item);
+            }
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !attrs_are_test_only(&item.attrs) {
+                self.record(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !attrs_are_test_only(&item.attrs) {
+                self.record(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeMap::new();
+    };
+    let mut visitor = DefinitionVisitor {
+        counts: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+
+    let tokens = rust_source_tokens(&rust_sanitized_production_text(&source.text));
+    for window in tokens.windows(2) {
+        if matches!(window[0].text.as_str(), "fn" | "struct" | "enum")
+            && EBD_4B3G_OPERATION_SYMBOLS.contains(&window[1].text.as_str())
+            && !visitor.counts.contains_key(&window[1].text)
+        {
+            *visitor.counts.entry(window[1].text.clone()).or_default() += 1;
+        }
+    }
+    visitor.counts
+}
+
+fn ebd_4b3g_owner_public_surface_violations(source: &GuardSource) -> BTreeSet<String> {
+    const CALLABLE_APIS: &[&str] = &[
+        "equality_delete_required_columns",
+        "plan_iceberg_scan_ranges",
+    ];
+    const TYPE_APIS: &[&str] = &["IcebergScanRangeContext", "PlannedIcebergScanRanges"];
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "iceberg-scan-range-owner-public-surface: {}|parse-failed",
+            source.path
+        )]);
+    };
+    struct SurfaceVisitor {
+        modules: Vec<String>,
+        impls: Vec<String>,
+        callable: BTreeMap<String, String>,
+        types: BTreeMap<String, String>,
+    }
+    impl SurfaceVisitor {
+        fn qualified(&self, name: &str) -> String {
+            self.modules
+                .iter()
+                .chain(self.impls.iter())
+                .map(String::as_str)
+                .chain(std::iter::once(name))
+                .collect::<Vec<_>>()
+                .join("::")
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SurfaceVisitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let name = item.sig.ident.to_string();
+            let visibility = ebd_4b3c_visibility(&item.vis);
+            if visibility != "private" {
+                self.callable.insert(self.qualified(&name), visibility);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let visibility = ebd_4b3c_visibility(&item.vis);
+            if visibility != "private" {
+                self.callable
+                    .insert(self.qualified(&item.sig.ident.to_string()), visibility);
+            }
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            let name = item.ident.to_string();
+            if TYPE_APIS.contains(&name.as_str()) {
+                self.types
+                    .insert(self.qualified(&name), ebd_4b3c_visibility(&item.vis));
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.modules.pop();
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let name = match item.self_ty.as_ref() {
+                syn::Type::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_else(|| "<impl>".to_string()),
+                _ => "<impl>".to_string(),
+            };
+            self.impls.push(name);
+            for item in &item.items {
+                syn::visit::Visit::visit_impl_item(self, item);
+            }
+            self.impls.pop();
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            let visibility = ebd_4b3c_visibility(&item.vis);
+            if visibility == "private" {
+                return;
+            }
+            self.impls.push(item.ident.to_string());
+            for trait_item in &item.items {
+                if let syn::TraitItem::Fn(method) = trait_item {
+                    self.callable.insert(
+                        self.qualified(&method.sig.ident.to_string()),
+                        visibility.clone(),
+                    );
+                }
+            }
+            self.impls.pop();
+        }
+    }
+
+    let mut surface = SurfaceVisitor {
+        modules: Vec::new(),
+        impls: Vec::new(),
+        callable: BTreeMap::new(),
+        types: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_file(&mut surface, &file);
+    for import in rust_raw_production_use_statements(&source.text)
+        .into_iter()
+        .filter(|import| import.visibility != "private")
+    {
+        let Some(export_name) =
+            forwarding_export_name(&import.path.segments, import.path.alias.as_deref())
+        else {
+            continue;
+        };
+        let qualified = import
+            .inline_modules
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(export_name.as_str()))
+            .collect::<Vec<_>>()
+            .join("::");
+        surface.callable.insert(qualified, import.visibility);
+    }
+
+    let expected_callable = CALLABLE_APIS
+        .iter()
+        .map(|name| ((*name).to_string(), "pub(crate)".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let expected_types = TYPE_APIS
+        .iter()
+        .map(|name| ((*name).to_string(), "pub(crate)".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = BTreeSet::new();
+    if surface.callable != expected_callable {
+        violations.insert(format!(
+            "iceberg-scan-range-owner-public-callables: expected={expected_callable:?} actual={:?}",
+            surface.callable
+        ));
+    }
+    if surface.types != expected_types {
+        violations.insert(format!(
+            "iceberg-scan-range-owner-public-types: expected={expected_types:?} actual={:?}",
+            surface.types
+        ));
+    }
+    violations
+}
+
+#[derive(Default)]
+struct Ebd4b3gReferenceSnapshot {
+    violations: BTreeSet<String>,
+    allowed_direct_calls: BTreeMap<String, usize>,
+}
+
+fn ebd_4b3g_reference_audit(
+    source: &GuardSource,
+    forwarding: &Ebd4b3gForwardingMap,
+) -> Ebd4b3gReferenceSnapshot {
+    fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attribute| {
+            if attribute.path().is_ident("test") {
+                return true;
+            }
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
+            };
+            list.path.is_ident("cfg")
+                && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+        })
+    }
+
+    fn canonical_api_path(path: &[String]) -> Option<&'static str> {
+        ebd_4b3g_api_for_path(path)
+    }
+
+    fn syntactic_canonical_api(path: &syn::Path) -> Option<&'static str> {
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        let strings = segments.iter().map(String::as_str).collect::<Vec<_>>();
+        EBD_4B3G_APIS
+            .iter()
+            .copied()
+            .find(|api| strings == ["crate", "connector", "iceberg", "scan_range", *api])
+    }
+
+    struct ReferenceVisitor<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        forwarding: &'a Ebd4b3gForwardingMap,
+        inline_modules: Vec<String>,
+        functions: Vec<String>,
+        snapshot: Ebd4b3gReferenceSnapshot,
+    }
+    impl ReferenceVisitor<'_> {
+        fn current_function(&self) -> String {
+            let function = self
+                .functions
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<module>".to_string());
+            if self.inline_modules.is_empty() {
+                function
+            } else {
+                format!("{}::{function}", self.inline_modules.join("::"))
+            }
+        }
+
+        fn resolved_apis(&self, path: &syn::Path) -> BTreeSet<&'static str> {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            ebd_4b3g_resolve_source_path(
+                &segments,
+                self.source,
+                &self.inline_modules,
+                self.aliases,
+                &[],
+                self.forwarding,
+            )
+            .into_iter()
+            .filter_map(|path| canonical_api_path(&path))
+            .collect()
+        }
+
+        fn record_reference(&mut self, api: &str, kind: &str) {
+            self.snapshot.violations.insert(format!(
+                "iceberg-scan-range-api-reference: {}|{}|{}|{}",
+                self.source.path,
+                self.current_function(),
+                kind,
+                api
+            ));
+        }
+
+        fn record_macro_tokens(&mut self, mac: &syn::Macro) {
+            let tokens = rust_source_tokens(&mac.tokens.to_string())
+                .into_iter()
+                .map(|token| token.text)
+                .collect::<Vec<_>>();
+            for api in EBD_4B3G_APIS {
+                let canonical = [
+                    "crate",
+                    "::",
+                    "connector",
+                    "::",
+                    "iceberg",
+                    "::",
+                    "scan_range",
+                    "::",
+                    api,
+                ];
+                if tokens
+                    .windows(canonical.len())
+                    .any(|window| window.iter().map(String::as_str).eq(canonical))
+                    || tokens.iter().any(|token| token == api)
+                {
+                    self.record_reference(api, "macro");
+                }
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for ReferenceVisitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.functions.push(item.sig.ident.to_string());
+            syn::visit::Visit::visit_block(self, &item.block);
+            self.functions.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.functions.push(item.sig.ident.to_string());
+            syn::visit::Visit::visit_block(self, &item.block);
+            self.functions.pop();
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = call.func.as_ref() {
+                let mut apis = self.resolved_apis(&function.path);
+                if function.qself.is_some()
+                    && let Some(api) = function
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string())
+                        .and_then(|name| EBD_4B3G_APIS.iter().copied().find(|api| name == *api))
+                {
+                    apis.insert(api);
+                }
+                if !apis.is_empty() {
+                    for api in apis {
+                        let allowed = self.source.path == EBD_4B3G_COORDINATOR
+                            && self.current_function() == "plan_iceberg_file_ranges"
+                            && function.qself.is_none()
+                            && syntactic_canonical_api(&function.path) == Some(api);
+                        if allowed {
+                            *self
+                                .snapshot
+                                .allowed_direct_calls
+                                .entry(api.to_string())
+                                .or_default() += 1;
+                        } else {
+                            self.record_reference(api, "call");
+                        }
+                    }
+                    for argument in &call.args {
+                        syn::visit::Visit::visit_expr(self, argument);
+                    }
+                    return;
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            let mut apis = self.resolved_apis(&path.path);
+            if path.qself.is_some()
+                && let Some(api) = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .and_then(|name| EBD_4B3G_APIS.iter().copied().find(|api| name == *api))
+            {
+                apis.insert(api);
+            }
+            for api in apis {
+                self.record_reference(api, "value");
+            }
+        }
+
+        fn visit_expr_macro(&mut self, item: &'ast syn::ExprMacro) {
+            self.record_macro_tokens(&item.mac);
+        }
+
+        fn visit_stmt_macro(&mut self, item: &'ast syn::StmtMacro) {
+            self.record_macro_tokens(&item.mac);
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if !attrs_are_test_only(&item.attrs) {
+                self.record_macro_tokens(&item.mac);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return Ebd4b3gReferenceSnapshot {
+            violations: BTreeSet::from([format!(
+                "iceberg-scan-range-reference-parse-failed: {}",
+                source.path
+            )]),
+            allowed_direct_calls: BTreeMap::new(),
+        };
+    };
+    let (_, aliases) = ebd_4b1_module_scope_inputs(&file);
+    let mut visitor = ReferenceVisitor {
+        source,
+        aliases: &aliases,
+        forwarding,
+        inline_modules: Vec::new(),
+        functions: Vec::new(),
+        snapshot: Ebd4b3gReferenceSnapshot::default(),
+    };
+
+    for import in rust_raw_production_use_statements(&source.text) {
+        let resolved = resolve_forwarding_paths(
+            &import.path.segments,
+            &source.path,
+            &import.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        )
+        .unwrap_or_else(|| {
+            vec![RustScopedUsePath {
+                segments: import.path.segments,
+                inline_modules: import.inline_modules,
+            }]
+        });
+        for path in resolved {
+            let Some(canonical) = rust_canonical_path_segments_in_scope(
+                &path.segments,
+                &source.path,
+                &path.inline_modules,
+            ) else {
+                continue;
+            };
+            for target in
+                ebd_4b3g_expand_forwarding_path(&canonical, forwarding, &mut BTreeSet::new(), 0)
+            {
+                if let Some(api) = canonical_api_path(&target) {
+                    visitor.snapshot.violations.insert(format!(
+                        "iceberg-scan-range-api-reference: {}|<module>|import|{}",
+                        source.path, api
+                    ));
+                }
+            }
+        }
+    }
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.snapshot
+}
+
+fn ebd_4b3g_production_paths(
+    source: &GuardSource,
+    forwarding: &Ebd4b3gForwardingMap,
+) -> BTreeSet<Vec<String>> {
+    rust_production_canonical_paths(&source.text, &source.path)
+        .into_iter()
+        .flat_map(|path| {
+            ebd_4b3g_expand_forwarding_path(&path, forwarding, &mut BTreeSet::new(), 0)
+        })
+        .collect()
+}
+
+fn ebd_4b3g_operational_surface_violations(
+    source: &GuardSource,
+    forwarding: &Ebd4b3gForwardingMap,
+) -> BTreeSet<String> {
+    let paths = ebd_4b3g_production_paths(source, forwarding);
+    let adapter_dependencies = paths
+        .iter()
+        .filter(|path| ebd_4b3g_connector_scan_range_path(path))
+        .map(|path| path.join("::"))
+        .collect::<BTreeSet<_>>();
+    let concrete_dependencies = paths
+        .iter()
+        .filter(|path| ebd_4b3g_concrete_adapter_path(path))
+        .map(|path| path.join("::"))
+        .collect::<BTreeSet<_>>();
+    let strong_codegen_input = paths.iter().any(|path| {
+        ["ScanHandle", "Split", "IcebergScanHandle", "IcebergSplit"]
+            .iter()
+            .any(|name| path.last().is_some_and(|leaf| leaf == name))
+            && ebd_4b3g_concrete_adapter_path(path)
+    });
+    let pruning_dependency = paths.iter().any(|path| {
+        path.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .starts_with(&["crate", "connector", "iceberg", "file_pruning"])
+    });
+
+    let mut violations = BTreeSet::new();
+    if source.path.starts_with("src/sql/codegen/")
+        && (!adapter_dependencies.is_empty() || strong_codegen_input || pruning_dependency)
+    {
+        violations.insert(format!(
+            "iceberg-scan-range-codegen-concrete-adapter: {}|adapter={adapter_dependencies:?}|concrete={concrete_dependencies:?}",
+            source.path
+        ));
+    }
+    if source.path != EBD_4B3G_OWNER
+        && source.path != EBD_4B3G_COORDINATOR
+        && !adapter_dependencies.is_empty()
+    {
+        violations.insert(format!(
+            "iceberg-scan-range-forwarding-surface: {}|{adapter_dependencies:?}",
+            source.path
+        ));
+    }
+    violations.extend(ebd_4b3g_semantic_owner_violations(source));
+    violations
+}
+
+#[derive(Clone)]
+struct Ebd4b3gMacroRule {
+    matcher: Vec<String>,
+    transcriber: Vec<String>,
+}
+
+fn ebd_4b3g_macro_rules(item: &syn::ItemMacro) -> Vec<Ebd4b3gMacroRule> {
+    if !item.mac.path.is_ident("macro_rules") || item.ident.is_none() {
+        return Vec::new();
+    }
+    let tokens = ebd_4b1_macro_tokens(item);
+    let mut rules = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if !matches!(tokens.get(index).map(String::as_str), Some("(" | "[" | "{")) {
+            index += 1;
+            continue;
+        }
+        let matcher_open = index;
+        let Some(matcher_close) = ebd_4b1_matching_macro_group(&tokens, matcher_open) else {
+            break;
+        };
+        if tokens
+            .get(matcher_close + 1)
+            .is_none_or(|token| token != "=")
+            || tokens
+                .get(matcher_close + 2)
+                .is_none_or(|token| token != ">")
+            || !matches!(
+                tokens.get(matcher_close + 3).map(String::as_str),
+                Some("(" | "[" | "{")
+            )
+        {
+            index = matcher_close + 1;
+            continue;
+        }
+        let transcriber_open = matcher_close + 3;
+        let Some(transcriber_close) = ebd_4b1_matching_macro_group(&tokens, transcriber_open)
+        else {
+            break;
+        };
+        rules.push(Ebd4b3gMacroRule {
+            matcher: tokens[matcher_open + 1..matcher_close].to_vec(),
+            transcriber: tokens[transcriber_open + 1..transcriber_close].to_vec(),
+        });
+        index = transcriber_close + 1;
+    }
+    rules
+}
+
+fn ebd_4b3g_macro_arguments(mac: &syn::Macro) -> Vec<String> {
+    rust_source_tokens(&mac.tokens.to_string())
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+fn ebd_4b3g_expand_macro_rule(
+    rule: &Ebd4b3gMacroRule,
+    arguments: &[String],
+) -> Option<Vec<String>> {
+    fn unsupported_repetition(matcher: &[String]) -> bool {
+        matcher
+            .windows(2)
+            .any(|window| window[0] == "$" && matches!(window[1].as_str(), "(" | "[" | "{"))
+    }
+
+    fn conservative_operational_expansion(
+        rule: &Ebd4b3gMacroRule,
+        arguments: &[String],
+    ) -> Option<Vec<String>> {
+        let transcriber_tokens = rule
+            .transcriber
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let uses_variables = rule.transcriber.windows(2).any(|window| {
+            window[0] == "$"
+                && window[1] != "crate"
+                && !matches!(window[1].as_str(), "(" | "[" | "{")
+        });
+        let has_operational_shape = [
+            "ScanRangeParams",
+            "FileScanRange",
+            "IcebergDeleteFile",
+            "DeletionVectorDescriptor",
+            "FilePruningMinMaxValue",
+            "file_pruning",
+        ]
+        .iter()
+        .any(|token| transcriber_tokens.contains(token));
+        if !uses_variables || !has_operational_shape || arguments.is_empty() {
+            return None;
+        }
+        let mut expanded = rule.transcriber.clone();
+        expanded.extend(arguments.iter().cloned());
+        Some(expanded)
+    }
+
+    fn balanced(tokens: &[String]) -> bool {
+        let mut groups = Vec::new();
+        for token in tokens {
+            match token.as_str() {
+                "(" | "[" | "{" => groups.push(token.as_str()),
+                ")" => {
+                    if groups.pop() != Some("(") {
+                        return false;
+                    }
+                }
+                "]" => {
+                    if groups.pop() != Some("[") {
+                        return false;
+                    }
+                }
+                "}" => {
+                    if groups.pop() != Some("{") {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        groups.is_empty()
+    }
+
+    fn fragment_matches(fragment: &str, tokens: &[String]) -> bool {
+        if tokens.is_empty() || !balanced(tokens) {
+            return false;
+        }
+        match fragment {
+            "ident" | "lifetime" => tokens.len() == 1,
+            "path" => syn::parse_str::<syn::Path>(&tokens.join(" ")).is_ok(),
+            _ => true,
+        }
+    }
+
+    fn bind_matcher(
+        matcher: &[String],
+        arguments: &[String],
+        matcher_index: usize,
+        argument_index: usize,
+        bindings: &BTreeMap<String, Vec<String>>,
+    ) -> Option<BTreeMap<String, Vec<String>>> {
+        if matcher_index == matcher.len() {
+            return (argument_index == arguments.len()).then(|| bindings.clone());
+        }
+        if matcher.get(matcher_index).is_some_and(|token| token == "$")
+            && matcher
+                .get(matcher_index + 2)
+                .is_some_and(|token| token == ":")
+        {
+            let name = matcher.get(matcher_index + 1)?;
+            let fragment = matcher.get(matcher_index + 3)?;
+            for end in (argument_index + 1..=arguments.len()).rev() {
+                let candidate = &arguments[argument_index..end];
+                if !fragment_matches(fragment, candidate) {
+                    continue;
+                }
+                let mut next_bindings = bindings.clone();
+                if let Some(existing) = next_bindings.get(name)
+                    && existing != candidate
+                {
+                    continue;
+                }
+                next_bindings.insert(name.clone(), candidate.to_vec());
+                if let Some(bound) =
+                    bind_matcher(matcher, arguments, matcher_index + 4, end, &next_bindings)
+                {
+                    return Some(bound);
+                }
+            }
+            return None;
+        }
+        if matcher.get(matcher_index) != arguments.get(argument_index) {
+            return None;
+        }
+        bind_matcher(
+            matcher,
+            arguments,
+            matcher_index + 1,
+            argument_index + 1,
+            bindings,
+        )
+    }
+
+    let bindings = match bind_matcher(&rule.matcher, arguments, 0, 0, &BTreeMap::new()) {
+        Some(bindings) => bindings,
+        None if unsupported_repetition(&rule.matcher) => {
+            return conservative_operational_expansion(rule, arguments);
+        }
+        None => return None,
+    };
+    let mut expanded = Vec::new();
+    let mut index = 0usize;
+    while index < rule.transcriber.len() {
+        if rule.transcriber[index] == "$"
+            && let Some(param) = rule.transcriber.get(index + 1)
+            && let Some(argument) = bindings.get(param)
+        {
+            expanded.extend(argument.iter().cloned());
+            index += 2;
+        } else {
+            expanded.push(rule.transcriber[index].clone());
+            index += 1;
+        }
+    }
+    Some(expanded)
+}
+
+fn ebd_4b3g_expanded_macro_invocations(file: &syn::File) -> Vec<(String, Vec<String>)> {
+    struct MacroCollector {
+        definitions: BTreeMap<String, Vec<Ebd4b3gMacroRule>>,
+        invocations: Vec<(String, Vec<String>)>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for MacroCollector {
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if item.mac.path.is_ident("macro_rules") {
+                if let Some(name) = &item.ident {
+                    self.definitions
+                        .insert(name.to_string(), ebd_4b3g_macro_rules(item));
+                }
+            } else if let Some(name) = item.mac.path.segments.last() {
+                self.invocations
+                    .push((name.ident.to_string(), ebd_4b3g_macro_arguments(&item.mac)));
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+
+        fn visit_expr_macro(&mut self, item: &'ast syn::ExprMacro) {
+            if let Some(name) = item.mac.path.segments.last() {
+                self.invocations
+                    .push((name.ident.to_string(), ebd_4b3g_macro_arguments(&item.mac)));
+            }
+        }
+
+        fn visit_stmt_macro(&mut self, item: &'ast syn::StmtMacro) {
+            if let Some(name) = item.mac.path.segments.last() {
+                self.invocations
+                    .push((name.ident.to_string(), ebd_4b3g_macro_arguments(&item.mac)));
+            }
+        }
+    }
+
+    let mut collector = MacroCollector {
+        definitions: BTreeMap::new(),
+        invocations: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut collector, file);
+    collector
+        .invocations
+        .into_iter()
+        .flat_map(|(name, arguments)| {
+            collector
+                .definitions
+                .get(&name)
+                .into_iter()
+                .flatten()
+                .filter_map(move |rule| {
+                    ebd_4b3g_expand_macro_rule(rule, &arguments)
+                        .map(|expanded| (name.clone(), expanded))
+                })
+        })
+        .collect()
+}
+
+fn ebd_4b3g_semantic_owner_violations(source: &GuardSource) -> BTreeSet<String> {
+    fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attribute| {
+            if attribute.path().is_ident("test") {
+                return true;
+            }
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
+            };
+            list.path.is_ident("cfg")
+                && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+        })
+    }
+
+    fn operational_owner_tokens(tokens: &BTreeSet<String>) -> bool {
+        let strong_input = ["ScanHandle", "Split", "IcebergScanHandle", "IcebergSplit"]
+            .iter()
+            .any(|name| tokens.contains(*name));
+        let data_file_input = ["IcebergDataFileInfo", "IcebergDeleteFileInfo"]
+            .iter()
+            .any(|name| tokens.contains(*name));
+        let range_operation = [
+            "ScanRangeParams",
+            "FileScanRange",
+            "IcebergDeleteFile",
+            "DeletionVectorDescriptor",
+            "FilePruningMinMaxValue",
+        ]
+        .iter()
+        .any(|name| tokens.contains(*name));
+        let pruning_operation = tokens.contains("file_pruning");
+        (strong_input && (range_operation || pruning_operation))
+            || (data_file_input && range_operation)
+    }
+
+    fn collect_type_aliases(
+        items: &[syn::Item],
+        inline_modules: &mut Vec<String>,
+        aliases: &mut RustScopedAliases,
+    ) {
+        for item in items {
+            match item {
+                syn::Item::Type(item) => {
+                    if let Some(path) = ebd_4b1_direct_alias_rhs_path(&item.ty) {
+                        aliases.insert(
+                            (inline_modules.clone(), item.ident.to_string()),
+                            vec![RustScopedUsePath {
+                                segments: path,
+                                inline_modules: inline_modules.clone(),
+                            }],
+                        );
+                    }
+                }
+                syn::Item::Mod(item) => {
+                    let Some((_, items)) = &item.content else {
+                        continue;
+                    };
+                    inline_modules.push(item.ident.to_string());
+                    collect_type_aliases(items, inline_modules, aliases);
+                    inline_modules.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    struct PathTokens<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: &'a [String],
+        tokens: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for PathTokens<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let resolved = resolve_forwarding_paths(
+                &segments,
+                &self.source.path,
+                self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments,
+                    inline_modules: self.inline_modules.to_vec(),
+                }]
+            });
+            for path in resolved {
+                if let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    &self.source.path,
+                    &path.inline_modules,
+                ) {
+                    self.tokens.extend(canonical);
+                }
+            }
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_item_fn(&mut self, _item: &'ast syn::ItemFn) {}
+
+        fn visit_impl_item_fn(&mut self, _item: &'ast syn::ImplItemFn) {}
+    }
+
+    struct SemanticVisitor<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+    impl SemanticVisitor<'_> {
+        fn function_tokens(
+            &self,
+            signature: &syn::Signature,
+            block: &syn::Block,
+        ) -> BTreeSet<String> {
+            let mut paths = PathTokens {
+                source: self.source,
+                aliases: self.aliases,
+                inline_modules: &self.inline_modules,
+                tokens: BTreeSet::new(),
+            };
+            syn::visit::Visit::visit_signature(&mut paths, signature);
+            syn::visit::Visit::visit_block(&mut paths, block);
+            paths.tokens
+        }
+
+        fn record_function(&mut self, name: &str, signature: &syn::Signature, block: &syn::Block) {
+            if self.source.path == EBD_4B3G_OWNER
+                || (self.source.path == EBD_4B3G_COORDINATOR
+                    && self.inline_modules.is_empty()
+                    && name == "plan_iceberg_file_ranges")
+            {
+                return;
+            }
+            if operational_owner_tokens(&self.function_tokens(signature, block)) {
+                let qualified = if self.inline_modules.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}::{name}", self.inline_modules.join("::"))
+                };
+                self.violations.insert(format!(
+                    "iceberg-scan-range-secondary-operational-owner: {}|{}",
+                    self.source.path, qualified
+                ));
+            }
+        }
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SemanticVisitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.record_function(&item.sig.ident.to_string(), &item.sig, &item.block);
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            self.record_function(&item.sig.ident.to_string(), &item.sig, &item.block);
+            syn::visit::visit_impl_item_fn(self, item);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if attrs_are_test_only(&item.attrs) || !item.mac.path.is_ident("macro_rules") {
+                return;
+            }
+            for transcriber in ebd_4b1_macro_rule_transcribers(item) {
+                let tokens = transcriber.into_iter().collect::<BTreeSet<_>>();
+                if operational_owner_tokens(&tokens) {
+                    self.violations.insert(format!(
+                        "iceberg-scan-range-secondary-operational-owner: {}|macro|{}",
+                        self.source.path,
+                        item.ident
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "<anonymous>".to_string())
+                    ));
+                }
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::new();
+    };
+    let (_, mut aliases) = ebd_4b1_module_scope_inputs(&file);
+    collect_type_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    let mut visitor = SemanticVisitor {
+        source,
+        aliases: &aliases,
+        inline_modules: Vec::new(),
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    if source.path != EBD_4B3G_OWNER {
+        for (macro_name, expanded) in ebd_4b3g_expanded_macro_invocations(&file) {
+            let mut tokens = expanded.iter().cloned().collect::<BTreeSet<_>>();
+            for token in &expanded {
+                let path = vec![token.clone()];
+                let Some(resolved) =
+                    rust_resolve_scoped_paths(&path, &[], &aliases, &mut BTreeSet::new(), 0)
+                else {
+                    continue;
+                };
+                for resolved in resolved {
+                    if let Some(canonical) = rust_canonical_path_segments_in_scope(
+                        &resolved.segments,
+                        &source.path,
+                        &resolved.inline_modules,
+                    ) {
+                        tokens.extend(canonical);
+                    }
+                }
+            }
+            if operational_owner_tokens(&tokens) {
+                visitor.violations.insert(format!(
+                    "iceberg-scan-range-secondary-operational-owner: {}|macro|{}",
+                    source.path, macro_name
+                ));
+            }
+        }
+    }
+    visitor.violations
+}
+
+fn ebd_4b3g_audit(sources: &[GuardSource], require_completion: bool) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    let audited_sources = sources
+        .iter()
+        .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
+        .collect::<Vec<_>>();
+    let forwarding =
+        ebd_4b3g_forwarding_map(&audited_sources.iter().cloned().cloned().collect::<Vec<_>>());
+    let mut allowed_direct_calls = BTreeMap::<String, usize>::new();
+
+    for source in &audited_sources {
+        violations.extend(ebd_4b3g_operational_surface_violations(source, &forwarding));
+        let references = ebd_4b3g_reference_audit(source, &forwarding);
+        violations.extend(references.violations);
+        for (api, count) in references.allowed_direct_calls {
+            *allowed_direct_calls.entry(api).or_default() += count;
+        }
+        let symbol_counts = ebd_4b3g_production_symbol_counts(source);
+        let adapter_path = rust_production_canonical_paths(&source.text, &source.path)
+            .iter()
+            .any(|path| ebd_4b3g_connector_scan_range_path(path));
+        if source.path.starts_with("src/sql/codegen/")
+            && (!symbol_counts.is_empty() || adapter_path)
+        {
+            violations.insert(format!(
+                "iceberg-scan-range-codegen-owner: {}|symbols={:?}|adapter_path={adapter_path}",
+                source.path, symbol_counts
+            ));
+        }
+        if source.path != EBD_4B3G_OWNER {
+            for (symbol, count) in ebd_4b3g_owned_definitions(source) {
+                if EBD_4B3G_EXCLUSIVE_OWNER_SYMBOLS.contains(&symbol.as_str()) {
+                    violations.insert(format!(
+                        "iceberg-scan-range-secondary-owner: {}|{symbol}|count={count}",
+                        source.path
+                    ));
+                }
+            }
+        }
+    }
+
+    if !require_completion {
+        return violations;
+    }
+
+    let Some(owner) = audited_sources
+        .iter()
+        .find(|source| source.path == EBD_4B3G_OWNER)
+    else {
+        violations.insert(format!(
+            "iceberg-scan-range-owner-missing: {EBD_4B3G_OWNER}"
+        ));
+        return violations;
+    };
+    let owner_definitions = ebd_4b3g_owned_definitions(owner);
+    violations.extend(ebd_4b3g_owner_public_surface_violations(owner));
+    for symbol in EBD_4B3G_REQUIRED_OWNER_SYMBOLS {
+        let actual = owner_definitions.get(*symbol).copied().unwrap_or_default();
+        if actual != 1 {
+            violations.insert(format!(
+                "iceberg-scan-range-owner-definition: {symbol}|expected=1 actual={actual}"
+            ));
+        }
+    }
+
+    for symbol in EBD_4B3G_APIS {
+        let actual = allowed_direct_calls
+            .get(*symbol)
+            .copied()
+            .unwrap_or_default();
+        if actual != 1 {
+            violations.insert(format!(
+                "iceberg-scan-range-resolved-call-count: {symbol}|expected=1 actual={actual}"
+            ));
+        }
+    }
+
+    let dynamic =
+        ebd_4b3c_audit_dynamic_seam(&audited_sources.into_iter().cloned().collect::<Vec<_>>());
+    violations.extend(
+        dynamic
+            .violations
+            .into_iter()
+            .filter(|violation| violation.contains("encoder-requery")),
+    );
+    violations
+}
+
+#[test]
+fn ebd_4b3g_detector_covers_direct_alias_ufcs_forwarding_macro_and_noise() {
+    let invalid = [
+        GuardSource::new(
+            "src/sql/codegen/direct.rs",
+            "fn emit() { crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/alias.rs",
+            "use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as emit; fn encode() { emit(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/module_alias.rs",
+            "use crate::connector::iceberg::scan_range as adapter; fn encode() { adapter::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/ufcs.rs",
+            "fn encode() { <IcebergScanRangeContext as Adapter>::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/helper_forward.rs",
+            "fn forward() { plan_iceberg_scan_ranges(); } fn encode() { forward(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/macro.rs",
+            "macro_rules! emit { () => { plan_iceberg_scan_ranges(); } } emit!();",
+        ),
+        GuardSource::new(
+            "src/adapter_facade.rs",
+            "pub use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as emit;",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/facade_codegen.rs",
+            "use crate::adapter_facade::emit; fn encode() { emit(); }",
+        ),
+        GuardSource::new(
+            "src/sql/codegen/renamed_rewrite.rs",
+            r#"
+use crate::connector::iceberg::scan_model::{IcebergDataFileInfo, IcebergDeleteFileInfo};
+use crate::connector::iceberg::scan_planner::{IcebergScanHandle, IcebergSplit};
+use crate::connector::scan_planning::{ScanHandle, Split};
+fn emit_ranges(
+    scan: &ScanHandle,
+    native: &IcebergScanHandle,
+    splits: &[Split],
+    iceberg_splits: &[IcebergSplit],
+    files: &[IcebergDataFileInfo],
+    deletes: &[IcebergDeleteFileInfo],
+) {
+    crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates();
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/macro_secondary_owner.rs",
+            r#"
+macro_rules! adapter {
+    ($name:ident) => {
+        fn $name(
+            scan: &crate::connector::scan_planning::ScanHandle,
+            splits: &[crate::connector::scan_planning::Split],
+        ) -> Vec<crate::runtime::scan_range::ScanRangeParams> {
+            crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates();
+            Vec::new()
+        }
+    };
+}
+adapter!(emit_ranges);
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/nested_secondary_owner.rs",
+            r#"
+mod nested {
+    fn emit_ranges(
+        scan: &crate::connector::scan_planning::ScanHandle,
+        splits: &[crate::connector::scan_planning::Split],
+    ) -> Vec<crate::runtime::scan_range::ScanRangeParams> {
+        crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates();
+        Vec::new()
+    }
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/cfg_production_secondary_owner.rs",
+            r#"
+#[cfg(feature = "iceberg")]
+fn emit_ranges(
+    scan: &crate::connector::scan_planning::ScanHandle,
+    splits: &[crate::connector::scan_planning::Split],
+) -> Vec<crate::runtime::scan_range::ScanRangeParams> {
+    crate::connector::iceberg::file_pruning::file_may_satisfy_scan_predicates();
+    Vec::new()
+}
+"#,
+        ),
+    ];
+    let violations = ebd_4b3g_audit(&invalid, false);
+    for fixture in [
+        "direct.rs",
+        "alias.rs",
+        "module_alias.rs",
+        "ufcs.rs",
+        "helper_forward.rs",
+        "macro.rs",
+        "facade_codegen.rs",
+        "renamed_rewrite.rs",
+        "macro_secondary_owner.rs",
+        "nested_secondary_owner.rs",
+        "cfg_production_secondary_owner.rs",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture)),
+            "Iceberg scan-range detector missed {fixture}: {violations:?}"
+        );
+    }
+
+    let noise = [GuardSource::new(
+        "src/sql/codegen/noise.rs",
+        r###"
+// plan_iceberg_scan_ranges();
+const TEXT: &str = "crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges";
+const RAW: &str = r#"IcebergScanRangeContext"#;
+#[cfg(test)]
+fn test_only() { plan_iceberg_scan_ranges(); }
+#[cfg(test)]
+fn test_only_rewrite(_: ScanHandle, _: Split, _: IcebergDataFileInfo) {
+    file_pruning::file_may_satisfy_scan_predicates();
+}
+fn encode_prepared_ranges() {}
+"###,
+    )];
+    assert!(
+        ebd_4b3g_audit(&noise, false).is_empty(),
+        "comments, strings, test-only code, and prepared-range mapping must remain legal"
+    );
+}
+
+#[test]
+fn ebd_4b3g_owner_public_surface_is_exact() {
+    let valid = GuardSource::new(
+        EBD_4B3G_OWNER,
+        r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+fn private_helper() {}
+"#,
+    );
+    assert!(
+        ebd_4b3g_owner_public_surface_violations(&valid).is_empty(),
+        "the exact typed owner surface must remain legal"
+    );
+
+    let invalid = GuardSource::new(
+        EBD_4B3G_OWNER,
+        r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+pub(crate) fn renamed_adapter_helper() {}
+"#,
+    );
+    let violations = ebd_4b3g_owner_public_surface_violations(&invalid);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("renamed_adapter_helper")),
+        "a third callable API escaped the exact public-surface guard: {violations:?}"
+    );
+
+    for (fixture, source) in [
+        (
+            "impl_method",
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+struct Adapter;
+impl Adapter { pub(crate) fn third_api() {} }
+"#,
+        ),
+        (
+            "nested_module",
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+mod nested { pub(crate) fn third_api() {} }
+"#,
+        ),
+        (
+            "reexport",
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+fn private_helper() {}
+pub(crate) use private_helper as third_api;
+"#,
+        ),
+        (
+            "external_reexport",
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+pub(crate) use crate::other::third_api;
+"#,
+        ),
+        (
+            "nested_trait_method",
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+mod nested {
+    pub(crate) trait Extra {
+        fn third_api();
+    }
+}
+"#,
+        ),
+    ] {
+        let source = GuardSource::new(EBD_4B3G_OWNER, source);
+        let violations = ebd_4b3g_owner_public_surface_violations(&source);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("third_api")),
+            "{fixture} callable escaped recursive public-surface audit: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3g_semantic_owner_rejects_coordinator_alias_and_generic_macro_rewrites() {
+    let invalid = [
+        GuardSource::new(
+            EBD_4B3G_COORDINATOR,
+            r#"
+use crate::connector::iceberg::scan_model::IcebergDataFileInfo as Data;
+use crate::runtime::scan_range::ScanRangeParams as Range;
+fn renamed_coordinator_rewrite(file: &Data) -> Range {
+    Range::file(crate::runtime::scan_range::FileScanRange::default())
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/type_alias_rewrite.rs",
+            r#"
+type H = crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+type R = crate::runtime::scan_range::ScanRangeParams;
+fn emit(file: &H) -> R {
+    R::file(crate::runtime::scan_range::FileScanRange::default())
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/generic_macro_rewrite.rs",
+            r#"
+type H = crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+type R = crate::runtime::scan_range::ScanRangeParams;
+macro_rules! make_adapter {
+    ($input:path, $range:path) => {
+        fn emit(file: &$input) -> $range {
+            $range::file(crate::runtime::scan_range::FileScanRange::default())
+        }
+    };
+}
+make_adapter!(H, R);
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/generic_macro_separator_rewrite.rs",
+            r#"
+type H = crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+type R = crate::runtime::scan_range::ScanRangeParams;
+macro_rules! make_adapter {
+    ($input:path => $range:path) => {
+        fn emit(file: &$input) -> $range {
+            $range::file(crate::runtime::scan_range::FileScanRange::default())
+        }
+    };
+}
+make_adapter!(H => R);
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/generic_macro_repetition_rewrite.rs",
+            r#"
+type H = crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+type R = crate::runtime::scan_range::ScanRangeParams;
+macro_rules! make_adapters {
+    ($( $input:path => $range:path );+) => {
+        $(
+            fn emit(file: &$input) -> $range {
+                $range::file(crate::runtime::scan_range::FileScanRange::default())
+            }
+        )+
+    };
+}
+make_adapters!(H => R);
+"#,
+        ),
+    ];
+    let violations = ebd_4b3g_audit(&invalid, false);
+    for expected in [
+        "scan_preparation.rs|renamed_coordinator_rewrite",
+        "type_alias_rewrite.rs|emit",
+        "generic_macro_rewrite.rs|macro",
+        "generic_macro_separator_rewrite.rs|macro",
+        "generic_macro_repetition_rewrite.rs|macro",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "semantic owner audit missed {expected}: {violations:?}"
+        );
+    }
+
+    let non_operational_noise = GuardSource::new(
+        "src/coordinator/generic_macro_noise.rs",
+        r#"
+type H = crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+type R = crate::runtime::scan_range::ScanRangeParams;
+macro_rules! describe_types {
+    ($( $input:path => $range:path );+) => {
+        $(const _: &str = stringify!($input, $range);)+
+    };
+}
+describe_types!(H => R);
+"#,
+    );
+    assert!(
+        ebd_4b3g_semantic_owner_violations(&non_operational_noise).is_empty(),
+        "non-operational repetition macro noise must remain legal"
+    );
+}
+
+#[test]
+fn ebd_4b3g_resolved_call_sites_cover_aliases_ufcs_and_generic_macros() {
+    let sources = [
+        GuardSource::new(
+            "src/facade_a.rs",
+            "pub use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as emit;",
+        ),
+        GuardSource::new(
+            "src/facade_b.rs",
+            "pub use crate::facade_a::emit as forward;",
+        ),
+        GuardSource::new(
+            "src/calls/direct.rs",
+            "fn direct() { crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/calls/grouped.rs",
+            "use crate::connector::iceberg::scan_range::{equality_delete_required_columns as discover}; fn grouped() { discover(); }",
+        ),
+        GuardSource::new(
+            "src/calls/module_alias.rs",
+            "use crate::connector::iceberg::scan_range as adapter; fn module_alias() { adapter::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/calls/local_alias.rs",
+            "fn local_alias() { use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as emit; emit(); }",
+        ),
+        GuardSource::new(
+            "src/calls/transitive.rs",
+            "use crate::facade_b::forward; fn transitive() { forward(); }",
+        ),
+        GuardSource::new(
+            "src/calls/function_value.rs",
+            "use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as emit; fn function_value() { let first = emit; let second = first; second(); }",
+        ),
+        GuardSource::new(
+            "src/calls/ufcs.rs",
+            "fn ufcs() { <Adapter as Trait>::plan_iceberg_scan_ranges(); }",
+        ),
+        GuardSource::new(
+            "src/calls/stmt_macro.rs",
+            "macro_rules! invoke { ($f:path) => { $f(); } } fn stmt_macro() { invoke!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges); }",
+        ),
+        GuardSource::new(
+            "src/calls/expr_macro.rs",
+            "macro_rules! invoke { ($f:path) => { $f() } } fn expr_macro() { let _ = invoke!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges); }",
+        ),
+        GuardSource::new(
+            "src/calls/item_macro.rs",
+            "macro_rules! invoke { ($f:path) => { const _: () = (); } } invoke!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges);",
+        ),
+    ];
+    let forwarding = ebd_4b3g_forwarding_map(&sources);
+    let violations = sources
+        .iter()
+        .flat_map(|source| ebd_4b3g_reference_audit(source, &forwarding).violations)
+        .collect::<BTreeSet<_>>();
+    for fixture in [
+        "direct.rs",
+        "grouped.rs",
+        "module_alias.rs",
+        "local_alias.rs",
+        "transitive.rs",
+        "function_value.rs",
+        "ufcs.rs",
+        "stmt_macro.rs",
+        "expr_macro.rs",
+        "item_macro.rs",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture)),
+            "reference-site audit missed {fixture}: {violations:?}"
+        );
+    }
+
+    let noise = GuardSource::new(
+        "src/calls/noise.rs",
+        r###"
+// plan_iceberg_scan_ranges();
+const TEXT: &str = "crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges";
+macro_rules! unused { ($f:path) => { $f(); } }
+#[cfg(test)]
+fn test_only() {
+    crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges();
+}
+"###,
+    );
+    assert!(
+        ebd_4b3g_reference_audit(&noise, &Ebd4b3gForwardingMap::new())
+            .violations
+            .is_empty(),
+        "noise, unused macro definitions, and test-only calls must remain legal"
+    );
+}
+
+#[test]
+fn ebd_4b3g_resolved_call_sites_track_scoped_value_flow_and_macro_semantics() {
+    let source = GuardSource::new(
+        "src/calls/value_flow.rs",
+        r#"
+use crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges as api;
+struct Holder<F> { call: F }
+fn value_flow(other: fn()) {
+    let casted = api as fn();
+    (casted)();
+    let tuple = (api, other);
+    tuple.0();
+    let holder = Holder { call: api };
+    (holder.call)();
+    let mut assigned = other;
+    assigned = api;
+    assigned();
+    let shadowed = api;
+    {
+        let shadowed = other;
+        shadowed();
+    }
+    shadowed();
+}
+"#,
+    );
+    let violations = ebd_4b3g_reference_audit(&source, &Ebd4b3gForwardingMap::new()).violations;
+    assert!(
+        !violations.is_empty(),
+        "cast/tuple/field/assignment/HOF references must be rejected without dataflow: {violations:?}"
+    );
+
+    let macro_source = GuardSource::new(
+        "src/calls/macro_semantics.rs",
+        r#"
+macro_rules! invoke { ($f:path) => { $f(); } }
+macro_rules! text { ($f:path) => { stringify!($f) } }
+macro_rules! unused { ($f:path) => { 7 } }
+fn macro_semantics() {
+    invoke!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges);
+    let _ = text!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges);
+    let _ = unused!(crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges);
+}
+"#,
+    );
+    let violations =
+        ebd_4b3g_reference_audit(&macro_source, &Ebd4b3gForwardingMap::new()).violations;
+    assert!(
+        !violations.is_empty(),
+        "production macro references, including stringify/unused parameters, must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_4b3g_call_site_guard_rejects_dead_expected_call_and_live_helper_alias() {
+    let sources = [
+        GuardSource::new(
+            EBD_4B3G_OWNER,
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B3G_COORDINATOR,
+            r#"
+use crate::connector::iceberg::scan_range::{
+    equality_delete_required_columns,
+    plan_iceberg_scan_ranges,
+};
+fn plan_iceberg_file_ranges() {
+    equality_delete_required_columns();
+    if false { plan_iceberg_scan_ranges(); }
+}
+fn other_helper() {
+    let live = plan_iceberg_scan_ranges as fn();
+    live();
+}
+"#,
+        ),
+    ];
+    let violations = ebd_4b3g_audit(&sources, true);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("scan_preparation.rs|other_helper")),
+        "live cast alias in another helper escaped call-site ownership: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_4b3g_resolved_call_site_detector_rejects_extra_and_dead_helper_calls() {
+    let sources = [
+        GuardSource::new(
+            EBD_4B3G_OWNER,
+            r#"
+pub(crate) struct IcebergScanRangeContext;
+pub(crate) struct PlannedIcebergScanRanges;
+pub(crate) fn equality_delete_required_columns() {}
+pub(crate) fn plan_iceberg_scan_ranges() {}
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B3G_COORDINATOR,
+            r#"
+use crate::connector::iceberg::scan_range::{
+    equality_delete_required_columns as discover,
+    plan_iceberg_scan_ranges as plan,
+};
+fn plan_iceberg_file_ranges() {
+    let discover_fn = discover;
+    discover_fn();
+    let plan_fn = plan;
+    plan_fn();
+}
+fn dead_helper() {
+    crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges();
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/coordinator/extra.rs",
+            r#"
+use crate::connector::iceberg::scan_range as adapter;
+fn extra() {
+    let call = adapter::equality_delete_required_columns;
+    call();
+}
+"#,
+        ),
+    ];
+    let violations = ebd_4b3g_audit(&sources, true);
+    for expected in ["scan_preparation.rs|dead_helper", "extra.rs|extra"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "resolved call-site detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3g_iceberg_scan_range_adapter_owner_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_4b3g_audit(&sources, true);
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3G Iceberg scan-range adapter owner cutover failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
 #[test]
 fn ebd_4a_catalog_identifier_boundary_is_ast_free() {
     let repo = Path::new(manifest_dir());

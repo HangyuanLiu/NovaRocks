@@ -17,6 +17,7 @@
 
 use crate::connector::ConnectorRegistry;
 use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+use crate::connector::iceberg::scan_range::IcebergScanRangeContext;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
 use crate::coordinator::prepare::scan::{
     ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
@@ -24,8 +25,7 @@ use crate::coordinator::prepare::scan::{
     ScanExecutionBindings,
 };
 use crate::sql::codegen::scan::connector::{
-    ConnectorScanContext, PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
-    to_native_file_scan,
+    PlannedNativeStarRocksScan, plan_native_starrocks_scan_node,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
@@ -574,7 +574,11 @@ fn plan_iceberg_file_ranges(
     let planner = connectors.scan_planner("iceberg")?;
     let mut scan_handle = planner.begin_scan(table_handle, BeginScanContext::default())?;
     let splits = planner.plan_splits(&scan_handle, SplitPlanningContext::default())?;
-    let equality_required = equality_delete_required_columns(&files.table, &splits)?;
+    let equality_required =
+        crate::connector::iceberg::scan_range::equality_delete_required_columns(
+            &files.table,
+            &splits,
+        )?;
     let effective_column_names =
         merge_effective_column_names(base_column_names.clone(), &equality_required);
     if effective_column_names != base_column_names {
@@ -583,11 +587,10 @@ fn plan_iceberg_file_ranges(
             BeginScanContext::default(),
         )?;
     }
-    let plan = to_native_file_scan(
-        planner.name(),
+    let plan = crate::connector::iceberg::scan_range::plan_iceberg_scan_ranges(
         &scan_handle,
         &splits,
-        ConnectorScanContext {
+        IcebergScanRangeContext {
             min_max_predicates: native_scan_min_max_predicates(&scan.predicates),
             columns: scan.table.columns.clone(),
         },
@@ -606,121 +609,6 @@ fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) ->
         }
     }
     out
-}
-
-pub(crate) fn equality_delete_required_columns(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-    splits: &[crate::connector::scan_planning::Split],
-) -> Result<Vec<String>, String> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut schema_by_id = BTreeMap::new();
-    let mut schema_by_name = BTreeMap::new();
-    for field in &table.schema.fields {
-        if schema_by_id
-            .insert(field.field_id, field.name.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "Iceberg ScanNode table schema has duplicate field id {} for table {}",
-                field.field_id, table.table
-            ));
-        }
-        let normalized = field.name.to_ascii_lowercase();
-        if schema_by_name
-            .insert(normalized, field.name.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "Iceberg ScanNode table schema has duplicate field name {} for table {}",
-                field.name, table.table
-            ));
-        }
-    }
-
-    let mut required = Vec::new();
-    let mut required_seen = BTreeSet::new();
-    for split in splits {
-        let file = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
-        for delete in &file.data_file.delete_files {
-            if delete.file_content
-                != crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
-            {
-                continue;
-            }
-
-            let mut resolved_ids = Vec::new();
-            let mut ids_seen = BTreeSet::new();
-            for field_id in &delete.equality_field_ids {
-                if !ids_seen.insert(*field_id) {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has duplicate equality field id {}",
-                        delete.path, field_id
-                    ));
-                }
-                let name = schema_by_id.get(field_id).ok_or_else(|| {
-                    format!(
-                        "Iceberg equality-delete file {} references unknown field id {} in table {}",
-                        delete.path, field_id, table.table
-                    )
-                })?;
-                resolved_ids.push(name.clone());
-            }
-
-            let mut resolved_names = Vec::new();
-            let mut names_seen = BTreeSet::new();
-            for name in &delete.equality_column_names {
-                let normalized = name.to_ascii_lowercase();
-                if !names_seen.insert(normalized.clone()) {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has duplicate equality column name {}",
-                        delete.path, name
-                    ));
-                }
-                let canonical = schema_by_name.get(&normalized).ok_or_else(|| {
-                    format!(
-                        "Iceberg equality-delete file {} references unknown equality column {} in table {}",
-                        delete.path, name, table.table
-                    )
-                })?;
-                resolved_names.push(canonical.clone());
-            }
-
-            let columns = match (resolved_ids.is_empty(), resolved_names.is_empty()) {
-                (true, true) => {
-                    return Err(format!(
-                        "Iceberg equality-delete file {} has no equality field identity",
-                        delete.path
-                    ));
-                }
-                (false, false) => {
-                    let ids = resolved_ids
-                        .iter()
-                        .map(|name| name.to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>();
-                    let names = resolved_names
-                        .iter()
-                        .map(|name| name.to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>();
-                    if ids != names {
-                        return Err(format!(
-                            "Iceberg equality-delete file {} field id/name mismatch: ids={resolved_ids:?} names={resolved_names:?}",
-                            delete.path
-                        ));
-                    }
-                    resolved_ids
-                }
-                (false, true) => resolved_ids,
-                (true, false) => resolved_names,
-            };
-            for name in columns {
-                if required_seen.insert(name.to_ascii_lowercase()) {
-                    required.push(name);
-                }
-            }
-        }
-    }
-    Ok(required)
 }
 
 pub(crate) fn native_scan_min_max_predicates(
