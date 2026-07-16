@@ -27,6 +27,7 @@ use crate::runtime_filter::model::contract::{
 };
 
 use super::artifact::encode_schema;
+use super::value_domain::ContributionSizeError;
 
 const ORDER_CONTRACT_VERSION: u16 = 1;
 pub(crate) const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
@@ -225,6 +226,79 @@ impl OrderedBoundUpdate {
             bytes = bytes.and_then(|bytes| bytes.checked_add(part.len()));
         });
         bytes
+    }
+
+    pub(crate) fn canonical_contribution_len(&self) -> Result<usize, ContributionSizeError> {
+        u64::try_from(self.bound.values().len())
+            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+        self.bound
+            .values()
+            .iter()
+            .try_fold(size_of::<u64>(), |bytes, value| {
+                let scalar_bytes = match value {
+                    None => 0,
+                    Some(OrderedScalar::Boolean(_) | OrderedScalar::Int8(_)) => 1,
+                    Some(OrderedScalar::Int16(_)) => 2,
+                    Some(OrderedScalar::Int32(_) | OrderedScalar::Date32(_)) => 4,
+                    Some(OrderedScalar::Int64(_) | OrderedScalar::Timestamp(_)) => 8,
+                    Some(OrderedScalar::LargeInt(_) | OrderedScalar::Decimal128(_)) => 16,
+                    Some(OrderedScalar::Utf8(value)) => {
+                        u64::try_from(value.len())
+                            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+                        size_of::<u64>()
+                            .checked_add(value.len())
+                            .ok_or(ContributionSizeError::SizeOverflow)?
+                    }
+                };
+                bytes
+                    .checked_add(1)
+                    .and_then(|bytes| bytes.checked_add(scalar_bytes))
+                    .ok_or(ContributionSizeError::SizeOverflow)
+            })
+    }
+
+    pub(crate) fn encode_bound_canonical_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        let exact_len = self.canonical_contribution_len()?;
+        let start = output.len();
+        output.extend_from_slice(
+            &u64::try_from(self.bound.values().len())
+                .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?
+                .to_be_bytes(),
+        );
+        for value in self.bound.values() {
+            let Some(value) = value else {
+                output.push(0);
+                continue;
+            };
+            output.push(1);
+            match value {
+                OrderedScalar::Boolean(value) => output.push(u8::from(*value)),
+                OrderedScalar::Int8(value) => output.extend_from_slice(&value.to_be_bytes()),
+                OrderedScalar::Int16(value) => output.extend_from_slice(&value.to_be_bytes()),
+                OrderedScalar::Int32(value) | OrderedScalar::Date32(value) => {
+                    output.extend_from_slice(&value.to_be_bytes());
+                }
+                OrderedScalar::Int64(value) | OrderedScalar::Timestamp(value) => {
+                    output.extend_from_slice(&value.to_be_bytes());
+                }
+                OrderedScalar::LargeInt(value) | OrderedScalar::Decimal128(value) => {
+                    output.extend_from_slice(&value.to_be_bytes());
+                }
+                OrderedScalar::Utf8(value) => {
+                    output.extend_from_slice(
+                        &u64::try_from(value.len())
+                            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?
+                            .to_be_bytes(),
+                    );
+                    output.extend_from_slice(value.as_bytes());
+                }
+            }
+        }
+        debug_assert_eq!(output.len() - start, exact_len);
+        Ok(())
     }
 }
 
@@ -838,5 +912,31 @@ mod tests {
         assert_eq!(first.replay_digest(), same.replay_digest());
         assert_ne!(first.replay_digest(), different_bound.replay_digest());
         assert_ne!(first.replay_digest(), different_contract.replay_digest());
+    }
+
+    #[test]
+    fn ordered_bound_codec_body_is_exact_canonical_tuple() {
+        let contract = mixed_key_contract();
+        let update = OrderedBoundUpdate::new(
+            &contract,
+            tuple(&contract, [Some(OrderedScalar::Utf8("codec".into())), None]),
+        )
+        .unwrap();
+        let mut encoded = Vec::new();
+
+        update.encode_bound_canonical_into(&mut encoded).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2_u64.to_be_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&5_u64.to_be_bytes());
+        expected.extend_from_slice(b"codec");
+        expected.push(0);
+        assert_eq!(encoded, expected);
+        assert_eq!(update.canonical_contribution_len(), Ok(encoded.len()));
+        assert!(
+            update.canonical_contribution_bytes().unwrap()
+                > update.canonical_contribution_len().unwrap()
+        );
     }
 }

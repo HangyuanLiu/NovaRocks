@@ -24,7 +24,9 @@ use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::final_domain::{FinalDomainShard, RuntimeCompletionFenceContract};
 use crate::runtime_filter::port::identity::{ProducerSequence, ProducerStreamId};
-use crate::runtime_filter::port::ordered_bound::{OrderedBoundUpdate, RuntimeOrderContract};
+use crate::runtime_filter::port::ordered_bound::{
+    OrderedBoundUpdate, OrderedScalar, OrderedTuple, RuntimeOrderContract,
+};
 use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
 use crate::runtime_filter::port::value_domain::{
     ContributionSizeError, FINGERPRINT_VERSION_TAG, MembershipValues, ValueDomainDelta,
@@ -148,10 +150,15 @@ pub(crate) fn encoded_contribution_len(
             delta.canonical_encoded_len()?
         }
         (
-            RuntimeFilterContribution::OrderedBound(_),
-            ContributionCodecExpectation::OrderedBound(_),
-        )
-        | (
+            RuntimeFilterContribution::OrderedBound(update),
+            ContributionCodecExpectation::OrderedBound(contract),
+        ) => {
+            if update.order_contract_digest() != contract.digest() {
+                return Err(ContributionCodecError::SchemaMismatch);
+            }
+            update.canonical_contribution_len()?
+        }
+        (
             RuntimeFilterContribution::TopKSummary(_),
             ContributionCodecExpectation::TopKSummary(_),
         )
@@ -225,6 +232,10 @@ pub(crate) fn decode_contribution(
         (WireContributionKind::Membership, ContributionCodecExpectation::Membership(schema)) => {
             RuntimeFilterContribution::Membership(decode_membership_body(body, schema.data_type())?)
         }
+        (
+            WireContributionKind::OrderedBound,
+            ContributionCodecExpectation::OrderedBound(contract),
+        ) => RuntimeFilterContribution::OrderedBound(decode_ordered_bound_body(body, contract)?),
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let canonical = encode_contribution(&contribution, expectation, payload.len())?;
@@ -270,6 +281,19 @@ fn encode_contribution_with_allocator(
             schema.digest().bytes(),
             delta.canonical_encoded_len()?,
         ),
+        (
+            RuntimeFilterContribution::OrderedBound(update),
+            ContributionCodecExpectation::OrderedBound(contract),
+        ) => {
+            if update.order_contract_digest() != contract.digest() {
+                return Err(ContributionCodecError::SchemaMismatch);
+            }
+            (
+                WireContributionKind::OrderedBound,
+                contract.digest().bytes(),
+                update.canonical_contribution_len()?,
+            )
+        }
         _ => return Err(ContributionCodecError::KindMismatch),
     };
     let body_len = u64::try_from(body_len).map_err(|_| ContributionCodecError::LengthOverflow)?;
@@ -283,6 +307,9 @@ fn encode_contribution_with_allocator(
     match contribution {
         RuntimeFilterContribution::Membership(delta) => {
             delta.encode_canonical_into(&mut payload)?;
+        }
+        RuntimeFilterContribution::OrderedBound(update) => {
+            update.encode_bound_canonical_into(&mut payload)?;
         }
         _ => return Err(ContributionCodecError::KindMismatch),
     }
@@ -488,6 +515,73 @@ fn decode_membership_body(
     Ok(ValueDomainDelta::new(values, contains_null))
 }
 
+fn decode_ordered_bound_body(
+    body: &[u8],
+    contract: &RuntimeOrderContract,
+) -> Result<OrderedBoundUpdate, ContributionCodecError> {
+    let mut reader = Reader::new(body);
+    let arity =
+        usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
+    if arity != contract.keys().len() {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    if arity > reader.remaining_len() {
+        return Err(ContributionCodecError::Truncated);
+    }
+    let mut values = reserve_values(arity)?;
+    for key in contract.keys() {
+        values.push(match reader.read_u8()? {
+            0 => None,
+            1 => Some(decode_ordered_scalar(&mut reader, key.data_type())?),
+            _ => return Err(ContributionCodecError::NonCanonicalPayload),
+        });
+    }
+    if !reader.is_empty() {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    let tuple = OrderedTuple::try_from_codec(contract, values)
+        .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+    OrderedBoundUpdate::new(contract, tuple)
+        .map_err(|_| ContributionCodecError::NonCanonicalPayload)
+}
+
+fn decode_ordered_scalar(
+    reader: &mut Reader<'_>,
+    data_type: &DataType,
+) -> Result<OrderedScalar, ContributionCodecError> {
+    Ok(match data_type {
+        DataType::Boolean => OrderedScalar::Boolean(match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ContributionCodecError::NonCanonicalPayload),
+        }),
+        DataType::Int8 => OrderedScalar::Int8(reader.read_i8()?),
+        DataType::Int16 => OrderedScalar::Int16(reader.read_i16()?),
+        DataType::Int32 => OrderedScalar::Int32(reader.read_i32()?),
+        DataType::Int64 => OrderedScalar::Int64(reader.read_i64()?),
+        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
+            OrderedScalar::LargeInt(reader.read_i128()?)
+        }
+        DataType::Utf8 => {
+            let len = usize::try_from(reader.read_u64()?)
+                .map_err(|_| ContributionCodecError::LengthOverflow)?;
+            let bytes = reader.read_exact(len)?;
+            let value = std::str::from_utf8(bytes)
+                .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(len)
+                .map_err(|_| ContributionCodecError::ResourceLimit)?;
+            owned.push_str(value);
+            OrderedScalar::Utf8(owned.into())
+        }
+        DataType::Date32 => OrderedScalar::Date32(reader.read_i32()?),
+        DataType::Timestamp(_, _) => OrderedScalar::Timestamp(reader.read_i64()?),
+        DataType::Decimal128(_, _) => OrderedScalar::Decimal128(reader.read_i128()?),
+        _ => return Err(ContributionCodecError::NonCanonicalPayload),
+    })
+}
+
 fn expect_type_tag(reader: &mut Reader<'_>, expected: u8) -> Result<(), ContributionCodecError> {
     if reader.read_u8()? != expected {
         return Err(ContributionCodecError::NonCanonicalPayload);
@@ -618,7 +712,13 @@ mod tests {
 
     use super::*;
     use crate::common::largeint::LARGEINT_BYTE_WIDTH;
-    use crate::runtime_filter::model::contract::NullSemantics;
+    use crate::runtime_filter::model::contract::{
+        NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
+    };
+    use crate::runtime_filter::port::ordered_bound::{
+        COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
+        comparator_digest_for_test,
+    };
     use crate::runtime_filter::port::value_domain::MembershipValues;
 
     struct CountingAllocator {
@@ -710,6 +810,62 @@ mod tests {
             ),
             Ok(encoded)
         );
+    }
+
+    fn order_contract(keys: Vec<OrderKeyContract>) -> RuntimeOrderContract {
+        let comparator_digest = comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION);
+        RuntimeOrderContract::try_from_plan(&OrderContract {
+            keys,
+            inclusive: true,
+            comparator_digest,
+        })
+        .unwrap()
+    }
+
+    fn order_key(
+        data_type: DataType,
+        direction: SortDirection,
+        null_order: NullOrder,
+    ) -> OrderKeyContract {
+        OrderKeyContract {
+            data_type,
+            direction,
+            null_order,
+        }
+    }
+
+    fn ordered_bound(
+        contract: &RuntimeOrderContract,
+        values: impl IntoIterator<Item = Option<OrderedScalar>>,
+    ) -> RuntimeFilterContribution {
+        let tuple = OrderedTuple::try_new(contract, values).unwrap();
+        RuntimeFilterContribution::OrderedBound(OrderedBoundUpdate::new(contract, tuple).unwrap())
+    }
+
+    fn assert_ordered_bound_round_trip(
+        contract: &RuntimeOrderContract,
+        values: impl IntoIterator<Item = Option<OrderedScalar>>,
+    ) -> EncodedContribution {
+        let contribution = ordered_bound(contract, values);
+        let expectation = ContributionCodecExpectation::OrderedBound(contract);
+        let encoded = encode_contribution(&contribution, expectation, usize::MAX);
+        let expected_len = encoded_contribution_len(&contribution, expectation);
+        assert_eq!(
+            encoded.as_ref().map(|encoded| encoded.payload().len()),
+            expected_len.as_ref().map(|len| *len)
+        );
+        let encoded = encoded.unwrap();
+        assert_eq!(encoded.schema_digest(), &contract.digest().bytes());
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                encoded.payload().len(),
+            ),
+            Ok(contribution)
+        );
+        encoded
     }
 
     #[test]
@@ -1112,6 +1268,285 @@ mod tests {
         assert_eq!(
             encoded_frame_len_from_body_len(usize::MAX),
             Err(ContributionCodecError::LengthOverflow)
+        );
+    }
+
+    #[test]
+    fn ordered_bound_round_trip_uses_installed_contract() {
+        let contract = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let contribution = ordered_bound(&contract, [Some(OrderedScalar::Int64(42))]);
+        let expectation = ContributionCodecExpectation::OrderedBound(&contract);
+
+        assert_eq!(
+            encode_contribution(&contribution, expectation, usize::MAX)
+                .map(|encoded| encoded.payload().len()),
+            Ok(HEADER_LEN + 8 + 1 + 8)
+        );
+        assert_ordered_bound_round_trip(&contract, [Some(OrderedScalar::Int64(42))]);
+    }
+
+    #[test]
+    fn ordered_bound_covers_asc_desc_nulls_first_last_and_multikey() {
+        let ascending = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::First,
+        )]);
+        let descending = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Descending,
+            NullOrder::Last,
+        )]);
+        let ascending_encoded =
+            assert_ordered_bound_round_trip(&ascending, [Some(OrderedScalar::Int64(7))]);
+        let descending_encoded =
+            assert_ordered_bound_round_trip(&descending, [Some(OrderedScalar::Int64(7))]);
+        assert_eq!(
+            ascending_encoded.payload()[HEADER_LEN..],
+            descending_encoded.payload()[HEADER_LEN..]
+        );
+
+        for (direction, null_order, value) in [
+            (SortDirection::Ascending, NullOrder::First, None),
+            (
+                SortDirection::Ascending,
+                NullOrder::Last,
+                Some(OrderedScalar::Int64(1)),
+            ),
+            (
+                SortDirection::Descending,
+                NullOrder::First,
+                Some(OrderedScalar::Int64(-1)),
+            ),
+            (SortDirection::Descending, NullOrder::Last, None),
+        ] {
+            let contract = order_contract(vec![order_key(DataType::Int64, direction, null_order)]);
+            assert_ordered_bound_round_trip(&contract, [value]);
+        }
+
+        let contract = order_contract(vec![
+            order_key(DataType::Int32, SortDirection::Ascending, NullOrder::Last),
+            order_key(DataType::Utf8, SortDirection::Descending, NullOrder::First),
+        ]);
+        assert_ordered_bound_round_trip(
+            &contract,
+            [
+                Some(OrderedScalar::Int32(7)),
+                Some(OrderedScalar::Utf8(Arc::from("多键"))),
+            ],
+        );
+    }
+
+    #[test]
+    fn ordered_bound_covers_utf8_decimal_timestamp_and_largeint() {
+        let cases = [
+            (
+                DataType::Utf8,
+                Some(OrderedScalar::Utf8(Arc::from("héllo-東京"))),
+            ),
+            (
+                DataType::Decimal128(38, 6),
+                Some(OrderedScalar::Decimal128(10_i128.pow(38) - 1)),
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                Some(OrderedScalar::Timestamp(i64::MIN)),
+            ),
+            (
+                DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
+                Some(OrderedScalar::LargeInt(i128::MAX)),
+            ),
+        ];
+
+        for (data_type, value) in cases {
+            let contract = order_contract(vec![order_key(
+                data_type,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )]);
+            assert_ordered_bound_round_trip(&contract, [value]);
+        }
+    }
+
+    #[test]
+    fn ordered_bound_rejects_wrong_kind_digest_arity_type_and_noncanonical_scalar() {
+        let contract = order_contract(vec![order_key(
+            DataType::Boolean,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let contribution = ordered_bound(&contract, [Some(OrderedScalar::Boolean(true))]);
+        let expectation = ContributionCodecExpectation::OrderedBound(&contract);
+        let encoded = encode_contribution(&contribution, expectation, usize::MAX).unwrap();
+
+        let membership_schema = schema(&DataType::Boolean, NullSemantics::NeverMatches);
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                ContributionCodecExpectation::Membership(&membership_schema),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::KindMismatch)
+        );
+
+        let mut wrong_digest = encoded.payload().to_vec();
+        wrong_digest[8] ^= 1;
+        assert_eq!(
+            decode_contribution(
+                &wrong_digest,
+                encoded.schema_digest(),
+                expectation,
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let other_contract = order_contract(vec![order_key(
+            DataType::Boolean,
+            SortDirection::Descending,
+            NullOrder::Last,
+        )]);
+        assert_eq!(
+            encode_contribution(
+                &contribution,
+                ContributionCodecExpectation::OrderedBound(&other_contract),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let mut wrong_arity = encoded.payload().to_vec();
+        wrong_arity[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&2_u64.to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &wrong_arity,
+                encoded.schema_digest(),
+                expectation,
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let mut impossible_arity = encoded.payload().to_vec();
+        impossible_arity[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &impossible_arity,
+                encoded.schema_digest(),
+                expectation,
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let mut invalid_boolean = encoded.payload().to_vec();
+        invalid_boolean[HEADER_LEN + 8 + 1] = 2;
+        assert_eq!(
+            decode_contribution(
+                &invalid_boolean,
+                encoded.schema_digest(),
+                expectation,
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let utf8_contract = order_contract(vec![order_key(
+            DataType::Utf8,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let utf8_encoded = assert_ordered_bound_round_trip(
+            &utf8_contract,
+            [Some(OrderedScalar::Utf8("a".into()))],
+        );
+        let mut invalid_utf8 = utf8_encoded.payload().to_vec();
+        invalid_utf8[HEADER_LEN + 8 + 1 + 8] = 0xff;
+        assert_eq!(
+            decode_contribution(
+                &invalid_utf8,
+                utf8_encoded.schema_digest(),
+                ContributionCodecExpectation::OrderedBound(&utf8_contract),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let mut impossible_utf8 = utf8_encoded.payload().to_vec();
+        impossible_utf8[HEADER_LEN + 8 + 1..HEADER_LEN + 8 + 1 + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &impossible_utf8,
+                utf8_encoded.schema_digest(),
+                ContributionCodecExpectation::OrderedBound(&utf8_contract),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::Truncated)
+        );
+
+        let decimal_contract = order_contract(vec![order_key(
+            DataType::Decimal128(3, 0),
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let decimal_encoded = assert_ordered_bound_round_trip(
+            &decimal_contract,
+            [Some(OrderedScalar::Decimal128(999))],
+        );
+        let mut decimal_overflow = decimal_encoded.payload().to_vec();
+        decimal_overflow[HEADER_LEN + 8 + 1..HEADER_LEN + 8 + 1 + 16]
+            .copy_from_slice(&1000_i128.to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &decimal_overflow,
+                decimal_encoded.schema_digest(),
+                ContributionCodecExpectation::OrderedBound(&decimal_contract),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+    }
+
+    #[test]
+    fn ordered_bound_exact_limit_succeeds_and_limit_minus_one_fails() {
+        let contract = order_contract(vec![order_key(
+            DataType::Utf8,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let contribution =
+            ordered_bound(&contract, [Some(OrderedScalar::Utf8(Arc::from("exact")))]);
+        let expectation = ContributionCodecExpectation::OrderedBound(&contract);
+        let exact = encoded_contribution_len(&contribution, expectation);
+        assert_eq!(exact, Ok(HEADER_LEN + 8 + 1 + 8 + 5));
+        let exact = exact.unwrap();
+
+        assert_eq!(
+            encode_contribution(&contribution, expectation, exact - 1),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        let encoded = encode_contribution(&contribution, expectation, exact).unwrap();
+        assert_eq!(encoded.payload().len(), exact);
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact - 1,
+            ),
+            Err(ContributionCodecError::EncodedSizeExceeded)
+        );
+        assert_eq!(
+            decode_contribution(
+                encoded.payload(),
+                encoded.schema_digest(),
+                expectation,
+                exact,
+            ),
+            Ok(contribution)
         );
     }
 }
