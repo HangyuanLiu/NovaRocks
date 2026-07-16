@@ -36745,6 +36745,16 @@ impl Rfd4M2b1TypeResolver {
         self.path_segments_are_symbol(&segments, symbol, scope)
     }
 
+    fn path_has_symbol_prefix(&self, path: &syn::Path, symbol: &str, scope: &[String]) -> bool {
+        let segments = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        (1..segments.len())
+            .any(|prefix_len| self.path_segments_are_symbol(&segments[..prefix_len], symbol, scope))
+    }
+
     fn path_segments_are_symbol(
         &self,
         segments: &[String],
@@ -37180,6 +37190,17 @@ impl Rfd4M2b1AstAudit {
             self.role_router_authorities.insert(name);
         }
     }
+
+    fn audit_authority_expression_path(&mut self, path: &syn::Path) {
+        self.composite_authority_reference |= self.type_resolver.path_has_symbol_prefix(
+            path,
+            "RuntimeFilterParticipantInstall",
+            &self.module_scope,
+        );
+        self.role_router_authority_reference |=
+            self.type_resolver
+                .path_has_symbol_prefix(path, "RoleRouter", &self.module_scope);
+    }
 }
 
 fn rfd4_m2b1_allowed_borrowed_view_helper(path: &str, name: &str) -> bool {
@@ -37394,6 +37415,13 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
                     .path_is_symbol(&path.path, "RoleRouter", &self.module_scope);
         }
         syn::visit::visit_type_path(self, path);
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.qself.is_none() {
+            self.audit_authority_expression_path(&path.path);
+        }
+        syn::visit::visit_expr_path(self, path);
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
@@ -38264,6 +38292,99 @@ fn rfd4_m2b1_detector_applies_scope_aware_authority_refs_to_live_owners() {
                 .iter()
                 .any(|violation| violation.contains(owner_violation)),
             "live ingress must also enforce the {owner_violation} owner boundary: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_rejects_authority_expression_paths_in_live_owners() {
+    for (source, symbol, owner_violation) in [
+        (
+            "fn install() { \
+             let _ = crate::runtime_filter::port::install::\
+             RuntimeFilterParticipantInstall::new(core(), shard()); \
+             }",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "use crate::runtime_filter::port::install::\
+             RuntimeFilterParticipantInstall as Install; \
+             fn install() { let _ = Install::new(core(), shard()); }",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "use crate::runtime_filter::port::install as install_port; \
+             fn install() { \
+             let _ = install_port::RuntimeFilterParticipantInstall::new(core(), shard()); \
+             }",
+            "RuntimeFilterParticipantInstall",
+            "composite-owner",
+        ),
+        (
+            "fn route() { \
+             let _ = crate::runtime_filter::router::role_graph::RoleRouter::new(shard()); \
+             }",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+        (
+            "use crate::runtime_filter::router::role_graph::RoleRouter as Router; \
+             fn route() { let _ = Router::new(shard()); }",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+        (
+            "use crate::runtime_filter::router::role_graph as routing; \
+             fn route() { let _ = routing::RoleRouter::new(shard()); }",
+            "RoleRouter",
+            "role-router-owner",
+        ),
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime/query_context.rs",
+            source,
+        )]);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("live-ingress-authority-leak") && violation.contains(symbol)
+            }),
+            "live ingress must reject authority-associated expression paths for {symbol}: \
+             {source}: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(owner_violation)),
+            "authority-associated expression paths must enforce {owner_violation}: \
+             {source}: {violations:?}"
+        );
+    }
+
+    for source in [
+        "struct RuntimeFilterParticipantInstall; \
+         impl RuntimeFilterParticipantInstall { fn new() -> Self { Self } } \
+         fn install() { let _ = RuntimeFilterParticipantInstall::new(); }",
+        "mod routing { \
+         pub(crate) struct RoleRouter; \
+         impl RoleRouter { pub(crate) fn new() -> Self { Self } } \
+         } \
+         fn route() { let _ = routing::RoleRouter::new(); }",
+        "fn inspect() { let _ = crate::common::types::UniqueId::new(); }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime/query_context.rs",
+            source,
+        )]);
+        assert!(
+            !violations.iter().any(|violation| {
+                violation.contains("live-ingress-authority-leak")
+                    || violation.contains("composite-owner")
+                    || violation.contains("role-router-owner")
+            }),
+            "local shadows and unrelated associated calls must remain outside authority detection: \
              {source}: {violations:?}"
         );
     }
