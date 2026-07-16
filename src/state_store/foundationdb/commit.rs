@@ -418,18 +418,25 @@ pub(super) async fn supervise_commit(
     started: StdInstant,
 ) -> CommitOutcome {
     let metrics = Arc::clone(&prepared.metrics);
+    #[cfg(feature = "state-store-test-hooks")]
+    let waiter_drop_guard = super::test_support::arm_commit_waiter_drop_guard();
     let (sender, receiver) = oneshot::channel();
     tokio::spawn(async move {
         let outcome = run_commit_owner(prepared).await;
         record_commit(&metrics, started, &outcome);
         let _ = sender.send(outcome);
     });
-    receiver.await.unwrap_or_else(|_| {
+    let outcome = receiver.await.unwrap_or_else(|_| {
         CommitOutcome::CommitUnknown(StateStoreError::new(
             StateStoreErrorKind::Internal,
             "FoundationDB commit supervisor stopped before reporting an outcome",
         ))
-    })
+    });
+    #[cfg(feature = "state-store-test-hooks")]
+    if let Some(waiter_drop_guard) = waiter_drop_guard {
+        waiter_drop_guard.complete();
+    }
+    outcome
 }
 
 pub(super) async fn supervise_pre_dispatch_failure(

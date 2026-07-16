@@ -32,8 +32,10 @@ struct GateState {
     pre_native_released: AtomicBool,
     response_reached: AtomicBool,
     response_released: AtomicBool,
+    waiter_dropped: AtomicBool,
     pre_native_notify: Notify,
     response_notify: Notify,
+    waiter_notify: Notify,
 }
 
 /// Test-only control for the two native commit boundaries that the binding exposes.
@@ -45,6 +47,10 @@ pub struct FoundationDbCommitGateControl {
 
 pub(super) struct CommitGates {
     state: Arc<GateState>,
+}
+
+pub(super) struct CommitWaiterDropGuard {
+    state: Option<Arc<GateState>>,
 }
 
 /// Arms the next FoundationDB commit supervisor in this process.
@@ -62,8 +68,10 @@ pub fn arm_next_foundationdb_commit(
         pre_native_released: AtomicBool::new(!block_pre_native),
         response_reached: AtomicBool::new(false),
         response_released: AtomicBool::new(!block_response),
+        waiter_dropped: AtomicBool::new(false),
         pre_native_notify: Notify::new(),
         response_notify: Notify::new(),
+        waiter_notify: Notify::new(),
     });
     let mut slot = gate_slot().lock().map_err(|_| hook_error())?;
     if slot.is_some() {
@@ -74,6 +82,14 @@ pub fn arm_next_foundationdb_commit(
     }
     *slot = Some(Arc::clone(&state));
     Ok(FoundationDbCommitGateControl { state })
+}
+
+pub(super) fn arm_commit_waiter_drop_guard() -> Option<CommitWaiterDropGuard> {
+    let state = match gate_slot().lock() {
+        Ok(slot) => slot.as_ref().map(Arc::clone),
+        Err(poisoned) => poisoned.into_inner().as_ref().map(Arc::clone),
+    }?;
+    Some(CommitWaiterDropGuard { state: Some(state) })
 }
 
 pub(super) fn take_commit_gates() -> Option<CommitGates> {
@@ -138,6 +154,26 @@ impl FoundationDbCommitGateControl {
         self.state.response_released.store(true, Ordering::Release);
         self.state.response_notify.notify_waiters();
     }
+
+    pub async fn wait_waiter_dropped(&self) {
+        wait_flag(&self.state.waiter_dropped, &self.state.waiter_notify).await;
+    }
+}
+
+impl CommitWaiterDropGuard {
+    pub fn complete(mut self) {
+        self.state.take();
+    }
+}
+
+impl Drop for CommitWaiterDropGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        state.waiter_dropped.store(true, Ordering::Release);
+        state.waiter_notify.notify_waiters();
+    }
 }
 
 async fn wait_flag(flag: &AtomicBool, notify: &Notify) {
@@ -167,8 +203,16 @@ fn hook_error() -> StateStoreError {
 mod tests {
     use super::*;
 
+    async fn test_gate_lock() -> tokio::sync::OwnedMutexGuard<()> {
+        static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+            .lock_owned()
+            .await
+    }
+
     #[tokio::test]
     async fn gates_expose_pre_native_and_response_as_distinct_boundaries() {
+        let _guard = test_gate_lock().await;
         let control = arm_next_foundationdb_commit(true, true, true).expect("arm gates");
         let gates = take_commit_gates().expect("take gates");
         let owner = tokio::spawn(async move {
@@ -198,6 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_waits_observe_signals_emitted_before_registration() {
+        let _guard = test_gate_lock().await;
         let control = arm_next_foundationdb_commit(false, false, false).expect("arm gates");
         let gates = take_commit_gates().expect("take gates");
         gates.before_native_commit().await;
@@ -220,5 +265,36 @@ mod tests {
         )
         .await
         .expect("response signal must not be lost");
+    }
+
+    #[tokio::test]
+    async fn caller_waiter_drop_is_observable_without_dropping_the_provider_owner() {
+        let _guard = test_gate_lock().await;
+        let control = arm_next_foundationdb_commit(true, false, false).expect("arm gates");
+        let waiter_guard = arm_commit_waiter_drop_guard().expect("register waiter drop guard");
+        let gates = take_commit_gates().expect("take provider gates");
+        let owner = tokio::spawn(async move {
+            gates.before_native_commit().await;
+            gates
+                .before_response(CommitOutcome::DefiniteFailure(StateStoreError::new(
+                    StateStoreErrorKind::InvalidRequest,
+                    "owner continued after caller cancellation",
+                )))
+                .await
+        });
+        control.wait_pre_native().await;
+
+        drop(waiter_guard);
+        control.wait_waiter_dropped().await;
+        assert!(
+            !owner.is_finished(),
+            "provider owner must remain blocked and owned after caller waiter drop"
+        );
+
+        control.release_pre_native();
+        assert!(matches!(
+            owner.await.expect("provider owner remains alive"),
+            CommitOutcome::DefiniteFailure(_)
+        ));
     }
 }

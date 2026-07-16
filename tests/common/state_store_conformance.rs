@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -33,12 +34,9 @@ use novarocks::state_store::{
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-pub type StoreFuture = Pin<
-    Box<
-        dyn Future<Output = Result<StateStoreConformanceFixture, StateStoreError>> + Send + 'static,
-    >,
->;
-pub type StateStoreFactory = Arc<dyn Fn() -> StoreFuture + Send + Sync>;
+pub type StoreFuture =
+    Pin<Box<dyn Future<Output = Result<StateStoreConformanceFixture, StateStoreError>> + 'static>>;
+pub type StateStoreFactory = Rc<dyn Fn() -> StoreFuture>;
 
 pub struct StateStoreConformanceFixture {
     pub store: Arc<dyn StateStore>,

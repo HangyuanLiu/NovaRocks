@@ -24,6 +24,13 @@ build = "src/build.rs"
 [lib]
 doctest = false
 
+[[bin]]
+name = "state-store-foundationdb-helper"
+path = "tests/support/state_store_foundationdb_helper.rs"
+required-features = ["foundationdb-provider", "state-store-test-hooks"]
+test = false
+bench = false
+
 [dependencies]
 # logging/config
 tracing = "0.1"
@@ -74,7 +81,7 @@ bytes = "1"
 csv = "1"
 hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"

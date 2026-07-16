@@ -19,19 +19,33 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::rc::Rc;
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::Arc;
 
+#[cfg(feature = "state-store-test-hooks")]
+use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
-#[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::arm_next_foundationdb_commit;
 use novarocks::state_store::{
     ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView,
     FoundationDbClientConfig, Key, KeyRange, Precondition, RangeRequest, StateStore,
     StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig,
     StateStoreRuntime, TransactionId, Value, open_state_store,
 };
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
 use uuid::Uuid;
+
+#[cfg(feature = "state-store-test-hooks")]
+mod common;
+
+#[cfg(feature = "state-store-test-hooks")]
+use common::state_store_conformance::{
+    PostDispatchControl, PostDispatchController, PostDispatchScenario,
+    StateStoreConformanceFixture, StateStoreFactory,
+};
 
 fn client_config() -> FoundationDbClientConfig {
     FoundationDbClientConfig {
@@ -747,6 +761,103 @@ async fn cancellation_safe_supervisor_scenarios(runtime: &StateStoreRuntime) {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
+fn conformance_factory(runtime: Rc<StateStoreRuntime>) -> StateStoreFactory {
+    Rc::new(move || {
+        let runtime = Rc::clone(&runtime);
+        Box::pin(async move {
+            let store = open_state_store(
+                runtime.as_ref(),
+                StateStoreConfig {
+                    cluster_id: "foundationdb-conformance-cluster".to_owned(),
+                    limits: StateStoreLimitOverrides {
+                        max_key_bytes: Some(64),
+                        max_value_bytes: Some(128),
+                        max_page_size: Some(10),
+                        max_transaction_operations: Some(8),
+                        max_transaction_bytes: Some(1_024),
+                        transaction_deadline_ms: Some(4_000),
+                        runner_max_attempts: Some(3),
+                    },
+                    provider: StateStoreProviderConfig::Foundationdb {
+                        cluster_file: cluster_file(),
+                        keyspace_id: Uuid::new_v4(),
+                    },
+                },
+                FeDeploymentView {
+                    active_fe_count: NonZeroUsize::new(2).expect("non-zero FE count"),
+                    topology_revision: Bytes::from_static(b"foundationdb-conformance-topology"),
+                },
+            )
+            .await?;
+            let controller: Arc<dyn PostDispatchController> =
+                Arc::new(FoundationDbPostDispatchController);
+            Ok(StateStoreConformanceFixture::new(store, controller))
+        })
+    })
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+struct FoundationDbPostDispatchController;
+
+#[cfg(feature = "state-store-test-hooks")]
+#[async_trait]
+impl PostDispatchController for FoundationDbPostDispatchController {
+    async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl> {
+        let gate = match scenario {
+            PostDispatchScenario::CancelWaiterBeforeApply => {
+                arm_next_foundationdb_commit(true, false, false)
+            }
+            PostDispatchScenario::LoseCommittedResponse => {
+                arm_next_foundationdb_commit(false, true, true)
+            }
+        }
+        .expect("arm real FoundationDB provider commit gate");
+        Box::new(FoundationDbPostDispatchControl { scenario, gate })
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+struct FoundationDbPostDispatchControl {
+    scenario: PostDispatchScenario,
+    gate: FoundationDbCommitGateControl,
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[async_trait]
+impl PostDispatchControl for FoundationDbPostDispatchControl {
+    async fn wait_dispatched(&self) {
+        match self.scenario {
+            PostDispatchScenario::CancelWaiterBeforeApply => self.gate.wait_pre_native().await,
+            PostDispatchScenario::LoseCommittedResponse => self.gate.wait_response().await,
+        }
+    }
+
+    async fn wait_waiter_cancelled(&self) {
+        if self.scenario == PostDispatchScenario::CancelWaiterBeforeApply {
+            self.gate.wait_waiter_dropped().await;
+        }
+    }
+
+    async fn allow_provider_progress(&self) {
+        if self.scenario == PostDispatchScenario::CancelWaiterBeforeApply {
+            self.gate.release_pre_native();
+        }
+    }
+
+    async fn release_response(&self) {
+        if self.scenario == PostDispatchScenario::LoseCommittedResponse {
+            self.gate.release_response();
+        }
+    }
+
+    async fn wait_inner_dropped(&self) {
+        if self.scenario == PostDispatchScenario::CancelWaiterBeforeApply {
+            self.gate.wait_waiter_dropped().await;
+        }
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
 async fn await_terminal(store: &dyn StateStore, transaction_id: TransactionId) -> CommitResolution {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -766,14 +877,16 @@ async fn await_terminal(store: &dyn StateStore, transaction_id: TransactionId) -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foundationdb_suite() {
-    let mut runtime = StateStoreRuntime::foundationdb(client_config())
-        .expect("boot process-owned FoundationDB runtime");
+    let runtime = Rc::new(
+        StateStoreRuntime::foundationdb(client_config())
+            .expect("boot process-owned FoundationDB runtime"),
+    );
 
     let keyspace_id = Uuid::new_v4();
     let config = store_config("identity-cluster", keyspace_id);
     let (left, right) = tokio::join!(
-        open_state_store(&runtime, config.clone(), deployment()),
-        open_state_store(&runtime, config, deployment())
+        open_state_store(runtime.as_ref(), config.clone(), deployment()),
+        open_state_store(runtime.as_ref(), config, deployment())
     );
     let left = left.expect("initialize FoundationDB keyspace");
     let right = right.expect("concurrent open converges on keyspace identity");
@@ -784,7 +897,7 @@ async fn foundationdb_suite() {
     assert_eq!(left_identity.initial_incarnation, 1);
 
     let mismatch = match open_state_store(
-        &runtime,
+        runtime.as_ref(),
         store_config("different-cluster", keyspace_id),
         deployment(),
     )
@@ -798,7 +911,7 @@ async fn foundationdb_suite() {
     let corrupt_keyspace = Uuid::new_v4();
     write_partial_identity(corrupt_keyspace).await;
     let corruption = match open_state_store(
-        &runtime,
+        runtime.as_ref(),
         store_config("identity-cluster", corrupt_keyspace),
         deployment(),
     )
@@ -809,13 +922,20 @@ async fn foundationdb_suite() {
     };
     assert_eq!(corruption.kind(), StateStoreErrorKind::Corruption);
 
-    transaction_scenarios(&runtime).await;
-    durable_commit_and_change_scenarios(&runtime).await;
+    transaction_scenarios(runtime.as_ref()).await;
+    durable_commit_and_change_scenarios(runtime.as_ref()).await;
     #[cfg(feature = "state-store-test-hooks")]
-    cancellation_safe_supervisor_scenarios(&runtime).await;
+    cancellation_safe_supervisor_scenarios(runtime.as_ref()).await;
+    #[cfg(feature = "state-store-test-hooks")]
+    {
+        let factory = conformance_factory(Rc::clone(&runtime));
+        common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+        drop(factory);
+    }
 
     drop(right);
     drop(left);
+    let mut runtime = Rc::try_unwrap(runtime).expect("all FoundationDB runtime owners drained");
     runtime
         .shutdown()
         .await

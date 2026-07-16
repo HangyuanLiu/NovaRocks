@@ -121,7 +121,7 @@ async fn read_state_record(
 
 fn conformance_factory() -> StateStoreFactory {
     let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
-    Arc::new(move || {
+    std::rc::Rc::new(move || {
         let temp = Arc::clone(&temp);
         Box::pin(async move {
             let path = temp.path().join("state-store.sqlite");
