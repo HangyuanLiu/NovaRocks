@@ -18,7 +18,7 @@
 #![cfg(all(feature = "foundationdb-provider", feature = "state-store-test-hooks"))]
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
+use std::process::{Child, ChildStdin, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -90,12 +90,18 @@ struct HelperProcess {
 
 impl HelperProcess {
     fn spawn() -> Self {
-        let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_state-store-foundationdb-helper"))
+        Self::spawn_with(|_| {})
+    }
+
+    fn spawn_with(configure: impl FnOnce(&mut ProcessCommand)) -> Self {
+        let mut command =
+            ProcessCommand::new(env!("CARGO_BIN_EXE_state-store-foundationdb-helper"));
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn FoundationDB helper process");
+            .stderr(Stdio::inherit());
+        configure(&mut command);
+        let mut child = command.spawn().expect("spawn FoundationDB helper process");
         let stdin = child.stdin.take().expect("take helper stdin");
         let stdout = child.stdout.take().expect("take helper stdout");
         let (responses_tx, responses) = mpsc::channel();
@@ -130,18 +136,21 @@ impl HelperProcess {
     }
 
     fn receive(&mut self) -> helper::Response {
-        let line = self
-            .responses
-            .recv_timeout(Duration::from_secs(10))
-            .expect("helper must respond within ten seconds");
-        let response: helper::Response =
-            serde_json::from_str(&line).expect("decode helper response");
+        let response = self.receive_unchecked();
         assert!(
             response.ok,
             "helper command failed: event={}, error={:?}",
             response.event, response.error
         );
         response
+    }
+
+    fn receive_unchecked(&mut self) -> helper::Response {
+        let line = self
+            .responses
+            .recv_timeout(Duration::from_secs(10))
+            .expect("helper must respond within ten seconds");
+        serde_json::from_str(&line).expect("decode helper response")
     }
 
     fn request(&mut self, command: JsonValue) -> helper::Response {
@@ -158,6 +167,24 @@ impl HelperProcess {
             reader.join().expect("join helper response reader");
         }
     }
+
+    fn wait_for_exit(mut self) -> ExitStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll helper exit") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper must exit within ten seconds"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("join helper response reader");
+        }
+        status
+    }
 }
 
 impl Drop for HelperProcess {
@@ -172,6 +199,36 @@ impl Drop for HelperProcess {
 
 fn transaction() -> Uuid {
     Uuid::now_v7()
+}
+
+#[test]
+fn helper_open_failure_shuts_down_runtime_and_exits_deterministically() {
+    let mut helper = HelperProcess::spawn_with(|command| {
+        command.env(
+            "NOVAROCKS_FDB_CLUSTER_FILE",
+            "/nonexistent/novarocks-foundationdb-helper.cluster",
+        );
+    });
+    helper.send(json!({
+        "command": "Open",
+        "cluster_id": "open-failure",
+        "keyspace_id": Uuid::now_v7(),
+    }));
+
+    let response = helper.receive_unchecked();
+    assert!(!response.ok, "invalid cluster file must fail helper open");
+    assert_eq!(response.event, "Error");
+    assert!(
+        response.error.as_deref().is_some_and(|error| error
+            == "InvalidConfiguration: FoundationDB state store configuration is invalid"),
+        "helper must preserve the original store-open error: {:?}",
+        response.error
+    );
+    let status = helper.wait_for_exit();
+    assert!(
+        !status.success(),
+        "helper must retire after a post-boot open failure"
+    );
 }
 
 fn begin(helper: &mut HelperProcess, transaction_id: Uuid, description: &str) {

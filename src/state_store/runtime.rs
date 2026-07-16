@@ -466,6 +466,21 @@ impl FoundationDbRuntime {
 }
 
 #[cfg(feature = "foundationdb-provider")]
+impl Drop for FoundationDbRuntime {
+    fn drop(&mut self) {
+        if matches!(self.network, FoundationDbNetworkLifecycle::Running(_)) {
+            tracing::error!(
+                provider = "foundationdb",
+                lifecycle = "shutdown_required",
+                process_id = self.shared.pid,
+                "FoundationDB state store runtime dropped before shutdown"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "foundationdb-provider")]
 impl FoundationDbNetworkLifecycle {
     fn terminal_result(&mut self) -> Option<Result<(), StateStoreError>> {
         match self {
@@ -1153,6 +1168,60 @@ mod tests {
             child.success(),
             "dropping a failed lifecycle must not abort, stop, or join"
         );
+    }
+
+    #[test]
+    fn running_runtime_drop_fails_fast() {
+        let child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "state_store::runtime::tests::running_runtime_drop_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .status()
+            .expect("exec running runtime drop child");
+        assert!(
+            !child.success(),
+            "dropping a running runtime must fail fast instead of detaching the network"
+        );
+    }
+
+    #[test]
+    #[ignore = "exec helper used by running_runtime_drop_fails_fast"]
+    fn running_runtime_drop_child() {
+        let runtime = StateStoreRuntime {
+            inner: RuntimeInner::FoundationDb(test_runtime(
+                test_stop(|| Ok(())),
+                std::thread::spawn(|| Ok(())),
+            )),
+        };
+        drop(runtime);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_runtime_drop_is_safe() {
+        let _guard = TEST_PROCESS_STATE.lock().unwrap();
+        reset_process_state();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let runtime = test_runtime(
+            test_stop(move || {
+                stop_tx.send(()).expect("signal network stop");
+                Ok(())
+            }),
+            std::thread::spawn(move || {
+                stop_rx.recv().expect("network stop signal");
+                Ok(())
+            }),
+        );
+        let mut runtime = StateStoreRuntime {
+            inner: RuntimeInner::FoundationDb(runtime),
+        };
+
+        runtime.shutdown().await.expect("stop test runtime");
+        drop(runtime);
+        reset_process_state();
     }
 
     #[test]

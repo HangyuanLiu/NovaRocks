@@ -311,6 +311,7 @@ struct HelperState {
     store: Option<Arc<dyn StateStore>>,
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
     pending: HashMap<Uuid, PendingCommit>,
+    terminal_error: Option<String>,
 }
 
 impl HelperState {
@@ -363,21 +364,38 @@ impl HelperState {
         if self.runtime.is_some() || self.store.is_some() {
             return Err("helper is already open".to_owned());
         }
-        let runtime = StateStoreRuntime::foundationdb(client_config()).map_err(display_error)?;
-        let store = open_state_store(
+        let cluster_file = cluster_file()?;
+        let mut runtime =
+            StateStoreRuntime::foundationdb(client_config()).map_err(display_error)?;
+        let store = match open_state_store(
             &runtime,
             StateStoreConfig {
                 cluster_id,
                 limits: StateStoreLimitOverrides::default(),
                 provider: StateStoreProviderConfig::Foundationdb {
-                    cluster_file: cluster_file()?,
+                    cluster_file,
                     keyspace_id,
                 },
             },
             deployment(),
         )
         .await
-        .map_err(display_error)?;
+        {
+            Ok(store) => store,
+            Err(error) => {
+                let open_error = display_error(error);
+                let shutdown_error = match runtime.shutdown().await {
+                    Ok(()) => None,
+                    Err(shutdown_error) => {
+                        self.runtime = Some(runtime);
+                        Some(display_error(shutdown_error))
+                    }
+                };
+                let terminal_error = helper_open_failure_error(open_error, shutdown_error);
+                self.terminal_error = Some(terminal_error.clone());
+                return Err(terminal_error);
+            }
+        };
         self.runtime = Some(runtime);
         self.store = Some(store);
         Ok(Response::success("Opened"))
@@ -638,6 +656,32 @@ fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn helper_open_failure_error(open_error: String, shutdown_error: Option<String>) -> String {
+    match shutdown_error {
+        Some(shutdown_error) => format!(
+            "{open_error}; FoundationDB runtime shutdown after helper open failure also failed: {shutdown_error}"
+        ),
+        None => open_error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_failure_error_preserves_primary_error_and_appends_shutdown_failure() {
+        assert_eq!(
+            helper_open_failure_error("open failed".to_owned(), None),
+            "open failed"
+        );
+        assert_eq!(
+            helper_open_failure_error("open failed".to_owned(), Some("shutdown failed".to_owned())),
+            "open failed; FoundationDB runtime shutdown after helper open failure also failed: shutdown failed"
+        );
+    }
+}
+
 async fn run() -> Result<(), String> {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -670,6 +714,9 @@ async fn run() -> Result<(), String> {
             .map_err(|error| format!("flush response: {error}"))?;
         if is_shutdown && response.ok {
             return Ok(());
+        }
+        if let Some(error) = state.terminal_error.take() {
+            return Err(error);
         }
     }
     state.shutdown().await?;
