@@ -121,7 +121,7 @@ async fn mysql_runtime_rejects_pid_mismatch() {
     let mut runtime = StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_PID_PASSWORD"))
         .expect("construct MySQL runtime");
     let owner = runtime_owner(&runtime).expect("read runtime owner");
-    let error = validate_owner(&runtime, owner.pid.wrapping_add(1), owner.tokio_runtime_id)
+    let error = validate_owner(&runtime, owner.pid.wrapping_add(1))
         .expect_err("a different process must be rejected");
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
     runtime.shutdown().await.expect("shutdown owner runtime");
@@ -142,16 +142,14 @@ fn mysql_runtime_rejects_independent_tokio_runtime() {
             StateStoreRuntime::mysql(client_config("NOVAROCKS_SS3_RUNTIME_TOKIO_PASSWORD"))
         })
         .expect("construct MySQL runtime");
-    let owner = first
-        .block_on(async { runtime_owner(&runtime) })
-        .expect("runtime owner");
     let second = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build second runtime");
     let (mut runtime, error) = second.block_on(async move {
-        let error = validate_owner(&runtime, owner.pid, owner.tokio_runtime_id.wrapping_add(1))
-            .expect_err("an independent Tokio runtime must be rejected");
+        let error = prepare_pool(&runtime, "novarocks_wrong_tokio_runtime")
+            .await
+            .expect_err("an independent Tokio runtime must be rejected automatically");
         (runtime, error)
     });
     assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);

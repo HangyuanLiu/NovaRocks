@@ -21,7 +21,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MysqlRuntimeOwner {
     pub pid: u32,
-    pub tokio_runtime_id: u64,
+    pub tokio_runtime_id: tokio::runtime::Id,
 }
 
 pub struct MysqlTestHandle {
@@ -48,12 +48,8 @@ pub fn runtime_owner(runtime: &StateStoreRuntime) -> Result<MysqlRuntimeOwner, S
     runtime.mysql_test_owner()
 }
 
-pub fn validate_owner(
-    runtime: &StateStoreRuntime,
-    pid: u32,
-    tokio_runtime_id: u64,
-) -> Result<(), StateStoreError> {
-    runtime.mysql_test_validate_owner(pid, tokio_runtime_id)
+pub fn validate_owner(runtime: &StateStoreRuntime, pid: u32) -> Result<(), StateStoreError> {
+    runtime.mysql_test_validate_owner(pid)
 }
 
 pub async fn prepare_pool(

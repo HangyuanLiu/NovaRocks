@@ -32,7 +32,7 @@ use {
     std::collections::HashMap,
     std::sync::Arc,
     std::sync::Mutex,
-    std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     std::time::Duration,
     tokio::sync::Notify,
     tokio::time::{Instant, timeout_at},
@@ -176,10 +176,16 @@ impl StateStoreRuntime {
         _config: &StateStoreConfig,
         _deployment: FeDeploymentView,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-        Err(StateStoreError::new(
-            StateStoreErrorKind::ProviderUnavailable,
-            "MySQL state store runtime is not implemented",
-        ))
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime.validate_process_and_context()?;
+                Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "MySQL state store runtime is not implemented",
+                ))
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
     }
 
     #[cfg(feature = "mysql-state-store-provider")]
@@ -191,13 +197,9 @@ impl StateStoreRuntime {
     }
 
     #[cfg(feature = "mysql-state-store-provider")]
-    pub(crate) fn mysql_test_validate_owner(
-        &self,
-        pid: u32,
-        tokio_runtime_id: u64,
-    ) -> Result<(), StateStoreError> {
+    pub(crate) fn mysql_test_validate_owner(&self, pid: u32) -> Result<(), StateStoreError> {
         match &self.inner {
-            RuntimeInner::Mysql(runtime) => runtime.validate_owner(pid, tokio_runtime_id),
+            RuntimeInner::Mysql(runtime) => runtime.validate_pid_owner(pid),
             _ => Err(mysql_runtime_mismatch()),
         }
     }
@@ -354,16 +356,15 @@ enum MysqlRuntimeLifecycle {
 #[cfg(feature = "mysql-state-store-provider")]
 impl MysqlRuntime {
     fn boot(config: MySqlClientConfig) -> Result<Self, StateStoreError> {
-        tokio::runtime::Handle::try_current().map_err(|_| {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "MySQL state store runtime requires an active Tokio runtime",
             )
         })?;
-        static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
         let owner = MysqlRuntimeOwner {
             pid: std::process::id(),
-            tokio_runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
+            tokio_runtime_id: handle.id(),
         };
         Ok(Self {
             shared: Arc::new(MysqlRuntimeShared {
@@ -379,8 +380,8 @@ impl MysqlRuntime {
         })
     }
 
-    fn validate_owner(&self, pid: u32, tokio_runtime_id: u64) -> Result<(), StateStoreError> {
-        if self.shared.owner.pid != pid || self.shared.owner.tokio_runtime_id != tokio_runtime_id {
+    fn validate_pid_owner(&self, pid: u32) -> Result<(), StateStoreError> {
+        if self.shared.owner.pid != pid {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "MySQL state store runtime owner does not match",
@@ -396,12 +397,18 @@ impl MysqlRuntime {
                 RUNTIME_PID_ERROR,
             ));
         }
-        tokio::runtime::Handle::try_current().map_err(|_| {
+        let current = tokio::runtime::Handle::try_current().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
                 "MySQL state store operation requires an active Tokio runtime",
             )
         })?;
+        if self.shared.owner.tokio_runtime_id != current.id() {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL state store runtime belongs to a different Tokio runtime",
+            ));
+        }
         Ok(())
     }
 
@@ -695,7 +702,7 @@ fn test_mysql_runtime_with_pool(pool: Arc<dyn PoolLifecycle>) -> MysqlRuntime {
         shared: Arc::new(MysqlRuntimeShared {
             owner: MysqlRuntimeOwner {
                 pid: std::process::id(),
-                tokio_runtime_id: 1,
+                tokio_runtime_id: tokio::runtime::Handle::current().id(),
             },
             accepting: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
