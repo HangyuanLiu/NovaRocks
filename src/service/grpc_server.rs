@@ -1526,6 +1526,26 @@ mod pr3_tests {
     }
 
     #[tokio::test]
+    async fn runtime_filter_envelope_report_only_gate_precedes_wire_validation() {
+        let ingress = Arc::new(RecordingEnvelopeIngress::accepting());
+        let svc = GrpcService::report_only_with_handlers(
+            Arc::new(CapturingReportHandler::accepting()),
+            ingress.clone(),
+        );
+        let mut request = valid_runtime_filter_envelope();
+        request.channel_id = 0;
+        request.route_identity = None;
+
+        let error = svc
+            .transmit_runtime_filter_envelope(Request::new(request))
+            .await
+            .expect_err("report-only gate must run before envelope decoding");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(ingress.calls(), 0);
+    }
+
+    #[tokio::test]
     async fn runtime_filter_envelope_default_full_execution_rejects_unconfigured_ingress() {
         let response = GrpcService::full_execution()
             .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
