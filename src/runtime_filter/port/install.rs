@@ -406,7 +406,12 @@ impl RuntimeFilterParticipantInstall {
 }
 
 #[cfg(test)]
-pub(crate) fn participant_install_for_test(
+/// Builds a local-only composite for Service unit tests.
+///
+/// This helper maps every expected producer instance to the view's local participant.
+/// It must not be used for aggregator or compiler-conformance tests, which require the
+/// compiler-produced remote-aware routing shard.
+pub(crate) fn local_participant_install_for_test(
     core_view: RuntimeFilterInstallView,
 ) -> RuntimeFilterParticipantInstall {
     let participant = core_view.local_participant_id();

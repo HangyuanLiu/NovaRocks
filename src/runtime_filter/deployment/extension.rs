@@ -22,7 +22,10 @@ use std::sync::Mutex;
 use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::RuntimeFilterDeploymentPlan;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
+use crate::runtime_filter::port::install::{
+    RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+};
+use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
 /// Install-port failures surfaced once a real coordinator starts issuing
 /// installs (RFD-6). Distinct from RFD-2's compile-time `DeploymentError`:
@@ -33,10 +36,18 @@ pub(crate) enum DeploymentInstallError {
     EpochConflict { installed: u64, incoming: u64 },
     /// The coordinator produced a core view without the matching routing authority.
     MissingRoutingShard { participant: u32 },
-    /// The outer install phase and composite payload disagree on the epoch.
-    EpochIdentityMismatch { outer: u64, core: u64, routing: u64 },
-    /// The outer install phase and composite payload disagree on the participant.
-    ParticipantIdentityMismatch { outer: u32, core: u32, routing: u32 },
+    /// An install projection disagrees with its plan or install-phase epoch.
+    EpochIdentityMismatch {
+        authority: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    /// An install projection disagrees with its map key or install target.
+    ParticipantIdentityMismatch {
+        authority: &'static str,
+        expected: u32,
+        actual: u32,
+    },
     /// Same epoch, but either side of the incoming composite differs.
     ConflictingDeployment { participant: u32 },
 }
@@ -56,22 +67,22 @@ impl fmt::Display for DeploymentInstallError {
                 "runtime filter install is missing routing shard for participant {participant}"
             ),
             Self::EpochIdentityMismatch {
-                outer,
-                core,
-                routing,
+                authority,
+                expected,
+                actual,
             } => write!(
                 f,
-                "runtime filter install epoch identity mismatch: outer {outer}, core {core}, \
-                 routing {routing}"
+                "runtime filter install epoch identity mismatch for {authority}: expected \
+                 {expected}, actual {actual}"
             ),
             Self::ParticipantIdentityMismatch {
-                outer,
-                core,
-                routing,
+                authority,
+                expected,
+                actual,
             } => write!(
                 f,
-                "runtime filter install participant identity mismatch: outer {outer}, core \
-                 {core}, routing {routing}"
+                "runtime filter install participant identity mismatch for {authority}: expected \
+                 {expected}, actual {actual}"
             ),
             Self::ConflictingDeployment { participant } => write!(
                 f,
@@ -122,6 +133,13 @@ impl RuntimeFilterDeploymentExtension {
         Vec<(RuntimeFilterParticipantId, RuntimeFilterParticipantInstall)>,
         DeploymentInstallError,
     > {
+        for (participant, view) in &plan.install_views {
+            validate_core_view_identity(plan.epoch, *participant, view)?;
+        }
+        for (participant, routing_shard) in &plan.routing_shards {
+            validate_routing_shard_identity(plan.epoch, *participant, routing_shard)?;
+        }
+
         plan.install_views
             .iter()
             .map(|(participant, view)| {
@@ -201,23 +219,49 @@ fn validate_install_identity(
     outer_participant: RuntimeFilterParticipantId,
     install: &RuntimeFilterParticipantInstall,
 ) -> Result<(), DeploymentInstallError> {
-    let core_epoch = install.epoch();
-    let routing_epoch = install.routing_shard().deployment_epoch();
-    if core_epoch != outer_epoch || routing_epoch != outer_epoch {
+    validate_core_view_identity(outer_epoch, outer_participant, install.core_view())?;
+    validate_routing_shard_identity(outer_epoch, outer_participant, install.routing_shard())
+}
+
+fn validate_core_view_identity(
+    expected_epoch: DeploymentEpoch,
+    expected_participant: RuntimeFilterParticipantId,
+    view: &RuntimeFilterInstallView,
+) -> Result<(), DeploymentInstallError> {
+    if view.epoch() != expected_epoch {
         return Err(DeploymentInstallError::EpochIdentityMismatch {
-            outer: outer_epoch.get(),
-            core: core_epoch.get(),
-            routing: routing_epoch.get(),
+            authority: "core view",
+            expected: expected_epoch.get(),
+            actual: view.epoch().get(),
         });
     }
-
-    let core_participant = install.local_participant_id();
-    let routing_participant = install.routing_shard().local_participant_id();
-    if core_participant != outer_participant || routing_participant != outer_participant {
+    if view.local_participant_id() != expected_participant {
         return Err(DeploymentInstallError::ParticipantIdentityMismatch {
-            outer: outer_participant.get(),
-            core: core_participant.get(),
-            routing: routing_participant.get(),
+            authority: "core view",
+            expected: expected_participant.get(),
+            actual: view.local_participant_id().get(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_routing_shard_identity(
+    expected_epoch: DeploymentEpoch,
+    expected_participant: RuntimeFilterParticipantId,
+    routing_shard: &RuntimeFilterRoutingShard,
+) -> Result<(), DeploymentInstallError> {
+    if routing_shard.deployment_epoch() != expected_epoch {
+        return Err(DeploymentInstallError::EpochIdentityMismatch {
+            authority: "routing shard",
+            expected: expected_epoch.get(),
+            actual: routing_shard.deployment_epoch().get(),
+        });
+    }
+    if routing_shard.local_participant_id() != expected_participant {
+        return Err(DeploymentInstallError::ParticipantIdentityMismatch {
+            authority: "routing shard",
+            expected: expected_participant.get(),
+            actual: routing_shard.local_participant_id().get(),
         });
     }
     Ok(())
@@ -389,6 +433,59 @@ mod tests {
                 .all(|(participant, _)| *participant != pid(2))
         );
         assert!(plan.routing_shards.contains_key(&pid(2)));
+    }
+
+    #[test]
+    fn participant_installs_reject_malformed_extra_routing_shard_epoch() {
+        let mut plan = sample_plan_with_roleless_participant(7);
+        plan.routing_shards.insert(
+            pid(2),
+            shard(DeploymentEpoch::new(plan.epoch.get() + 1), pid(2)),
+        );
+
+        let err = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DeploymentInstallError::EpochIdentityMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn participant_installs_reject_malformed_extra_routing_shard_participant() {
+        let mut plan = sample_plan_with_roleless_participant(7);
+        plan.routing_shards
+            .insert(pid(2), shard(plan.epoch, pid(3)));
+
+        let err = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DeploymentInstallError::ParticipantIdentityMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn participant_installs_reject_malformed_view_before_missing_shard() {
+        let mut plan = sample_plan(7);
+        plan.install_views.insert(
+            pid(0),
+            RuntimeFilterInstallView::new(plan.epoch, pid(9), BTreeMap::new()),
+        );
+        plan.routing_shards.remove(&pid(0));
+
+        let err = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DeploymentInstallError::ParticipantIdentityMismatch { .. }
+        ));
     }
 
     #[test]
