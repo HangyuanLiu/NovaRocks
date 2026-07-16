@@ -1520,6 +1520,19 @@ mod tests {
     }
 
     #[test]
+    fn all_contribution_kinds_have_exact_known_frame_prefixes() {
+        let fixtures = conformance_fixtures();
+        for ((contribution, expectation), tag) in fixtures.cases().into_iter().zip([1_u8, 2, 3, 4])
+        {
+            let encoded = encode_contribution(contribution, expectation, usize::MAX).unwrap();
+            assert_eq!(
+                &encoded.payload()[..8],
+                &[b'N', b'R', b'F', b'C', 0, 1, tag, 0]
+            );
+        }
+    }
+
+    #[test]
     fn unified_encode_rejects_contribution_expectation_kind_mismatch() {
         let fixtures = conformance_fixtures();
         for (contribution, _) in fixtures.cases() {

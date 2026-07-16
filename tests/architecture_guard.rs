@@ -43755,6 +43755,23 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
         }
         let call_count = rfd4_m2b2_remote_constructor_call_count(text, source_rel);
         let canonical_paths = rust_production_canonical_paths(text, source_rel);
+        let canonical_fence_reference = canonical_paths.iter().any(|path| {
+            path.len() == 5
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "final_domain",
+                        "CompletionFence",
+                    ],
+                )
+        });
+        let remote_name_occurrences = tokens
+            .iter()
+            .filter(|token| token.as_str() == "try_from_remote_codec")
+            .count();
         let canonical_remote = canonical_paths.iter().any(|path| {
             path.len() == 6
                 && rfd4_m2b2_path_starts_with(
@@ -43825,11 +43842,21 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                         "{source_rel}: definition owner must not call remote reconstruction, found {call_count} call(s)"
                     ));
                 }
+                if remote_name_occurrences != 1 {
+                    violations.push(format!(
+                        "{source_rel}: definition owner must contain only the remote constructor declaration, found {remote_name_occurrences} method-name token(s)"
+                    ));
+                }
             }
             CODEC_OWNER => {
                 if call_count != 1 {
                     violations.push(format!(
                         "{source_rel}: contribution codec must make exactly one remote constructor call, found {call_count}"
+                    ));
+                }
+                if remote_name_occurrences != 1 {
+                    violations.push(format!(
+                        "{source_rel}: contribution codec must contain exactly one remote constructor method-name token, found {remote_name_occurrences}"
                     ));
                 }
             }
@@ -43839,6 +43866,7 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                     || final_domain_glob
                     || aliases_remote_type
                     || public_fence_facade
+                    || (canonical_fence_reference && remote_name_occurrences != 0)
                 {
                     violations.push(format!(
                         "{source_rel}: remote completion-fence reconstruction escaped the codec owner"
@@ -44064,6 +44092,241 @@ fn rfd4_m2b2_wire_tag_maps(
     Ok((encode, decode))
 }
 
+fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
+    fn expr_is_path(expression: &syn::Expr, expected: &str) -> bool {
+        matches!(expression, syn::Expr::Path(path) if path.path.is_ident(expected))
+    }
+
+    #[derive(Default)]
+    struct FrameExecutionAudit {
+        decoder_calls_from_tag: bool,
+        decoder_compares_magic: bool,
+        decoder_reads_magic_len: bool,
+        encoder_calls_tag: bool,
+        encoder_writes_magic: bool,
+    }
+    impl FrameExecutionAudit {
+        fn visit_encoder(&mut self, block: &syn::Block) {
+            struct Encoder<'a>(&'a mut FrameExecutionAudit);
+            impl<'ast> syn::visit::Visit<'ast> for Encoder<'_> {
+                fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                    if call.method == "extend_from_slice"
+                        && call.args.len() == 1
+                        && call
+                            .args
+                            .first()
+                            .is_some_and(|argument| expr_is_path(argument, "MAGIC"))
+                    {
+                        self.0.encoder_writes_magic = true;
+                    }
+                    if call.method == "tag"
+                        && matches!(call.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("kind"))
+                    {
+                        self.0.encoder_calls_tag = true;
+                    }
+                    syn::visit::visit_expr_method_call(self, call);
+                }
+            }
+            syn::visit::Visit::visit_block(&mut Encoder(self), block);
+        }
+
+        fn visit_decoder(&mut self, block: &syn::Block) {
+            struct Decoder<'a>(&'a mut FrameExecutionAudit);
+            impl<'ast> syn::visit::Visit<'ast> for Decoder<'_> {
+                fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
+                    if matches!(binary.op, syn::BinOp::Ne(_))
+                        && (expr_is_path(&binary.left, "MAGIC")
+                            || expr_is_path(&binary.right, "MAGIC"))
+                    {
+                        self.0.decoder_compares_magic = true;
+                    }
+                    syn::visit::visit_expr_binary(self, binary);
+                }
+
+                fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                    if let syn::Expr::Path(function) = call.func.as_ref() {
+                        let segments = function
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if segments.ends_with(&["WireContributionKind".into(), "from_tag".into()]) {
+                            self.0.decoder_calls_from_tag = true;
+                        }
+                    }
+                    syn::visit::visit_expr_call(self, call);
+                }
+
+                fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                    if call.method == "read_exact"
+                        && call.args.len() == 1
+                        && call.args.first().is_some_and(|argument| {
+                            matches!(
+                                argument,
+                                syn::Expr::MethodCall(len)
+                                    if len.method == "len"
+                                        && expr_is_path(len.receiver.as_ref(), "MAGIC")
+                            )
+                        })
+                    {
+                        self.0.decoder_reads_magic_len = true;
+                    }
+                    syn::visit::visit_expr_method_call(self, call);
+                }
+            }
+            syn::visit::Visit::visit_block(&mut Decoder(self), block);
+        }
+    }
+
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => return vec![format!("contribution codec source must parse: {error}")],
+    };
+    let mut named_magic = 0usize;
+    let mut correct_magic = 0usize;
+    let mut tag_is_single_match = false;
+    let mut from_tag_is_single_match = false;
+    let mut execution = FrameExecutionAudit::default();
+    for item in &file.items {
+        match item {
+            syn::Item::Const(item_const) if item_const.ident == "MAGIC" => {
+                named_magic += 1;
+                if matches!(
+                    item_const.expr.as_ref(),
+                    syn::Expr::Lit(literal)
+                        if matches!(&literal.lit, syn::Lit::ByteStr(value) if value.value() == b"NRFC")
+                ) {
+                    correct_magic += 1;
+                }
+            }
+            syn::Item::Fn(function)
+                if function.sig.ident == "encode_contribution_with_allocator" =>
+            {
+                execution.visit_encoder(&function.block);
+            }
+            syn::Item::Fn(function) if function.sig.ident == "decode_contribution" => {
+                execution.visit_decoder(&function.block);
+            }
+            syn::Item::Impl(item_impl) => {
+                let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+                    continue;
+                };
+                if self_ty
+                    .path
+                    .segments
+                    .last()
+                    .is_none_or(|segment| segment.ident != "WireContributionKind")
+                {
+                    continue;
+                }
+                for item in &item_impl.items {
+                    let syn::ImplItem::Fn(method) = item else {
+                        continue;
+                    };
+                    if method.sig.ident == "tag" {
+                        tag_is_single_match = method.block.stmts.len() == 1
+                            && matches!(
+                                rfd4_m2b2_tail_expr(&method.block),
+                                Some(syn::Expr::Match(_))
+                            );
+                    } else if method.sig.ident == "from_tag" {
+                        from_tag_is_single_match = method.block.stmts.len() == 1
+                            && matches!(
+                                rfd4_m2b2_tail_expr(&method.block),
+                                Some(syn::Expr::Match(_))
+                            );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut violations = Vec::new();
+    if named_magic != 1 || correct_magic != 1 {
+        violations.push(format!(
+            "MAGIC must be one named b\"NRFC\" const, found named={named_magic}, correct={correct_magic}"
+        ));
+    }
+    if !execution.encoder_writes_magic {
+        violations.push("common encoder must write MAGIC".into());
+    }
+    if !execution.encoder_calls_tag {
+        violations.push("common encoder must call WireContributionKind::tag".into());
+    }
+    if !execution.decoder_reads_magic_len || !execution.decoder_compares_magic {
+        violations.push("common decoder must read and compare MAGIC".into());
+    }
+    if !execution.decoder_calls_from_tag {
+        violations.push("common decoder must call WireContributionKind::from_tag".into());
+    }
+    if !tag_is_single_match {
+        violations.push("WireContributionKind::tag must be exactly one exhaustive match".into());
+    }
+    if !from_tag_is_single_match {
+        violations
+            .push("WireContributionKind::from_tag must be exactly one exhaustive match".into());
+    }
+    violations
+}
+
+fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -> Vec<String> {
+    const OWNER: &str = "src/runtime_filter/port/subscription.rs";
+    let mut violations = Vec::new();
+    for (source_rel, text) in sources {
+        if source_rel == OWNER {
+            continue;
+        }
+        for statement in rust_production_scoped_use_statements(text) {
+            if rust_use_visibility(&statement.import) == "private" {
+                continue;
+            }
+            let Some(path) = rust_canonical_use_segments_in_scope(
+                &statement.import,
+                source_rel,
+                &statement.inline_modules,
+            ) else {
+                continue;
+            };
+            let exact_delivery = path.len() == 5
+                && (rfd4_m2b2_path_starts_with(
+                    &path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "subscription",
+                        "ArtifactDelivery",
+                    ],
+                ) || rfd4_m2b2_path_starts_with(
+                    &path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "subscription",
+                        "ArtifactDeliveryOutcome",
+                    ],
+                ));
+            let delivery_glob = path.len() == 5
+                && rfd4_m2b2_path_starts_with(
+                    &path,
+                    &["crate", "runtime_filter", "port", "subscription", "*"],
+                );
+            if exact_delivery || delivery_glob {
+                violations.push(format!(
+                    "{source_rel}: ArtifactDelivery facade {}",
+                    path.join("::")
+                ));
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
 fn rfd4_m2b2_final_domain_authority_violations(text: &str) -> Vec<String> {
     #[derive(Default)]
     struct AuthorityCallAudit {
@@ -44192,6 +44455,12 @@ fn rfd4_m2b2_nrfc_magic_and_wire_tags_have_one_codec_owner() {
         rfd4_m2b2_wire_tag_maps(&codec).expect("parse contribution wire-tag maps");
     assert_eq!(encode, expected_encode);
     assert_eq!(decode, expected_decode);
+    let execution_violations = rfd4_m2b2_nrfc_execution_violations(&codec);
+    assert!(
+        execution_violations.is_empty(),
+        "NRFC/tag declarations must be bound to encoder and decoder execution:\n{}",
+        execution_violations.join("\n")
+    );
 
     let mut owners = Vec::new();
     for path in rs_files(&src_dir()) {
@@ -44305,6 +44574,21 @@ fn rfd4_m2b2_new_owner_graph_has_no_sender_retry_delivery_or_legacy_bridge() {
         violations.is_empty(),
         "M2B2 owner graph acquired out-of-scope delivery dependencies:\n{}",
         violations.join("\n")
+    );
+
+    let sources = rs_files(&src_dir())
+        .into_iter()
+        .map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("read Rust source");
+            (source_rel, text)
+        })
+        .collect::<Vec<_>>();
+    let facade_violations = rfd4_m2b2_artifact_delivery_facade_violations(&sources);
+    assert!(
+        facade_violations.is_empty(),
+        "ArtifactDelivery facade escaped its subscription owner:\n{}",
+        facade_violations.join("\n")
     );
 }
 
@@ -44511,6 +44795,161 @@ fn rebuild(
     assert!(
         !definition_owner_violations.is_empty(),
         "the definition owner must not gain a second production reconstruction caller"
+    );
+
+    let macro_bypass = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+macro_rules! rebuild {
+    ($fence:ty, $digest:expr, $stream:expr, $sequence:expr, $encoded:expr) => {
+        <$fence>::try_from_remote_codec($digest, $stream, $sequence, $encoded)
+    };
+}
+fn f() {
+    let _ = rebuild!(CompletionFence, todo!(), todo!(), todo!(), [0; 32]);
+}
+"#;
+    let macro_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/service/producer.rs".into(),
+        macro_bypass.into(),
+    )]);
+    assert!(
+        !macro_violations.is_empty(),
+        "macro-expanded canonical CompletionFence reconstruction must be rejected"
+    );
+
+    let definition_owner_macro = r#"
+struct CompletionFence;
+struct CompletionFenceContractDigest;
+struct ProducerStreamId;
+struct ProducerSequence;
+struct FinalDomainError;
+impl CompletionFence {
+    pub(crate) fn try_from_remote_codec(
+        _: CompletionFenceContractDigest,
+        _: ProducerStreamId,
+        _: ProducerSequence,
+        _: [u8; 32],
+    ) -> Result<Self, FinalDomainError> {
+        todo!()
+    }
+}
+macro_rules! hidden_rebuild {
+    () => { CompletionFence::try_from_remote_codec(todo!(), todo!(), todo!(), [0; 32]) };
+}
+"#;
+    let definition_macro_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/port/final_domain.rs".into(),
+        definition_owner_macro.into(),
+    )]);
+    assert!(
+        !definition_macro_violations.is_empty(),
+        "definition owner must contain only the constructor declaration token"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_nrfc_execution_detector_rejects_dead_or_bypassed_declarations() {
+    let dead_declarations = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>) {
+    payload.extend_from_slice(b"ALT!");
+    payload.push(9);
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(4) == b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(dead_declarations).is_empty(),
+        "dead correct declarations must not mask hardcoded alternate execution"
+    );
+
+    let early_return = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        if false { return 9; }
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        if false { return None; }
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.push(kind.tag());
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(MAGIC.len()) == MAGIC;
+    let _ = WireContributionKind::from_tag(reader.read_u8());
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(early_return).is_empty(),
+        "tag methods must be one exhaustive match without prefix statements"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_artifact_delivery_facade_detector_rejects_cross_file_reexports() {
+    let sources = vec![
+        (
+            "src/runtime_filter/facade.rs".to_string(),
+            "pub(crate) use crate::runtime_filter::port::subscription::ArtifactDelivery as HiddenDelivery;"
+                .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::facade::HiddenDelivery; fn f(delivery: &dyn HiddenDelivery) { delivery.deliver(todo!(), todo!()); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&sources).is_empty(),
+        "cross-file ArtifactDelivery facades must be rejected before adapter resolution"
+    );
+
+    let local = vec![(
+        "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+        "struct LocalDelivery; impl LocalDelivery { fn deliver(&self) {} }".to_string(),
+    )];
+    assert!(
+        rfd4_m2b2_artifact_delivery_facade_violations(&local).is_empty(),
+        "unrelated local delivery helpers must remain allowed"
     );
 }
 
