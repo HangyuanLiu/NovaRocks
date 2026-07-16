@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::catalog::{ColumnDef, IcebergMvTargetStateScan, ScanSource};
+use crate::catalog::schema::ColumnDef;
+use crate::sql::catalog::{IcebergMvTargetStateScan, ScanSource};
 
 pub(crate) fn build_target_state_scan_source(
     catalog: String,

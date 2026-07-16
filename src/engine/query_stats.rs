@@ -283,9 +283,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::connector::stats::StatsProviderError;
     use crate::sql::catalog::{
-        ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::column_id::ColumnRefFactory;

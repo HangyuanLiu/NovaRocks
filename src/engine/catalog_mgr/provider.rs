@@ -151,6 +151,7 @@ impl CatalogProvider for CatalogMgrProvider<'_> {
 mod tests {
     use super::*;
     use crate::catalog::identifier::TableIdentity;
+    use crate::catalog::schema::ColumnDef;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
@@ -158,9 +159,7 @@ mod tests {
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableLookupMode,
-    };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableLookupMode};
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;

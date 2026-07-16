@@ -19,10 +19,11 @@ use std::collections::BTreeSet;
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
-use crate::sql::catalog::{ColumnDef, IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use crate::sql::catalog::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,

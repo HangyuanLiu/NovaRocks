@@ -29,12 +29,13 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::schema::ColumnDef;
 use crate::connector::stats::TableStatsProvider;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
     RefreshOutcome, RefreshPlan, RefreshRequest,
 };
-use crate::sql::catalog::{ColumnDef, TableDef};
+use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::{
     AlterIcebergPartitionSpecStmt, IcebergPartitionFieldExpr, Literal, TableColumnDef, TableKeyDesc,
 };

@@ -526,7 +526,8 @@ mod tests {
     /// identity flows from the plan node and the snapshot is found.
     #[test]
     fn dictionary_provider_owner_for_starrocks_reads_identity_from_plan_node() {
-        use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::sync::Arc;
 
@@ -577,9 +578,8 @@ mod tests {
     /// Active iceberg dictionary snapshot when one exists in the metadata store.
     #[test]
     fn dictionary_provider_loads_iceberg_data_files_snapshot() {
-        use crate::sql::catalog::{
-            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-        };
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -665,9 +665,8 @@ mod tests {
     /// keeps a post-write query from loading a stale dictionary snapshot.
     #[test]
     fn dictionary_provider_skips_stale_iceberg_snapshot_after_table_advances() {
-        use crate::sql::catalog::{
-            ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-        };
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;

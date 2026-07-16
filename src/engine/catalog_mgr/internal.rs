@@ -59,10 +59,11 @@ impl Catalog for InternalCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::sync::{Arc, RwLock};
 

@@ -365,6 +365,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::engine::mv::iceberg_target_apply::{
         ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
     };
@@ -380,9 +381,7 @@ mod tests {
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::opt_expr::OptExpr;

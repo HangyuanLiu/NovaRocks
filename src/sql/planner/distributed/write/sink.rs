@@ -17,8 +17,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::catalog::schema::ColumnDef;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput;
-use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableDef};
+use crate::sql::catalog::{IcebergTableInfo, TableDef};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {

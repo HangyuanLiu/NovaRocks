@@ -3948,13 +3948,14 @@ fn sync_output_columns_from_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::sql::analysis::{
         ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
         SubqueryKind,
     };
     use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
+        IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef, TableLookupMode,
     };
 
     struct TestCatalog;

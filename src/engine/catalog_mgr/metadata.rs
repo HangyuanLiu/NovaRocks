@@ -26,7 +26,8 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::identifier::TableIdentity;
-use crate::sql::catalog::{ColumnDef, IcebergTableInfo, ScanSource, TableDef};
+use crate::catalog::schema::ColumnDef;
+use crate::sql::catalog::{IcebergTableInfo, ScanSource, TableDef};
 
 /// Backend-specific locator for scan-binding. Carries identity only, never data.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,9 +122,8 @@ impl TableMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::catalog::schema::ColumnDef;
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
 

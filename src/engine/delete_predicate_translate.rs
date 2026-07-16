@@ -12,7 +12,7 @@
 
 use sqlparser::ast as sqlast;
 
-use crate::sql::catalog::ColumnDef;
+use crate::catalog::schema::ColumnDef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {

@@ -21,12 +21,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 
+use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
 use crate::sql::catalog::{
-    ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+    IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -2221,6 +2222,7 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
@@ -2230,9 +2232,7 @@ mod tests {
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;

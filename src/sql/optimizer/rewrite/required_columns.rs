@@ -995,9 +995,10 @@ impl LogicalRewriteRule for TagRequiredColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
         AggregateOutputLayout, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp,
         GenerateSeriesOp, ImvDeltaOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
@@ -2582,7 +2583,7 @@ mod tests {
                 database: "db".to_string(),
                 table: crate::sql::catalog::TableDef {
                     name: "t".to_string(),
-                    columns: vec![crate::sql::catalog::ColumnDef {
+                    columns: vec![crate::catalog::schema::ColumnDef {
                         name: "a".to_string(),
                         data_type: arrow::datatypes::DataType::Int32,
                         nullable: false,

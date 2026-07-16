@@ -21,8 +21,8 @@ use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::sql::analysis::LambdaParam;
-use crate::sql::catalog::ColumnDef;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 
 /// Tracks column names and types visible at the current query level.
@@ -368,7 +368,7 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns(
         &mut self,
         qualifier: &str,
-        columns: &[crate::sql::catalog::ColumnDef],
+        columns: &[crate::catalog::schema::ColumnDef],
     ) -> Vec<crate::sql::column_id::ColumnId> {
         let q_lower = qualifier.to_lowercase();
         let mut ids = Vec::with_capacity(columns.len());
@@ -400,7 +400,7 @@ impl AnalyzerScope {
     pub(super) fn add_iceberg_metadata_columns_with_ids(
         &mut self,
         qualifier: &str,
-        columns: &[crate::sql::catalog::ColumnDef],
+        columns: &[crate::catalog::schema::ColumnDef],
         column_ids: &[crate::sql::column_id::ColumnId],
     ) {
         assert_eq!(
@@ -768,7 +768,7 @@ fn reserved_name_error(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::catalog::ColumnDef;
+    use crate::catalog::schema::ColumnDef;
     use arrow::datatypes::DataType;
 
     fn test_factory() -> Rc<RefCell<ColumnRefFactory>> {

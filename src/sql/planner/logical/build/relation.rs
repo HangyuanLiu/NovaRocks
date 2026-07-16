@@ -212,8 +212,9 @@ fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_source;
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
 
     let cols =
         metadata_table_schema_for_source(rel.metadata_table_type.clone(), &rel.table.source)?;

@@ -26,11 +26,12 @@ use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
 };
 use crate::sql::analysis::OutputColumn;
-use crate::sql::catalog::{ColumnDef, ScanSource};
+use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -423,8 +424,9 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::imv_rewrite::change_stream::{
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,

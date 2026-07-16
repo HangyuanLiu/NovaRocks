@@ -22,14 +22,15 @@ use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::schema::ColumnDef;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
     TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-    ScanSource, TableDef,
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
+    TableDef,
 };
 use crate::sql::parser::ast::Literal;
 

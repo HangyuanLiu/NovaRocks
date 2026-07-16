@@ -984,8 +984,8 @@ fn try_register_scoped_framework_locator_table(
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct FrameworkLocatorTableFingerprint {
-    columns: Vec<crate::engine::ColumnDef>,
-    iceberg_row_lineage_metadata_columns: Vec<crate::engine::ColumnDef>,
+    columns: Vec<crate::catalog::schema::ColumnDef>,
+    iceberg_row_lineage_metadata_columns: Vec<crate::catalog::schema::ColumnDef>,
     source_debug: String,
 }
 
@@ -1290,7 +1290,7 @@ fn framework_locator_loaded_table(
                     field.name()
                 )
             })?;
-            Ok(crate::engine::ColumnDef {
+            Ok(crate::catalog::schema::ColumnDef {
                 name: field.name().clone(),
                 data_type: field.data_type().clone(),
                 nullable: field.is_nullable(),
@@ -1360,7 +1360,7 @@ pub(crate) fn expose_physical_apply_key_for_locator_registration(
 fn iceberg_column_def_for_locator(
     target_table: &iceberg::table::Table,
     column_name: &str,
-) -> Result<crate::engine::ColumnDef, String> {
+) -> Result<crate::catalog::schema::ColumnDef, String> {
     let iceberg_schema = target_table.metadata().current_schema();
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
@@ -1377,7 +1377,7 @@ fn iceberg_column_def_for_locator(
             field.name()
         )
     })?;
-    Ok(crate::engine::ColumnDef {
+    Ok(crate::catalog::schema::ColumnDef {
         name: field.name().clone(),
         data_type: field.data_type().clone(),
         nullable: field.is_nullable(),
@@ -2703,14 +2703,14 @@ mod tests {
         crate::connector::iceberg::catalog::IcebergLoadedTable {
             table: target_table.clone(),
             columns: vec![
-                crate::engine::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
                     logical_type: None,
                 },
-                crate::engine::ColumnDef {
+                crate::catalog::schema::ColumnDef {
                     name: "region".to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: true,
@@ -2754,7 +2754,7 @@ mod tests {
         assert_standard_mv_target_table_def_hides_physical_apply_key(&table_def);
         table_def.columns.insert(
             0,
-            crate::engine::ColumnDef {
+            crate::catalog::schema::ColumnDef {
                 name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
@@ -3570,7 +3570,7 @@ mod tests {
     ) -> crate::sql::catalog::TableDef {
         crate::sql::catalog::TableDef {
             name: name.to_string(),
-            columns: vec![crate::engine::ColumnDef {
+            columns: vec![crate::catalog::schema::ColumnDef {
                 name: column_name.to_string(),
                 data_type: arrow::datatypes::DataType::Int32,
                 nullable: false,

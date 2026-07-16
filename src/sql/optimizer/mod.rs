@@ -996,11 +996,12 @@ mod is_known_rule_name_tests {
 
     use arrow::datatypes::DataType;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::engine::dictionary::model::{
         DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
     };
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::{
         QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
@@ -1657,8 +1658,9 @@ mod is_known_rule_name_tests {
 
     #[test]
     fn optimize_with_root_distribution_overrides_default_gather_root() {
+        use crate::catalog::schema::ColumnDef;
         use crate::sql::analysis::ExprKind;
-        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
         use crate::sql::planner::logical::LogicalPlanKind;
@@ -1742,8 +1744,9 @@ mod is_known_rule_name_tests {
 
     #[test]
     fn optimize_preserves_ranking_window_partition_topn_sort() {
+        use crate::catalog::schema::ColumnDef;
         use crate::exec::node::sort::SortTopNType;
-        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
 
@@ -1869,7 +1872,8 @@ mod is_known_rule_name_tests {
     /// and no residual Apply node or "subquery decorrelation failed" error.
     #[test]
     fn scalar_subquery_decorrelates_to_join() {
-        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::catalog::schema::ColumnDef;
+        use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
 
         // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same

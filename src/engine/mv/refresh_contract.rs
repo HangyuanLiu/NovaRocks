@@ -131,13 +131,14 @@ pub(crate) fn derive_imv_refresh_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::engine::mv::analysis::{MvAnalysis, ResolvedTableRef};
     use crate::sql::analysis::{
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-        ScanSource, TableDef,
+        CatalogProvider, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource,
+        TableDef,
     };
     use arrow::datatypes::DataType;
 

@@ -748,8 +748,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
-    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::ScanOp;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};

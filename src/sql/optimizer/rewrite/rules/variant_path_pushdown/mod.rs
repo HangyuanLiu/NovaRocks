@@ -30,11 +30,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::VariantPathPushdownRule;
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;

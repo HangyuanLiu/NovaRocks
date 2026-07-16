@@ -534,7 +534,10 @@ pub(crate) fn merge_required_columns_with_projected(
 fn resolved_source_column<'a>(
     scan: &'a PlanScanNode,
     name: &str,
-) -> Option<(&'a crate::sql::catalog::ColumnDef, ResolvedScanColumnKind)> {
+) -> Option<(
+    &'a crate::catalog::schema::ColumnDef,
+    ResolvedScanColumnKind,
+)> {
     if let Some(column) = scan
         .table
         .columns
@@ -916,6 +919,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{collect_scan_bindings, prepare_scan_bindings, store_planned_starrocks_scan};
+    use crate::catalog::schema::ColumnDef;
     use crate::connector::ConnectorRegistry;
     use crate::connector::scan_planning::{
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
@@ -928,8 +932,8 @@ mod tests {
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{
-        ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
-        IcebergSchemaFieldDef, IcebergTableInfo, ScanSource, TableDef,
+        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
+        IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{

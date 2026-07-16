@@ -34,6 +34,7 @@ use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
+use crate::catalog::schema::ColumnDef;
 use crate::catalog::schema::SqlType;
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::backend::{
@@ -66,8 +67,8 @@ use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-    ScanSource, TableDef,
+    IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
+    TableDef,
 };
 use crate::sql::parser::ast::{InsertSource, Literal};
 use crate::sql::planner::distributed::write::sink::{
@@ -1358,8 +1359,8 @@ mod tests {
         name: &str,
         data_type: DataType,
         write_default: Option<ColumnDefault>,
-    ) -> crate::sql::catalog::ColumnDef {
-        crate::sql::catalog::ColumnDef {
+    ) -> crate::catalog::schema::ColumnDef {
+        crate::catalog::schema::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: true,

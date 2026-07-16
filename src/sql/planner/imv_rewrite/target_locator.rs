@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::DataType;
 
+use crate::catalog::schema::ColumnDef;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
 };
@@ -33,7 +34,7 @@ use crate::meta::repository::mv_contract::ApplyKeySource;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
-use crate::sql::catalog::{ColumnDef, IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use crate::sql::catalog::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;

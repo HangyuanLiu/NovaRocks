@@ -17,11 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::catalog::schema::ColumnDef;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
-use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
+use crate::sql::catalog::{IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo};
 use crate::sql::codegen::scan::{
     connector::StarRocksScanSourceDescriptor, iceberg_delta::IcebergDeltaScanRuntimePlan,
 };

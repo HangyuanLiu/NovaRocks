@@ -55,7 +55,7 @@ use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 use super::catalog::register_starrocks_table_in_catalog;
 use crate::catalog::identifier::LocalTableIdentity;
 use crate::catalog::identifier::normalize_identifier;
-use crate::engine::catalog::ColumnDef;
+use crate::catalog::schema::ColumnDef;
 use crate::engine::{
     StandaloneState, StatementResult, build_local_insert_batch, execute_query, reorder_insert_rows,
 };

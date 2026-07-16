@@ -5317,7 +5317,7 @@ mod tests {
             }
             Ok(crate::sql::catalog::TableDef {
                 name: table.to_string(),
-                columns: vec![crate::sql::catalog::ColumnDef {
+                columns: vec![crate::catalog::schema::ColumnDef {
                     name: "offset".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,

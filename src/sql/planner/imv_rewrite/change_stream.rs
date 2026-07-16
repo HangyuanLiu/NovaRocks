@@ -523,11 +523,12 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
+    use crate::catalog::schema::ColumnDef;
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        ColumnDef, IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
     };
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
     use crate::sql::planner::imv_rewrite::target_state::build_target_state_scan_source;

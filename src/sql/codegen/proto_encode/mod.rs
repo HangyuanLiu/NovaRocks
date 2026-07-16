@@ -570,7 +570,7 @@ mod tests {
     fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::catalog::TableDef {
         let columns = names
             .iter()
-            .map(|name| crate::sql::catalog::ColumnDef {
+            .map(|name| crate::catalog::schema::ColumnDef {
                 name: (*name).to_string(),
                 data_type: DataType::Int64,
                 nullable: true,
@@ -1135,14 +1135,14 @@ mod tests {
         let mut sink_spec =
             crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
         sink_spec.target_columns = vec![
-            crate::sql::catalog::ColumnDef {
+            crate::catalog::schema::ColumnDef {
                 name: "c0".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 write_default: None,
                 logical_type: None,
             },
-            crate::sql::catalog::ColumnDef {
+            crate::catalog::schema::ColumnDef {
                 name: "c1".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -1251,7 +1251,7 @@ mod tests {
         };
         let table = crate::sql::catalog::TableDef {
             name: "orders".to_string(),
-            columns: vec![crate::sql::catalog::ColumnDef {
+            columns: vec![crate::catalog::schema::ColumnDef {
                 name: "amount".to_string(),
                 data_type: DataType::Decimal128(10, 2),
                 nullable: true,
@@ -1340,7 +1340,7 @@ mod tests {
         ));
         let table = crate::sql::catalog::TableDef {
             name: "orders".to_string(),
-            columns: vec![crate::sql::catalog::ColumnDef {
+            columns: vec![crate::catalog::schema::ColumnDef {
                 name: "tags".to_string(),
                 data_type: list_type.clone(),
                 nullable: true,

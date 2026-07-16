@@ -86,15 +86,14 @@ impl Catalog for IcebergCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::schema::ColumnDef;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
     use crate::engine::catalog_mgr::CatalogMgr;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::metadata::TableBinding;
-    use crate::sql::catalog::{
-        ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use arrow::datatypes::DataType;
     use std::sync::Arc;
