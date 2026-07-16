@@ -36449,6 +36449,12 @@ impl Rfd4M2b1TypeResolver {
             let Some(local) = local else {
                 continue;
             };
+            resolver
+                .scopes
+                .entry(import_scope.clone())
+                .or_default()
+                .shadows
+                .insert(local.clone());
             let resolved = rust_resolve_scoped_paths(
                 &raw.path.segments,
                 &raw.inline_modules,
@@ -36499,12 +36505,6 @@ impl Rfd4M2b1TypeResolver {
                     }
                 }
             }
-            resolver
-                .scopes
-                .entry(import_scope)
-                .or_default()
-                .shadows
-                .remove(&local);
         }
 
         for _ in 0..=type_aliases.len() + scoped_imports.len() + scoped_globs.len() {
@@ -36566,6 +36566,33 @@ impl Rfd4M2b1TypeResolver {
                                         .extend(symbols);
                                 }
                             }
+                            let child_scopes = resolver
+                                .scopes
+                                .keys()
+                                .filter(|candidate| {
+                                    candidate.len() == target_scope.len() + 1
+                                        && candidate.starts_with(&target_scope)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for child_scope in child_scopes {
+                                let child = child_scope
+                                    .last()
+                                    .expect("a direct child scope must have a final segment")
+                                    .clone();
+                                let destination = resolver.scopes.entry(scope.clone()).or_default();
+                                if !destination.shadows.contains(&child) {
+                                    let mut path = vec!["crate".to_string()];
+                                    path.extend(resolver.source_module.iter().cloned());
+                                    path.extend(child_scope);
+                                    destination.namespaces.entry(child).or_default().insert(
+                                        Rfd4M2b1NamespaceTarget {
+                                            path,
+                                            scope: Vec::new(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         Rfd4M2b1ResolvedNamespace::Canonical(module) => {
                             for symbol in [
@@ -36584,6 +36611,30 @@ impl Rfd4M2b1TypeResolver {
                                             .entry(symbol.to_string())
                                             .or_default()
                                             .insert(symbol.to_string());
+                                    }
+                                }
+                                let Some(owner) = rfd4_m2b1_canonical_symbol_owner(symbol) else {
+                                    continue;
+                                };
+                                if owner.len() > module.len()
+                                    && module
+                                        .iter()
+                                        .map(String::as_str)
+                                        .zip(owner.iter().copied())
+                                        .all(|(actual, expected)| actual == expected)
+                                {
+                                    let child = owner[module.len()].to_string();
+                                    let destination =
+                                        resolver.scopes.entry(scope.clone()).or_default();
+                                    if !destination.shadows.contains(&child) {
+                                        let mut path = module.clone();
+                                        path.push(child.clone());
+                                        destination.namespaces.entry(child).or_default().insert(
+                                            Rfd4M2b1NamespaceTarget {
+                                                path,
+                                                scope: Vec::new(),
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -36615,6 +36666,7 @@ impl Rfd4M2b1TypeResolver {
                 syn::Item::Union(item) => Some(item.ident.to_string()),
                 syn::Item::Trait(item) => Some(item.ident.to_string()),
                 syn::Item::Mod(item) => Some(item.ident.to_string()),
+                syn::Item::Type(item) => Some(item.ident.to_string()),
                 _ => None,
             };
             if let Some(ident) = ident {
@@ -36901,12 +36953,8 @@ fn rfd4_m2b1_source_module(source_rel: &str) -> Vec<String> {
 }
 
 fn rfd4_m2b1_canonical_symbol_path(path: &[String], symbol: &str) -> bool {
-    let owner = match symbol {
-        "RuntimeFilterInstallView" | "RuntimeFilterParticipantInstall" => {
-            &["crate", "runtime_filter", "port", "install"][..]
-        }
-        "RoleRouter" => &["crate", "runtime_filter", "router", "role_graph"][..],
-        _ => return false,
+    let Some(owner) = rfd4_m2b1_canonical_symbol_owner(symbol) else {
+        return false;
     };
     path.len() == owner.len() + 1
         && path
@@ -36915,6 +36963,16 @@ fn rfd4_m2b1_canonical_symbol_path(path: &[String], symbol: &str) -> bool {
             .zip(owner.iter().copied())
             .all(|(actual, expected)| actual == expected)
         && path.last().is_some_and(|member| member == symbol)
+}
+
+fn rfd4_m2b1_canonical_symbol_owner(symbol: &str) -> Option<&'static [&'static str]> {
+    match symbol {
+        "RuntimeFilterInstallView" | "RuntimeFilterParticipantInstall" => {
+            Some(&["crate", "runtime_filter", "port", "install"])
+        }
+        "RoleRouter" => Some(&["crate", "runtime_filter", "router", "role_graph"]),
+        _ => None,
+    }
 }
 
 fn rfd4_m2b1_type_is_named(ty: &syn::Type, expected: &str) -> bool {
@@ -37862,6 +37920,67 @@ fn rfd4_m2b1_detector_resolves_inline_and_external_authority_globs() {
             .any(|violation| violation.contains("view-only-install")),
         "an explicit local definition must shadow a protected glob import: {shadowed:?}"
     );
+}
+
+#[test]
+fn rfd4_m2b1_detector_propagates_authority_child_namespaces_through_globs() {
+    for (source, expected) in [
+        (
+            "mod hidden { \
+             pub(crate) mod types { \
+             pub(crate) type View = \
+             crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+             } \
+             } \
+             use self::hidden::*; \
+             pub(crate) fn publish(view: types::View) {}",
+            "view-only-install",
+        ),
+        (
+            "use crate::runtime_filter::port::*; \
+             pub(crate) fn publish(view: install::RuntimeFilterInstallView) {}",
+            "view-only-install",
+        ),
+        (
+            "use crate::runtime_filter::router::*; \
+             struct RoutingState { router: Arc<role_graph::RoleRouter> }",
+            "role-router-storage",
+        ),
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "authority globs must propagate direct child namespaces for qualified lookup: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_preserves_unrelated_type_and_import_shadows() {
+    for source in [
+        "type RuntimeFilterInstallView = u32; \
+         pub(crate) fn inspect(view: RuntimeFilterInstallView) {}",
+        "use crate::common::types::UniqueId as RuntimeFilterInstallView; \
+         pub(crate) fn inspect(view: RuntimeFilterInstallView) {}",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "an unrelated explicit type binding must shadow a protected bare symbol name: \
+             {source}: {violations:?}"
+        );
+    }
 }
 
 #[test]
