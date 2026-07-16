@@ -21,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 VERSION="7.3.69"
+API_VERSION="730"
 prepare_only=false
 
 sha1_text() {
@@ -70,6 +71,7 @@ self_check() {
     # shellcheck disable=SC1090
     source "$exports_file"
     test "$NOVAROCKS_FDB_VERSION" = "$VERSION"
+    test "$NOVAROCKS_FDB_API_VERSION" = "$API_VERSION"
     test -n "$NOVA_FDB_ENV_ID"
     test -n "$NOVA_FDB_COMPOSE_PROJECT"
     test -n "$NOVAROCKS_FDB_KEYSPACE_ID"
@@ -162,6 +164,7 @@ chmod 600 "$cluster_file"
 
 {
   printf 'export NOVAROCKS_FDB_VERSION=%q\n' "$VERSION"
+  printf 'export NOVAROCKS_FDB_API_VERSION=%q\n' "$API_VERSION"
   printf 'export NOVA_FDB_ENV_ID=%q\n' "$env_id"
   printf 'export NOVA_FDB_COMPOSE_PROJECT=%q\n' "$compose_project"
   printf 'export NOVA_FDB_RUNTIME_DIR=%q\n' "$runtime_dir"

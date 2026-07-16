@@ -97,6 +97,12 @@ impl FoundationDbStateStore {
         let identity = open_identity(database.as_ref(), &codec, &cluster_id)
             .await?
             .identity;
+        tracing::info!(
+            provider = "foundationdb",
+            client_status = "ready",
+            keyspace_hash = %codec.keyspace_hash(),
+            "FoundationDB state store client is ready"
+        );
         Ok(Self {
             lease,
             codec,

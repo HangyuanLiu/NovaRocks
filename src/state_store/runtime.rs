@@ -37,6 +37,8 @@ use {
 };
 
 const RUNTIME_PID_ERROR: &str = "state store runtime belongs to a different process";
+#[cfg(feature = "foundationdb-provider")]
+const FOUNDATIONDB_API_VERSION: i32 = 730;
 
 pub struct StateStoreRuntime {
     inner: RuntimeInner,
@@ -305,6 +307,12 @@ impl FoundationDbRuntime {
                 config: config.clone(),
             };
         }
+        tracing::info!(
+            provider = "foundationdb",
+            lifecycle = "started",
+            process_id = pid,
+            "FoundationDB state store runtime started"
+        );
 
         Ok(Self {
             shared: Arc::new(FoundationDbRuntimeShared {
@@ -385,6 +393,12 @@ impl FoundationDbRuntime {
                 "FoundationDB runtime shutdown is already in progress",
             ));
         }
+        tracing::info!(
+            provider = "foundationdb",
+            lifecycle = "stopping",
+            process_id = self.shared.pid,
+            "FoundationDB state store runtime stopping"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.shared.is_drained() {
@@ -404,10 +418,23 @@ impl FoundationDbRuntime {
         match self.network.stop_and_join() {
             Ok(()) => {
                 mark_process_network_stopped(self.shared.pid);
+                tracing::info!(
+                    provider = "foundationdb",
+                    lifecycle = "stopped",
+                    process_id = self.shared.pid,
+                    "FoundationDB state store runtime stopped"
+                );
                 Ok(())
             }
             Err(error) => {
                 mark_process_network_failed(self.shared.pid, error.clone());
+                tracing::warn!(
+                    provider = "foundationdb",
+                    lifecycle = "stop_failed",
+                    process_id = self.shared.pid,
+                    error_kind = ?error.kind(),
+                    "FoundationDB state store runtime stop failed"
+                );
                 Err(error)
             }
         }
@@ -694,16 +721,18 @@ impl Drop for OperationHandle {
 fn start_foundationdb_network(
     config: &FoundationDbClientConfig,
 ) -> Result<FoundationDbNetworkOwner, StateStoreError> {
-    if foundationdb::api::get_max_api_version() < 730 {
-        return Err(StateStoreError::new(
-            StateStoreErrorKind::InvalidConfiguration,
-            "FoundationDB client does not support API version 730",
-        ));
-    }
+    let (max_api_version, selected_api_version) =
+        foundationdb_api_versions(foundationdb::api::get_max_api_version())?;
+    tracing::info!(
+        provider = "foundationdb",
+        api_max_version = max_api_version,
+        api_selected_version = selected_api_version,
+        "FoundationDB API version selected"
+    );
 
     let initialized = catch_unwind(AssertUnwindSafe(|| {
         let mut network = FdbApiBuilder::default()
-            .set_runtime_version(730)
+            .set_runtime_version(selected_api_version)
             .build()
             .map_err(|_| ())?;
         network = network
@@ -789,6 +818,17 @@ fn start_foundationdb_network(
                 )
             })
     })
+}
+
+#[cfg(feature = "foundationdb-provider")]
+fn foundationdb_api_versions(max_api_version: i32) -> Result<(i32, i32), StateStoreError> {
+    if max_api_version < FOUNDATIONDB_API_VERSION {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "FoundationDB client does not support API version 730",
+        ));
+    }
+    Ok((max_api_version, FOUNDATIONDB_API_VERSION))
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -890,6 +930,16 @@ mod tests {
         *PROCESS_NETWORK
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = ProcessNetworkState::Never;
+    }
+
+    #[test]
+    fn foundationdb_api_selection_reports_max_and_fixed_selected_version() {
+        assert_eq!(
+            foundationdb_api_versions(740).expect("supported API"),
+            (740, 730)
+        );
+        let error = foundationdb_api_versions(729).expect_err("old client must fail closed");
+        assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
     }
 
     #[tokio::test(flavor = "current_thread")]

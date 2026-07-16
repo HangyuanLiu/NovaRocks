@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::state_store::{StateStoreError, StateStoreErrorKind};
@@ -32,6 +33,7 @@ const PENDING_TAG: u8 = 0x01;
 const COMMITTED_TAG: u8 = 0x02;
 const NOT_COMMITTED_TAG: u8 = 0x03;
 pub(super) const REVISION_BYTES: usize = 10;
+const KEYSPACE_HASH_HEX_BYTES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum DurableCommitState {
@@ -60,6 +62,10 @@ impl KeyspaceCodec {
 
     pub fn root(&self) -> &[u8] {
         &self.root
+    }
+
+    pub fn keyspace_hash(&self) -> String {
+        keyspace_hash(self.root())
     }
 
     fn meta_key(&self, field: u8) -> Vec<u8> {
@@ -277,6 +283,28 @@ impl KeyspaceCodec {
                 )
             })
             .collect()
+    }
+}
+
+fn keyspace_hash(root: &[u8]) -> String {
+    let digest = Sha256::digest(root);
+    hex::encode(&digest[..KEYSPACE_HASH_HEX_BYTES])
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    #[test]
+    fn keyspace_hash_is_stable_and_does_not_expose_the_uuid() {
+        let keyspace_id = Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41").unwrap();
+        let codec = KeyspaceCodec::new(keyspace_id);
+        let hash = codec.keyspace_hash();
+
+        assert_eq!(hash.len(), 16);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!hash.contains("22db595e"));
+        assert_eq!(hash, KeyspaceCodec::new(keyspace_id).keyspace_hash());
     }
 }
 
