@@ -36402,9 +36402,27 @@ impl Rfd4M2b1TypeResolver {
             ..Self::default()
         };
         let mut type_aliases = Vec::new();
+        let mut extern_crate_aliases = Vec::new();
         let mut scoped_imports = Vec::new();
         let mut scoped_globs = Vec::new();
-        resolver.collect_items(&file.items, &mut Vec::new(), &mut type_aliases);
+        resolver.collect_items(
+            &file.items,
+            &mut Vec::new(),
+            &mut type_aliases,
+            &mut extern_crate_aliases,
+        );
+        for (scope, local, target) in extern_crate_aliases {
+            let destination = resolver.scopes.entry(scope).or_default();
+            destination.shadows.insert(local.clone());
+            destination
+                .namespaces
+                .entry(local)
+                .or_default()
+                .insert(Rfd4M2b1NamespaceTarget {
+                    path: vec![target],
+                    scope: Vec::new(),
+                });
+        }
 
         let aliases = rust_scoped_aliases(production);
         for raw in rust_raw_use_statements(production) {
@@ -36551,12 +36569,12 @@ impl Rfd4M2b1TypeResolver {
                 for target in targets {
                     match target {
                         Rfd4M2b1ResolvedNamespace::Local(target_scope) => {
-                            let bindings = resolver
+                            let target = resolver
                                 .scopes
                                 .get(&target_scope)
-                                .map(|scope| scope.bindings.clone())
+                                .cloned()
                                 .unwrap_or_default();
-                            for (name, symbols) in bindings {
+                            for (name, symbols) in target.bindings {
                                 let destination = resolver.scopes.entry(scope.clone()).or_default();
                                 if !destination.shadows.contains(&name) {
                                     destination
@@ -36564,6 +36582,16 @@ impl Rfd4M2b1TypeResolver {
                                         .entry(name)
                                         .or_default()
                                         .extend(symbols);
+                                }
+                            }
+                            for (name, targets) in target.namespaces {
+                                let destination = resolver.scopes.entry(scope.clone()).or_default();
+                                if !destination.shadows.contains(&name) {
+                                    destination
+                                        .namespaces
+                                        .entry(name)
+                                        .or_default()
+                                        .extend(targets);
                                 }
                             }
                             let child_scopes = resolver
@@ -36654,6 +36682,7 @@ impl Rfd4M2b1TypeResolver {
         items: &'a [syn::Item],
         scope: &mut Vec<String>,
         type_aliases: &mut Vec<(Vec<String>, &'a syn::ItemType)>,
+        extern_crate_aliases: &mut Vec<(Vec<String>, String, String)>,
     ) {
         self.scopes.entry(scope.clone()).or_default();
         for item in items {
@@ -36678,10 +36707,24 @@ impl Rfd4M2b1TypeResolver {
             }
             match item {
                 syn::Item::Type(alias) => type_aliases.push((scope.clone(), alias)),
+                syn::Item::ExternCrate(item) => {
+                    let local = item
+                        .rename
+                        .as_ref()
+                        .map(|(_, ident)| ident)
+                        .unwrap_or(&item.ident)
+                        .to_string();
+                    let target = if item.ident == "self" {
+                        "crate".to_string()
+                    } else {
+                        item.ident.to_string()
+                    };
+                    extern_crate_aliases.push((scope.clone(), local, target));
+                }
                 syn::Item::Mod(module) => {
                     if let Some((_, items)) = &module.content {
                         scope.push(module.ident.to_string());
-                        self.collect_items(items, scope, type_aliases);
+                        self.collect_items(items, scope, type_aliases, extern_crate_aliases);
                         scope.pop();
                     }
                 }
@@ -36790,6 +36833,13 @@ impl Rfd4M2b1TypeResolver {
         }
         let remaining = &segments[owner_index..];
         if remaining.is_empty() {
+            if crate_qualified {
+                return [Rfd4M2b1ResolvedNamespace::Canonical(vec![
+                    "crate".to_string(),
+                ])]
+                .into_iter()
+                .collect();
+            }
             return [Rfd4M2b1ResolvedNamespace::Local(target_scope)]
                 .into_iter()
                 .collect();
@@ -37956,6 +38006,113 @@ fn rfd4_m2b1_detector_propagates_authority_child_namespaces_through_globs() {
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "authority globs must propagate direct child namespaces for qualified lookup: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_propagates_transitive_facade_namespace_globs() {
+    for (source, expected) in [
+        (
+            "mod hidden { \
+             pub(crate) mod types { \
+             pub(crate) type View = \
+             crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+             } \
+             } \
+             mod facade { pub(crate) use super::hidden::*; } \
+             use self::facade::*; \
+             pub(crate) fn publish(view: types::View) {}",
+            "view-only-install",
+        ),
+        (
+            "mod facade { pub(crate) use crate::runtime_filter::port::*; } \
+             use self::facade::*; \
+             pub(crate) fn publish(view: install::RuntimeFilterInstallView) {}",
+            "view-only-install",
+        ),
+        (
+            "mod facade { pub(crate) use crate::runtime_filter::router::*; } \
+             use self::facade::*; \
+             struct RoutingState { router: Arc<role_graph::RoleRouter> }",
+            "role-router-storage",
+        ),
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "transitive facade globs must preserve already imported authority namespaces: \
+             {source}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_crate_root_authority_aliases() {
+    for (source, expected) in [
+        (
+            "use crate as nr; \
+             pub(crate) fn publish( \
+             view: nr::runtime_filter::port::install::RuntimeFilterInstallView \
+             ) {}",
+            "view-only-install",
+        ),
+        (
+            "use crate as nr; \
+             struct RoutingState { \
+             router: Arc<nr::runtime_filter::router::role_graph::RoleRouter> \
+             }",
+            "role-router-storage",
+        ),
+        (
+            "extern crate self as nr; \
+             pub(crate) fn publish( \
+             view: nr::runtime_filter::port::install::RuntimeFilterInstallView \
+             ) {}",
+            "view-only-install",
+        ),
+        (
+            "extern crate self as nr; \
+             struct RoutingState { \
+             router: Arc<nr::runtime_filter::router::role_graph::RoleRouter> \
+             }",
+            "role-router-storage",
+        ),
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "crate-root aliases must not bypass protected authority resolution: \
+             {source}: {violations:?}"
+        );
+    }
+
+    for source in [
+        "use crate::common as nr; \
+         pub(crate) fn inspect(value: nr::types::UniqueId) {}",
+        "extern crate alloc as nr; \
+         pub(crate) fn inspect(value: nr::string::String) {}",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            !violations.iter().any(|violation| {
+                violation.contains("view-only-install") || violation.contains("role-router-storage")
+            }),
+            "unrelated crate and module aliases must remain outside authority detection: \
              {source}: {violations:?}"
         );
     }
