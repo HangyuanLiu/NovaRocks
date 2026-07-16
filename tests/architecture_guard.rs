@@ -36379,12 +36379,17 @@ struct Rfd4M2b1TypeScope {
 #[derive(Clone, Debug, Default)]
 struct Rfd4M2b1TypeResolver {
     scopes: BTreeMap<Vec<String>, Rfd4M2b1TypeScope>,
+    source_module: Vec<String>,
 }
 
 impl Rfd4M2b1TypeResolver {
     fn from_source(source_rel: &str, production: &str, file: &syn::File) -> Self {
-        let mut resolver = Self::default();
+        let mut resolver = Self {
+            source_module: rfd4_m2b1_source_module(source_rel),
+            ..Self::default()
+        };
         let mut type_aliases = Vec::new();
+        let mut scoped_imports = Vec::new();
         resolver.collect_items(&file.items, &mut Vec::new(), &mut type_aliases);
 
         let aliases = rust_scoped_aliases(production);
@@ -36417,6 +36422,7 @@ impl Rfd4M2b1TypeResolver {
                 }]
             });
             for path in resolved {
+                scoped_imports.push((import_scope.clone(), local.clone(), path.segments.clone()));
                 let Some(canonical) = rust_canonical_path_segments_in_scope(
                     &path.segments,
                     source_rel,
@@ -36449,7 +36455,7 @@ impl Rfd4M2b1TypeResolver {
                 .remove(&local);
         }
 
-        for _ in 0..=type_aliases.len() {
+        for _ in 0..=type_aliases.len() + scoped_imports.len() {
             let before = resolver.scopes.clone();
             for (scope, alias) in &type_aliases {
                 for symbol in [
@@ -36464,6 +36470,24 @@ impl Rfd4M2b1TypeResolver {
                             .or_default()
                             .bindings
                             .entry(alias.ident.to_string())
+                            .or_default()
+                            .insert(symbol.to_string());
+                    }
+                }
+            }
+            for (scope, local, path) in &scoped_imports {
+                for symbol in [
+                    "RuntimeFilterInstallView",
+                    "RuntimeFilterParticipantInstall",
+                    "RoleRouter",
+                ] {
+                    if resolver.path_segments_are_symbol(path, symbol, scope) {
+                        resolver
+                            .scopes
+                            .entry(scope.clone())
+                            .or_default()
+                            .bindings
+                            .entry(local.clone())
                             .or_default()
                             .insert(symbol.to_string());
                     }
@@ -36522,6 +36546,15 @@ impl Rfd4M2b1TypeResolver {
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect::<Vec<_>>();
+        self.path_segments_are_symbol(&segments, symbol, scope)
+    }
+
+    fn path_segments_are_symbol(
+        &self,
+        segments: &[String],
+        symbol: &str,
+        scope: &[String],
+    ) -> bool {
         if segments.is_empty() {
             return false;
         }
@@ -36536,6 +36569,9 @@ impl Rfd4M2b1TypeResolver {
         {
             target_scope.clear();
             owner_index += 1;
+            if segments[owner_index..].starts_with(&self.source_module) {
+                owner_index += self.source_module.len();
+            }
         }
         while segments
             .get(owner_index)
@@ -36568,6 +36604,19 @@ impl Rfd4M2b1TypeResolver {
             return true;
         }
         owner == symbol && !scope.is_some_and(|scope| scope.shadows.contains(owner))
+    }
+
+    fn type_is_exact_symbol(&self, ty: &syn::Type, symbol: &str, scope: &[String]) -> bool {
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+        path.qself.is_none()
+            && path
+                .path
+                .segments
+                .iter()
+                .all(|segment| matches!(segment.arguments, syn::PathArguments::None))
+            && self.path_is_symbol(&path.path, symbol, scope)
     }
 
     fn type_contains_symbol(&self, ty: &syn::Type, symbol: &str, scope: &[String]) -> bool {
@@ -36645,6 +36694,26 @@ impl Rfd4M2b1TypeResolver {
         syn::visit::Visit::visit_type(&mut audit, ty);
         audit.found
     }
+}
+
+fn rfd4_m2b1_source_module(source_rel: &str) -> Vec<String> {
+    let Some(source) = source_rel
+        .strip_prefix("src/")
+        .and_then(|path| path.strip_suffix(".rs"))
+    else {
+        return Vec::new();
+    };
+    let mut module = source
+        .split('/')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if module
+        .last()
+        .is_some_and(|segment| segment == "lib" || segment == "main" || segment == "mod")
+    {
+        module.pop();
+    }
+    module
 }
 
 fn rfd4_m2b1_canonical_symbol_path(path: &[String], symbol: &str) -> bool {
@@ -36874,7 +36943,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
             == "src/runtime_filter/port/install.rs"
             && self.module_scope.is_empty()
             && (rfd4_m2b1_type_is_named(item.self_ty.as_ref(), "RuntimeFilterParticipantInstall")
-                || self.type_resolver.type_contains_symbol(
+                || self.type_resolver.type_is_exact_symbol(
                     item.self_ty.as_ref(),
                     "RuntimeFilterParticipantInstall",
                     &self.module_scope,
@@ -37504,6 +37573,19 @@ fn rfd4_m2b1_detector_resolves_qualified_inline_module_view_aliases() {
          } \
          mod api { pub(crate) fn publish(view: super::hidden::View) {} } \
          }",
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         pub(crate) fn publish( \
+         view: crate::runtime_filter::service::registry::hidden::View \
+         ) {}",
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         use self::hidden::View as V; \
+         pub(crate) fn publish(view: V) {}",
     ] {
         let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
             "src/runtime_filter/service/registry.rs",
@@ -37573,7 +37655,9 @@ fn rfd4_m2b1_detector_does_not_exempt_same_named_service_impls() {
          routing_shard: RuntimeFilterRoutingShard \
          } \
          impl RuntimeFilterParticipantInstall { \
-         fn publish(view: RuntimeFilterInstallView) {} \
+         fn publish( \
+         view: crate::runtime_filter::port::install::RuntimeFilterInstallView \
+         ) {} \
          }",
     )]);
     assert!(
@@ -37582,6 +37666,25 @@ fn rfd4_m2b1_detector_does_not_exempt_same_named_service_impls() {
             .any(|violation| violation.contains("view-only-install")),
         "the real composite impl in port/install remains the sole raw-view impl exemption: \
          {canonical_owner:?}"
+    );
+
+    let wrapped_owner = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/port/install.rs",
+        "struct Wrapper<T>(T); \
+         impl Wrapper< \
+         crate::runtime_filter::port::install::RuntimeFilterParticipantInstall \
+         > { \
+         fn publish( \
+         view: crate::runtime_filter::port::install::RuntimeFilterInstallView \
+         ) {} \
+         }",
+    )]);
+    assert!(
+        wrapped_owner
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "a generic wrapper containing the composite is not the exact canonical composite impl: \
+         {wrapped_owner:?}"
     );
 }
 
