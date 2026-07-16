@@ -9299,9 +9299,32 @@ fn ebd_4b3b_statistics_lookup_decoupling_is_complete() {
     );
 }
 
-const EBD_4B3C_OWNER: &str = "src/sql/planner/table.rs";
+const EBD_4B3C_PLANNER_OWNER: &str = "src/sql/planner/table.rs";
+const EBD_4B3E_CONNECTOR_OWNER: &str = "src/connector/iceberg/scan_model.rs";
 const EBD_4B3C_CODEGEN_HELPER: &str = "src/sql/codegen/scan/connector.rs";
 const EBD_4B3C_COORDINATOR_ENTRY: &str = "src/coordinator/prepare/scan_preparation.rs";
+const EBD_4B3E_CONNECTOR_MODEL_SYMBOLS: &[&str] = &[
+    "IcebergColumnStats",
+    "IcebergPartitionValue",
+    "IcebergPartitionFieldValue",
+    "IcebergDeleteFileFormat",
+    "IcebergDeleteFileContent",
+    "IcebergDeleteFileInfo",
+    "IcebergSchemaFieldDef",
+    "IcebergSchemaDef",
+    "IcebergTableInfo",
+    "IcebergDataFileInfo",
+    "IcebergDataFileBinding",
+];
+const EBD_4B3C_PLANNER_MODEL_SYMBOLS: &[&str] = &[
+    "IcebergMvTargetStateScan",
+    "IcebergMvTargetLocatorScan",
+    "BranchScope",
+    "IcebergMvTargetStateRowFilter",
+    "IcebergMvTargetStatePartitionConstraint",
+    "ScanSource",
+    "TableDef",
+];
 const EBD_4B3C_MODEL_SYMBOLS: &[&str] = &[
     "IcebergColumnStats",
     "IcebergPartitionValue",
@@ -9312,14 +9335,14 @@ const EBD_4B3C_MODEL_SYMBOLS: &[&str] = &[
     "IcebergSchemaFieldDef",
     "IcebergSchemaDef",
     "IcebergTableInfo",
+    "IcebergDataFileInfo",
+    "IcebergDataFileBinding",
     "IcebergMvTargetStateScan",
     "IcebergMvTargetLocatorScan",
     "BranchScope",
     "IcebergMvTargetStateRowFilter",
     "IcebergMvTargetStatePartitionConstraint",
-    "IcebergDataFileInfo",
     "ScanSource",
-    "IcebergDataFileBinding",
     "TableDef",
 ];
 
@@ -9465,6 +9488,20 @@ fn ebd_4b3c_is_model_symbol(name: &str) -> bool {
     EBD_4B3C_MODEL_SYMBOLS.contains(&name)
 }
 
+fn ebd_4b3e_is_connector_model_symbol(name: &str) -> bool {
+    EBD_4B3E_CONNECTOR_MODEL_SYMBOLS.contains(&name)
+}
+
+fn ebd_4b3c_expected_owner(name: &str) -> Option<&'static str> {
+    if ebd_4b3e_is_connector_model_symbol(name) {
+        Some(EBD_4B3E_CONNECTOR_OWNER)
+    } else if EBD_4B3C_PLANNER_MODEL_SYMBOLS.contains(&name) {
+        Some(EBD_4B3C_PLANNER_OWNER)
+    } else {
+        None
+    }
+}
+
 fn ebd_4b3c_visibility(visibility: &syn::Visibility) -> String {
     match visibility {
         syn::Visibility::Inherited => "private".to_string(),
@@ -9581,7 +9618,10 @@ fn ebd_4b3c_audit_owner(source: &GuardSource) -> BTreeSet<String> {
     };
     let shapes = ebd_4b3c_root_declaration_shapes(&source.text);
     let mut violations = BTreeSet::new();
-    for spec in EBD_4B3C_OWNER_SPECS {
+    for spec in EBD_4B3C_OWNER_SPECS
+        .iter()
+        .filter(|spec| ebd_4b3c_expected_owner(spec.name) == Some(source.path.as_str()))
+    {
         let matching = file
             .items
             .iter()
@@ -9647,11 +9687,35 @@ fn ebd_4b3c_is_legacy_model_path(path: &[String]) -> bool {
 
 fn ebd_4b3c_is_canonical_model_path(path: &[String]) -> bool {
     let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    for (root, owner) in [
+        (
+            &["crate", "sql", "planner", "table"][..],
+            EBD_4B3C_PLANNER_OWNER,
+        ),
+        (
+            &["crate", "connector", "iceberg", "scan_model"][..],
+            EBD_4B3E_CONNECTOR_OWNER,
+        ),
+    ] {
+        if segments.starts_with(root)
+            && segments.get(root.len()).is_some_and(|leaf| {
+                *leaf == "*"
+                    || ebd_4b3c_expected_owner(leaf).is_some_and(|expected| expected == owner)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn ebd_4b3e_is_retired_planner_raw_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
     let root = ["crate", "sql", "planner", "table"];
     segments.starts_with(&root)
         && segments
             .get(root.len())
-            .is_some_and(|leaf| *leaf == "*" || ebd_4b3c_is_model_symbol(leaf))
+            .is_some_and(|leaf| *leaf == "*" || ebd_4b3e_is_connector_model_symbol(leaf))
 }
 
 fn ebd_4b3c_type_contains_model_path(
@@ -9720,7 +9784,7 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
     }
     impl DefinitionAudit<'_> {
         fn canonical_root(&self, name: &str) -> bool {
-            self.source.path == EBD_4B3C_OWNER
+            ebd_4b3c_expected_owner(name) == Some(self.source.path.as_str())
                 && self.inline_modules.is_empty()
                 && ebd_4b3c_is_model_symbol(name)
         }
@@ -9738,12 +9802,7 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
             }
         }
 
-        fn record_wrapper<'a>(
-            &mut self,
-            visibility: &syn::Visibility,
-            name: &str,
-            fields: impl Iterator<Item = &'a syn::Field>,
-        ) {
+        fn record_wrapper<'a>(&mut self, name: &str, fields: impl Iterator<Item = &'a syn::Field>) {
             let fields = fields.collect::<Vec<_>>();
             // These are connector-owned runtime envelopes with their own behavior,
             // not alternate planner-model owners or transparent forwarding aliases.
@@ -9753,10 +9812,20 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
                     "src/connector/iceberg/file_pruning.rs",
                     "IcebergFilePruningMetadata"
                 ) | ("src/connector/iceberg/scan_planner.rs", "IcebergSplit")
+                    | ("src/engine/catalog.rs", "DatabaseDef")
+                    | ("src/sql/codegen/fragment/build.rs", "PlannedIcebergFiles")
             );
-            if ebd_4b3c_visibility(visibility) != "private"
-                && fields.len() == 1
-                && !semantic_connector_wrapper
+            let tuple_wrapper = fields.iter().any(|field| field.ident.is_none());
+            let named_wrapper = fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|ident| {
+                    matches!(
+                        ident.to_string().as_str(),
+                        "inner" | "value" | "wrapped" | "delegate"
+                    )
+                })
+            });
+            if !semantic_connector_wrapper
+                && (tuple_wrapper || fields.len() == 1 || named_wrapper)
                 && fields.iter().any(|field| {
                     ebd_4b3c_type_contains_model_path(
                         &field.ty,
@@ -9777,7 +9846,7 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
         fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
             self.record_definition("struct", &item.ident.to_string());
             if !self.canonical_root(&item.ident.to_string()) {
-                self.record_wrapper(&item.vis, &item.ident.to_string(), item.fields.iter());
+                self.record_wrapper(&item.ident.to_string(), item.fields.iter());
             }
             syn::visit::visit_item_struct(self, item);
         }
@@ -9788,11 +9857,7 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
                 && item.variants.len() == 1
                 && item.variants[0].fields.len() == 1
             {
-                self.record_wrapper(
-                    &item.vis,
-                    &item.ident.to_string(),
-                    item.variants[0].fields.iter(),
-                );
+                self.record_wrapper(&item.ident.to_string(), item.variants[0].fields.iter());
             }
             syn::visit::visit_item_enum(self, item);
         }
@@ -9850,11 +9915,14 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
         for path in remove_redundant_descendant_paths(
             rust_production_canonical_paths(&source.text, &source.path)
                 .into_iter()
-                .filter(|path| ebd_4b3c_is_legacy_model_path(path))
+                .filter(|path| {
+                    ebd_4b3c_is_legacy_model_path(path)
+                        || ebd_4b3e_is_retired_planner_raw_path(path)
+                })
                 .collect(),
         ) {
             violations.insert(format!(
-                "planner-scan-model-legacy-path: {}|{}",
+                "planner-scan-model-retired-path: {}|{}",
                 source.path,
                 path.join("::")
             ));
@@ -9899,15 +9967,20 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
                 ) else {
                     continue;
                 };
-                if ebd_4b3c_is_legacy_model_path(&canonical) {
+                if ebd_4b3c_is_legacy_model_path(&canonical)
+                    || (ebd_4b3e_is_retired_planner_raw_path(&canonical)
+                        && canonical.last().is_some_and(|leaf| leaf != "*"))
+                {
                     violations.insert(format!(
-                        "planner-scan-model-legacy-import: {}|{}|{}",
+                        "planner-scan-model-retired-import: {}|{}|{}",
                         source.path,
                         import.visibility,
                         canonical.join("::")
                     ));
                 } else if import.visibility != "private"
-                    && source.path != EBD_4B3C_OWNER
+                    && !canonical.last().is_some_and(|name| {
+                        ebd_4b3c_expected_owner(name) == Some(source.path.as_str())
+                    })
                     && ebd_4b3c_is_canonical_model_path(&canonical)
                 {
                     violations.insert(format!(
@@ -9920,6 +9993,101 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
             }
         }
     }
+    violations
+}
+
+fn ebd_4b3e_audit_planner_literal_carrier(source: &GuardSource) -> BTreeSet<String> {
+    struct LiteralAudit<'a> {
+        source: &'a GuardSource,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for LiteralAudit<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if let Some(resolved) = rust_resolve_scoped_paths(
+                &segments,
+                &self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) {
+                for path in resolved {
+                    if path.segments == ["iceberg", "spec", "Literal"] {
+                        self.violations.insert(format!(
+                            "planner-scan-model-iceberg-literal-carrier: {}|{}",
+                            self.source.path,
+                            path.segments.join("::")
+                        ));
+                    }
+                }
+            }
+            syn::visit::visit_path(self, path);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            let tokens = rust_source_tokens(&item.mac.tokens.to_string());
+            if tokens.windows(5).any(|window| {
+                window[0].text == "iceberg"
+                    && window[1].text == "::"
+                    && window[2].text == "spec"
+                    && window[3].text == "::"
+                    && window[4].text == "Literal"
+            }) {
+                self.violations.insert(format!(
+                    "planner-scan-model-iceberg-literal-macro-carrier: {}",
+                    self.source.path
+                ));
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "planner-scan-model-literal-audit-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+    let mut violations = imports
+        .into_iter()
+        .filter(|import| {
+            import.segments == ["iceberg", "spec", "Literal"]
+                || import.segments == ["iceberg", "spec", "*"]
+        })
+        .map(|import| {
+            format!(
+                "planner-scan-model-iceberg-literal-import: {}|{}",
+                source.path,
+                import.segments.join("::")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut audit = LiteralAudit {
+        source,
+        aliases: &aliases,
+        inline_modules: Vec::new(),
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    violations.extend(audit.violations);
     violations
 }
 
@@ -10172,18 +10340,26 @@ fn ebd_4b3c_audit_dynamic_seam(sources: &[GuardSource]) -> Ebd4b3cDynamicSnapsho
 
 fn ebd_4b3c_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     let mut violations = BTreeSet::new();
-    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B3C_OWNER) {
-        violations.extend(ebd_4b3c_audit_owner(owner));
-    } else {
-        violations.insert(format!(
-            "planner-scan-model-owner-missing: {EBD_4B3C_OWNER}"
-        ));
+    for expected_owner in [EBD_4B3C_PLANNER_OWNER, EBD_4B3E_CONNECTOR_OWNER] {
+        if let Some(owner) = sources.iter().find(|source| source.path == expected_owner) {
+            violations.extend(ebd_4b3c_audit_owner(owner));
+        } else {
+            violations.insert(format!(
+                "planner-scan-model-owner-missing: {expected_owner}"
+            ));
+        }
     }
     let audited_sources = sources
         .iter()
         .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
         .cloned()
         .collect::<Vec<_>>();
+    for planner_source in audited_sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/planner/"))
+    {
+        violations.extend(ebd_4b3e_audit_planner_literal_carrier(planner_source));
+    }
     violations.extend(ebd_4b3c_audit_paths_definitions_and_forwarding(
         &audited_sources,
     ));
@@ -10214,8 +10390,9 @@ fn ebd_4b3c_detector_covers_owner_paths_forwarding_and_noise() {
         GuardSource::new(
             "src/sql/analyzer/allowed.rs",
             r###"
-use crate::sql::planner::table::{ScanSource, TableDef};
-use crate::sql::catalog::TableLookupMode;
+	use crate::sql::planner::table::{ScanSource, TableDef};
+	use crate::connector::iceberg::scan_model::IcebergTableInfo;
+	use crate::sql::catalog::TableLookupMode;
 fn lookup(mode: TableLookupMode) {
     let _ = TableLookupMode::IcebergMetadata { metadata_table_type: kind() };
     let _: crate::proto::plan::TableDef = protobuf();
@@ -10298,6 +10475,38 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
             "src/sql/named_wrapper.rs",
             "pub struct LegacyTable { pub inner: crate::sql::planner::table::TableDef }",
         ),
+        GuardSource::new(
+            "src/sql/retired_direct.rs",
+            "use crate::sql::planner::table::IcebergTableInfo;",
+        ),
+        GuardSource::new(
+            "src/sql/retired_alias.rs",
+            "use crate::sql::planner::table as old; type Legacy = old::IcebergDataFileInfo;",
+        ),
+        GuardSource::new(
+            "src/sql/retired_glob.rs",
+            "use crate::sql::planner::table::*;",
+        ),
+        GuardSource::new(
+            "src/sql/connector_forward.rs",
+            "pub use crate::connector::iceberg::scan_model::IcebergTableInfo;",
+        ),
+        GuardSource::new(
+            "src/sql/connector_wrapper.rs",
+            "pub struct LegacyIceberg(pub crate::connector::iceberg::scan_model::IcebergTableInfo);",
+        ),
+        GuardSource::new(
+            "src/sql/private_connector_wrapper.rs",
+            "struct LegacyIceberg(crate::connector::iceberg::scan_model::IcebergTableInfo);",
+        ),
+        GuardSource::new(
+            "src/sql/multifield_connector_wrapper.rs",
+            "pub struct LegacyIceberg { inner: crate::connector::iceberg::scan_model::IcebergTableInfo, marker: u8 }",
+        ),
+        GuardSource::new(
+            "src/sql/payload_connector_wrapper.rs",
+            "pub struct LegacyIceberg { payload: crate::connector::iceberg::scan_model::IcebergTableInfo }",
+        ),
     ];
     let violations = ebd_4b3c_audit_paths_definitions_and_forwarding(&invalid);
     for fixture in [
@@ -10313,6 +10522,14 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
         "macro_owner.rs",
         "wrapper.rs",
         "named_wrapper.rs",
+        "retired_direct.rs",
+        "retired_alias.rs",
+        "retired_glob.rs",
+        "connector_forward.rs",
+        "connector_wrapper.rs",
+        "private_connector_wrapper.rs",
+        "multifield_connector_wrapper.rs",
+        "payload_connector_wrapper.rs",
     ] {
         assert!(
             violations
@@ -10321,6 +10538,15 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
             "planner model detector missed {fixture}: {violations:?}"
         );
     }
+
+    let planner_literal = GuardSource::new(
+        EBD_4B3C_PLANNER_OWNER,
+        "use iceberg::spec::Literal; pub struct PlannerCarrier { value: Literal }",
+    );
+    assert!(
+        !ebd_4b3e_audit_planner_literal_carrier(&planner_literal).is_empty(),
+        "planner Iceberg literal carrier must fail closed"
+    );
 
     let dynamic_invalid = [
         GuardSource::new(
@@ -10359,6 +10585,28 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
                 .any(|violation| violation.contains(fixture)),
             "dynamic seam detector missed {fixture}: {:?}",
             dynamic.violations
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3e_detector_rejects_literal_carriers_across_the_planner() {
+    let mut sources = ebd_4b1_collect_repo_sources();
+    sources.push(GuardSource::new(
+        "src/sql/planner/optimizer_bridge/literal_carrier.rs",
+        "struct PlannerCarrier { value: iceberg::spec::Literal }",
+    ));
+    sources.push(GuardSource::new(
+        "src/sql/planner/optimizer_bridge/literal_macro_carrier.rs",
+        "macro_rules! carrier { () => { struct PlannerCarrier { value: iceberg::spec::Literal } }; }",
+    ));
+    let violations = ebd_4b3c_completion_violations(&sources);
+    for fixture in ["literal_carrier.rs", "literal_macro_carrier.rs"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(fixture)),
+            "planner-wide Iceberg literal carrier escaped completion guard for {fixture}: {violations:?}"
         );
     }
 }

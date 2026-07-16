@@ -425,6 +425,7 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::imv_rewrite::change_stream::{
@@ -435,7 +436,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalUnionNode};
     use crate::sql::planner::payload::PlanProjectNode;
     use crate::sql::planner::payload::*;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, TableDef};
+    use crate::sql::planner::table::TableDef;
 
     #[test]
     fn output_column_has_expected_shape() {

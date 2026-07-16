@@ -54,6 +54,9 @@ use crate::connector::iceberg::position_delete_descriptor::{
     ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
 use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::backend_resolver::TargetBackend;
@@ -71,10 +74,7 @@ use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id, transform_to_sink_string,
 };
-use crate::sql::planner::table::{
-    IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo, ScanSource,
-    TableDef,
-};
+use crate::sql::planner::table::{ScanSource, TableDef};
 
 pub(crate) fn execute_iceberg_insert_or_overwrite(
     state: &Arc<StandaloneState>,

@@ -1061,8 +1061,8 @@ mod is_known_rule_name_tests {
         catalog: &str,
         ns: &str,
         tbl: &str,
-    ) -> crate::sql::planner::table::IcebergTableInfo {
-        crate::sql::planner::table::IcebergTableInfo {
+    ) -> crate::connector::iceberg::scan_model::IcebergTableInfo {
+        crate::connector::iceberg::scan_model::IcebergTableInfo {
             catalog: catalog.to_string(),
             namespace: ns.to_string(),
             table: tbl.to_string(),
@@ -1070,7 +1070,7 @@ mod is_known_rule_name_tests {
             current_snapshot_id: None,
             schema_id: 0,
             location: String::new(),
-            schema: crate::sql::planner::table::IcebergSchemaDef { fields: vec![] },
+            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef { fields: vec![] },
             serialized_metadata: None,
             serialized_metadata_rows: None,
         }
@@ -1094,7 +1094,8 @@ mod is_known_rule_name_tests {
                 table: iceberg_info(catalog, ns, tbl),
                 files: vec![],
                 cloud_properties: Default::default(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }

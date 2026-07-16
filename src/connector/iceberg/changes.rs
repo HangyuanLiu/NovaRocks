@@ -618,18 +618,18 @@ fn delete_visibility_data_file_from_stats(
         .into_iter()
         .map(|delete| {
             let file_format = match delete.file_format {
-                crate::sql::planner::table::IcebergDeleteFileFormat::Parquet => {
+                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
                     DeleteVisibilityDeleteFileFormat::Parquet
                 }
-                crate::sql::planner::table::IcebergDeleteFileFormat::Puffin => {
+                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
                     DeleteVisibilityDeleteFileFormat::Puffin
                 }
             };
             let file_content = match delete.file_content {
-                crate::sql::planner::table::IcebergDeleteFileContent::Position => {
+                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
                     DeleteVisibilityDeleteFileContent::Position
                 }
-                crate::sql::planner::table::IcebergDeleteFileContent::Equality => {
+                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
                     DeleteVisibilityDeleteFileContent::Equality
                 }
             };

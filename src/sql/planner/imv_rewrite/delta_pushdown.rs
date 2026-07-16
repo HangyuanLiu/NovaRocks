@@ -175,10 +175,11 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -231,7 +232,7 @@ mod tests {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

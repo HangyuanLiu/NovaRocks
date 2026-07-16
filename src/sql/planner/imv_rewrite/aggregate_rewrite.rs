@@ -2223,6 +2223,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
@@ -2242,7 +2243,7 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     #[test]
     fn signed_state_function_maps_supported_aggregates() {
@@ -2609,7 +2610,7 @@ mod tests {
                         files: Vec::new(),
                         cloud_properties: BTreeMap::new(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

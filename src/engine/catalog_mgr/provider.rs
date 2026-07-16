@@ -140,13 +140,14 @@ mod tests {
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
     use crate::connector::iceberg::IcebergMetadataTableType;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::catalog_mgr::catalog::Catalog;
     use crate::engine::catalog_mgr::iceberg::IcebergCatalog;
     use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
     use crate::sql::catalog::TableLookupMode;
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource};
+    use crate::sql::planner::table::ScanSource;
     use arrow::datatypes::DataType;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -228,7 +229,8 @@ mod tests {
                     "aws.s3.endpoint".to_string(),
                     "http://minio:9000".to_string(),
                 )]),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }

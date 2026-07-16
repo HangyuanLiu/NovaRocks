@@ -578,9 +578,8 @@ mod tests {
     #[test]
     fn dictionary_provider_loads_iceberg_data_files_snapshot() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::planner::table::{
-            IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-        };
+        use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
+        use crate::sql::planner::table::{ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -647,7 +646,8 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 
@@ -667,9 +667,8 @@ mod tests {
     #[test]
     fn dictionary_provider_skips_stale_iceberg_snapshot_after_table_advances() {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::planner::table::{
-            IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-        };
+        use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
+        use crate::sql::planner::table::{ScanSource, TableDef};
         use arrow::datatypes::DataType;
         use std::collections::BTreeMap;
         use std::sync::Arc;
@@ -735,7 +734,8 @@ mod tests {
                 table: iceberg,
                 files: vec![],
                 cloud_properties: BTreeMap::new(),
-                binding: crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             },
         };
 

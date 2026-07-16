@@ -2444,6 +2444,9 @@ fn repeat_output_columns(
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
+    };
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -2460,9 +2463,7 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
     };
     use crate::sql::planner::payload::*;
-    use crate::sql::planner::table::{
-        IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
@@ -2698,7 +2699,7 @@ mod tests {
                         }],
                         cloud_properties: Default::default(),
                         binding:
-                            crate::sql::planner::table::IcebergDataFileBinding::CurrentSnapshot,
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     },
                 },
                 alias: None,

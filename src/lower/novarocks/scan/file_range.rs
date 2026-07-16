@@ -22,9 +22,9 @@ use crate::connector::iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+use crate::connector::iceberg::scan_model::IcebergColumnStats;
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::{novarocks, plan};
-use crate::sql::planner::table::IcebergColumnStats;
 
 pub(super) fn decode_file_scan_ranges(
     node_id: i32,

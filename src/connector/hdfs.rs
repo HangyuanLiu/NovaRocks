@@ -818,6 +818,7 @@ mod tests {
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
     use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+    use crate::connector::iceberg::scan_model::IcebergColumnStats;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::RuntimeFilterProbeSpec;
@@ -841,7 +842,6 @@ mod tests {
         AcquiredRuntimeFilters, RuntimeFilterHub, RuntimeFilterSnapshot,
         RuntimeFilterUnavailableReason,
     };
-    use crate::sql::planner::table::IcebergColumnStats;
 
     use super::{
         HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp,

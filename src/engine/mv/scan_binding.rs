@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::coordinator::prepare::scan::{
     ResolvedIcebergDeltaScan, ResolvedIcebergFileScan, ResolvedScanExecution, ScanBindingResolver,
 };
@@ -26,7 +27,7 @@ use crate::exec::node::iceberg_delta_scan::{
 };
 use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::{IcebergTableInfo, ScanSource};
+use crate::sql::planner::table::ScanSource;
 
 impl ScanBindingResolver for IcebergMvRefreshContext {
     fn resolve_scan(
@@ -299,15 +300,17 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
+    };
     use crate::engine::mv::refresh_context::tests_support::{
         TargetLocatorRefreshFixture, aggregate_target_state_refresh_fixture,
         refresh_context_for_target_fixture, target_fixture_table_info,
         target_locator_refresh_fixture,
     };
     use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergDataFileInfo, IcebergMvTargetLocatorScan,
-        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
-        IcebergMvTargetStateScan, IcebergSchemaDef, TableDef,
+        IcebergMvTargetLocatorScan, IcebergMvTargetStatePartitionConstraint,
+        IcebergMvTargetStateRowFilter, IcebergMvTargetStateScan, TableDef,
     };
 
     fn table_info(catalog: &str, table: &str) -> IcebergTableInfo {

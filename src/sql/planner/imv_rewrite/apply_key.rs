@@ -261,6 +261,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
@@ -269,7 +270,7 @@ mod tests {
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 

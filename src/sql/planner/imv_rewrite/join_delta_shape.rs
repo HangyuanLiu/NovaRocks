@@ -291,13 +291,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::LogicalPlanKind;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, TableDef,
-    };
+    use crate::sql::planner::table::TableDef;
 
     fn table_info(table: &str) -> IcebergTableInfo {
         IcebergTableInfo {

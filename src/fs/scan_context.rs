@@ -117,8 +117,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
+    use crate::connector::iceberg::scan_model::IcebergColumnStats;
     use crate::fs::access::FsScheme;
-    use crate::sql::planner::table::IcebergColumnStats;
 
     fn range(path: &str) -> FileScanRange {
         FileScanRange {

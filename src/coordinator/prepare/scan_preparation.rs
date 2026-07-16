@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::connector::ConnectorRegistry;
+use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext, TableHandle};
 use crate::coordinator::prepare::scan::{
     ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
@@ -31,7 +32,7 @@ use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::{IcebergDataFileBinding, ScanSource};
+use crate::sql::planner::table::ScanSource;
 
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -233,7 +234,8 @@ fn reject_target_equality_deletes(
     };
     if files.files.iter().any(|file| {
         file.delete_files.iter().any(|delete| {
-            delete.file_content == crate::sql::planner::table::IcebergDeleteFileContent::Equality
+            delete.file_content
+                == crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
         })
     }) {
         return Err(format!(
@@ -607,7 +609,7 @@ fn merge_effective_column_names(existing: Vec<String>, additional: &[String]) ->
 }
 
 pub(crate) fn equality_delete_required_columns(
-    table: &crate::sql::planner::table::IcebergTableInfo,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
     splits: &[crate::connector::scan_planning::Split],
 ) -> Result<Vec<String>, String> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -641,7 +643,8 @@ pub(crate) fn equality_delete_required_columns(
     for split in splits {
         let file = crate::connector::iceberg::scan_planner::iceberg_split(split)?;
         for delete in &file.data_file.delete_files {
-            if delete.file_content != crate::sql::planner::table::IcebergDeleteFileContent::Equality
+            if delete.file_content
+                != crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
             {
                 continue;
             }
@@ -922,6 +925,10 @@ mod tests {
     use super::{collect_scan_bindings, prepare_scan_bindings, store_planned_starrocks_scan};
     use crate::catalog::schema::ColumnDef;
     use crate::connector::ConnectorRegistry;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
+        IcebergTableInfo,
+    };
     use crate::connector::scan_planning::{
         BeginScanContext, ConnectorScanPlanner, ScanHandle, Split, SplitPlanningContext,
         TableHandle,
@@ -939,10 +946,7 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanScanNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-    use crate::sql::planner::table::{
-        IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
-        IcebergTableInfo, ScanSource, TableDef,
-    };
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
     #[derive(Debug)]
     struct PlannedIcebergFiles {
@@ -1122,7 +1126,7 @@ mod tests {
         let mut file = data_file(path);
         file.column_stats = Some(HashMap::from([(
             "id".to_string(),
-            crate::sql::planner::table::IcebergColumnStats {
+            crate::connector::iceberg::scan_model::IcebergColumnStats {
                 null_count: Some(0),
                 value_count: Some(10),
                 column_size: None,
@@ -1136,11 +1140,11 @@ mod tests {
     fn equality_delete_file(
         equality_column_names: Vec<&str>,
         equality_field_ids: Vec<i32>,
-    ) -> crate::sql::planner::table::IcebergDeleteFileInfo {
-        crate::sql::planner::table::IcebergDeleteFileInfo {
+    ) -> crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+        crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
             path: "s3://bucket/eq-delete.parquet".to_string(),
-            file_format: crate::sql::planner::table::IcebergDeleteFileFormat::Parquet,
-            file_content: crate::sql::planner::table::IcebergDeleteFileContent::Equality,
+            file_format: crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+            file_content: crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality,
             length: Some(1),
             content_offset: None,
             content_size_in_bytes: None,

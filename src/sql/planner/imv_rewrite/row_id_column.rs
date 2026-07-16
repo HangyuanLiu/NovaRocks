@@ -152,9 +152,10 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::planner::table::{IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, TableDef};
     use std::cell::RefCell;
     use std::rc::Rc;
 

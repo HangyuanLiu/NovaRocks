@@ -591,7 +591,7 @@ fn table_properties(scan: &ScanOp) -> HashMap<String, String> {
 
 fn iceberg_table_info(
     source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
+) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
     match source {
         crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }

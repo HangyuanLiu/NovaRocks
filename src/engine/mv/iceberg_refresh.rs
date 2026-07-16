@@ -12906,7 +12906,7 @@ fn validate_join_full_refresh_payload_columns(
 #[derive(Clone, Debug)]
 struct JoinFullRefreshBaseScan {
     output_columns: Vec<OutputColumn>,
-    schema_fields: Vec<crate::sql::planner::table::IcebergSchemaFieldDef>,
+    schema_fields: Vec<crate::connector::iceberg::scan_model::IcebergSchemaFieldDef>,
 }
 
 fn find_join_full_refresh_base_scan(
@@ -12952,7 +12952,7 @@ fn collect_join_full_refresh_base_scans(
 
 fn iceberg_scan_table_info(
     source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::sql::planner::table::IcebergTableInfo> {
+) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
     match source {
         crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
@@ -16891,7 +16891,7 @@ mod tests {
         assert_eq!(table.table, "mv_join");
         assert_eq!(
             *binding,
-            crate::sql::planner::table::IcebergDataFileBinding::ExplicitFiles
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
         );
         assert_eq!(files.len(), 1, "locator must use supplied snapshot files");
     }
