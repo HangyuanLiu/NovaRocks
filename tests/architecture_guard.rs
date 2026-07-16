@@ -44212,6 +44212,7 @@ fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String
 
 fn rfd4_m2b2_external_owner_children(source_rel: &str) -> Option<&'static [&'static str]> {
     match source_rel {
+        "src/runtime_filter/mod.rs" => Some(&["codec", "port", "router", "service"]),
         "src/runtime_filter/codec/mod.rs" => Some(&["contribution"]),
         "src/runtime_filter/port/mod.rs" => Some(&["final_domain", "subscription"]),
         "src/runtime_filter/router/mod.rs" => Some(&["loopback"]),
@@ -44228,7 +44229,8 @@ fn rfd4_m2b2_effective_owner_surface_inventory(
 ) -> Result<Vec<String>, String> {
     let parent_only = matches!(
         source_rel,
-        "src/runtime_filter/codec/mod.rs"
+        "src/runtime_filter/mod.rs"
+            | "src/runtime_filter/codec/mod.rs"
             | "src/runtime_filter/port/mod.rs"
             | "src/runtime_filter/router/mod.rs"
     );
@@ -44268,6 +44270,7 @@ fn rfd4_m2b2_effective_owner_surface_inventory(
 
 fn rfd4_m2b2_allowed_owner_surface_violations(source_rel: &str, text: &str) -> Vec<String> {
     let expected = match source_rel {
+        "src/runtime_filter/mod.rs" => (5, 10131374070505018865),
         "src/runtime_filter/codec/contribution.rs" => (18, 10198486929407087720),
         "src/runtime_filter/codec/mod.rs" => (2, 11564291660451389536),
         "src/runtime_filter/port/final_domain.rs" => (29, 17041071041840420617),
@@ -46357,6 +46360,32 @@ mod hidden_surface_context {{
     assert!(
         !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &delivery_default).is_empty(),
         "required ArtifactDelivery methods must not silently gain default behavior"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_runtime_filter_root_freezes_owner_child_declarations() {
+    let root_rel = "src/runtime_filter/mod.rs";
+    let root = fs::read_to_string(Path::new(manifest_dir()).join(root_rel))
+        .expect("read live runtime-filter root module");
+    let baseline_violations = rfd4_m2b2_allowed_owner_surface_violations(root_rel, &root);
+    assert!(
+        baseline_violations.is_empty(),
+        "live runtime-filter root baseline must satisfy the owner-child declaration ledger: {baseline_violations:#?}"
+    );
+
+    let service_cfg = root.replacen(
+        "pub(crate) mod service;",
+        "#[cfg(any(test, feature = \"surface-root-context\"))]\npub(crate) mod service;",
+        1,
+    );
+    assert_ne!(
+        service_cfg, root,
+        "live service declaration mutation must apply"
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(root_rel, &service_cfg).is_empty(),
+        "runtime-filter root attrs controlling the service owner must be frozen"
     );
 }
 
