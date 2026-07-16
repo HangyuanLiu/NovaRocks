@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod iceberg_delta;
+pub(crate) mod starrocks;

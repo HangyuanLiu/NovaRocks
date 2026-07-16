@@ -642,6 +642,9 @@ impl ConnectorScanPlanner for StarRocksTableScanPlanner {
 }
 
 #[cfg(test)]
+pub(crate) use tests::live_scan_test_state;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::RwLock;
@@ -660,7 +663,7 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-    fn live_scan_test_state() -> Arc<StandaloneState> {
+    pub(crate) fn live_scan_test_state() -> Arc<StandaloneState> {
         let tablet_schema = TabletSchemaPb {
             id: Some(30),
             keys_type: Some(KeysType::DupKeys as i32),

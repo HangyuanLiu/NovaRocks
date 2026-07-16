@@ -18,6 +18,7 @@ pub(crate) mod backend;
 pub mod hdfs;
 pub mod iceberg;
 pub mod jdbc;
+pub(crate) mod scan_model;
 pub(crate) mod scan_planning;
 pub mod schema;
 #[cfg(feature = "compat")]

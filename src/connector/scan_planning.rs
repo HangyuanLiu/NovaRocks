@@ -19,6 +19,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+pub(crate) mod starrocks;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectorId(String);
 

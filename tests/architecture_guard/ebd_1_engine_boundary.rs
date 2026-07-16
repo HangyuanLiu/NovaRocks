@@ -9301,7 +9301,7 @@ fn ebd_4b3b_statistics_lookup_decoupling_is_complete() {
 
 const EBD_4B3C_PLANNER_OWNER: &str = "src/sql/planner/table.rs";
 const EBD_4B3E_CONNECTOR_OWNER: &str = "src/connector/iceberg/scan_model.rs";
-const EBD_4B3C_CODEGEN_HELPER: &str = "src/sql/codegen/scan/connector.rs";
+const EBD_4B3C_CODEGEN_HELPER: &str = "src/connector/scan_planning/starrocks.rs";
 const EBD_4B3C_COORDINATOR_ENTRY: &str = "src/coordinator/prepare/scan_preparation.rs";
 const EBD_4B3E_CONNECTOR_MODEL_SYMBOLS: &[&str] = &[
     "IcebergColumnStats",
@@ -10130,7 +10130,7 @@ fn ebd_4b3c_audit_dynamic_seam(sources: &[GuardSource]) -> Ebd4b3cDynamicSnapsho
         }
 
         fn enter_function(&mut self, name: String, block: &syn::Block) {
-            if self.source == EBD_4B3C_CODEGEN_HELPER && name == "plan_native_starrocks_scan_node" {
+            if self.source == EBD_4B3C_CODEGEN_HELPER && name == "plan_native_starrocks_scan" {
                 self.snapshot.helper_definitions += 1;
             }
             self.functions.push(name);
@@ -10140,7 +10140,7 @@ fn ebd_4b3c_audit_dynamic_seam(sources: &[GuardSource]) -> Ebd4b3cDynamicSnapsho
 
         fn record_dynamic_call(&mut self, method: &str) {
             let in_helper = self.source == EBD_4B3C_CODEGEN_HELPER
-                && self.current_function() == "plan_native_starrocks_scan_node";
+                && self.current_function() == "plan_native_starrocks_scan";
             let in_coordinator = self.source == EBD_4B3C_COORDINATOR_ENTRY;
             let in_connector = self.source.starts_with("src/connector/");
             if in_helper {
@@ -10229,7 +10229,7 @@ fn ebd_4b3c_audit_dynamic_seam(sources: &[GuardSource]) -> Ebd4b3cDynamicSnapsho
                     self.record_dynamic_call(&method);
                 }
                 self.record_encoder_lookup(&method);
-                if method == "plan_native_starrocks_scan_node" {
+                if method == "plan_native_starrocks_scan" {
                     if self.source == EBD_4B3C_COORDINATOR_ENTRY
                         && self.current_function() == "prepare_scan_node"
                     {
@@ -10367,8 +10367,8 @@ fn ebd_4b3c_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     violations.extend(dynamic.violations);
     for (surface, actual, expected) in [
         ("helper-definition", dynamic.helper_definitions, 1),
-        ("helper-begin-scan", dynamic.helper_begin_scan_calls, 1),
-        ("helper-plan-splits", dynamic.helper_plan_splits_calls, 1),
+        ("helper-begin-scan", dynamic.helper_begin_scan_calls, 0),
+        ("helper-plan-splits", dynamic.helper_plan_splits_calls, 0),
         (
             "coordinator-helper-call",
             dynamic.coordinator_helper_calls,
@@ -10410,11 +10410,11 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
         ),
         GuardSource::new(
             EBD_4B3C_COORDINATOR_ENTRY,
-            "fn prepare_scan_node() { let _ = plan_native_starrocks_scan_node(); planner.begin_scan(); planner.plan_splits(); }",
+            "fn prepare_scan_node() { let _ = plan_native_starrocks_scan(); planner.begin_scan(); planner.plan_splits(); }",
         ),
         GuardSource::new(
             EBD_4B3C_CODEGEN_HELPER,
-            "fn plan_native_starrocks_scan_node() { planner.begin_scan(); planner.plan_splits(); }",
+            "fn plan_native_starrocks_scan() {}",
         ),
     ];
     assert!(
@@ -10425,8 +10425,8 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
     assert!(
         dynamic.violations.is_empty()
             && dynamic.helper_definitions == 1
-            && dynamic.helper_begin_scan_calls == 1
-            && dynamic.helper_plan_splits_calls == 1
+            && dynamic.helper_begin_scan_calls == 0
+            && dynamic.helper_plan_splits_calls == 0
             && dynamic.coordinator_helper_calls == 1,
         "the coordinator entry and its one allowlisted helper must remain legal: {:?}",
         dynamic.violations
@@ -10559,7 +10559,7 @@ const RAW: &str = r#"use crate::sql::catalog::TableDef;"#;
         ),
         GuardSource::new(
             "src/sql/codegen/bad.rs",
-            "fn encode() { ConnectorScanPlanner::begin_scan(planner); plan_native_starrocks_scan_node(); }",
+            "fn encode() { ConnectorScanPlanner::begin_scan(planner); plan_native_starrocks_scan(); }",
         ),
         GuardSource::new(
             "src/sql/codegen/proto_encode/requery.rs",
@@ -12636,6 +12636,248 @@ fn ebd_4b3g_iceberg_scan_range_adapter_owner_is_complete() {
     assert!(
         violations.is_empty(),
         "EBD-4B3G Iceberg scan-range adapter owner cutover failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+const EBD_4B3F_MODEL_OWNER: &str = "src/connector/scan_model/starrocks.rs";
+const EBD_4B3F_FACADE_OWNER: &str = "src/connector/scan_planning/starrocks.rs";
+const EBD_4B3F_COMPAT_OWNER: &str = "src/connector/starrocks/table/scan_adapter.rs";
+const EBD_4B3F_LEGACY_OWNER: &str = "src/sql/codegen/scan/connector.rs";
+const EBD_4B3F_COORDINATOR: &str = "src/coordinator/prepare/scan_preparation.rs";
+const EBD_4B3F_DESCRIPTOR_SYMBOLS: &[&str] = &[
+    "StarRocksStorageColumnDescriptor",
+    "StarRocksKeysTypeDescriptor",
+    "StarRocksColumnSchemaDescriptor",
+    "StarRocksTabletSchemaDescriptor",
+    "StarRocksScanSourceDescriptor",
+    "PlannedNativeStarRocksScan",
+];
+
+fn ebd_4b3f_named_declarations(source: &str) -> BTreeMap<String, usize> {
+    struct DeclarationVisitor {
+        declarations: BTreeMap<String, usize>,
+    }
+
+    impl DeclarationVisitor {
+        fn record(&mut self, name: &syn::Ident) {
+            let name = name.to_string();
+            if EBD_4B3F_DESCRIPTOR_SYMBOLS.contains(&name.as_str()) {
+                *self.declarations.entry(name).or_default() += 1;
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for DeclarationVisitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            self.record(&item.ident);
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            self.record(&item.ident);
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.record(&item.ident);
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeMap::new();
+    };
+    let mut visitor = DeclarationVisitor {
+        declarations: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.declarations
+}
+
+fn ebd_4b3f_symbol_call_count(source: &str, symbol: &str) -> usize {
+    let tokens = rust_source_tokens(&rust_sanitized_production_text(source));
+    tokens
+        .windows(2)
+        .enumerate()
+        .filter(|(index, window)| {
+            window[0].text == symbol
+                && window[1].text == "("
+                && index
+                    .checked_sub(1)
+                    .and_then(|previous| tokens.get(previous))
+                    .is_none_or(|token| token.text != "fn")
+        })
+        .count()
+}
+
+fn ebd_4b3f_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
+    let by_path = sources
+        .iter()
+        .map(|source| (source.path.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = BTreeSet::new();
+
+    let Some(model) = by_path.get(EBD_4B3F_MODEL_OWNER) else {
+        violations.insert(format!(
+            "starrocks-scan-model-owner-missing: {EBD_4B3F_MODEL_OWNER}"
+        ));
+        return violations;
+    };
+    let model_declarations = ebd_4b3f_named_declarations(&model.text);
+    for symbol in EBD_4B3F_DESCRIPTOR_SYMBOLS {
+        let owner_count = model_declarations.get(*symbol).copied().unwrap_or_default();
+        if owner_count != 1 {
+            violations.insert(format!(
+                "starrocks-scan-model-owner-count: {EBD_4B3F_MODEL_OWNER}|{symbol}|expected=1 actual={owner_count}"
+            ));
+        }
+        for source in sources
+            .iter()
+            .filter(|source| source.path != EBD_4B3F_MODEL_OWNER)
+        {
+            let count = ebd_4b3f_named_declarations(&source.text)
+                .get(*symbol)
+                .copied()
+                .unwrap_or_default();
+            if count != 0 {
+                violations.insert(format!(
+                    "starrocks-scan-model-secondary-owner: {}|{symbol}|count={count}",
+                    source.path
+                ));
+            }
+        }
+    }
+    if !rust_sanitized_production_text(&model.text).contains("validate_starrocks_source_descriptor")
+    {
+        violations.insert(format!(
+            "starrocks-scan-model-validator-missing: {EBD_4B3F_MODEL_OWNER}"
+        ));
+    }
+
+    let Some(facade) = by_path.get(EBD_4B3F_FACADE_OWNER) else {
+        violations.insert(format!(
+            "starrocks-scan-facade-owner-missing: {EBD_4B3F_FACADE_OWNER}"
+        ));
+        return violations;
+    };
+    let facade_production = rust_sanitized_production_text(&facade.text);
+    for required in [
+        "plan_native_starrocks_scan",
+        "plan_native_starrocks_scan_with_compat",
+    ] {
+        if !facade_production.contains(required) {
+            violations.insert(format!(
+                "starrocks-scan-facade-surface-missing: {EBD_4B3F_FACADE_OWNER}|{required}"
+            ));
+        }
+    }
+    for required in [
+        "feature = \"compat\"",
+        "not(feature = \"compat\")",
+        "StarRocks native scan planning requires feature compat",
+    ] {
+        if !facade.text.contains(required) {
+            violations.insert(format!(
+                "starrocks-scan-facade-surface-missing: {EBD_4B3F_FACADE_OWNER}|{required}"
+            ));
+        }
+    }
+    for forbidden in ["begin_scan", "plan_splits", "starrocks_tablet"] {
+        if facade_production.contains(forbidden) {
+            violations.insert(format!(
+                "starrocks-scan-facade-live-planning: {EBD_4B3F_FACADE_OWNER}|{forbidden}"
+            ));
+        }
+    }
+
+    let Some(compat) = by_path.get(EBD_4B3F_COMPAT_OWNER) else {
+        violations.insert(format!(
+            "starrocks-scan-compat-owner-missing: {EBD_4B3F_COMPAT_OWNER}"
+        ));
+        return violations;
+    };
+    let compat_production = rust_sanitized_production_text(&compat.text);
+    for required in [
+        "plan_native_starrocks_scan_with_compat",
+        "begin_scan",
+        "plan_splits",
+        "starrocks_tablet",
+        "validate_starrocks_source_descriptor",
+    ] {
+        if !compat_production.contains(required) {
+            violations.insert(format!(
+                "starrocks-scan-compat-operation-missing: {EBD_4B3F_COMPAT_OWNER}|{required}"
+            ));
+        }
+    }
+
+    if by_path.contains_key(EBD_4B3F_LEGACY_OWNER) {
+        violations.insert(format!(
+            "starrocks-scan-legacy-owner-still-present: {EBD_4B3F_LEGACY_OWNER}"
+        ));
+    }
+    let coordinator_calls = by_path
+        .get(EBD_4B3F_COORDINATOR)
+        .map(|source| ebd_4b3f_symbol_call_count(&source.text, "plan_native_starrocks_scan"))
+        .unwrap_or_default();
+    if coordinator_calls != 1 {
+        violations.insert(format!(
+            "starrocks-scan-coordinator-call-count: {EBD_4B3F_COORDINATOR}|expected=1 actual={coordinator_calls}"
+        ));
+    }
+    for source in sources
+        .iter()
+        .filter(|source| source.path.starts_with("src/sql/codegen/"))
+    {
+        let production = rust_sanitized_production_text(&source.text);
+        if production.contains("plan_native_starrocks_scan") {
+            violations.insert(format!(
+                "starrocks-scan-codegen-reference: {}|plan_native_starrocks_scan",
+                source.path
+            ));
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn ebd_4b3f_detector_rejects_secondary_owner_and_extra_coordinator_call() {
+    let mut sources = ebd_4b1_collect_repo_sources();
+    sources.push(GuardSource::new(
+        "src/sql/codegen/secondary_owner.rs",
+        "struct PlannedNativeStarRocksScan; fn encode() { plan_native_starrocks_scan(); }",
+    ));
+    let coordinator = sources
+        .iter_mut()
+        .find(|source| source.path == EBD_4B3F_COORDINATOR)
+        .expect("coordinator fixture");
+    coordinator
+        .text
+        .push_str("\nfn duplicate_orchestration() { plan_native_starrocks_scan(); }\n");
+    let violations = ebd_4b3f_completion_violations(&sources);
+    for expected in [
+        "starrocks-scan-model-secondary-owner",
+        "starrocks-scan-codegen-reference",
+        "starrocks-scan-coordinator-call-count",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "EBD-4B3F detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3f_starrocks_scan_adapter_owner_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_4b3f_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3F StarRocks scan adapter owner cutover failed:\n{}",
         violations.into_iter().collect::<Vec<_>>().join("\n")
     );
 }

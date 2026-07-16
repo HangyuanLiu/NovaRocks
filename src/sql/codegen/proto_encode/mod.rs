@@ -32,11 +32,11 @@ mod tests {
     use super::expr::encode_expr;
     use super::{instance, plan};
     use crate::catalog::schema::ColumnDefault;
+    use crate::connector::scan_model::starrocks as connector_scan;
     use crate::coordinator::prepare::scan::ScanExecutionBindings;
     use crate::proto::{common, expr};
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
-    use crate::sql::codegen::scan::connector as connector_scan;
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::{
         BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn native_plan_encoder_rejects_missing_or_mismatched_starrocks_descriptor() {
+    fn native_plan_encoder_rejects_missing_starrocks_descriptor() {
         let scan = crate::sql::planner::distributed::DistributedNode {
             node_id: 7,
             fragment_id: 0,
@@ -1566,141 +1566,6 @@ mod tests {
         let err = plan::encode_node(&scan)
             .expect_err("StarRocks scan without a builder descriptor must fail");
         assert!(err.contains("missing native source descriptor"), "{err}");
-
-        let mut bindings = ScanExecutionBindings::default();
-        bindings
-            .insert_starrocks_source(
-                7,
-                connector_scan::StarRocksScanSourceDescriptor {
-                    catalog_name: "default_catalog".to_string(),
-                    db_id: 1,
-                    table_id: 99,
-                    schema_id: 3,
-                    storage_columns: Vec::new(),
-                    tablet_schema: connector_scan::test_starrocks_tablet_schema_descriptor(3, &[]),
-                },
-            )
-            .expect("insert mismatched StarRocks descriptor");
-        let err = plan::encode_node_with_context(
-            &scan,
-            &plan::NativePlanEncodeContext {
-                scan_bindings: Some(&bindings),
-                node_outputs: None,
-                fragment_edge_outputs: None,
-                write_contracts: None,
-                runtime_filter_projection: None,
-            },
-        )
-        .expect_err("mismatched builder descriptor must fail");
-        assert!(err.contains("identity mismatch"), "{err}");
-    }
-
-    #[test]
-    fn native_plan_encoder_rejects_invalid_starrocks_source_fields() {
-        let scan = crate::sql::planner::distributed::DistributedNode {
-            node_id: 7,
-            fragment_id: 0,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children: Vec::new(),
-            stats: physical_stats(),
-            payload: crate::sql::planner::distributed::DistributedNodeKind::Scan(
-                crate::sql::planner::payload::PlanScanNode {
-                    database: "db".to_string(),
-                    table: crate::sql::planner::table::TableDef {
-                        name: "sr_table".to_string(),
-                        columns: Vec::new(),
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::planner::table::ScanSource::StarRocks {
-                            db_id: 1,
-                            table_id: 2,
-                        },
-                    },
-                    alias: None,
-                    columns: Vec::new(),
-                    predicates: Vec::new(),
-                    required_columns: None,
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                },
-            ),
-        };
-        let valid_column = connector_scan::StarRocksStorageColumnDescriptor {
-            name: "id".to_string(),
-            unique_id: 11,
-            default_value: None,
-        };
-        let invalid = [
-            (
-                connector_scan::StarRocksScanSourceDescriptor {
-                    catalog_name: String::new(),
-                    db_id: 1,
-                    table_id: 2,
-                    schema_id: 3,
-                    storage_columns: vec![valid_column.clone()],
-                    tablet_schema:
-                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
-                            3, "id", 11, None,
-                        ),
-                },
-                "catalog_name",
-            ),
-            (
-                connector_scan::StarRocksScanSourceDescriptor {
-                    catalog_name: "default_catalog".to_string(),
-                    db_id: 1,
-                    table_id: 2,
-                    schema_id: 0,
-                    storage_columns: vec![valid_column.clone()],
-                    tablet_schema:
-                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
-                            0, "id", 11, None,
-                        ),
-                },
-                "schema_id must be positive",
-            ),
-            (
-                connector_scan::StarRocksScanSourceDescriptor {
-                    catalog_name: "default_catalog".to_string(),
-                    db_id: 1,
-                    table_id: 2,
-                    schema_id: 3,
-                    storage_columns: vec![
-                        valid_column.clone(),
-                        connector_scan::StarRocksStorageColumnDescriptor {
-                            name: "flag".to_string(),
-                            unique_id: 11,
-                            default_value: None,
-                        },
-                    ],
-                    tablet_schema:
-                        connector_scan::test_starrocks_tablet_schema_descriptor_for_column(
-                            3, "id", 11, None,
-                        ),
-                },
-                "duplicate unique_id 11",
-            ),
-        ];
-        for (descriptor, expected) in invalid {
-            let mut bindings = ScanExecutionBindings::default();
-            bindings
-                .insert_starrocks_source(7, descriptor)
-                .expect("insert invalid descriptor for encoder validation");
-            let err = plan::encode_node_with_context(
-                &scan,
-                &plan::NativePlanEncodeContext {
-                    scan_bindings: Some(&bindings),
-                    node_outputs: None,
-                    fragment_edge_outputs: None,
-                    write_contracts: None,
-                    runtime_filter_projection: None,
-                },
-            )
-            .expect_err("invalid StarRocks source must fail");
-            assert!(err.contains(expected), "{err}");
-        }
     }
 
     #[test]
