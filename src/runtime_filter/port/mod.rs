@@ -22,6 +22,7 @@ pub(crate) mod identity;
 pub(crate) mod install;
 pub(crate) mod ordered_bound;
 pub(crate) mod producer;
+pub(crate) mod routing;
 pub(crate) mod subscription;
 pub(crate) mod support;
 pub(crate) mod topk_summary;
