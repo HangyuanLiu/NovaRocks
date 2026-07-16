@@ -14017,29 +14017,122 @@ fn ebd_5a1_connector_state_registration_violations(
     #[derive(Default)]
     struct SignatureTypes {
         state: bool,
+        catalog_params: BTreeSet<String>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for SignatureTypes {
-        fn visit_path(&mut self, path: &'ast syn::Path) {
-            for segment in &path.segments {
-                match segment.ident.to_string().as_str() {
-                    "StandaloneState" => self.state = true,
-                    _ => {}
+    impl SignatureTypes {
+        fn inspect(signature: &syn::Signature) -> Self {
+            fn type_contains(ty: &syn::Type, names: &[&str]) -> bool {
+                struct Visitor<'a> {
+                    names: &'a [&'a str],
+                    found: bool,
+                }
+
+                impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+                    fn visit_path(&mut self, path: &'ast syn::Path) {
+                        self.found |= path.segments.iter().any(|segment| {
+                            self.names.contains(&segment.ident.to_string().as_str())
+                        });
+                        if !self.found {
+                            syn::visit::visit_path(self, path);
+                        }
+                    }
+                }
+
+                let mut visitor = Visitor {
+                    names,
+                    found: false,
+                };
+                syn::visit::Visit::visit_type(&mut visitor, ty);
+                visitor.found
+            }
+
+            let mut result = Self::default();
+            for input in &signature.inputs {
+                let syn::FnArg::Typed(input) = input else {
+                    continue;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    continue;
+                };
+                if type_contains(&input.ty, &["StandaloneState"]) {
+                    result.state = true;
+                }
+                if type_contains(
+                    &input.ty,
+                    &[
+                        "CatalogMgr",
+                        "CatalogRegistry",
+                        "CatalogService",
+                        "MemoryCatalog",
+                        "SchemaCache",
+                        "StandaloneCatalogService",
+                    ],
+                ) {
+                    result.catalog_params.insert(binding.ident.to_string());
                 }
             }
-            syn::visit::visit_path(self, path);
+            result
         }
     }
 
-    #[derive(Default)]
     struct FunctionBody {
         legacy_registry: bool,
         service: bool,
         service_registration: bool,
         calls: BTreeSet<(Vec<String>, bool)>,
+        tainted: BTreeSet<String>,
+    }
+
+    impl FunctionBody {
+        fn new(tainted: BTreeSet<String>) -> Self {
+            Self {
+                legacy_registry: false,
+                service: false,
+                service_registration: false,
+                calls: BTreeSet::new(),
+                tainted,
+            }
+        }
+
+        fn expr_is_tainted(&self, expr: &syn::Expr) -> bool {
+            match expr {
+                syn::Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| self.tainted.contains(&segment.ident.to_string())),
+                syn::Expr::Field(field) => {
+                    matches!(
+                        &field.member,
+                        syn::Member::Named(name)
+                            if matches!(name.to_string().as_str(), "catalog_mgr" | "catalog_service")
+                    ) || self.expr_is_tainted(&field.base)
+                }
+                syn::Expr::Reference(reference) => self.expr_is_tainted(&reference.expr),
+                syn::Expr::Paren(paren) => self.expr_is_tainted(&paren.expr),
+                syn::Expr::Group(group) => self.expr_is_tainted(&group.expr),
+                syn::Expr::Cast(cast) => self.expr_is_tainted(&cast.expr),
+                syn::Expr::Await(await_expr) => self.expr_is_tainted(&await_expr.base),
+                syn::Expr::Try(try_expr) => self.expr_is_tainted(&try_expr.expr),
+                syn::Expr::Unary(unary) => self.expr_is_tainted(&unary.expr),
+                _ => false,
+            }
+        }
     }
 
     impl<'ast> syn::visit::Visit<'ast> for FunctionBody {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let tainted = local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_is_tainted(&init.expr));
+            syn::visit::visit_local(self, local);
+            if tainted && let syn::Pat::Ident(binding) = &local.pat {
+                self.tainted.insert(binding.ident.to_string());
+            }
+        }
+
         fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
             if let syn::Member::Named(name) = &field.member {
                 match name.to_string().as_str() {
@@ -14069,7 +14162,8 @@ fn ebd_5a1_connector_state_registration_violations(
         }
 
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if let syn::Expr::Path(path) = call.func.as_ref() {
+            let tainted = call.args.iter().any(|arg| self.expr_is_tainted(arg));
+            if tainted && let syn::Expr::Path(path) = call.func.as_ref() {
                 self.calls.insert((
                     path.path
                         .segments
@@ -14084,9 +14178,13 @@ fn ebd_5a1_connector_state_registration_violations(
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
             let method = call.method.to_string();
-            self.calls.insert((vec![method.clone()], true));
+            let tainted = self.expr_is_tainted(&call.receiver)
+                || call.args.iter().any(|arg| self.expr_is_tainted(arg));
+            if tainted {
+                self.calls.insert((vec![method.clone()], true));
+            }
             if matches!(method.as_str(), "register_catalog" | "unregister_catalog") {
-                self.service_registration = true;
+                self.service_registration |= self.expr_is_tainted(&call.receiver);
             }
             syn::visit::visit_expr_method_call(self, call);
         }
@@ -14169,9 +14267,8 @@ fn ebd_5a1_connector_state_registration_violations(
         }
 
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
-            let mut signature_types = SignatureTypes::default();
-            syn::visit::Visit::visit_signature(&mut signature_types, signature);
-            let mut body = FunctionBody::default();
+            let signature_types = SignatureTypes::inspect(signature);
+            let mut body = FunctionBody::new(signature_types.catalog_params.clone());
             syn::visit::Visit::visit_block(&mut body, block);
             let name = signature.ident.to_string();
             let mut function_path = self.impl_self_path.clone().unwrap_or_else(|| {
@@ -14185,7 +14282,9 @@ fn ebd_5a1_connector_state_registration_violations(
                 source_path: self.source_path.to_string(),
                 name,
                 accepts_state: signature_types.state,
-                touches_catalog_runtime: body.legacy_registry || body.service,
+                touches_catalog_runtime: body.legacy_registry
+                    || body.service
+                    || !signature_types.catalog_params.is_empty(),
                 direct_registration: body.legacy_registry || body.service_registration,
                 calls: self.call_targets(body.calls),
             });
@@ -14328,6 +14427,189 @@ fn ebd_5a1_connector_state_registration_violations(
             )
         })
         .collect()
+}
+
+fn ebd_5a1_engine_forwarding_facade_violations(
+    sources: &BTreeMap<&str, &GuardSource>,
+) -> BTreeSet<String> {
+    const RUNTIME_TYPES: &[&str] = &[
+        "CatalogRegistry",
+        "CatalogService",
+        "CatalogServiceProvider",
+        "MemoryCatalog",
+        "SchemaCache",
+        "StandaloneCatalogService",
+    ];
+
+    fn type_contains(ty: &syn::Type, names: &[&str]) -> bool {
+        struct Visitor<'a> {
+            names: &'a [&'a str],
+            found: bool,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.found |= path
+                    .segments
+                    .iter()
+                    .any(|segment| self.names.contains(&segment.ident.to_string().as_str()));
+                if !self.found {
+                    syn::visit::visit_path(self, path);
+                }
+            }
+        }
+
+        let mut visitor = Visitor {
+            names,
+            found: false,
+        };
+        syn::visit::Visit::visit_type(&mut visitor, ty);
+        visitor.found
+    }
+
+    fn binding_names(signature: &syn::Signature, names: &[&str]) -> BTreeSet<String> {
+        signature
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(input) = input else {
+                    return None;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    return None;
+                };
+                type_contains(&input.ty, names).then(|| binding.ident.to_string())
+            })
+            .collect()
+    }
+
+    fn expr_touches_runtime(expr: &syn::Expr, runtime_bindings: &BTreeSet<String>) -> bool {
+        match expr {
+            syn::Expr::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| runtime_bindings.contains(&segment.ident.to_string())),
+            syn::Expr::Field(field) => {
+                matches!(
+                    &field.member,
+                    syn::Member::Named(name)
+                        if name == "catalog_service"
+                ) || expr_touches_runtime(&field.base, runtime_bindings)
+            }
+            syn::Expr::Call(call) => {
+                expr_touches_runtime(&call.func, runtime_bindings)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_touches_runtime(arg, runtime_bindings))
+            }
+            syn::Expr::MethodCall(call) => {
+                expr_touches_runtime(&call.receiver, runtime_bindings)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_touches_runtime(arg, runtime_bindings))
+            }
+            syn::Expr::Reference(reference) => {
+                expr_touches_runtime(&reference.expr, runtime_bindings)
+            }
+            syn::Expr::Return(return_expr) => return_expr
+                .expr
+                .as_deref()
+                .is_some_and(|expr| expr_touches_runtime(expr, runtime_bindings)),
+            syn::Expr::Paren(paren) => expr_touches_runtime(&paren.expr, runtime_bindings),
+            syn::Expr::Group(group) => expr_touches_runtime(&group.expr, runtime_bindings),
+            syn::Expr::Await(await_expr) => {
+                expr_touches_runtime(&await_expr.base, runtime_bindings)
+            }
+            syn::Expr::Try(try_expr) => expr_touches_runtime(&try_expr.expr, runtime_bindings),
+            _ => false,
+        }
+    }
+
+    fn is_thin_forwarder(signature: &syn::Signature, block: &syn::Block) -> bool {
+        let runtime_bindings = binding_names(signature, RUNTIME_TYPES);
+        let state_bindings = binding_names(signature, &["StandaloneState"]);
+        let exposes_runtime = !runtime_bindings.is_empty()
+            || match &signature.output {
+                syn::ReturnType::Default => false,
+                syn::ReturnType::Type(_, ty) => type_contains(ty, RUNTIME_TYPES),
+            };
+        let Some(syn::Stmt::Expr(expr, _)) = block.stmts.first() else {
+            return false;
+        };
+        block.stmts.len() == 1
+            && (exposes_runtime || !state_bindings.is_empty())
+            && expr_touches_runtime(expr, &runtime_bindings)
+    }
+
+    struct Visitor<'a> {
+        path: &'a str,
+        violations: BTreeSet<String>,
+    }
+
+    impl Visitor<'_> {
+        fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            if is_thin_forwarder(signature, block) {
+                self.violations.insert(format!(
+                    "catalog-runtime-engine-forwarding-facade: {}|{}",
+                    self.path, signature.ident
+                ));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+    }
+
+    let declared = sources
+        .get("src/engine/mod.rs")
+        .into_iter()
+        .flat_map(|source| rust_module_items(&rust_sanitized_production_text(&source.text)))
+        .filter(|item| item.is_external && item.inline_modules.is_empty())
+        .map(|item| item.name)
+        .collect::<BTreeSet<_>>();
+    let mut violations = BTreeSet::new();
+    for module in declared {
+        for path in [
+            format!("src/engine/{module}.rs"),
+            format!("src/engine/{module}/mod.rs"),
+        ] {
+            let Some(source) = sources.get(path.as_str()) else {
+                continue;
+            };
+            let Ok(file) = syn::parse_file(&source.text) else {
+                continue;
+            };
+            let mut visitor = Visitor {
+                path: &source.path,
+                violations: BTreeSet::new(),
+            };
+            syn::visit::Visit::visit_file(&mut visitor, &file);
+            violations.extend(visitor.violations);
+        }
+    }
+    violations
 }
 
 fn ebd_5a1_standalone_state_fields(source: &str) -> BTreeMap<String, usize> {
@@ -14484,6 +14766,7 @@ fn ebd_5a1_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
         }
     }
     violations.extend(ebd_5a1_connector_state_registration_violations(&sources));
+    violations.extend(ebd_5a1_engine_forwarding_facade_violations(&sources));
 
     for path in [
         EBD_5A1_MEMORY_OWNER,
@@ -14994,6 +15277,138 @@ impl MethodObserver {
             "catalog-runtime-connector-state-registration: src/connector/inspect.rs|inspect_state"
         ),
         "EBD-5A1 detector misreported a non-registration associated function: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_renamed_engine_runtime_forwarding_facades() {
+    let mut valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            r#"
+mod query_flow;
+struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/query_flow.rs",
+            r#"
+fn execute_query(state: &StandaloneState, request: QueryRequest) -> QueryResult {
+    let table = state.catalog_service.resolve_table(&request)?;
+    let plan = plan_query(table, request)?;
+    execute_plan(plan)
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "multi-step engine business flows must remain accepted: {valid_violations:?}"
+    );
+
+    valid[5] = GuardSource::new(
+        "src/engine/mod.rs",
+        r#"
+mod query_flow;
+mod catalog_facade;
+pub(crate) use catalog_facade::register_catalog;
+struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
+"#,
+    );
+    valid.push(GuardSource::new(
+        "src/engine/catalog_facade.rs",
+        r#"
+pub(crate) fn register_catalog(
+    service: &CatalogService<(), ()>,
+    catalog: Arc<dyn Catalog>,
+) {
+    service.register_catalog(catalog);
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        violations.contains(
+            "catalog-runtime-engine-forwarding-facade: src/engine/catalog_facade.rs|register_catalog"
+        ),
+        "EBD-5A1 detector missed renamed engine catalog runtime forwarding facade: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_only_aggregates_tainted_ambiguous_method_calls() {
+    let sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/observer.rs",
+            r#"
+struct Observer;
+impl Observer {
+    fn install(&self) {}
+}
+
+struct CatalogInstaller;
+impl CatalogInstaller {
+    fn install(service: &StandaloneCatalogService) {
+        service.register_catalog(build_catalog());
+    }
+}
+
+fn inspect_then_observe(state: &StandaloneState, observer: &Observer) {
+    state.catalog_service.catalog_names();
+    observer.install();
+}
+"#,
+        ),
+    ];
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "unrelated untainted method calls must not aggregate global registration candidates: {violations:?}"
     );
 }
 
