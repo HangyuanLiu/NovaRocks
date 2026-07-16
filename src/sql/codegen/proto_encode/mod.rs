@@ -43,6 +43,14 @@ mod tests {
     };
     use crate::types::native_proto::decode_type;
 
+    fn empty_runtime_filter_projection()
+    -> &'static crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection {
+        Box::leak(Box::new(
+            crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection::default(
+            ),
+        ))
+    }
+
     fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(value),
@@ -688,7 +696,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let decoded =
             crate::proto::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
                 .expect("decode proto message");
@@ -821,7 +830,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -924,7 +934,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1036,7 +1047,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1118,7 +1130,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1186,7 +1199,8 @@ mod tests {
             runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
-        let encoded_plan = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded_plan = plan::encode_distributed_plan(&plan, empty_runtime_filter_projection())
+            .expect("encode distributed plan");
         let encoded = encoded_plan
             .fragments
             .iter()

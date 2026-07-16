@@ -558,7 +558,7 @@ mod tests {
                 crate::coordinator::prepare::scan::ResolvedScanExecution::IcebergDelta(
                     crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
                         runtime_plan:
-                            crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan {
+                            crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
                                 table_location: "s3://bucket/test_table".to_string(),
                                 data_columns: Vec::new(),
                                 cloud_properties: BTreeMap::new(),

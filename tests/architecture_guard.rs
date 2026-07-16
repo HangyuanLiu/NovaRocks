@@ -38950,6 +38950,59 @@ fn coordinator_prepared_fragment_set() {
 }
 
 #[test]
+fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
+    let repo = Path::new(manifest_dir());
+    for required in [
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+    ] {
+        assert!(
+            repo.join(required).is_file(),
+            "missing CGO-13 owner {required}"
+        );
+    }
+    for retired in [
+        "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/sql/codegen/fragment/runtime_filter.rs",
+    ] {
+        assert!(
+            !repo.join(retired).exists(),
+            "retired CGO-13 owner remains: {retired}"
+        );
+    }
+    let projection =
+        fs::read_to_string(repo.join("src/coordinator/prepare/projection.rs")).unwrap();
+    assert!(projection.contains("runtime_filter_projection: RuntimeFilterGraphProjection"));
+    assert!(projection.contains("fn runtime_filter_projection(&self)"));
+    let bundle = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    assert!(
+        bundle.contains("runtime_filter_projection: Some(prepared.runtime_filter_projection())")
+    );
+    let encoder = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    assert!(!encoder.contains("project_runtime_filters"));
+    let preparation =
+        fs::read_to_string(repo.join("src/coordinator/prepare/scan_preparation.rs")).unwrap();
+    for required in [
+        "plan_iceberg_scan_ranges",
+        "plan_native_starrocks_scan",
+        "ScanExecutionBindings",
+    ] {
+        assert!(
+            preparation.contains(required),
+            "coordinator preparation must consume canonical connector planning and own prepared sidecars: missing `{required}`"
+        );
+    }
+    assert!(
+        !repo.join("src/coordinator/prepare/native_scan.rs").exists(),
+        "coordinator must not duplicate canonical connector scan models or planning"
+    );
+}
+
+#[test]
 fn coordinator_artifact_separation() {
     let bundle_path = src_dir().join("sql/codegen/fragment/bundle.rs");
     assert!(bundle_path.is_file(), "COOR-3B requires fragment/bundle.rs");

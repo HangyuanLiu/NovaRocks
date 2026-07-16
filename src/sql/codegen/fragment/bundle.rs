@@ -58,7 +58,7 @@ pub(crate) fn encode_native_fragment_bundle(
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_projection: None,
+            runtime_filter_projection: Some(prepared.runtime_filter_projection()),
         },
     )?;
     let sealed_ids = plan

@@ -54,6 +54,8 @@
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
 
+mod runtime_filter;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
@@ -63,9 +65,12 @@ use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::codegen::fragment::RuntimeFilterPlanResult;
 use crate::sql::planner::distributed::{
     FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
+};
+
+pub(crate) use runtime_filter::{
+    PlannedRuntimeFilter, RuntimeFilterPlanResult, plan_runtime_filters,
 };
 
 pub(crate) type LiveBackend = (usize, SocketAddr);
@@ -574,10 +579,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
+    use super::RuntimeFilterPlanResult;
     use crate::coordinator::prepare::{
         PreparedFragmentRole, PreparedFragmentSet, prepared_fragment_set_for_test,
     };
-    use crate::sql::codegen::fragment::RuntimeFilterPlanResult;
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };

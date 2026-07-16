@@ -53,7 +53,9 @@ use crate::coordinator::profile::{
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 #[cfg(test)]
 use crate::coordinator::scheduler::SchedulingPlan;
-use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
+use crate::coordinator::scheduler::{
+    FragmentInstancePlacement, FragmentScheduler, RuntimeFilterPlanResult,
+};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -62,7 +64,7 @@ use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::fragment::{NativeFragmentBundle, RuntimeFilterPlanResult};
+use crate::sql::codegen::fragment::NativeFragmentBundle;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 

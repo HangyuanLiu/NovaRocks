@@ -20,9 +20,7 @@ mod boundary_schema;
 #[cfg(test)]
 mod build;
 mod bundle;
-mod runtime_filter;
 
 #[cfg(test)]
 pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
 pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
-pub(crate) use runtime_filter::{RuntimeFilterPlanResult, plan_runtime_filters};
