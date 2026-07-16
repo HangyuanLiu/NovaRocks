@@ -20,24 +20,36 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::Command;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::mysql::test_support::{MysqlOpenGatePhase, arm_mysql_open_gate};
 use novarocks::state_store::mysql::test_support::{
-    MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
+    MysqlOccTestApi, MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
+    MysqlStatementTestApi, MysqlTransactionTestApi, MysqlWriteTestApi,
     acquire_schema_advisory_lock, active_readiness, advisory_lock_name, apply_schema_mutation,
     is_schema_advisory_lock_free, schema_snapshot, schema_timeout_connection_is_destroyed,
     store_readiness_snapshot,
 };
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::mysql::test_support::{MysqlOpenGatePhase, arm_mysql_open_gate};
 use novarocks::state_store::{
-    FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStore, StateStoreConfig,
-    StateStoreErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime,
+    CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
+    Precondition, RangeRequest, StateStore, StateStoreConfig, StateStoreErrorKind,
+    StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, TransactionId, Value,
     open_state_store,
 };
 use sha2::{Digest, Sha256};
-use uuid::Version;
+use uuid::{Uuid, Version};
+
+mod common;
+
+use common::state_store_conformance::{
+    PostDispatchControl, PostDispatchController, PostDispatchScenario,
+    StateStoreConformanceFixture, StateStoreFactory,
+};
 
 const CLUSTER_ID: &str = "mysql-schema-test-cluster";
 const EXPECTED_SCHEMA_DIGEST: &str =
@@ -120,6 +132,16 @@ fn store_config(database: &str, cluster_id: &str, deadline_ms: u64) -> StateStor
     }
 }
 
+fn transaction_store_config(database: &str, limits: StateStoreLimitOverrides) -> StateStoreConfig {
+    StateStoreConfig {
+        cluster_id: CLUSTER_ID.to_owned(),
+        limits,
+        provider: StateStoreProviderConfig::Mysql {
+            database: database.to_owned(),
+        },
+    }
+}
+
 fn deployment() -> FeDeploymentView {
     FeDeploymentView {
         active_fe_count: NonZeroUsize::new(2).expect("two is non-zero"),
@@ -139,6 +161,46 @@ async fn open_store(
         deployment(),
     )
     .await
+}
+
+fn key(bytes: impl Into<Bytes>) -> Key {
+    Key::try_from(bytes.into()).expect("valid test key")
+}
+
+fn value(bytes: impl Into<Bytes>) -> Value {
+    Value::try_from(bytes.into()).expect("valid test value")
+}
+
+fn transaction_id() -> TransactionId {
+    TransactionId::from(Uuid::now_v7())
+}
+
+fn assert_committed(outcome: CommitOutcome) {
+    assert!(
+        matches!(outcome, CommitOutcome::Committed(_)),
+        "{outcome:?}"
+    );
+}
+
+struct UnusedPostDispatch;
+
+#[async_trait]
+impl PostDispatchController for UnusedPostDispatch {
+    async fn arm(&self, _scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl> {
+        panic!("Task 5 conformance cases do not use post-dispatch controls")
+    }
+}
+
+fn shared_factory(store: Arc<dyn StateStore>) -> StateStoreFactory {
+    Rc::new(move || {
+        let store = Arc::clone(&store);
+        Box::pin(async move {
+            Ok(StateStoreConformanceFixture::new(
+                store,
+                Arc::new(UnusedPostDispatch),
+            ))
+        })
+    })
 }
 
 fn expected_tables() -> Vec<MysqlSchemaTableSnapshot> {
@@ -659,6 +721,1118 @@ async fn mysql_store_readiness_rejects_schema_or_identity_drift_after_pool_check
     };
     assert_eq!(mismatch.kind(), StateStoreErrorKind::InvalidConfiguration);
 
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_snapshot_repeatable_read() {
+    let database = TestDatabase::provision("mysql_shared_snapshot_repeatable_read", "snapshot");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    common::state_store_conformance::snapshot_repeatable_read(&factory).await;
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_read_abort_uses_explicit_rollback() {
+    let database = TestDatabase::provision("mysql_read_abort_uses_explicit_rollback", "rollback");
+    let mut client = fixture_client_config();
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let rollback_count = MysqlTransactionTestApi::explicit_rollback_count();
+    let reader = store.begin_read().await.expect("begin read transaction");
+
+    reader.abort().await.expect("abort read transaction");
+
+    assert_eq!(
+        MysqlTransactionTestApi::explicit_rollback_count(),
+        rollback_count + 1
+    );
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_read_get_preserves_arbitrary_binary_payload() {
+    let database = TestDatabase::provision(
+        "mysql_read_get_preserves_arbitrary_binary_payload",
+        "binary",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(&[0x00, 0xff, 0x7f, 0x80]));
+    let payload = value(Bytes::from_static(&[0xff, 0x00, 0x80, 0x7f]));
+    let mut writer = store
+        .begin_write(transaction_id(), "binary payload seed")
+        .await
+        .expect("begin binary payload seed");
+    writer
+        .put(item.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage binary payload");
+    assert_committed(writer.commit().await);
+
+    let mut reader = store.begin_read().await.expect("begin binary read");
+    let record = reader
+        .get(&item)
+        .await
+        .expect("read binary payload")
+        .expect("binary payload record");
+    assert_eq!(record.key, item);
+    assert_eq!(record.value, payload);
+    reader.abort().await.expect("abort binary read");
+
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_forward_reverse_pages() {
+    let database = TestDatabase::provision("mysql_shared_forward_reverse_pages", "pages");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    common::state_store_conformance::forward_reverse_pages(&factory).await;
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_range_continuation_stays_in_one_snapshot_and_binds_request() {
+    let database = TestDatabase::provision(
+        "mysql_range_continuation_stays_in_one_snapshot_and_binds_request",
+        "continuation",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let range = KeyRange::new(key([0x31, 0x00].to_vec()), key([0x31, 0xff].to_vec()))
+        .expect("bounded range");
+    let mut seed = store
+        .begin_write(transaction_id(), "pagination seed")
+        .await
+        .expect("begin pagination seed");
+    for suffix in 1_u8..=3 {
+        seed.put(
+            key([0x31, suffix].to_vec()),
+            value([suffix].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage pagination seed");
+    }
+    assert_committed(seed.commit().await);
+    let request = RangeRequest {
+        range: range.clone(),
+        direction: Direction::Forward,
+        page_size: 1,
+        continuation: None,
+    };
+    let mut reader = store.begin_read().await.expect("begin paginated snapshot");
+    let first = reader.range(&request).await.expect("first snapshot page");
+    let continuation = first.continuation.expect("first page continuation");
+    let mut concurrent = store
+        .begin_write(transaction_id(), "concurrent pagination insert")
+        .await
+        .expect("begin concurrent insert");
+    concurrent
+        .put(
+            key([0x31, 0x04].to_vec()),
+            value([0x04].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage concurrent insert");
+    assert_committed(concurrent.commit().await);
+
+    let second = reader
+        .range(&RangeRequest {
+            continuation: Some(continuation.clone()),
+            ..request.clone()
+        })
+        .await
+        .expect("second snapshot page");
+    assert_eq!(second.records[0].key.as_bytes(), &[0x31, 0x02]);
+    let wrong = RangeRequest {
+        direction: Direction::Reverse,
+        continuation: Some(continuation),
+        ..request
+    };
+    assert_eq!(
+        reader
+            .range(&wrong)
+            .await
+            .expect_err("continuation must bind direction")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    reader.abort().await.expect("abort paginated snapshot");
+
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_limits_before_io() {
+    let database = TestDatabase::provision("mysql_shared_limits_before_io", "limits");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let config = transaction_store_config(
+        &database.name,
+        StateStoreLimitOverrides {
+            max_key_bytes: Some(16),
+            max_value_bytes: Some(32),
+            max_page_size: Some(2),
+            max_transaction_operations: Some(4),
+            max_transaction_bytes: Some(256),
+            transaction_deadline_ms: Some(4_000),
+            runner_max_attempts: Some(2),
+        },
+    );
+    let store = open_state_store(&runtime, config, deployment())
+        .await
+        .expect("open limited MySQL store");
+    let factory = shared_factory(store);
+
+    common::state_store_conformance::limits_before_io(&factory).await;
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_arbitrary_binary_payloads() {
+    let database = TestDatabase::provision("mysql_shared_arbitrary_binary_payloads", "binary");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    common::state_store_conformance::arbitrary_binary_payloads(&factory).await;
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_read_rejects_malformed_persisted_rows_as_corruption() {
+    let database = TestDatabase::provision(
+        "mysql_read_rejects_malformed_persisted_rows_as_corruption",
+        "corruption",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"malformed-row"));
+    MysqlTransactionTestApi::insert_malformed_kv_row(
+        &runtime,
+        &database.name,
+        item.as_bytes(),
+        Duration::from_secs(4),
+    )
+    .await
+    .expect("insert malformed persisted row");
+
+    let mut reader = store.begin_read().await.expect("begin corruption read");
+    assert_eq!(
+        reader
+            .get(&item)
+            .await
+            .expect_err("malformed row must fail closed")
+            .kind(),
+        StateStoreErrorKind::Corruption
+    );
+    reader.abort().await.expect("abort corruption read");
+
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_overlay_is_ordered_and_read_your_writes() {
+    MysqlWriteTestApi::assert_task5_api();
+    let database = TestDatabase::provision(
+        "mysql_write_overlay_is_ordered_and_read_your_writes",
+        "overlay",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"ordered-overlay"));
+    let mut writer = store
+        .begin_write(transaction_id(), "ordered overlay")
+        .await
+        .expect("begin ordered overlay");
+    writer
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"first")),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage first put");
+    assert_eq!(
+        writer
+            .get(&item)
+            .await
+            .expect("read first overlay")
+            .expect("first overlay record")
+            .value
+            .as_bytes(),
+        b"first"
+    );
+    writer
+        .delete(item.clone(), Precondition::Present)
+        .await
+        .expect("stage delete");
+    assert!(
+        writer
+            .get(&item)
+            .await
+            .expect("read delete overlay")
+            .is_none()
+    );
+    writer
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"final")),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage final put");
+    assert_eq!(
+        writer
+            .get(&item)
+            .await
+            .expect("read final overlay")
+            .expect("final overlay record")
+            .value
+            .as_bytes(),
+        b"final"
+    );
+    assert_committed(writer.commit().await);
+
+    let mut reader = store.begin_read().await.expect("begin persisted read");
+    assert_eq!(
+        reader
+            .get(&item)
+            .await
+            .expect("read persisted final")
+            .expect("persisted final record")
+            .value
+            .as_bytes(),
+        b"final"
+    );
+    reader.abort().await.expect("abort persisted read");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_provisional_versions_are_stable_and_operation_specific() {
+    let database = TestDatabase::provision(
+        "mysql_write_provisional_versions_are_stable_and_operation_specific",
+        "versions",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let first_key = key(Bytes::from_static(b"provisional/first"));
+    let second_key = key(Bytes::from_static(b"provisional/second"));
+    let mut writer = store
+        .begin_write(transaction_id(), "provisional versions")
+        .await
+        .expect("begin provisional versions");
+    writer
+        .put(
+            first_key.clone(),
+            value(Bytes::from_static(b"one")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage first provisional");
+    let first = writer
+        .get(&first_key)
+        .await
+        .expect("read first provisional")
+        .expect("first provisional record");
+    assert_eq!(
+        writer
+            .get(&first_key)
+            .await
+            .expect("repeat first provisional")
+            .expect("repeat first provisional record")
+            .version,
+        first.version
+    );
+    writer
+        .put(
+            second_key.clone(),
+            value(Bytes::from_static(b"two")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage second provisional");
+    let second = writer
+        .get(&second_key)
+        .await
+        .expect("read second provisional")
+        .expect("second provisional record");
+    assert_ne!(first.version, second.version);
+    writer.abort().await.expect("abort provisional versions");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_freezes_mutation_after_range_pagination() {
+    let database = TestDatabase::provision(
+        "mysql_write_freezes_mutation_after_range_pagination",
+        "freeze",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let mut seed = store
+        .begin_write(transaction_id(), "freeze seed")
+        .await
+        .expect("begin freeze seed");
+    for suffix in 1_u8..=2 {
+        seed.put(
+            key([0x42, suffix].to_vec()),
+            value([suffix].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage freeze seed");
+    }
+    assert_committed(seed.commit().await);
+    let mut writer = store
+        .begin_write(transaction_id(), "range freeze")
+        .await
+        .expect("begin range freeze");
+    let page = writer
+        .range(&RangeRequest {
+            range: KeyRange::new(key([0x42, 0].to_vec()), key([0x42, 0xff].to_vec()))
+                .expect("freeze range"),
+            direction: Direction::Forward,
+            page_size: 1,
+            continuation: None,
+        })
+        .await
+        .expect("read paginated write range");
+    assert!(page.continuation.is_some());
+    assert_eq!(
+        writer
+            .put(
+                key([0x42, 3].to_vec()),
+                value([3].to_vec()),
+                Precondition::Any,
+            )
+            .await
+            .expect_err("mutation must freeze after pagination")
+            .kind(),
+        StateStoreErrorKind::InvalidRequest
+    );
+    writer.abort().await.expect("abort frozen writer");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_abort_rolls_back_without_durable_artifacts() {
+    let database = TestDatabase::provision(
+        "mysql_write_abort_rolls_back_without_durable_artifacts",
+        "abort",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"abort/no-artifact"));
+    let mut writer = store
+        .begin_write(transaction_id(), "abort no artifact")
+        .await
+        .expect("begin abort writer");
+    writer
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"not-durable")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage aborted put");
+    writer.abort().await.expect("abort writer");
+    let mut reader = store.begin_read().await.expect("begin post-abort read");
+    assert!(reader.get(&item).await.expect("post-abort get").is_none());
+    reader.abort().await.expect("abort post-abort read");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_write_budget_accepts_and_rejects_exact_boundaries() {
+    let database = TestDatabase::provision(
+        "mysql_write_budget_accepts_and_rejects_exact_boundaries",
+        "budget",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_state_store(
+        &runtime,
+        transaction_store_config(
+            &database.name,
+            StateStoreLimitOverrides {
+                max_transaction_operations: Some(2),
+                max_transaction_bytes: Some(64),
+                transaction_deadline_ms: Some(4_000),
+                ..StateStoreLimitOverrides::default()
+            },
+        ),
+        deployment(),
+    )
+    .await
+    .expect("open budgeted MySQL store");
+    let mut writer = store
+        .begin_write(transaction_id(), "exact budget")
+        .await
+        .expect("begin exact budget");
+    writer
+        .put(
+            key(Bytes::from_static(b"a")),
+            value(Bytes::from_static(b"1234567890")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage first exact-budget put");
+    writer
+        .delete(key(Bytes::from_static(b"b")), Precondition::Absent)
+        .await
+        .expect("stage second exact-budget mutation");
+    assert_eq!(
+        writer
+            .put(
+                key(Bytes::from_static(b"c")),
+                value(Bytes::from_static(b"x")),
+                Precondition::Any,
+            )
+            .await
+            .expect_err("reject operation beyond exact budget")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    assert_committed(writer.commit().await);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_preconditions_stage_successfully_and_fail_only_at_commit() {
+    let database = TestDatabase::provision(
+        "mysql_preconditions_stage_successfully_and_fail_only_at_commit",
+        "stage",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let present = key(Bytes::from_static(b"precondition/present"));
+    let missing = key(Bytes::from_static(b"precondition/missing"));
+    let mut seed = store
+        .begin_write(transaction_id(), "precondition seed")
+        .await
+        .expect("begin precondition seed");
+    seed.put(
+        present.clone(),
+        value(Bytes::from_static(b"seed")),
+        Precondition::Any,
+    )
+    .await
+    .expect("stage precondition seed");
+    assert_committed(seed.commit().await);
+    let stale = novarocks::state_store::VersionToken::try_from(Bytes::from_static(b"stale"))
+        .expect("stale version");
+
+    for (item, precondition) in [
+        (present.clone(), Precondition::Absent),
+        (missing.clone(), Precondition::Present),
+        (present.clone(), Precondition::Version(stale.clone())),
+        (missing.clone(), Precondition::Version(stale)),
+    ] {
+        let mut writer = store
+            .begin_write(transaction_id(), "stage-only precondition")
+            .await
+            .expect("begin stage-only precondition");
+        writer
+            .put(
+                item,
+                value(Bytes::from_static(b"must-conflict")),
+                precondition,
+            )
+            .await
+            .expect("stale precondition must stage successfully");
+        assert!(
+            matches!(writer.commit().await, CommitOutcome::Conflict(_)),
+            "stale precondition must conflict only at commit"
+        );
+    }
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_preconditions() {
+    let database = TestDatabase::provision("mysql_shared_preconditions", "preconditions");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    common::state_store_conformance::preconditions(&factory).await;
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_reader() {
+    let database = TestDatabase::provision(
+        "mysql_shared_same_key_conflict_first_commit_does_not_wait_for_second_reader",
+        "same_key",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        common::state_store_conformance::same_key_conflict(&factory),
+    )
+    .await
+    .expect("first same-key commit must not wait for second reader");
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_reader() {
+    let database = TestDatabase::provision(
+        "mysql_shared_write_skew_conflict_first_commit_does_not_wait_for_second_reader",
+        "write_skew",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        common::state_store_conformance::write_skew_conflict(&factory),
+    )
+    .await
+    .expect("first write-skew commit must not wait for second reader");
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_second_reader() {
+    let database = TestDatabase::provision(
+        "mysql_shared_range_phantom_conflict_first_commit_does_not_wait_for_second_reader",
+        "phantom",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let factory = shared_factory(store);
+
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        common::state_store_conformance::range_phantom_conflict(&factory),
+    )
+    .await
+    .expect("first phantom commit must not wait for second reader");
+
+    drop(factory);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_point_occ_compares_presence_and_persisted_version_exactly() {
+    let database = TestDatabase::provision(
+        "mysql_point_occ_compares_presence_and_persisted_version_exactly",
+        "point_occ",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"point-occ"));
+    let mut observer = store
+        .begin_write(transaction_id(), "point observer")
+        .await
+        .expect("begin point observer");
+    assert!(observer.get(&item).await.expect("observe absent").is_none());
+    let mut concurrent = store
+        .begin_write(transaction_id(), "point concurrent")
+        .await
+        .expect("begin point concurrent");
+    concurrent
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"present")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage concurrent presence");
+    assert_committed(concurrent.commit().await);
+    observer
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"observer")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage observed key");
+    assert!(matches!(
+        observer.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+
+    let mut version_observer = store
+        .begin_write(transaction_id(), "version observer")
+        .await
+        .expect("begin version observer");
+    version_observer
+        .get(&item)
+        .await
+        .expect("observe persisted version");
+    let mut update = store
+        .begin_write(transaction_id(), "version update")
+        .await
+        .expect("begin version update");
+    update
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"updated")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage version update");
+    assert_committed(update.commit().await);
+    version_observer
+        .put(
+            item,
+            value(Bytes::from_static(b"stale-observer")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage stale observer");
+    assert!(matches!(
+        version_observer.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_range_observation_conflicts_on_any_revision_drift() {
+    let database = TestDatabase::provision(
+        "mysql_range_observation_conflicts_on_any_revision_drift",
+        "range_drift",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let request = RangeRequest {
+        range: KeyRange::new(key([0x51, 0].to_vec()), key([0x51, 0xff].to_vec()))
+            .expect("range observation"),
+        direction: Direction::Forward,
+        page_size: 8,
+        continuation: None,
+    };
+    let mut observer = store
+        .begin_write(transaction_id(), "range observer")
+        .await
+        .expect("begin range observer");
+    observer.range(&request).await.expect("observe range");
+    let mut concurrent = store
+        .begin_write(transaction_id(), "range concurrent")
+        .await
+        .expect("begin range concurrent");
+    concurrent
+        .put(
+            key([0x51, 1].to_vec()),
+            value([1].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage range drift");
+    assert_committed(concurrent.commit().await);
+    observer
+        .put(
+            key([0x51, 2].to_vec()),
+            value([2].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage observer mutation");
+    assert!(matches!(
+        observer.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_range_observation_conflicts_on_unrelated_out_of_range_commit() {
+    let database = TestDatabase::provision(
+        "mysql_range_observation_conflicts_on_unrelated_out_of_range_commit",
+        "unrelated",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let mut observer = store
+        .begin_write(transaction_id(), "unrelated range observer")
+        .await
+        .expect("begin unrelated observer");
+    observer
+        .range(&RangeRequest {
+            range: KeyRange::new(key([0x52, 0].to_vec()), key([0x52, 0xff].to_vec()))
+                .expect("unrelated range"),
+            direction: Direction::Forward,
+            page_size: 8,
+            continuation: None,
+        })
+        .await
+        .expect("observe unrelated range");
+    let mut concurrent = store
+        .begin_write(transaction_id(), "out of range commit")
+        .await
+        .expect("begin out of range commit");
+    concurrent
+        .put(
+            key([0x53, 1].to_vec()),
+            value([1].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage out of range commit");
+    assert_committed(concurrent.commit().await);
+    observer
+        .put(
+            key([0x52, 1].to_vec()),
+            value([1].to_vec()),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage observed-range mutation");
+    assert!(matches!(
+        observer.commit().await,
+        CommitOutcome::Conflict(_)
+    ));
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_touched_keys_lock_in_stable_byte_order() {
+    let database =
+        TestDatabase::provision("mysql_touched_keys_lock_in_stable_byte_order", "lock_order");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let low = key(Bytes::from_static(b"lock/a"));
+    let high = key(Bytes::from_static(b"lock/z"));
+    let mut first = store
+        .begin_write(transaction_id(), "stable locks first")
+        .await
+        .expect("begin stable locks first");
+    first
+        .put(
+            high.clone(),
+            value(Bytes::from_static(b"first-high")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage first high");
+    first
+        .put(
+            low.clone(),
+            value(Bytes::from_static(b"first-low")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage first low");
+    let mut second = store
+        .begin_write(transaction_id(), "stable locks second")
+        .await
+        .expect("begin stable locks second");
+    second
+        .put(
+            low,
+            value(Bytes::from_static(b"second-low")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage second low");
+    second
+        .put(
+            high,
+            value(Bytes::from_static(b"second-high")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage second high");
+    assert_committed(first.commit().await);
+    assert_committed(second.commit().await);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_commit_replays_multiple_preconditions_in_call_order() {
+    let database = TestDatabase::provision(
+        "mysql_commit_replays_multiple_preconditions_in_call_order",
+        "replay",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let item = key(Bytes::from_static(b"ordered-preconditions"));
+    let mut writer = store
+        .begin_write(transaction_id(), "ordered preconditions")
+        .await
+        .expect("begin ordered preconditions");
+    writer
+        .put(
+            item.clone(),
+            value(Bytes::from_static(b"first")),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage absent put");
+    let first_version = writer
+        .get(&item)
+        .await
+        .expect("read first staged value")
+        .expect("first staged record")
+        .version;
+    writer
+        .delete(item.clone(), Precondition::Version(first_version))
+        .await
+        .expect("stage version delete");
+    writer
+        .put(
+            item,
+            value(Bytes::from_static(b"final")),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage final absent put");
+    assert_committed(writer.commit().await);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_deadlock_1213_maps_to_conflict() {
+    let database = TestDatabase::provision("mysql_deadlock_1213_maps_to_conflict", "deadlock");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    MysqlOccTestApi::deadlock_1213_maps_to_conflict(
+        &runtime,
+        &database.name,
+        Duration::from_secs(8),
+    )
+    .await
+    .expect("deadlock mapping");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_lock_timeout_1205_rolls_back_before_conflict() {
+    let database = TestDatabase::provision(
+        "mysql_lock_timeout_1205_rolls_back_before_conflict",
+        "lock_timeout",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    MysqlOccTestApi::lock_timeout_1205_rolls_back_before_conflict(
+        &runtime,
+        &database.name,
+        Duration::from_secs(8),
+    )
+    .await
+    .expect("lock timeout mapping and rollback");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_statement_deadline_destroys_undrained_connection() {
+    let database = TestDatabase::provision(
+        "mysql_statement_deadline_destroys_undrained_connection",
+        "statement_deadline",
+    );
+    let mut client = fixture_client_config();
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    MysqlOccTestApi::statement_deadline_destroys_undrained_connection(&runtime, &database.name)
+        .await
+        .expect("statement deadline disposition");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io() {
+    let database = TestDatabase::provision(
+        "mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io",
+        "physical_boundary",
+    );
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL transaction store");
+    let statements_before_boundary = MysqlStatementTestApi::statement_count();
+
+    let mut boundary_bytes = (0..3072)
+        .map(|index| ((index * 131) % 256) as u8)
+        .collect::<Vec<_>>();
+    boundary_bytes[3071] = 0x7f;
+    let boundary_key = key(boundary_bytes.clone());
+    let payload = value(vec![0x00, 0xff, 0x80, 0x7f, 0x01]);
+    let mut writer = store
+        .begin_write(transaction_id(), "3072-byte physical boundary")
+        .await
+        .expect("begin boundary writer");
+    writer
+        .put(boundary_key.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage 3072-byte key");
+    assert_committed(writer.commit().await);
+
+    let mut reader = store.begin_read().await.expect("begin boundary reader");
+    let record = reader
+        .get(&boundary_key)
+        .await
+        .expect("read 3072-byte key")
+        .expect("3072-byte key exists");
+    assert_eq!(record.value, payload);
+    let mut end_bytes = boundary_bytes;
+    end_bytes[3071] = 0x80;
+    let page = reader
+        .range(&RangeRequest {
+            range: KeyRange::new(boundary_key.clone(), key(end_bytes))
+                .expect("3072-byte bounded range"),
+            direction: Direction::Forward,
+            page_size: 1,
+            continuation: None,
+        })
+        .await
+        .expect("range 3072-byte key");
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].key, boundary_key);
+    assert!(page.continuation.is_none());
+    reader.abort().await.expect("abort boundary reader");
+    assert!(
+        MysqlStatementTestApi::statement_count() > statements_before_boundary,
+        "statement counter must observe accepted provider SQL"
+    );
+
+    let mut oversized_writer = store
+        .begin_write(transaction_id(), "3073-byte pre-I/O rejection")
+        .await
+        .expect("begin oversized writer");
+    let statements_before = MysqlStatementTestApi::statement_count();
+    let error = oversized_writer
+        .put(
+            key(vec![0x5a; 3073]),
+            value(Bytes::from_static(b"must-not-reach-mysql")),
+            Precondition::Any,
+        )
+        .await
+        .expect_err("reject 3073-byte key");
+    assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+    assert_eq!(
+        MysqlStatementTestApi::statement_count(),
+        statements_before,
+        "3073-byte key must be rejected before SQL"
+    );
+    oversized_writer
+        .abort()
+        .await
+        .expect("abort oversized writer");
+    drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
 

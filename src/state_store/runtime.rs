@@ -417,6 +417,55 @@ impl StateStoreRuntime {
         }
     }
 
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_insert_malformed_kv_row(
+        &self,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .insert_malformed_kv_row(database, key, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_deadlock_1213_maps_to_conflict(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .deadlock_1213_maps_to_conflict(database, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_lock_timeout_1205_rolls_back_before_conflict(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime
+                    .lock_timeout_1205_rolls_back_before_conflict(database, deadline)
+                    .await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
     #[cfg(all(
         feature = "mysql-state-store-provider",
         feature = "state-store-test-hooks"
@@ -837,6 +886,59 @@ impl MysqlRuntime {
             pool,
             Instant::now() + timeout_deadline,
             Instant::now() + checkout_deadline,
+        )
+        .await
+    }
+
+    async fn insert_malformed_kv_row(
+        &self,
+        database: &str,
+        key: &[u8],
+        total_deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::txn::insert_malformed_kv_row_for_test(
+            pool,
+            key,
+            Instant::now() + total_deadline,
+        )
+        .await
+    }
+
+    async fn deadlock_1213_maps_to_conflict(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.validate_process_and_context()?;
+        let first_operation = self.acquire_operation()?;
+        let second_operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::txn::deadlock_1213_maps_to_conflict_for_test(
+            pool,
+            first_operation,
+            second_operation,
+            Instant::now() + total_deadline,
+        )
+        .await
+    }
+
+    async fn lock_timeout_1205_rolls_back_before_conflict(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        self.validate_process_and_context()?;
+        let first_operation = self.acquire_operation()?;
+        let second_operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        super::mysql::txn::lock_timeout_1205_rolls_back_before_conflict_for_test(
+            pool,
+            first_operation,
+            second_operation,
+            Instant::now() + total_deadline,
         )
         .await
     }

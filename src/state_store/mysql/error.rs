@@ -85,6 +85,15 @@ impl MysqlNativeError {
         }
     }
 
+    pub(crate) fn conflict() -> Self {
+        Self {
+            public: StateStoreError::new(
+                StateStoreErrorKind::Conflict,
+                "MySQL transaction encountered a concurrent lock conflict",
+            ),
+        }
+    }
+
     pub(crate) fn into_public(self) -> StateStoreError {
         self.public
     }
@@ -93,6 +102,7 @@ impl MysqlNativeError {
 impl From<Error> for MysqlNativeError {
     fn from(error: Error) -> Self {
         match error {
+            Error::Server(server) if matches!(server.code, 1205 | 1213) => Self::conflict(),
             Error::Server(server) if matches!(server.code, 1044 | 1045 | 1049) => {
                 Self::invalid_configuration()
             }

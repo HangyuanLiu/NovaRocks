@@ -18,6 +18,8 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -29,6 +31,19 @@ use tokio::time::{Instant, timeout_at};
 
 use super::super::{MySqlClientConfig, MySqlTlsMode, StateStoreError, StateStoreErrorKind};
 use super::error::MysqlNativeError;
+
+#[cfg(feature = "state-store-test-hooks")]
+static STATEMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_statement() {
+    #[cfg(feature = "state-store-test-hooks")]
+    STATEMENT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn statement_count_for_test() -> u64 {
+    STATEMENT_COUNT.load(Ordering::Relaxed)
+}
 
 pub(crate) trait PoolLifecycle: Send + Sync {
     fn get_conn<'a>(
@@ -217,6 +232,7 @@ async fn execute_with_deadline<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a mut Conn) -> BoxFuture<'a, Result<T, mysql_async::Error>>,
 ) -> Result<(MysqlPoolConnection, T), StateStoreError> {
+    record_statement();
     match timeout_at(deadline, operation(&mut connection)).await {
         Ok(Ok(value)) => Ok((connection, value)),
         Ok(Err(error)) => Err(MysqlNativeError::from(error).into_public()),
@@ -232,6 +248,7 @@ pub(crate) async fn execute_owned_with_deadline<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a mut Conn) -> BoxFuture<'a, Result<T, mysql_async::Error>>,
 ) -> Result<(MysqlPoolConnection, Result<T, StateStoreError>), StateStoreError> {
+    record_statement();
     match timeout_at(deadline, operation(&mut connection)).await {
         Ok(result) => Ok((
             connection,

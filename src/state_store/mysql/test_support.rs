@@ -60,6 +60,88 @@ pub struct MysqlHeldAdvisoryLock {
     lock_name: String,
 }
 
+pub struct MysqlTransactionTestApi;
+pub struct MysqlWriteTestApi;
+pub struct MysqlOccTestApi;
+#[cfg(feature = "state-store-test-hooks")]
+pub struct MysqlStatementTestApi;
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlStatementTestApi {
+    pub fn statement_count() -> u64 {
+        super::client::statement_count_for_test()
+    }
+}
+
+impl MysqlWriteTestApi {
+    pub fn assert_task5_api() {}
+}
+
+impl MysqlOccTestApi {
+    pub async fn deadlock_1213_maps_to_conflict(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        runtime
+            .mysql_test_deadlock_1213_maps_to_conflict(database, deadline)
+            .await
+    }
+
+    pub async fn lock_timeout_1205_rolls_back_before_conflict(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        runtime
+            .mysql_test_lock_timeout_1205_rolls_back_before_conflict(database, deadline)
+            .await
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    pub async fn statement_deadline_destroys_undrained_connection(
+        runtime: &StateStoreRuntime,
+        database: &str,
+    ) -> Result<(), StateStoreError> {
+        let before = active_readiness(runtime, database, Duration::from_secs(4))
+            .await?
+            .connection_id;
+        let error = run_sleep_until_deadline(runtime, database, Duration::from_millis(100))
+            .await
+            .expect_err("sleep must exceed the statement deadline");
+        if error.kind() != StateStoreErrorKind::DeadlineExceeded {
+            return Err(error);
+        }
+        let after = active_readiness(runtime, database, Duration::from_secs(4))
+            .await?
+            .connection_id;
+        if before == after {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "timed out MySQL connection was returned to the pool",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl MysqlTransactionTestApi {
+    pub fn explicit_rollback_count() -> u64 {
+        super::txn::explicit_rollback_count_for_test()
+    }
+
+    pub async fn insert_malformed_kv_row(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        key: &[u8],
+        deadline: Duration,
+    ) -> Result<(), StateStoreError> {
+        runtime
+            .mysql_test_insert_malformed_kv_row(database, key, deadline)
+            .await
+    }
+}
+
 pub fn runtime_owner(runtime: &StateStoreRuntime) -> Result<MysqlRuntimeOwner, StateStoreError> {
     runtime.mysql_test_owner()
 }

@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod budget;
 pub(crate) mod client;
 pub(crate) mod codec;
 pub(crate) mod error;
 pub(crate) mod identity;
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) mod open_test_hooks;
+pub(crate) mod range;
 pub(crate) mod schema;
+pub(crate) mod txn;
 
 #[doc(hidden)]
 pub mod test_support;
@@ -42,7 +45,6 @@ use super::{
 
 pub(super) struct MysqlStateStore {
     lease: MysqlProviderHandle,
-    _database: String,
     identity: MysqlIdentitySnapshot,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
@@ -82,17 +84,16 @@ impl MysqlStateStore {
         );
         Ok(Self {
             lease,
-            _database: database,
             identity,
             limits,
             metrics: Arc::new(StateStoreMetrics::new("mysql")),
         })
     }
 
-    fn transactions_unavailable() -> StateStoreError {
+    fn task_six_unavailable() -> StateStoreError {
         StateStoreError::new(
             StateStoreErrorKind::ProviderUnavailable,
-            "MySQL state transactions are not initialized",
+            "MySQL durable commit state is not initialized",
         )
     }
 }
@@ -134,17 +135,34 @@ impl StateStore for MysqlStateStore {
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        Err(Self::transactions_unavailable())
+        let operation = self.lease.acquire_operation()?;
+        Ok(Box::new(
+            txn::begin_read(
+                self.lease.pool(),
+                operation,
+                self.limits.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?,
+        ))
     }
 
     async fn begin_write(
         &self,
-        _transaction_id: TransactionId,
+        transaction_id: TransactionId,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        Err(Self::transactions_unavailable())
+        let operation = self.lease.acquire_operation()?;
+        Ok(Box::new(
+            txn::begin_write(
+                self.lease.pool(),
+                operation,
+                transaction_id,
+                self.limits.clone(),
+                Arc::clone(&self.metrics),
+            )
+            .await?,
+        ))
     }
 
     async fn poll_changes(
@@ -152,7 +170,7 @@ impl StateStore for MysqlStateStore {
         _request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Err(Self::transactions_unavailable())
+        Err(Self::task_six_unavailable())
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
@@ -165,6 +183,6 @@ impl StateStore for MysqlStateStore {
         _transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Err(Self::transactions_unavailable())
+        Err(Self::task_six_unavailable())
     }
 }
