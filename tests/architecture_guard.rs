@@ -36370,34 +36370,26 @@ impl Rfd4M2b1GuardSource {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Rfd4M2b1TypeResolver {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Rfd4M2b1TypeScope {
     bindings: BTreeMap<String, BTreeSet<String>>,
     shadows: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Rfd4M2b1TypeResolver {
+    scopes: BTreeMap<Vec<String>, Rfd4M2b1TypeScope>,
 }
 
 impl Rfd4M2b1TypeResolver {
     fn from_source(source_rel: &str, production: &str, file: &syn::File) -> Self {
         let mut resolver = Self::default();
-        for item in &file.items {
-            let ident = match item {
-                syn::Item::Struct(item) => Some(item.ident.to_string()),
-                syn::Item::Enum(item) => Some(item.ident.to_string()),
-                syn::Item::Union(item) => Some(item.ident.to_string()),
-                syn::Item::Trait(item) => Some(item.ident.to_string()),
-                syn::Item::Mod(item) => Some(item.ident.to_string()),
-                _ => None,
-            };
-            if let Some(ident) = ident {
-                resolver.shadows.insert(ident);
-            }
-        }
+        let mut type_aliases = Vec::new();
+        resolver.collect_items(&file.items, &mut Vec::new(), &mut type_aliases);
 
         let aliases = rust_scoped_aliases(production);
-        for raw in rust_raw_use_statements(production)
-            .into_iter()
-            .filter(|raw| raw.inline_modules.is_empty())
-        {
+        for raw in rust_raw_use_statements(production) {
+            let import_scope = raw.inline_modules.clone();
             let local = match raw.path.alias.as_deref() {
                 Some("_") => None,
                 Some(alias) => Some(alias.to_string()),
@@ -36439,6 +36431,9 @@ impl Rfd4M2b1TypeResolver {
                 ] {
                     if rfd4_m2b1_canonical_symbol_path(&canonical, symbol) {
                         resolver
+                            .scopes
+                            .entry(import_scope.clone())
+                            .or_default()
                             .bindings
                             .entry(local.clone())
                             .or_default()
@@ -36446,27 +36441,27 @@ impl Rfd4M2b1TypeResolver {
                     }
                 }
             }
-            resolver.shadows.remove(&local);
+            resolver
+                .scopes
+                .entry(import_scope)
+                .or_default()
+                .shadows
+                .remove(&local);
         }
 
-        let type_aliases = file
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                syn::Item::Type(item) if !nfe_4_syn_attrs_require_test(&item.attrs) => Some(item),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         for _ in 0..=type_aliases.len() {
-            let before = resolver.bindings.clone();
-            for alias in &type_aliases {
+            let before = resolver.scopes.clone();
+            for (scope, alias) in &type_aliases {
                 for symbol in [
                     "RuntimeFilterInstallView",
                     "RuntimeFilterParticipantInstall",
                     "RoleRouter",
                 ] {
-                    if resolver.type_contains_symbol(&alias.ty, symbol) {
+                    if resolver.type_contains_symbol(&alias.ty, symbol, scope) {
                         resolver
+                            .scopes
+                            .entry(scope.clone())
+                            .or_default()
                             .bindings
                             .entry(alias.ident.to_string())
                             .or_default()
@@ -36474,45 +36469,110 @@ impl Rfd4M2b1TypeResolver {
                     }
                 }
             }
-            if resolver.bindings == before {
+            if resolver.scopes == before {
                 break;
             }
         }
         resolver
     }
 
-    fn path_is_symbol(&self, path: &syn::Path, symbol: &str) -> bool {
+    fn collect_items<'a>(
+        &mut self,
+        items: &'a [syn::Item],
+        scope: &mut Vec<String>,
+        type_aliases: &mut Vec<(Vec<String>, &'a syn::ItemType)>,
+    ) {
+        self.scopes.entry(scope.clone()).or_default();
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            let ident = match item {
+                syn::Item::Struct(item) => Some(item.ident.to_string()),
+                syn::Item::Enum(item) => Some(item.ident.to_string()),
+                syn::Item::Union(item) => Some(item.ident.to_string()),
+                syn::Item::Trait(item) => Some(item.ident.to_string()),
+                syn::Item::Mod(item) => Some(item.ident.to_string()),
+                _ => None,
+            };
+            if let Some(ident) = ident {
+                self.scopes
+                    .entry(scope.clone())
+                    .or_default()
+                    .shadows
+                    .insert(ident);
+            }
+            match item {
+                syn::Item::Type(alias) => type_aliases.push((scope.clone(), alias)),
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        scope.push(module.ident.to_string());
+                        self.collect_items(items, scope, type_aliases);
+                        scope.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn path_is_symbol(&self, path: &syn::Path, symbol: &str, scope: &[String]) -> bool {
         let segments = path
             .segments
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect::<Vec<_>>();
-        let Some(first) = segments.first() else {
+        if segments.is_empty() {
             return false;
-        };
+        }
         if rfd4_m2b1_canonical_symbol_path(&segments, symbol) {
             return true;
         }
-        if self
-            .bindings
-            .get(first)
+        let mut target_scope = scope.to_vec();
+        let mut owner_index = 0usize;
+        while segments
+            .get(owner_index)
+            .is_some_and(|segment| segment == "self")
+        {
+            owner_index += 1;
+        }
+        while segments
+            .get(owner_index)
+            .is_some_and(|segment| segment == "super")
+        {
+            if target_scope.pop().is_none() {
+                return false;
+            }
+            owner_index += 1;
+        }
+        let Some(owner) = segments.get(owner_index) else {
+            return false;
+        };
+        let scope = self.scopes.get(&target_scope);
+        if scope
+            .and_then(|scope| scope.bindings.get(owner))
             .is_some_and(|symbols| symbols.contains(symbol))
         {
             return true;
         }
-        first == symbol && !self.shadows.contains(first)
+        owner == symbol && !scope.is_some_and(|scope| scope.shadows.contains(owner))
     }
 
-    fn type_contains_symbol(&self, ty: &syn::Type, symbol: &str) -> bool {
+    fn type_contains_symbol(&self, ty: &syn::Type, symbol: &str, scope: &[String]) -> bool {
         struct SymbolAudit<'a> {
             resolver: &'a Rfd4M2b1TypeResolver,
             symbol: &'a str,
+            scope: &'a [String],
             found: bool,
         }
 
         impl<'ast> syn::visit::Visit<'ast> for SymbolAudit<'_> {
             fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-                if path.qself.is_none() && self.resolver.path_is_symbol(&path.path, self.symbol) {
+                if path.qself.is_none()
+                    && self
+                        .resolver
+                        .path_is_symbol(&path.path, self.symbol, self.scope)
+                {
                     self.found = true;
                 }
                 syn::visit::visit_type_path(self, path);
@@ -36522,6 +36582,52 @@ impl Rfd4M2b1TypeResolver {
         let mut audit = SymbolAudit {
             resolver: self,
             symbol,
+            scope,
+            found: false,
+        };
+        syn::visit::Visit::visit_type(&mut audit, ty);
+        audit.found
+    }
+
+    fn type_contains_unborrowed_symbol(
+        &self,
+        ty: &syn::Type,
+        symbol: &str,
+        scope: &[String],
+    ) -> bool {
+        struct UnborrowedSymbolAudit<'a> {
+            resolver: &'a Rfd4M2b1TypeResolver,
+            symbol: &'a str,
+            scope: &'a [String],
+            reference_depth: usize,
+            found: bool,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for UnborrowedSymbolAudit<'_> {
+            fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+                self.reference_depth += 1;
+                syn::visit::visit_type_reference(self, reference);
+                self.reference_depth -= 1;
+            }
+
+            fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                if self.reference_depth == 0
+                    && path.qself.is_none()
+                    && self
+                        .resolver
+                        .path_is_symbol(&path.path, self.symbol, self.scope)
+                {
+                    self.found = true;
+                }
+                syn::visit::visit_type_path(self, path);
+            }
+        }
+
+        let mut audit = UnborrowedSymbolAudit {
+            resolver: self,
+            symbol,
+            scope,
+            reference_depth: 0,
             found: false,
         };
         syn::visit::Visit::visit_type(&mut audit, ty);
@@ -36561,6 +36667,7 @@ fn rfd4_m2b1_type_is_arc_of_symbol(
     ty: &syn::Type,
     expected: &str,
     resolver: &Rfd4M2b1TypeResolver,
+    scope: &[String],
 ) -> bool {
     let syn::Type::Path(path) = ty else {
         return false;
@@ -36580,7 +36687,7 @@ fn rfd4_m2b1_type_is_arc_of_symbol(
     });
     types
         .next()
-        .is_some_and(|inner| resolver.type_contains_symbol(inner, expected))
+        .is_some_and(|inner| resolver.type_contains_symbol(inner, expected, scope))
         && types.next().is_none()
 }
 
@@ -36596,6 +36703,7 @@ fn rfd4_m2b1_split_routing_phase_name(lower: &str) -> bool {
 struct Rfd4M2b1AstAudit {
     source_path: String,
     type_resolver: Rfd4M2b1TypeResolver,
+    module_scope: Vec<String>,
     composite_fields_are_exact: Option<bool>,
     current_impl_owner: Option<String>,
     installed_deployment_has_router: Option<bool>,
@@ -36611,6 +36719,7 @@ impl Rfd4M2b1AstAudit {
         Self {
             source_path: source_path.into(),
             type_resolver,
+            module_scope: Vec::new(),
             composite_fields_are_exact: None,
             current_impl_owner: None,
             installed_deployment_has_router: None,
@@ -36625,36 +36734,50 @@ impl Rfd4M2b1AstAudit {
     fn audit_signature(&mut self, signature: &syn::Signature, allow_borrowed_view_helper: bool) {
         let name = signature.ident.to_string();
         let mut has_view = false;
+        let mut has_unborrowed_view = false;
         let mut has_participant_install = false;
         let mut has_role_router_input = false;
         for input in &signature.inputs {
             if let syn::FnArg::Typed(input) = input {
-                has_view |= self
-                    .type_resolver
-                    .type_contains_symbol(&input.ty, "RuntimeFilterInstallView");
-                has_participant_install |= self
-                    .type_resolver
-                    .type_contains_symbol(&input.ty, "RuntimeFilterParticipantInstall");
-                has_role_router_input |= self
-                    .type_resolver
-                    .type_contains_symbol(&input.ty, "RoleRouter");
+                has_view |= self.type_resolver.type_contains_symbol(
+                    &input.ty,
+                    "RuntimeFilterInstallView",
+                    &self.module_scope,
+                );
+                has_unborrowed_view |= self.type_resolver.type_contains_unborrowed_symbol(
+                    &input.ty,
+                    "RuntimeFilterInstallView",
+                    &self.module_scope,
+                );
+                has_participant_install |= self.type_resolver.type_contains_symbol(
+                    &input.ty,
+                    "RuntimeFilterParticipantInstall",
+                    &self.module_scope,
+                );
+                has_role_router_input |= self.type_resolver.type_contains_symbol(
+                    &input.ty,
+                    "RoleRouter",
+                    &self.module_scope,
+                );
             }
         }
         if has_view
             && !has_participant_install
             && self.current_impl_owner.as_deref() != Some("RuntimeFilterParticipantInstall")
-            && !allow_borrowed_view_helper
+            && !(allow_borrowed_view_helper && !has_unborrowed_view)
         {
             self.view_only_installs.insert(name.clone());
         }
         let has_role_router_output = match &signature.output {
             syn::ReturnType::Default => false,
-            syn::ReturnType::Type(_, output) => self
-                .type_resolver
-                .type_contains_symbol(output, "RoleRouter"),
+            syn::ReturnType::Type(_, output) => {
+                self.type_resolver
+                    .type_contains_symbol(output, "RoleRouter", &self.module_scope)
+            }
         };
         if (has_role_router_input || has_role_router_output)
             && !(self.source_path == "src/runtime_filter/service/registry.rs"
+                && self.module_scope.is_empty()
                 && self.current_impl_owner.as_deref() == Some("InstalledDeployment")
                 && name == "role_router"
                 && !has_role_router_input
@@ -36711,6 +36834,17 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         syn::visit::visit_trait_item(self, item);
     }
 
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        let Some((_, items)) = &item.content else {
+            return;
+        };
+        self.module_scope.push(item.ident.to_string());
+        for item in items {
+            syn::visit::Visit::visit_item(self, item);
+        }
+        self.module_scope.pop();
+    }
+
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         let previous = self.current_impl_owner.take();
         self.current_impl_owner = match item.self_ty.as_ref() {
@@ -36747,11 +36881,16 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
             }
             if self
                 .type_resolver
-                .type_contains_symbol(&field.ty, "RoleRouter")
+                .type_contains_symbol(&field.ty, "RoleRouter", &self.module_scope)
             {
                 if owner == "InstalledDeployment"
                     && field_name == "role_router"
-                    && rfd4_m2b1_type_is_arc_of_symbol(&field.ty, "RoleRouter", &self.type_resolver)
+                    && rfd4_m2b1_type_is_arc_of_symbol(
+                        &field.ty,
+                        "RoleRouter",
+                        &self.type_resolver,
+                        &self.module_scope,
+                    )
                 {
                     installed_router = true;
                 } else {
@@ -36786,10 +36925,11 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
                 if nfe_4_syn_attrs_require_test(&field.attrs) {
                     continue;
                 }
-                if self
-                    .type_resolver
-                    .type_contains_symbol(&field.ty, "RoleRouter")
-                {
+                if self.type_resolver.type_contains_symbol(
+                    &field.ty,
+                    "RoleRouter",
+                    &self.module_scope,
+                ) {
                     let field = field
                         .ident
                         .as_ref()
@@ -36806,7 +36946,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
         if self
             .type_resolver
-            .type_contains_symbol(&item.ty, "RoleRouter")
+            .type_contains_symbol(&item.ty, "RoleRouter", &self.module_scope)
         {
             self.role_router_storage.insert(item.ident.to_string());
         }
@@ -36816,7 +36956,7 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
         if self
             .type_resolver
-            .type_contains_symbol(&item.ty, "RoleRouter")
+            .type_contains_symbol(&item.ty, "RoleRouter", &self.module_scope)
         {
             self.role_router_storage.insert(item.ident.to_string());
         }
@@ -36829,7 +36969,8 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
         if rfd4_m2b1_split_routing_phase_name(&lower) {
             self.split_routing_activation.insert(name);
         }
-        let allow_borrowed_view_helper = matches!(item.vis, syn::Visibility::Inherited)
+        let allow_borrowed_view_helper = self.module_scope.is_empty()
+            && matches!(item.vis, syn::Visibility::Inherited)
             && rfd4_m2b1_allowed_borrowed_view_helper(
                 &self.source_path,
                 &item.sig.ident.to_string(),
@@ -37263,6 +37404,7 @@ fn rfd4_m2b1_detector_resolves_view_aliases_and_defaults_borrowed_authorities_to
          pub(crate) fn publish_deployment(view: &View) {}",
         "fn publish_deployment(view: &RuntimeFilterInstallView) { publish(view.clone()); }",
         "pub(crate) fn validate_view(view: &RuntimeFilterInstallView) { publish(view.clone()); }",
+        "fn validate_view(view: RuntimeFilterInstallView) { publish(view); }",
     ] {
         let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
             "src/runtime_filter/service/registry.rs",
@@ -37276,6 +37418,39 @@ fn rfd4_m2b1_detector_resolves_view_aliases_and_defaults_borrowed_authorities_to
              {source}: {violations:?}"
         );
     }
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_inline_module_view_aliases_without_cross_scope_pollution() {
+    let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "mod hidden { \
+         use crate::runtime_filter::port::install::RuntimeFilterInstallView as View; \
+         pub(crate) fn publish(view: View) {} \
+         }",
+    )]);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "inline production module aliases must resolve to raw-view authority: {violations:?}"
+    );
+
+    let shadowed = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "mod imported { \
+         use crate::runtime_filter::port::install::RuntimeFilterInstallView as View; \
+         fn marker() {} \
+         } \
+         mod shadowed { struct View; pub(crate) fn publish(view: View) {} }",
+    )]);
+    assert!(
+        !shadowed
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "an alias in one inline module must not pollute a sibling module that shadows the same \
+         name with an unrelated local type: {shadowed:?}"
+    );
 }
 
 #[test]
