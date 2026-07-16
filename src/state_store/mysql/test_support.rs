@@ -93,6 +93,7 @@ pub async fn active_readiness(
         .await
 }
 
+#[cfg(feature = "state-store-test-hooks")]
 pub async fn delayed_active_readiness(
     runtime: &StateStoreRuntime,
     database: &str,

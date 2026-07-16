@@ -3235,6 +3235,7 @@ dependencies = [
  "reqwest",
  "roaring 0.10.12",
  "rusqlite",
+ "rustls",
  "ryu",
  "serde",
  "serde_json",

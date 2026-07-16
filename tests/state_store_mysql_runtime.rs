@@ -21,12 +21,14 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-#[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::mysql::test_support::run_sleep_until_deadline;
 use novarocks::state_store::mysql::test_support::{
-    acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown,
-    delayed_active_readiness, hold_connection, is_accepting, pollute_session, pool_count,
-    prepare_pool, restart_mysql_fixture, runtime_owner, validate_owner,
+    acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown, hold_connection,
+    is_accepting, pollute_session, pool_count, prepare_pool, restart_mysql_fixture, runtime_owner,
+    validate_owner,
+};
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::mysql::test_support::{
+    delayed_active_readiness, run_sleep_until_deadline,
 };
 use novarocks::state_store::{
     FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreErrorKind,
@@ -479,6 +481,7 @@ async fn mysql_client_pool_wait_can_outlive_connect_timeout_within_operation_dea
     runtime.shutdown().await.expect("shutdown fixture runtime");
 }
 
+#[cfg(feature = "state-store-test-hooks")]
 #[tokio::test(flavor = "current_thread")]
 async fn mysql_client_readiness_timeout_destroys_undrained_connection() {
     let _guard = environment_lock();

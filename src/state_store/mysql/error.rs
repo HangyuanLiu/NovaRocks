@@ -16,7 +16,41 @@
 // under the License.
 
 use super::super::{StateStoreError, StateStoreErrorKind};
-use mysql_async::{DriverError, Error, IoError};
+use mysql_async::{DriverError, Error, IoError, TlsError};
+
+#[derive(Clone, Copy)]
+enum MysqlTlsErrorClass {
+    InvalidDnsName,
+    Pem,
+    VerifierBuilder,
+    InvalidCertificateEncoding,
+    Runtime,
+}
+
+fn classify_tls_error(error: &TlsError) -> StateStoreErrorKind {
+    let class = match error {
+        TlsError::InvalidDnsName(_) => MysqlTlsErrorClass::InvalidDnsName,
+        TlsError::Pem(_) => MysqlTlsErrorClass::Pem,
+        TlsError::VerifierBuilderError(_) => MysqlTlsErrorClass::VerifierBuilder,
+        TlsError::Tls(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)) => {
+            MysqlTlsErrorClass::InvalidCertificateEncoding
+        }
+        TlsError::Tls(_) => MysqlTlsErrorClass::Runtime,
+    };
+    classify_tls_error_class(class)
+}
+
+fn classify_tls_error_class(class: MysqlTlsErrorClass) -> StateStoreErrorKind {
+    match class {
+        MysqlTlsErrorClass::InvalidDnsName
+        | MysqlTlsErrorClass::Pem
+        | MysqlTlsErrorClass::VerifierBuilder
+        | MysqlTlsErrorClass::InvalidCertificateEncoding => {
+            StateStoreErrorKind::InvalidConfiguration
+        }
+        MysqlTlsErrorClass::Runtime => StateStoreErrorKind::ProviderUnavailable,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MysqlNativeError {
@@ -62,7 +96,12 @@ impl From<Error> for MysqlNativeError {
             Error::Server(server) if matches!(server.code, 1044 | 1045 | 1049) => {
                 Self::invalid_configuration()
             }
-            Error::Io(IoError::Tls(_)) | Error::Url(_) => Self::invalid_configuration(),
+            Error::Io(IoError::Tls(error)) => match classify_tls_error(&error) {
+                StateStoreErrorKind::InvalidConfiguration => Self::invalid_configuration(),
+                StateStoreErrorKind::ProviderUnavailable => Self::provider_unavailable(),
+                _ => unreachable!("TLS classifier returns only supported public classes"),
+            },
+            Error::Url(_) => Self::invalid_configuration(),
             Error::Driver(
                 DriverError::UnknownAuthPlugin { .. }
                 | DriverError::MysqlOldPasswordDisabled
@@ -75,5 +114,34 @@ impl From<Error> for MysqlNativeError {
                 Self::provider_unavailable()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_pem_tls_error_is_invalid_configuration() {
+        assert_eq!(
+            classify_tls_error_class(MysqlTlsErrorClass::Pem),
+            StateStoreErrorKind::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn runtime_tls_error_is_provider_unavailable() {
+        assert_eq!(
+            classify_tls_error_class(MysqlTlsErrorClass::Runtime),
+            StateStoreErrorKind::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    fn invalid_certificate_encoding_is_invalid_configuration() {
+        assert_eq!(
+            classify_tls_error_class(MysqlTlsErrorClass::InvalidCertificateEncoding),
+            StateStoreErrorKind::InvalidConfiguration
+        );
     }
 }

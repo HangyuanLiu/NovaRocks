@@ -19,12 +19,16 @@ use std::fmt;
 
 use super::{StateStoreError, StateStoreErrorKind};
 
+#[cfg(all(
+    feature = "mysql-state-store-provider",
+    feature = "state-store-test-hooks"
+))]
+use super::mysql::client::delayed_active_readiness as mysql_delayed_active_readiness;
 #[cfg(feature = "mysql-state-store-provider")]
 use {
     super::mysql::client::{
         PoolLifecycle, ResolvedMysqlClient, active_readiness as mysql_active_readiness,
-        checkout_hygienic_connection, delayed_active_readiness as mysql_delayed_active_readiness,
-        pollute_session as mysql_pollute_session,
+        checkout_hygienic_connection, pollute_session as mysql_pollute_session,
     },
     super::mysql::test_support::{
         MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner, MysqlTestHandle,
@@ -276,7 +280,10 @@ impl StateStoreRuntime {
         }
     }
 
-    #[cfg(feature = "mysql-state-store-provider")]
+    #[cfg(all(
+        feature = "mysql-state-store-provider",
+        feature = "state-store-test-hooks"
+    ))]
     pub(crate) async fn mysql_test_delayed_active_readiness(
         &self,
         database: &str,
@@ -518,6 +525,7 @@ impl MysqlRuntime {
         mysql_pollute_session(pool, deadline).await
     }
 
+    #[cfg(feature = "state-store-test-hooks")]
     async fn delayed_active_readiness(
         &self,
         database: &str,

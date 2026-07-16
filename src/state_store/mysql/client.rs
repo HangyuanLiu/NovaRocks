@@ -74,6 +74,7 @@ const READINESS_SQL: &str = "SELECT VERSION(), @@innodb_page_size, \
     @@default_storage_engine, @@SESSION.sql_mode, @@SESSION.time_zone, \
     @@SESSION.character_set_connection, CONNECTION_ID()";
 
+#[cfg(feature = "state-store-test-hooks")]
 const DELAYED_READINESS_SQL: &str = "SELECT IF(SLEEP(10) = 0, VERSION(), VERSION()), \
     @@innodb_page_size, EXISTS(SELECT 1 FROM information_schema.ENGINES \
     WHERE ENGINE = 'InnoDB' AND SUPPORT IN ('YES', 'DEFAULT')), \
@@ -87,6 +88,7 @@ pub(crate) async fn active_readiness(
     active_readiness_with_sql(pool, deadline, READINESS_SQL).await
 }
 
+#[cfg(feature = "state-store-test-hooks")]
 pub(crate) async fn delayed_active_readiness(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
