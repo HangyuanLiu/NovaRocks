@@ -1762,7 +1762,22 @@ impl StandaloneSession {
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
-        crate::connector::register_iceberg_catalog_service_entry(&self.inner, &stmt.name)?;
+        let (backend, source) = {
+            let connectors = self
+                .inner
+                .connectors
+                .read()
+                .expect("connector registry read lock");
+            (
+                connectors.catalog_backend("iceberg")?,
+                connectors.table_source("iceberg")?,
+            )
+        };
+        self.inner
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                &stmt.name, backend, source,
+            ));
         persist_iceberg_catalog_if_needed(
             &self.inner,
             &normalize_identifier(&stmt.name)?,
@@ -2325,6 +2340,16 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .iceberg_catalog_repo
         .list_tables(read.as_ref())
         .map_err(|e| format!("load iceberg table metadata failed: {e}"))?;
+    let (backend, source) = {
+        let connectors = state
+            .connectors
+            .read()
+            .expect("connector registry read lock");
+        (
+            connectors.catalog_backend("iceberg")?,
+            connectors.table_source("iceberg")?,
+        )
+    };
 
     {
         let mut guard = state
@@ -2333,7 +2358,13 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .expect("standalone iceberg catalog write lock");
         for catalog in &catalogs {
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
-            crate::connector::register_iceberg_catalog_service_entry(state, &catalog.catalog)?;
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                    &catalog.catalog,
+                    Arc::clone(&backend),
+                    Arc::clone(&source),
+                ));
         }
     }
 
@@ -5017,10 +5048,7 @@ path = "{metadata_path}"
             let connectors = state.connectors.read().expect("connectors");
             state
                 .catalog_service
-                .registry()
-                .write()
-                .expect("catalog service registry")
-                .register(crate::sql::catalog::build_iceberg_catalog(
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     "ice",
                     connectors.catalog_backend("iceberg").expect("backend"),
                     connectors.table_source("iceberg").expect("source"),

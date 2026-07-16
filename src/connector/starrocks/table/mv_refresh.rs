@@ -4228,7 +4228,6 @@ enable_path_style_access = true
             .write()
             .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_service_entries(&state);
         Ok((metadata_dir, state, shape))
     }
 
@@ -4658,10 +4657,7 @@ enable_path_style_access = true
         }
         state
             .catalog_service
-            .registry()
-            .write()
-            .expect("catalog service registry write lock")
-            .register(crate::sql::catalog::build_internal_catalog(
+            .register_catalog(crate::sql::catalog::build_internal_catalog(
                 "ice",
                 Arc::clone(state.catalog_service.local()),
             ));

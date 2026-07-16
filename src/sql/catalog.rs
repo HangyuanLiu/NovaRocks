@@ -54,12 +54,12 @@ pub(crate) fn build_iceberg_catalog(
 
 pub(crate) fn new_standalone_catalog_service() -> StandaloneCatalogService {
     let local = Arc::new(RwLock::new(local::PlannerMemoryCatalog::default()));
-    let mut registry = CatalogRegistry::new();
-    registry.register(build_internal_catalog(
+    let service = CatalogService::new(Arc::clone(&local), CatalogRegistry::new());
+    service.register_catalog(build_internal_catalog(
         "default_catalog",
         Arc::clone(&local),
     ));
-    CatalogService::new(local, registry)
+    service
 }
 
 #[derive(Clone, Debug)]

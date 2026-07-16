@@ -18,7 +18,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::catalog::memory::{MemoryCatalog, MemoryCatalogEntry};
-use crate::catalog::registry::CatalogRegistry;
+use crate::catalog::registry::{Catalog, CatalogRegistry};
 
 pub(crate) struct CatalogService<L, M>
 where
@@ -60,10 +60,37 @@ where
             .expect("catalog service registry read lock")
             .clone()
     }
+
+    pub(crate) fn register_catalog(&self, catalog: Arc<dyn Catalog<M>>) {
+        self.registry
+            .write()
+            .expect("catalog service registry write lock")
+            .register(catalog);
+    }
+
+    pub(crate) fn unregister_catalog(&self, name: &str) {
+        self.registry
+            .write()
+            .expect("catalog service registry write lock")
+            .unregister(name);
+    }
+
+    pub(crate) fn invalidate_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<(), String> {
+        self.registry
+            .read()
+            .expect("catalog service registry read lock")
+            .invalidate_table(catalog, namespace, table)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
 
     use super::CatalogService;
@@ -110,6 +137,24 @@ mod tests {
 
         fn get_table_metadata(&self, _namespace: &str, _table: &str) -> Result<u64, String> {
             Ok(7)
+        }
+    }
+
+    struct InvalidatingCatalog {
+        invalidations: Arc<AtomicUsize>,
+    }
+
+    impl Catalog<u64> for InvalidatingCatalog {
+        fn name(&self) -> &str {
+            "invalidating"
+        }
+
+        fn get_table_metadata(&self, _namespace: &str, _table: &str) -> Result<u64, String> {
+            Ok(11)
+        }
+
+        fn invalidate_table(&self, _namespace: &str, _table: &str) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -202,5 +247,38 @@ mod tests {
                 .resolve("named", "ns", "t"),
             Ok(7)
         );
+    }
+
+    #[test]
+    fn unregister_catalog_removes_the_live_service_entry() {
+        let service = service();
+
+        service.unregister_catalog("named");
+
+        assert_eq!(
+            service
+                .registry()
+                .read()
+                .expect("registry read lock")
+                .resolve("named", "ns", "t"),
+            Err("unknown catalog: named".to_string())
+        );
+    }
+
+    #[test]
+    fn invalidate_table_is_forwarded_by_the_catalog_service() {
+        let local = Arc::new(RwLock::new(MemoryCatalog::<TestEntry>::default()));
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let mut registry = CatalogRegistry::new();
+        registry.register(Arc::new(InvalidatingCatalog {
+            invalidations: Arc::clone(&invalidations),
+        }));
+        let service = CatalogService::new(local, registry);
+
+        service
+            .invalidate_table("invalidating", "ns", "orders")
+            .expect("invalidate");
+
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
     }
 }

@@ -18276,8 +18276,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
-            .expect("register iceberg catalog mgr entry");
+        {
+            let connectors = state.connectors.read().expect("connector registry");
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                    catalog,
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ));
+        }
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -18317,8 +18325,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
-            .expect("register iceberg catalog mgr entry");
+        {
+            let connectors = state.connectors.read().expect("connector registry");
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                    catalog,
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ));
+        }
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -18361,8 +18377,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
-            .expect("register iceberg catalog mgr entry");
+        {
+            let connectors = state.connectors.read().expect("connector registry");
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                    catalog,
+                    connectors.catalog_backend("iceberg").expect("backend"),
+                    connectors.table_source("iceberg").expect("source"),
+                ));
+        }
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),

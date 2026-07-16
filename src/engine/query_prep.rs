@@ -121,23 +121,11 @@ pub(crate) fn add_files(
         &s3_path,
     )?;
     entry.invalidate_table_cache(&namespace, &table_name);
-    invalidate_catalog_service_table(state, &catalog_name, &namespace, &table_name)?;
-    let msg = format!("Added {count} file(s)");
-    build_string_query_result("status", vec![msg]).map(StatementResult::Query)
-}
-
-pub(crate) fn invalidate_catalog_service_table(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<(), String> {
     state
         .catalog_service
-        .registry()
-        .read()
-        .expect("catalog service registry read lock")
-        .invalidate_table(catalog, namespace, table)
+        .invalidate_table(&catalog_name, &namespace, &table_name)?;
+    let msg = format!("Added {count} file(s)");
+    build_string_query_result("status", vec![msg]).map(StatementResult::Query)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,10 +943,7 @@ mod tests {
             let connectors = state.connectors.read().expect("connectors");
             state
                 .catalog_service
-                .registry()
-                .write()
-                .expect("catalog service registry")
-                .register(crate::sql::catalog::build_iceberg_catalog(
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     "ice",
                     connectors.catalog_backend("iceberg").expect("backend"),
                     connectors.table_source("iceberg").expect("source"),

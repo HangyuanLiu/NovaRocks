@@ -1549,7 +1549,6 @@ mod tests {
             .write()
             .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_service_entries(&state);
         (dir, state)
     }
 

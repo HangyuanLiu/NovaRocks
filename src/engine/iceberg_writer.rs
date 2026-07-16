@@ -1194,12 +1194,9 @@ pub(crate) fn invalidate_iceberg_caches(
         let entry = registry.get(&target.catalog)?;
         entry.invalidate_table_cache(&target.namespace, &target.table);
     }
-    crate::engine::query_prep::invalidate_catalog_service_table(
-        state,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )
+    state
+        .catalog_service
+        .invalidate_table(&target.catalog, &target.namespace, &target.table)
 }
 
 fn target_string(t: &TargetBackend) -> String {

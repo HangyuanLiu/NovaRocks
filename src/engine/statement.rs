@@ -980,10 +980,7 @@ pub(crate) fn execute_drop_catalog_statement(
             delete_iceberg_catalog_if_needed(state, &normalized_catalog)?;
             state
                 .catalog_service
-                .registry()
-                .write()
-                .expect("catalog service registry write lock")
-                .unregister(&normalized_catalog);
+                .unregister_catalog(&normalized_catalog);
             Ok(StatementResult::Ok)
         }
         Err(err) if if_exists && err.contains("unknown catalog") => Ok(StatementResult::Ok),
@@ -1104,8 +1101,7 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
-                crate::engine::query_prep::invalidate_catalog_service_table(
-                    state,
+                state.catalog_service.invalidate_table(
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -1153,12 +1149,9 @@ fn cleanup_iceberg_drop_table_registration_if_exists(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
 ) -> Result<(), String> {
-    crate::engine::query_prep::invalidate_catalog_service_table(
-        state,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
+    state
+        .catalog_service
+        .invalidate_table(&target.catalog, &target.namespace, &target.table)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
         &target.namespace,

@@ -207,7 +207,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn standalone_backends_register_internal_catalog_service_entry() {
+    fn standalone_catalog_service_keeps_internal_entry_after_backend_registration() {
         let state = Arc::new(crate::engine::StandaloneState::default());
         super::register_standalone_backends(&state);
 
@@ -483,45 +483,6 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
         ));
     }
-    register_default_catalog_service_entries(state);
-}
-
-pub(crate) fn register_default_catalog_service_entries(
-    state: &Arc<crate::engine::StandaloneState>,
-) {
-    state
-        .catalog_service
-        .registry()
-        .write()
-        .expect("catalog service registry write lock")
-        .register(crate::sql::catalog::build_internal_catalog(
-            "default_catalog",
-            Arc::clone(state.catalog_service.local()),
-        ));
-}
-
-pub(crate) fn register_iceberg_catalog_service_entry(
-    state: &Arc<crate::engine::StandaloneState>,
-    catalog_name: &str,
-) -> Result<(), String> {
-    let connectors = state
-        .connectors
-        .read()
-        .expect("connector registry read lock");
-    let backend = connectors.catalog_backend("iceberg")?;
-    let source = connectors.table_source("iceberg")?;
-    drop(connectors);
-    state
-        .catalog_service
-        .registry()
-        .write()
-        .expect("catalog service registry write lock")
-        .register(crate::sql::catalog::build_iceberg_catalog(
-            catalog_name,
-            backend,
-            source,
-        ));
-    Ok(())
 }
 
 impl Default for ConnectorRegistry {

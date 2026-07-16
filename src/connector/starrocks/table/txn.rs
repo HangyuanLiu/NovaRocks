@@ -2706,7 +2706,6 @@ mod mv_target_tests {
             .write()
             .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_service_entries(&state);
 
         MvTestFixture {
             state,
@@ -3194,7 +3193,6 @@ mod mv_target_tests {
             .write()
             .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_service_entries(&state);
 
         Ok(MvTestFixture {
             state,

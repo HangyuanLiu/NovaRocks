@@ -316,4 +316,29 @@ mod tests {
 
         assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn catalog_service_registers_iceberg_entry_from_backend_and_source() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let schema_id = Arc::new(AtomicUsize::new(1));
+        let schema_probes = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn CatalogBackend> = Arc::new(TrackingBackend {
+            loads: Arc::clone(&loads),
+            schema_id: Arc::clone(&schema_id),
+            schema_probes: Arc::clone(&schema_probes),
+        });
+        let source: Arc<dyn TableSource> = Arc::new(TrackingSource::new());
+        let service = crate::sql::catalog::new_standalone_catalog_service();
+
+        service.register_catalog(Arc::new(IcebergCatalog::new("ice", backend, source)));
+
+        assert!(
+            service
+                .registry()
+                .read()
+                .expect("catalog service registry")
+                .get_catalog("ice")
+                .is_ok()
+        );
+    }
 }
