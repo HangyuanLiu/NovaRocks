@@ -535,6 +535,11 @@ pub(crate) enum RuntimeFilterRouteContractError {
         binding: BindingId,
         fragment_instance_id: UniqueId,
     },
+    UnknownInboundProducerRoute {
+        channel: ChannelId,
+        binding: BindingId,
+        source_participant: RuntimeFilterParticipantId,
+    },
     UnknownInboundRoute {
         channel: ChannelId,
         edge: RouteEdgeId,
