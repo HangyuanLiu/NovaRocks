@@ -273,6 +273,7 @@ mod tests {
     use super::*;
     use crate::coordinator::scheduler::FragmentInstancePlacement;
     use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
     use crate::runtime_filter::deployment::role_graph::RouteKind;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
@@ -652,6 +653,61 @@ mod tests {
         for view in plan.install_views.values() {
             assert_eq!(view.epoch(), plan.epoch);
         }
+    }
+
+    #[test]
+    fn compiler_all_of_aggregator_core_view_matches_routing_authority() {
+        let (graph, scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        let plan = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap();
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let aggregator = pid(2);
+        let remote_producer = pid(7);
+        let remote_consumer = pid(11);
+
+        let aggregator_channel = &plan.install_views[&aggregator].channels()[&channel_id];
+        let core_instances =
+            aggregator_channel.producers()[&producer_binding].expected_fragment_instances();
+        let routing_channel = plan.routing_shards[&aggregator]
+            .channel(channel_id)
+            .expect("aggregator routing channel");
+        let routing_instances = routing_channel
+            .producer_instances()
+            .keys()
+            .filter_map(|(binding, finst)| (*binding == producer_binding).then_some(*finst))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(core_instances, &routing_instances);
+        assert_eq!(
+            core_instances,
+            &BTreeSet::from([UniqueId { hi: 1, lo: 3 }, UniqueId { hi: 1, lo: 4 }])
+        );
+        assert!(aggregator_channel.consumers().is_empty());
+        assert_eq!(
+            plan.install_views[&remote_producer].channels()[&channel_id].producers()
+                [&producer_binding]
+                .expected_fragment_instances(),
+            &BTreeSet::from([UniqueId { hi: 1, lo: 4 }])
+        );
+        assert!(!plan.install_views.contains_key(&remote_consumer));
+        assert!(plan.routing_shards.contains_key(&remote_consumer));
+
+        let installs = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .expect("every core view has a matching routing shard");
+        assert_eq!(installs.len(), plan.install_views.len());
+        assert!(installs.iter().all(|(participant, install)| {
+            install.core_view() == &plan.install_views[participant]
+                && install.routing_shard() == &plan.routing_shards[participant]
+        }));
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::role_graph::{RoleGraph, RouteKind};
 use crate::runtime_filter::deployment::{BindingInstanceIndex, DeploymentError};
 use crate::runtime_filter::model::contract::{
@@ -101,8 +102,9 @@ fn consumer_artifact_profile(
 /// `producer_witness`, and `consumer_facts` entries covering every channel /
 /// producer binding / loopback-consumer binding present in `role_graph`. A
 /// missing entry is logged (`tracing::warn!`) and the offending binding/channel
-/// is skipped rather than panicking; there is no downstream "all consumers
-/// present" check, so a silent drop here would be invisible.
+/// is skipped rather than panicking, except for an Aggregator's producer
+/// authority: every producer witness and placement must be present so the Core
+/// view cannot silently disagree with routing authorization.
 ///
 /// Fails with [`DeploymentError::InvalidArtifactProfile`] if a consumer's
 /// semantic capabilities cannot form a valid M2 physical artifact profile.
@@ -159,6 +161,63 @@ pub(crate) fn project_install_views(
                     .or_default()
                     .0
                     .insert(*binding, ProducerDeployment::new(witness, expected));
+            }
+        }
+        // Aggregators reduce contributions from every producer participant, so
+        // their Core authority must contain the same query-global finst set as
+        // the routing shard. Keep non-aggregator producer views local-only.
+        if let Some(aggregator) = cg.aggregator {
+            let mut aggregator_producers: BTreeMap<BindingId, BTreeSet<UniqueId>> = BTreeMap::new();
+            for (participant, bindings) in &cg.producers {
+                for binding in bindings {
+                    let Some(_witness) = spec.producer_witness.get(binding) else {
+                        return Err(DeploymentError::InvalidRoutingShard {
+                            detail: format!(
+                                "runtime filter aggregator projection missing producer witness \
+                                 for channel {} binding {}",
+                                channel_id.get(),
+                                binding.get()
+                            ),
+                        });
+                    };
+                    let Some(expected) = instances.get(&(*channel_id, *binding, *participant))
+                    else {
+                        return Err(DeploymentError::InvalidRoutingShard {
+                            detail: format!(
+                                "runtime filter aggregator projection missing producer placement \
+                                 for channel {} binding {} participant {}",
+                                channel_id.get(),
+                                binding.get(),
+                                participant.get()
+                            ),
+                        });
+                    };
+                    if expected.is_empty() {
+                        return Err(DeploymentError::InvalidRoutingShard {
+                            detail: format!(
+                                "runtime filter aggregator projection missing producer placement \
+                                 for channel {} binding {} participant {}",
+                                channel_id.get(),
+                                binding.get(),
+                                participant.get()
+                            ),
+                        });
+                    }
+                    aggregator_producers
+                        .entry(*binding)
+                        .or_default()
+                        .extend(expected.iter().copied());
+                }
+            }
+            for (binding, expected) in aggregator_producers {
+                let witness = spec.producer_witness[&binding];
+                per_participant
+                    .entry(aggregator)
+                    .or_default()
+                    .entry(*channel_id)
+                    .or_default()
+                    .0
+                    .insert(binding, ProducerDeployment::new(witness, expected));
             }
         }
         // Consumers: only those reachable through a Loopback route edge.
@@ -337,6 +396,201 @@ mod tests {
                 ]),
             },
         )
+    }
+
+    fn pid(raw: u32) -> RuntimeFilterParticipantId {
+        RuntimeFilterParticipantId::new(raw)
+    }
+
+    fn finst(raw: i64) -> UniqueId {
+        UniqueId {
+            hi: raw,
+            lo: raw + 100,
+        }
+    }
+
+    fn all_of_projection_fixture() -> (
+        RoleGraph,
+        BTreeMap<ChannelId, ChannelProjectionSpec>,
+        BTreeMap<BindingId, ConsumerBindingFacts>,
+        BindingInstanceIndex,
+    ) {
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let consumer_binding = BindingId::new(11);
+        let aggregator = pid(2);
+        let remote_producer = pid(7);
+        let remote_consumer = pid(11);
+
+        let mut channel = ChannelRoleGraph::empty(channel_id);
+        channel
+            .producers
+            .insert(aggregator, BTreeSet::from([producer_binding]));
+        channel
+            .producers
+            .insert(remote_producer, BTreeSet::from([producer_binding]));
+        channel
+            .consumers
+            .insert(remote_consumer, BTreeSet::from([consumer_binding]));
+        channel.aggregator = Some(aggregator);
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(1),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: remote_producer,
+                binding: producer_binding,
+            },
+            to: RouteEndpoint {
+                participant: aggregator,
+                binding: producer_binding,
+            },
+        });
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(2),
+            kind: RouteKind::FromAggregator,
+            from: RouteEndpoint {
+                participant: aggregator,
+                binding: consumer_binding,
+            },
+            to: RouteEndpoint {
+                participant: remote_consumer,
+                binding: consumer_binding,
+            },
+        });
+
+        let instances = BTreeMap::from([
+            (
+                (channel_id, producer_binding, aggregator),
+                BTreeSet::from([finst(2)]),
+            ),
+            (
+                (channel_id, producer_binding, remote_producer),
+                BTreeSet::from([finst(7)]),
+            ),
+            (
+                (channel_id, consumer_binding, remote_consumer),
+                BTreeSet::from([finst(11)]),
+            ),
+        ]);
+
+        (
+            RoleGraph {
+                channels: BTreeMap::from([(channel_id, channel)]),
+            },
+            BTreeMap::from([(channel_id, membership_channel(5))]),
+            BTreeMap::from([membership_consumer_facts(11)]),
+            instances,
+        )
+    }
+
+    fn project_all_of_fixture()
+    -> Result<BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>, DeploymentError> {
+        let (role_graph, channel_specs, consumer_facts, instances) = all_of_projection_fixture();
+        project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+    }
+
+    #[test]
+    fn all_of_aggregator_projects_union_of_remote_producer_instances() {
+        let views = project_all_of_fixture().expect("projection succeeds");
+
+        let aggregator_producer =
+            &views[&pid(2)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)];
+        assert_eq!(
+            aggregator_producer.expected_fragment_instances(),
+            &BTreeSet::from([finst(2), finst(7)])
+        );
+    }
+
+    #[test]
+    fn aggregator_without_local_consumer_still_gets_core_channel() {
+        let views = project_all_of_fixture().expect("projection succeeds");
+
+        let channel = &views[&pid(2)].channels()[&ChannelId::new(5)];
+        assert_eq!(
+            channel.producers()[&BindingId::new(10)].expected_fragment_instances(),
+            &BTreeSet::from([finst(2), finst(7)])
+        );
+        assert!(channel.consumers().is_empty());
+    }
+
+    #[test]
+    fn non_aggregator_producer_keeps_only_its_local_instances() {
+        let views = project_all_of_fixture().expect("projection succeeds");
+
+        assert_eq!(
+            views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(7)])
+        );
+    }
+
+    #[test]
+    fn remote_only_consumer_still_has_no_install_view_until_m2c() {
+        let views = project_all_of_fixture().expect("projection succeeds");
+
+        assert!(!views.contains_key(&pid(11)));
+    }
+
+    #[test]
+    fn all_of_aggregator_rejects_missing_producer_witness() {
+        let (role_graph, mut channel_specs, consumer_facts, instances) =
+            all_of_projection_fixture();
+        channel_specs
+            .get_mut(&ChannelId::new(5))
+            .unwrap()
+            .producer_witness
+            .clear();
+
+        let err = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DeploymentError::InvalidRoutingShard { detail }
+                if detail.contains("producer witness")
+        ));
+    }
+
+    #[test]
+    fn all_of_aggregator_rejects_missing_producer_placement() {
+        let (role_graph, channel_specs, consumer_facts, mut instances) =
+            all_of_projection_fixture();
+        instances.remove(&(ChannelId::new(5), BindingId::new(10), pid(7)));
+
+        let err = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DeploymentError::InvalidRoutingShard { detail }
+                if detail.contains("producer placement")
+        ));
     }
 
     #[test]
