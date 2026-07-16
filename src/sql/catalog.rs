@@ -32,7 +32,7 @@ pub struct ColumnDef {
     /// materialise as generic Arrow storage. The analyzer uses this side table
     /// to preserve StarRocks semantics that are not encoded in Arrow alone.
     /// `None` means "the Arrow type is the authoritative type".
-    pub logical_type: Option<crate::sql::SqlType>,
+    pub logical_type: Option<crate::catalog::schema::SqlType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

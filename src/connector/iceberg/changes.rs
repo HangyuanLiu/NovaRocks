@@ -2518,6 +2518,7 @@ mod tests {
         validate_replace_snapshot,
     };
 
+    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::catalog::registry::{
         IcebergCatalogEntry, block_on_iceberg, build_catalog_entry, build_hadoop_catalog,
         create_namespace, create_table, insert_rows, load_table,
@@ -2527,7 +2528,7 @@ mod tests {
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
-    use crate::sql::{Literal, SqlType, TableColumnDef};
+    use crate::sql::{Literal, TableColumnDef};
 
     use super::plan_changes;
 

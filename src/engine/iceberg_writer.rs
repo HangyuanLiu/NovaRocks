@@ -34,6 +34,7 @@ use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
+use crate::catalog::schema::SqlType;
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::backend::{
     ICEBERG_ROW_IDENTITY_FILE_COLUMN, ICEBERG_ROW_IDENTITY_POS_COLUMN,
@@ -68,7 +69,7 @@ use crate::sql::catalog::{
     ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     ScanSource, TableDef,
 };
-use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
+use crate::sql::parser::ast::{InsertSource, Literal};
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
     synthetic_iceberg_write_table_id, transform_to_sink_string,
@@ -1600,7 +1601,7 @@ mod tests {
     fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
         assert_eq!(
             arrow_data_type_to_sql_type(&DataType::Time64(TimeUnit::Microsecond)).expect("type"),
-            crate::sql::parser::ast::SqlType::Time
+            crate::catalog::schema::SqlType::Time
         );
     }
 

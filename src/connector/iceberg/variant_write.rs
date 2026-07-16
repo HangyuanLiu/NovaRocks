@@ -249,7 +249,7 @@ fn parse_path_type_entry<'a>(
 }
 
 fn parse_shredding_sql_type(property_key: &str, raw: &str) -> Result<DataType, String> {
-    use crate::sql::parser::ast::SqlType;
+    use crate::catalog::schema::SqlType;
 
     let sql_type = crate::sql::parser::dialect::create_table::parse_sql_type_string(raw)
         .map_err(|e| format!("{property_key}: invalid shredding type `{raw}`: {e}"))?;

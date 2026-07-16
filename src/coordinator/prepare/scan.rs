@@ -251,7 +251,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::SqlType;
+    use crate::catalog::schema::SqlType;
 
     #[test]
     fn resolver_trait_object_is_send_and_sync() {

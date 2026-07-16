@@ -358,6 +358,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, RwLock};
 
+    use crate::catalog::schema::SqlType;
     use crate::connector::iceberg::catalog::registry::{
         DataFileWithStats, IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg,
         build_iceberg_catalog,
@@ -373,7 +374,7 @@ mod tests {
     use crate::sql::optimizer::stats_input::{
         BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
     };
-    use crate::sql::{Literal, SqlType, TableColumnDef};
+    use crate::sql::{Literal, TableColumnDef};
 
     fn s3_cloud_properties(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries

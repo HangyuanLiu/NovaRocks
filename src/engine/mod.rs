@@ -5990,7 +5990,7 @@ mysql_port = 47892
     #[test]
     fn sql_type_to_arrow_type_maps_largeint_to_fixed_size_binary() {
         assert_eq!(
-            super::sql_type_to_arrow_type(&crate::sql::parser::ast::SqlType::LargeInt)
+            super::sql_type_to_arrow_type(&crate::catalog::schema::SqlType::LargeInt)
                 .expect("map largeint type"),
             DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
         );

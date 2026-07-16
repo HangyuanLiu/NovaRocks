@@ -18572,14 +18572,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "name".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -18613,21 +18613,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "amount".to_string(),
-                data_type: crate::sql::SqlType::BigInt,
+                data_type: crate::catalog::schema::SqlType::BigInt,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -18661,21 +18661,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "price".to_string(),
-                data_type: crate::sql::SqlType::Double,
+                data_type: crate::catalog::schema::SqlType::Double,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -18709,14 +18709,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "category".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -18750,14 +18750,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "customer_id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -18791,14 +18791,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "region".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -18832,21 +18832,21 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "label".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: false,
                 aggregation: None,
                 default: None,
@@ -18924,14 +18924,14 @@ mod tests {
         let columns = vec![
             crate::sql::TableColumnDef {
                 name: "id".to_string(),
-                data_type: crate::sql::SqlType::Int,
+                data_type: crate::catalog::schema::SqlType::Int,
                 nullable: false,
                 aggregation: None,
                 default: None,
             },
             crate::sql::TableColumnDef {
                 name: "name".to_string(),
-                data_type: crate::sql::SqlType::String,
+                data_type: crate::catalog::schema::SqlType::String,
                 nullable: true,
                 aggregation: None,
                 default: None,
@@ -25714,12 +25714,12 @@ mod tests {
         });
     }
     mod aggregate_apply_test_helpers {
+        use crate::catalog::schema::SqlType;
         use crate::engine::mv::agg_state::mv_agg_state::{
             AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
         };
         use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
         use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
-        use crate::sql::parser::ast::SqlType;
         use arrow::datatypes::DataType;
 
         pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {

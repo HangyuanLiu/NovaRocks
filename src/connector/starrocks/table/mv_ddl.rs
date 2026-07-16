@@ -2156,11 +2156,11 @@ fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
 mod tests {
     use super::super::model::StoredStarRocksTable;
     use super::*;
+    use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
     use crate::engine::catalog::InMemoryCatalog;
     use crate::meta::MetaStoreProvider;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::sql::parser::ast::SqlType;
     use arrow::array::Array;
     use std::sync::RwLock;
     use tempfile::TempDir;

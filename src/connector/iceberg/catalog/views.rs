@@ -339,7 +339,7 @@ mod rest_view_tests {
 
     use super::super::registry::{IcebergCatalogEntry, build_catalog_entry};
     use super::{create_view, drop_view, list_views, load_view, view_exists};
-    use crate::sql::SqlType;
+    use crate::catalog::schema::SqlType;
     use crate::sql::parser::ast::TableColumnDef;
 
     fn rest_props(uri: &str) -> Vec<(String, String)> {

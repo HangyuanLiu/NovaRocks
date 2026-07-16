@@ -33,7 +33,7 @@ pub(crate) mod explain;
 pub(crate) mod planner;
 
 pub(crate) use parser::ast::{
-    ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
+    ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 
 #[cfg(test)]

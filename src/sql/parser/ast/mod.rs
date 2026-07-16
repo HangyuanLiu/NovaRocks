@@ -19,6 +19,7 @@
 pub mod iceberg_ref;
 pub(crate) use iceberg_ref::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
+use crate::catalog::schema::SqlType;
 use crate::sql::catalog::LegacyRangePartition;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,41 +389,6 @@ pub(crate) enum DefaultLiteral {
     Date(i32),     // days since 1970-01-01
     DateTime(i64), // microseconds since 1970-01-01T00:00:00Z
     Binary(Vec<u8>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SqlType {
-    TinyInt,
-    SmallInt,
-    Int,
-    BigInt,
-    LargeInt,
-    Float,
-    Double,
-    Decimal {
-        precision: u8,
-        scale: i8,
-    },
-    String,
-    Json,
-    Binary,
-    Bitmap,
-    Hll,
-    Boolean,
-    Date,
-    DateTime,
-    /// Iceberg v3 nanosecond timestamp (`timestamp_ns`). Default DATETIME stays
-    /// microsecond; this is a distinct variant so existing DATETIME behavior is
-    /// untouched. Time zone (`timestamptz_ns`) is carried at the Arrow level on
-    /// read/insert; native CREATE of the tz variant is out of scope.
-    DateTimeNs,
-    Time,
-    Array(Box<SqlType>),
-    Map(Box<SqlType>, Box<SqlType>),
-    Struct(Vec<(String, SqlType)>),
-    /// Iceberg v3 unshredded variant. Carried as Arrow `LargeBinary`
-    /// in execution; persisted as a parquet group with `LogicalType::Variant`.
-    Variant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

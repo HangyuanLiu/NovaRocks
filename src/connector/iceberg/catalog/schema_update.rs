@@ -18,7 +18,8 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::parser::ast::{DefaultLiteral, SqlType};
+    use crate::catalog::schema::SqlType;
+    use crate::sql::parser::ast::DefaultLiteral;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::collections::HashMap;
 
@@ -1174,7 +1175,7 @@ mod tests {
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("n").unwrap();
         let new =
-            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+            apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt).unwrap();
         assert!(matches!(
             *new.as_struct().fields()[0].field_type,
             Type::Primitive(PrimitiveType::Long)
@@ -1196,7 +1197,7 @@ mod tests {
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("wrap.n").unwrap();
         let new =
-            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+            apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt).unwrap();
         let Type::Struct(s) = &*new.as_struct().fields()[0].field_type else {
             panic!()
         };
@@ -1225,7 +1226,7 @@ mod tests {
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("tags.element").unwrap();
         let new =
-            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+            apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt).unwrap();
         let Type::List(l) = &*new.as_struct().fields()[0].field_type else {
             panic!()
         };
@@ -1258,7 +1259,7 @@ mod tests {
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("m.value").unwrap();
         let new =
-            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).unwrap();
+            apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt).unwrap();
         let Type::Map(m) = &*new.as_struct().fields()[0].field_type else {
             panic!()
         };
@@ -1281,7 +1282,7 @@ mod tests {
             .build()
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("s").unwrap();
-        let res = apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt);
+        let res = apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt);
         assert!(res.is_err());
     }
 
@@ -1296,9 +1297,7 @@ mod tests {
             .build()
             .unwrap();
         let path = crate::engine::statement::ColumnPath::parse("nonexistent").unwrap();
-        assert!(
-            apply_modify_at(&schema, &path, &crate::sql::parser::ast::SqlType::BigInt).is_err()
-        );
+        assert!(apply_modify_at(&schema, &path, &crate::catalog::schema::SqlType::BigInt).is_err());
     }
 
     // ----- apply_add_at tests -----
@@ -2239,6 +2238,7 @@ use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, Tr
 use iceberg::{TableRequirement, TableUpdate};
 
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::schema::SqlType;
 use crate::connector::iceberg::catalog::registry::{
     TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key, logical_type_property_key,
     logical_type_property_value,
@@ -2253,7 +2253,6 @@ use crate::engine::statement::{
     AlterIcebergPropertiesStmt, AlterIcebergSchemaStmt, ColumnPath, IcebergSchemaChange,
     PropertiesOp,
 };
-use crate::sql::parser::ast::SqlType;
 
 #[cfg(test)]
 pub(crate) fn apply_change_to_schema_for_test(

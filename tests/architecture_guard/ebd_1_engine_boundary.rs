@@ -3192,9 +3192,7 @@ fn ebd_3c_query_result_boundary_has_one_runtime_owner() {
         {
             violations.insert(format!("runtime-reverse-dependency: {canonical}"));
         }
-        if (canonical == "crate::sql" || canonical.starts_with("crate::sql::"))
-            && canonical != "crate::sql::SqlType"
-        {
+        if canonical == "crate::sql" || canonical.starts_with("crate::sql::") {
             violations.insert(format!("runtime-sql-dependency-growth: {canonical}"));
         }
     }
@@ -3205,8 +3203,7 @@ fn ebd_3c_query_result_boundary_has_one_runtime_owner() {
         violations.insert("runtime-owner-mentions-StandaloneState".to_string());
     }
 
-    let expected_runtime_sql_edges =
-        BTreeSet::from(["src/runtime/query_result.rs|crate::sql::SqlType".to_string()]);
+    let expected_runtime_sql_edges = BTreeSet::new();
     let actual_runtime_sql_edges = rs_files(&repo.join("src/runtime"))
         .into_iter()
         .flat_map(|path| {
@@ -3808,6 +3805,1776 @@ fn ebd_4a_audit_legacy_paths_and_forwarding(sources: &[GuardSource]) -> BTreeSet
         }
     }
     violations
+}
+
+const EBD_4B1_OWNER: &str = "src/catalog/schema.rs";
+const EBD_4B1_EXPECTED_VARIANTS: &[&str] = &[
+    "TinyInt",
+    "SmallInt",
+    "Int",
+    "BigInt",
+    "LargeInt",
+    "Float",
+    "Double",
+    "Decimal{precision:u8,scale:i8}",
+    "String",
+    "Json",
+    "Binary",
+    "Bitmap",
+    "Hll",
+    "Boolean",
+    "Date",
+    "DateTime",
+    "DateTimeNs",
+    "Time",
+    "Array(Box<SqlType>)",
+    "Map(Box<SqlType>,Box<SqlType>)",
+    "Struct(Vec<(String,SqlType)>)",
+    "Variant",
+];
+
+fn ebd_4b1_type_shape(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) if path.qself.is_none() => {
+            let mut rendered = Vec::new();
+            for segment in &path.path.segments {
+                let arguments = match &segment.arguments {
+                    syn::PathArguments::None => String::new(),
+                    syn::PathArguments::AngleBracketed(arguments) => {
+                        let arguments = arguments
+                            .args
+                            .iter()
+                            .map(|argument| match argument {
+                                syn::GenericArgument::Type(ty) => ebd_4b1_type_shape(ty),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        format!("<{}>", arguments.join(","))
+                    }
+                    syn::PathArguments::Parenthesized(_) => return None,
+                };
+                rendered.push(format!("{}{arguments}", segment.ident));
+            }
+            Some(rendered.join("::"))
+        }
+        syn::Type::Tuple(tuple) => Some(format!(
+            "({})",
+            tuple
+                .elems
+                .iter()
+                .map(ebd_4b1_type_shape)
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
+        _ => None,
+    }
+}
+
+fn ebd_4b1_variant_shape(variant: &syn::Variant) -> Option<String> {
+    if variant.discriminant.is_some() {
+        return None;
+    }
+    let name = variant.ident.to_string();
+    match &variant.fields {
+        syn::Fields::Unit => Some(name),
+        syn::Fields::Unnamed(fields) => Some(format!(
+            "{name}({})",
+            fields
+                .unnamed
+                .iter()
+                .map(|field| ebd_4b1_type_shape(&field.ty))
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
+        syn::Fields::Named(fields) => Some(format!(
+            "{name}{{{}}}",
+            fields
+                .named
+                .iter()
+                .map(|field| {
+                    Some(format!(
+                        "{}:{}",
+                        field.ident.as_ref()?,
+                        ebd_4b1_type_shape(&field.ty)?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
+    }
+}
+
+fn ebd_4b1_derive_set(item: &syn::ItemEnum) -> Option<BTreeSet<String>> {
+    let mut derives = BTreeSet::new();
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("derive"))
+    {
+        let paths = attribute
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            )
+            .ok()?;
+        derives.extend(paths.into_iter().map(|path| {
+            path.segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        }));
+    }
+    Some(derives)
+}
+
+fn ebd_4b1_attribute_is(attribute: &syn::Attribute, name: &str) -> bool {
+    attribute.path().is_ident(name)
+}
+
+fn ebd_4b1_is_pub(visibility: &syn::Visibility) -> bool {
+    matches!(visibility, syn::Visibility::Public(_))
+}
+
+fn ebd_4b1_is_pub_crate(visibility: &syn::Visibility) -> bool {
+    matches!(
+        visibility,
+        syn::Visibility::Restricted(restricted)
+            if restricted.in_token.is_none() && restricted.path.is_ident("crate")
+    )
+}
+
+fn ebd_4b1_audit_schema_dependencies(source: &GuardSource) -> BTreeSet<String> {
+    struct CratePathAudit<'a> {
+        source: &'a str,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CratePathAudit<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments
+                .first()
+                .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
+            {
+                self.violations.insert(format!(
+                    "catalog-schema-forbidden-local-path: {}|{}",
+                    self.source,
+                    segments.join("::")
+                ));
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let mut violations = ebd_4a_audit_catalog_dependencies(source);
+    if let Ok(file) = syn::parse_file(&source.text) {
+        let mut audit = CratePathAudit {
+            source: &source.path,
+            violations: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        violations.extend(audit.violations);
+    }
+    violations
+}
+
+fn ebd_4b1_audit_schema_owner(source: &GuardSource) -> BTreeSet<String> {
+    struct SqlTypeEnumCounter {
+        count: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SqlTypeEnumCounter {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if item.ident == "SqlType" {
+                self.count += 1;
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-schema-owner-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let mut violations = ebd_4b1_audit_schema_dependencies(source);
+    let mut counter = SqlTypeEnumCounter { count: 0 };
+    syn::visit::Visit::visit_file(&mut counter, &file);
+    if counter.count != 1 {
+        violations.insert(format!(
+            "catalog-schema-owner-enum-count: expected=1 actual={}",
+            counter.count
+        ));
+    }
+
+    let canonical = file.items.iter().find_map(|item| match item {
+        syn::Item::Enum(item) if item.ident == "SqlType" => Some(item),
+        _ => None,
+    });
+    let Some(canonical) = canonical else {
+        violations.insert("catalog-schema-owner-enum-missing: SqlType".to_string());
+        return violations;
+    };
+    if !ebd_4b1_is_pub(&canonical.vis) {
+        violations.insert("catalog-schema-owner-visibility: SqlType must be pub".to_string());
+    }
+    if !canonical.generics.params.is_empty() || canonical.generics.where_clause.is_some() {
+        violations.insert("catalog-schema-owner-generics-forbidden: SqlType".to_string());
+    }
+    for attribute in &canonical.attrs {
+        if !ebd_4b1_attribute_is(attribute, "derive") && !ebd_4b1_attribute_is(attribute, "doc") {
+            violations.insert(format!(
+                "catalog-schema-owner-semantic-attribute-forbidden: SqlType|{}",
+                attribute
+                    .path()
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::")
+            ));
+        }
+    }
+    for variant in &canonical.variants {
+        for attribute in &variant.attrs {
+            if !ebd_4b1_attribute_is(attribute, "doc") {
+                violations.insert(format!(
+                    "catalog-schema-variant-semantic-attribute-forbidden: {}|{}",
+                    variant.ident,
+                    attribute
+                        .path()
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::")
+                ));
+            }
+        }
+        for field in &variant.fields {
+            for attribute in &field.attrs {
+                if !ebd_4b1_attribute_is(attribute, "doc") {
+                    violations.insert(format!(
+                        "catalog-schema-field-semantic-attribute-forbidden: {}|{}",
+                        variant.ident,
+                        attribute
+                            .path()
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::")
+                    ));
+                }
+            }
+        }
+    }
+
+    let expected_derives = BTreeSet::from([
+        "Clone".to_string(),
+        "Debug".to_string(),
+        "Eq".to_string(),
+        "PartialEq".to_string(),
+    ]);
+    match ebd_4b1_derive_set(canonical) {
+        Some(actual) if actual == expected_derives => {}
+        Some(actual) => {
+            violations.insert(format!(
+                "catalog-schema-owner-derives: expected={expected_derives:?} actual={actual:?}"
+            ));
+        }
+        None => {
+            violations.insert("catalog-schema-owner-derives-parse-failed: SqlType".to_string());
+        }
+    }
+
+    let actual_variants = canonical
+        .variants
+        .iter()
+        .map(ebd_4b1_variant_shape)
+        .collect::<Option<Vec<_>>>();
+    let expected_variants = EBD_4B1_EXPECTED_VARIANTS
+        .iter()
+        .map(|variant| (*variant).to_string())
+        .collect::<Vec<_>>();
+    match actual_variants {
+        Some(actual) if actual == expected_variants => {}
+        Some(actual) => {
+            violations.insert(format!(
+                "catalog-schema-owner-variants: expected={expected_variants:?} actual={actual:?}"
+            ));
+        }
+        None => {
+            violations
+                .insert("catalog-schema-owner-variant-shape-unsupported: SqlType".to_string());
+        }
+    }
+    violations
+}
+
+fn ebd_4b1_audit_schema_module(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-schema-module-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let modules = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(item) if item.ident == "schema" => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut violations = BTreeSet::new();
+    if modules.len() != 1 {
+        violations.insert(format!(
+            "catalog-schema-module-count: expected=1 actual={}",
+            modules.len()
+        ));
+        return violations;
+    }
+    if modules[0].content.is_some() {
+        violations.insert("catalog-schema-module-must-be-file-backed".to_string());
+    }
+    if !ebd_4b1_is_pub_crate(&modules[0].vis) {
+        violations.insert("catalog-schema-module-visibility: expected pub(crate)".to_string());
+    }
+    if !modules[0].attrs.is_empty() {
+        violations.insert("catalog-schema-module-attributes-forbidden".to_string());
+    }
+    violations
+}
+
+fn is_legacy_ebd_4b1_sql_type_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "sql", "SqlType"])
+        || segments.starts_with(&["crate", "sql", "parser", "ast", "SqlType"])
+}
+
+fn is_catalog_schema_sql_type_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments.starts_with(&["crate", "catalog", "schema", "SqlType"])
+}
+
+fn is_exact_catalog_schema_sql_type_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "catalog", "schema", "SqlType"]
+}
+
+fn is_catalog_schema_module_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "catalog", "schema"]
+}
+
+fn is_catalog_schema_glob_path(path: &[String]) -> bool {
+    let segments = path.iter().map(String::as_str).collect::<Vec<_>>();
+    segments == ["crate", "catalog", "schema", "*"]
+}
+
+fn is_catalog_schema_sql_type_forward_target(path: &[String]) -> bool {
+    is_catalog_schema_module_path(path)
+        || is_catalog_schema_glob_path(path)
+        || is_catalog_schema_sql_type_path(path)
+}
+
+#[derive(Clone, Debug)]
+struct Ebd4b1ModuleUseStatement {
+    visibility: String,
+    segments: Vec<String>,
+    alias: Option<String>,
+    inline_modules: Vec<String>,
+}
+
+fn ebd_4b1_visibility(visibility: &syn::Visibility) -> String {
+    match visibility {
+        syn::Visibility::Inherited => "private".to_string(),
+        syn::Visibility::Public(_) => "pub".to_string(),
+        syn::Visibility::Restricted(restricted) => {
+            let path = restricted
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path == "self" {
+                "private".to_string()
+            } else if restricted.in_token.is_some() {
+                format!("pub(in {path})")
+            } else {
+                format!("pub({path})")
+            }
+        }
+    }
+}
+
+fn ebd_4b1_flatten_use_tree(
+    tree: &syn::UseTree,
+    prefix: &[String],
+    output: &mut Vec<(Vec<String>, Option<String>)>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let mut prefix = prefix.to_vec();
+            prefix.push(path.ident.to_string());
+            ebd_4b1_flatten_use_tree(&path.tree, &prefix, output);
+        }
+        syn::UseTree::Name(name) => {
+            let mut segments = prefix.to_vec();
+            if name.ident != "self" {
+                segments.push(name.ident.to_string());
+            }
+            output.push((segments, None));
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut segments = prefix.to_vec();
+            if rename.ident != "self" {
+                segments.push(rename.ident.to_string());
+            }
+            output.push((segments, Some(rename.rename.to_string())));
+        }
+        syn::UseTree::Glob(_) => {
+            let mut segments = prefix.to_vec();
+            segments.push("*".to_string());
+            output.push((segments, None));
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                ebd_4b1_flatten_use_tree(item, prefix, output);
+            }
+        }
+    }
+}
+
+fn ebd_4b1_collect_module_scope_inputs(
+    items: &[syn::Item],
+    inline_modules: &mut Vec<String>,
+    imports: &mut Vec<Ebd4b1ModuleUseStatement>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Use(item) => {
+                let mut flattened = Vec::new();
+                ebd_4b1_flatten_use_tree(&item.tree, &[], &mut flattened);
+                imports.extend(flattened.into_iter().map(|(segments, alias)| {
+                    Ebd4b1ModuleUseStatement {
+                        visibility: ebd_4b1_visibility(&item.vis),
+                        segments,
+                        alias,
+                        inline_modules: inline_modules.clone(),
+                    }
+                }));
+            }
+            syn::Item::Mod(item) => {
+                let Some((_, nested)) = &item.content else {
+                    continue;
+                };
+                inline_modules.push(item.ident.to_string());
+                ebd_4b1_collect_module_scope_inputs(nested, inline_modules, imports);
+                inline_modules.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn ebd_4b1_module_scope_inputs(
+    file: &syn::File,
+) -> (Vec<Ebd4b1ModuleUseStatement>, RustScopedAliases) {
+    let mut imports = Vec::new();
+    ebd_4b1_collect_module_scope_inputs(&file.items, &mut Vec::new(), &mut imports);
+
+    let mut aliases = RustScopedAliases::new();
+    for import in &imports {
+        let local_name = match import.alias.as_deref() {
+            Some("_") => None,
+            Some(alias) => Some(alias.to_string()),
+            None => import
+                .segments
+                .last()
+                .filter(|leaf| !matches!(leaf.as_str(), "*" | "crate" | "self" | "super"))
+                .cloned(),
+        };
+        let Some(local_name) = local_name else {
+            continue;
+        };
+        let target = RustScopedUsePath {
+            segments: import.segments.clone(),
+            inline_modules: import.inline_modules.clone(),
+        };
+        let targets = aliases
+            .entry((import.inline_modules.clone(), local_name))
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    (imports, aliases)
+}
+
+fn ebd_4b1_audit_extern_self_aliases(source: &GuardSource, file: &syn::File) -> BTreeSet<String> {
+    struct ExternSelfAliasAudit<'a> {
+        source_path: &'a str,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ExternSelfAliasAudit<'_> {
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            if item.ident == "self"
+                && let Some((_, rename)) = &item.rename
+            {
+                self.violations.insert(format!(
+                    "catalog-schema-extern-self-alias-forbidden: {}|{}",
+                    self.source_path, rename
+                ));
+            }
+        }
+    }
+
+    let mut audit = ExternSelfAliasAudit {
+        source_path: &source.path,
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, file);
+    audit.violations
+}
+
+fn ebd_4b1_canonical_schema_glob_scopes(
+    source: &GuardSource,
+    imports: &[Ebd4b1ModuleUseStatement],
+    aliases: &RustScopedAliases,
+) -> BTreeSet<Vec<String>> {
+    let mut scopes = BTreeSet::new();
+    for import in imports {
+        let Some(resolved) = resolve_forwarding_paths(
+            &import.segments,
+            &source.path,
+            &import.inline_modules,
+            aliases,
+            &mut BTreeSet::new(),
+            0,
+        ) else {
+            continue;
+        };
+        if resolved.into_iter().any(|target| {
+            rust_canonical_path_segments_in_scope(
+                &target.segments,
+                &source.path,
+                &target.inline_modules,
+            )
+            .is_some_and(|canonical| is_catalog_schema_glob_path(&canonical))
+        }) {
+            scopes.insert(import.inline_modules.clone());
+        }
+    }
+    scopes
+}
+
+fn ebd_4b1_direct_alias_rhs_path(ty: &syn::Type) -> Option<Vec<String>> {
+    match ty {
+        syn::Type::Paren(paren) => ebd_4b1_direct_alias_rhs_path(&paren.elem),
+        syn::Type::Group(group) => ebd_4b1_direct_alias_rhs_path(&group.elem),
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .all(|segment| matches!(segment.arguments, syn::PathArguments::None)) =>
+        {
+            Some(
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn ebd_4b1_macro_tokens(item: &syn::ItemMacro) -> Vec<String> {
+    rust_source_tokens(&item.mac.tokens.to_string())
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+fn ebd_4b1_matching_macro_group(tokens: &[String], open: usize) -> Option<usize> {
+    fn close_for(token: &str) -> Option<&'static str> {
+        match token {
+            "(" => Some(")"),
+            "[" => Some("]"),
+            "{" => Some("}"),
+            _ => None,
+        }
+    }
+
+    let mut expected = vec![close_for(tokens.get(open)?)?];
+    for (index, token) in tokens.iter().enumerate().skip(open + 1) {
+        if let Some(close) = close_for(token) {
+            expected.push(close);
+        } else if expected.last().is_some_and(|close| token == close) {
+            expected.pop();
+            if expected.is_empty() {
+                return Some(index);
+            }
+        } else if matches!(token.as_str(), ")" | "]" | "}") {
+            return None;
+        }
+    }
+    None
+}
+
+fn ebd_4b1_macro_rule_transcribers(item: &syn::ItemMacro) -> Vec<Vec<String>> {
+    if !item.mac.path.is_ident("macro_rules") || item.ident.is_none() {
+        return Vec::new();
+    }
+    let tokens = ebd_4b1_macro_tokens(item);
+    let mut transcribers = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if matches!(tokens[index].as_str(), "(" | "[" | "{") {
+            let Some(close) = ebd_4b1_matching_macro_group(&tokens, index) else {
+                break;
+            };
+            index = close + 1;
+            continue;
+        }
+        if tokens.get(index).is_some_and(|token| token == "=")
+            && tokens.get(index + 1).is_some_and(|token| token == ">")
+            && tokens
+                .get(index + 2)
+                .is_some_and(|token| matches!(token.as_str(), "(" | "[" | "{"))
+        {
+            let open = index + 2;
+            let Some(close) = ebd_4b1_matching_macro_group(&tokens, open) else {
+                break;
+            };
+            transcribers.push(tokens[open + 1..close].to_vec());
+            index = close + 1;
+            continue;
+        }
+        index += 1;
+    }
+    transcribers
+}
+
+fn ebd_4b1_macro_generated_definition(tokens: &[String]) -> Option<&str> {
+    const TYPE_NAMESPACE_ITEMS: &[&str] = &["enum", "struct", "union", "trait", "type", "mod"];
+    tokens.windows(2).find_map(|pair| {
+        (TYPE_NAMESPACE_ITEMS.contains(&pair[0].as_str()) && pair[1] == "SqlType")
+            .then_some(pair[0].as_str())
+    })
+}
+
+fn ebd_4b1_macro_generated_direct_aliases(tokens: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut aliases = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "type" {
+            continue;
+        }
+        let end = tokens[index + 1..]
+            .iter()
+            .position(|token| token == ";")
+            .map_or(tokens.len(), |offset| index + 1 + offset);
+        let alias = &tokens[index + 1..end];
+        let Some(equals) = alias.iter().position(|token| token == "=") else {
+            continue;
+        };
+        let Some(name) = alias.first() else {
+            continue;
+        };
+        let mut rhs_tokens = Vec::new();
+        let mut rhs_index = equals + 1;
+        while rhs_index < alias.len() {
+            if alias.get(rhs_index).is_some_and(|token| token == "$")
+                && alias
+                    .get(rhs_index + 1)
+                    .is_some_and(|token| token == "crate")
+            {
+                rhs_tokens.push("crate".to_string());
+                rhs_index += 2;
+            } else {
+                rhs_tokens.push(alias[rhs_index].clone());
+                rhs_index += 1;
+            }
+        }
+        let rhs = rhs_tokens.join(" ");
+        let Ok(rhs) = syn::parse_str::<syn::Type>(&rhs) else {
+            continue;
+        };
+        if let Some(path) = ebd_4b1_direct_alias_rhs_path(&rhs) {
+            aliases.push((name.clone(), path));
+        }
+    }
+    aliases
+}
+
+fn ebd_4b1_audit_definitions(sources: &[GuardSource]) -> BTreeSet<String> {
+    struct SqlTypeDefinitionAudit<'a> {
+        source_path: &'a str,
+        aliases: &'a RustScopedAliases,
+        canonical_glob_scopes: &'a BTreeSet<Vec<String>>,
+        inline_modules: Vec<String>,
+        allow_canonical_enum: bool,
+        canonical_enum_count: usize,
+        violations: BTreeSet<String>,
+    }
+
+    impl SqlTypeDefinitionAudit<'_> {
+        fn audit_direct_alias_target(&mut self, name: &str, path: &[String], kind: &str) {
+            let resolved = rust_resolve_scoped_paths(
+                path,
+                &self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: path.to_vec(),
+                    inline_modules: self.inline_modules.clone(),
+                }]
+            });
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    self.source_path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if is_catalog_schema_sql_type_path(&canonical)
+                    || is_legacy_ebd_4b1_sql_type_path(&canonical)
+                {
+                    self.violations.insert(format!(
+                        "{kind}: {}|{}|{}",
+                        self.source_path,
+                        name,
+                        canonical.join("::")
+                    ));
+                }
+            }
+            if path == ["SqlType"] && self.canonical_glob_scopes.contains(&self.inline_modules) {
+                self.violations.insert(format!(
+                    "{kind}: {}|{}|crate::catalog::schema::SqlType",
+                    self.source_path, name
+                ));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SqlTypeDefinitionAudit<'_> {
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if item.ident == "SqlType" {
+                if self.allow_canonical_enum {
+                    self.canonical_enum_count += 1;
+                } else {
+                    self.violations.insert(format!(
+                        "catalog-schema-secondary-enum: {}|SqlType",
+                        self.source_path
+                    ));
+                }
+            }
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "SqlType" {
+                self.violations.insert(format!(
+                    "catalog-schema-secondary-struct: {}|SqlType",
+                    self.source_path
+                ));
+            }
+        }
+
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if item.ident == "SqlType" {
+                self.violations.insert(format!(
+                    "catalog-schema-secondary-union: {}|SqlType",
+                    self.source_path
+                ));
+            }
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if item.ident == "SqlType" {
+                self.violations.insert(format!(
+                    "catalog-schema-secondary-trait: {}|SqlType",
+                    self.source_path
+                ));
+            }
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if item.ident == "SqlType" {
+                self.violations.insert(format!(
+                    "catalog-schema-type-alias: {}|SqlType",
+                    self.source_path
+                ));
+            }
+
+            if let Some(path) = ebd_4b1_direct_alias_rhs_path(&item.ty) {
+                self.audit_direct_alias_target(
+                    &item.ident.to_string(),
+                    &path,
+                    "catalog-schema-type-alias-target",
+                );
+            }
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            for transcriber in ebd_4b1_macro_rule_transcribers(item) {
+                if let Some(kind) = ebd_4b1_macro_generated_definition(&transcriber) {
+                    self.violations.insert(format!(
+                        "catalog-schema-macro-generated-definition: {}|{kind}|SqlType",
+                        self.source_path
+                    ));
+                }
+                for (name, path) in ebd_4b1_macro_generated_direct_aliases(&transcriber) {
+                    self.audit_direct_alias_target(
+                        &name,
+                        &path,
+                        "catalog-schema-macro-generated-alias",
+                    );
+                }
+            }
+        }
+
+        fn visit_item_fn(&mut self, _item: &'ast syn::ItemFn) {}
+
+        fn visit_item_impl(&mut self, _item: &'ast syn::ItemImpl) {}
+
+        fn visit_item_const(&mut self, _item: &'ast syn::ItemConst) {}
+
+        fn visit_item_static(&mut self, _item: &'ast syn::ItemStatic) {}
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if item.ident == "SqlType" {
+                self.violations.insert(format!(
+                    "catalog-schema-secondary-module: {}|SqlType",
+                    self.source_path
+                ));
+            }
+            let Some((_, items)) = &item.content else {
+                return;
+            };
+            self.inline_modules.push(item.ident.to_string());
+            for item in items {
+                syn::visit::Visit::visit_item(self, item);
+            }
+            self.inline_modules.pop();
+        }
+    }
+
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "catalog-schema-definition-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+        let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+        let canonical_glob_scopes =
+            ebd_4b1_canonical_schema_glob_scopes(source, &imports, &aliases);
+        let mut audit = SqlTypeDefinitionAudit {
+            source_path: &source.path,
+            aliases: &aliases,
+            canonical_glob_scopes: &canonical_glob_scopes,
+            inline_modules: Vec::new(),
+            allow_canonical_enum: source.path == EBD_4B1_OWNER,
+            canonical_enum_count: 0,
+            violations: ebd_4b1_audit_extern_self_aliases(source, &file),
+        };
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        if audit.allow_canonical_enum && audit.canonical_enum_count != 1 {
+            audit.violations.insert(format!(
+                "catalog-schema-canonical-enum-count: {}|expected=1 actual={}",
+                source.path, audit.canonical_enum_count
+            ));
+        }
+        violations.extend(audit.violations);
+    }
+    violations
+}
+
+fn ebd_4b1_audit_legacy_paths_and_forwarding(sources: &[GuardSource]) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    for source in sources {
+        let legacy_paths = rust_all_source_canonical_paths(&source.text, &source.path)
+            .into_iter()
+            .filter(|path| is_legacy_ebd_4b1_sql_type_path(path))
+            .collect::<BTreeSet<_>>();
+        for path in remove_redundant_descendant_paths(legacy_paths) {
+            violations.insert(format!(
+                "catalog-schema-legacy-path: {}|{}",
+                source.path,
+                path.join("::")
+            ));
+        }
+
+        if source.path == EBD_4B1_OWNER {
+            continue;
+        }
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "catalog-schema-forwarding-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+        let (imports, aliases) = ebd_4b1_module_scope_inputs(&file);
+        for import in imports {
+            let Some(resolved) = resolve_forwarding_paths(
+                &import.segments,
+                &source.path,
+                &import.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in resolved {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if import.visibility == "private" && is_catalog_schema_glob_path(&canonical) {
+                    violations.insert(format!(
+                        "catalog-schema-private-glob-import: {}|{}",
+                        source.path,
+                        canonical.join("::")
+                    ));
+                } else if import.visibility != "private"
+                    && is_catalog_schema_sql_type_forward_target(&canonical)
+                {
+                    violations.insert(format!(
+                        "catalog-schema-forwarding-reexport: {}|{}|{}",
+                        source.path,
+                        import.visibility,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+fn ebd_4b1_option_inner_path(ty: &syn::Type) -> Option<(Vec<String>, bool)> {
+    let syn::Type::Path(option) = ty else {
+        return None;
+    };
+    if option.qself.is_some() {
+        return None;
+    }
+    let outer_segments = option
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let plain_prelude = option.path.leading_colon.is_none() && outer_segments == ["Option"];
+    if !plain_prelude
+        && outer_segments != ["std", "option", "Option"]
+        && outer_segments != ["core", "option", "Option"]
+    {
+        return None;
+    }
+    if option
+        .path
+        .segments
+        .iter()
+        .take(option.path.segments.len().saturating_sub(1))
+        .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return None;
+    }
+    let option_segment = option.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(arguments) = &option_segment.arguments else {
+        return None;
+    };
+    if arguments.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(syn::Type::Path(inner)) = arguments.args.first()? else {
+        return None;
+    };
+    if inner.qself.is_some()
+        || inner
+            .path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return None;
+    }
+    Some((
+        inner
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+        plain_prelude,
+    ))
+}
+
+fn ebd_4b1_file_defines_root_type_name(file: &syn::File, name: &str) -> bool {
+    file.items.iter().any(|item| match item {
+        syn::Item::Enum(item) => item.ident == name,
+        syn::Item::Mod(item) => item.ident == name,
+        syn::Item::Struct(item) => item.ident == name,
+        syn::Item::Trait(item) => item.ident == name,
+        syn::Item::Type(item) => item.ident == name,
+        syn::Item::Union(item) => item.ident == name,
+        _ => false,
+    })
+}
+
+fn ebd_4b1_audit_column_def(source: &GuardSource) -> BTreeSet<String> {
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::from([format!(
+            "catalog-schema-column-def-parse-failed: {}",
+            source.path
+        )]);
+    };
+    let Some(column_def) = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item) if item.ident == "ColumnDef" => Some(item),
+        _ => None,
+    }) else {
+        return BTreeSet::from(["catalog-schema-column-def-missing".to_string()]);
+    };
+    let Some(field) = column_def.fields.iter().find(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == "logical_type")
+    }) else {
+        return BTreeSet::from(["catalog-schema-column-def-logical-type-missing".to_string()]);
+    };
+    let Some((inner_path, plain_prelude)) = ebd_4b1_option_inner_path(&field.ty) else {
+        return BTreeSet::from([
+            "catalog-schema-column-def-logical-type-must-be-Option-SqlType".to_string(),
+        ]);
+    };
+
+    let (_, aliases) = ebd_4b1_module_scope_inputs(&file);
+    if plain_prelude
+        && (aliases.contains_key(&(Vec::new(), "Option".to_string()))
+            || ebd_4b1_file_defines_root_type_name(&file, "Option"))
+    {
+        return BTreeSet::from([
+            "catalog-schema-column-def-logical-type-must-use-prelude-Option".to_string(),
+        ]);
+    }
+    let Some(resolved) =
+        rust_resolve_scoped_paths(&inner_path, &[], &aliases, &mut BTreeSet::new(), 0)
+    else {
+        return BTreeSet::from(
+            ["catalog-schema-column-def-logical-type-not-canonical".to_string()],
+        );
+    };
+    let canonical = resolved
+        .into_iter()
+        .map(|path| {
+            rust_canonical_path_segments_in_scope(
+                &path.segments,
+                &source.path,
+                &path.inline_modules,
+            )
+        })
+        .collect::<Option<Vec<_>>>();
+    if canonical.is_some_and(|paths| {
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| is_exact_catalog_schema_sql_type_path(path))
+    }) {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from(["catalog-schema-column-def-logical-type-not-canonical".to_string()])
+    }
+}
+
+fn ebd_4b1_collect_repo_sources() -> Vec<GuardSource> {
+    let repo = Path::new(manifest_dir());
+    let src = src_dir();
+    let mut sources = Vec::new();
+    for root in [&src, &repo.join("tests")] {
+        for path in rs_files(root) {
+            let source = rel(&path);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {source}: {error}"));
+            sources.push(GuardSource::new(&source, &text));
+        }
+    }
+    sources
+}
+
+#[test]
+fn ebd_4b1_catalog_logical_type_boundary_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let mut violations = BTreeSet::new();
+
+    if let Some(owner) = sources.iter().find(|source| source.path == EBD_4B1_OWNER) {
+        violations.extend(ebd_4b1_audit_schema_owner(owner));
+    } else {
+        violations.insert(format!("catalog-schema-owner-missing: {EBD_4B1_OWNER}"));
+    }
+    if let Some(catalog_mod) = sources
+        .iter()
+        .find(|source| source.path == "src/catalog/mod.rs")
+    {
+        violations.extend(ebd_4b1_audit_schema_module(catalog_mod));
+    } else {
+        violations.insert("catalog-schema-module-owner-missing: src/catalog/mod.rs".to_string());
+    }
+    if let Some(identifier) = sources.iter().find(|source| source.path == EBD_4A_OWNER) {
+        violations.extend(ebd_4a_audit_catalog_dependencies(identifier));
+    } else {
+        violations.insert(format!("catalog-identifier-owner-missing: {EBD_4A_OWNER}"));
+    }
+    if let Some(catalog) = sources
+        .iter()
+        .find(|source| source.path == "src/sql/catalog.rs")
+    {
+        violations.extend(ebd_4b1_audit_column_def(catalog));
+    } else {
+        violations
+            .insert("catalog-schema-column-def-owner-missing: src/sql/catalog.rs".to_string());
+    }
+    violations.extend(ebd_4b1_audit_definitions(&sources));
+    violations.extend(ebd_4b1_audit_legacy_paths_and_forwarding(&sources));
+
+    assert!(
+        violations.is_empty(),
+        "EBD-4B1 catalog logical type boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_4b1_detector_requires_exact_sql_type_shape_visibility_and_derives() {
+    let valid_text = r#"
+#[doc = "catalog type vocabulary"]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqlType {
+    #[doc = "tiny integer"]
+    TinyInt, SmallInt, Int, BigInt, LargeInt, Float, Double,
+    Decimal { #[doc = "precision"] precision: u8, scale: i8 },
+    String, Json, Binary, Bitmap, Hll, Boolean, Date, DateTime, DateTimeNs, Time,
+    Array(Box<SqlType>),
+    Map(Box<SqlType>, Box<SqlType>),
+    Struct(Vec<(String, SqlType)>),
+    Variant,
+}
+"#;
+    let valid = GuardSource::new(EBD_4B1_OWNER, valid_text);
+    assert!(
+        ebd_4b1_audit_schema_owner(&valid).is_empty(),
+        "exact enum fixture must pass"
+    );
+
+    let invalid = [
+        ("DateTimeNs,", ""),
+        ("scale: i8", "scale: i16"),
+        ("Map(Box<SqlType>, Box<SqlType>)", "Map(Box<SqlType>)"),
+        ("Struct(Vec<(String, SqlType)>)", "Struct(Vec<SqlType>)"),
+        ("Variant,", "Variant, Unknown,"),
+        ("Variant,", "#[cfg(any())] Variant,"),
+        ("precision: u8", "#[cfg(any())] precision: u8"),
+        (
+            "#[derive(Clone, Debug, PartialEq, Eq)]",
+            "#[cfg(any())]\n#[derive(Clone, Debug, PartialEq, Eq)]",
+        ),
+        (
+            "#[derive(Clone, Debug, PartialEq, Eq)]",
+            "#[cfg_attr(test, repr(u8))]\n#[derive(Clone, Debug, PartialEq, Eq)]",
+        ),
+        ("TinyInt,", "TinyInt = 1,"),
+        ("pub enum SqlType", "pub enum SqlType<T>"),
+        ("pub enum SqlType", "pub(crate) enum SqlType"),
+        (
+            "#[derive(Clone, Debug, PartialEq, Eq)]",
+            "#[derive(Clone, Debug, PartialEq)]",
+        ),
+    ];
+    for (from, to) in invalid {
+        let source = GuardSource::new(EBD_4B1_OWNER, &valid_text.replace(from, to));
+        assert!(
+            !ebd_4b1_audit_schema_owner(&source).is_empty(),
+            "invalid exact enum fixture passed: {from:?} -> {to:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b1_detector_seals_schema_dependencies_without_weakening_identifier() {
+    let valid = GuardSource::new(
+        EBD_4B1_OWNER,
+        r###"
+use std::fmt;
+use core::cmp;
+use alloc::string::String;
+// use crate::engine::StandaloneState;
+const TEXT: &str = "crate::sql::SqlType iceberg::spec::Literal";
+const RAW: &str = r#"arrow::datatypes::DataType"#;
+fn local(_: String) { let _ = (fmt::Error, cmp::Ordering::Equal); }
+"###,
+    );
+    let valid_violations = ebd_4b1_audit_schema_dependencies(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "valid std-only schema fixture was rejected: {valid_violations:?}"
+    );
+
+    for text in [
+        "use crate::sql::SqlType;",
+        "use crate::engine::StandaloneState;",
+        "use iceberg::spec::Literal;",
+        "fn bad(_: arrow::datatypes::DataType) {}",
+    ] {
+        let invalid = GuardSource::new(EBD_4B1_OWNER, text);
+        assert!(
+            !ebd_4b1_audit_schema_dependencies(&invalid).is_empty(),
+            "forbidden schema dependency passed: {text}"
+        );
+    }
+
+    let identifier_valid = GuardSource::new(
+        EBD_4A_OWNER,
+        "use crate::catalog::identifier::TableIdentity; fn local(_: TableIdentity) {}",
+    );
+    assert!(ebd_4a_audit_catalog_dependencies(&identifier_valid).is_empty());
+    let identifier_invalid = GuardSource::new(
+        EBD_4A_OWNER,
+        "use crate::engine::StandaloneState; fn bad(_: StandaloneState) {}",
+    );
+    assert!(!ebd_4a_audit_catalog_dependencies(&identifier_invalid).is_empty());
+}
+
+#[test]
+fn ebd_4b1_detector_rejects_legacy_definitions_paths_and_forwarding() {
+    let allowed = [
+        GuardSource::new(
+            "src/runtime/query_result.rs",
+            r###"
+use crate::catalog::schema::SqlType;
+// use crate::sql::SqlType;
+const TEXT: &str = "crate::sql::parser::ast::SqlType";
+const RAW: &str = r#"pub use crate::catalog::schema::SqlType"#;
+struct SqlTypeInfo;
+type SqlTypeFactory = fn() -> SqlType;
+type Validator = fn(&SqlType) -> bool;
+type SqlTypeCollection = Vec<SqlType>;
+"###,
+        ),
+        GuardSource::new(
+            "src/catalog/function_scope_noise.rs",
+            r#"
+use crate::catalog::schema::SqlType;
+fn local_aliases() {
+    use arrow::datatypes::DataType as SqlType;
+    pub use crate::catalog::schema::SqlType as LocalForward;
+    let _ = std::mem::size_of::<SqlType>();
+}
+fn local_option_alias() { use std::result::Result as Option; }
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/private_visibility.rs",
+            r#"
+pub(self) use crate::catalog::schema::SqlType as SelfType;
+pub(in self) use crate::catalog::schema::SqlType as InSelfType;
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/macro_consumer.rs",
+            r#"
+use crate::catalog::schema::SqlType;
+fn consume(value: SqlType) { let _ = matches!(value, SqlType::Int); }
+macro_rules! consume_type { ($ty:ty) => { const _: usize = std::mem::size_of::<$ty>(); } }
+consume_type!(Vec<SqlType>);
+macro_rules! assert_impl { ($ty:ty) => {} }
+assert_impl!(SqlType);
+macro_rules! composite_alias { () => { type Collection = Vec<crate::catalog::schema::SqlType>; } }
+composite_alias!();
+macro_rules! matcher_only { (type CatalogType = crate::catalog::schema::SqlType;) => {} }
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B1_OWNER,
+            "#[derive(Clone, Debug, PartialEq, Eq)] pub enum SqlType { TinyInt }",
+        ),
+    ];
+    assert!(ebd_4b1_audit_definitions(&allowed).is_empty());
+    assert!(ebd_4b1_audit_legacy_paths_and_forwarding(&allowed).is_empty());
+
+    let invalid = [
+        GuardSource::new("src/sql/parser/ast/mod.rs", "pub enum SqlType { Int }"),
+        GuardSource::new(
+            "src/server/direct.rs",
+            "use crate::sql::SqlType; fn direct(_: SqlType) {}",
+        ),
+        GuardSource::new(
+            "src/server/grouped.rs",
+            "use crate::sql::{SqlType, catalog::ColumnDef}; fn grouped(_: SqlType) {}",
+        ),
+        GuardSource::new(
+            "src/server/alias.rs",
+            "use crate::sql::parser::ast::SqlType as Legacy; fn alias(_: Legacy) {}",
+        ),
+        GuardSource::new(
+            "src/server/nested.rs",
+            "mod nested { use crate::sql::SqlType; type Local = SqlType; }",
+        ),
+        GuardSource::new(
+            "src/server/test_only.rs",
+            "#[cfg(test)] mod tests { use crate::sql::SqlType as Legacy; fn test(_: Legacy) {} }",
+        ),
+        GuardSource::new(
+            "src/catalog/alias.rs",
+            "pub(crate) type SqlType = crate::catalog::schema::SqlType;",
+        ),
+        GuardSource::new(
+            "src/catalog/canonical_named_alias.rs",
+            "pub(crate) type CatalogType = crate::catalog::schema::SqlType;",
+        ),
+        GuardSource::new(
+            "src/catalog/canonical_short_alias.rs",
+            "use crate::catalog::schema::SqlType; pub(crate) type CatalogType = SqlType;",
+        ),
+        GuardSource::new(
+            "src/catalog/canonical_parenthesized_alias.rs",
+            "use crate::catalog::schema::SqlType; pub(crate) type CatalogType = (SqlType);",
+        ),
+        GuardSource::new(
+            "src/catalog/legacy_named_alias.rs",
+            "use crate::sql::SqlType as OldType; type LegacyCatalogType = OldType;",
+        ),
+        GuardSource::new(
+            "src/catalog/test_named_alias.rs",
+            "#[cfg(test)] mod tests { use crate::catalog::schema::SqlType as Canonical; type TestCatalogType = Canonical; }",
+        ),
+        GuardSource::new(
+            "src/catalog/glob_named_alias.rs",
+            "use crate::catalog::schema::*; pub(crate) type CatalogType = SqlType;",
+        ),
+        GuardSource::new("src/catalog/struct_owner.rs", "struct SqlType;"),
+        GuardSource::new("src/catalog/union_owner.rs", "union SqlType { value: u64 }"),
+        GuardSource::new("src/catalog/trait_owner.rs", "trait SqlType {}"),
+        GuardSource::new("src/catalog/module_owner.rs", "mod SqlType {}"),
+        GuardSource::new(
+            "src/catalog/forward.rs",
+            r#"
+pub use crate::catalog::schema::SqlType;
+pub(crate) use crate::catalog::schema::{SqlType as CatalogType};
+pub(in crate::catalog) use crate::catalog::schema::SqlType as InCatalogType;
+mod nested { pub(super) use crate::catalog::schema::SqlType as NestedType; }
+#[cfg(test)] mod tests { pub(crate) use crate::catalog::schema::SqlType as TestType; }
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/glob_forward.rs",
+            r#"
+pub(crate) use crate::catalog::schema::*;
+mod nested { pub(super) use crate::catalog::schema::*; }
+#[cfg(test)] mod tests { pub use crate::catalog::schema::*; }
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/module_forward.rs",
+            r#"
+pub(crate) use crate::catalog::schema;
+pub use crate::catalog::schema as catalog_schema;
+pub(super) use crate::catalog::{schema};
+mod nested { pub(crate) use crate::catalog::schema; }
+#[cfg(test)] mod tests { pub use crate::catalog::schema as test_schema; }
+"#,
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_private.rs",
+            "extern crate self as nr;",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_pub_self.rs",
+            "pub(self) extern crate self as nr;",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_pub_in_self.rs",
+            "pub(in self) extern crate self as nr;",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_pub_crate.rs",
+            "pub(crate) extern crate self as nr;",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_public.rs",
+            "pub extern crate self as nr;",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_nested.rs",
+            "mod nested { extern crate self as nr; pub(crate) use nr::catalog::schema::SqlType as NestedType; }",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_cfg.rs",
+            "#[cfg(test)] mod tests { extern crate self as nr; }",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_function.rs",
+            "fn local() { extern crate self as nr; let _: nr::sql::SqlType; }",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_block.rs",
+            "fn local() { { extern crate self as nr; let _: nr::sql::SqlType; } }",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_impl.rs",
+            "struct Holder; impl Holder { fn method() { extern crate self as nr; let _: nr::sql::SqlType; } }",
+        ),
+        GuardSource::new(
+            "src/catalog/extern_self_const.rs",
+            "const LOCAL: () = { extern crate self as nr; let _: Option<nr::sql::SqlType> = None; };",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_struct.rs",
+            "macro_rules! shadow { () => { struct SqlType; } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_enum.rs",
+            "macro_rules! shadow { () => { enum SqlType { Int } } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_union.rs",
+            "macro_rules! shadow { () => { union SqlType { value: u64 } } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_trait.rs",
+            "macro_rules! shadow { () => { trait SqlType {} } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_type.rs",
+            "macro_rules! shadow { () => { type SqlType = u64; } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_mod.rs",
+            "macro_rules! shadow { () => { mod SqlType {} } } shadow!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_alias.rs",
+            "macro_rules! aliases { () => { type CatalogType = crate::catalog::schema::SqlType; } } aliases!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_short_alias.rs",
+            "use crate::catalog::schema::SqlType; macro_rules! aliases { () => { type CatalogType = SqlType; } } aliases!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_glob_alias.rs",
+            "use crate::catalog::schema::*; macro_rules! aliases { () => { type CatalogType = SqlType; } } aliases!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_legacy_alias.rs",
+            "use crate::sql::SqlType as Legacy; macro_rules! aliases { () => { type CatalogType = Legacy; } } aliases!();",
+        ),
+        GuardSource::new(
+            "src/catalog/macro_generated_dollar_crate_alias.rs",
+            r#"
+macro_rules! aliases {
+    (first) => { type CatalogType = $crate::catalog::schema::SqlType; };
+    (second) => {{ type NestedCatalogType = ($crate::catalog::schema::SqlType); }};
+}
+"#,
+        ),
+    ];
+    let definitions = ebd_4b1_audit_definitions(&invalid);
+    assert!(definitions.iter().any(|item| {
+        item == "catalog-schema-secondary-enum: src/sql/parser/ast/mod.rs|SqlType"
+    }));
+    assert!(
+        definitions
+            .iter()
+            .any(|item| item == "catalog-schema-type-alias: src/catalog/alias.rs|SqlType")
+    );
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/canonical_named_alias.rs|CatalogType")
+            && item.contains("crate::catalog::schema::SqlType")
+    }));
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/canonical_short_alias.rs|CatalogType")
+            && item.contains("crate::catalog::schema::SqlType")
+    }));
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/canonical_parenthesized_alias.rs|CatalogType")
+            && item.contains("crate::catalog::schema::SqlType")
+    }));
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/legacy_named_alias.rs|LegacyCatalogType")
+            && item.contains("crate::sql::SqlType")
+    }));
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/test_named_alias.rs|TestCatalogType")
+            && item.contains("crate::catalog::schema::SqlType")
+    }));
+    assert!(definitions.iter().any(|item| {
+        item.contains("src/catalog/glob_named_alias.rs|CatalogType")
+            && item.contains("crate::catalog::schema::SqlType")
+    }));
+    for (path, kind) in [
+        ("struct_owner.rs", "struct"),
+        ("union_owner.rs", "union"),
+        ("trait_owner.rs", "trait"),
+        ("module_owner.rs", "module"),
+    ] {
+        assert!(
+            definitions.iter().any(|item| {
+                item.contains(path) && item.contains(kind) && item.contains("SqlType")
+            }),
+            "secondary {kind} owner fixture was missed: {definitions:?}"
+        );
+    }
+
+    let paths = ebd_4b1_audit_legacy_paths_and_forwarding(&invalid);
+    for path in [
+        "direct.rs",
+        "grouped.rs",
+        "alias.rs",
+        "nested.rs",
+        "test_only.rs",
+    ] {
+        assert!(
+            paths
+                .iter()
+                .any(|item| item.contains(path) && item.starts_with("catalog-schema-legacy-path:")),
+            "legacy path fixture was missed: {path}; got {paths:?}"
+        );
+    }
+    for visibility in [
+        "|pub|",
+        "|pub(crate)|",
+        "|pub(in crate::catalog)|",
+        "|pub(super)|",
+    ] {
+        assert!(
+            paths
+                .iter()
+                .any(|item| item.contains("forward") && item.contains(visibility)),
+            "forwarding visibility fixture was missed: {visibility}; got {paths:?}"
+        );
+    }
+    assert!(paths.iter().any(|item| {
+        item.contains("src/catalog/forward.rs") && item.contains("catalog::schema::SqlType")
+    }));
+    for visibility in ["|pub|", "|pub(crate)|", "|pub(super)|"] {
+        assert!(
+            paths.iter().any(|item| {
+                item.contains("src/catalog/glob_forward.rs")
+                    && item.contains(visibility)
+                    && item.contains("catalog::schema::*")
+            }),
+            "canonical schema glob fixture was missed: {visibility}; got {paths:?}"
+        );
+    }
+    for visibility in ["|pub|", "|pub(crate)|", "|pub(super)|"] {
+        assert!(
+            paths.iter().any(|item| {
+                item.contains("src/catalog/module_forward.rs")
+                    && item.contains(visibility)
+                    && item.ends_with("crate::catalog::schema")
+            }),
+            "canonical schema module forwarding fixture was missed: {visibility}; got {paths:?}"
+        );
+    }
+    assert!(paths.iter().any(|item| {
+        item.starts_with("catalog-schema-private-glob-import:")
+            && item.contains("src/catalog/glob_named_alias.rs")
+    }));
+    for path in [
+        "extern_self_private.rs",
+        "extern_self_pub_self.rs",
+        "extern_self_pub_in_self.rs",
+        "extern_self_pub_crate.rs",
+        "extern_self_public.rs",
+        "extern_self_nested.rs",
+        "extern_self_cfg.rs",
+        "extern_self_function.rs",
+        "extern_self_block.rs",
+        "extern_self_impl.rs",
+        "extern_self_const.rs",
+    ] {
+        assert!(
+            definitions.iter().any(|item| item
+                .starts_with("catalog-schema-extern-self-alias-forbidden:")
+                && item.contains(path)),
+            "extern-self declaration fixture was missed: {path}; got {definitions:?}"
+        );
+    }
+    for kind in ["struct", "enum", "union", "trait", "type", "mod"] {
+        assert!(definitions.iter().any(|item| {
+            item.starts_with("catalog-schema-macro-generated-definition:")
+                && item.contains(&format!("macro_generated_{kind}.rs"))
+                && item.contains(&format!("|{kind}|SqlType"))
+        }));
+    }
+    for path in [
+        "macro_generated_alias.rs",
+        "macro_generated_short_alias.rs",
+        "macro_generated_glob_alias.rs",
+        "macro_generated_legacy_alias.rs",
+        "macro_generated_dollar_crate_alias.rs",
+    ] {
+        assert!(definitions.iter().any(|item| {
+            item.starts_with("catalog-schema-macro-generated-alias:") && item.contains(path)
+        }));
+    }
+    for name in ["CatalogType", "NestedCatalogType"] {
+        assert!(definitions.iter().any(|item| {
+            item.starts_with("catalog-schema-macro-generated-alias:")
+                && item.contains("macro_generated_dollar_crate_alias.rs")
+                && item.contains(name)
+        }));
+    }
+}
+
+#[test]
+fn ebd_4b1_detector_requires_file_backed_module_and_canonical_column_field() {
+    let module = GuardSource::new("src/catalog/mod.rs", "pub(crate) mod schema;");
+    assert!(ebd_4b1_audit_schema_module(&module).is_empty());
+    for invalid in [
+        "mod schema;",
+        "pub mod schema;",
+        "pub(crate) mod schema {}",
+        "#[path = \"other.rs\"] pub(crate) mod schema;",
+        "#[cfg(test)] pub(crate) mod schema;",
+        "#[cfg_attr(test, path = \"test.rs\")] pub(crate) mod schema;",
+    ] {
+        assert!(
+            !ebd_4b1_audit_schema_module(&GuardSource::new("src/catalog/mod.rs", invalid,))
+                .is_empty()
+        );
+    }
+
+    let canonical = GuardSource::new(
+        "src/sql/catalog.rs",
+        "use crate::catalog::schema::SqlType; pub struct ColumnDef { pub logical_type: Option<SqlType> }",
+    );
+    assert!(ebd_4b1_audit_column_def(&canonical).is_empty());
+    let canonical_with_function_scope_noise = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+use crate::catalog::schema::SqlType;
+pub struct ColumnDef { pub logical_type: Option<SqlType> }
+fn local_aliases() {
+    use arrow::datatypes::DataType as SqlType;
+    use std::result::Result as Option;
+}
+"#,
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&canonical_with_function_scope_noise).is_empty(),
+        "function-local aliases must not pollute root ColumnDef resolution"
+    );
+    let canonical_qualified = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: Option<crate::catalog::schema::SqlType> }",
+    );
+    assert!(ebd_4b1_audit_column_def(&canonical_qualified).is_empty());
+    let canonical_std_option = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: std::option::Option<crate::catalog::schema::SqlType> }",
+    );
+    assert!(ebd_4b1_audit_column_def(&canonical_std_option).is_empty());
+    let canonical_core_option = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: core::option::Option<crate::catalog::schema::SqlType> }",
+    );
+    assert!(ebd_4b1_audit_column_def(&canonical_core_option).is_empty());
+    let legacy = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: Option<crate::sql::SqlType> }",
+    );
+    assert_eq!(
+        ebd_4b1_audit_column_def(&legacy),
+        BTreeSet::from(["catalog-schema-column-def-logical-type-not-canonical".to_string(),])
+    );
+    let custom_option = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: other::Option<crate::catalog::schema::SqlType> }",
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&custom_option)
+            .iter()
+            .any(|item| item.contains("Option"))
+    );
+    let descendant = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: Option<crate::catalog::schema::SqlType::Variant> }",
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&descendant)
+            .contains("catalog-schema-column-def-logical-type-not-canonical")
+    );
+    let ambiguous = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+use crate::catalog::schema::SqlType;
+use crate::sql::SqlType;
+pub struct ColumnDef { pub logical_type: Option<SqlType> }
+"#,
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&ambiguous)
+            .contains("catalog-schema-column-def-logical-type-not-canonical")
+    );
+    let imported_custom_option = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+use other::Option;
+use crate::catalog::schema::SqlType;
+pub struct ColumnDef { pub logical_type: Option<SqlType> }
+"#,
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&imported_custom_option)
+            .iter()
+            .any(|item| item.contains("Option"))
+    );
+    let local_custom_option = GuardSource::new(
+        "src/sql/catalog.rs",
+        r#"
+struct Option<T>(T);
+use crate::catalog::schema::SqlType;
+pub struct ColumnDef { pub logical_type: Option<SqlType> }
+"#,
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&local_custom_option)
+            .iter()
+            .any(|item| item.contains("Option"))
+    );
+    let qself_inner = GuardSource::new(
+        "src/sql/catalog.rs",
+        "pub struct ColumnDef { pub logical_type: Option<<Wrapper as Trait>::SqlType> }",
+    );
+    assert!(
+        ebd_4b1_audit_column_def(&qself_inner)
+            .iter()
+            .any(|item| item.contains("Option"))
+    );
 }
 
 #[test]

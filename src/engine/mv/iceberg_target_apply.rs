@@ -45,7 +45,7 @@ pub(crate) const ICEBERG_MV_PROP_HIDDEN_COLUMNS: &str = "novarocks.mv.hidden-col
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-        data_type: crate::sql::parser::ast::SqlType::BigInt,
+        data_type: crate::catalog::schema::SqlType::BigInt,
         nullable: false,
         aggregation: None,
         default: None,
@@ -55,7 +55,7 @@ pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDe
 pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
-        data_type: crate::sql::parser::ast::SqlType::String,
+        data_type: crate::catalog::schema::SqlType::String,
         nullable: false,
         aggregation: None,
         default: None,
@@ -65,7 +65,7 @@ pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableCol
 pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
         name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-        data_type: crate::sql::parser::ast::SqlType::Int,
+        data_type: crate::catalog::schema::SqlType::Int,
         nullable: false,
         aggregation: None,
         default: None,
@@ -1741,7 +1741,7 @@ mod tests {
         let column = apply_key_table_column();
 
         assert_eq!(column.name, "__nova_base_row_id");
-        assert_eq!(column.data_type, crate::sql::parser::ast::SqlType::BigInt);
+        assert_eq!(column.data_type, crate::catalog::schema::SqlType::BigInt);
         assert!(!column.nullable);
         assert!(column.aggregation.is_none());
         assert!(column.default.is_none());
@@ -1752,7 +1752,7 @@ mod tests {
         let column = join_apply_key_table_column();
 
         assert_eq!(column.name, "__nova_join_row_key");
-        assert_eq!(column.data_type, crate::sql::parser::ast::SqlType::String);
+        assert_eq!(column.data_type, crate::catalog::schema::SqlType::String);
         assert!(!column.nullable);
         assert!(column.aggregation.is_none());
         assert!(column.default.is_none());
@@ -1766,7 +1766,7 @@ mod tests {
         assert!(!col.nullable);
         assert!(matches!(
             col.data_type,
-            crate::sql::parser::ast::SqlType::Int
+            crate::catalog::schema::SqlType::Int
         ));
     }
 

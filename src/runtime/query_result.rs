@@ -27,6 +27,7 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::schema::SqlType;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 
 #[derive(Clone, Debug)]
@@ -34,7 +35,7 @@ pub struct QueryResultColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
-    pub logical_type: Option<crate::sql::SqlType>,
+    pub logical_type: Option<SqlType>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,5 +175,29 @@ mod tests {
         assert_eq!(empty.row_count(), 0);
         assert_eq!(empty.chunks.len(), 1);
         assert_eq!(empty.columns[0].name, "status");
+    }
+
+    #[test]
+    fn query_result_column_preserves_logical_decimal_type() {
+        let column = QueryResultColumn {
+            name: "amount".to_string(),
+            data_type: DataType::Decimal128(38, -2),
+            nullable: true,
+            logical_type: Some(SqlType::Decimal {
+                precision: 38,
+                scale: -2,
+            }),
+        };
+
+        assert_eq!(column.name, "amount");
+        assert_eq!(column.data_type, DataType::Decimal128(38, -2));
+        assert!(column.nullable);
+        assert_eq!(
+            column.logical_type,
+            Some(SqlType::Decimal {
+                precision: 38,
+                scale: -2,
+            })
+        );
     }
 }

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::parser::ast::{SqlType, TableColumnDef};
+use crate::catalog::schema::SqlType;
+use crate::sql::parser::ast::TableColumnDef;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StarRocksPhysicalColumn {

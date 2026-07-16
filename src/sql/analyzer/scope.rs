@@ -58,8 +58,8 @@ pub(super) struct AnalyzerScope {
     /// consults this side-table to reject or special-case semantics that
     /// depend on the original StarRocks logical type. Keyed by lower-cased
     /// (qualifier, column) and the unqualified column name.
-    qualified_logical_types: HashMap<(String, String), crate::sql::SqlType>,
-    unqualified_logical_types: HashMap<String, crate::sql::SqlType>,
+    qualified_logical_types: HashMap<(String, String), crate::catalog::schema::SqlType>,
+    unqualified_logical_types: HashMap<String, crate::catalog::schema::SqlType>,
 }
 
 impl AnalyzerScope {
@@ -89,7 +89,7 @@ impl AnalyzerScope {
         &self,
         qualifier: Option<&str>,
         name: &str,
-    ) -> Option<crate::sql::SqlType> {
+    ) -> Option<crate::catalog::schema::SqlType> {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier
             && let Some(t) = self
@@ -108,7 +108,7 @@ impl AnalyzerScope {
     pub(super) fn logical_type_of_expr(
         &self,
         expr: &crate::sql::analysis::TypedExpr,
-    ) -> Option<crate::sql::SqlType> {
+    ) -> Option<crate::catalog::schema::SqlType> {
         if let crate::sql::analysis::ExprKind::ColumnRef {
             qualifier, column, ..
         } = &expr.kind

@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::parser::ast::SqlType;
+use crate::catalog::schema::SqlType;
 
 pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
     match data_type {
@@ -73,5 +73,98 @@ pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlTyp
             ))
         }
         other => Err(format!("unsupported MV output type: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+
+    use super::arrow_data_type_to_sql_type;
+    use crate::catalog::schema::SqlType;
+
+    #[test]
+    fn arrow_data_type_to_sql_type_preserves_scalar_contract() {
+        let cases = [
+            (DataType::Boolean, SqlType::Boolean),
+            (DataType::Int8, SqlType::TinyInt),
+            (DataType::Int16, SqlType::SmallInt),
+            (DataType::Int32, SqlType::Int),
+            (DataType::Int64, SqlType::BigInt),
+            (
+                DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+                SqlType::LargeInt,
+            ),
+            (
+                DataType::Decimal128(38, -2),
+                SqlType::Decimal {
+                    precision: 38,
+                    scale: -2,
+                },
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                SqlType::DateTimeNs,
+            ),
+        ];
+
+        for (arrow_type, expected) in cases {
+            assert_eq!(
+                arrow_data_type_to_sql_type(&arrow_type).expect("supported scalar type"),
+                expected,
+                "Arrow type {arrow_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_data_type_to_sql_type_preserves_nested_shape_and_order() {
+        let map_entries = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", DataType::Decimal128(20, -3), true)),
+        ]));
+        let nested = DataType::Struct(Fields::from(vec![
+            Arc::new(Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )),
+            Arc::new(Field::new(
+                "attrs",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Map(Arc::new(Field::new("entries", map_entries, false)), false),
+                    true,
+                ))),
+                true,
+            )),
+        ]));
+
+        assert_eq!(
+            arrow_data_type_to_sql_type(&nested).expect("supported nested type"),
+            SqlType::Struct(vec![
+                ("ts".to_string(), SqlType::DateTimeNs),
+                (
+                    "attrs".to_string(),
+                    SqlType::Array(Box::new(SqlType::Map(
+                        Box::new(SqlType::String),
+                        Box::new(SqlType::Decimal {
+                            precision: 20,
+                            scale: -3,
+                        }),
+                    ))),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn arrow_data_type_to_sql_type_rejects_null_exactly() {
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::Null),
+            Err("unsupported MV output type: Null".to_string())
+        );
     }
 }

@@ -254,9 +254,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, RwLock};
 
+    use crate::catalog::schema::SqlType;
     use crate::connector::scan_planning::{ScanHandle, Split, validate_split_connectors};
     use crate::sql::catalog::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::sql::{Literal, SqlType, TableColumnDef};
+    use crate::sql::{Literal, TableColumnDef};
 
     fn dummy_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
