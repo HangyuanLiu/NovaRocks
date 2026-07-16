@@ -46,6 +46,6 @@ All cases here run on **Iceberg v3** via `init.sql`'s
 dictionary metadata; a subsequent write advances the table snapshot so stale
 metadata must not change the rows returned by standalone SQL (see `stale`).
 
-The legacy 128-bit `LARGEINT` compressed-key cases that cannot be represented
-on Iceberg (`LARGEINT -> DECIMAL(38,0)` would lose the 128-bit range) live in
-the sibling **`low-cardinality-native`** suite on StarRocks native storage.
+The legacy compressed-key cases now live with the aggregate correctness cases
+in **`aggregate`**. Focused 128-bit `LARGEINT` statistics coverage lives in
+**`statistics`**.

@@ -15,14 +15,23 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- @catalog=lowcard_native_cat_${suite_uuid0}
-CREATE EXTERNAL CATALOG IF NOT EXISTS `lowcard_native_cat_${suite_uuid0}`
-PROPERTIES (
-    "type"="iceberg",
-    "iceberg.catalog.type"="${iceberg_catalog_type}",
-    "iceberg.catalog.warehouse"="${iceberg_catalog_warehouse}",
-    "aws.s3.access_key"="${oss_ak}",
-    "aws.s3.secret_key"="${oss_sk}",
-    "aws.s3.endpoint"="${oss_endpoint}",
-    "aws.s3.enable_path_style_access"="true"
+-- @tags=statistics,largeint,minmax
+-- Test Objective:
+-- Preserve 128-bit LARGEINT min-max statistics at both boundaries
+-- without coupling statistics collection to low-cardinality regressions.
+CREATE TABLE ${case_db}.largeint_minmax (
+    k LARGEINT NOT NULL
 );
+
+INSERT INTO ${case_db}.largeint_minmax VALUES
+    (-170141183460469231731687303715884105728),
+    (0),
+    (170141183460469231731687303715884105727);
+
+ANALYZE TABLE ${case_db}.largeint_minmax;
+
+-- @result_contains=min-max stats
+-- @skip_result_check=true
+EXPLAIN VERBOSE
+SELECT DISTINCT k
+FROM ${case_db}.largeint_minmax;
