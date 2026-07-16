@@ -696,12 +696,8 @@ mod tests {
             &BTreeSet::from([UniqueId { hi: 1, lo: 3 }, UniqueId { hi: 1, lo: 4 }])
         );
         assert!(aggregator_channel.consumers().is_empty());
-        assert_eq!(
-            plan.install_views[&remote_producer].channels()[&channel_id].producers()
-                [&producer_binding]
-                .expected_fragment_instances(),
-            &BTreeSet::from([UniqueId { hi: 1, lo: 4 }])
-        );
+        assert!(!plan.install_views.contains_key(&remote_producer));
+        assert!(plan.routing_shards.contains_key(&remote_producer));
         assert!(!plan.install_views.contains_key(&remote_consumer));
         assert!(plan.routing_shards.contains_key(&remote_consumer));
 
@@ -709,6 +705,13 @@ mod tests {
             .participant_installs(&plan)
             .expect("every core view has a matching routing shard");
         assert_eq!(installs.len(), plan.install_views.len());
+        assert_eq!(
+            installs
+                .iter()
+                .map(|(participant, _)| *participant)
+                .collect::<BTreeSet<_>>(),
+            plan.install_views.keys().copied().collect()
+        );
         assert!(installs.iter().all(|(participant, install)| {
             install.core_view() == &plan.install_views[participant]
                 && install.routing_shard() == &plan.routing_shards[participant]

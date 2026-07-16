@@ -1432,8 +1432,11 @@ mod tests {
         FragmentInstancePlacement, LiveBackendSnapshot, SchedulingPlan,
     };
     use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
     use crate::runtime_filter::deployment::compiler::compile;
+    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
+    use crate::runtime_filter::deployment::{
+        RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
+    };
     use crate::runtime_filter::materializer::codec::{ArtifactDecodeExpectations, decode_leaf};
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
@@ -2024,8 +2027,7 @@ mod tests {
         RuntimeFilterParticipantInstall::new(core_view, routing_shard)
     }
 
-    fn compiled_three_backend_all_of_aggregator_install()
-    -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
+    fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
         let consumer_binding = BindingId::new(11);
@@ -2158,7 +2160,7 @@ mod tests {
             replica_redundancy: 2,
             materialization: MaterializationPolicy::for_test(),
         };
-        let mut plan = compile(
+        compile(
             &graph,
             &scheduling,
             &edges,
@@ -2166,7 +2168,15 @@ mod tests {
             &policy,
             DeploymentEpoch::new(9),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn compiled_three_backend_all_of_aggregator_install()
+    -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let remote_producer = UniqueId { hi: 1, lo: 4 };
+        let mut plan = compiled_three_backend_all_of_plan();
         let aggregator = plan
             .routing_shards
             .iter()
@@ -3616,6 +3626,31 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn compiler_participant_installs_all_succeed() {
+        let plan = compiled_three_backend_all_of_plan();
+        let installs = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .expect("compiler projections pair into participant installs");
+
+        assert_eq!(installs.len(), plan.install_views.len());
+        for (participant, install) in installs {
+            let service = RuntimeFilterService::new_with_dependencies(
+                uid(0),
+                Arc::new(Clock(Instant::now())),
+                Arc::new(Events::default()),
+                MemTrackerMemoryAccount::new_root_for_test("compiler-participant-install"),
+            );
+            service.install(install).unwrap_or_else(|error| {
+                panic!(
+                    "compiler participant {} install must succeed: {:?}",
+                    participant.get(),
+                    error.kind()
+                )
+            });
+        }
     }
 
     #[test]

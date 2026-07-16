@@ -277,6 +277,11 @@ pub(crate) fn project_install_views(
     for (participant, channels) in per_participant {
         let mut channel_deployments = BTreeMap::new();
         for (channel_id, (producers, consumers)) in channels {
+            if consumers.is_empty()
+                && role_graph.channels[&channel_id].aggregator != Some(participant)
+            {
+                continue;
+            }
             let spec = &channel_specs[&channel_id];
             channel_deployments.insert(
                 channel_id,
@@ -296,6 +301,9 @@ pub(crate) fn project_install_views(
                     consumers,
                 ),
             );
+        }
+        if channel_deployments.is_empty() {
+            continue;
         }
         views.insert(
             participant,
@@ -587,23 +595,20 @@ mod tests {
     }
 
     #[test]
-    fn non_aggregator_producer_keeps_only_its_local_instances() {
+    fn source_only_non_aggregator_producer_stays_routing_only_until_rfd6() {
         let views = project_all_of_fixture().expect("projection succeeds");
 
+        assert!(!views.contains_key(&pid(7)));
+        assert!(!views.contains_key(&pid(13)));
         assert_eq!(
-            views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
+            views[&pid(2)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
                 .expected_fragment_instances(),
-            &BTreeSet::from([finst(7)])
+            &BTreeSet::from([finst(2), finst(7)])
         );
         assert_eq!(
-            views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
+            views[&pid(2)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
                 .expected_fragment_instances(),
-            &BTreeSet::from([finst(17)])
-        );
-        assert_eq!(
-            views[&pid(13)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
-                .expected_fragment_instances(),
-            &BTreeSet::from([finst(13)])
+            &BTreeSet::from([finst(13), finst(17)])
         );
     }
 
@@ -706,6 +711,7 @@ mod tests {
         channel_graph
             .producers
             .insert(participant, BTreeSet::from([BindingId::new(10)]));
+        channel_graph.aggregator = Some(participant);
         let mut role_graph = RoleGraph::default();
         role_graph.channels.insert(ChannelId::new(5), channel_graph);
 
@@ -857,14 +863,9 @@ mod tests {
             views.get(&consumer_participant).is_none(),
             "a participant with only a skipped remote consumer must get no view"
         );
-        // The producer's own participant still gets its producer-side deployment.
-        let producer_view = views
-            .get(&producer_participant)
-            .expect("producer participant has a view");
         assert!(
-            producer_view.channels()[&ChannelId::new(5)]
-                .producers()
-                .contains_key(&BindingId::new(10))
+            views.get(&producer_participant).is_none(),
+            "a source-only non-aggregator producer remains routing-only until RFD-6"
         );
     }
 }
