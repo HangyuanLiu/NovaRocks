@@ -217,6 +217,20 @@ impl StateStoreRuntime {
         }
     }
 
+    #[cfg(all(
+        feature = "mysql-state-store-provider",
+        feature = "state-store-test-hooks"
+    ))]
+    pub(crate) fn mysql_test_pool(
+        &self,
+        database: &str,
+    ) -> Result<Arc<dyn PoolLifecycle>, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => runtime.get_or_create_pool(database),
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
     #[cfg(feature = "mysql-state-store-provider")]
     pub(crate) fn mysql_test_pool_count(&self) -> Result<usize, StateStoreError> {
         match &self.inner {

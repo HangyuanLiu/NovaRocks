@@ -16,8 +16,10 @@
 // under the License.
 
 pub(crate) mod budget;
+pub(crate) mod changes;
 pub(crate) mod client;
 pub(crate) mod codec;
+pub(crate) mod commit;
 pub(crate) mod error;
 pub(crate) mod identity;
 #[cfg(feature = "state-store-test-hooks")]
@@ -88,13 +90,6 @@ impl MysqlStateStore {
             limits,
             metrics: Arc::new(StateStoreMetrics::new("mysql")),
         })
-    }
-
-    fn task_six_unavailable() -> StateStoreError {
-        StateStoreError::new(
-            StateStoreErrorKind::ProviderUnavailable,
-            "MySQL durable commit state is not initialized",
-        )
     }
 }
 
@@ -167,10 +162,10 @@ impl StateStore for MysqlStateStore {
 
     async fn poll_changes(
         &self,
-        _request: &ChangePollRequest,
+        request: &ChangePollRequest,
     ) -> Result<ChangePage, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Err(Self::task_six_unavailable())
+        changes::poll_changes(self.lease.pool(), &self.identity, request, &self.limits).await
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
@@ -180,9 +175,24 @@ impl StateStore for MysqlStateStore {
 
     async fn resolve_commit(
         &self,
-        _transaction_id: &TransactionId,
+        transaction_id: &TransactionId,
     ) -> Result<CommitResolution, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        Err(Self::task_six_unavailable())
+        let operation = self.lease.acquire_operation()?;
+        let codec = codec::MysqlCodec::new(self.limits.max_key_bytes)?;
+        let pool = self.lease.pool();
+        let transaction_id = *transaction_id;
+        let deadline = Instant::now() + self.limits.transaction_deadline;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _operation = operation;
+            let result = commit::resolve_commit(pool, &codec, &transaction_id, deadline).await;
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "MySQL commit resolution supervisor stopped unexpectedly",
+            )
+        })?
     }
 }

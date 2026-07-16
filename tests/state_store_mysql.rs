@@ -28,15 +28,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks::state_store::ContinuationToken;
+#[cfg(feature = "state-store-test-hooks")]
+use novarocks::state_store::mysql::test_support::{
+    MysqlChangeTestApi, MysqlCommitTestApi, MysqlOpenGatePhase, MysqlPostDispatchTestControl,
+    MysqlStatementTestApi, arm_mysql_open_gate,
+};
 use novarocks::state_store::mysql::test_support::{
     MysqlOccTestApi, MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
     MysqlTransactionTestApi, MysqlWriteTestApi, acquire_schema_advisory_lock, active_readiness,
     advisory_lock_name, apply_schema_mutation, is_schema_advisory_lock_free, schema_snapshot,
     schema_timeout_connection_is_destroyed, store_readiness_snapshot,
-};
-#[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::mysql::test_support::{
-    MysqlOpenGatePhase, MysqlStatementTestApi, arm_mysql_open_gate,
 };
 use novarocks::state_store::{
     CommitOutcome, Direction, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
@@ -201,6 +202,62 @@ fn shared_factory(store: Arc<dyn StateStore>) -> StateStoreFactory {
             Ok(StateStoreConformanceFixture::new(
                 store,
                 Arc::new(UnusedPostDispatch),
+            ))
+        })
+    })
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+struct MysqlPostDispatchController;
+
+#[cfg(feature = "state-store-test-hooks")]
+#[async_trait]
+impl PostDispatchController for MysqlPostDispatchController {
+    async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl> {
+        Box::new(MysqlPostDispatchControl {
+            inner: MysqlCommitTestApi::arm_shared_post_dispatch(matches!(
+                scenario,
+                PostDispatchScenario::LoseCommittedResponse
+            )),
+        })
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+struct MysqlPostDispatchControl {
+    inner: MysqlPostDispatchTestControl,
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[async_trait]
+impl PostDispatchControl for MysqlPostDispatchControl {
+    async fn wait_dispatched(&self) {
+        self.inner.wait_dispatched().await;
+    }
+
+    async fn wait_waiter_cancelled(&self) {
+        tokio::task::yield_now().await;
+    }
+
+    async fn allow_provider_progress(&self) {
+        self.inner.allow_provider_progress();
+    }
+
+    async fn release_response(&self) {}
+
+    async fn wait_inner_dropped(&self) {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn shared_post_dispatch_factory(store: Arc<dyn StateStore>) -> StateStoreFactory {
+    Rc::new(move || {
+        let store = Arc::clone(&store);
+        Box::pin(async move {
+            Ok(StateStoreConformanceFixture::new(
+                store,
+                Arc::new(MysqlPostDispatchController),
             ))
         })
     })
@@ -2751,3 +2808,366 @@ async fn mysql_store_readiness_cancellation_after_start_is_safely_disposed() {
         .await
         .expect("shutdown observer runtime");
 }
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn run_task6_change_case(test_name: &str, scenario: &str) {
+    let database = TestDatabase::provision(test_name, scenario);
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    MysqlChangeTestApi::run_scenario(&runtime, &database.name, store, scenario)
+        .await
+        .expect("run MySQL change scenario");
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn run_task6_commit_case(test_name: &str, scenario: &str) {
+    let database = TestDatabase::provision(test_name, scenario);
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    MysqlCommitTestApi::run_scenario(&runtime, &database.name, store, scenario)
+        .await
+        .expect("run MySQL commit scenario");
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn open_task6_shared_fixture(
+    test_name: &str,
+    suffix: &str,
+) -> (TestDatabase, StateStoreRuntime, Arc<dyn StateStore>) {
+    let database = TestDatabase::provision(test_name, suffix);
+    let runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    (database, runtime, store)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_commit_progresses_with_single_connection_pool() {
+    let database = TestDatabase::provision(
+        "mysql_commit_progresses_with_single_connection_pool",
+        "single_connection",
+    );
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let committed_key = key(Bytes::from_static(b"single-connection/commit"));
+    let mut writer = store
+        .begin_write(transaction_id(), "single connection commit")
+        .await
+        .expect("begin single-connection writer");
+    writer
+        .put(
+            committed_key.clone(),
+            value(Bytes::from_static(b"durable")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage single-connection mutation");
+    assert_committed(writer.commit().await);
+    let mut reader = store
+        .begin_read()
+        .await
+        .expect("begin single-connection verification read");
+    assert_eq!(
+        reader
+            .get(&committed_key)
+            .await
+            .expect("read single-connection commit")
+            .expect("single-connection key exists")
+            .value,
+        value(Bytes::from_static(b"durable"))
+    );
+    reader
+        .abort()
+        .await
+        .expect("abort single-connection verification read");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
+    let database = TestDatabase::provision("task6_predispatch_deadline", "predispatch_deadline");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 600)
+        .await
+        .expect("open MySQL state store");
+    let transaction_id = transaction_id();
+    let control = MysqlCommitTestApi::arm_shared_post_dispatch(false);
+    let mut writer = store
+        .begin_write(transaction_id, "pre-dispatch deadline")
+        .await
+        .expect("begin pre-dispatch deadline writer");
+    writer
+        .put(
+            key(Bytes::from_static(b"predispatch/deadline")),
+            value(Bytes::from_static(b"must-not-commit")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage pre-dispatch deadline mutation");
+    let waiter = tokio::spawn(async move { writer.commit().await });
+    control.wait_dispatched().await;
+    assert_eq!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve gated pre-dispatch commit"),
+        novarocks::state_store::CommitResolution::Unresolved
+    );
+    let outcome = waiter.await.expect("join pre-dispatch deadline waiter");
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::DefiniteFailure(ref error)
+                if error.kind() == StateStoreErrorKind::DeadlineExceeded
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve terminalized pre-dispatch commit"),
+        novarocks::state_store::CommitResolution::NotCommitted
+    );
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_auxiliary_statement_timeout_destroys_connection() {
+    let database = TestDatabase::provision("task6_aux_timeout", "aux_timeout");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let timed_out_connection =
+        MysqlCommitTestApi::auxiliary_statement_timeout_disposes(&runtime, &database.name)
+            .await
+            .expect("dispose timed-out auxiliary connection");
+    let replacement = active_readiness(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("checkout replacement auxiliary connection")
+        .connection_id;
+    assert_ne!(replacement, timed_out_connection);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_auxiliary_native_error_rolls_back_active_transaction() {
+    let database = TestDatabase::provision("task6_aux_rollback", "aux_rollback");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    MysqlCommitTestApi::auxiliary_native_error_rolls_back(&runtime, &database.name)
+        .await
+        .expect("rollback active auxiliary transaction after native error");
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_same_revision_change_pages() {
+    let (_database, mut runtime, store) =
+        open_task6_shared_fixture("task6_shared_same_revision", "same_revision_pages").await;
+    let factory = shared_factory(Arc::clone(&store));
+    common::state_store_conformance::same_revision_change_pages(&factory).await;
+    drop(factory);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_atomic_commit() {
+    let (_database, mut runtime, store) =
+        open_task6_shared_fixture("task6_shared_atomic", "shared_atomic").await;
+    let factory = shared_factory(Arc::clone(&store));
+    common::state_store_conformance::atomic_commit(&factory).await;
+    drop(factory);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_notification_delivery_faults() {
+    let (_database, mut runtime, store) =
+        open_task6_shared_fixture("task6_shared_notifications", "shared_notifications").await;
+    let factory = shared_factory(Arc::clone(&store));
+    common::state_store_conformance::notification_delivery_faults(&factory).await;
+    drop(factory);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_post_dispatch_response_loss_reconciles() {
+    let (_database, mut runtime, store) =
+        open_task6_shared_fixture("task6_shared_response_loss", "shared_response_loss").await;
+    let factory = shared_post_dispatch_factory(Arc::clone(&store));
+    common::state_store_conformance::post_dispatch_response_loss_reconciles(&factory).await;
+    drop(factory);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_shared_post_dispatch_cancel_waiter_reconciles() {
+    let (_database, mut runtime, store) =
+        open_task6_shared_fixture("task6_shared_cancel_waiter", "shared_cancel_waiter").await;
+    let factory = shared_post_dispatch_factory(Arc::clone(&store));
+    common::state_store_conformance::post_dispatch_cancel_waiter_reconciles(&factory).await;
+    drop(factory);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+macro_rules! task6_change_test {
+    ($name:ident, $scenario:literal) => {
+        #[cfg(feature = "state-store-test-hooks")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() {
+            run_task6_change_case(stringify!($name), $scenario).await;
+        }
+    };
+}
+
+macro_rules! task6_commit_test {
+    ($name:ident, $scenario:literal) => {
+        #[cfg(feature = "state-store-test-hooks")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() {
+            run_task6_commit_case(stringify!($name), $scenario).await;
+        }
+    };
+}
+
+task6_change_test!(
+    mysql_revision_assigns_one_revision_and_stable_key_sequences,
+    "revision_sequence"
+);
+task6_change_test!(
+    mysql_version_is_exact_big_endian_revision_and_sequence,
+    "version_encoding"
+);
+task6_change_test!(
+    mysql_change_poll_handles_empty_high_watermark_future_and_stale_cursor,
+    "cursor_boundaries"
+);
+task6_change_test!(
+    mysql_change_poll_reports_retention_gap_without_cleanup,
+    "retention_gap"
+);
+task6_change_test!(
+    mysql_change_poll_rejects_duplicate_revision_sequence_rows,
+    "duplicate_position"
+);
+task6_change_test!(
+    mysql_change_poll_rejects_cursor_and_sequence_gaps,
+    "cursor_sequence_gap"
+);
+
+task6_commit_test!(
+    mysql_commit_reservation_absent_becomes_own_pending,
+    "reservation_absent"
+);
+task6_commit_test!(
+    mysql_commit_reservation_returns_existing_committed_receipt,
+    "reservation_committed"
+);
+task6_commit_test!(
+    mysql_commit_reservation_rejects_not_committed_reuse,
+    "reservation_not_committed"
+);
+task6_commit_test!(
+    mysql_commit_reservation_never_steals_foreign_pending,
+    "reservation_foreign_pending"
+);
+task6_commit_test!(
+    mysql_commit_reservation_conflict_requires_authoritative_reload,
+    "reservation_reload"
+);
+task6_commit_test!(
+    mysql_commit_ledger_rejects_malformed_and_nonterminal_mutation,
+    "ledger_corruption"
+);
+task6_commit_test!(
+    mysql_atomic_commit_publishes_kv_change_revision_and_ledger_together,
+    "atomic_publication"
+);
+task6_commit_test!(
+    mysql_commit_error_after_dispatch_is_always_unknown,
+    "dispatch_error_unknown"
+);
+task6_commit_test!(
+    mysql_commit_success_response_loss_resolves_committed,
+    "response_loss"
+);
+task6_commit_test!(
+    mysql_reservation_deadline_is_bounded_and_terminalized,
+    "reservation_deadline"
+);
+task6_commit_test!(
+    mysql_commit_dispatch_deadline_returns_unknown_and_resolves,
+    "dispatch_deadline"
+);
+task6_commit_test!(
+    mysql_resolve_absent_persists_not_committed_before_return,
+    "resolve_absent"
+);
+task6_commit_test!(
+    mysql_resolve_and_reservation_race_has_one_stable_terminal,
+    "resolve_reservation_race"
+);
+task6_commit_test!(
+    mysql_cleanup_terminalizes_only_absent_or_own_pending,
+    "cleanup_own"
+);
+task6_commit_test!(
+    mysql_cleanup_preserves_foreign_pending_and_terminal_states,
+    "cleanup_foreign"
+);
+task6_commit_test!(
+    mysql_cleanup_outlives_waiter_and_holds_runtime_guard,
+    "cleanup_guard"
+);
+task6_commit_test!(
+    mysql_prepare_error_cannot_mask_authoritative_committed_receipt,
+    "prepare_fallback"
+);
+task6_commit_test!(
+    mysql_resolution_deadline_never_fabricates_not_committed,
+    "resolution_deadline"
+);

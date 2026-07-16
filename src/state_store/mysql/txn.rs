@@ -58,6 +58,12 @@ pub(super) struct OwnedMysqlTransaction {
     statement_in_flight: bool,
 }
 
+enum NativeDataCommitOutcome {
+    Committed,
+    BeforeDispatchFailure(StateStoreError),
+    Unknown(StateStoreError),
+}
+
 pub(super) struct MysqlReadTransaction {
     commands: Option<mpsc::Sender<ReadCommand>>,
     limits: StateStoreLimits,
@@ -100,6 +106,7 @@ pub(super) struct MysqlWriteTransaction {
 }
 
 struct MysqlWriteActorState {
+    pool: Arc<dyn PoolLifecycle>,
     transaction: Option<OwnedMysqlTransaction>,
     codec: MysqlCodec,
     limits: StateStoreLimits,
@@ -338,7 +345,8 @@ async fn initialize_write_actor(
     deadline: Instant,
 ) -> Result<MysqlWriteActorState, StateStoreError> {
     let budget = TransactionBudget::new(limits.clone())?;
-    let mut transaction = OwnedMysqlTransaction::begin(pool, operation, deadline).await?;
+    let mut transaction =
+        OwnedMysqlTransaction::begin(Arc::clone(&pool), operation, deadline).await?;
     #[cfg(feature = "state-store-test-hooks")]
     {
         let connection_id: Option<u64> = transaction
@@ -361,6 +369,7 @@ async fn initialize_write_actor(
     let base_revision =
         codec.decode_revision(revision_bytes.as_deref().ok_or_else(persisted_corruption)?)?;
     Ok(MysqlWriteActorState {
+        pool,
         transaction: Some(transaction),
         codec,
         limits: limits.clone(),
@@ -656,10 +665,25 @@ impl OwnedMysqlTransaction {
         operation: MysqlRuntimeGuard,
         deadline: Instant,
     ) -> Result<Self, StateStoreError> {
+        Self::begin_with_operation(pool, Some(operation), deadline).await
+    }
+
+    async fn begin_without_operation(
+        pool: Arc<dyn PoolLifecycle>,
+        deadline: Instant,
+    ) -> Result<Self, StateStoreError> {
+        Self::begin_with_operation(pool, None, deadline).await
+    }
+
+    async fn begin_with_operation(
+        pool: Arc<dyn PoolLifecycle>,
+        operation: Option<MysqlRuntimeGuard>,
+        deadline: Instant,
+    ) -> Result<Self, StateStoreError> {
         let connection = checkout_hygienic_connection(pool, deadline).await?;
         let mut transaction = Self {
             connection: Some(connection),
-            operation: Some(operation),
+            operation,
             deadline,
             active: false,
             statement_in_flight: false,
@@ -695,6 +719,11 @@ impl OwnedMysqlTransaction {
         }
         transaction.active = true;
         Ok(transaction)
+    }
+
+    async fn rollback_for_reservation(mut self) -> Result<MysqlRuntimeGuard, StateStoreError> {
+        self.rollback_inner().await?;
+        self.operation.take().ok_or_else(transaction_finished)
     }
 
     pub(super) async fn run<T>(
@@ -741,28 +770,44 @@ impl OwnedMysqlTransaction {
         result
     }
 
-    async fn commit_native(mut self) -> Result<(), StateStoreError> {
+    async fn commit_native(mut self) -> NativeDataCommitOutcome {
         if !self.active {
-            return Err(transaction_finished());
+            return NativeDataCommitOutcome::BeforeDispatchFailure(transaction_finished());
         }
-        let connection = self.connection.take().ok_or_else(transaction_finished)?;
+        let Some(connection) = self.connection.take() else {
+            return NativeDataCommitOutcome::BeforeDispatchFailure(transaction_finished());
+        };
         self.statement_in_flight = true;
-        let result = execute_owned_with_deadline(connection, self.deadline, |connection| {
-            Box::pin(connection.query_drop("COMMIT"))
-        })
+        let result = super::commit::NativeCommitDispatcher::dispatch(
+            &super::commit::MysqlNativeCommitDispatcher,
+            connection,
+            self.deadline,
+        )
         .await;
         self.statement_in_flight = false;
         self.active = false;
-        match result {
-            Ok((connection, Ok(()))) => {
+        match result.result {
+            Ok(()) => {
+                let Some(connection) = result.connection else {
+                    return NativeDataCommitOutcome::Unknown(transaction_finished());
+                };
                 self.connection = Some(connection);
-                Ok(())
+                NativeDataCommitOutcome::Committed
             }
-            Ok((connection, Err(error))) => {
-                connection.destroy().await;
-                Err(error.into_public())
+            Err(error) if result.phase == super::commit::NativeCommitPhase::BeforeDispatch => {
+                let Some(connection) = result.connection else {
+                    return NativeDataCommitOutcome::BeforeDispatchFailure(error);
+                };
+                self.connection = Some(connection);
+                self.active = true;
+                match self.rollback_inner().await {
+                    Ok(()) => NativeDataCommitOutcome::BeforeDispatchFailure(error),
+                    Err(rollback_error) => {
+                        NativeDataCommitOutcome::BeforeDispatchFailure(rollback_error)
+                    }
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => NativeDataCommitOutcome::Unknown(error),
         }
     }
 
@@ -772,7 +817,10 @@ impl OwnedMysqlTransaction {
         }
         let connection = self.connection.take().ok_or_else(transaction_finished)?;
         self.statement_in_flight = true;
-        let result = execute_owned_with_deadline(connection, self.deadline, |connection| {
+        let cleanup_deadline = self
+            .deadline
+            .max(Instant::now() + std::time::Duration::from_secs(1));
+        let result = execute_owned_with_deadline(connection, cleanup_deadline, |connection| {
             Box::pin(connection.query_drop("ROLLBACK"))
         })
         .await;
@@ -1325,7 +1373,72 @@ impl WriteTransaction for MysqlWriteTransaction {
 
 impl MysqlWriteActorState {
     async fn commit_inner(&mut self) -> CommitOutcome {
-        let result = self.prepare_and_apply_commit().await;
+        let reservation_token = super::commit::new_reservation_token();
+        let deadline = match self.transaction() {
+            Ok(transaction) => transaction.deadline,
+            Err(error) => return CommitOutcome::DefiniteFailure(error),
+        };
+        let operation = match self.take_transaction() {
+            Ok(transaction) => match transaction.rollback_for_reservation().await {
+                Ok(operation) => operation,
+                Err(error) => return CommitOutcome::DefiniteFailure(error),
+            },
+            Err(error) => return CommitOutcome::DefiniteFailure(error),
+        };
+        let _operation = operation;
+        let reservation = super::commit::reserve_commit(
+            Arc::clone(&self.pool),
+            &self.codec,
+            self.transaction_id,
+            reservation_token,
+            deadline,
+        )
+        .await;
+        match reservation {
+            Ok(super::commit::ReservationDecision::Committed(receipt)) => {
+                return CommitOutcome::Committed(receipt);
+            }
+            Ok(super::commit::ReservationDecision::Reserved) => {}
+            Err(error) => {
+                let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+                return match super::commit::terminalize_undispatched(
+                    Arc::clone(&self.pool),
+                    &self.codec,
+                    self.transaction_id,
+                    reservation_token,
+                    cleanup_deadline,
+                )
+                .await
+                {
+                    Ok(()) => classify_prepare_error(error),
+                    Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
+                };
+            }
+        }
+
+        let transaction =
+            match OwnedMysqlTransaction::begin_without_operation(Arc::clone(&self.pool), deadline)
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+                    return match super::commit::terminalize_undispatched(
+                        Arc::clone(&self.pool),
+                        &self.codec,
+                        self.transaction_id,
+                        reservation_token,
+                        cleanup_deadline,
+                    )
+                    .await
+                    {
+                        Ok(()) => classify_prepare_error(error),
+                        Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
+                    };
+                }
+            };
+        self.transaction = Some(transaction);
+        let result = self.prepare_and_apply_commit(reservation_token).await;
         match result {
             Ok(revision) => {
                 let transaction = match self.take_transaction() {
@@ -1333,11 +1446,26 @@ impl MysqlWriteActorState {
                     Err(error) => return CommitOutcome::DefiniteFailure(error),
                 };
                 match transaction.commit_native().await {
-                    Ok(()) => CommitOutcome::Committed(CommitReceipt {
+                    NativeDataCommitOutcome::Committed => CommitOutcome::Committed(CommitReceipt {
                         transaction_id: self.transaction_id,
                         revision,
                     }),
-                    Err(error) => CommitOutcome::CommitUnknown(error),
+                    NativeDataCommitOutcome::BeforeDispatchFailure(error) => {
+                        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+                        match super::commit::terminalize_undispatched(
+                            Arc::clone(&self.pool),
+                            &self.codec,
+                            self.transaction_id,
+                            reservation_token,
+                            cleanup_deadline,
+                        )
+                        .await
+                        {
+                            Ok(()) => classify_prepare_error(error),
+                            Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
+                        }
+                    }
+                    NativeDataCommitOutcome::Unknown(error) => CommitOutcome::CommitUnknown(error),
                 }
             }
             Err(error) => {
@@ -1348,12 +1476,56 @@ impl MysqlWriteActorState {
                 if let Err(rollback_error) = rollback {
                     return CommitOutcome::DefiniteFailure(rollback_error);
                 }
+                let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+                if let Err(cleanup_error) = super::commit::terminalize_undispatched(
+                    Arc::clone(&self.pool),
+                    &self.codec,
+                    self.transaction_id,
+                    reservation_token,
+                    cleanup_deadline,
+                )
+                .await
+                {
+                    return CommitOutcome::CommitUnknown(cleanup_error);
+                }
                 classify_prepare_error(error)
             }
         }
     }
 
-    async fn prepare_and_apply_commit(&mut self) -> Result<StoreRevision, StateStoreError> {
+    async fn prepare_and_apply_commit(
+        &mut self,
+        reservation_token: [u8; 16],
+    ) -> Result<StoreRevision, StateStoreError> {
+        let transaction_bytes = self
+            .codec
+            .encode_uuid(*self.transaction_id.as_uuid())
+            .to_vec();
+        let ledger: Option<(u8, Option<Vec<u8>>, Option<u64>)> = self
+            .transaction()?
+            .run({
+                let transaction_bytes = transaction_bytes.clone();
+                move |connection| {
+                    Box::pin(connection.exec_first(
+                        "SELECT state, reservation_token, revision
+                         FROM state_store_commits WHERE transaction_id = ? FOR UPDATE",
+                        (transaction_bytes,),
+                    ))
+                }
+            })
+            .await?;
+        let state = ledger
+            .map(|(state, token, revision)| {
+                self.codec
+                    .decode_commit_state(state, token.as_deref(), revision)
+            })
+            .transpose()?
+            .ok_or_else(persisted_corruption)?;
+        if state != super::codec::DurableCommitState::Pending(reservation_token) {
+            return Err(conflict(
+                "MySQL commit reservation is not owned by this transaction",
+            ));
+        }
         let revision_bytes: Option<Vec<u8>> = self
             .transaction()?
             .run(|connection| {
@@ -1488,6 +1660,16 @@ impl MysqlWriteActorState {
                         .await?;
                 }
             }
+            let key_bytes = key.as_bytes().to_vec();
+            self.transaction()?
+                .run(move |connection| {
+                    Box::pin(connection.exec_drop(
+                        "INSERT INTO state_store_changes (revision, sequence, key_bytes)
+                         VALUES (?, ?, ?)",
+                        (next_revision, sequence, key_bytes),
+                    ))
+                })
+                .await?;
         }
         self.transaction()?
             .run(move |connection| {
@@ -1501,6 +1683,33 @@ impl MysqlWriteActorState {
                 ))
             })
             .await?;
+        let ledger_updates = self
+            .transaction()?
+            .run(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .exec_drop(
+                            "UPDATE state_store_commits
+                             SET state = ?, reservation_token = NULL, revision = ?,
+                                 updated_at_ms = ?
+                             WHERE transaction_id = ? AND state = ? AND reservation_token = ?",
+                            (
+                                2_u8,
+                                next_revision,
+                                current_time_ms(),
+                                transaction_bytes,
+                                1_u8,
+                                reservation_token.to_vec(),
+                            ),
+                        )
+                        .await?;
+                    Ok(connection.affected_rows())
+                })
+            })
+            .await?;
+        if ledger_updates != 1 {
+            return Err(persisted_corruption());
+        }
         StoreRevision::try_from(bytes::Bytes::copy_from_slice(
             &self.codec.encode_revision(next_revision),
         ))
@@ -1577,6 +1786,15 @@ fn provisional_version(transaction_id: TransactionId, operation: u64) -> Version
         .concat(),
     ))
     .expect("provisional version is non-empty")
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn validate_key(key: &Key, limits: &StateStoreLimits) -> Result<(), StateStoreError> {

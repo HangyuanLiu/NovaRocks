@@ -15,9 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "state-store-test-hooks")]
+use super::super::{
+    ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, Key, Precondition,
+    StateStore, TransactionId, Value,
+};
 use super::super::{StateStoreError, StateStoreErrorKind, StateStoreRuntime};
 use super::client::MysqlPoolConnection;
+#[cfg(feature = "state-store-test-hooks")]
+use bytes::Bytes;
+#[cfg(feature = "state-store-test-hooks")]
+use mysql_async::prelude::Queryable;
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "state-store-test-hooks")]
+use uuid::Uuid;
 
 #[cfg(feature = "state-store-test-hooks")]
 pub use super::open_test_hooks::{MysqlOpenGateControl, MysqlOpenGatePhase, arm_mysql_open_gate};
@@ -67,6 +80,12 @@ pub struct MysqlHeldKvLock {
 pub struct MysqlTransactionTestApi;
 pub struct MysqlWriteTestApi;
 pub struct MysqlOccTestApi;
+pub struct MysqlChangeTestApi;
+pub struct MysqlCommitTestApi;
+#[cfg(feature = "state-store-test-hooks")]
+pub struct MysqlPostDispatchTestControl {
+    inner: super::commit::CommitHookControl,
+}
 #[cfg(feature = "state-store-test-hooks")]
 pub struct MysqlStatementTestApi;
 
@@ -168,6 +187,799 @@ impl MysqlOccTestApi {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlChangeTestApi {
+    pub async fn run_scenario(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        store: Arc<dyn StateStore>,
+        scenario: &str,
+    ) -> Result<(), StateStoreError> {
+        match scenario {
+            "revision_sequence" | "version_encoding" => {
+                let receipt = commit_keys(
+                    &store,
+                    &[
+                        (b"change/z".as_slice(), b"z".as_slice()),
+                        (b"change/a".as_slice(), b"a".as_slice()),
+                        (b"change/m".as_slice(), b"m".as_slice()),
+                    ],
+                )
+                .await?;
+                let revision = u64::from_be_bytes(
+                    receipt
+                        .revision
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| scenario_error())?,
+                );
+                let expected = [b"change/a".as_slice(), b"change/m", b"change/z"];
+                for (sequence, key_bytes) in expected.iter().enumerate() {
+                    let record = read_key(&store, key_bytes)
+                        .await?
+                        .ok_or_else(scenario_error)?;
+                    let version: [u8; 12] = record
+                        .version
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| scenario_error())?;
+                    if version[..8] != revision.to_be_bytes()
+                        || version[8..]
+                            != u32::try_from(sequence)
+                                .map_err(|_| scenario_error())?
+                                .to_be_bytes()
+                    {
+                        return Err(scenario_error());
+                    }
+                }
+                let page = store
+                    .poll_changes(&ChangePollRequest {
+                        after: None,
+                        page_size: store.limits().max_page_size,
+                    })
+                    .await?;
+                if page.hints.len() != 3
+                    || page
+                        .hints
+                        .iter()
+                        .any(|hint| hint.revision != receipt.revision)
+                    || page
+                        .hints
+                        .iter()
+                        .map(|hint| hint.key.as_bytes())
+                        .ne(expected)
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "cursor_boundaries" => {
+                let identity = store.identity().await?;
+                let empty = store
+                    .poll_changes(&ChangePollRequest {
+                        after: None,
+                        page_size: 1,
+                    })
+                    .await?;
+                if !empty.hints.is_empty() || empty.resync_required {
+                    return Err(scenario_error());
+                }
+                let future = ChangeCursor::new(
+                    identity.store_id,
+                    super::super::StoreRevision::try_from(Bytes::copy_from_slice(
+                        &1_u64.to_be_bytes(),
+                    ))?,
+                    u32::MAX,
+                )?;
+                if store
+                    .poll_changes(&ChangePollRequest {
+                        after: Some(future),
+                        page_size: 1,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    return Err(scenario_error());
+                }
+                let foreign = ChangeCursor::new(Uuid::now_v7(), empty.high_watermark, u32::MAX)?;
+                if store
+                    .poll_changes(&ChangePollRequest {
+                        after: Some(foreign),
+                        page_size: 1,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "retention_gap" => {
+                let receipt = commit_keys(&store, &[(b"gap/key", b"value")]).await?;
+                let revision = u64::from_be_bytes(
+                    receipt
+                        .revision
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| scenario_error())?,
+                );
+                let pool = runtime.mysql_test_pool(database)?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                let mut connection =
+                    super::client::checkout_hygienic_connection(pool, deadline).await?;
+                connection
+                    .exec_drop(
+                        "UPDATE state_store_meta SET meta_value = ? WHERE meta_key = ?",
+                        (
+                            super::codec::MysqlCodec::new(store.limits().max_key_bytes)?
+                                .encode_cursor(revision, u32::MAX)
+                                .to_vec(),
+                            b"change_retention_floor".to_vec(),
+                        ),
+                    )
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                let before: Option<u64> = connection
+                    .query_first("SELECT COUNT(*) FROM state_store_changes")
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                let page = store
+                    .poll_changes(&ChangePollRequest {
+                        after: None,
+                        page_size: 1,
+                    })
+                    .await?;
+                let after: Option<u64> = connection
+                    .query_first("SELECT COUNT(*) FROM state_store_changes")
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                if !page.resync_required || !page.hints.is_empty() || before != after {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "duplicate_position" => {
+                if super::changes::validate_positions_for_test((0, u32::MAX), &[(1, 0), (1, 0)])
+                    .is_ok()
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "cursor_sequence_gap" => {
+                for rows in [&[(1, 1)][..], &[(1, 0), (1, 2)][..]] {
+                    if super::changes::validate_positions_for_test((0, u32::MAX), rows).is_ok() {
+                        return Err(scenario_error());
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(scenario_error()),
+        }
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlCommitTestApi {
+    pub async fn auxiliary_statement_timeout_disposes(
+        runtime: &StateStoreRuntime,
+        database: &str,
+    ) -> Result<u64, StateStoreError> {
+        super::commit::auxiliary_statement_timeout_disposes_for_test(
+            runtime.mysql_test_pool(database)?,
+        )
+        .await
+    }
+
+    pub async fn auxiliary_native_error_rolls_back(
+        runtime: &StateStoreRuntime,
+        database: &str,
+    ) -> Result<(), StateStoreError> {
+        super::commit::auxiliary_native_error_rolls_back_for_test(
+            runtime.mysql_test_pool(database)?,
+        )
+        .await
+    }
+
+    pub fn arm_shared_post_dispatch(response_loss: bool) -> MysqlPostDispatchTestControl {
+        let mode = if response_loss {
+            super::commit::CommitHookMode::SharedResponseLoss
+        } else {
+            super::commit::CommitHookMode::SharedCancelWaiter
+        };
+        MysqlPostDispatchTestControl {
+            inner: super::commit::arm_commit_hook(mode),
+        }
+    }
+
+    pub async fn run_scenario(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        store: Arc<dyn StateStore>,
+        scenario: &str,
+    ) -> Result<(), StateStoreError> {
+        let pool = runtime.mysql_test_pool(database)?;
+        let codec = super::codec::MysqlCodec::new(store.limits().max_key_bytes)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        match scenario {
+            "reservation_absent" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let token = *Uuid::new_v4().as_bytes();
+                if super::commit::reserve_commit(
+                    Arc::clone(&pool),
+                    &codec,
+                    transaction_id,
+                    token,
+                    deadline,
+                )
+                .await?
+                    != super::commit::ReservationDecision::Reserved
+                    || read_ledger_row(Arc::clone(&pool), transaction_id, deadline).await?
+                        != Some((1, Some(token.to_vec()), None))
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "reservation_committed" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(
+                    Arc::clone(&pool),
+                    transaction_id,
+                    2,
+                    None,
+                    Some(41),
+                    deadline,
+                )
+                .await?;
+                match super::commit::reserve_commit(
+                    pool,
+                    &codec,
+                    transaction_id,
+                    *Uuid::new_v4().as_bytes(),
+                    deadline,
+                )
+                .await?
+                {
+                    super::commit::ReservationDecision::Committed(receipt)
+                        if receipt.transaction_id == transaction_id
+                            && receipt.revision.as_bytes() == 41_u64.to_be_bytes() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(scenario_error()),
+                }
+            }
+            "reservation_not_committed" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(Arc::clone(&pool), transaction_id, 3, None, None, deadline)
+                    .await?;
+                if super::commit::reserve_commit(
+                    pool,
+                    &codec,
+                    transaction_id,
+                    *Uuid::new_v4().as_bytes(),
+                    deadline,
+                )
+                .await
+                .is_ok()
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "reservation_foreign_pending" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let foreign = *Uuid::new_v4().as_bytes();
+                insert_ledger_row(
+                    Arc::clone(&pool),
+                    transaction_id,
+                    1,
+                    Some(foreign),
+                    None,
+                    deadline,
+                )
+                .await?;
+                if super::commit::reserve_commit(
+                    Arc::clone(&pool),
+                    &codec,
+                    transaction_id,
+                    *Uuid::new_v4().as_bytes(),
+                    deadline,
+                )
+                .await
+                .is_ok()
+                    || read_ledger_row(pool, transaction_id, deadline).await?
+                        != Some((1, Some(foreign.to_vec()), None))
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "reservation_reload" => {
+                let ours = *Uuid::new_v4().as_bytes();
+                if !super::commit::reservation_requires_authoritative_reload_for_test(
+                    true, None, ours,
+                ) || super::commit::reservation_requires_authoritative_reload_for_test(
+                    true,
+                    Some(super::codec::DurableCommitState::Pending(ours)),
+                    ours,
+                ) {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "ledger_corruption" => {
+                let malformed = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(
+                    Arc::clone(&pool),
+                    malformed,
+                    2,
+                    Some(*Uuid::new_v4().as_bytes()),
+                    Some(1),
+                    deadline,
+                )
+                .await?;
+                if store.resolve_commit(&malformed).await.is_ok() {
+                    return Err(scenario_error());
+                }
+                let terminal = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(Arc::clone(&pool), terminal, 2, None, Some(9), deadline).await?;
+                super::commit::terminalize_undispatched(
+                    Arc::clone(&pool),
+                    &codec,
+                    terminal,
+                    *Uuid::new_v4().as_bytes(),
+                    deadline,
+                )
+                .await?;
+                if read_ledger_row(pool, terminal, deadline).await? != Some((2, None, Some(9))) {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "atomic_publication" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let key = Key::try_from(Bytes::from_static(b"atomic/publication"))?;
+                let mut writer = store
+                    .begin_write(transaction_id, "atomic publication")
+                    .await?;
+                writer
+                    .put(
+                        key.clone(),
+                        Value::try_from(Bytes::from_static(b"durable"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                let receipt = committed(writer.commit().await)?;
+                let revision = u64::from_be_bytes(
+                    receipt
+                        .revision
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| scenario_error())?,
+                );
+                let mut connection =
+                    super::client::checkout_hygienic_connection(pool, deadline).await?;
+                let row: Option<(u64, u64, u64, u8, Option<u64>)> = connection
+                    .exec_first(
+                        "SELECT
+                           (SELECT COUNT(*) FROM state_store_kv WHERE key_bytes = ?),
+                           (SELECT COUNT(*) FROM state_store_changes
+                            WHERE revision = ? AND key_bytes = ?),
+                           (SELECT CAST(CONV(HEX(meta_value), 16, 10) AS UNSIGNED)
+                            FROM state_store_meta WHERE meta_key = ?),
+                           state, revision
+                         FROM state_store_commits WHERE transaction_id = ?",
+                        (
+                            key.as_bytes().to_vec(),
+                            revision,
+                            key.as_bytes().to_vec(),
+                            b"current_revision".to_vec(),
+                            transaction_id.as_uuid().as_bytes().to_vec(),
+                        ),
+                    )
+                    .await
+                    .map_err(super::error::MysqlNativeError::from)
+                    .map_err(super::error::MysqlNativeError::into_public)?;
+                if row != Some((1, 1, revision, 2, Some(revision))) {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "dispatch_error_unknown" | "response_loss" => {
+                let control =
+                    super::commit::arm_commit_hook(super::commit::CommitHookMode::ResponseLoss);
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let key = Key::try_from(Bytes::copy_from_slice(scenario.as_bytes()))?;
+                let mut writer = store.begin_write(transaction_id, "response loss").await?;
+                writer
+                    .put(
+                        key.clone(),
+                        Value::try_from(Bytes::from_static(b"committed"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                if !matches!(writer.commit().await, CommitOutcome::CommitUnknown(_)) {
+                    return Err(scenario_error());
+                }
+                control.wait_reached().await;
+                if !matches!(
+                    store.resolve_commit(&transaction_id).await?,
+                    CommitResolution::Committed(_)
+                ) || read_key(&store, key.as_bytes()).await?.is_none()
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "reservation_deadline" => {
+                super::commit::delay_next_reservation();
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let mut writer = store
+                    .begin_write(transaction_id, "reservation deadline")
+                    .await?;
+                writer
+                    .put(
+                        Key::try_from(Bytes::from_static(b"deadline/reservation"))?,
+                        Value::try_from(Bytes::from_static(b"must-not-commit"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                let outcome = writer.commit().await;
+                let inspection_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                if matches!(outcome, CommitOutcome::Committed(_))
+                    || read_ledger_row(Arc::clone(&pool), transaction_id, inspection_deadline)
+                        .await?
+                        != Some((3, None, None))
+                    || store.resolve_commit(&transaction_id).await?
+                        != CommitResolution::NotCommitted
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "dispatch_deadline" => {
+                let control = super::commit::arm_commit_hook(
+                    super::commit::CommitHookMode::DeadlineAfterSuccess,
+                );
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let mut writer = store
+                    .begin_write(transaction_id, "dispatch deadline")
+                    .await?;
+                writer
+                    .put(
+                        Key::try_from(Bytes::from_static(b"deadline/dispatch"))?,
+                        Value::try_from(Bytes::from_static(b"committed"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                if !matches!(writer.commit().await, CommitOutcome::CommitUnknown(_)) {
+                    return Err(scenario_error());
+                }
+                control.wait_reached().await;
+                if !matches!(
+                    store.resolve_commit(&transaction_id).await?,
+                    CommitResolution::Committed(_)
+                ) {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "resolve_absent" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                if store.resolve_commit(&transaction_id).await? != CommitResolution::NotCommitted
+                    || read_ledger_row(Arc::clone(&pool), transaction_id, deadline).await?
+                        != Some((3, None, None))
+                    || store.resolve_commit(&transaction_id).await?
+                        != CommitResolution::NotCommitted
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "resolve_reservation_race" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let mut writer = store.begin_write(transaction_id, "resolve race").await?;
+                writer
+                    .put(
+                        Key::try_from(Bytes::from_static(b"resolve/race"))?,
+                        Value::try_from(Bytes::from_static(b"value"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                let resolver_store = Arc::clone(&store);
+                let resolver =
+                    tokio::spawn(
+                        async move { resolver_store.resolve_commit(&transaction_id).await },
+                    );
+                let commit = tokio::spawn(async move { writer.commit().await });
+                let _ = resolver.await.map_err(|_| scenario_error())??;
+                let _ = commit.await.map_err(|_| scenario_error())?;
+                let first = store.resolve_commit(&transaction_id).await?;
+                let second = store.resolve_commit(&transaction_id).await?;
+                if first != second
+                    || !matches!(
+                        first,
+                        CommitResolution::Committed(_) | CommitResolution::NotCommitted
+                    )
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "cleanup_own" => {
+                let absent = TransactionId::from(Uuid::now_v7());
+                let token = *Uuid::new_v4().as_bytes();
+                super::commit::terminalize_undispatched(
+                    Arc::clone(&pool),
+                    &codec,
+                    absent,
+                    token,
+                    deadline,
+                )
+                .await?;
+                let pending = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(Arc::clone(&pool), pending, 1, Some(token), None, deadline)
+                    .await?;
+                super::commit::terminalize_undispatched(
+                    Arc::clone(&pool),
+                    &codec,
+                    pending,
+                    token,
+                    deadline,
+                )
+                .await?;
+                if read_ledger_row(Arc::clone(&pool), absent, deadline).await?
+                    != Some((3, None, None))
+                    || read_ledger_row(pool, pending, deadline).await? != Some((3, None, None))
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "cleanup_foreign" => {
+                let ours = *Uuid::new_v4().as_bytes();
+                let foreign = *Uuid::new_v4().as_bytes();
+                let pending = TransactionId::from(Uuid::now_v7());
+                let committed_id = TransactionId::from(Uuid::now_v7());
+                let not_committed = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(Arc::clone(&pool), pending, 1, Some(foreign), None, deadline)
+                    .await?;
+                insert_ledger_row(Arc::clone(&pool), committed_id, 2, None, Some(7), deadline)
+                    .await?;
+                insert_ledger_row(Arc::clone(&pool), not_committed, 3, None, None, deadline)
+                    .await?;
+                for transaction_id in [pending, committed_id, not_committed] {
+                    super::commit::terminalize_undispatched(
+                        Arc::clone(&pool),
+                        &codec,
+                        transaction_id,
+                        ours,
+                        deadline,
+                    )
+                    .await?;
+                }
+                if read_ledger_row(Arc::clone(&pool), pending, deadline).await?
+                    != Some((1, Some(foreign.to_vec()), None))
+                    || read_ledger_row(Arc::clone(&pool), committed_id, deadline).await?
+                        != Some((2, None, Some(7)))
+                    || read_ledger_row(pool, not_committed, deadline).await?
+                        != Some((3, None, None))
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            "cleanup_guard" => {
+                let guard = Key::try_from(Bytes::from_static(b"cleanup/guard"))?;
+                commit_keys(&store, &[(b"cleanup/guard", b"original")]).await?;
+                let stale = read_key(&store, guard.as_bytes())
+                    .await?
+                    .ok_or_else(scenario_error)?;
+                commit_keys(&store, &[(b"cleanup/guard", b"new")]).await?;
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                let mut writer = store.begin_write(transaction_id, "cleanup guard").await?;
+                writer
+                    .put(
+                        guard,
+                        Value::try_from(Bytes::from_static(b"stale"))?,
+                        Precondition::Version(stale.version),
+                    )
+                    .await?;
+                let control = super::commit::arm_cleanup_hook();
+                let waiter = tokio::spawn(async move { writer.commit().await });
+                control.wait_reached().await;
+                waiter.abort();
+                if !waiter.await.is_err_and(|error| error.is_cancelled())
+                    || read_ledger_row(Arc::clone(&pool), transaction_id, deadline)
+                        .await?
+                        .is_none()
+                {
+                    control.release();
+                    return Err(scenario_error());
+                }
+                control.release();
+                for _ in 0..100 {
+                    if read_ledger_row(Arc::clone(&pool), transaction_id, deadline).await?
+                        == Some((3, None, None))
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(scenario_error())
+            }
+            "prepare_fallback" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                insert_ledger_row(
+                    Arc::clone(&pool),
+                    transaction_id,
+                    2,
+                    None,
+                    Some(77),
+                    deadline,
+                )
+                .await?;
+                let mut writer = store
+                    .begin_write(transaction_id, "prepare fallback")
+                    .await?;
+                writer
+                    .put(
+                        Key::try_from(Bytes::from_static(b"prepare/fallback"))?,
+                        Value::try_from(Bytes::from_static(b"ignored"))?,
+                        Precondition::Any,
+                    )
+                    .await?;
+                match writer.commit().await {
+                    CommitOutcome::Committed(receipt)
+                        if receipt.transaction_id == transaction_id
+                            && receipt.revision.as_bytes() == 77_u64.to_be_bytes() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(scenario_error()),
+                }
+            }
+            "resolution_deadline" => {
+                let transaction_id = TransactionId::from(Uuid::now_v7());
+                super::commit::delay_next_resolution();
+                let error = store
+                    .resolve_commit(&transaction_id)
+                    .await
+                    .expect_err("delayed resolution must exceed deadline");
+                let inspection_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                if error.kind() != StateStoreErrorKind::DeadlineExceeded
+                    || read_ledger_row(Arc::clone(&pool), transaction_id, inspection_deadline)
+                        .await?
+                        .is_some()
+                    || store.resolve_commit(&transaction_id).await?
+                        != CommitResolution::NotCommitted
+                {
+                    return Err(scenario_error());
+                }
+                Ok(())
+            }
+            _ => Err(scenario_error()),
+        }
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlPostDispatchTestControl {
+    pub async fn wait_dispatched(&self) {
+        self.inner.wait_reached().await;
+    }
+
+    pub fn allow_provider_progress(&self) {
+        self.inner.release();
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn commit_keys(
+    store: &Arc<dyn StateStore>,
+    rows: &[(&[u8], &[u8])],
+) -> Result<super::super::CommitReceipt, StateStoreError> {
+    let mut writer = store
+        .begin_write(
+            TransactionId::from(Uuid::now_v7()),
+            "MySQL task six change test",
+        )
+        .await?;
+    for (key_bytes, value_bytes) in rows {
+        writer
+            .put(
+                Key::try_from(Bytes::copy_from_slice(key_bytes))?,
+                Value::try_from(Bytes::copy_from_slice(value_bytes))?,
+                Precondition::Any,
+            )
+            .await?;
+    }
+    committed(writer.commit().await)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn committed(outcome: CommitOutcome) -> Result<super::super::CommitReceipt, StateStoreError> {
+    match outcome {
+        CommitOutcome::Committed(receipt) => Ok(receipt),
+        CommitOutcome::Conflict(error)
+        | CommitOutcome::TransientBeforeCommit(error)
+        | CommitOutcome::DefiniteFailure(error)
+        | CommitOutcome::CommitUnknown(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn read_key(
+    store: &Arc<dyn StateStore>,
+    key_bytes: &[u8],
+) -> Result<Option<super::super::StateRecord>, StateStoreError> {
+    let mut reader = store.begin_read().await?;
+    let record = reader
+        .get(&Key::try_from(Bytes::copy_from_slice(key_bytes))?)
+        .await?;
+    reader.abort().await?;
+    Ok(record)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+const fn scenario_error() -> StateStoreError {
+    StateStoreError::new(
+        StateStoreErrorKind::Internal,
+        "MySQL task six test scenario failed",
+    )
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn insert_ledger_row(
+    pool: Arc<dyn super::client::PoolLifecycle>,
+    transaction_id: TransactionId,
+    state: u8,
+    token: Option<[u8; 16]>,
+    revision: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<(), StateStoreError> {
+    let mut connection = super::client::checkout_hygienic_connection(pool, deadline).await?;
+    connection
+        .exec_drop(
+            "INSERT INTO state_store_commits
+                (transaction_id, state, reservation_token, revision, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?)",
+            (
+                transaction_id.as_uuid().as_bytes().to_vec(),
+                state,
+                token.map(|token| token.to_vec()),
+                revision,
+                1_u64,
+            ),
+        )
+        .await
+        .map_err(super::error::MysqlNativeError::from)
+        .map_err(super::error::MysqlNativeError::into_public)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn read_ledger_row(
+    pool: Arc<dyn super::client::PoolLifecycle>,
+    transaction_id: TransactionId,
+    deadline: tokio::time::Instant,
+) -> Result<Option<(u8, Option<Vec<u8>>, Option<u64>)>, StateStoreError> {
+    let mut connection = super::client::checkout_hygienic_connection(pool, deadline).await?;
+    connection
+        .exec_first(
+            "SELECT state, reservation_token, revision
+             FROM state_store_commits WHERE transaction_id = ?",
+            (transaction_id.as_uuid().as_bytes().to_vec(),),
+        )
+        .await
+        .map_err(super::error::MysqlNativeError::from)
+        .map_err(super::error::MysqlNativeError::into_public)
 }
 
 impl MysqlHeldKvLock {
