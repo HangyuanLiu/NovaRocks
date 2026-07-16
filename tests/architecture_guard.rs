@@ -24558,19 +24558,178 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
             .any(|component| component.to_ascii_lowercase().contains("codegen"))
     }
 
+    struct ExternAliasCollector {
+        inline_modules: Vec<String>,
+        aliases: RustScopedAliases,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ExternAliasCollector {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if nfe_4_syn_attrs_require_test(&module.attrs) {
+                return;
+            }
+            self.inline_modules.push(coor_3b_ident_text(&module.ident));
+            syn::visit::visit_item_mod(self, module);
+            self.inline_modules.pop();
+        }
+
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            if nfe_4_syn_attrs_require_test(&item.attrs) {
+                return;
+            }
+            let local_name = item
+                .rename
+                .as_ref()
+                .map(|(_, rename)| coor_3b_ident_text(rename))
+                .unwrap_or_else(|| coor_3b_ident_text(&item.ident));
+            let target = if item.ident == "self" {
+                vec!["crate".to_string()]
+            } else {
+                vec![coor_3b_ident_text(&item.ident)]
+            };
+            self.aliases
+                .entry((self.inline_modules.clone(), local_name))
+                .or_default()
+                .push(RustScopedUsePath {
+                    segments: target,
+                    inline_modules: self.inline_modules.clone(),
+                });
+        }
+    }
+
+    fn production_aliases(text: &str, file: &syn::File) -> RustScopedAliases {
+        let mut aliases = rust_production_scoped_aliases(text);
+        let mut collector = ExternAliasCollector {
+            inline_modules: Vec::new(),
+            aliases: RustScopedAliases::new(),
+        };
+        syn::visit::Visit::visit_file(&mut collector, file);
+        for (key, targets) in collector.aliases {
+            let existing = aliases.entry(key).or_default();
+            for target in targets {
+                if !existing.contains(&target) {
+                    existing.push(target);
+                }
+            }
+        }
+        aliases
+    }
+
+    fn production_canonical_paths(
+        text: &str,
+        source_rel: &str,
+        aliases: &RustScopedAliases,
+    ) -> Vec<Vec<String>> {
+        let sanitized = rust_sanitized_production_text(text);
+        let mut canonical = BTreeSet::new();
+        for raw in rust_raw_use_statements(&sanitized) {
+            let resolved = rust_resolve_scoped_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments,
+                    inline_modules: raw.inline_modules,
+                }]
+            });
+            canonical.extend(resolved.into_iter().filter_map(|path| {
+                rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    source_rel,
+                    &path.inline_modules,
+                )
+            }));
+        }
+        for path in rust_raw_non_use_paths(&sanitized) {
+            let resolved = rust_resolve_scoped_paths(
+                &path.segments,
+                &path.inline_modules,
+                aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| vec![path]);
+            canonical.extend(resolved.into_iter().filter_map(|path| {
+                rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    source_rel,
+                    &path.inline_modules,
+                )
+            }));
+        }
+        canonical.into_iter().collect()
+    }
+
     struct IncludeAudit<'a> {
         source_rel: &'a str,
+        aliases: &'a RustScopedAliases,
         inline_modules: Vec<String>,
         violations: Vec<String>,
     }
 
     impl IncludeAudit<'_> {
-        fn in_sql_namespace(&self) -> bool {
-            let Some(mut scope) = rust_source_module_segments(self.source_rel) else {
-                return false;
-            };
+        fn scope(&self) -> Option<Vec<String>> {
+            let mut scope = rust_source_module_segments(self.source_rel)?;
             scope.extend(self.inline_modules.iter().cloned());
-            scope.starts_with(&["crate".to_string(), "sql".to_string()])
+            Some(scope)
+        }
+
+        fn in_restricted_namespace(&self) -> bool {
+            self.scope().is_some_and(|scope| {
+                scope == ["crate"] || scope.starts_with(&["crate".to_string(), "sql".to_string()])
+            })
+        }
+
+        fn is_known_safe_root_generated_include(&self, item: &syn::Macro) -> bool {
+            if !self.scope().is_some_and(|scope| scope == ["crate"]) {
+                return false;
+            }
+            let tokens = item.tokens.to_string().replace(char::is_whitespace, "");
+            [
+                r#"concat!(env!("OUT_DIR"),"/thrift_root_mod.rs")"#,
+                r#"concat!(env!("OUT_DIR"),"/proto_root_mod.rs")"#,
+            ]
+            .contains(&tokens.as_str())
+        }
+
+        fn is_include_macro(&self, item: &syn::Macro) -> bool {
+            let path = item
+                .path
+                .segments
+                .iter()
+                .map(|segment| coor_3b_ident_text(&segment.ident))
+                .collect::<Vec<_>>();
+            rust_resolve_scoped_paths(
+                &path,
+                &self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: path,
+                    inline_modules: self.inline_modules.clone(),
+                }]
+            })
+            .iter()
+            .any(|resolved| {
+                resolved
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment == "include")
+            })
         }
     }
 
@@ -24634,9 +24793,12 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
         }
 
         fn visit_macro(&mut self, item: &'ast syn::Macro) {
-            if item.path.is_ident("include") && self.in_sql_namespace() {
+            if self.is_include_macro(item)
+                && self.in_restricted_namespace()
+                && !self.is_known_safe_root_generated_include(item)
+            {
                 self.violations.push(format!(
-                    "{} uses production include! inside the SQL namespace",
+                    "{} uses production include! at crate root or inside the SQL namespace",
                     self.source_rel
                 ));
             }
@@ -24646,35 +24808,51 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
 
     let source_rel = source_rel.replace('\\', "/");
     let mut violations = Vec::new();
-    if rust_production_canonical_paths(text, &source_rel)
-        .iter()
-        .any(|path| path_starts_with(path, RETIRED_ROOT))
-    {
+    let parsed = syn::parse_file(text);
+    if let Ok(file) = &parsed {
+        let aliases = production_aliases(text, file);
+        if production_canonical_paths(text, &source_rel, &aliases)
+            .iter()
+            .any(|path| path_starts_with(path, RETIRED_ROOT))
+        {
+            violations.push(format!(
+                "{source_rel} reaches the retired crate::sql::codegen namespace"
+            ));
+        }
+
+        let mut audit = IncludeAudit {
+            source_rel: &source_rel,
+            aliases: &aliases,
+            inline_modules: Vec::new(),
+            violations: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut audit, file);
+        violations.extend(audit.violations);
+    } else if let Err(error) = &parsed {
         violations.push(format!(
-            "{source_rel} reaches the retired crate::sql::codegen namespace"
+            "{source_rel} cannot be parsed while checking codegen retirement: {error}"
         ));
     }
 
     for module in rust_module_items(text) {
         if cfg_attributes_test_requirement(module.attributes.iter().map(String::as_str))
-            == CfgTestRequirement::RequiresTest
+            != CfgTestRequirement::RequiresTest
         {
-            continue;
-        }
-        let Some(mut declared_path) = rust_source_module_segments(&source_rel) else {
-            continue;
-        };
-        declared_path.extend(
-            module
-                .inline_modules
-                .iter()
-                .map(|inline| inline.name.clone()),
-        );
-        declared_path.push(module.name.clone());
-        if path_starts_with(&declared_path, RETIRED_ROOT) {
-            violations.push(format!(
-                "{source_rel} declares the retired `codegen` module"
-            ));
+            let Some(mut declared_path) = rust_source_module_segments(&source_rel) else {
+                continue;
+            };
+            declared_path.extend(
+                module
+                    .inline_modules
+                    .iter()
+                    .map(|inline| inline.name.clone()),
+            );
+            declared_path.push(module.name.clone());
+            if path_starts_with(&declared_path, RETIRED_ROOT) {
+                violations.push(format!(
+                    "{source_rel} declares the retired `codegen` module"
+                ));
+            }
         }
     }
 
@@ -24724,21 +24902,6 @@ fn cgo_13_sql_codegen_source_retirement_violations(source_rel: &str, text: &str)
                 module.name
             ));
         }
-    }
-
-    match syn::parse_file(text) {
-        Ok(file) => {
-            let mut audit = IncludeAudit {
-                source_rel: &source_rel,
-                inline_modules: Vec::new(),
-                violations: Vec::new(),
-            };
-            syn::visit::Visit::visit_file(&mut audit, &file);
-            violations.extend(audit.violations);
-        }
-        Err(error) => violations.push(format!(
-            "{source_rel} cannot be parsed while checking codegen retirement: {error}"
-        )),
     }
 
     violations.sort();
@@ -24842,6 +25005,11 @@ fn cgo_13_sql_codegen_retirement_detector_is_source_aware_and_non_vacuous() {
             "extern crate self as codegen;",
         ),
         (
+            "extern-crate root alias path",
+            "src/engine/mod.rs",
+            "extern crate self as root; use root::sql::codegen::NativeFragmentBundle;",
+        ),
+        (
             "path source indirection",
             "src/sql/mod.rs",
             "#[path = \"codegen/mod.rs\"] mod legacy;",
@@ -24851,14 +25019,29 @@ fn cgo_13_sql_codegen_retirement_detector_is_source_aware_and_non_vacuous() {
             "src/sql/mod.rs",
             "include!(concat!(\"code\", \"gen/mod.rs\"));",
         ),
+        (
+            "crate-root include source indirection",
+            "src/lib.rs",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        ),
+        (
+            "SQL include macro alias",
+            "src/sql/mod.rs",
+            "use std::include as inject; inject!(concat!(\"code\", \"gen/mod.rs\"));",
+        ),
     ];
-    for (case, source_rel, source) in invalid {
-        let violations = cgo_13_sql_codegen_source_retirement_violations(source_rel, source);
-        assert!(
-            !violations.is_empty(),
-            "{case} escaped the sql::codegen retirement guard"
-        );
-    }
+    let missed_invalid = invalid
+        .into_iter()
+        .filter_map(|(case, source_rel, source)| {
+            cgo_13_sql_codegen_source_retirement_violations(source_rel, source)
+                .is_empty()
+                .then(|| case.to_string())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        missed_invalid.is_empty(),
+        "sql::codegen retirement escapes: {missed_invalid:?}"
+    );
 
     let valid = r#"
 // use crate::sql::codegen::NativeFragmentBundle;
@@ -24874,13 +25057,32 @@ pub(crate) use crate::protocol::native::encode as codegen;
 mod legacy;
 #[cfg(test)]
 include!("codegen/mod.rs");
-use crate::protocol::native::encode::NativeFragmentBundle;
+extern crate self as harmless_root;
+use harmless_root::protocol::native::encode::NativeFragmentBundle;
 "#;
     assert_eq!(
         cgo_13_sql_codegen_source_retirement_violations("src/sql/mod.rs", valid),
         Vec::<String>::new(),
         "comments, strings and cfg(test) fixtures must not fail production retirement"
     );
+    assert_eq!(
+        cgo_13_sql_codegen_source_retirement_violations(
+            "src/runtime/generated.rs",
+            "include!(\"safe_generated.rs\");",
+        ),
+        Vec::<String>::new(),
+        "an unrelated module-local literal include outside crate root/SQL must remain legal"
+    );
+    for generated in [
+        r#"include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));"#,
+        r#"include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));"#,
+    ] {
+        assert_eq!(
+            cgo_13_sql_codegen_source_retirement_violations("src/lib.rs", generated),
+            Vec::<String>::new(),
+            "the two audited crate-root generated protocol modules must remain legal"
+        );
+    }
 
     let root = std::env::temp_dir().join(format!(
         "cgo_13_sql_codegen_retirement_{}_{}",
@@ -24898,6 +25100,30 @@ use crate::protocol::native::encode::NativeFragmentBundle;
         "a recreated physical directory must fail the retirement guard"
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cgo_13_plan_ir_codegen_audit_self_tests_production_stripping() {
+    let repo = Path::new(manifest_dir());
+    let audit = repo.join("tools/dev/audit_plan_ir_codegen_boundary.py");
+    let output = std::process::Command::new("python3")
+        .arg(&audit)
+        .arg("--self-test")
+        .current_dir(repo)
+        .output()
+        .expect("run plan IR codegen boundary audit self-tests");
+    assert!(
+        output.status.success(),
+        "audit self-tests failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("plan IR codegen boundary audit self-tests passed"),
+        "audit self-test mode must execute its stripping fixtures:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]
