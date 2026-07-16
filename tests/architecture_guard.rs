@@ -39968,7 +39968,9 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
 
     fn encoder_call_path(
         expression: &syn::Expr,
-        imported_functions: &BTreeSet<String>,
+        aliases: &RustScopedAliases,
+        source_path: &str,
+        inline_modules: &[String],
     ) -> Option<String> {
         let expression = match expression {
             syn::Expr::Return(returned) => returned.expr.as_deref()?,
@@ -39990,18 +39992,33 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
             .iter()
             .map(|segment| coor_3b_ident_text(&segment.ident))
             .collect::<Vec<_>>();
-        let direct = path_starts_with(&segments, ENCODER_ROOT)
-            && segments
-                .get(ENCODER_ROOT.len())
-                .is_some_and(|name| FACADE_FUNCTIONS.contains(&name.as_str()));
-        let imported = segments.len() == 1 && imported_functions.contains(&segments[0]);
-        (direct || imported).then(|| segments.join("::"))
+        let resolved =
+            rust_resolve_scoped_paths(&segments, inline_modules, aliases, &mut BTreeSet::new(), 0)
+                .unwrap_or_else(|| {
+                    vec![RustScopedUsePath {
+                        segments,
+                        inline_modules: inline_modules.to_vec(),
+                    }]
+                });
+        resolved.into_iter().find_map(|path| {
+            let canonical = rust_canonical_path_segments_in_scope(
+                &path.segments,
+                source_path,
+                &path.inline_modules,
+            )?;
+            (path_starts_with(&canonical, ENCODER_ROOT)
+                && canonical
+                    .get(ENCODER_ROOT.len())
+                    .is_some_and(|name| FACADE_FUNCTIONS.contains(&name.as_str())))
+            .then(|| canonical.join("::"))
+        })
     }
 
     fn collect_forwarders(
         items: &[syn::Item],
-        imported_functions: &BTreeSet<String>,
+        aliases: &RustScopedAliases,
         source_path: &str,
+        inline_modules: &[String],
         violations: &mut Vec<String>,
     ) {
         for item in items {
@@ -40014,9 +40031,9 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
                         Some(syn::Stmt::Expr(expression, _)) => Some(expression),
                         _ => None,
                     };
-                    if let Some(path) = expression
-                        .and_then(|expression| encoder_call_path(expression, imported_functions))
-                    {
+                    if let Some(path) = expression.and_then(|expression| {
+                        encoder_call_path(expression, aliases, source_path, inline_modules)
+                    }) {
                         violations.push(format!(
                             "sql-encoder-forwarder: {source_path} visible function `{}` forwards directly to `{path}`",
                             function.sig.ident
@@ -40025,7 +40042,15 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
                 }
                 syn::Item::Mod(module) => {
                     if let Some((_, nested)) = &module.content {
-                        collect_forwarders(nested, imported_functions, source_path, violations);
+                        let mut nested_modules = inline_modules.to_vec();
+                        nested_modules.push(coor_3b_ident_text(&module.ident));
+                        collect_forwarders(
+                            nested,
+                            aliases,
+                            source_path,
+                            &nested_modules,
+                            violations,
+                        );
                     }
                 }
                 _ => {}
@@ -40094,14 +40119,20 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
             }
 
             fn visit_macro(&mut self, item: &'ast syn::Macro) {
-                if item.path.is_ident("include")
-                    && let Ok(path) = syn::parse2::<syn::LitStr>(item.tokens.clone())
-                    && path_targets_encoder_source(&path.value())
-                {
-                    self.violations.push(format!(
-                        "sql-encoder-source-indirection: {} includes an encoder source",
-                        self.source_path
-                    ));
+                if item.path.is_ident("include") {
+                    match syn::parse2::<syn::LitStr>(item.tokens.clone()) {
+                        Ok(path) if path_targets_encoder_source(&path.value()) => {
+                            self.violations.push(format!(
+                                "sql-encoder-source-indirection: {} includes an encoder source",
+                                self.source_path
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(_) => self.violations.push(format!(
+                            "sql-encoder-source-indirection: {} has a production include target that cannot be proven safe",
+                            self.source_path
+                        )),
+                    }
                 }
                 syn::visit::visit_macro(self, item);
             }
@@ -40161,7 +40192,6 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
             }
         }
 
-        let mut imported_functions = BTreeSet::new();
         for import in rust_production_scoped_use_statements(&source.text) {
             let path = rust_use_path(&import.import)
                 .split("::")
@@ -40187,9 +40217,6 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
                     "sql-encoder-alias-shell: {} imports the encoder through `{}`",
                     source.path, import.import
                 ));
-            }
-            if tail.len() == 1 && FACADE_FUNCTIONS.contains(&tail[0].as_str()) && alias.is_none() {
-                imported_functions.insert(tail[0].clone());
             }
         }
 
@@ -40224,8 +40251,9 @@ fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<Str
             Ok(file) => {
                 collect_forwarders(
                     &file.items,
-                    &imported_functions,
+                    &scoped_aliases,
                     &source.path,
+                    &[],
                     &mut violations,
                 );
                 collect_include_indirections(&file, &source.path, &mut violations);
@@ -40348,6 +40376,62 @@ fn cgo_13_review_fix_ignores_test_only_include_indirection_with_production_inclu
     assert!(
         violations.is_empty(),
         "test-only encoder include must stay outside the production surface: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_rejects_upper_module_alias_forwarder() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "use crate::protocol as p; use crate::protocol::native::encode::NativeFragmentBundle; pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { p::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-forwarder")),
+        "an upper-module alias must not hide a visible SQL encoder forwarder: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_allows_private_upper_module_alias_consumption() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/caller.rs",
+        "use crate::protocol as p; fn consume(plan: &DistributedPlan, prepared: &PreparedFragmentSet) { let _ = p::native::encode::encode_native_fragment_bundle(plan, prepared); }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "an ordinary private canonical consumer is not a forwarding surface: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_rejects_dynamic_production_include_indirection() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/protocol/native/encode/mod.rs\"));",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-source-indirection")),
+        "a dynamic production include must fail closed before it can include encoder source: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_allows_safe_literal_and_test_only_dynamic_include() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(\"safe.rs\"); #[cfg(test)] include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/protocol/native/encode/mod.rs\"));",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a safe literal include and test-only dynamic include must remain legal: {violations:?}"
     );
 }
 

@@ -80,7 +80,7 @@ impl DistributedPlan {
     }
 
     // Consumed by coordinator preparation for production boundary validation.
-    // `protocol::native::encode::project_boundary_reports` is test-only diagnostics.
+    // The remaining boundary projection is test-only diagnostics.
     pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
         &self.data.boundaries
     }
