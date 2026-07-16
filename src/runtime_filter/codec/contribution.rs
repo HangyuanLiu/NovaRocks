@@ -421,7 +421,7 @@ fn decode_membership_body(
     decode_membership_body_with_policy(
         body,
         expected_data_type,
-        ContributionCodecError::NonCanonicalPayload,
+        ContributionCodecError::SchemaMismatch,
     )
 }
 
@@ -1139,6 +1139,24 @@ mod tests {
         exact_len: Cell<usize>,
     }
 
+    struct RejectingContributionFrameAllocator {
+        calls: Cell<usize>,
+        exact_len: Cell<usize>,
+    }
+
+    struct ConformanceFixtures {
+        membership: RuntimeFilterContribution,
+        membership_schema: ArtifactMembershipSchema,
+        ordered: RuntimeFilterContribution,
+        ordered_contract: RuntimeOrderContract,
+        topk: RuntimeFilterContribution,
+        topk_contract: RuntimeTopKSummaryContract,
+        final_domain: RuntimeFilterContribution,
+        final_contract: RuntimeCompletionFenceContract,
+        final_stream: ProducerStreamId,
+        final_sequence: ProducerSequence,
+    }
+
     struct BorrowedTimezoneObserver {
         calls: Cell<usize>,
         pointer: Cell<usize>,
@@ -1177,6 +1195,50 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             self.exact_len.set(exact_len);
             Ok(Vec::with_capacity(exact_len))
+        }
+    }
+
+    impl RejectingContributionFrameAllocator {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+                exact_len: Cell::new(0),
+            }
+        }
+    }
+
+    impl ContributionFrameAllocator for RejectingContributionFrameAllocator {
+        fn allocate(&self, exact_len: usize) -> Result<Vec<u8>, ContributionCodecError> {
+            self.calls.set(self.calls.get() + 1);
+            self.exact_len.set(exact_len);
+            Err(ContributionCodecError::ResourceLimit)
+        }
+    }
+
+    impl ConformanceFixtures {
+        fn cases(&self) -> [(&RuntimeFilterContribution, ContributionCodecExpectation<'_>); 4] {
+            [
+                (
+                    &self.membership,
+                    ContributionCodecExpectation::Membership(&self.membership_schema),
+                ),
+                (
+                    &self.ordered,
+                    ContributionCodecExpectation::OrderedBound(&self.ordered_contract),
+                ),
+                (
+                    &self.topk,
+                    ContributionCodecExpectation::TopKSummary(&self.topk_contract),
+                ),
+                (
+                    &self.final_domain,
+                    ContributionCodecExpectation::FinalDomain {
+                        contract: &self.final_contract,
+                        stream: self.final_stream,
+                        sequence: self.final_sequence,
+                    },
+                ),
+            ]
         }
     }
 
@@ -1409,6 +1471,545 @@ mod tests {
         };
         let encoded = encode_contribution(&contribution, expectation, usize::MAX).unwrap();
         (contribution, encoded)
+    }
+
+    fn conformance_fixtures() -> ConformanceFixtures {
+        let (membership, membership_schema) = membership(MembershipValues::int64([1, 2]), true);
+        let ordered_contract = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Ascending,
+            NullOrder::Last,
+        )]);
+        let ordered = ordered_bound(&ordered_contract, [Some(OrderedScalar::Int64(7))]);
+        let topk_contract = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            2,
+        );
+        let topk = topk_summary(
+            &topk_contract,
+            [
+                vec![Some(OrderedScalar::Int64(3))],
+                vec![Some(OrderedScalar::Int64(5))],
+            ],
+        );
+        let final_contract = final_domain_contract(&DataType::Int64);
+        let final_stream = final_domain_stream(603, UniqueId { hi: 601, lo: 602 }, 604);
+        let final_sequence = ProducerSequence::new(605);
+        let final_domain = RuntimeFilterContribution::FinalDomain(final_domain_shard(
+            &final_contract,
+            final_stream,
+            final_sequence,
+            ValueDomainDelta::new(MembershipValues::int64([11, 13]), false),
+        ));
+        ConformanceFixtures {
+            membership,
+            membership_schema,
+            ordered,
+            ordered_contract,
+            topk,
+            topk_contract,
+            final_domain,
+            final_contract,
+            final_stream,
+            final_sequence,
+        }
+    }
+
+    #[test]
+    fn unified_encode_rejects_contribution_expectation_kind_mismatch() {
+        let fixtures = conformance_fixtures();
+        for (contribution, _) in fixtures.cases() {
+            for (_, expectation) in fixtures.cases() {
+                if expectation_kind(expectation)
+                    == match contribution {
+                        RuntimeFilterContribution::Membership(_) => {
+                            WireContributionKind::Membership
+                        }
+                        RuntimeFilterContribution::OrderedBound(_) => {
+                            WireContributionKind::OrderedBound
+                        }
+                        RuntimeFilterContribution::TopKSummary(_) => {
+                            WireContributionKind::TopKSummary
+                        }
+                        RuntimeFilterContribution::FinalDomain(_) => {
+                            WireContributionKind::FinalDomain
+                        }
+                    }
+                {
+                    continue;
+                }
+                assert_eq!(
+                    encoded_contribution_len(contribution, expectation),
+                    Err(ContributionCodecError::KindMismatch)
+                );
+                let allocator = CountingAllocator::new();
+                assert_eq!(
+                    encode_contribution_with_allocator(
+                        contribution,
+                        expectation,
+                        usize::MAX,
+                        &allocator,
+                    ),
+                    Err(ContributionCodecError::KindMismatch)
+                );
+                assert_eq!(allocator.calls.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unified_decode_rejects_frame_expectation_kind_mismatch() {
+        let fixtures = conformance_fixtures();
+        for (contribution, source_expectation) in fixtures.cases() {
+            let encoded =
+                encode_contribution(contribution, source_expectation, usize::MAX).unwrap();
+            for (_, target_expectation) in fixtures.cases() {
+                if expectation_kind(source_expectation) == expectation_kind(target_expectation) {
+                    continue;
+                }
+                assert_eq!(
+                    decode_contribution(
+                        encoded.payload(),
+                        encoded.schema_digest(),
+                        target_expectation,
+                        usize::MAX,
+                    ),
+                    Err(ContributionCodecError::KindMismatch)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_variants_report_exact_encoded_length() {
+        let fixtures = conformance_fixtures();
+        for (contribution, expectation) in fixtures.cases() {
+            let exact = encoded_contribution_len(contribution, expectation).unwrap();
+            let encoded = encode_contribution(contribution, expectation, exact).unwrap();
+            assert_eq!(encoded.payload().len(), exact);
+            assert_eq!(
+                encode_contribution(contribution, expectation, exact - 1),
+                Err(ContributionCodecError::EncodedSizeExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn all_variants_enforce_frame_envelope_expectation_digest_equality() {
+        let fixtures = conformance_fixtures();
+        for (contribution, expectation) in fixtures.cases() {
+            let encoded = encode_contribution(contribution, expectation, usize::MAX).unwrap();
+            let expected_digest = expectation_digest(expectation);
+            assert_eq!(encoded.schema_digest(), &expected_digest);
+            assert_eq!(&encoded.payload()[8..40], &expected_digest);
+            assert_eq!(
+                decode_contribution(encoded.payload(), &expected_digest, expectation, usize::MAX,),
+                Ok(contribution.clone())
+            );
+
+            let mut wrong_frame = encoded.payload().to_vec();
+            wrong_frame[8] ^= 1;
+            assert_eq!(
+                decode_contribution(
+                    &wrong_frame,
+                    encoded.schema_digest(),
+                    expectation,
+                    usize::MAX,
+                ),
+                Err(ContributionCodecError::SchemaMismatch)
+            );
+            let mut wrong_envelope = expected_digest;
+            wrong_envelope[0] ^= 1;
+            assert_eq!(
+                decode_contribution(encoded.payload(), &wrong_envelope, expectation, usize::MAX,),
+                Err(ContributionCodecError::SchemaMismatch)
+            );
+
+            let mut coherent_wrong = encoded.payload().to_vec();
+            let mut wrong_digest = expected_digest;
+            wrong_digest[0] ^= 1;
+            coherent_wrong[8..40].copy_from_slice(&wrong_digest);
+            assert_eq!(
+                decode_contribution(&coherent_wrong, &wrong_digest, expectation, usize::MAX,),
+                Err(ContributionCodecError::SchemaMismatch)
+            );
+        }
+
+        let membership = encode_contribution(
+            &fixtures.membership,
+            ContributionCodecExpectation::Membership(&fixtures.membership_schema),
+            usize::MAX,
+        )
+        .unwrap();
+        let alternate_membership = schema(&DataType::Utf8, NullSemantics::NullSafeEqual);
+        assert_eq!(
+            decode_contribution(
+                membership.payload(),
+                membership.schema_digest(),
+                ContributionCodecExpectation::Membership(&alternate_membership),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let ordered = encode_contribution(
+            &fixtures.ordered,
+            ContributionCodecExpectation::OrderedBound(&fixtures.ordered_contract),
+            usize::MAX,
+        )
+        .unwrap();
+        let alternate_ordered = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Descending,
+            NullOrder::Last,
+        )]);
+        assert_eq!(
+            decode_contribution(
+                ordered.payload(),
+                ordered.schema_digest(),
+                ContributionCodecExpectation::OrderedBound(&alternate_ordered),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let topk = encode_contribution(
+            &fixtures.topk,
+            ContributionCodecExpectation::TopKSummary(&fixtures.topk_contract),
+            usize::MAX,
+        )
+        .unwrap();
+        let alternate_topk = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            3,
+        );
+        assert_eq!(
+            decode_contribution(
+                topk.payload(),
+                topk.schema_digest(),
+                ContributionCodecExpectation::TopKSummary(&alternate_topk),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let final_domain = encode_contribution(
+            &fixtures.final_domain,
+            ContributionCodecExpectation::FinalDomain {
+                contract: &fixtures.final_contract,
+                stream: fixtures.final_stream,
+                sequence: fixtures.final_sequence,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        let alternate_final = RuntimeCompletionFenceContract::try_from_install(
+            UniqueId { hi: 801, lo: 802 },
+            DeploymentEpoch::new(803),
+            ChannelId::new(804),
+            CompletionFenceKind::CommittedDomainFrozen,
+            &schema(&DataType::Int64, NullSemantics::NullSafeEqual),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_contribution(
+                final_domain.payload(),
+                final_domain.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &alternate_final,
+                    stream: fixtures.final_stream,
+                    sequence: fixtures.final_sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn all_variants_reject_truncated_trailing_unknown_and_oversized_frames() {
+        let fixtures = conformance_fixtures();
+        for (contribution, expectation) in fixtures.cases() {
+            let encoded = encode_contribution(contribution, expectation, usize::MAX).unwrap();
+
+            let truncated = &encoded.payload()[..encoded.payload().len() - 1];
+            assert_eq!(
+                decode_contribution(truncated, encoded.schema_digest(), expectation, usize::MAX,),
+                Err(ContributionCodecError::Truncated)
+            );
+
+            let mut trailing = encoded.payload().to_vec();
+            trailing.push(0);
+            assert_eq!(
+                decode_contribution(&trailing, encoded.schema_digest(), expectation, usize::MAX,),
+                Err(ContributionCodecError::TrailingBytes)
+            );
+
+            let mut unknown = encoded.payload().to_vec();
+            unknown[6] = u8::MAX;
+            assert_eq!(
+                decode_contribution(&unknown, encoded.schema_digest(), expectation, usize::MAX,),
+                Err(ContributionCodecError::UnknownKind)
+            );
+
+            assert_eq!(
+                decode_contribution(
+                    encoded.payload(),
+                    encoded.schema_digest(),
+                    expectation,
+                    encoded.payload().len() - 1,
+                ),
+                Err(ContributionCodecError::EncodedSizeExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn cross_kind_body_splicing_is_rejected() {
+        let fixtures = conformance_fixtures();
+        let membership = encode_contribution(
+            &fixtures.membership,
+            ContributionCodecExpectation::Membership(&fixtures.membership_schema),
+            usize::MAX,
+        )
+        .unwrap();
+        let ordered = encode_contribution(
+            &fixtures.ordered,
+            ContributionCodecExpectation::OrderedBound(&fixtures.ordered_contract),
+            usize::MAX,
+        )
+        .unwrap();
+        let topk_one_contract = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            1,
+        );
+        let topk_one_contribution =
+            topk_summary(&topk_one_contract, [vec![Some(OrderedScalar::Int64(3))]]);
+        let topk_one = encode_contribution(
+            &topk_one_contribution,
+            ContributionCodecExpectation::TopKSummary(&topk_one_contract),
+            usize::MAX,
+        )
+        .unwrap();
+        let final_domain = encode_contribution(
+            &fixtures.final_domain,
+            ContributionCodecExpectation::FinalDomain {
+                contract: &fixtures.final_contract,
+                stream: fixtures.final_stream,
+                sequence: fixtures.final_sequence,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        let (_, long_membership_schema, long_membership) =
+            encode_membership(MembershipValues::utf8(["0123456789abcdef"]), false);
+
+        for (target, source, expectation) in [
+            (
+                &membership,
+                &ordered,
+                ContributionCodecExpectation::Membership(&fixtures.membership_schema),
+            ),
+            (
+                &ordered,
+                &membership,
+                ContributionCodecExpectation::OrderedBound(&fixtures.ordered_contract),
+            ),
+            (
+                &topk_one,
+                &membership,
+                ContributionCodecExpectation::TopKSummary(&topk_one_contract),
+            ),
+            (
+                &final_domain,
+                &long_membership,
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &fixtures.final_contract,
+                    stream: fixtures.final_stream,
+                    sequence: fixtures.final_sequence,
+                },
+            ),
+        ] {
+            let mut spliced = target.payload()[..HEADER_LEN].to_vec();
+            spliced.extend_from_slice(&source.payload()[HEADER_LEN..]);
+            let body_len = spliced.len() - HEADER_LEN;
+            spliced[40..48].copy_from_slice(&(body_len as u64).to_be_bytes());
+            assert_eq!(
+                decode_contribution(&spliced, target.schema_digest(), expectation, usize::MAX,),
+                Err(ContributionCodecError::NonCanonicalPayload)
+            );
+        }
+        assert_eq!(
+            long_membership.schema_digest(),
+            &long_membership_schema.digest().bytes()
+        );
+    }
+
+    #[test]
+    fn allocation_failure_maps_to_resource_limit() {
+        let fixtures = conformance_fixtures();
+        for (contribution, expectation) in fixtures.cases() {
+            let exact = encoded_contribution_len(contribution, expectation).unwrap();
+            let allocator = RejectingContributionFrameAllocator::new();
+            assert_eq!(
+                encode_contribution_with_allocator(
+                    contribution,
+                    expectation,
+                    exact - 1,
+                    &allocator,
+                ),
+                Err(ContributionCodecError::EncodedSizeExceeded)
+            );
+            assert_eq!(allocator.calls.get(), 0);
+
+            assert_eq!(
+                encode_contribution_with_allocator(contribution, expectation, exact, &allocator,),
+                Err(ContributionCodecError::ResourceLimit)
+            );
+            assert_eq!(allocator.calls.get(), 1);
+            assert_eq!(allocator.exact_len.get(), exact);
+        }
+    }
+
+    #[test]
+    fn membership_data_type_mismatch_maps_to_schema_mismatch() {
+        let contribution = RuntimeFilterContribution::Membership(ValueDomainDelta::new(
+            MembershipValues::int64([1]),
+            false,
+        ));
+        let wrong_schema = schema(&DataType::Utf8, NullSemantics::NullSafeEqual);
+        assert_eq!(
+            encode_contribution(
+                &contribution,
+                ContributionCodecExpectation::Membership(&wrong_schema),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let installed_schema = schema(&DataType::Int64, NullSemantics::NullSafeEqual);
+        let encoded = encode_contribution(
+            &contribution,
+            ContributionCodecExpectation::Membership(&installed_schema),
+            usize::MAX,
+        )
+        .unwrap();
+        let wrong_digest = wrong_schema.digest().bytes();
+        let mut forged_for_wrong_install = encoded.payload().to_vec();
+        forged_for_wrong_install[8..40].copy_from_slice(&wrong_digest);
+        assert_eq!(
+            decode_contribution(
+                &forged_for_wrong_install,
+                &wrong_digest,
+                ContributionCodecExpectation::Membership(&wrong_schema),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn ordered_and_topk_contract_digest_mismatch_map_to_schema_mismatch() {
+        let fixtures = conformance_fixtures();
+        let wrong_ordered = order_contract(vec![order_key(
+            DataType::Int64,
+            SortDirection::Descending,
+            NullOrder::Last,
+        )]);
+        assert_eq!(
+            encode_contribution(
+                &fixtures.ordered,
+                ContributionCodecExpectation::OrderedBound(&wrong_ordered),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let wrong_topk = topk_contract(
+            vec![order_key(
+                DataType::Int64,
+                SortDirection::Ascending,
+                NullOrder::Last,
+            )],
+            3,
+        );
+        assert_eq!(
+            encode_contribution(
+                &fixtures.topk,
+                ContributionCodecExpectation::TopKSummary(&wrong_topk),
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn final_domain_contract_mismatch_maps_to_schema_mismatch() {
+        let fixtures = conformance_fixtures();
+        let wrong_contract = RuntimeCompletionFenceContract::try_from_install(
+            UniqueId { hi: 701, lo: 702 },
+            DeploymentEpoch::new(703),
+            ChannelId::new(704),
+            CompletionFenceKind::CommittedDomainFrozen,
+            &schema(&DataType::Int64, NullSemantics::NullSafeEqual),
+        )
+        .unwrap();
+        assert_eq!(
+            encode_contribution(
+                &fixtures.final_domain,
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &wrong_contract,
+                    stream: fixtures.final_stream,
+                    sequence: fixtures.final_sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn final_domain_route_scope_mismatch_maps_to_noncanonical_payload() {
+        let fixtures = conformance_fixtures();
+        for (stream, sequence) in [
+            (
+                final_domain_stream(
+                    fixtures.final_stream.binding_id().get() + 1,
+                    fixtures.final_stream.fragment_instance_id(),
+                    fixtures.final_stream.partition_id().get(),
+                ),
+                fixtures.final_sequence,
+            ),
+            (
+                fixtures.final_stream,
+                ProducerSequence::new(fixtures.final_sequence.get() + 1),
+            ),
+        ] {
+            assert_eq!(
+                encode_contribution(
+                    &fixtures.final_domain,
+                    ContributionCodecExpectation::FinalDomain {
+                        contract: &fixtures.final_contract,
+                        stream,
+                        sequence,
+                    },
+                    usize::MAX,
+                ),
+                Err(ContributionCodecError::NonCanonicalPayload)
+            );
+        }
     }
 
     #[test]
