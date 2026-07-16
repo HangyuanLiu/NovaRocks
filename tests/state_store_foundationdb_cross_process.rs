@@ -72,6 +72,13 @@ fn helper_protocol_accepts_only_the_frozen_command_set_and_hex_payloads() {
         .is_err(),
         "helper protocol must reject unknown fields"
     );
+    assert!(
+        helper::parse_command(
+            r#"{"command":"Put","transaction_id":"00000000-0000-4000-8000-000000000002","key":"00","value":"01","precondition":{"version":"00","unexpected":true}}"#,
+        )
+        .is_err(),
+        "helper protocol must reject unknown nested precondition fields"
+    );
 }
 
 struct HelperProcess {

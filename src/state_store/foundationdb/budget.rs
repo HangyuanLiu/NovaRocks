@@ -355,4 +355,65 @@ mod tests {
             StateStoreErrorKind::LimitExceeded
         );
     }
+
+    #[test]
+    fn conformance_limits_fit_four_max_puts_and_eight_small_mutations() {
+        const CONFORMANCE_TRANSACTION_BYTES: usize = 16 * 1024;
+        const CONFORMANCE_MAX_VALUE_BYTES: usize = 1_899;
+        const KEYSPACE_ROOT_BYTES: usize = 5 + 16;
+        const CONFORMANCE_KEY_BYTES: usize = 3;
+
+        let mut max_value_budget = TransactionBudget::new(
+            limits(CONFORMANCE_TRANSACTION_BYTES, 8),
+            KEYSPACE_ROOT_BYTES,
+        )
+        .expect("conformance max-value budget");
+        for suffix in 1_u8..=4 {
+            max_value_budget
+                .stage_put(
+                    &[11, 0xfe, suffix],
+                    &vec![suffix; CONFORMANCE_MAX_VALUE_BYTES],
+                    &Precondition::Any,
+                )
+                .expect("four max-sized puts fit");
+        }
+        assert_eq!(
+            max_value_budget.accounted_bytes(),
+            CONFORMANCE_TRANSACTION_BYTES - 1
+        );
+        assert_eq!(
+            max_value_budget
+                .stage_put(
+                    &[11, 0xfe, 5],
+                    &vec![5; CONFORMANCE_MAX_VALUE_BYTES],
+                    &Precondition::Any,
+                )
+                .expect_err("fifth max-sized put exceeds byte budget")
+                .kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+
+        let mut operation_budget = TransactionBudget::new(
+            limits(CONFORMANCE_TRANSACTION_BYTES, 8),
+            KEYSPACE_ROOT_BYTES,
+        )
+        .expect("conformance operation budget");
+        for index in 0_u8..8 {
+            operation_budget
+                .stage_put(&[11, 0, index], b"v", &Precondition::Any)
+                .expect("eight small mutations fit the byte budget");
+        }
+        assert_eq!(
+            operation_budget.accounted_bytes(),
+            fixed_envelope_bytes(KEYSPACE_ROOT_BYTES).expect("fixed envelope")
+                + 8 * accounted_put_bytes(
+                    KEYSPACE_ROOT_BYTES,
+                    CONFORMANCE_KEY_BYTES,
+                    1,
+                    &Precondition::Any,
+                )
+                .expect("small put accounting")
+        );
+        assert!(operation_budget.accounted_bytes() < CONFORMANCE_TRANSACTION_BYTES);
+    }
 }

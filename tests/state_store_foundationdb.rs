@@ -761,6 +761,29 @@ async fn cancellation_safe_supervisor_scenarios(runtime: &StateStoreRuntime) {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
+fn conformance_limit_overrides() -> StateStoreLimitOverrides {
+    StateStoreLimitOverrides {
+        max_key_bytes: Some(64),
+        max_value_bytes: Some(1_899),
+        max_page_size: Some(10),
+        max_transaction_operations: Some(8),
+        max_transaction_bytes: Some(16 * 1024),
+        transaction_deadline_ms: Some(4_000),
+        runner_max_attempts: Some(3),
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[test]
+fn conformance_fixture_uses_foundationdb_budget_compatible_limits() {
+    let limits = conformance_limit_overrides();
+    assert_eq!(
+        (limits.max_transaction_bytes, limits.max_value_bytes),
+        (Some(16 * 1024), Some(1_899))
+    );
+}
+
+#[cfg(feature = "state-store-test-hooks")]
 fn conformance_factory(runtime: Rc<StateStoreRuntime>) -> StateStoreFactory {
     Rc::new(move || {
         let runtime = Rc::clone(&runtime);
@@ -769,15 +792,7 @@ fn conformance_factory(runtime: Rc<StateStoreRuntime>) -> StateStoreFactory {
                 runtime.as_ref(),
                 StateStoreConfig {
                     cluster_id: "foundationdb-conformance-cluster".to_owned(),
-                    limits: StateStoreLimitOverrides {
-                        max_key_bytes: Some(64),
-                        max_value_bytes: Some(128),
-                        max_page_size: Some(10),
-                        max_transaction_operations: Some(8),
-                        max_transaction_bytes: Some(1_024),
-                        transaction_deadline_ms: Some(4_000),
-                        runner_max_attempts: Some(3),
-                    },
+                    limits: conformance_limit_overrides(),
                     provider: StateStoreProviderConfig::Foundationdb {
                         cluster_file: cluster_file(),
                         keyspace_id: Uuid::new_v4(),

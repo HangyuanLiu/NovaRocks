@@ -142,7 +142,13 @@ enum RawCommand {
 #[serde(untagged)]
 enum RawPrecondition {
     Name(PreconditionName),
-    Version { version: String },
+    Version(RawVersionPrecondition),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVersionPrecondition {
+    version: String,
 }
 
 #[derive(Deserialize)]
@@ -228,10 +234,9 @@ fn decode_precondition(raw: RawPrecondition) -> Result<Precondition, String> {
         RawPrecondition::Name(PreconditionName::Any) => Ok(Precondition::Any),
         RawPrecondition::Name(PreconditionName::Absent) => Ok(Precondition::Absent),
         RawPrecondition::Name(PreconditionName::Present) => Ok(Precondition::Present),
-        RawPrecondition::Version { version } => Ok(Precondition::Version(decode_hex(
-            "precondition version",
-            &version,
-        )?)),
+        RawPrecondition::Version(RawVersionPrecondition { version }) => Ok(Precondition::Version(
+            decode_hex("precondition version", &version)?,
+        )),
     }
 }
 
