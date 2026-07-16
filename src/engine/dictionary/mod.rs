@@ -323,8 +323,7 @@ impl DictionaryQueryProvider {
     ) -> Result<Option<DictionaryOwner>, String> {
         match &table.source {
             // Lock-free: (db_id, table_id) live in the plan node, populated
-            // when the StarRocks table was registered via
-            // `InMemoryCatalog::register_starrocks_table`. We do NOT take
+            // when the StarRocks logical table was registered. We do NOT take
             // `state.starrocks_table.read()` here — every Scan column of every
             // SELECT calls this method, and that lock is contended with
             // INSERT / DROP DATABASE writers under parallel sql-tests.

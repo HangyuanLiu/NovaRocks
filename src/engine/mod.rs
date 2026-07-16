@@ -5366,7 +5366,7 @@ mysql_port = 47892
         Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
     ) {
         use crate::catalog::schema::ColumnDef;
-        use crate::sql::catalog::{PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef};
+        use crate::sql::catalog::{ScanSource, TableDef};
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
         let mut catalog = super::InMemoryCatalog::default();
@@ -5389,33 +5389,30 @@ mysql_port = 47892
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            // Must match the PhysicalTableLayout below so the debug_assert
-            // in InMemoryCatalog::register_starrocks_table is satisfied.
             source: ScanSource::StarRocks {
                 db_id: 1,
                 table_id: 2,
             },
         };
-        let layout = PhysicalTableLayout {
-            db_id: 1,
-            table_id: 2,
-            schema_id: 3,
-            tablets: vec![StarRocksTabletRef {
-                tablet_id: 4,
-                partition_id: 5,
-                version: 6,
-            }],
-        };
         catalog
-            .register_starrocks_table("default", table.clone(), layout.clone())
+            .register("default", table.clone())
             .expect("register StarRocks tbl");
         let mut date_dim = table;
         date_dim.name = "date_dim".to_string();
         catalog
-            .register_starrocks_table("default", date_dim, layout.clone())
+            .register("default", date_dim)
             .expect("register StarRocks date_dim");
 
-        let registry = mock_starrocks_registry_for_engine_test(&layout);
+        let registry = mock_starrocks_registry_for_engine_test(
+            3,
+            vec![
+                crate::connector::starrocks::table::scan_planner::StarRocksSplit {
+                    tablet_id: 4,
+                    partition_id: 5,
+                    version: 6,
+                },
+            ],
+        );
 
         let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
@@ -5485,12 +5482,13 @@ mysql_port = 47892
     }
 
     /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
-    /// returns the schema_id and tablet splits from the given layout. Used by
+    /// returns the provided schema_id and tablet splits. Used by
     /// engine-level tests that build fragments for a StarRocks table but do not
     /// have a full `StandaloneState` available.
     #[cfg(feature = "compat")]
     fn mock_starrocks_registry_for_engine_test(
-        layout: &crate::sql::catalog::PhysicalTableLayout,
+        schema_id: i64,
+        splits: Vec<crate::connector::starrocks::table::scan_planner::StarRocksSplit>,
     ) -> crate::connector::ConnectorRegistry {
         use crate::connector::scan_planning::{
             BeginScanContext, ConnectorScanPlanner, SplitPlanningContext,
@@ -5549,19 +5547,7 @@ mysql_port = 47892
             }
         }
 
-        let splits = layout
-            .tablets
-            .iter()
-            .map(|t| StarRocksSplit {
-                tablet_id: t.tablet_id,
-                partition_id: t.partition_id,
-                version: t.version,
-            })
-            .collect();
-        let planner = std::sync::Arc::new(MockPlanner {
-            schema_id: layout.schema_id,
-            splits,
-        });
+        let planner = std::sync::Arc::new(MockPlanner { schema_id, splits });
         let mut registry = crate::connector::ConnectorRegistry::new();
         registry.register_scan_planner(planner);
         registry.register_scan_planner(std::sync::Arc::new(

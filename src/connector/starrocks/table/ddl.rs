@@ -1061,7 +1061,9 @@ mod tests {
     use prost::Message;
 
     use crate::catalog::schema::SqlType;
-    use crate::connector::starrocks::table::catalog::register_starrocks_table_in_catalog;
+    use crate::connector::starrocks::table::catalog::{
+        register_starrocks_table_in_catalog, starrocks_scan_tablets,
+    };
     use crate::connector::starrocks::table::model::{
         StarRocksGlobalMeta, StarRocksIndexState, StarRocksPartitionState, StarRocksTableKind,
         StarRocksTableSnapshot, StarRocksTableState, StarRocksTxnState, StoredStarRocksColumn,
@@ -1601,11 +1603,25 @@ mod tests {
     }
 
     #[test]
-    fn truncate_starrocks_table_replaces_active_partition_and_updates_catalog_layout() {
+    fn truncate_starrocks_table_replaces_active_partition_for_next_live_scan() {
         // See drop_starrocks_table_removes_catalog_entry_and_marks_metadata_dropping
         // for why we hold the runtime-test lock here.
         let _runtime_guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let (_dir, state) = seeded_state();
+        let logical_columns_before = {
+            let catalog = state.catalog.read().expect("catalog read lock");
+            let table = catalog
+                .get(DEFAULT_DATABASE, "orders")
+                .expect("logical table before truncate");
+            assert!(matches!(
+                table.source,
+                crate::engine::catalog::ScanSource::StarRocks {
+                    db_id: 1,
+                    table_id: 10,
+                }
+            ));
+            table.columns.clone()
+        };
 
         truncate_starrocks_table_with_hooks(
             &state,
@@ -1615,18 +1631,6 @@ mod tests {
             |_| Ok(()),
         )
         .expect("truncate StarRocks table");
-
-        let catalog = state.catalog.read().expect("catalog read lock");
-        let layout = catalog
-            .get_physical_layout(DEFAULT_DATABASE, "orders")
-            .expect("physical layout lookup")
-            .expect("StarRocks physical layout");
-        assert_eq!(layout.table_id, 10);
-        assert_eq!(layout.tablets.len(), 1);
-        assert_eq!(layout.tablets[0].tablet_id, 41);
-        assert_eq!(layout.tablets[0].partition_id, 21);
-        assert_eq!(layout.tablets[0].version, 1);
-        drop(catalog);
 
         let starrocks = state
             .starrocks_table
@@ -1640,11 +1644,30 @@ mod tests {
         assert_eq!(runtime.partitions[0].visible_version, 1);
         assert_eq!(runtime.tablets.len(), 1);
         assert_eq!(runtime.tablets[0].tablet_id, 41);
+        let scan_tablets = starrocks_scan_tablets(runtime);
+        assert_eq!(scan_tablets.len(), 1);
+        assert_eq!(scan_tablets[0].tablet_id, 41);
+        assert_eq!(scan_tablets[0].partition_id, 21);
+        assert_eq!(scan_tablets[0].version, 1);
         assert_eq!(
             runtime.tablets[0].tablet_root_path,
             "s3://test/warehouse/db_1/table_10/partition_21"
         );
         drop(starrocks);
+
+        let catalog = state.catalog.read().expect("catalog read lock");
+        let logical_after = catalog
+            .get(DEFAULT_DATABASE, "orders")
+            .expect("logical table after truncate");
+        assert!(matches!(
+            logical_after.source,
+            crate::engine::catalog::ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 10,
+            }
+        ));
+        assert_eq!(logical_after.columns, logical_columns_before);
+        drop(catalog);
 
         let read = state
             .metadata_provider

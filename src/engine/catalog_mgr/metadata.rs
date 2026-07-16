@@ -32,8 +32,8 @@ use crate::sql::catalog::{IcebergTableInfo, ScanSource, TableDef};
 /// Backend-specific locator for scan-binding. Carries identity only, never data.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TableBinding {
-    /// Local / StarRocks table. Tablets live in `InMemoryCatalog`
-    /// (`PhysicalTableLayout`); resolved at plan time, not here.
+    /// Local / StarRocks table. StarRocks tablets are resolved from the live
+    /// connector runtime at scan-planning time, not here.
     Internal { db_id: i64, table_id: i64 },
     /// Iceberg table. `info` carries identity + schema; the current snapshot's
     /// data files are resolved at codegen time, never stored here.
