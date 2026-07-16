@@ -8035,6 +8035,89 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
 
 fn runtime_filter_task4_whole_exact_inventory(source_rel: &str) -> Option<&'static str> {
     let exact_inventory = match source_rel {
+        "src/runtime_filter/codec/mod.rs" => Some(""),
+        "src/runtime_filter/codec/contribution.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Float32
+arrow::datatypes::DataType::Float64
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+arrow::datatypes::TimeUnit
+arrow::datatypes::TimeUnit::Microsecond
+arrow::datatypes::TimeUnit::Millisecond
+arrow::datatypes::TimeUnit::Nanosecond
+arrow::datatypes::TimeUnit::Second
+crate::common::largeint::LARGEINT_BYTE_WIDTH
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::final_domain::CompletionFence
+crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec
+crate::runtime_filter::port::final_domain::FinalDomainError
+crate::runtime_filter::port::final_domain::FinalDomainError::ContractMismatch
+crate::runtime_filter::port::final_domain::FinalDomainError::DomainSchemaMismatch
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::FinalDomainShard::try_new
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::FINGERPRINT_VERSION_TAG
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::boolean
+crate::runtime_filter::port::value_domain::MembershipValues::date32
+crate::runtime_filter::port::value_domain::MembershipValues::decimal128
+crate::runtime_filter::port::value_domain::MembershipValues::float32
+crate::runtime_filter::port::value_domain::MembershipValues::float64
+crate::runtime_filter::port::value_domain::MembershipValues::int16
+crate::runtime_filter::port::value_domain::MembershipValues::int32
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::MembershipValues::int8
+crate::runtime_filter::port::value_domain::MembershipValues::large_int
+crate::runtime_filter::port::value_domain::MembershipValues::timestamp
+crate::runtime_filter::port::value_domain::MembershipValues::utf8
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::error::Error
+std::fmt
+std::fmt::Display
+std::fmt::Formatter
+std::fmt::Result
+std::mem::size_of
+std::str::from_utf8
+"#,
+        ),
         "src/runtime_filter/core/ordered_reducer.rs" => Some(
             r#"
 crate::common::types::UniqueId
@@ -8193,6 +8276,9 @@ crate::runtime_filter::model::contract::SortDirection
 crate::runtime_filter::model::contract::SortDirection::Ascending
 crate::runtime_filter::model::contract::SortDirection::Descending
 crate::runtime_filter::port::artifact::encode_schema
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::ContributionSizeError::LengthExceedsCanonicalRange
+crate::runtime_filter::port::value_domain::ContributionSizeError::SizeOverflow
 sha2::Digest
 sha2::Sha256
 sha2::Sha256::digest
@@ -8213,6 +8299,9 @@ crate::runtime_filter::port::ordered_bound::OrderedTuple
 crate::runtime_filter::port::ordered_bound::OrderedTupleError
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::ContributionSizeError::LengthExceedsCanonicalRange
+crate::runtime_filter::port::value_domain::ContributionSizeError::SizeOverflow
 sha2::Digest
 sha2::Sha256
 sha2::Sha256::new
@@ -9505,6 +9594,7 @@ fn runtime_filter_task4_added_dependency_prefixes(source_rel: &str) -> &'static 
             "crate::runtime_filter::port::producer::RuntimeContractViolation",
             "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
         ],
+        "src/runtime_filter/port/transport.rs" => &["std::num::NonZeroU32"],
         "src/runtime_filter/port/value_domain.rs" => {
             &["crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain"]
         }
@@ -9536,6 +9626,12 @@ fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]
 
 fn runtime_filter_task4_added_exact_inventory(source_rel: &str) -> Option<&'static str> {
     let exact_added_inventory = match source_rel {
+        "src/runtime_filter/port/transport.rs" => {
+            r#"
+std::num::NonZeroU32
+std::num::NonZeroU32::new
+"#
+        }
         "src/runtime_filter/core/channel.rs" => {
             r#"
 crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome
@@ -10492,6 +10588,7 @@ fn runtime_filter_runtime_dependency_allowlist(
         return Some(Vec::new());
     }
     let allowed: Vec<&'static [&'static str]> = match source_rel {
+        "src/runtime_filter/codec/mod.rs" | "src/runtime_filter/codec/contribution.rs" => vec![],
         "src/runtime_filter/core/mod.rs" => vec![],
         "src/runtime_filter/core/channel.rs" => vec![
             &["std", "collections", "BTreeMap"],
@@ -11084,6 +11181,7 @@ fn runtime_filter_runtime_dependency_allowlist(
         "src/runtime_filter/port/transport.rs" => vec![
             &["std", "error"],
             &["std", "fmt"],
+            &["std", "num", "NonZeroU32"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
             &["crate", "runtime_filter", "model", "contract", "ChannelId"],
@@ -15682,7 +15780,7 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
     let mut violations = Vec::new();
     for path in rs_files(&runtime_filter) {
         let source_rel = rel(&path);
-        if ["core", "materializer", "port", "router", "service"]
+        if ["codec", "core", "materializer", "port", "router", "service"]
             .into_iter()
             .any(|namespace| {
                 source_rel == format!("src/runtime_filter/{namespace}.rs")
@@ -43321,6 +43419,947 @@ fn coordinator_scheduler_sealed_topology() {
             "test drift must not create production scheduler surface `{forbidden}`"
         );
     }
+}
+
+fn rfd4_m2b2_path_starts_with(path: &[String], prefix: &[&str]) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn rfd4_m2b2_path_is_concrete_contribution(path: &[String]) -> bool {
+    const CONCRETE: [&[&str]; 5] = [
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "value_domain",
+            "ValueDomainDelta",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "ordered_bound",
+            "OrderedBoundUpdate",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "topk_summary",
+            "TopKSummary",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "final_domain",
+            "FinalDomainShard",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "codec",
+            "contribution",
+            "RuntimeFilterContribution",
+        ],
+    ];
+    const CONCRETE_GLOBS: [&[&str]; 5] = [
+        &["crate", "runtime_filter", "port", "value_domain", "*"],
+        &["crate", "runtime_filter", "port", "ordered_bound", "*"],
+        &["crate", "runtime_filter", "port", "topk_summary", "*"],
+        &["crate", "runtime_filter", "port", "final_domain", "*"],
+        &["crate", "runtime_filter", "codec", "contribution", "*"],
+    ];
+    CONCRETE
+        .iter()
+        .any(|expected| path.len() == expected.len() && rfd4_m2b2_path_starts_with(path, expected))
+        || CONCRETE_GLOBS.iter().any(|expected| {
+            path.len() == expected.len() && rfd4_m2b2_path_starts_with(path, expected)
+        })
+}
+
+fn rfd4_m2b2_production_call_names(text: &str) -> Result<BTreeSet<String>, syn::Error> {
+    #[derive(Default)]
+    struct CallAudit {
+        names: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for CallAudit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref()
+                && let Some(last) = path.path.segments.last()
+            {
+                self.names.insert(last.ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.names.insert(call.method.to_string());
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    let file = syn::parse_file(text)?;
+    let mut audit = CallAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.names)
+}
+
+fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
+    const ADAPTER: &str = "src/service/grpc_runtime_filter_adapter.rs";
+    let is_transport = source_rel == "src/runtime_filter/port/transport.rs";
+    let is_router = source_rel.starts_with("src/runtime_filter/router/");
+    let is_adapter = source_rel == ADAPTER;
+    let is_codec = matches!(
+        source_rel,
+        "src/runtime_filter/codec/mod.rs" | "src/runtime_filter/codec/contribution.rs"
+    );
+    let is_new_owner = is_adapter || is_codec;
+
+    let mut violations = Vec::new();
+    let production = rust_sanitized_production_text(text);
+    if rfd4_m2a_has_forbidden_source_indirection(&production) {
+        violations.push(format!(
+            "{source_rel}: guarded owner must not hide dependencies behind include!/path"
+        ));
+    }
+    for alias_violation in production_crate_self_alias_violations(source_rel, text) {
+        violations.push(format!("{source_rel}: {alias_violation}"));
+    }
+
+    let paths = rust_production_canonical_paths(text, source_rel);
+    for path in paths {
+        if (is_transport || is_router || is_adapter)
+            && rfd4_m2b2_path_is_concrete_contribution(&path)
+        {
+            violations.push(format!(
+                "{source_rel}: concrete contribution dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_codec
+            && [
+                &["crate", "service"][..],
+                &["crate", "runtime", "query_context"][..],
+                &["crate", "runtime_filter", "router"][..],
+                &["crate", "runtime_filter", "service"][..],
+                &["crate", "proto"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: codec dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_adapter
+            && [
+                &["crate", "runtime_filter", "codec", "contribution"][..],
+                &["crate", "runtime_filter", "core"][..],
+                &["crate", "runtime_filter", "router"][..],
+                &["crate", "runtime_filter", "service"][..],
+                &["crate", "runtime", "query_context"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: adapter authority dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_new_owner
+            && [
+                &["crate", "service", "grpc_client"][..],
+                &["crate", "service", "internal_rpc_client"][..],
+                &["crate", "service", "exchange_sender"][..],
+                &["crate", "runtime_filter", "service", "materialization"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: out-of-scope delivery dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_new_owner
+            && path.last().is_some_and(|last| {
+                matches!(
+                    last.as_str(),
+                    "TransmitRuntimeFilterRequest" | "TransmitRuntimeFilterResponse"
+                )
+            })
+        {
+            violations.push(format!(
+                "{source_rel}: legacy runtime-filter bridge {}",
+                path.join("::")
+            ));
+        }
+    }
+
+    let calls = match rfd4_m2b2_production_call_names(text) {
+        Ok(calls) => calls,
+        Err(error) => {
+            violations.push(format!(
+                "{source_rel}: guarded production source must parse: {error}"
+            ));
+            return violations;
+        }
+    };
+    if is_adapter {
+        for forbidden in [
+            "authorize_contribution",
+            "authorize_delivery",
+            "close_partition",
+            "decode_contribution",
+            "get_query_context",
+            "get_query_context_second_chance",
+            "open_producer",
+            "runtime_filter_service",
+            "submit",
+            "submit_bound",
+            "submit_final_domain",
+            "submit_summary",
+        ] {
+            if calls.contains(forbidden) {
+                violations.push(format!("{source_rel}: forbidden adapter call {forbidden}"));
+            }
+        }
+    }
+    if is_new_owner {
+        for forbidden in [
+            "deliver_artifact",
+            "enqueue_retry",
+            "retry_delivery",
+            "send_runtime_filter",
+            "transmit_runtime_filter",
+        ] {
+            if calls.contains(forbidden) {
+                violations.push(format!(
+                    "{source_rel}: out-of-scope owner-graph call {forbidden}"
+                ));
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> Vec<String> {
+    const CODEC_OWNER: &str = "src/runtime_filter/codec/contribution.rs";
+    const DEFINITION_OWNER: &str = "src/runtime_filter/port/final_domain.rs";
+    let mut violations = Vec::new();
+    for (source_rel, text) in sources {
+        let production = rust_sanitized_production_text(text);
+        let tokens = rust_use_tokens(&production);
+        let parsed = syn::parse_file(text);
+        if let Err(error) = &parsed {
+            violations.push(format!(
+                "{source_rel}: remote reconstruction audit must parse production source: {error}"
+            ));
+            continue;
+        }
+        let canonical_paths = rust_production_canonical_paths(text, source_rel);
+        let canonical_remote = canonical_paths.iter().any(|path| {
+            path.len() == 6
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "final_domain",
+                        "CompletionFence",
+                        "try_from_remote_codec",
+                    ],
+                )
+        });
+        let final_domain_glob = canonical_paths.iter().any(|path| {
+            rfd4_m2b2_path_starts_with(path, &["crate", "runtime_filter", "port", "final_domain"])
+                && path.last().is_some_and(|last| last == "*")
+        });
+        let public_fence_facade =
+            rust_production_scoped_use_statements(text)
+                .into_iter()
+                .any(|statement| {
+                    rust_use_visibility(&statement.import) != "private"
+                        && rust_canonical_use_segments_in_scope(
+                            &statement.import,
+                            source_rel,
+                            &statement.inline_modules,
+                        )
+                        .is_some_and(|path| {
+                            path.len() == 5
+                                && rfd4_m2b2_path_starts_with(
+                                    &path,
+                                    &[
+                                        "crate",
+                                        "runtime_filter",
+                                        "port",
+                                        "final_domain",
+                                        "CompletionFence",
+                                    ],
+                                )
+                        })
+                });
+        let aliases_remote_type = tokens.windows(7).any(|window| {
+            window
+                == [
+                    "crate",
+                    "::",
+                    "runtime_filter",
+                    "::",
+                    "port",
+                    "::",
+                    "final_domain",
+                ]
+        }) && tokens.iter().any(|token| token == "CompletionFence")
+            && tokens.iter().any(|token| token == "type");
+
+        match source_rel.as_str() {
+            DEFINITION_OWNER => {
+                let declarations =
+                    rust_named_function_declaration_count(&production, "try_from_remote_codec");
+                if declarations != 1 {
+                    violations.push(format!(
+                        "{source_rel}: expected one remote constructor declaration, found {declarations}"
+                    ));
+                }
+            }
+            CODEC_OWNER => {
+                if !canonical_remote {
+                    violations.push(format!(
+                        "{source_rel}: contribution codec must be the remote constructor caller"
+                    ));
+                }
+            }
+            _ => {
+                if canonical_remote
+                    || final_domain_glob
+                    || aliases_remote_type
+                    || public_fence_facade
+                {
+                    violations.push(format!(
+                        "{source_rel}: remote completion-fence reconstruction escaped the codec owner"
+                    ));
+                }
+                if tokens.iter().any(|token| token == "try_from_remote_codec") {
+                    let extern_alias =
+                        !production_crate_self_alias_violations(source_rel, text).is_empty();
+                    if extern_alias {
+                        violations.push(format!(
+                            "{source_rel}: extern-crate alias may hide remote reconstruction"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn rfd4_m2b2_tail_expr(block: &syn::Block) -> Option<&syn::Expr> {
+    match block.stmts.last()? {
+        syn::Stmt::Expr(expression, None) => Some(expression),
+        _ => None,
+    }
+}
+
+fn rfd4_m2b2_matches_tokens(expression: &syn::Expr) -> Option<Vec<String>> {
+    let syn::Expr::Macro(expression) = expression else {
+        return None;
+    };
+    expression
+        .mac
+        .path
+        .is_ident("matches")
+        .then(|| rust_use_tokens(&expression.mac.tokens.to_string()))
+}
+
+fn rfd4_m2b2_open_payload_matrix_violations(text: &str) -> Vec<String> {
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => return vec![format!("transport production source must parse: {error}")],
+    };
+    let expected_open = rust_use_tokens("self, Self::Contribution | Self::ProducerClosed");
+    let expected_payload = rust_use_tokens(
+        "kind, RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable",
+    );
+    let mut open = Vec::new();
+    let mut payload = Vec::new();
+
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        let owner = self_ty
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string());
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if owner.as_deref() == Some("RuntimeFilterEnvelopeKind")
+                && method.sig.ident == "requires_producer_open"
+                && let Some(expression) = rfd4_m2b2_tail_expr(&method.block)
+                && let Some(tokens) = rfd4_m2b2_matches_tokens(expression)
+            {
+                open.push(tokens);
+            }
+            if owner.as_deref() == Some("RuntimeFilterEnvelope") && method.sig.ident == "try_new" {
+                for statement in &method.block.stmts {
+                    let syn::Stmt::Local(local) = statement else {
+                        continue;
+                    };
+                    let syn::Pat::Ident(binding) = &local.pat else {
+                        continue;
+                    };
+                    if binding.ident != "payload_required" {
+                        continue;
+                    }
+                    if let Some(init) = &local.init
+                        && let Some(tokens) = rfd4_m2b2_matches_tokens(init.expr.as_ref())
+                    {
+                        payload.push(tokens);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    if open != [expected_open] {
+        violations.push(format!("producer-open kind set drifted: {open:?}"));
+    }
+    if payload != [expected_payload] {
+        violations.push(format!("payload-bearing kind set drifted: {payload:?}"));
+    }
+    violations
+}
+
+fn rfd4_m2b2_nrfc_magic_count(text: &str) -> Result<usize, syn::Error> {
+    #[derive(Default)]
+    struct MagicAudit {
+        count: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for MagicAudit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_expr_lit(&mut self, expression: &'ast syn::ExprLit) {
+            if let syn::Lit::ByteStr(value) = &expression.lit
+                && value.value() == b"NRFC"
+            {
+                self.count += 1;
+            }
+            syn::visit::visit_expr_lit(self, expression);
+        }
+    }
+
+    let file = syn::parse_file(text)?;
+    let mut audit = MagicAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.count)
+}
+
+fn rfd4_m2b2_wire_tag_maps(
+    text: &str,
+) -> Result<(BTreeMap<String, u8>, BTreeMap<u8, String>), String> {
+    let file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    let mut encode = BTreeMap::new();
+    let mut decode = BTreeMap::new();
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        if self_ty
+            .path
+            .segments
+            .last()
+            .is_none_or(|segment| segment.ident != "WireContributionKind")
+        {
+            continue;
+        }
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            let Some(syn::Expr::Match(expression)) = rfd4_m2b2_tail_expr(&method.block) else {
+                continue;
+            };
+            if method.sig.ident == "tag" {
+                for arm in &expression.arms {
+                    let syn::Pat::Path(kind) = &arm.pat else {
+                        continue;
+                    };
+                    let Some(kind) = kind.path.segments.last() else {
+                        continue;
+                    };
+                    let syn::Expr::Lit(value) = arm.body.as_ref() else {
+                        continue;
+                    };
+                    let syn::Lit::Int(value) = &value.lit else {
+                        continue;
+                    };
+                    encode.insert(
+                        kind.ident.to_string(),
+                        value
+                            .base10_parse::<u8>()
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            } else if method.sig.ident == "from_tag" {
+                for arm in &expression.arms {
+                    let syn::Pat::Lit(tag) = &arm.pat else {
+                        continue;
+                    };
+                    let syn::Lit::Int(tag) = &tag.lit else {
+                        continue;
+                    };
+                    let syn::Expr::Call(some) = arm.body.as_ref() else {
+                        continue;
+                    };
+                    let syn::Expr::Path(function) = some.func.as_ref() else {
+                        continue;
+                    };
+                    if function
+                        .path
+                        .segments
+                        .last()
+                        .is_none_or(|segment| segment.ident != "Some")
+                        || some.args.len() != 1
+                    {
+                        continue;
+                    }
+                    let Some(syn::Expr::Path(kind)) = some.args.first() else {
+                        continue;
+                    };
+                    let Some(kind) = kind.path.segments.last() else {
+                        continue;
+                    };
+                    decode.insert(
+                        tag.base10_parse::<u8>()
+                            .map_err(|error| error.to_string())?,
+                        kind.ident.to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok((encode, decode))
+}
+
+fn rfd4_m2b2_final_domain_authority_violations(text: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct AuthorityCallAudit {
+        calls_private_issue: bool,
+        reads_proof: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for AuthorityCallAudit {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                if segments.ends_with(&["CompletionFence".to_string(), "issue".to_string()]) {
+                    self.calls_private_issue = true;
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("proof")) {
+                self.reads_proof = true;
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+    }
+
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "final-domain production source must parse: {error}"
+            )];
+        }
+    };
+    let mut private_issue = false;
+    let mut remote_constructor = false;
+    let mut authority_chain = false;
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        let Some(owner) = self_ty.path.segments.last() else {
+            continue;
+        };
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if owner.ident == "CompletionFence" && method.sig.ident == "issue" {
+                private_issue = matches!(method.vis, syn::Visibility::Inherited)
+                    && method.sig.inputs.len() == 3;
+            }
+            if owner.ident == "CompletionFence" && method.sig.ident == "try_from_remote_codec" {
+                remote_constructor = matches!(method.vis, syn::Visibility::Restricted(_))
+                    && method.sig.inputs.len() == 4;
+            }
+            if owner.ident == "CompletionFenceAuthority" && method.sig.ident == "issue" {
+                let has_proof = method.sig.inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        syn::FnArg::Typed(argument)
+                            if matches!(argument.pat.as_ref(), syn::Pat::Ident(binding) if binding.ident == "proof")
+                    )
+                });
+                let mut audit = AuthorityCallAudit::default();
+                syn::visit::Visit::visit_block(&mut audit, &method.block);
+                authority_chain = has_proof && audit.reads_proof && audit.calls_private_issue;
+            }
+        }
+    }
+    let mut violations = Vec::new();
+    if !private_issue {
+        violations
+            .push("CompletionFence::issue must remain private with the frozen signature".into());
+    }
+    if !remote_constructor {
+        violations.push(
+            "CompletionFence::try_from_remote_codec must remain crate-restricted with four inputs"
+                .into(),
+        );
+    }
+    if !authority_chain {
+        violations.push(
+            "CompletionFenceAuthority::issue must consume proof state before the private issue path"
+                .into(),
+        );
+    }
+    violations
+}
+
+#[test]
+fn rfd4_m2b2_open_metadata_matrix_and_producer_closed_payload_are_frozen() {
+    let transport = fs::read_to_string(src_dir().join("runtime_filter/port/transport.rs"))
+        .expect("read runtime-filter transport");
+    let violations = rfd4_m2b2_open_payload_matrix_violations(&transport);
+    assert!(
+        violations.is_empty(),
+        "producer-open/payload matrix drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_nrfc_magic_and_wire_tags_have_one_codec_owner() {
+    let codec_owner = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_owner))
+        .expect("read contribution codec");
+    let expected_encode = BTreeMap::from([
+        ("FinalDomain".to_string(), 4),
+        ("Membership".to_string(), 1),
+        ("OrderedBound".to_string(), 2),
+        ("TopKSummary".to_string(), 3),
+    ]);
+    let expected_decode = expected_encode
+        .iter()
+        .map(|(kind, tag)| (*tag, kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let (encode, decode) =
+        rfd4_m2b2_wire_tag_maps(&codec).expect("parse contribution wire-tag maps");
+    assert_eq!(encode, expected_encode);
+    assert_eq!(decode, expected_decode);
+
+    let mut owners = Vec::new();
+    for path in rs_files(&src_dir()) {
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).expect("read Rust source");
+        let magic_count =
+            rfd4_m2b2_nrfc_magic_count(&text).expect("guarded Rust source must parse");
+        let production = rust_sanitized_production_text(&text);
+        let wire_kind_count = rust_use_tokens(&production)
+            .iter()
+            .filter(|token| token.as_str() == "WireContributionKind")
+            .count();
+        if magic_count > 0 || wire_kind_count > 0 {
+            owners.push(source_rel);
+        }
+    }
+    assert_eq!(owners, vec![codec_owner.to_string()]);
+}
+
+#[test]
+fn rfd4_m2b2_transport_router_adapter_and_codec_dependencies_stay_separated() {
+    let mut sources = vec![
+        "src/runtime_filter/port/transport.rs".to_string(),
+        "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+        "src/runtime_filter/codec/mod.rs".to_string(),
+        "src/runtime_filter/codec/contribution.rs".to_string(),
+    ];
+    sources.extend(
+        rs_files(&src_dir().join("runtime_filter/router"))
+            .into_iter()
+            .map(|path| rel(&path)),
+    );
+    sources.sort();
+    sources.dedup();
+
+    let violations = sources
+        .into_iter()
+        .flat_map(|source_rel| {
+            let text = fs::read_to_string(Path::new(manifest_dir()).join(&source_rel))
+                .expect("read guarded owner");
+            rfd4_m2b2_source_violations(&source_rel, &text)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "M2B2 dependency boundaries drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_remote_completion_fence_reconstruction_has_one_production_caller() {
+    let sources = rs_files(&src_dir())
+        .into_iter()
+        .map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("read Rust source");
+            (source_rel, text)
+        })
+        .collect::<Vec<_>>();
+    let violations = rfd4_m2b2_remote_reconstruction_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "remote completion-fence reconstruction authority drifted:\n{}",
+        violations.join("\n")
+    );
+
+    let final_domain = fs::read_to_string(src_dir().join("runtime_filter/port/final_domain.rs"))
+        .expect("read final-domain port");
+    let authority_violations = rfd4_m2b2_final_domain_authority_violations(&final_domain);
+    assert!(
+        authority_violations.is_empty(),
+        "local frozen-proof authority drifted:\n{}",
+        authority_violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_grpc_adapter_remains_an_opaque_injected_ingress() {
+    let source_rel = "src/service/grpc_runtime_filter_adapter.rs";
+    let adapter = fs::read_to_string(Path::new(manifest_dir()).join(source_rel))
+        .expect("read gRPC runtime-filter adapter");
+    let production = rust_sanitized_production_text(&adapter);
+    assert!(
+        production.contains("ingress.accept(envelope)"),
+        "adapter must forward one opaque envelope to its injected ingress"
+    );
+    let violations = rfd4_m2b2_source_violations(source_rel, &adapter);
+    assert!(
+        violations.is_empty(),
+        "gRPC adapter acquired Core or codec authority:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_new_owner_graph_has_no_sender_retry_delivery_or_legacy_bridge() {
+    let violations = [
+        "src/runtime_filter/codec/mod.rs",
+        "src/runtime_filter/codec/contribution.rs",
+        "src/service/grpc_runtime_filter_adapter.rs",
+    ]
+    .into_iter()
+    .flat_map(|source_rel| {
+        let text = fs::read_to_string(Path::new(manifest_dir()).join(source_rel))
+            .expect("read M2B2 owner");
+        rfd4_m2b2_source_violations(source_rel, &text)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "M2B2 owner graph acquired out-of-scope delivery dependencies:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_detector_rejects_alias_reexport_glob_inline_and_extern_crate_bypasses() {
+    let invalid = [
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::codec::contribution::decode_contribution as decode; fn f() { let _ = decode; }",
+        ),
+        (
+            "src/runtime_filter/port/transport.rs",
+            "pub(crate) use crate::runtime_filter::port::value_domain::ValueDomainDelta as Delta;",
+        ),
+        (
+            "src/runtime_filter/router/role_graph.rs",
+            "use crate::runtime_filter::port::topk_summary::*;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "mod hidden { use crate::service::grpc_server as live; fn f() { let _ = live; } }",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "extern crate self as nova; use nova::runtime_filter::router::RoleRouter;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "#[path = \"hidden.rs\"] mod hidden;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "include!(\"hidden.rs\");",
+        ),
+        ("src/runtime_filter/codec/contribution.rs", "fn malformed("),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "#[cfg(any(test, feature = \"hidden\"))] use crate::service::grpc_server;",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        assert!(
+            !rfd4_m2b2_source_violations(source_rel, source).is_empty(),
+            "detector missed forbidden production bypass in {source_rel}: {source}"
+        );
+    }
+
+    let cfg_test_only = r#"
+#[cfg(test)]
+mod tests {
+    use crate::runtime_filter::codec::contribution::decode_contribution;
+    use crate::runtime_filter::router::RoleRouter;
+}
+"#;
+    assert!(
+        rfd4_m2b2_source_violations("src/service/grpc_runtime_filter_adapter.rs", cfg_test_only,)
+            .is_empty(),
+        "definite cfg(test) fixtures must not count as production dependencies"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_remote_reconstruction_detector_covers_alias_glob_facade_type_alias_and_cfg() {
+    let invalid = [
+        (
+            "src/runtime_filter/service/producer.rs",
+            "use crate::runtime_filter::port::final_domain::CompletionFence as Fence; fn f() { let _ = Fence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "use crate::runtime_filter::port::final_domain::*; fn f() { let _ = CompletionFence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "pub(crate) use crate::runtime_filter::port::final_domain::CompletionFence as RemoteFence;",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "type Fence = crate::runtime_filter::port::final_domain::CompletionFence; fn f() { let _ = Fence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "extern crate self as nova; fn f() { let _ = nova::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "#[cfg(any(test, feature = \"remote\"))] fn f() { let _ = crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec; }",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        let violations =
+            rfd4_m2b2_remote_reconstruction_violations(&[(source_rel.into(), source.into())]);
+        assert!(
+            !violations.is_empty(),
+            "remote reconstruction detector missed {source_rel}: {source}"
+        );
+    }
+
+    let local_shadow = r#"
+struct CompletionFence;
+impl CompletionFence {
+    fn try_from_remote_codec() {}
+}
+fn f() { CompletionFence::try_from_remote_codec(); }
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            local_shadow.into(),
+        )])
+        .is_empty(),
+        "same-named local types must not be treated as the canonical remote fence"
+    );
+
+    let cfg_test_only = r#"
+#[cfg(test)]
+fn f() {
+    let _ = crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec;
+}
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            cfg_test_only.into(),
+        )])
+        .is_empty(),
+        "definite cfg(test) remote reconstruction fixtures must be ignored"
+    );
+
+    let parse_failure = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/service/producer.rs".into(),
+        "fn malformed(".into(),
+    )]);
+    assert!(
+        !parse_failure.is_empty(),
+        "remote reconstruction audit must fail closed on parse errors"
+    );
 }
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
