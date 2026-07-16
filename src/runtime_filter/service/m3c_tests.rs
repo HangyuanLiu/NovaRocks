@@ -260,10 +260,12 @@ fn installed_service_for(
         memory,
     ));
     service
-        .install(RuntimeFilterInstallView::new(
-            epoch,
-            RuntimeFilterParticipantId::new(1),
-            BTreeMap::from([(channel_id, deployment_for(channel_id, producers))]),
+        .install(local_participant_install_for_test(
+            RuntimeFilterInstallView::new(
+                epoch,
+                RuntimeFilterParticipantId::new(1),
+                BTreeMap::from([(channel_id, deployment_for(channel_id, producers))]),
+            ),
         ))
         .unwrap();
     service

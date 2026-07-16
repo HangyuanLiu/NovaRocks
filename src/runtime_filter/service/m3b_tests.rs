@@ -297,10 +297,12 @@ fn installed_service_with_sink(
     let contract = Arc::new(RuntimeTopKSummaryContract::try_from_plan(&plan, requirement).unwrap());
     let deployment = topk_deployment(plan, requirement);
     service
-        .install(RuntimeFilterInstallView::new(
-            DeploymentEpoch::new(9),
-            RuntimeFilterParticipantId::new(3),
-            BTreeMap::from([(ChannelId::new(1), deployment)]),
+        .install(local_participant_install_for_test(
+            RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                RuntimeFilterParticipantId::new(3),
+                BTreeMap::from([(ChannelId::new(1), deployment)]),
+            ),
         ))
         .unwrap();
     (service, contract)
@@ -451,13 +453,15 @@ fn direct_and_topk_ports_never_alias_cached_handles() {
         )]),
     );
     service
-        .install(RuntimeFilterInstallView::new(
-            DeploymentEpoch::new(9),
-            RuntimeFilterParticipantId::new(3),
-            BTreeMap::from([
-                (ChannelId::new(1), topk_deployment(plan, requirement)),
-                (ChannelId::new(2), direct_deployment),
-            ]),
+        .install(local_participant_install_for_test(
+            RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                RuntimeFilterParticipantId::new(3),
+                BTreeMap::from([
+                    (ChannelId::new(1), topk_deployment(plan, requirement)),
+                    (ChannelId::new(2), direct_deployment),
+                ]),
+            ),
         ))
         .unwrap();
 
@@ -912,26 +916,28 @@ fn topk_public_port_cross_channel_reentry_preserves_causal_order_and_cache_ident
         MemTrackerMemoryAccount::new_root_for_test("topk-cross-channel-reentry"),
     ));
     service
-        .install(RuntimeFilterInstallView::new(
-            DeploymentEpoch::new(9),
-            RuntimeFilterParticipantId::new(3),
-            BTreeMap::from([
-                (
-                    ChannelId::new(1),
-                    topk_deployment(plan.clone(), requirement),
-                ),
-                (
-                    ChannelId::new(2),
-                    topk_deployment_with_ids(
-                        plan,
-                        requirement,
-                        ChannelId::new(2),
-                        (BindingId::new(11), CoverageWitnessId::new(11), uid(11)),
-                        (BindingId::new(13), CoverageWitnessId::new(12), uid(13)),
-                        (BindingId::new(12), RouteEdgeId::new(2), uid(12)),
+        .install(local_participant_install_for_test(
+            RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                RuntimeFilterParticipantId::new(3),
+                BTreeMap::from([
+                    (
+                        ChannelId::new(1),
+                        topk_deployment(plan.clone(), requirement),
                     ),
-                ),
-            ]),
+                    (
+                        ChannelId::new(2),
+                        topk_deployment_with_ids(
+                            plan,
+                            requirement,
+                            ChannelId::new(2),
+                            (BindingId::new(11), CoverageWitnessId::new(11), uid(11)),
+                            (BindingId::new(13), CoverageWitnessId::new(12), uid(13)),
+                            (BindingId::new(12), RouteEdgeId::new(2), uid(12)),
+                        ),
+                    ),
+                ]),
+            ),
         ))
         .unwrap();
 

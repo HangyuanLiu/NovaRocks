@@ -42,7 +42,7 @@ use crate::common::types::UniqueId;
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::install::RuntimeFilterInstallView;
+use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
     ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
@@ -1067,9 +1067,9 @@ impl RuntimeFilterService {
 
     pub(crate) fn install(
         &self,
-        view: RuntimeFilterInstallView,
+        install: RuntimeFilterParticipantInstall,
     ) -> Result<InstallOutcome, InstallContractError> {
-        let result = self.registry.install(view)?;
+        let result = self.registry.install(install)?;
         let outcome = result.outcome();
         Ok(outcome)
     }
@@ -1888,7 +1888,7 @@ mod tests {
         )
     }
 
-    fn compiled_fenced_final_view() -> RuntimeFilterInstallView {
+    fn compiled_fenced_final_install() -> RuntimeFilterParticipantInstall {
         let deployment = fenced_final_deployment();
         let expression = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -1979,7 +1979,7 @@ mod tests {
             replica_redundancy: 1,
             materialization: deployment.materialization_policy(),
         };
-        compile(
+        let mut plan = compile(
             &graph,
             &scheduling,
             &[],
@@ -1987,23 +1987,30 @@ mod tests {
             &policy,
             DeploymentEpoch::new(9),
         )
-        .unwrap()
-        .install_views
-        .remove(&RuntimeFilterParticipantId::new(0))
-        .expect("compiler projects the colocated aggregate install shard")
+        .unwrap();
+        let participant = RuntimeFilterParticipantId::new(0);
+        let core_view = plan
+            .install_views
+            .remove(&participant)
+            .expect("compiler projects the colocated aggregate install view");
+        let routing_shard = plan
+            .routing_shards
+            .remove(&participant)
+            .expect("compiler projects the matching routing shard");
+        RuntimeFilterParticipantInstall::new(core_view, routing_shard)
     }
 
     fn view(
         channels: impl IntoIterator<Item = RuntimeFilterChannelDeployment>,
-    ) -> RuntimeFilterInstallView {
-        RuntimeFilterInstallView::new(
+    ) -> RuntimeFilterParticipantInstall {
+        local_participant_install_for_test(RuntimeFilterInstallView::new(
             DeploymentEpoch::new(9),
             RuntimeFilterParticipantId::new(3),
             channels
                 .into_iter()
                 .map(|channel| (channel.channel_id(), channel))
                 .collect(),
-        )
+        ))
     }
 
     fn deployment_with_profiles(
@@ -2098,7 +2105,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .install(compiled_fenced_final_view())
+                .install(compiled_fenced_final_install())
                 .unwrap(),
             InstallOutcome::Installed
         );
@@ -5434,7 +5441,7 @@ mod tests {
 
     struct NonemptyReentrantInstallSink {
         service: Mutex<Weak<RuntimeFilterService>>,
-        view: Mutex<Option<RuntimeFilterInstallView>>,
+        view: Mutex<Option<RuntimeFilterParticipantInstall>>,
         outcome: mpsc::Sender<InstallOutcome>,
     }
 
@@ -5455,7 +5462,7 @@ mod tests {
 
     struct CrossThreadReentrantInstallSink {
         service: Mutex<Weak<RuntimeFilterService>>,
-        view: Mutex<Option<RuntimeFilterInstallView>>,
+        view: Mutex<Option<RuntimeFilterParticipantInstall>>,
         outcome: mpsc::Sender<Option<InstallOutcome>>,
     }
 

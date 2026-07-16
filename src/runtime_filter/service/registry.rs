@@ -39,18 +39,22 @@ use crate::runtime_filter::port::final_domain::{
 };
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RouteEdgeId};
 use crate::runtime_filter::port::install::{
-    RuntimeFilterChannelDeployment, RuntimeFilterInstallView,
+    RuntimeFilterChannelDeployment, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
 };
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{
     InstallContractError, InstallContractErrorKind, InstallOutcome, ProducerPortKind,
     RuntimeContractViolation, RuntimeContractViolationKind,
 };
+use crate::runtime_filter::port::routing::{
+    RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole, RuntimeFilterRoutingShard,
+};
 use crate::runtime_filter::port::subscription::{SubscriptionHandle, SubscriptionKind};
 use crate::runtime_filter::port::support::{
     ArtifactRetainedBudget, ArtifactScratchBudget, RuntimeFilterClock, RuntimeFilterMemoryAccount,
 };
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 
@@ -175,7 +179,7 @@ impl ChannelArtifactPlan {
 }
 
 pub(super) struct InstalledDeployment {
-    view: RuntimeFilterInstallView,
+    install: RuntimeFilterParticipantInstall,
     committed_at: Instant,
     channels: BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
     deadlines: BTreeMap<ChannelId, Instant>,
@@ -359,15 +363,15 @@ impl InstalledDeployment {
 }
 
 struct InstallFlight {
-    view: RuntimeFilterInstallView,
+    install: RuntimeFilterParticipantInstall,
     result: Mutex<Option<Result<Arc<InstalledDeployment>, InstallContractError>>>,
     completed: Condvar,
 }
 
 impl InstallFlight {
-    fn new(view: RuntimeFilterInstallView) -> Self {
+    fn new(install: RuntimeFilterParticipantInstall) -> Self {
         Self {
-            view,
+            install,
             result: Mutex::new(None),
             completed: Condvar::new(),
         }
@@ -463,16 +467,24 @@ impl DeploymentRegistry {
 
     pub(super) fn install(
         &self,
-        view: RuntimeFilterInstallView,
+        install: RuntimeFilterParticipantInstall,
     ) -> Result<RegistryInstallResult, InstallContractError> {
-        if view.is_empty() {
+        validate_install_identity(&install)?;
+        let view = install.core_view();
+        if view.is_empty() && install.routing_shard().channels().is_empty() {
             return Ok(RegistryInstallResult {
                 outcome: InstallOutcome::IgnoredEmpty,
                 committed_at: None,
                 events: Vec::new(),
             });
         }
-        validate_view(&view)?;
+        if view.is_empty() {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "empty core view with nonempty routing shard is not a valid participant install",
+            ));
+        }
+        validate_install(&install)?;
 
         let (flight, leader) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -482,17 +494,17 @@ impl DeploymentRegistry {
                     // Publishing begins after the logical commit. New install calls compare
                     // against that committed deployment and return immediately; only callers
                     // that already observed Installing wait for event publication to finish.
-                    return compare_installed(installed, &view);
+                    return compare_installed(installed, &install);
                 }
                 RegistryState::Installed(installed) => {
-                    return compare_installed(installed, &view);
+                    return compare_installed(installed, &install);
                 }
                 RegistryState::Installing(flight) => {
-                    compare_installing(flight, &view)?;
+                    compare_installing(flight, &install)?;
                     (flight.clone(), false)
                 }
                 RegistryState::Uninstalled => {
-                    let flight = Arc::new(InstallFlight::new(view.clone()));
+                    let flight = Arc::new(InstallFlight::new(install.clone()));
                     *state = RegistryState::Installing(flight.clone());
                     (flight, true)
                 }
@@ -500,7 +512,7 @@ impl DeploymentRegistry {
         };
         if !leader {
             let installed = flight.wait()?;
-            return compare_installed(&installed, &view);
+            return compare_installed(&installed, &install);
         }
 
         let candidate = (|| {
@@ -591,7 +603,7 @@ impl DeploymentRegistry {
             }
         }
         let candidate = Arc::new(InstalledDeployment {
-            view: view.clone(),
+            install: install.clone(),
             committed_at,
             channels,
             deadlines,
@@ -700,7 +712,7 @@ impl DeploymentRegistry {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         match &*state {
             RegistryState::Publishing { installed, .. } | RegistryState::Installed(installed) => {
-                Some(installed.view.epoch())
+                Some(installed.install.core_view().epoch())
             }
             RegistryState::Uninstalled
             | RegistryState::Installing(_)
@@ -747,18 +759,18 @@ impl DeploymentRegistry {
 
 fn compare_installing(
     flight: &InstallFlight,
-    incoming: &RuntimeFilterInstallView,
+    incoming: &RuntimeFilterParticipantInstall,
 ) -> Result<(), InstallContractError> {
-    if flight.view.epoch() != incoming.epoch() {
+    if flight.install.epoch() != incoming.epoch() {
         return Err(install_error(
             InstallContractErrorKind::EpochMismatch,
             "runtime filter deployment epoch differs from the installing epoch",
         ));
     }
-    if !install_views_equivalent(&flight.view, incoming) {
+    if !participant_installs_equivalent(&flight.install, incoming) {
         return Err(install_error(
             InstallContractErrorKind::ConflictingDeployment,
-            "same deployment epoch carried a different in-flight install view",
+            "same deployment epoch carried a different in-flight composite install",
         ));
     }
     Ok(())
@@ -766,18 +778,18 @@ fn compare_installing(
 
 fn compare_installed(
     installed: &InstalledDeployment,
-    incoming: &RuntimeFilterInstallView,
+    incoming: &RuntimeFilterParticipantInstall,
 ) -> Result<RegistryInstallResult, InstallContractError> {
-    if installed.view.epoch() != incoming.epoch() {
+    if installed.install.epoch() != incoming.epoch() {
         return Err(install_error(
             InstallContractErrorKind::EpochMismatch,
             "runtime filter deployment epoch differs from the installed epoch",
         ));
     }
-    if !install_views_equivalent(&installed.view, incoming) {
+    if !participant_installs_equivalent(&installed.install, incoming) {
         return Err(install_error(
             InstallContractErrorKind::ConflictingDeployment,
-            "same deployment epoch carried a different install view",
+            "same deployment epoch carried a different installed composite",
         ));
     }
     Ok(RegistryInstallResult {
@@ -787,7 +799,37 @@ fn compare_installed(
     })
 }
 
+fn validate_install_identity(
+    install: &RuntimeFilterParticipantInstall,
+) -> Result<(), InstallContractError> {
+    if install.core_view().epoch() != install.routing_shard().deployment_epoch() {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "participant install core and routing epochs differ",
+        ));
+    }
+    if install.core_view().local_participant_id() != install.routing_shard().local_participant_id()
+    {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "participant install core and routing participants differ",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_install(install: &RuntimeFilterParticipantInstall) -> Result<(), InstallContractError> {
+    validate_view_with_routing(install.core_view(), Some(install.routing_shard()))
+}
+
 fn validate_view<'a>(view: &'a RuntimeFilterInstallView) -> Result<(), InstallContractError> {
+    validate_view_with_routing(view, None)
+}
+
+fn validate_view_with_routing<'a>(
+    view: &'a RuntimeFilterInstallView,
+    routing_shard: Option<&RuntimeFilterRoutingShard>,
+) -> Result<(), InstallContractError> {
     if view.epoch().get() == 0 {
         return Err(install_error(
             InstallContractErrorKind::InvalidEpoch,
@@ -827,9 +869,119 @@ fn validate_view<'a>(view: &'a RuntimeFilterInstallView) -> Result<(), InstallCo
 
     let mut profile_encodings = BTreeMap::<ConsumerProfileId, &'a [u8]>::new();
     for channel in view.channels().values() {
-        validate_channel(channel, &mut profile_encodings)?;
+        let allow_consumerless_aggregator = match routing_shard {
+            Some(shard) => {
+                let routing = shard.channel(channel.channel_id()).ok_or_else(|| {
+                    install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "core channel {} is missing from routing shard",
+                            channel.channel_id().get()
+                        ),
+                    )
+                })?;
+                validate_channel_routing_contract(view.local_participant_id(), channel, routing)?
+            }
+            None => false,
+        };
+        validate_channel(
+            channel,
+            &mut profile_encodings,
+            allow_consumerless_aggregator,
+        )?;
     }
     Ok(())
+}
+
+fn validate_channel_routing_contract(
+    local_participant_id: crate::runtime_filter::port::identity::RuntimeFilterParticipantId,
+    channel: &RuntimeFilterChannelDeployment,
+    routing: &RuntimeFilterChannelRoutingView,
+) -> Result<bool, InstallContractError> {
+    for (binding_id, producer) in channel.producers() {
+        for fragment_instance_id in producer.expected_fragment_instances() {
+            if routing
+                .producer_participant(*binding_id, *fragment_instance_id)
+                .is_none()
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "producer binding {} instance {:?} is missing from routing producer index",
+                        binding_id.get(),
+                        fragment_instance_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    let is_local_aggregator = routing
+        .local_roles()
+        .contains(&RuntimeFilterRouteRole::Aggregator);
+    if is_local_aggregator {
+        for ((binding_id, fragment_instance_id), _) in routing.producer_instances() {
+            let installed = channel.producers().get(binding_id).is_some_and(|producer| {
+                producer
+                    .expected_fragment_instances()
+                    .contains(fragment_instance_id)
+            });
+            if !installed {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "aggregator core is missing routing-authorized producer binding {} instance {:?}",
+                        binding_id.get(),
+                        fragment_instance_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    if !channel.consumers().is_empty() {
+        return Ok(false);
+    }
+    if !is_local_aggregator {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "consumerless channel requires local Aggregator authority",
+        ));
+    }
+    let inbound_producer_edges = routing.inbound_edges().iter().filter(|edge| {
+        matches!(edge.source().role(), RuntimeFilterRouteRole::Producer(binding)
+            if channel.producers().contains_key(&binding))
+            && edge.target().participant_id() == local_participant_id
+            && edge.target().role() == RuntimeFilterRouteRole::Aggregator
+            && edge
+                .allowed_kinds()
+                .contains(&RuntimeFilterEnvelopeKind::Contribution)
+    });
+    let inbound_producer_edges = inbound_producer_edges.collect::<Vec<_>>();
+    if inbound_producer_edges.is_empty() {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "consumerless aggregator requires an inbound producer edge",
+        ));
+    }
+    let has_authorized_source = inbound_producer_edges.iter().any(|edge| {
+        let RuntimeFilterRouteRole::Producer(binding_id) = edge.source().role() else {
+            unreachable!("inbound producer edges were filtered by source role")
+        };
+        routing
+            .producer_instances()
+            .iter()
+            .any(|((indexed_binding, _), participant)| {
+                *indexed_binding == binding_id && *participant == edge.source().participant_id()
+            })
+    });
+    if !has_authorized_source {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "consumerless aggregator inbound producer edge source has no authorized producer instance",
+        ));
+    }
+    Ok(true)
 }
 
 /// Test-only shim so RFD-2 deployment-compiler tests (a different module) can
@@ -1029,12 +1181,13 @@ fn build_routing(
 fn validate_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
+    allow_consumerless_aggregator: bool,
 ) -> Result<(), InstallContractError> {
     if matches!(
         channel.logical_domain(),
         RuntimeFilterLogicalDomain::OrderedBound(_)
     ) {
-        return validate_ordered_channel(channel, profile_encodings);
+        return validate_ordered_channel(channel, profile_encodings, allow_consumerless_aggregator);
     }
     let RuntimeFilterLogicalDomain::Membership {
         value_type,
@@ -1078,7 +1231,9 @@ fn validate_channel<'a>(
             "membership data type is not supported by the runtime filter port",
         ));
     }
-    if channel.producers().is_empty() || channel.consumers().is_empty() {
+    if channel.producers().is_empty()
+        || (channel.consumers().is_empty() && !allow_consumerless_aggregator)
+    {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
             "M1 channel requires at least one producer and one consumer binding",
@@ -1277,7 +1432,9 @@ fn validate_channel<'a>(
             }
         }
     }
-    if materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
+    if !allow_consumerless_aggregator
+        && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
+    {
         return Err(install_error(
             InstallContractErrorKind::InvalidPolicy,
             "max concurrent materialization jobs exceeds normalized unique profile count",
@@ -1289,6 +1446,7 @@ fn validate_channel<'a>(
 fn validate_ordered_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
+    allow_consumerless_aggregator: bool,
 ) -> Result<(), InstallContractError> {
     let RuntimeFilterLogicalDomain::OrderedBound(plan) = channel.logical_domain() else {
         unreachable!("ordered validator is called only for ordered channels")
@@ -1354,7 +1512,9 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if channel.producers().is_empty() || channel.consumers().is_empty() {
+    if channel.producers().is_empty()
+        || (channel.consumers().is_empty() && !allow_consumerless_aggregator)
+    {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
             "ordered channel requires at least one producer and one consumer binding",
@@ -1457,7 +1617,9 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
+    if !allow_consumerless_aggregator
+        && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
+    {
         return Err(install_error(
             InstallContractErrorKind::InvalidPolicy,
             "max concurrent materialization jobs exceeds normalized unique profile count",
@@ -1470,7 +1632,7 @@ fn validate_ordered_channel<'a>(
 fn validate_channel_contract(
     channel: &RuntimeFilterChannelDeployment,
 ) -> Result<(), InstallContractError> {
-    validate_channel(channel, &mut BTreeMap::new())
+    validate_channel(channel, &mut BTreeMap::new(), false)
 }
 
 fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
@@ -1645,6 +1807,14 @@ fn install_views_equivalent(
         })
 }
 
+fn participant_installs_equivalent(
+    left: &RuntimeFilterParticipantInstall,
+    right: &RuntimeFilterParticipantInstall,
+) -> bool {
+    install_views_equivalent(left.core_view(), right.core_view())
+        && left.routing_shard() == right.routing_shard()
+}
+
 fn channels_equivalent(
     left: &RuntimeFilterChannelDeployment,
     right: &RuntimeFilterChannelDeployment,
@@ -1692,6 +1862,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::materializer::bloom::BloomHashContract;
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
@@ -1701,13 +1872,21 @@ mod tests {
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
-    use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
+    use crate::runtime_filter::port::producer::{
+        InstallContractError, InstallContractErrorKind, InstallOutcome,
+    };
+    use crate::runtime_filter::port::routing::{
+        RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
+        RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
+    };
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
+    use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
     use super::{
         DeploymentRegistry, EventEmitter, RuntimeOrderContract, validate_channel_contract,
+        validate_view,
     };
 
     #[derive(Default)]
@@ -2400,7 +2579,7 @@ mod tests {
         )
     }
 
-    fn view(
+    fn core_view(
         channels: impl IntoIterator<Item = (u32, RuntimeFilterChannelDeployment)>,
     ) -> RuntimeFilterInstallView {
         RuntimeFilterInstallView::new(
@@ -2411,6 +2590,396 @@ mod tests {
                 .map(|(key, value)| (ChannelId::new(key), value))
                 .collect(),
         )
+    }
+
+    fn view(
+        channels: impl IntoIterator<Item = (u32, RuntimeFilterChannelDeployment)>,
+    ) -> RuntimeFilterParticipantInstall {
+        local_install(core_view(channels))
+    }
+
+    fn participant_install(
+        core_view: RuntimeFilterInstallView,
+        routing_shard: RuntimeFilterRoutingShard,
+    ) -> RuntimeFilterParticipantInstall {
+        RuntimeFilterParticipantInstall::new(core_view, routing_shard)
+    }
+
+    fn local_install(core_view: RuntimeFilterInstallView) -> RuntimeFilterParticipantInstall {
+        local_participant_install_for_test(core_view)
+    }
+
+    fn inbound_to_aggregator(
+        channel_id: ChannelId,
+        binding_id: BindingId,
+        source_participant: RuntimeFilterParticipantId,
+        target_participant: RuntimeFilterParticipantId,
+    ) -> RuntimeFilterRoutingEdgeView {
+        RuntimeFilterRoutingEdgeView::new(
+            channel_id,
+            RouteEdgeId::new(901),
+            RuntimeFilterRouteEndpointView::new(
+                source_participant,
+                RuntimeFilterRouteRole::Producer(binding_id),
+            ),
+            RuntimeFilterRouteEndpointView::new(
+                target_participant,
+                RuntimeFilterRouteRole::Aggregator,
+            ),
+            RuntimeFilterRoutePeer::Remote {
+                participant_id: source_participant,
+                endpoint: RuntimeEndpoint::new("remote-producer", 9060).unwrap(),
+            },
+            BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]),
+        )
+        .unwrap()
+    }
+
+    fn routing_shard(
+        epoch: DeploymentEpoch,
+        participant: RuntimeFilterParticipantId,
+        channel_id: ChannelId,
+        local_roles: BTreeSet<RuntimeFilterRouteRole>,
+        producer_instances: BTreeMap<(BindingId, UniqueId), RuntimeFilterParticipantId>,
+        inbound_edges: Vec<RuntimeFilterRoutingEdgeView>,
+    ) -> RuntimeFilterRoutingShard {
+        RuntimeFilterRoutingShard::new(
+            epoch,
+            participant,
+            BTreeMap::from([(
+                channel_id,
+                RuntimeFilterChannelRoutingView::new(
+                    channel_id,
+                    local_roles,
+                    producer_instances,
+                    inbound_edges,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap()
+    }
+
+    fn without_consumers(
+        channel: &RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            BTreeMap::new(),
+        )
+    }
+
+    fn consumerless_channels() -> [RuntimeFilterChannelDeployment; 2] {
+        [
+            without_consumers(&channel(1, 10, 20, 30, 40)),
+            without_consumers(&ordered_deployment_fixture()),
+        ]
+    }
+
+    fn assert_install_error(
+        error: InstallContractError,
+        kind: InstallContractErrorKind,
+        detail: &str,
+    ) {
+        assert_eq!(error.kind(), kind);
+        assert!(
+            error.detail().contains(detail),
+            "expected detail containing {detail:?}, got {:?}",
+            error.detail()
+        );
+    }
+
+    #[test]
+    fn install_rejects_core_and_routing_epoch_mismatch() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let mut install = local_install(core.clone());
+        install = participant_install(
+            core,
+            RuntimeFilterRoutingShard::new(
+                DeploymentEpoch::new(10),
+                install.local_participant_id(),
+                install.routing_shard().channels().clone(),
+            )
+            .unwrap(),
+        );
+
+        assert_install_error(
+            registry().install(install).unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "core and routing epochs differ",
+        );
+    }
+
+    #[test]
+    fn install_rejects_core_and_routing_participant_mismatch() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let install = local_install(core.clone());
+        let mismatched = RuntimeFilterRoutingShard::new(
+            install.epoch(),
+            RuntimeFilterParticipantId::new(4),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, mismatched))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "core and routing participants differ",
+        );
+    }
+
+    #[test]
+    fn same_epoch_changed_routing_shard_is_conflicting_deployment() {
+        let registry = registry();
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let first = local_install(core.clone());
+        registry.install(first.clone()).unwrap();
+        let channel = first.routing_shard().channel(ChannelId::new(1)).unwrap();
+        let mut roles = channel.local_roles().clone();
+        roles.insert(RuntimeFilterRouteRole::Relay);
+        let changed = routing_shard(
+            first.epoch(),
+            first.local_participant_id(),
+            ChannelId::new(1),
+            roles,
+            channel.producer_instances().clone(),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry
+                .install(participant_install(core, changed))
+                .unwrap_err(),
+            InstallContractErrorKind::ConflictingDeployment,
+            "different installed composite",
+        );
+    }
+
+    #[test]
+    fn install_rejects_core_channel_missing_from_routing_shard() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let routing = RuntimeFilterRoutingShard::new(
+            core.epoch(),
+            core.local_participant_id(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "core channel 1 is missing from routing shard",
+        );
+    }
+
+    #[test]
+    fn install_rejects_expected_producer_instance_missing_from_routing_index() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let routing = routing_shard(
+            core.epoch(),
+            core.local_participant_id(),
+            ChannelId::new(1),
+            BTreeSet::from([
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(30)),
+            ]),
+            BTreeMap::new(),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "producer binding 10 instance",
+        );
+    }
+
+    #[test]
+    fn install_rejects_aggregator_core_missing_authorized_remote_instance() {
+        let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let participant = core.local_participant_id();
+        let remote = RuntimeFilterParticipantId::new(4);
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(30)),
+                RuntimeFilterRouteRole::Aggregator,
+            ]),
+            BTreeMap::from([
+                ((BindingId::new(10), uid(10)), participant),
+                ((BindingId::new(10), uid(11)), remote),
+            ]),
+            vec![inbound_to_aggregator(
+                ChannelId::new(1),
+                BindingId::new(10),
+                remote,
+                participant,
+            )],
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "aggregator core is missing routing-authorized producer",
+        );
+    }
+
+    #[test]
+    fn empty_core_and_nonempty_routing_is_not_ignored() {
+        let core = core_view([]);
+        let routing = routing_shard(
+            core.epoch(),
+            core.local_participant_id(),
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Relay]),
+            BTreeMap::new(),
+            Vec::new(),
+        );
+
+        assert_install_error(
+            registry()
+                .install(participant_install(core, routing))
+                .unwrap_err(),
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "empty core view with nonempty routing shard",
+        );
+    }
+
+    #[test]
+    fn consumerless_aggregator_channel_installs_when_routing_proves_inbound_authority() {
+        for channel in consumerless_channels() {
+            let core = core_view([(1, channel)]);
+            let participant = core.local_participant_id();
+            let remote = RuntimeFilterParticipantId::new(4);
+            let routing = routing_shard(
+                core.epoch(),
+                participant,
+                ChannelId::new(1),
+                BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+                BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+                vec![inbound_to_aggregator(
+                    ChannelId::new(1),
+                    BindingId::new(10),
+                    remote,
+                    participant,
+                )],
+            );
+
+            assert_eq!(
+                registry()
+                    .install(participant_install(core, routing))
+                    .unwrap()
+                    .outcome(),
+                InstallOutcome::Installed
+            );
+        }
+    }
+
+    #[test]
+    fn consumerless_non_aggregator_channel_is_rejected() {
+        for channel in consumerless_channels() {
+            let core = core_view([(1, channel)]);
+            let participant = core.local_participant_id();
+            let routing = routing_shard(
+                core.epoch(),
+                participant,
+                ChannelId::new(1),
+                BTreeSet::from([RuntimeFilterRouteRole::Producer(BindingId::new(10))]),
+                BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
+                Vec::new(),
+            );
+
+            assert_install_error(
+                registry()
+                    .install(participant_install(core, routing))
+                    .unwrap_err(),
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "consumerless channel requires local Aggregator authority",
+            );
+        }
+    }
+
+    #[test]
+    fn consumerless_aggregator_without_inbound_producer_edge_is_rejected() {
+        for channel in consumerless_channels() {
+            let core = core_view([(1, channel)]);
+            let participant = core.local_participant_id();
+            let remote = RuntimeFilterParticipantId::new(4);
+            let routing = routing_shard(
+                core.epoch(),
+                participant,
+                ChannelId::new(1),
+                BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+                BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+                Vec::new(),
+            );
+
+            assert_install_error(
+                registry()
+                    .install(participant_install(core, routing))
+                    .unwrap_err(),
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "consumerless aggregator requires an inbound producer edge",
+            );
+        }
+    }
+
+    #[test]
+    fn consumerless_aggregator_rejects_inbound_edge_from_unindexed_source() {
+        for channel in consumerless_channels() {
+            let core = core_view([(1, channel)]);
+            let participant = core.local_participant_id();
+            let edge_source = RuntimeFilterParticipantId::new(4);
+            let indexed_source = RuntimeFilterParticipantId::new(5);
+            let routing = routing_shard(
+                core.epoch(),
+                participant,
+                ChannelId::new(1),
+                BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+                BTreeMap::from([((BindingId::new(10), uid(10)), indexed_source)]),
+                vec![inbound_to_aggregator(
+                    ChannelId::new(1),
+                    BindingId::new(10),
+                    edge_source,
+                    participant,
+                )],
+            );
+
+            assert_install_error(
+                registry()
+                    .install(participant_install(core, routing))
+                    .unwrap_err(),
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "inbound producer edge source has no authorized producer instance",
+            );
+        }
     }
 
     fn with_consumer_contract(
@@ -3044,12 +3613,12 @@ mod tests {
         registry
             .install(view([(1, channel(1, 10, 20, 30, 40))]))
             .unwrap();
-        let mut other = view([(1, channel(1, 10, 20, 30, 40))]);
-        other = RuntimeFilterInstallView::new(
+        let other = core_view([(1, channel(1, 10, 20, 30, 40))]);
+        let other = local_install(RuntimeFilterInstallView::new(
             DeploymentEpoch::new(10),
             other.local_participant_id(),
             other.channels().clone(),
-        );
+        ));
         assert_eq!(
             registry.install(other).unwrap_err().kind(),
             InstallContractErrorKind::EpochMismatch
@@ -3098,16 +3667,17 @@ mod tests {
     fn validation_error_order_is_stable_and_complete_once_matrix_is_strict() {
         let registry = registry();
         let base = channel(1, 10, 20, 30, 40);
+        let invalid_epoch = RuntimeFilterInstallView::new(
+            DeploymentEpoch::new(0),
+            RuntimeFilterParticipantId::new(3),
+            BTreeMap::from([(ChannelId::new(2), base.clone())]),
+        );
+        assert_eq!(
+            validate_view(&invalid_epoch).unwrap_err().kind(),
+            InstallContractErrorKind::InvalidEpoch
+        );
 
         let cases = [
-            (
-                RuntimeFilterInstallView::new(
-                    DeploymentEpoch::new(0),
-                    RuntimeFilterParticipantId::new(3),
-                    BTreeMap::from([(ChannelId::new(2), base.clone())]),
-                ),
-                InstallContractErrorKind::InvalidEpoch,
-            ),
             (
                 view([(2, base.clone())]),
                 InstallContractErrorKind::DuplicateIdentity,
