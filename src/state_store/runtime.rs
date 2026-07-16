@@ -23,7 +23,8 @@ use super::{StateStoreError, StateStoreErrorKind};
 use {
     super::mysql::client::{
         PoolLifecycle, ResolvedMysqlClient, active_readiness as mysql_active_readiness,
-        checkout_hygienic_connection, pollute_session as mysql_pollute_session,
+        checkout_hygienic_connection, delayed_active_readiness as mysql_delayed_active_readiness,
+        pollute_session as mysql_pollute_session,
     },
     super::mysql::test_support::{
         MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner, MysqlTestHandle,
@@ -276,6 +277,20 @@ impl StateStoreRuntime {
     }
 
     #[cfg(feature = "mysql-state-store-provider")]
+    pub(crate) async fn mysql_test_delayed_active_readiness(
+        &self,
+        database: &str,
+        deadline: Duration,
+    ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
+        match &self.inner {
+            RuntimeInner::Mysql(runtime) => {
+                runtime.delayed_active_readiness(database, deadline).await
+            }
+            _ => Err(mysql_runtime_mismatch()),
+        }
+    }
+
+    #[cfg(feature = "mysql-state-store-provider")]
     pub(crate) async fn mysql_test_pollute_session(
         &self,
         database: &str,
@@ -483,6 +498,7 @@ impl MysqlRuntime {
             server_version: snapshot.server_version,
             innodb_page_size: snapshot.innodb_page_size,
             innodb_available: snapshot.innodb_available,
+            default_storage_engine: snapshot.default_storage_engine,
             sql_mode: snapshot.sql_mode,
             time_zone: snapshot.time_zone,
             character_set: snapshot.character_set,
@@ -500,6 +516,28 @@ impl MysqlRuntime {
         let pool = self.get_or_create_pool(database)?;
         let deadline = Instant::now() + total_deadline;
         mysql_pollute_session(pool, deadline).await
+    }
+
+    async fn delayed_active_readiness(
+        &self,
+        database: &str,
+        total_deadline: Duration,
+    ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
+        self.validate_process_and_context()?;
+        let _operation = self.acquire_operation()?;
+        let pool = self.get_or_create_pool(database)?;
+        let deadline = Instant::now() + total_deadline;
+        let snapshot = mysql_delayed_active_readiness(pool, deadline).await?;
+        Ok(MysqlReadinessSnapshot {
+            server_version: snapshot.server_version,
+            innodb_page_size: snapshot.innodb_page_size,
+            innodb_available: snapshot.innodb_available,
+            default_storage_engine: snapshot.default_storage_engine,
+            sql_mode: snapshot.sql_mode,
+            time_zone: snapshot.time_zone,
+            character_set: snapshot.character_set,
+            connection_id: snapshot.connection_id,
+        })
     }
 
     async fn hold_connection(
@@ -532,6 +570,23 @@ impl MysqlRuntime {
     }
 
     async fn shutdown(&mut self, timeout: Duration) -> Result<(), StateStoreError> {
+        self.shutdown_with_drain_hook(timeout, || {}).await
+    }
+
+    #[cfg(test)]
+    async fn shutdown_with_drain_registration_hook(
+        &mut self,
+        timeout: Duration,
+        hook: impl FnMut(),
+    ) -> Result<(), StateStoreError> {
+        self.shutdown_with_drain_hook(timeout, hook).await
+    }
+
+    async fn shutdown_with_drain_hook(
+        &mut self,
+        timeout: Duration,
+        mut after_registration: impl FnMut(),
+    ) -> Result<(), StateStoreError> {
         self.validate_process_and_context()?;
         {
             let lifecycle = self.lifecycle.lock().map_err(|_| {
@@ -548,11 +603,15 @@ impl MysqlRuntime {
         }
         self.shared.accepting.store(false, Ordering::Release);
         let deadline = Instant::now() + timeout;
-        while !self.shared.is_drained() {
-            if timeout_at(deadline, self.shared.drained.notified())
-                .await
-                .is_err()
-            {
+        loop {
+            let notified = self.shared.drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            after_registration();
+            if self.shared.is_drained() {
+                break;
+            }
+            if timeout_at(deadline, notified).await.is_err() {
                 self.shared.accepting.store(true, Ordering::Release);
                 return Err(StateStoreError::new(
                     StateStoreErrorKind::DeadlineExceeded,
@@ -736,8 +795,14 @@ mod mysql_tests {
     impl PoolLifecycle for FailingPool {
         fn get_conn<'a>(
             &'a self,
-        ) -> BoxFuture<'a, Result<mysql_async::Conn, super::super::mysql::error::MysqlNativeError>>
-        {
+            _deadline: Instant,
+        ) -> BoxFuture<
+            'a,
+            Result<
+                super::super::mysql::client::MysqlPoolConnection,
+                super::super::mysql::error::MysqlNativeError,
+            >,
+        > {
             Box::pin(async {
                 Err(super::super::mysql::error::MysqlNativeError::provider_unavailable())
             })
@@ -777,6 +842,43 @@ mod mysql_tests {
             *runtime.lifecycle.lock().expect("lifecycle"),
             MysqlRuntimeLifecycle::Failed(_)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mysql_shutdown_does_not_lose_final_guard_notification() {
+        let pool: Arc<dyn PoolLifecycle> = Arc::new(FailingPool {
+            disconnects: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut runtime = test_mysql_runtime_with_pool(pool);
+        let guard = runtime
+            .acquire_provider_handle()
+            .expect("acquire final provider handle");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let shutdown = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let result = runtime
+                    .shutdown_with_drain_registration_hook(Duration::from_millis(250), move || {
+                        entered.wait();
+                        release.wait();
+                    })
+                    .await;
+                (runtime, result)
+            })
+        };
+        entered.wait();
+        drop(guard);
+        release.wait();
+
+        let (runtime, result) = shutdown.await.expect("join shutdown");
+        let error = result.expect_err("the injected pool disconnect still fails");
+        assert_eq!(error.kind(), StateStoreErrorKind::ProviderUnavailable);
+        assert!(
+            !runtime.shared.accepting.load(Ordering::Acquire),
+            "a completed drain must not reopen the runtime"
+        );
     }
 }
 

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::super::{StateStoreError, StateStoreErrorKind, StateStoreRuntime};
+use super::client::MysqlPoolConnection;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,7 @@ pub struct MysqlReadinessSnapshot {
     pub server_version: String,
     pub innodb_page_size: u64,
     pub innodb_available: bool,
+    pub default_storage_engine: String,
     pub sql_mode: String,
     pub time_zone: String,
     pub character_set: String,
@@ -40,7 +42,7 @@ pub struct MysqlReadinessSnapshot {
 }
 
 pub struct MysqlHeldConnection {
-    connection: Option<mysql_async::Conn>,
+    connection: Option<MysqlPoolConnection>,
     operation: Option<MysqlTestHandle>,
 }
 
@@ -88,6 +90,16 @@ pub async fn active_readiness(
 ) -> Result<MysqlReadinessSnapshot, StateStoreError> {
     runtime
         .mysql_test_active_readiness(database, deadline)
+        .await
+}
+
+pub async fn delayed_active_readiness(
+    runtime: &StateStoreRuntime,
+    database: &str,
+    deadline: Duration,
+) -> Result<MysqlReadinessSnapshot, StateStoreError> {
+    runtime
+        .mysql_test_delayed_active_readiness(database, deadline)
         .await
 }
 
@@ -208,7 +220,7 @@ impl std::fmt::Debug for MysqlHeldConnection {
 }
 
 impl MysqlHeldConnection {
-    pub(crate) fn new(connection: mysql_async::Conn, operation: MysqlTestHandle) -> Self {
+    pub(crate) fn new(connection: MysqlPoolConnection, operation: MysqlTestHandle) -> Self {
         Self {
             connection: Some(connection),
             operation: Some(operation),

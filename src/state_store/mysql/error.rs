@@ -16,6 +16,7 @@
 // under the License.
 
 use super::super::{StateStoreError, StateStoreErrorKind};
+use mysql_async::{DriverError, Error, IoError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MysqlNativeError {
@@ -41,13 +42,38 @@ impl MysqlNativeError {
         }
     }
 
+    pub(crate) fn invalid_configuration() -> Self {
+        Self {
+            public: StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL provider configuration was rejected",
+            ),
+        }
+    }
+
     pub(crate) fn into_public(self) -> StateStoreError {
         self.public
     }
 }
 
-impl From<mysql_async::Error> for MysqlNativeError {
-    fn from(_error: mysql_async::Error) -> Self {
-        Self::provider_unavailable()
+impl From<Error> for MysqlNativeError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Server(server) if matches!(server.code, 1044 | 1045 | 1049) => {
+                Self::invalid_configuration()
+            }
+            Error::Io(IoError::Tls(_)) | Error::Url(_) => Self::invalid_configuration(),
+            Error::Driver(
+                DriverError::UnknownAuthPlugin { .. }
+                | DriverError::MysqlOldPasswordDisabled
+                | DriverError::NoKeyFound
+                | DriverError::NoClientSslFlagFromServer
+                | DriverError::CleartextPluginDisabled
+                | DriverError::InvalidParsecSalt,
+            ) => Self::invalid_configuration(),
+            Error::Driver(_) | Error::Io(IoError::Io(_)) | Error::Other(_) | Error::Server(_) => {
+                Self::provider_unavailable()
+            }
+        }
     }
 }

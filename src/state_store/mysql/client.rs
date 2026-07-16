@@ -16,6 +16,7 @@
 // under the License.
 
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,13 +24,17 @@ use futures::future::BoxFuture;
 use mysql_async::{
     ClientIdentity, Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout_at};
 
 use super::super::{MySqlClientConfig, MySqlTlsMode, StateStoreError, StateStoreErrorKind};
 use super::error::MysqlNativeError;
 
 pub(crate) trait PoolLifecycle: Send + Sync {
-    fn get_conn<'a>(&'a self) -> BoxFuture<'a, Result<mysql_async::Conn, MysqlNativeError>>;
+    fn get_conn<'a>(
+        &'a self,
+        deadline: Instant,
+    ) -> BoxFuture<'a, Result<MysqlPoolConnection, MysqlNativeError>>;
 
     fn disconnect(self: Arc<Self>) -> BoxFuture<'static, Result<(), MysqlNativeError>>;
 }
@@ -37,6 +42,7 @@ pub(crate) trait PoolLifecycle: Send + Sync {
 pub(crate) struct MysqlAsyncPoolLifecycle {
     pool: Pool,
     connect_timeout: Duration,
+    checkout_slots: Arc<Semaphore>,
 }
 
 pub(crate) struct ResolvedMysqlClient {
@@ -48,6 +54,7 @@ pub(crate) struct MysqlClientReadiness {
     pub(crate) server_version: String,
     pub(crate) innodb_page_size: u64,
     pub(crate) innodb_available: bool,
+    pub(crate) default_storage_engine: String,
     pub(crate) sql_mode: String,
     pub(crate) time_zone: String,
     pub(crate) character_set: String,
@@ -56,28 +63,53 @@ pub(crate) struct MysqlClientReadiness {
 
 struct MysqlPassword(String);
 
+pub(crate) struct MysqlPoolConnection {
+    connection: Option<Conn>,
+    _checkout_slot: OwnedSemaphorePermit,
+}
+
+const READINESS_SQL: &str = "SELECT VERSION(), @@innodb_page_size, \
+    EXISTS(SELECT 1 FROM information_schema.ENGINES \
+    WHERE ENGINE = 'InnoDB' AND SUPPORT IN ('YES', 'DEFAULT')), \
+    @@default_storage_engine, @@SESSION.sql_mode, @@SESSION.time_zone, \
+    @@SESSION.character_set_connection, CONNECTION_ID()";
+
+const DELAYED_READINESS_SQL: &str = "SELECT IF(SLEEP(10) = 0, VERSION(), VERSION()), \
+    @@innodb_page_size, EXISTS(SELECT 1 FROM information_schema.ENGINES \
+    WHERE ENGINE = 'InnoDB' AND SUPPORT IN ('YES', 'DEFAULT')), \
+    @@default_storage_engine, @@SESSION.sql_mode, @@SESSION.time_zone, \
+    @@SESSION.character_set_connection, CONNECTION_ID()";
+
 pub(crate) async fn active_readiness(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
 ) -> Result<MysqlClientReadiness, StateStoreError> {
-    let mut connection = checkout_hygienic_connection(pool, deadline).await?;
-    let row: Option<(String, u64, u8, String, String, String, u64)> = timeout_at(
-        deadline,
-        connection.query_first(
-            "SELECT VERSION(), @@innodb_page_size, \
-             EXISTS(SELECT 1 FROM information_schema.ENGINES \
-             WHERE ENGINE = 'InnoDB' AND SUPPORT IN ('YES', 'DEFAULT')), \
-             @@SESSION.sql_mode, @@SESSION.time_zone, \
-             @@SESSION.character_set_connection, CONNECTION_ID()",
-        ),
-    )
-    .await
-    .map_err(|_| mysql_deadline_error())?
-    .map_err(|_| mysql_provider_error())?;
+    active_readiness_with_sql(pool, deadline, READINESS_SQL).await
+}
+
+pub(crate) async fn delayed_active_readiness(
+    pool: Arc<dyn PoolLifecycle>,
+    deadline: Instant,
+) -> Result<MysqlClientReadiness, StateStoreError> {
+    active_readiness_with_sql(pool, deadline, DELAYED_READINESS_SQL).await
+}
+
+async fn active_readiness_with_sql(
+    pool: Arc<dyn PoolLifecycle>,
+    deadline: Instant,
+    sql: &'static str,
+) -> Result<MysqlClientReadiness, StateStoreError> {
+    let connection = checkout_hygienic_connection(pool, deadline).await?;
+    let (_connection, row) = execute_with_deadline(connection, deadline, move |connection| {
+        Box::pin(connection.query_first(sql))
+    })
+    .await?;
+    let row: Option<(String, u64, u8, String, String, String, String, u64)> = row;
     let (
         server_version,
         innodb_page_size,
         innodb_available,
+        default_storage_engine,
         sql_mode,
         time_zone,
         character_set,
@@ -100,6 +132,12 @@ pub(crate) async fn active_readiness(
             "MySQL InnoDB readiness contract is not satisfied",
         ));
     }
+    if !default_storage_engine.eq_ignore_ascii_case("InnoDB") {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "MySQL default storage engine is not InnoDB",
+        ));
+    }
     if !sql_mode
         .split(',')
         .any(|mode| mode.trim().starts_with("STRICT_"))
@@ -115,6 +153,7 @@ pub(crate) async fn active_readiness(
         server_version,
         innodb_page_size,
         innodb_available: true,
+        default_storage_engine,
         sql_mode,
         time_zone,
         character_set,
@@ -126,17 +165,15 @@ pub(crate) async fn pollute_session(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
 ) -> Result<(), StateStoreError> {
-    let mut connection = checkout_connection(pool, deadline).await?;
-    timeout_at(
-        deadline,
-        connection.query_drop(
+    let connection = checkout_connection(pool, deadline).await?;
+    let (_connection, ()) = execute_with_deadline(connection, deadline, |connection| {
+        Box::pin(connection.query_drop(
             "SET SESSION time_zone = '+05:00', SESSION sql_mode = '', \
              SESSION character_set_connection = 'latin1'",
-        ),
-    )
-    .await
-    .map_err(|_| mysql_deadline_error())?
-    .map_err(|_| mysql_provider_error())
+        ))
+    })
+    .await?;
+    Ok(())
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -144,39 +181,51 @@ pub(crate) async fn run_sleep_until_deadline(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
 ) -> Result<(), StateStoreError> {
-    let mut connection = checkout_hygienic_connection(pool, deadline).await?;
-    match timeout_at(deadline, connection.query_drop("SELECT SLEEP(10)")).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(mysql_provider_error()),
-        Err(_) => {
-            let _ = tokio::time::timeout(Duration::from_secs(1), connection.disconnect()).await;
-            Err(mysql_deadline_error())
-        }
-    }
+    let connection = checkout_hygienic_connection(pool, deadline).await?;
+    let (_connection, ()) = execute_with_deadline(connection, deadline, |connection| {
+        Box::pin(connection.query_drop("SELECT SLEEP(10)"))
+    })
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn checkout_hygienic_connection(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
-) -> Result<Conn, StateStoreError> {
-    let mut connection = checkout_connection(pool, deadline).await?;
-    timeout_at(deadline, apply_session_hygiene(&mut connection))
-        .await
-        .map_err(|_| mysql_deadline_error())??;
+) -> Result<MysqlPoolConnection, StateStoreError> {
+    let connection = checkout_connection(pool, deadline).await?;
+    let (connection, ()) = execute_with_deadline(connection, deadline, |connection| {
+        Box::pin(apply_session_hygiene(connection))
+    })
+    .await?;
     Ok(connection)
 }
 
 async fn checkout_connection(
     pool: Arc<dyn PoolLifecycle>,
     deadline: Instant,
-) -> Result<Conn, StateStoreError> {
-    timeout_at(deadline, pool.get_conn())
+) -> Result<MysqlPoolConnection, StateStoreError> {
+    pool.get_conn(deadline)
         .await
-        .map_err(|_| mysql_deadline_error())?
         .map_err(MysqlNativeError::into_public)
 }
 
-async fn apply_session_hygiene(connection: &mut Conn) -> Result<(), StateStoreError> {
+async fn execute_with_deadline<T>(
+    mut connection: MysqlPoolConnection,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a mut Conn) -> BoxFuture<'a, Result<T, mysql_async::Error>>,
+) -> Result<(MysqlPoolConnection, T), StateStoreError> {
+    match timeout_at(deadline, operation(&mut connection)).await {
+        Ok(Ok(value)) => Ok((connection, value)),
+        Ok(Err(error)) => Err(MysqlNativeError::from(error).into_public()),
+        Err(_) => {
+            connection.destroy().await;
+            Err(mysql_deadline_error())
+        }
+    }
+}
+
+async fn apply_session_hygiene(connection: &mut Conn) -> Result<(), mysql_async::Error> {
     connection
         .query_drop(
             "SET SESSION time_zone = '+00:00', \
@@ -186,14 +235,6 @@ async fn apply_session_hygiene(connection: &mut Conn) -> Result<(), StateStoreEr
              SESSION character_set_results = 'utf8mb4'",
         )
         .await
-        .map_err(|_| mysql_provider_error())
-}
-
-fn mysql_provider_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::ProviderUnavailable,
-        "MySQL provider operation failed",
-    )
 }
 
 fn mysql_deadline_error() -> StateStoreError {
@@ -265,6 +306,7 @@ impl ResolvedMysqlClient {
         Ok(Arc::new(MysqlAsyncPoolLifecycle {
             pool: Pool::new(opts),
             connect_timeout: Duration::from_millis(self.config.connect_timeout_ms),
+            checkout_slots: Arc::new(Semaphore::new(self.config.pool_max)),
         }))
     }
 
@@ -295,12 +337,25 @@ impl ResolvedMysqlClient {
 }
 
 impl PoolLifecycle for MysqlAsyncPoolLifecycle {
-    fn get_conn<'a>(&'a self) -> BoxFuture<'a, Result<mysql_async::Conn, MysqlNativeError>> {
+    fn get_conn<'a>(
+        &'a self,
+        deadline: Instant,
+    ) -> BoxFuture<'a, Result<MysqlPoolConnection, MysqlNativeError>> {
         Box::pin(async move {
-            tokio::time::timeout(self.connect_timeout, self.pool.get_conn())
+            let checkout_slot =
+                timeout_at(deadline, Arc::clone(&self.checkout_slots).acquire_owned())
+                    .await
+                    .map_err(|_| MysqlNativeError::deadline())?
+                    .map_err(|_| MysqlNativeError::provider_unavailable())?;
+            let connect_deadline = deadline.min(Instant::now() + self.connect_timeout);
+            let connection = timeout_at(connect_deadline, self.pool.get_conn())
                 .await
                 .map_err(|_| MysqlNativeError::deadline())?
-                .map_err(MysqlNativeError::from)
+                .map_err(MysqlNativeError::from)?;
+            Ok(MysqlPoolConnection {
+                connection: Some(connection),
+                _checkout_slot: checkout_slot,
+            })
         })
     }
 
@@ -312,6 +367,32 @@ impl PoolLifecycle for MysqlAsyncPoolLifecycle {
                 .await
                 .map_err(MysqlNativeError::from)
         })
+    }
+}
+
+impl MysqlPoolConnection {
+    async fn destroy(mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), connection.disconnect()).await;
+        }
+    }
+}
+
+impl Deref for MysqlPoolConnection {
+    type Target = Conn;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+            .as_ref()
+            .expect("connection remains present until disposition")
+    }
+}
+
+impl DerefMut for MysqlPoolConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+            .as_mut()
+            .expect("connection remains present until disposition")
     }
 }
 

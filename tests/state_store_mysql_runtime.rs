@@ -24,9 +24,9 @@ use std::time::Duration;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks::state_store::mysql::test_support::run_sleep_until_deadline;
 use novarocks::state_store::mysql::test_support::{
-    acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown, hold_connection,
-    is_accepting, pollute_session, pool_count, prepare_pool, restart_mysql_fixture, runtime_owner,
-    validate_owner,
+    acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown,
+    delayed_active_readiness, hold_connection, is_accepting, pollute_session, pool_count,
+    prepare_pool, restart_mysql_fixture, runtime_owner, validate_owner,
 };
 use novarocks::state_store::{
     FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreErrorKind,
@@ -333,6 +333,7 @@ async fn mysql_client_readiness_checks_exact_server_and_session_contract() {
     assert_eq!(snapshot.server_version, "8.4.10");
     assert_eq!(snapshot.innodb_page_size, 16_384);
     assert!(snapshot.innodb_available);
+    assert_eq!(snapshot.default_storage_engine, "InnoDB");
     assert!(snapshot.sql_mode.contains("STRICT"));
     assert_eq!(snapshot.time_zone, "+00:00");
     assert_eq!(snapshot.character_set, "utf8mb4");
@@ -353,7 +354,7 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
     let auth = active_readiness(&auth_runtime, &database, Duration::from_secs(2))
         .await
         .expect_err("bad auth must fail");
-    assert_eq!(auth.kind(), StateStoreErrorKind::ProviderUnavailable);
+    assert_eq!(auth.kind(), StateStoreErrorKind::InvalidConfiguration);
     auth_runtime
         .shutdown()
         .await
@@ -370,7 +371,7 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
     .expect_err("missing database must fail");
     assert_eq!(
         missing_database.kind(),
-        StateStoreErrorKind::ProviderUnavailable
+        StateStoreErrorKind::InvalidConfiguration
     );
     database_runtime
         .shutdown()
@@ -387,7 +388,7 @@ async fn mysql_client_readiness_maps_auth_database_and_tls_failures() {
     let tls = active_readiness(&tls_runtime, &database, Duration::from_secs(2))
         .await
         .expect_err("invalid CA must fail");
-    assert_eq!(tls.kind(), StateStoreErrorKind::ProviderUnavailable);
+    assert_eq!(tls.kind(), StateStoreErrorKind::InvalidConfiguration);
     tls_runtime.shutdown().await.expect("shutdown TLS runtime");
 }
 
@@ -452,6 +453,56 @@ async fn mysql_client_pool_exhaustion_honors_operation_deadline() {
         .expect_err("pool wait must honor total deadline");
     assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
     drop(held);
+    runtime.shutdown().await.expect("shutdown fixture runtime");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mysql_client_pool_wait_can_outlive_connect_timeout_within_operation_deadline() {
+    let _guard = environment_lock();
+    let mut config = fixture_client_config();
+    config.connect_timeout_ms = 50;
+    config.pool_min = 1;
+    config.pool_max = 1;
+    let database = fixture_database();
+    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let held = hold_connection(&runtime, &database, Duration::from_secs(2))
+        .await
+        .expect("hold the only connection");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(held);
+    });
+
+    active_readiness(&runtime, &database, Duration::from_secs(1))
+        .await
+        .expect("pool wait may exceed connect timeout while inside total deadline");
+    runtime.shutdown().await.expect("shutdown fixture runtime");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mysql_client_readiness_timeout_destroys_undrained_connection() {
+    let _guard = environment_lock();
+    let mut config = fixture_client_config();
+    config.pool_min = 1;
+    config.pool_max = 1;
+    let database = fixture_database();
+    let mut runtime = StateStoreRuntime::mysql(config).expect("fixture runtime");
+    let before = active_readiness(&runtime, &database, Duration::from_secs(2))
+        .await
+        .expect("establish pooled connection");
+
+    let error = delayed_active_readiness(&runtime, &database, Duration::from_millis(100))
+        .await
+        .expect_err("delayed production readiness query must time out");
+    assert_eq!(error.kind(), StateStoreErrorKind::DeadlineExceeded);
+
+    let after = active_readiness(&runtime, &database, Duration::from_secs(2))
+        .await
+        .expect("checkout after timed-out readiness");
+    assert_ne!(
+        before.connection_id, after.connection_id,
+        "undrained readiness connection must not return to the pool"
+    );
     runtime.shutdown().await.expect("shutdown fixture runtime");
 }
 
