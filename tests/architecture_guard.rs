@@ -36530,6 +36530,13 @@ impl Rfd4M2b1TypeResolver {
         }
         let mut target_scope = scope.to_vec();
         let mut owner_index = 0usize;
+        if segments
+            .get(owner_index)
+            .is_some_and(|segment| segment == "crate")
+        {
+            target_scope.clear();
+            owner_index += 1;
+        }
         while segments
             .get(owner_index)
             .is_some_and(|segment| segment == "self")
@@ -36545,10 +36552,15 @@ impl Rfd4M2b1TypeResolver {
             }
             owner_index += 1;
         }
-        let Some(owner) = segments.get(owner_index) else {
+        let remaining = &segments[owner_index..];
+        let Some((owner, modules)) = remaining.split_last() else {
             return false;
         };
+        target_scope.extend(modules.iter().cloned());
         let scope = self.scopes.get(&target_scope);
+        if !modules.is_empty() && scope.is_none() {
+            return false;
+        }
         if scope
             .and_then(|scope| scope.bindings.get(owner))
             .is_some_and(|symbols| symbols.contains(symbol))
@@ -36706,6 +36718,7 @@ struct Rfd4M2b1AstAudit {
     module_scope: Vec<String>,
     composite_fields_are_exact: Option<bool>,
     current_impl_owner: Option<String>,
+    current_impl_is_canonical_composite: bool,
     installed_deployment_has_router: Option<bool>,
     role_router_storage: BTreeSet<String>,
     role_router_authorities: BTreeSet<String>,
@@ -36722,6 +36735,7 @@ impl Rfd4M2b1AstAudit {
             module_scope: Vec::new(),
             composite_fields_are_exact: None,
             current_impl_owner: None,
+            current_impl_is_canonical_composite: false,
             installed_deployment_has_router: None,
             role_router_storage: BTreeSet::new(),
             role_router_authorities: BTreeSet::new(),
@@ -36763,7 +36777,7 @@ impl Rfd4M2b1AstAudit {
         }
         if has_view
             && !has_participant_install
-            && self.current_impl_owner.as_deref() != Some("RuntimeFilterParticipantInstall")
+            && !self.current_impl_is_canonical_composite
             && !(allow_borrowed_view_helper && !has_unborrowed_view)
         {
             self.view_only_installs.insert(name.clone());
@@ -36846,7 +36860,8 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        let previous = self.current_impl_owner.take();
+        let previous_owner = self.current_impl_owner.take();
+        let previous_is_canonical_composite = self.current_impl_is_canonical_composite;
         self.current_impl_owner = match item.self_ty.as_ref() {
             syn::Type::Path(path) => path
                 .path
@@ -36855,8 +36870,18 @@ impl<'ast> syn::visit::Visit<'ast> for Rfd4M2b1AstAudit {
                 .map(|segment| segment.ident.to_string()),
             _ => None,
         };
+        self.current_impl_is_canonical_composite = self.source_path
+            == "src/runtime_filter/port/install.rs"
+            && self.module_scope.is_empty()
+            && (rfd4_m2b1_type_is_named(item.self_ty.as_ref(), "RuntimeFilterParticipantInstall")
+                || self.type_resolver.type_contains_symbol(
+                    item.self_ty.as_ref(),
+                    "RuntimeFilterParticipantInstall",
+                    &self.module_scope,
+                ));
         syn::visit::visit_item_impl(self, item);
-        self.current_impl_owner = previous;
+        self.current_impl_owner = previous_owner;
+        self.current_impl_is_canonical_composite = previous_is_canonical_composite;
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
@@ -37450,6 +37475,113 @@ fn rfd4_m2b1_detector_resolves_inline_module_view_aliases_without_cross_scope_po
             .any(|violation| violation.contains("view-only-install")),
         "an alias in one inline module must not pollute a sibling module that shadows the same \
          name with an unrelated local type: {shadowed:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2b1_detector_resolves_qualified_inline_module_view_aliases() {
+    for source in [
+        "mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         pub(crate) fn publish(view: hidden::View) {}",
+        "mod outer { mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } } \
+         pub(crate) fn publish(view: outer::hidden::View) {}",
+        "mod api { mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         pub(crate) fn publish(view: self::hidden::View) {} \
+         }",
+        "mod outer { \
+         mod hidden { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         mod api { pub(crate) fn publish(view: super::hidden::View) {} } \
+         }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "qualified inline-module aliases must resolve through nested/self/super paths to \
+             raw-view authority: {source}: {violations:?}"
+        );
+    }
+
+    let shadowed = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/service/registry.rs",
+        "mod imported { \
+         pub(crate) type View = \
+         crate::runtime_filter::port::install::RuntimeFilterInstallView; \
+         } \
+         mod shadowed { \
+         mod hidden { pub(crate) struct View; } \
+         pub(crate) fn publish(view: hidden::View) {} \
+         }",
+    )]);
+    assert!(
+        !shadowed
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "qualified module descent must preserve an unrelated sibling shadow: {shadowed:?}"
+    );
+}
+
+#[test]
+fn rfd4_m2b1_detector_does_not_exempt_same_named_service_impls() {
+    for source in [
+        "struct RuntimeFilterParticipantInstall; \
+         impl RuntimeFilterParticipantInstall { \
+         fn publish(view: RuntimeFilterInstallView) {} \
+         }",
+        "use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall; \
+         impl RuntimeFilterParticipantInstall { \
+         fn publish(view: RuntimeFilterInstallView) {} \
+         }",
+        "use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall as Install; \
+         impl Install { fn publish(view: RuntimeFilterInstallView) {} }",
+    ] {
+        let violations = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+            "src/runtime_filter/service/registry.rs",
+            source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("view-only-install")),
+            "local, imported, and aliased service impls are not the canonical composite owner: \
+             {source}: {violations:?}"
+        );
+    }
+
+    let canonical_owner = rfd4_m2b1_atomic_install_violations(&[Rfd4M2b1GuardSource::new(
+        "src/runtime_filter/port/install.rs",
+        "struct RuntimeFilterInstallView; \
+         struct RuntimeFilterRoutingShard; \
+         struct RuntimeFilterParticipantInstall { \
+         core_view: RuntimeFilterInstallView, \
+         routing_shard: RuntimeFilterRoutingShard \
+         } \
+         impl RuntimeFilterParticipantInstall { \
+         fn publish(view: RuntimeFilterInstallView) {} \
+         }",
+    )]);
+    assert!(
+        !canonical_owner
+            .iter()
+            .any(|violation| violation.contains("view-only-install")),
+        "the real composite impl in port/install remains the sole raw-view impl exemption: \
+         {canonical_owner:?}"
     );
 }
 
