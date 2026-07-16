@@ -6861,7 +6861,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [80, 78, 211, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7763,7 +7763,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [80, 78, 211, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8685,7 +8685,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [80, 78, 211, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8843,15 +8843,168 @@ fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
 }
 
 fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
+    fn unwrap_expr(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Group(group) => unwrap_expr(&group.expr),
+            syn::Expr::Paren(paren) => unwrap_expr(&paren.expr),
+            syn::Expr::Try(try_expr) => unwrap_expr(&try_expr.expr),
+            _ => expr,
+        }
+    }
+
+    fn binding_name(local: &syn::Local) -> Option<String> {
+        let syn::Pat::Ident(pattern) = &local.pat else {
+            return None;
+        };
+        Some(pattern.ident.to_string())
+    }
+
+    fn method_call<'a>(expr: &'a syn::Expr, method: &str) -> Option<&'a syn::ExprMethodCall> {
+        let syn::Expr::MethodCall(call) = unwrap_expr(expr) else {
+            return None;
+        };
+        (call.method == method).then_some(call)
+    }
+
+    fn path_ident(expr: &syn::Expr) -> Option<String> {
+        let syn::Expr::Path(path) = unwrap_expr(expr) else {
+            return None;
+        };
+        (path.qself.is_none() && path.path.segments.len() == 1)
+            .then(|| path.path.segments[0].ident.to_string())
+    }
+
+    fn method_count(expr: &syn::Expr, method: &str) -> usize {
+        struct MethodVisitor<'a> {
+            method: &'a str,
+            count: usize,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for MethodVisitor<'_> {
+            fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+                if item.method == self.method {
+                    self.count += 1;
+                }
+                syn::visit::visit_expr_method_call(self, item);
+            }
+        }
+
+        let mut visitor = MethodVisitor { method, count: 0 };
+        syn::visit::Visit::visit_expr(&mut visitor, expr);
+        visitor.count
+    }
+
+    fn field_is_from_binding(expr: &syn::Expr, binding: &str, field: &str) -> bool {
+        let syn::Expr::Field(field_expr) = unwrap_expr(expr) else {
+            return false;
+        };
+        matches!(&field_expr.member, syn::Member::Named(member) if member == field)
+            && path_ident(&field_expr.base).as_deref() == Some(binding)
+    }
+
+    fn result_uses_resolved_metadata(
+        expr: &syn::Expr,
+        metadata_binding: &str,
+        planner_binding: &str,
+    ) -> bool {
+        let syn::Expr::Call(ok_call) = unwrap_expr(expr) else {
+            return false;
+        };
+        if !matches!(
+            ok_call.func.as_ref(),
+            syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && ebd_4b3b_path_ends_with(&path.path, "Ok")
+                    && ok_call.args.len() == 1
+        ) {
+            return false;
+        }
+        let Some(argument) = ok_call.args.first() else {
+            return false;
+        };
+        let syn::Expr::Struct(result) = unwrap_expr(argument) else {
+            return false;
+        };
+        if !ebd_4b3b_path_ends_with(&result.path, "ResolvedAnalyzerTable")
+            || result.rest.is_some()
+            || result.fields.len() != 2
+        {
+            return false;
+        }
+
+        let mut catalog_from_metadata = false;
+        let mut planner_from_metadata = false;
+        for field in &result.fields {
+            match &field.member {
+                syn::Member::Named(member) if member == "catalog" => {
+                    catalog_from_metadata =
+                        field_is_from_binding(&field.expr, metadata_binding, "table");
+                }
+                syn::Member::Named(member) if member == "planner" => {
+                    planner_from_metadata =
+                        path_ident(&field.expr).as_deref() == Some(planner_binding);
+                }
+                _ => return false,
+            }
+        }
+        catalog_from_metadata && planner_from_metadata
+    }
+
+    fn resolution_branch_is_exact(block: &syn::Block) -> bool {
+        let [
+            syn::Stmt::Local(metadata_local),
+            syn::Stmt::Local(planner_local),
+            syn::Stmt::Expr(result, None),
+        ] = block.stmts.as_slice()
+        else {
+            return false;
+        };
+        let Some(metadata_binding) = binding_name(metadata_local) else {
+            return false;
+        };
+        let Some(metadata_init) = &metadata_local.init else {
+            return false;
+        };
+        let Some(resolve) = method_call(&metadata_init.expr, "resolve") else {
+            return false;
+        };
+        if method_count(&resolve.receiver, "registry") != 1 {
+            return false;
+        }
+
+        let Some(planner_binding) = binding_name(planner_local) else {
+            return false;
+        };
+        let Some(planner_init) = &planner_local.init else {
+            return false;
+        };
+        let Some(to_table_def) = method_call(&planner_init.expr, "to_table_def") else {
+            return false;
+        };
+        if path_ident(&to_table_def.receiver).as_deref() != Some(&metadata_binding) {
+            return false;
+        }
+
+        result_uses_resolved_metadata(result, &metadata_binding, &planner_binding)
+    }
+
     #[derive(Default)]
     struct ResolutionVisitor {
         resolve_calls: usize,
         catalog_table_calls: usize,
         planner_table_calls: usize,
         forbidden_calls: usize,
+        exact_resolution_branches: usize,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for ResolutionVisitor {
+        fn visit_expr_block(&mut self, item: &'ast syn::ExprBlock) {
+            if resolution_branch_is_exact(&item.block) {
+                self.exact_resolution_branches += 1;
+            }
+            syn::visit::visit_expr_block(self, item);
+        }
+
         fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
             match item.method.to_string().as_str() {
                 "resolve" => self.resolve_calls += 1,
@@ -8873,8 +9026,9 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
     syn::visit::Visit::visit_block(&mut visitor, block);
     visitor.resolve_calls == 1
         && visitor.planner_table_calls == 1
-        && visitor.catalog_table_calls <= 1
+        && visitor.catalog_table_calls == 0
         && visitor.forbidden_calls == 0
+        && visitor.exact_resolution_branches == 1
 }
 
 fn ebd_4b3b_schema_only_helper_is_metadata_only(block: &syn::Block) -> bool {
@@ -9221,6 +9375,44 @@ fn execute() {
         violations
             .iter()
             .any(|item| item.contains("explain-full-payload-read"))
+    );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_catalog_table_not_derived_from_resolved_metadata() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        let metadata = self
+            .service
+            .registry()
+            .read()
+            .expect("catalog service registry read lock")
+            .resolve(catalog.unwrap(), database, table)?;
+        let planner = metadata.to_table_def();
+        Ok(ResolvedAnalyzerTable {
+            catalog: CatalogTable::default(),
+            planner,
+        })
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "a fake CatalogTable must not satisfy one-resolution metadata provenance: {violations:?}"
     );
 }
 
