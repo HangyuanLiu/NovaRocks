@@ -73,12 +73,12 @@ mod backend_test;
 #[cfg(not(feature = "compat"))]
 mod starrocks_table_stub {
     use crate::common::app_config::StandaloneStarRocksTableConfig as AppStarRocksTableConfig;
-    use crate::engine::catalog::InMemoryCatalog;
     use crate::meta::repository::starrocks_table::{
         StarRocksTableSnapshot, StoredStarRocksPartition, StoredStarRocksTable,
         StoredStarRocksTablet,
     };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
 
     #[derive(Clone, Debug)]
     pub(crate) struct StarRocksTableConfig {
@@ -194,7 +194,7 @@ mod starrocks_table_stub {
     }
 
     pub(crate) fn register_starrocks_tables_in_catalog(
-        catalog: &mut InMemoryCatalog,
+        catalog: &mut PlannerMemoryCatalog,
         starrocks: &StarRocksTableCatalog,
     ) -> Result<(), String> {
         let _ = (catalog, starrocks);
@@ -207,12 +207,16 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn standalone_backends_register_internal_catalog_mgr_entry() {
+    fn standalone_backends_register_internal_catalog_service_entry() {
         let state = Arc::new(crate::engine::StandaloneState::default());
         super::register_standalone_backends(&state);
 
-        let mgr = state.catalog_mgr.read().expect("catalog mgr");
-        assert!(mgr.get_catalog("default_catalog").is_ok());
+        let registry = state
+            .catalog_service
+            .registry()
+            .read()
+            .expect("catalog service registry");
+        assert!(registry.get_catalog("default_catalog").is_ok());
     }
 }
 
@@ -479,20 +483,24 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             crate::engine::mv::iceberg_backend::IcebergMvBackend::new(state),
         ));
     }
-    register_default_catalog_mgr_entries(state);
+    register_default_catalog_service_entries(state);
 }
 
-pub(crate) fn register_default_catalog_mgr_entries(state: &Arc<crate::engine::StandaloneState>) {
-    let mut mgr = state.catalog_mgr.write().expect("catalog mgr write lock");
-    mgr.register(Arc::new(
-        crate::engine::catalog_mgr::internal::InternalCatalog::new(
+pub(crate) fn register_default_catalog_service_entries(
+    state: &Arc<crate::engine::StandaloneState>,
+) {
+    state
+        .catalog_service
+        .registry()
+        .write()
+        .expect("catalog service registry write lock")
+        .register(crate::sql::catalog::build_internal_catalog(
             "default_catalog",
-            Arc::clone(&state.catalog),
-        ),
-    ));
+            Arc::clone(state.catalog_service.local()),
+        ));
 }
 
-pub(crate) fn register_iceberg_catalog_mgr_entry(
+pub(crate) fn register_iceberg_catalog_service_entry(
     state: &Arc<crate::engine::StandaloneState>,
     catalog_name: &str,
 ) -> Result<(), String> {
@@ -504,11 +512,14 @@ pub(crate) fn register_iceberg_catalog_mgr_entry(
     let source = connectors.table_source("iceberg")?;
     drop(connectors);
     state
-        .catalog_mgr
+        .catalog_service
+        .registry()
         .write()
-        .expect("catalog mgr write lock")
-        .register(Arc::new(
-            crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(catalog_name, backend, source),
+        .expect("catalog service registry write lock")
+        .register(crate::sql::catalog::build_iceberg_catalog(
+            catalog_name,
+            backend,
+            source,
         ));
     Ok(())
 }

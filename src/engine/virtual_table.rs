@@ -557,7 +557,11 @@ mod tests {
         let state = Arc::new(StandaloneState::default());
         // Seed one database so the rewriter has at least one row to produce.
         {
-            let mut cat = state.catalog.write().expect("catalog lock");
+            let mut cat = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("catalog service local lock");
             cat.create_database("mydb").expect("create db");
         }
         let mut query =

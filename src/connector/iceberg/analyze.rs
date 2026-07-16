@@ -94,8 +94,8 @@ pub(crate) fn analyze_iceberg_puffin_stats(
     }
 
     // 4. Full-table scan of the requested columns. Route through the
-    //    catalog-mgr provider so the iceberg table resolves even though it is
-    //    not registered in the in-memory catalog (the ANALYZE handler does not
+    //    catalog-service provider so the Iceberg table resolves even though it
+    //    is not registered in the local planner catalog (the ANALYZE handler does not
     //    go through the SELECT query-prep flow).
     let sql = build_scan_sql(&target.catalog, &target.namespace, &target.table, columns);
     let query = crate::sql::parser::parse_normalized_sql_raw(&sql)
@@ -103,7 +103,7 @@ pub(crate) fn analyze_iceberg_puffin_stats(
     let sqlparser::ast::Statement::Query(query) = query else {
         return Err("analyze scan did not parse as a query".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_mgr(
+    let result = crate::engine::execute_query_with_catalog_service(
         state,
         Some(target.catalog.as_str()),
         &target.namespace,

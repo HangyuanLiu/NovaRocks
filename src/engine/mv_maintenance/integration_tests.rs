@@ -93,8 +93,8 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
             )
             .expect("create iceberg catalog");
     }
-    crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
-        .expect("register iceberg catalog mgr entry");
+    crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
+        .expect("register iceberg catalog service entry");
     MaintenanceTestEnv {
         state,
         current_db: current_db.to_string(),

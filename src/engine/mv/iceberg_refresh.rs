@@ -2550,7 +2550,8 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
         table_def.iceberg_row_lineage_metadata_columns.clear();
     }
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .map_err(|e| format!("standalone catalog write lock: {e}"))?;
     catalog.create_database(&target.namespace)?;
@@ -8520,7 +8521,7 @@ fn run_mv_full_select_result(
             &mut query,
         )?;
     }
-    crate::engine::execute_query_with_catalog_mgr(
+    crate::engine::execute_query_with_catalog_service(
         state,
         current_catalog,
         current_database,
@@ -11553,8 +11554,8 @@ fn synthetic_snapshot_object_name(
 fn build_join_snapshot_catalog(
     state: &Arc<StandaloneState>,
     snapshots: &[(&IcebergTableRef, i64); 2],
-) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
+    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
     for (base, snapshot_id) in snapshots {
         register_join_snapshot_side(&mut catalog, state, base, *snapshot_id)?;
     }
@@ -11574,8 +11575,8 @@ fn build_join_snapshot_catalog(
 fn build_iceberg_mv_planning_catalog(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
+    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
 
     for base in ctx.rewrite.base_refs.iter() {
         let snapshot_id = ctx.rewrite.pin.get(base).ok_or_else(|| {
@@ -11620,7 +11621,7 @@ fn build_iceberg_mv_planning_catalog(
 }
 
 fn register_join_snapshot_side(
-    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
     base: &IcebergTableRef,
     snapshot_id: i64,
@@ -14388,8 +14389,8 @@ fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
     base_refs: &[&IcebergTableRef],
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
+    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
     for base_ref in base_refs {
         let snapshot_id = pin
             .get(base_ref)
@@ -14408,8 +14409,8 @@ fn build_imv_refresh_catalog(
 fn build_join_branch_catalog(
     state: &Arc<StandaloneState>,
     branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
-) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
+    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
     register_join_branch_side(&mut catalog, state, &branch.left_base, branch.left)?;
     register_join_branch_side(&mut catalog, state, &branch.right_base, branch.right)?;
     Ok(catalog)
@@ -14421,8 +14422,8 @@ fn build_join_delta_coalesce_catalog(
     target: &IcebergMvTarget,
     target_table: &iceberg::table::Table,
     target_snapshot_id: Option<i64>,
-) -> Result<crate::engine::catalog::InMemoryCatalog, String> {
-    let mut catalog = crate::engine::catalog::InMemoryCatalog::default();
+) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
+    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
     let mut registered_delta_tables = BTreeSet::new();
     let mut registered_snapshot_tables = BTreeSet::new();
     for branch in branches {
@@ -14454,7 +14455,7 @@ fn build_join_delta_coalesce_catalog(
 }
 
 fn register_join_delta_target_locator(
-    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_table: &iceberg::table::Table,
@@ -14518,7 +14519,7 @@ fn build_empty_join_delta_target_locator_table_def(
 }
 
 fn register_join_delta_coalesce_side(
-    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
     base: &IcebergTableRef,
     side: crate::engine::mv::iceberg_join_branch::BranchSide,
@@ -14567,7 +14568,7 @@ fn join_catalog_registration_key(
 }
 
 fn register_join_branch_side(
-    catalog: &mut crate::engine::catalog::InMemoryCatalog,
+    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
     base: &IcebergTableRef,
     side: crate::engine::mv::iceberg_join_branch::BranchSide,
@@ -18275,7 +18276,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
             .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
@@ -18316,7 +18317,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
             .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
@@ -18360,7 +18361,7 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        crate::connector::register_iceberg_catalog_mgr_entry(&state, catalog)
+        crate::connector::register_iceberg_catalog_service_entry(&state, catalog)
             .expect("register iceberg catalog mgr entry");
         IcebergMvTestState {
             state,
@@ -22535,7 +22536,12 @@ mod tests {
         };
         crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
             .expect("target table");
-        let catalog = env.state.catalog.read().expect("standalone catalog");
+        let catalog = env
+            .state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog");
         catalog
             .get("analytics", "mv_orders")
             .expect("registered target");
@@ -22924,7 +22930,12 @@ mod tests {
                 .is_err()
         );
         assert!(find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_none());
-        let catalog = env.state.catalog.read().expect("standalone catalog");
+        let catalog = env
+            .state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog");
         assert!(catalog.get("analytics", "mv_orders").is_err());
     }
 

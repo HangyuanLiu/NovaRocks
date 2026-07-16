@@ -19,16 +19,15 @@ use std::sync::{Arc, RwLock};
 
 use crate::catalog::identifier::TableIdentity;
 use crate::catalog::registry::Catalog;
-use crate::engine::catalog::InMemoryCatalog;
-use crate::sql::catalog::CatalogRuntimeMetadata;
+use crate::sql::catalog::{CatalogRuntimeMetadata, local::PlannerMemoryCatalog};
 
 pub(super) struct InternalCatalog {
     name: String,
-    local: Arc<RwLock<InMemoryCatalog>>,
+    local: Arc<RwLock<PlannerMemoryCatalog>>,
 }
 
 impl InternalCatalog {
-    pub(super) fn new(name: &str, local: Arc<RwLock<InMemoryCatalog>>) -> Self {
+    pub(super) fn new(name: &str, local: Arc<RwLock<PlannerMemoryCatalog>>) -> Self {
         Self {
             name: name.to_string(),
             local,
@@ -67,8 +66,9 @@ mod tests {
     use super::InternalCatalog;
     use crate::catalog::registry::Catalog;
     use crate::catalog::schema::ColumnDef;
-    use crate::engine::catalog::InMemoryCatalog;
-    use crate::sql::catalog::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
+    use crate::sql::catalog::{
+        CatalogRuntimeBinding, CatalogRuntimeMetadata, local::PlannerMemoryCatalog,
+    };
     use crate::sql::planner::table::{ScanSource, TableDef};
 
     fn starrocks_table_def() -> TableDef {
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn default_catalog_resolves_registered_local_table() {
-        let mut local = InMemoryCatalog::default();
+        let mut local = PlannerMemoryCatalog::default();
         local.create_database("sales").expect("create database");
         local
             .register("sales", starrocks_table_def())
@@ -119,7 +119,7 @@ mod tests {
     fn default_catalog_preserves_local_missing_table_error() {
         let catalog = InternalCatalog::new(
             "default_catalog",
-            Arc::new(RwLock::new(InMemoryCatalog::default())),
+            Arc::new(RwLock::new(PlannerMemoryCatalog::default())),
         );
 
         assert_eq!(

@@ -1817,7 +1817,8 @@ fn refresh_starrocks_catalog(state: &Arc<StandaloneState>) -> Result<(), String>
     )?;
     {
         let mut catalog = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .expect("standalone catalog write lock");
         for database in &snapshot.databases {
@@ -1889,12 +1890,12 @@ mod tests {
     use crate::connector::starrocks::table::schema_adapter::{
         build_create_tablet_request, build_tablet_schema,
     };
-    use crate::engine::catalog::InMemoryCatalog;
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
     use crate::meta::MetaStoreProvider;
     use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
     use crate::sql::column_id::ColumnId;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
     use arrow::array::{Array, Int64Array, StringArray};
@@ -3817,7 +3818,11 @@ enable_path_style_access = true
     ) -> Result<crate::engine::StatementResult, String> {
         let state = engine.state_for_test();
         {
-            let mut catalog = state.catalog.write().expect("catalog write lock");
+            let mut catalog = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("catalog write lock");
             if !catalog.database_exists("analytics")? {
                 catalog.create_database("analytics")?;
             }
@@ -4207,7 +4212,7 @@ enable_path_style_access = true
         };
         seed_repository_snapshot_for_mv_refresh(&provider, &snapshot)?;
         let starrocks = StarRocksTableCatalog::rebuild(Some(config.clone()), snapshot)?;
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         catalog.create_database("analytics")?;
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks)?;
         let mut state = StandaloneState {
@@ -4217,9 +4222,13 @@ enable_path_style_access = true
             exchange_port: 0,
             ..Default::default()
         };
-        state.catalog = Arc::new(RwLock::new(catalog));
+        *state
+            .catalog_service
+            .local()
+            .write()
+            .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_mgr_entries(&state);
+        crate::connector::register_default_catalog_service_entries(&state);
         Ok((metadata_dir, state, shape))
     }
 
@@ -4611,7 +4620,11 @@ enable_path_style_access = true
         use crate::sql::planner::table::{ScanSource, TableDef};
         let state = Arc::new(crate::engine::StandaloneState::default());
         {
-            let mut catalog = state.catalog.write().expect("catalog write lock");
+            let mut catalog = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("catalog write lock");
             catalog.create_database("ns").expect("create ns database");
             catalog
                 .register(
@@ -4644,14 +4657,13 @@ enable_path_style_access = true
                 .expect("register orders table");
         }
         state
-            .catalog_mgr
+            .catalog_service
+            .registry()
             .write()
-            .expect("catalog mgr write lock")
-            .register(Arc::new(
-                crate::engine::catalog_mgr::internal::InternalCatalog::new(
-                    "ice",
-                    Arc::clone(&state.catalog),
-                ),
+            .expect("catalog service registry write lock")
+            .register(crate::sql::catalog::build_internal_catalog(
+                "ice",
+                Arc::clone(state.catalog_service.local()),
             ));
         state
     }

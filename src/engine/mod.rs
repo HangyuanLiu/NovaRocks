@@ -37,8 +37,8 @@ use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
 
-use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
 use crate::catalog::identifier::normalize_identifier;
+use crate::catalog::memory::DEFAULT_DATABASE;
 use crate::connector::{
     IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, create_iceberg_namespace,
     iceberg_namespace_exists, register_existing_iceberg_table,
@@ -56,6 +56,8 @@ use crate::meta::repository::job::{
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
+use crate::sql::catalog::StandaloneCatalogService;
+use crate::sql::catalog::local::PlannerMemoryCatalog;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_ops;
@@ -216,7 +218,8 @@ pub(crate) fn recover_starrocks_tablet_paths_from_state(
 
     {
         let mut catalog = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .expect("standalone catalog write lock");
         for database in &snapshot.databases {
@@ -296,24 +299,21 @@ fn register_starrocks_shard_infos(
     ))
 }
 
-pub(crate) fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
-    state
-        .catalog_mgr
-        .read()
-        .expect("catalog mgr read lock")
-        .clone()
+pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> StandaloneCatalogService {
+    StandaloneCatalogService::new(
+        Arc::new(RwLock::new(state.catalog_service.local_snapshot())),
+        state.catalog_service.registry_snapshot(),
+    )
 }
 
-pub(crate) fn build_analyzer_provider<'a>(
+pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
-    catalog: &'a InMemoryCatalog,
-    catalog_mgr: &'a catalog_mgr::CatalogMgr,
+    catalog_service: &'a StandaloneCatalogService,
     connectors: &'a crate::connector::ConnectorRegistry,
-) -> catalog_mgr::provider::CatalogMgrProvider<'a> {
-    catalog_mgr::provider::CatalogMgrProvider::new(
+) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
+    crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
-        catalog,
-        catalog_mgr,
+        catalog_service,
         connectors,
     )
 }
@@ -346,8 +346,7 @@ pub(crate) enum StatementResult {
 }
 
 pub(crate) struct StandaloneState {
-    pub(crate) catalog: Arc<RwLock<InMemoryCatalog>>,
-    pub(crate) catalog_mgr: RwLock<catalog_mgr::CatalogMgr>,
+    pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
@@ -385,15 +384,8 @@ pub(crate) struct StandaloneState {
 
 impl Default for StandaloneState {
     fn default() -> Self {
-        let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
-        let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
-        catalog_mgr.register(Arc::new(catalog_mgr::internal::InternalCatalog::new(
-            "default_catalog",
-            Arc::clone(&catalog),
-        )));
         Self {
-            catalog,
-            catalog_mgr: RwLock::new(catalog_mgr),
+            catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
@@ -544,15 +536,8 @@ impl StandaloneNovaRocks {
             None => None,
         };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
-        let catalog = Arc::new(RwLock::new(InMemoryCatalog::default()));
-        let mut catalog_mgr = catalog_mgr::CatalogMgr::new();
-        catalog_mgr.register(Arc::new(catalog_mgr::internal::InternalCatalog::new(
-            "default_catalog",
-            Arc::clone(&catalog),
-        )));
         let inner = Arc::new(StandaloneState {
-            catalog,
-            catalog_mgr: RwLock::new(catalog_mgr),
+            catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
                 starrocks_table_config.clone(),
             )),
@@ -662,7 +647,8 @@ impl StandaloneNovaRocks {
     pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
         let guard = self
             .inner
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog read lock");
         guard.database_exists(database_name)
@@ -700,7 +686,8 @@ impl StandaloneNovaRocks {
         };
         let guard = self
             .inner
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog read lock");
         guard.get(&database_name, &table_name).is_ok()
@@ -1020,23 +1007,20 @@ impl StandaloneSession {
                         crate::sql::explain::ExplainLevel::Normal
                     }
                 });
-                let catalog_snapshot = self
-                    .inner
-                    .catalog
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
                     .read()
-                    .expect("standalone catalog read lock")
-                    .clone();
+                    .expect("catalog service snapshot local read lock");
                 let connectors_snapshot = self
                     .inner
                     .connectors
                     .read()
                     .expect("standalone connector registry read lock")
                     .clone();
-                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
-                let analyzer_provider = build_analyzer_provider(
+                let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
-                    &catalog_snapshot,
-                    &catalog_mgr_snapshot,
+                    &catalog_service_snapshot,
                     &connectors_snapshot,
                 );
                 let result = if force_logical_explain {
@@ -1064,23 +1048,20 @@ impl StandaloneSession {
                 };
                 let prepared =
                     prepare_explain_query(&self.inner, current_catalog, current_database, query)?;
-                let catalog_snapshot = self
-                    .inner
-                    .catalog
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
                     .read()
-                    .expect("standalone catalog read lock")
-                    .clone();
+                    .expect("catalog service snapshot local read lock");
                 let connectors_snapshot = self
                     .inner
                     .connectors
                     .read()
                     .expect("standalone connector registry read lock")
                     .clone();
-                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
-                let analyzer_provider = build_analyzer_provider(
+                let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
-                    &catalog_snapshot,
-                    &catalog_mgr_snapshot,
+                    &catalog_service_snapshot,
                     &connectors_snapshot,
                 );
                 let result = explain_analyze_query(
@@ -1131,7 +1112,7 @@ impl StandaloneSession {
                 // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.
                 // Rewrite version-bearing table refs to synthetic per-snapshot
                 // names and register only those synthetic TableDefs. Ordinary
-                // Iceberg refs are resolved by CatalogMgrProvider during analysis.
+                // Iceberg refs are resolved by CatalogServiceProvider during analysis.
                 if has_time_travel_refs(&prepared) {
                     rewrite_time_travel_refs(
                         &self.inner,
@@ -1144,26 +1125,23 @@ impl StandaloneSession {
                 // Clone-then-release: do not hold the catalog read lock
                 // across pipeline execution. Pipeline execution can run for
                 // many seconds and would otherwise starve writers (e.g.
-                // INSERT cleanup taking `state.catalog.write()` in
+                // INSERT cleanup taking `state.catalog_service.local().write()` in
                 // `invalidate_iceberg_caches`) on the std::sync::RwLock
                 // writer queue.
-                let catalog_snapshot = self
-                    .inner
-                    .catalog
+                let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
+                let catalog_snapshot = catalog_service_snapshot
+                    .local()
                     .read()
-                    .expect("standalone catalog read lock")
-                    .clone();
+                    .expect("catalog service snapshot local read lock");
                 let connectors_snapshot = self
                     .inner
                     .connectors
                     .read()
                     .expect("standalone connector registry read lock")
                     .clone();
-                let catalog_mgr_snapshot = catalog_mgr_snapshot(&self.inner);
-                let analyzer_provider = build_analyzer_provider(
+                let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
-                    &catalog_snapshot,
-                    &catalog_mgr_snapshot,
+                    &catalog_service_snapshot,
                     &connectors_snapshot,
                 );
                 self::statistics::observe_query(&self.inner, &prepared, current_database)?;
@@ -1270,7 +1248,8 @@ impl StandaloneSession {
         }
         let mut catalog = self
             .inner
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .expect("standalone catalog write lock");
         let table_def = catalog.get(&target.namespace, &target.table)?;
@@ -1783,7 +1762,7 @@ impl StandaloneSession {
         guard.create_catalog(&stmt.name, &stmt.properties)?;
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
-        crate::connector::register_iceberg_catalog_mgr_entry(&self.inner, &stmt.name)?;
+        crate::connector::register_iceberg_catalog_service_entry(&self.inner, &stmt.name)?;
         persist_iceberg_catalog_if_needed(
             &self.inner,
             &normalize_identifier(&stmt.name)?,
@@ -2354,7 +2333,7 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
             .expect("standalone iceberg catalog write lock");
         for catalog in &catalogs {
             guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
-            crate::connector::register_iceberg_catalog_mgr_entry(state, &catalog.catalog)?;
+            crate::connector::register_iceberg_catalog_service_entry(state, &catalog.catalog)?;
         }
     }
 
@@ -2613,7 +2592,7 @@ fn prepare_explain_query(
     )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
-    // remain untouched and resolve through CatalogMgrProvider during analysis.
+    // remain untouched and resolve through CatalogServiceProvider during analysis.
     if has_time_travel_refs(&prepared) {
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
@@ -2628,7 +2607,7 @@ fn prepare_explain_query(
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-    _codegen_catalog: &InMemoryCatalog,
+    _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     query_opts: Option<QueryOptions>,
@@ -2811,7 +2790,7 @@ fn explain_logical_query(
 fn explain_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-    _codegen_catalog: &InMemoryCatalog,
+    _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
@@ -2868,7 +2847,7 @@ fn explain_query(
 
 pub(crate) fn execute_query(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -2886,28 +2865,26 @@ pub(crate) fn execute_query(
     )
 }
 
-pub(crate) fn execute_query_with_catalog_mgr(
+pub(crate) fn execute_query_with_catalog_service(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
     query_opts: Option<QueryOptions>,
 ) -> Result<QueryResult, String> {
-    let catalog_snapshot = state
-        .catalog
+    let catalog_service_snapshot = catalog_service_snapshot(state);
+    let catalog_snapshot = catalog_service_snapshot
+        .local()
         .read()
-        .expect("standalone catalog read lock")
-        .clone();
+        .expect("catalog service snapshot local read lock");
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr_snapshot = catalog_mgr_snapshot(state);
-    let analyzer_provider = build_analyzer_provider(
+    let analyzer_provider = build_catalog_service_provider(
         current_catalog,
-        &catalog_snapshot,
-        &catalog_mgr_snapshot,
+        &catalog_service_snapshot,
         &connectors_snapshot,
     );
     execute_query_with_catalog_provider(
@@ -3005,21 +2982,15 @@ pub(crate) fn execute_query_as_iceberg_write(
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
 
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
+    let catalog_service_snapshot = catalog_service_snapshot(state);
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr_snapshot = catalog_mgr_snapshot(state);
-    let analyzer_provider = build_analyzer_provider(
+    let analyzer_provider = build_catalog_service_provider(
         current_catalog,
-        &catalog_snapshot,
-        &catalog_mgr_snapshot,
+        &catalog_service_snapshot,
         &connectors_snapshot,
     );
 
@@ -3311,7 +3282,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-    codegen_catalog: &InMemoryCatalog,
+    codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -3350,7 +3321,7 @@ pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::planner::imv_rewri
 
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -3377,7 +3348,7 @@ pub(crate) fn execute_query_with_options(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_with_options_and_imv_validator(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -3408,7 +3379,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
+    catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -3546,7 +3517,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
 fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-    _codegen_catalog: &InMemoryCatalog,
+    _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     exchange_port: u16,
@@ -3663,7 +3634,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 pub(crate) fn execute_logical_plan_with_options(
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
-    _codegen_catalog: &InMemoryCatalog,
+    _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     _current_database: &str,
     exchange_port: u16,
@@ -4021,7 +3992,11 @@ fn rewrite_select_partition_table_refs(
             continue;
         };
         let partition = {
-            let catalog = state.catalog.read().expect("standalone catalog read lock");
+            let catalog = state
+                .catalog_service
+                .local()
+                .read()
+                .expect("standalone catalog read lock");
             catalog
                 .get_legacy_range_partition(&database, &table, &marker.partition_name)?
                 .ok_or_else(|| {
@@ -4460,6 +4435,46 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn standalone_state_has_one_catalog_service_owner() {
+        let source = include_str!("mod.rs");
+        let state_start = source
+            .find("pub(crate) struct StandaloneState {")
+            .expect("StandaloneState declaration");
+        let state_source = &source[state_start
+            ..source[state_start..]
+                .find("\n}")
+                .map(|offset| state_start + offset)
+                .expect("StandaloneState end")];
+
+        assert!(
+            state_source.contains("pub(crate) catalog_service: Arc<StandaloneCatalogService>,"),
+            "StandaloneState must own the canonical catalog service"
+        );
+        assert!(
+            !state_source.contains("pub(crate) catalog:"),
+            "StandaloneState must not retain the parallel local catalog field"
+        );
+        assert!(
+            !state_source.contains("pub(crate) catalog_mgr:"),
+            "StandaloneState must not retain the parallel named catalog field"
+        );
+    }
+
+    #[test]
+    fn engine_uses_catalog_service_snapshot_and_provider_helpers() {
+        let source = include_str!("mod.rs");
+        let snapshot_helper = ["fn ", "catalog_service_snapshot", "("].concat();
+        let provider_helper = ["fn ", "build_catalog_service_provider"].concat();
+        let retired_snapshot_helper = ["fn ", "catalog_mgr_snapshot", "("].concat();
+        let retired_provider_helper = ["fn ", "build_analyzer_provider"].concat();
+
+        assert!(source.contains(&snapshot_helper));
+        assert!(source.contains(&provider_helper));
+        assert!(!source.contains(&retired_snapshot_helper));
+        assert!(!source.contains(&retired_provider_helper));
+    }
+
+    #[test]
     fn explain_analyze_query_options_only_enable_profile() {
         assert_eq!(
             super::query_options_for_explain_analyze(None),
@@ -4818,7 +4833,7 @@ path = "{metadata_path}"
     }
 
     #[test]
-    fn create_catalog_registers_catalog_mgr_entry() {
+    fn create_catalog_registers_catalog_service_entry() {
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open");
         let warehouse = TempDir::new().expect("warehouse");
         let sql = format!(
@@ -4827,8 +4842,13 @@ path = "{metadata_path}"
         );
         engine.session().execute(&sql).expect("create catalog");
 
-        let mgr = engine.inner.catalog_mgr.read().expect("catalog mgr");
-        assert!(mgr.get_catalog("ice").is_ok());
+        let registry = engine
+            .inner
+            .catalog_service
+            .registry()
+            .read()
+            .expect("catalog service registry");
+        assert!(registry.get_catalog("ice").is_ok());
     }
 
     #[test]
@@ -4995,14 +5015,16 @@ path = "{metadata_path}"
         }
         {
             let connectors = state.connectors.read().expect("connectors");
-            let mut mgr = state.catalog_mgr.write().expect("catalog mgr");
-            mgr.register(Arc::new(
-                crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(
+            state
+                .catalog_service
+                .registry()
+                .write()
+                .expect("catalog service registry")
+                .register(crate::sql::catalog::build_iceberg_catalog(
                     "ice",
                     connectors.catalog_backend("iceberg").expect("backend"),
                     connectors.table_source("iceberg").expect("source"),
-                ),
-            ));
+                ));
         }
         let session = StandaloneSession {
             inner: Arc::clone(&state),
@@ -5035,7 +5057,11 @@ path = "{metadata_path}"
         assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
         assert_eq!(stats_requests.load(Ordering::SeqCst), 1);
 
-        let local = state.catalog.read().expect("catalog");
+        let local = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("catalog service local");
         assert!(
             local.get("db", "parted").is_err(),
             "EXPLAIN analysis must not require global InMemoryCatalog registration"
@@ -5440,7 +5466,7 @@ mysql_port = 47892
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
         use crate::sql::planner::table::{ScanSource, TableDef};
 
-        let mut catalog = super::InMemoryCatalog::default();
+        let mut catalog = super::PlannerMemoryCatalog::default();
         let table = TableDef {
             name: "tbl".to_string(),
             columns: vec![
@@ -5641,7 +5667,7 @@ mysql_port = 47892
     #[test]
     fn query_without_exchange_backend_fails_instead_of_direct_exec() {
         let query = parse_query_for_engine_test("select 1");
-        let catalog = super::InMemoryCatalog::default();
+        let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
 
         let err = super::execute_query_with_options(
@@ -5668,7 +5694,7 @@ mysql_port = 47892
         let backend = super::install_all_in_one_loopback_backend_for_test()
             .expect("install loopback backend");
         let query = parse_query_for_engine_test("select 1");
-        let catalog = super::InMemoryCatalog::default();
+        let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
 
         let result = super::execute_query_with_options(
@@ -5764,7 +5790,7 @@ mysql_port = 47892
     #[test]
     fn execute_query_with_imv_validator_propagates_validator_error() {
         let query = parse_query_for_engine_test("select k, v from ice.db.b");
-        let mut catalog = super::InMemoryCatalog::default();
+        let mut catalog = super::PlannerMemoryCatalog::default();
         catalog.create_database("db").expect("create db");
         catalog
             .register(
@@ -5858,7 +5884,7 @@ mysql_port = 47892
     #[test]
     fn preexpanded_mv_refresh_query_skips_imv_rewrite() {
         let query = parse_query_for_engine_test("select 1");
-        let catalog = super::InMemoryCatalog::default();
+        let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
 

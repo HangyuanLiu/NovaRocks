@@ -383,7 +383,11 @@ pub(crate) fn analyze_mv_select(
     if has_three_part_refs(&resolved_refs) {
         crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
     }
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let catalog = state
+        .catalog_service
+        .local()
+        .read()
+        .expect("standalone catalog read lock");
     let (resolved, _, _factory) =
         crate::sql::analyzer::analyze(&analyzed_query, &*catalog, current_database)?;
     drop(catalog);
@@ -747,7 +751,8 @@ fn register_iceberg_tables_for_mv_analysis(
         let mut table_def = table_source.build_table_def(&resolved)?;
         table_def.name = table.clone();
         let mut local_catalog = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .map_err(|e| format!("standalone catalog write lock: {e}"))?;
         local_catalog.create_database(namespace)?;

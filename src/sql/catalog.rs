@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::{Arc, RwLock};
+
 use crate::catalog::identifier::TableIdentity;
+use crate::catalog::registry::{Catalog, CatalogRegistry};
+use crate::catalog::service::CatalogService;
 use crate::catalog::table::CatalogTable;
+use crate::connector::backend::{CatalogBackend, TableSource};
 use crate::sql::planner::table::TableDef;
 
 mod conversion;
@@ -26,7 +31,36 @@ pub(crate) mod local;
 mod metadata;
 pub(crate) mod provider;
 
-use metadata::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
+#[cfg(test)]
+use metadata::CatalogRuntimeBinding;
+use metadata::CatalogRuntimeMetadata;
+
+pub(crate) type StandaloneCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
+
+pub(crate) fn build_internal_catalog(
+    name: &str,
+    local: Arc<RwLock<local::PlannerMemoryCatalog>>,
+) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
+    Arc::new(internal::InternalCatalog::new(name, local))
+}
+
+pub(crate) fn build_iceberg_catalog(
+    name: &str,
+    backend: Arc<dyn CatalogBackend>,
+    source: Arc<dyn TableSource>,
+) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
+    Arc::new(iceberg::IcebergCatalog::new(name, backend, source))
+}
+
+pub(crate) fn new_standalone_catalog_service() -> StandaloneCatalogService {
+    let local = Arc::new(RwLock::new(local::PlannerMemoryCatalog::default()));
+    let mut registry = CatalogRegistry::new();
+    registry.register(build_internal_catalog(
+        "default_catalog",
+        Arc::clone(&local),
+    ));
+    CatalogService::new(local, registry)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedAnalyzerTable {
@@ -83,6 +117,18 @@ pub(crate) trait IcebergMetadataTableProvider {
 
 #[cfg(test)]
 mod visibility_tests {
+    #[test]
+    fn exposes_canonical_standalone_catalog_service_alias() {
+        let source = include_str!("catalog.rs");
+
+        assert!(
+            source.contains(
+                "pub(crate) type StandaloneCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;"
+            ),
+            "sql::catalog must expose the canonical standalone catalog service specialization"
+        );
+    }
+
     #[test]
     fn runtime_metadata_module_remains_private_to_sql_catalog() {
         let source = include_str!("catalog.rs");
