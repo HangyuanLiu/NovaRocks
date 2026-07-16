@@ -33,7 +33,7 @@ pub(super) enum CatalogRuntimeBinding {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct CatalogRuntimeMetadata {
+pub(crate) struct CatalogRuntimeMetadata {
     pub(super) table: CatalogTable,
     pub(super) binding: CatalogRuntimeBinding,
 }

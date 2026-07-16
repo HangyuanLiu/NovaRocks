@@ -22,7 +22,9 @@ use crate::sql::planner::table::TableDef;
 mod conversion;
 mod iceberg;
 mod internal;
-mod metadata;
+pub(crate) mod local;
+pub(crate) mod metadata;
+pub(crate) mod provider;
 
 use metadata::{CatalogRuntimeBinding, CatalogRuntimeMetadata};
 
