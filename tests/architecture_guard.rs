@@ -43706,7 +43706,50 @@ fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
 
 fn rfd4_m2b2_remote_constructor_call_count(text: &str, source_rel: &str) -> usize {
     let sanitized = rust_sanitized_production_text(text);
-    let aliases = rust_production_scoped_aliases(text);
+    let mut aliases = rust_production_scoped_aliases(text);
+    if let Ok(file) = syn::parse_file(text) {
+        fn collect_type_aliases(
+            items: &[syn::Item],
+            inline_modules: &mut Vec<String>,
+            aliases: &mut RustScopedAliases,
+        ) {
+            for item in items {
+                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                    continue;
+                }
+                match item {
+                    syn::Item::Mod(item_mod) => {
+                        let Some((_, items)) = &item_mod.content else {
+                            continue;
+                        };
+                        inline_modules.push(item_mod.ident.to_string());
+                        collect_type_aliases(items, inline_modules, aliases);
+                        inline_modules.pop();
+                    }
+                    syn::Item::Type(item_type) => {
+                        let syn::Type::Path(target) = item_type.ty.as_ref() else {
+                            continue;
+                        };
+                        let target = RustScopedUsePath {
+                            segments: target
+                                .path
+                                .segments
+                                .iter()
+                                .map(|segment| segment.ident.to_string())
+                                .collect(),
+                            inline_modules: inline_modules.clone(),
+                        };
+                        aliases
+                            .entry((inline_modules.clone(), item_type.ident.to_string()))
+                            .or_default()
+                            .push(target);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        collect_type_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    }
     rust_raw_non_use_paths(&sanitized)
         .into_iter()
         .flat_map(|path| {
@@ -43801,32 +43844,48 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                             &statement.inline_modules,
                         )
                         .is_some_and(|path| {
-                            path.len() == 5
+                            (path.len() == 4
                                 && rfd4_m2b2_path_starts_with(
                                     &path,
-                                    &[
-                                        "crate",
-                                        "runtime_filter",
-                                        "port",
-                                        "final_domain",
-                                        "CompletionFence",
-                                    ],
-                                )
+                                    &["crate", "runtime_filter", "port", "final_domain"],
+                                ))
+                                || (path.len() == 5
+                                    && rfd4_m2b2_path_starts_with(
+                                        &path,
+                                        &[
+                                            "crate",
+                                            "runtime_filter",
+                                            "port",
+                                            "final_domain",
+                                            "CompletionFence",
+                                        ],
+                                    ))
                         })
                 });
-        let aliases_remote_type = tokens.windows(7).any(|window| {
-            window
-                == [
-                    "crate",
-                    "::",
-                    "runtime_filter",
-                    "::",
-                    "port",
-                    "::",
-                    "final_domain",
-                ]
-        }) && tokens.iter().any(|token| token == "CompletionFence")
-            && tokens.iter().any(|token| token == "type");
+        #[derive(Default)]
+        struct RemoteMacroAudit {
+            contains_remote_constructor: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for RemoteMacroAudit {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                    return;
+                }
+                syn::visit::visit_item(self, item);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if rust_use_tokens(&mac.tokens.to_string())
+                    .iter()
+                    .any(|token| token == "try_from_remote_codec")
+                {
+                    self.contains_remote_constructor = true;
+                }
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+        let mut macro_audit = RemoteMacroAudit::default();
+        syn::visit::Visit::visit_file(&mut macro_audit, parsed.as_ref().expect("checked above"));
 
         match source_rel.as_str() {
             DEFINITION_OWNER => {
@@ -43864,9 +43923,8 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                 if call_count != 0
                     || canonical_remote
                     || final_domain_glob
-                    || aliases_remote_type
                     || public_fence_facade
-                    || (canonical_fence_reference && remote_name_occurrences != 0)
+                    || (canonical_fence_reference && macro_audit.contains_remote_constructor)
                 {
                     violations.push(format!(
                         "{source_rel}: remote completion-fence reconstruction escaped the codec owner"
@@ -44094,88 +44152,145 @@ fn rfd4_m2b2_wire_tag_maps(
 
 fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
     fn expr_is_path(expression: &syn::Expr, expected: &str) -> bool {
-        matches!(expression, syn::Expr::Path(path) if path.path.is_ident(expected))
+        matches!(unwrap_expr(expression), syn::Expr::Path(path) if path.path.is_ident(expected))
+    }
+
+    fn unwrap_expr(mut expression: &syn::Expr) -> &syn::Expr {
+        loop {
+            expression = match expression {
+                syn::Expr::Group(group) => &group.expr,
+                syn::Expr::Paren(paren) => &paren.expr,
+                syn::Expr::Try(value) => &value.expr,
+                _ => return expression,
+            };
+        }
+    }
+
+    fn method_call<'a>(expression: &'a syn::Expr, method: &str) -> Option<&'a syn::ExprMethodCall> {
+        match unwrap_expr(expression) {
+            syn::Expr::MethodCall(call) if call.method == method => Some(call),
+            _ => None,
+        }
+    }
+
+    fn reads_magic(expression: &syn::Expr) -> bool {
+        let Some(read) = method_call(expression, "read_exact") else {
+            return false;
+        };
+        expr_is_path(&read.receiver, "reader")
+            && read.args.len() == 1
+            && read.args.first().is_some_and(|argument| {
+                method_call(argument, "len")
+                    .is_some_and(|len| len.args.is_empty() && expr_is_path(&len.receiver, "MAGIC"))
+            })
+    }
+
+    fn reads_wire_tag(expression: &syn::Expr) -> bool {
+        method_call(expression, "read_u8")
+            .is_some_and(|read| read.args.is_empty() && expr_is_path(&read.receiver, "reader"))
+    }
+
+    fn compares_magic_read(expression: &syn::Expr) -> bool {
+        let syn::Expr::Binary(binary) = unwrap_expr(expression) else {
+            return false;
+        };
+        matches!(binary.op, syn::BinOp::Ne(_))
+            && ((reads_magic(&binary.left) && expr_is_path(&binary.right, "MAGIC"))
+                || (reads_magic(&binary.right) && expr_is_path(&binary.left, "MAGIC")))
+    }
+
+    fn calls_from_live_wire_tag(expression: &syn::Expr) -> bool {
+        #[derive(Default)]
+        struct FromTagAudit {
+            found: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for FromTagAudit {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let syn::Expr::Path(function) = call.func.as_ref() {
+                    let segments = function
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>();
+                    if segments
+                        .ends_with(&["WireContributionKind".to_string(), "from_tag".to_string()])
+                        && call.args.len() == 1
+                        && call.args.first().is_some_and(reads_wire_tag)
+                    {
+                        self.found = true;
+                    }
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut audit = FromTagAudit::default();
+        syn::visit::Visit::visit_expr(&mut audit, expression);
+        audit.found
     }
 
     #[derive(Default)]
     struct FrameExecutionAudit {
-        decoder_calls_from_tag: bool,
-        decoder_compares_magic: bool,
-        decoder_reads_magic_len: bool,
-        encoder_calls_tag: bool,
-        encoder_writes_magic: bool,
+        decoder_binds_live_from_tag: bool,
+        decoder_compares_magic_read: bool,
+        encoder_magic_index: Option<usize>,
+        encoder_tag_index: Option<usize>,
+        encoder_writes_alternate_literal_magic: bool,
     }
     impl FrameExecutionAudit {
         fn visit_encoder(&mut self, block: &syn::Block) {
-            struct Encoder<'a>(&'a mut FrameExecutionAudit);
-            impl<'ast> syn::visit::Visit<'ast> for Encoder<'_> {
-                fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-                    if call.method == "extend_from_slice"
-                        && call.args.len() == 1
-                        && call
-                            .args
-                            .first()
-                            .is_some_and(|argument| expr_is_path(argument, "MAGIC"))
-                    {
-                        self.0.encoder_writes_magic = true;
-                    }
-                    if call.method == "tag"
-                        && matches!(call.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("kind"))
-                    {
-                        self.0.encoder_calls_tag = true;
-                    }
-                    syn::visit::visit_expr_method_call(self, call);
+            for (index, statement) in block.stmts.iter().enumerate() {
+                let syn::Stmt::Expr(expression, _) = statement else {
+                    continue;
+                };
+                let Some(call) = method_call(expression, "extend_from_slice")
+                    .or_else(|| method_call(expression, "push"))
+                else {
+                    continue;
+                };
+                if !expr_is_path(&call.receiver, "payload") || call.args.len() != 1 {
+                    continue;
+                }
+                let argument = call.args.first().expect("checked above");
+                if call.method == "extend_from_slice" && expr_is_path(argument, "MAGIC") {
+                    self.encoder_magic_index = Some(index);
+                } else if call.method == "extend_from_slice"
+                    && matches!(
+                        unwrap_expr(argument),
+                        syn::Expr::Lit(literal) if matches!(literal.lit, syn::Lit::ByteStr(_))
+                    )
+                {
+                    self.encoder_writes_alternate_literal_magic = true;
+                } else if call.method == "push"
+                    && method_call(argument, "tag").is_some_and(|tag| {
+                        tag.args.is_empty() && expr_is_path(&tag.receiver, "kind")
+                    })
+                {
+                    self.encoder_tag_index = Some(index);
                 }
             }
-            syn::visit::Visit::visit_block(&mut Encoder(self), block);
         }
 
         fn visit_decoder(&mut self, block: &syn::Block) {
-            struct Decoder<'a>(&'a mut FrameExecutionAudit);
-            impl<'ast> syn::visit::Visit<'ast> for Decoder<'_> {
-                fn visit_expr_binary(&mut self, binary: &'ast syn::ExprBinary) {
-                    if matches!(binary.op, syn::BinOp::Ne(_))
-                        && (expr_is_path(&binary.left, "MAGIC")
-                            || expr_is_path(&binary.right, "MAGIC"))
+            for statement in &block.stmts {
+                match statement {
+                    syn::Stmt::Expr(syn::Expr::If(if_expression), _)
+                        if compares_magic_read(&if_expression.cond) =>
                     {
-                        self.0.decoder_compares_magic = true;
+                        self.decoder_compares_magic_read = true;
                     }
-                    syn::visit::visit_expr_binary(self, binary);
-                }
-
-                fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                    if let syn::Expr::Path(function) = call.func.as_ref() {
-                        let segments = function
-                            .path
-                            .segments
-                            .iter()
-                            .map(|segment| segment.ident.to_string())
-                            .collect::<Vec<_>>();
-                        if segments.ends_with(&["WireContributionKind".into(), "from_tag".into()]) {
-                            self.0.decoder_calls_from_tag = true;
-                        }
-                    }
-                    syn::visit::visit_expr_call(self, call);
-                }
-
-                fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-                    if call.method == "read_exact"
-                        && call.args.len() == 1
-                        && call.args.first().is_some_and(|argument| {
-                            matches!(
-                                argument,
-                                syn::Expr::MethodCall(len)
-                                    if len.method == "len"
-                                        && expr_is_path(len.receiver.as_ref(), "MAGIC")
-                            )
-                        })
+                    syn::Stmt::Local(local)
+                        if matches!(&local.pat, syn::Pat::Ident(binding) if binding.ident == "frame_kind")
+                            && local
+                                .init
+                                .as_ref()
+                                .is_some_and(|init| calls_from_live_wire_tag(&init.expr)) =>
                     {
-                        self.0.decoder_reads_magic_len = true;
+                        self.decoder_binds_live_from_tag = true;
                     }
-                    syn::visit::visit_expr_method_call(self, call);
+                    _ => {}
                 }
             }
-            syn::visit::Visit::visit_block(&mut Decoder(self), block);
         }
     }
 
@@ -44249,17 +44364,21 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
             "MAGIC must be one named b\"NRFC\" const, found named={named_magic}, correct={correct_magic}"
         ));
     }
-    if !execution.encoder_writes_magic {
-        violations.push("common encoder must write MAGIC".into());
+    if execution.encoder_magic_index.is_none()
+        || execution.encoder_tag_index.is_none()
+        || execution.encoder_magic_index >= execution.encoder_tag_index
+        || execution.encoder_writes_alternate_literal_magic
+    {
+        violations.push("common encoder must write MAGIC before the live kind.tag() byte".into());
     }
-    if !execution.encoder_calls_tag {
-        violations.push("common encoder must call WireContributionKind::tag".into());
+    if !execution.decoder_compares_magic_read {
+        violations.push("common decoder must compare the exact MAGIC-sized read with MAGIC".into());
     }
-    if !execution.decoder_reads_magic_len || !execution.decoder_compares_magic {
-        violations.push("common decoder must read and compare MAGIC".into());
-    }
-    if !execution.decoder_calls_from_tag {
-        violations.push("common decoder must call WireContributionKind::from_tag".into());
+    if !execution.decoder_binds_live_from_tag {
+        violations.push(
+            "common decoder must bind frame_kind from WireContributionKind::from_tag(reader.read_u8())"
+                .into(),
+        );
     }
     if !tag_is_single_match {
         violations.push("WireContributionKind::tag must be exactly one exhaustive match".into());
@@ -44273,6 +44392,39 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
 
 fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -> Vec<String> {
     const OWNER: &str = "src/runtime_filter/port/subscription.rs";
+    fn is_delivery_path(path: &[String]) -> bool {
+        (path.len() == 5
+            && (rfd4_m2b2_path_starts_with(
+                path,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDelivery",
+                ],
+            ) || rfd4_m2b2_path_starts_with(
+                path,
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDeliveryOutcome",
+                ],
+            )))
+            || (path.len() == 4
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &["crate", "runtime_filter", "port", "subscription"],
+                ))
+            || (path.len() == 5
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &["crate", "runtime_filter", "port", "subscription", "*"],
+                ))
+    }
+
     let mut violations = Vec::new();
     for (source_rel, text) in sources {
         if source_rel == OWNER {
@@ -44289,37 +44441,126 @@ fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -
             ) else {
                 continue;
             };
-            let exact_delivery = path.len() == 5
-                && (rfd4_m2b2_path_starts_with(
-                    &path,
-                    &[
-                        "crate",
-                        "runtime_filter",
-                        "port",
-                        "subscription",
-                        "ArtifactDelivery",
-                    ],
-                ) || rfd4_m2b2_path_starts_with(
-                    &path,
-                    &[
-                        "crate",
-                        "runtime_filter",
-                        "port",
-                        "subscription",
-                        "ArtifactDeliveryOutcome",
-                    ],
-                ));
-            let delivery_glob = path.len() == 5
-                && rfd4_m2b2_path_starts_with(
-                    &path,
-                    &["crate", "runtime_filter", "port", "subscription", "*"],
-                );
-            if exact_delivery || delivery_glob {
+            if is_delivery_path(&path) {
                 violations.push(format!(
                     "{source_rel}: ArtifactDelivery facade {}",
                     path.join("::")
                 ));
             }
+        }
+
+        let Ok(file) = syn::parse_file(text) else {
+            if rust_use_tokens(text).iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "ArtifactDelivery" | "ArtifactDeliveryOutcome"
+                )
+            }) {
+                violations.push(format!(
+                    "{source_rel}: ArtifactDelivery facade audit must parse source"
+                ));
+            }
+            continue;
+        };
+        let aliases = rust_production_scoped_aliases(text);
+        struct DeliveryPathAudit<'a> {
+            aliases: &'a RustScopedAliases,
+            found: bool,
+            inline_modules: &'a [String],
+            source_rel: &'a str,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for DeliveryPathAudit<'_> {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                let segments = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                let resolved = rust_resolve_scoped_paths(
+                    &segments,
+                    self.inline_modules,
+                    self.aliases,
+                    &mut BTreeSet::new(),
+                    0,
+                )
+                .unwrap_or_else(|| {
+                    vec![RustScopedUsePath {
+                        segments,
+                        inline_modules: self.inline_modules.to_vec(),
+                    }]
+                });
+                self.found |= resolved.into_iter().any(|path| {
+                    rust_canonical_path_segments_in_scope(
+                        &path.segments,
+                        self.source_rel,
+                        &path.inline_modules,
+                    )
+                    .is_some_and(|path| is_delivery_path(&path))
+                });
+                syn::visit::visit_path(self, path);
+            }
+        }
+        fn audit_facade_items(
+            items: &[syn::Item],
+            source_rel: &str,
+            aliases: &RustScopedAliases,
+            inline_modules: &mut Vec<String>,
+        ) -> bool {
+            for item in items {
+                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                    continue;
+                }
+                match item {
+                    syn::Item::Mod(item_mod) => {
+                        let Some((_, items)) = &item_mod.content else {
+                            continue;
+                        };
+                        inline_modules.push(item_mod.ident.to_string());
+                        let found = audit_facade_items(items, source_rel, aliases, inline_modules);
+                        inline_modules.pop();
+                        if found {
+                            return true;
+                        }
+                    }
+                    syn::Item::Type(item_type)
+                        if !matches!(item_type.vis, syn::Visibility::Inherited) =>
+                    {
+                        let mut audit = DeliveryPathAudit {
+                            aliases,
+                            found: false,
+                            inline_modules,
+                            source_rel,
+                        };
+                        syn::visit::Visit::visit_type(&mut audit, &item_type.ty);
+                        if audit.found {
+                            return true;
+                        }
+                    }
+                    syn::Item::Trait(item_trait)
+                        if !matches!(item_trait.vis, syn::Visibility::Inherited) =>
+                    {
+                        let mut audit = DeliveryPathAudit {
+                            aliases,
+                            found: false,
+                            inline_modules,
+                            source_rel,
+                        };
+                        for bound in &item_trait.supertraits {
+                            syn::visit::Visit::visit_type_param_bound(&mut audit, bound);
+                        }
+                        if audit.found {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        if audit_facade_items(&file.items, source_rel, &aliases, &mut Vec::new()) {
+            violations.push(format!(
+                "{source_rel}: ArtifactDelivery type or trait facade"
+            ));
         }
     }
     violations.sort();
@@ -44739,6 +44980,26 @@ fn f() { CompletionFence::try_from_remote_codec(); }
         "same-named local types must not be treated as the canonical remote fence"
     );
 
+    let canonical_import_with_unrelated_local_method = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+struct LocalFence;
+impl LocalFence {
+    fn try_from_remote_codec() {}
+}
+fn f() {
+    let _ = std::mem::size_of::<CompletionFence>();
+    LocalFence::try_from_remote_codec();
+}
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            canonical_import_with_unrelated_local_method.into(),
+        )])
+        .is_empty(),
+        "canonical fence references must not poison unrelated local method calls"
+    );
+
     let cfg_test_only = r#"
 #[cfg(test)]
 fn f() {
@@ -44845,6 +45106,39 @@ macro_rules! hidden_rebuild {
         !definition_macro_violations.is_empty(),
         "definition owner must contain only the constructor declaration token"
     );
+
+    let namespace_facade = vec![
+        (
+            "src/runtime_filter/fence_facade.rs".to_string(),
+            "pub(crate) use crate::runtime_filter::port::final_domain as fd;".to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::fence_facade::fd; fn f() { let _ = fd::CompletionFence::try_from_remote_codec; }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&namespace_facade).is_empty(),
+        "cross-file final_domain namespace facades must be rejected"
+    );
+
+    let private_ancestor_facade = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence as HiddenFence;
+mod child {
+    fn f() {
+        let _ = super::HiddenFence::try_from_remote_codec;
+    }
+}
+"#;
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            private_ancestor_facade.into(),
+        )])
+        .is_empty(),
+        "private ancestor aliases must not hide child-module reconstruction"
+    );
 }
 
 #[test]
@@ -44922,6 +45216,89 @@ fn decode_contribution(reader: &mut Reader) {
         !rfd4_m2b2_nrfc_execution_violations(early_return).is_empty(),
         "tag methods must be one exhaustive match without prefix statements"
     );
+
+    let dead_correct_execution = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    if false {
+        payload.extend_from_slice(MAGIC);
+        payload.push(kind.tag());
+    }
+    payload.extend_from_slice(b"ALT!");
+    payload.push(9);
+}
+fn decode_contribution(reader: &mut Reader) {
+    if false {
+        let _ = reader.read_exact(MAGIC.len()) != MAGIC;
+        let _ = WireContributionKind::from_tag(reader.read_u8());
+    }
+    let _ = reader.read_exact(4) != b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(dead_correct_execution).is_empty(),
+        "dead correct calls must not mask live alternate frame execution"
+    );
+
+    let decoupled_decoder = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.push(kind.tag());
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(MAGIC.len());
+    let _ = MAGIC != MAGIC;
+    let _ = WireContributionKind::from_tag(1);
+    let _ = reader.read_exact(4) != b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(decoupled_decoder).is_empty(),
+        "decoder must compare the exact MAGIC read and feed the live wire byte into from_tag"
+    );
 }
 
 #[test]
@@ -44950,6 +45327,42 @@ fn rfd4_m2b2_artifact_delivery_facade_detector_rejects_cross_file_reexports() {
     assert!(
         rfd4_m2b2_artifact_delivery_facade_violations(&local).is_empty(),
         "unrelated local delivery helpers must remain allowed"
+    );
+
+    let type_alias = vec![
+        (
+            "src/runtime_filter/facade.rs".to_string(),
+            "pub(crate) type HiddenDelivery = dyn crate::runtime_filter::port::subscription::ArtifactDelivery;"
+                .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::facade::HiddenDelivery; fn f(delivery: &HiddenDelivery) { delivery.deliver(todo!(), todo!()); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&type_alias).is_empty(),
+        "public ArtifactDelivery type aliases must be rejected"
+    );
+
+    let wrapper_trait = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) trait HiddenDelivery: crate::runtime_filter::port::subscription::ArtifactDelivery {}"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_trait).is_empty(),
+        "public wrapper traits must not facade ArtifactDelivery"
+    );
+
+    let namespace_facade = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) use crate::runtime_filter::port::subscription as hidden;".to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&namespace_facade).is_empty(),
+        "subscription namespace facades must be rejected"
     );
 }
 
