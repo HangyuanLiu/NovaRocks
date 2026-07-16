@@ -542,8 +542,7 @@ mod tests {
                 tuple_ids: vec![70],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: PhysicalPlanStats {
                     output_row_count: 0.0,
@@ -593,8 +592,7 @@ mod tests {
                 tuple_ids: vec![90],
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 stats: PhysicalPlanStats {
                     output_row_count: 0.0,

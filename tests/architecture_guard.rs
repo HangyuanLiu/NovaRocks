@@ -30269,6 +30269,18 @@ fn coordinator_runtime_filter_guard_rejects_graph_type_dependency() {
 }
 
 #[test]
+fn coordinator_runtime_filter_guard_allows_read_only_graph_projection_owner() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/fragment/runtime_filter.rs",
+        "use crate::sql::planner::distributed::runtime_filter::{RuntimeFilterGraphProjection, project_runtime_filters}; fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "the independent RF sidecar owner may consume the sealed Graph projection API"
+    );
+}
+
+#[test]
 fn coordinator_runtime_filter_guard_rejects_unrelated_graph_method_in_opaque_scope() {
     assert_coor_3b_fixture_rejected(
         "src/sql/codegen/fragment/runtime_filter.rs",
