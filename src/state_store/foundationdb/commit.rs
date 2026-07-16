@@ -25,7 +25,7 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use super::codec::{DurableCommitState, KeyspaceCodec, REVISION_BYTES};
-use super::txn::create_raw_transaction;
+use super::txn::create_raw_transaction_with_observer;
 use crate::state_store::runtime::OperationHandle;
 use crate::state_store::{
     CommitOutcome, CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind,
@@ -76,6 +76,87 @@ enum NativeCommitDisposition {
     RetryableNotCommitted,
     DefiniteNotCommitted,
     Unknown,
+}
+
+impl NativeCommitDisposition {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::ConflictNotCommitted => "conflict_not_committed",
+            Self::RetryableNotCommitted => "retryable_not_committed",
+            Self::DefiniteNotCommitted => "definite_not_committed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitStatePhase {
+    Reservation,
+    DataCommit,
+    Versionstamp,
+    PreDispatchTombstone,
+    Terminalization,
+    Resolve,
+}
+
+impl CommitStatePhase {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::Reservation,
+        Self::DataCommit,
+        Self::Versionstamp,
+        Self::PreDispatchTombstone,
+        Self::Terminalization,
+        Self::Resolve,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reservation => "reservation",
+            Self::DataCommit => "data_commit",
+            Self::Versionstamp => "versionstamp",
+            Self::PreDispatchTombstone => "pre_dispatch_tombstone",
+            Self::Terminalization => "terminalization",
+            Self::Resolve => "resolve",
+        }
+    }
+}
+
+struct NativeErrorLogFields {
+    transaction_id: String,
+    phase: &'static str,
+    native_error_code: i32,
+    category: &'static str,
+}
+
+fn native_error_log_fields(
+    transaction_id: TransactionId,
+    phase: CommitStatePhase,
+    error: FdbError,
+    disposition: NativeCommitDisposition,
+) -> NativeErrorLogFields {
+    NativeErrorLogFields {
+        transaction_id: transaction_id.as_uuid().to_string(),
+        phase: phase.as_str(),
+        native_error_code: error.code(),
+        category: disposition.category(),
+    }
+}
+
+fn log_native_error(
+    transaction_id: TransactionId,
+    phase: CommitStatePhase,
+    error: FdbError,
+    disposition: NativeCommitDisposition,
+) {
+    let fields = native_error_log_fields(transaction_id, phase, error, disposition);
+    tracing::warn!(
+        transaction_id = %fields.transaction_id,
+        phase = fields.phase,
+        native_error_code = fields.native_error_code,
+        category = fields.category,
+        "FoundationDB commit-state native error"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,9 +312,12 @@ fn native_error_metric_event(
 
 fn record_native_error(
     metrics: &StateStoreMetrics,
+    transaction_id: TransactionId,
+    phase: CommitStatePhase,
     error: FdbError,
     disposition: NativeCommitDisposition,
 ) {
+    log_native_error(transaction_id, phase, error, disposition);
     if let Some(event) = native_error_metric_event(error, disposition) {
         record_auxiliary_metric(metrics, event);
     }
@@ -345,6 +429,8 @@ async fn persist_pre_dispatch_failure(
             deadline,
             &mut budget,
             prepared.metrics.as_ref(),
+            prepared.transaction_id,
+            CommitStatePhase::PreDispatchTombstone,
         ) {
             Ok(transaction) => transaction,
             Err(_) => return CommitOutcome::CommitUnknown(provider_unknown()),
@@ -355,6 +441,8 @@ async fn persist_pre_dispatch_failure(
             &state_key,
             deadline,
             prepared.metrics.as_ref(),
+            prepared.transaction_id,
+            CommitStatePhase::PreDispatchTombstone,
         )
         .await
         {
@@ -382,7 +470,13 @@ async fn persist_pre_dispatch_failure(
                     Ok(Err(error)) => {
                         let error = *error;
                         let disposition = classify_native_commit_error(error);
-                        record_native_error(prepared.metrics.as_ref(), error, disposition);
+                        record_native_error(
+                            prepared.metrics.as_ref(),
+                            prepared.transaction_id,
+                            CommitStatePhase::PreDispatchTombstone,
+                            error,
+                            disposition,
+                        );
                         if should_retry_auxiliary_commit(error)
                             && budget.has_remaining()
                             && Instant::now() < deadline
@@ -447,6 +541,8 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
                 Ok(Err(error)) => {
                     record_native_error(
                         prepared.metrics.as_ref(),
+                        prepared.transaction_id,
+                        CommitStatePhase::Versionstamp,
                         error,
                         classify_native_commit_error(error),
                     );
@@ -464,7 +560,13 @@ async fn run_commit_owner(prepared: PreparedCommit) -> CommitOutcome {
         Ok(Err(error)) => {
             let error = *error;
             let disposition = classify_native_commit_error(error);
-            record_native_error(prepared.metrics.as_ref(), error, disposition);
+            record_native_error(
+                prepared.metrics.as_ref(),
+                prepared.transaction_id,
+                CommitStatePhase::DataCommit,
+                error,
+                disposition,
+            );
             match disposition {
                 NativeCommitDisposition::ConflictNotCommitted
                 | NativeCommitDisposition::RetryableNotCommitted
@@ -527,29 +629,45 @@ async fn reserve_commit_state(
     let mut reservation_may_exist = false;
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
     loop {
-        let transaction =
-            match create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics) {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    return ReservationResult::Outcome(classify_reservation_read_error(
-                        error,
-                        reservation_may_exist,
-                    ));
+        let transaction = match create_auxiliary_transaction(
+            database,
+            limits,
+            deadline,
+            &mut budget,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Reservation,
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return ReservationResult::Outcome(classify_reservation_read_error(
+                    error,
+                    reservation_may_exist,
+                ));
+            }
+        };
+        let observed = match load_commit_state(
+            &transaction,
+            codec,
+            &state_key,
+            deadline,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Reservation,
+        )
+        .await
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                if is_retryable_auxiliary_error(&error) && Instant::now() < deadline {
+                    continue;
                 }
-            };
-        let observed =
-            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
-                Ok(observed) => observed,
-                Err(error) => {
-                    if is_retryable_auxiliary_error(&error) && Instant::now() < deadline {
-                        continue;
-                    }
-                    return ReservationResult::Outcome(classify_reservation_read_error(
-                        error,
-                        reservation_may_exist,
-                    ));
-                }
-            };
+                return ReservationResult::Outcome(classify_reservation_read_error(
+                    error,
+                    reservation_may_exist,
+                ));
+            }
+        };
         match decide_reservation(observed.as_ref(), reservation_token) {
             ReservationDecision::Dispatch => return ReservationResult::Dispatch,
             ReservationDecision::ReturnCommitted(revision) => {
@@ -571,7 +689,13 @@ async fn reserve_commit_state(
                     Ok(Err(error)) => {
                         let error = *error;
                         let disposition = classify_native_commit_error(error);
-                        record_native_error(metrics, error, disposition);
+                        record_native_error(
+                            metrics,
+                            transaction_id,
+                            CommitStatePhase::Reservation,
+                            error,
+                            disposition,
+                        );
                         if disposition == NativeCommitDisposition::DefiniteNotCommitted {
                             return ReservationResult::Outcome(CommitOutcome::DefiniteFailure(
                                 deterministic_commit_error(error.code()),
@@ -608,16 +732,32 @@ pub(super) async fn resolve_commit(
     let mut budget = AuxiliaryAttemptBudget::new();
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
     loop {
-        let transaction =
-            create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics)?;
-        let state =
-            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
-                Ok(state) => state,
-                Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+        let transaction = create_auxiliary_transaction(
+            database,
+            limits,
+            deadline,
+            &mut budget,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Resolve,
+        )?;
+        let state = match load_commit_state(
+            &transaction,
+            codec,
+            &state_key,
+            deadline,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Resolve,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         match state {
             Some(DurableCommitState::Committed(revision)) => {
                 return Ok(CommitResolution::Committed(receipt(
@@ -637,7 +777,13 @@ pub(super) async fn resolve_commit(
                     Ok(Err(error)) => {
                         let error = *error;
                         let disposition = classify_native_commit_error(error);
-                        record_native_error(metrics, error, disposition);
+                        record_native_error(
+                            metrics,
+                            transaction_id,
+                            CommitStatePhase::Resolve,
+                            error,
+                            disposition,
+                        );
                         if should_retry_auxiliary_commit(error)
                             && budget.has_remaining()
                             && Instant::now() < deadline
@@ -669,19 +815,35 @@ async fn terminalize_matching_pending(
     let mut budget = AuxiliaryAttemptBudget::new();
     let state_key = codec.commit_state_key(*transaction_id.as_uuid().as_bytes());
     loop {
-        let transaction =
-            match create_auxiliary_transaction(database, limits, deadline, &mut budget, metrics) {
-                Ok(transaction) => transaction,
-                Err(_) => return false,
-            };
-        let state =
-            match load_commit_state(&transaction, codec, &state_key, deadline, metrics).await {
-                Ok(state) => state,
-                Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
-                    continue;
-                }
-                Err(_) => return false,
-            };
+        let transaction = match create_auxiliary_transaction(
+            database,
+            limits,
+            deadline,
+            &mut budget,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Terminalization,
+        ) {
+            Ok(transaction) => transaction,
+            Err(_) => return false,
+        };
+        let state = match load_commit_state(
+            &transaction,
+            codec,
+            &state_key,
+            deadline,
+            metrics,
+            transaction_id,
+            CommitStatePhase::Terminalization,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) if is_retryable_auxiliary_error(&error) && Instant::now() < deadline => {
+                continue;
+            }
+            Err(_) => return false,
+        };
         match decide_terminalization(state.as_ref(), reservation_token) {
             TerminalizationDecision::WriteNotCommitted => {
                 transaction.set(&state_key, &codec.not_committed_value());
@@ -693,7 +855,13 @@ async fn terminalize_matching_pending(
                     Ok(Err(error)) => {
                         let error = *error;
                         let disposition = classify_native_commit_error(error);
-                        record_native_error(metrics, error, disposition);
+                        record_native_error(
+                            metrics,
+                            transaction_id,
+                            CommitStatePhase::Terminalization,
+                            error,
+                            disposition,
+                        );
                         if should_retry_auxiliary_commit(error)
                             && budget.has_remaining()
                             && Instant::now() < deadline
@@ -720,10 +888,18 @@ async fn load_commit_state(
     state_key: &[u8],
     deadline: Instant,
     metrics: &StateStoreMetrics,
+    transaction_id: TransactionId,
+    phase: CommitStatePhase,
 ) -> Result<Option<DurableCommitState>, StateStoreError> {
     let value = match timeout_at(deadline, transaction.get(state_key, false)).await {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
+            log_native_error(
+                transaction_id,
+                phase,
+                error,
+                classify_native_commit_error(error),
+            );
             let error = classify_auxiliary_native_error(error);
             record_auxiliary_error(metrics, &error);
             return Err(error);
@@ -744,9 +920,19 @@ fn create_auxiliary_transaction(
     deadline: Instant,
     budget: &mut AuxiliaryAttemptBudget,
     metrics: &StateStoreMetrics,
+    transaction_id: TransactionId,
+    phase: CommitStatePhase,
 ) -> Result<Transaction, StateStoreError> {
     begin_auxiliary_attempt(budget, deadline, metrics)?;
-    create_raw_transaction(database, limits, deadline).inspect_err(|error| {
+    create_raw_transaction_with_observer(database, limits, deadline, |error| {
+        log_native_error(
+            transaction_id,
+            phase,
+            error,
+            classify_native_commit_error(error),
+        );
+    })
+    .inspect_err(|error| {
         record_auxiliary_error(metrics, error);
     })
 }
@@ -1127,6 +1313,92 @@ mod tests {
                 NativeCommitDisposition::DefiniteNotCommitted
             ),
             None
+        );
+    }
+
+    #[test]
+    fn native_error_log_fields_are_structured_phase_complete_and_secret_free() {
+        let transaction_id = TransactionId::from(Uuid::from_bytes([0x5a; 16]));
+        let fields = native_error_log_fields(
+            transaction_id,
+            CommitStatePhase::DataCommit,
+            FdbError::from_code(1007),
+            NativeCommitDisposition::RetryableNotCommitted,
+        );
+        assert_eq!(fields.transaction_id, transaction_id.as_uuid().to_string());
+        assert_eq!(fields.phase, "data_commit");
+        assert_eq!(fields.native_error_code, 1007);
+        assert_eq!(fields.category, "retryable_not_committed");
+
+        assert_eq!(
+            CommitStatePhase::ALL.map(CommitStatePhase::as_str),
+            [
+                "reservation",
+                "data_commit",
+                "versionstamp",
+                "pre_dispatch_tombstone",
+                "terminalization",
+                "resolve",
+            ]
+        );
+
+        let source = include_str!("commit.rs");
+        let helper = source
+            .split("fn log_native_error")
+            .nth(1)
+            .expect("structured native error log helper")
+            .split("\nfn ")
+            .next()
+            .expect("helper body");
+        for required in ["transaction_id", "phase", "native_error_code", "category"] {
+            assert!(helper.contains(required), "missing log field {required}");
+        }
+        for forbidden in [
+            "logical_key",
+            "logical_value",
+            "cluster_file",
+            "tls",
+            "path",
+            "secret",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "sensitive field {forbidden} must not enter commit-state logs"
+            );
+        }
+
+        let txn_source = include_str!("txn.rs");
+        assert!(
+            txn_source.contains("fn create_raw_transaction_with_observer"),
+            "raw transaction creation must expose native failures to commit-state logging"
+        );
+        assert!(
+            txn_source.contains("create_raw_transaction_with_observer(")
+                && txn_source.contains("|_| {}"),
+            "ordinary state transactions must retain a no-op native-error observer"
+        );
+        let raw_helper = txn_source
+            .split("fn create_raw_transaction_with_observer")
+            .nth(1)
+            .expect("raw transaction observer helper")
+            .split("impl FoundationDbReadTransaction")
+            .next()
+            .expect("raw transaction helper body");
+        assert!(
+            raw_helper
+                .matches("classify_native_read_error(error)")
+                .count()
+                >= 4,
+            "raw create/options errors must preserve native fail-closed classification"
+        );
+        assert!(
+            !raw_helper.contains("provider_error()"),
+            "raw create/options must not flatten deterministic native errors into provider failures"
+        );
+        assert!(
+            source.contains("create_raw_transaction_with_observer(")
+                && source.contains("log_native_error(transaction_id, phase"),
+            "commit-state raw creation must preserve transaction and phase context"
         );
     }
 

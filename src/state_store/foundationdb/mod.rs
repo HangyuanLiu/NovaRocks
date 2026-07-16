@@ -26,6 +26,7 @@ pub(super) mod test_support;
 mod txn;
 
 use async_trait::async_trait;
+use foundationdb::FdbError;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -34,8 +35,8 @@ use self::identity::open_identity;
 use super::runtime::ProviderHandle;
 use super::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
-    WriteTransaction,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
+    StoreIdentity, TransactionId, WriteTransaction,
 };
 
 pub(super) struct FoundationDbStateStore {
@@ -44,6 +45,44 @@ pub(super) struct FoundationDbStateStore {
     identity: StoreIdentity,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderErrorMetricEvent {
+    Deadline,
+    BlockingFailure,
+}
+
+fn provider_error_metric_event(error: &StateStoreError) -> Option<ProviderErrorMetricEvent> {
+    match error.kind() {
+        StateStoreErrorKind::DeadlineExceeded => Some(ProviderErrorMetricEvent::Deadline),
+        StateStoreErrorKind::Transient | StateStoreErrorKind::ProviderUnavailable => {
+            Some(ProviderErrorMetricEvent::BlockingFailure)
+        }
+        _ => None,
+    }
+}
+
+fn record_provider_error_metric(metrics: &StateStoreMetrics, error: &StateStoreError) {
+    match provider_error_metric_event(error) {
+        Some(ProviderErrorMetricEvent::Deadline) => metrics.record_deadline(),
+        Some(ProviderErrorMetricEvent::BlockingFailure) => metrics.record_blocking_failure(),
+        None => {}
+    }
+}
+
+fn classify_native_read_error(error: FdbError) -> StateStoreError {
+    let kind = match error.code() {
+        1031 => StateStoreErrorKind::DeadlineExceeded,
+        2006 | 2007 => StateStoreErrorKind::InvalidConfiguration,
+        2101 | 2102 | 2103 | 2109 | 2110 => StateStoreErrorKind::LimitExceeded,
+        2000 | 2002 | 2004 | 2018 | 2020 | 2023 | 2108 => StateStoreErrorKind::InvalidRequest,
+        _ if error.is_retryable() || error.is_maybe_committed() => {
+            StateStoreErrorKind::ProviderUnavailable
+        }
+        _ => StateStoreErrorKind::Internal,
+    };
+    StateStoreError::new(kind, "FoundationDB native read failed")
 }
 
 impl FoundationDbStateStore {
@@ -105,6 +144,7 @@ impl StateStore for FoundationDbStateStore {
             &self.codec,
             &self.identity,
             &self.limits,
+            self.metrics.as_ref(),
             request,
         )
         .await;
@@ -140,5 +180,78 @@ impl StateStore for FoundationDbStateStore {
             self.metrics.as_ref(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state_store::{StateStoreErrorKind, StateStoreOperation};
+
+    #[test]
+    fn provider_error_metrics_count_each_blocker_without_public_operation_duplication() {
+        assert_eq!(
+            provider_error_metric_event(&StateStoreError::new(
+                StateStoreErrorKind::DeadlineExceeded,
+                "deadline",
+            )),
+            Some(ProviderErrorMetricEvent::Deadline)
+        );
+        assert_eq!(
+            provider_error_metric_event(&StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "provider",
+            )),
+            Some(ProviderErrorMetricEvent::BlockingFailure)
+        );
+        assert_eq!(
+            provider_error_metric_event(&StateStoreError::new(
+                StateStoreErrorKind::Corruption,
+                "corruption",
+            )),
+            None
+        );
+
+        let metrics = StateStoreMetrics::new("foundationdb");
+        record_provider_error_metric(
+            &metrics,
+            &StateStoreError::new(StateStoreErrorKind::DeadlineExceeded, "deadline"),
+        );
+        record_provider_error_metric(
+            &metrics,
+            &StateStoreError::new(StateStoreErrorKind::ProviderUnavailable, "provider"),
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.deadline_count, 1);
+        assert_eq!(snapshot.blocking_failure_count, 1);
+        assert_eq!(snapshot.commit_count, 0);
+        assert_eq!(
+            snapshot.operation_duration_observations(StateStoreOperation::Commit),
+            0
+        );
+    }
+
+    #[test]
+    fn native_read_errors_preserve_deadline_provider_and_fail_closed_boundaries() {
+        assert_eq!(
+            classify_native_read_error(foundationdb::FdbError::from_code(1031)).kind(),
+            StateStoreErrorKind::DeadlineExceeded
+        );
+        assert_eq!(
+            classify_native_read_error(foundationdb::FdbError::from_code(1007)).kind(),
+            StateStoreErrorKind::ProviderUnavailable
+        );
+        assert_eq!(
+            classify_native_read_error(foundationdb::FdbError::from_code(2006)).kind(),
+            StateStoreErrorKind::InvalidConfiguration
+        );
+        assert_eq!(
+            classify_native_read_error(foundationdb::FdbError::from_code(2102)).kind(),
+            StateStoreErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            classify_native_read_error(foundationdb::FdbError::from_code(9999)).kind(),
+            StateStoreErrorKind::Internal
+        );
     }
 }

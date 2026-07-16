@@ -24,9 +24,10 @@ use tokio::time::{Instant, timeout_at};
 
 use super::codec::{KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction;
+use super::{classify_native_read_error, record_provider_error_metric};
 use crate::state_store::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Key, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StoreIdentity, StoreRevision,
+    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StoreIdentity, StoreRevision,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -107,44 +108,53 @@ pub(super) async fn poll_changes(
     codec: &KeyspaceCodec,
     identity: &StoreIdentity,
     limits: &StateStoreLimits,
+    metrics: &StateStoreMetrics,
     request: &ChangePollRequest,
 ) -> Result<ChangePage, StateStoreError> {
-    request.validate(limits)?;
-    let deadline = Instant::now() + limits.transaction_deadline;
-    let transaction = create_raw_transaction(database, limits, deadline)?;
-    let after = decode_after(request, identity, codec)?;
-    let floor = read_revision(&transaction, &codec.retention_floor_key(), codec, deadline).await?;
-    let high_watermark =
-        read_revision(&transaction, &codec.high_watermark_key(), codec, deadline).await?;
-    validate_snapshot(after, floor, high_watermark)?;
-    let floor_position = ChangePosition {
-        revision: floor,
-        sequence: u32::MAX,
-    };
-    if after < floor_position {
-        return build_page(
-            identity,
-            high_watermark,
-            PageDecision {
-                returned: Vec::new(),
-                cursor: floor_position,
-                resync_required: true,
-            },
-            Vec::new(),
-        );
-    }
+    let result = async {
+        request.validate(limits)?;
+        let deadline = Instant::now() + limits.transaction_deadline;
+        let transaction = create_raw_transaction(database, limits, deadline)?;
+        let after = decode_after(request, identity, codec)?;
+        let floor =
+            read_revision(&transaction, &codec.retention_floor_key(), codec, deadline).await?;
+        let high_watermark =
+            read_revision(&transaction, &codec.high_watermark_key(), codec, deadline).await?;
+        validate_snapshot(after, floor, high_watermark)?;
+        let floor_position = ChangePosition {
+            revision: floor,
+            sequence: u32::MAX,
+        };
+        if after < floor_position {
+            return build_page(
+                identity,
+                high_watermark,
+                PageDecision {
+                    returned: Vec::new(),
+                    cursor: floor_position,
+                    resync_required: true,
+                },
+                Vec::new(),
+            );
+        }
 
-    let (positions, keys) = read_change_rows(
-        &transaction,
-        codec,
-        after,
-        high_watermark,
-        request.page_size,
-        deadline,
-    )
-    .await?;
-    let decision = decide_page(after, floor, high_watermark, positions, request.page_size);
-    build_page(identity, high_watermark, decision, keys)
+        let (positions, keys) = read_change_rows(
+            &transaction,
+            codec,
+            after,
+            high_watermark,
+            request.page_size,
+            deadline,
+        )
+        .await?;
+        let decision = decide_page(after, floor, high_watermark, positions, request.page_size);
+        build_page(identity, high_watermark, decision, keys)
+    }
+    .await;
+    if let Err(error) = &result {
+        record_provider_error_metric(metrics, error);
+    }
+    result
 }
 
 fn decode_after(
@@ -176,7 +186,7 @@ async fn read_revision(
     let value = timeout_at(deadline, transaction.get(key, false))
         .await
         .map_err(|_| deadline_error())?
-        .map_err(|_| provider_error())?
+        .map_err(classify_native_read_error)?
         .ok_or_else(corruption_error)?;
     codec.decode_revision(value.as_ref())
 }
@@ -202,7 +212,7 @@ async fn read_change_rows(
     let values = timeout_at(deadline, transaction.get_range(&options, 1, false))
         .await
         .map_err(|_| deadline_error())?
-        .map_err(|_| provider_error())?;
+        .map_err(classify_native_read_error)?;
     let mut positions = Vec::with_capacity(values.len());
     let mut keys = Vec::with_capacity(values.len());
     for value in values.iter() {
@@ -251,13 +261,6 @@ fn deadline_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::DeadlineExceeded,
         "FoundationDB change poll deadline exceeded",
-    )
-}
-
-fn provider_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::ProviderUnavailable,
-        "FoundationDB change poll failed",
     )
 }
 

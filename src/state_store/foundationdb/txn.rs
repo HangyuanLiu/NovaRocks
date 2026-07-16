@@ -22,7 +22,7 @@ use std::time::Instant as StdInstant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::options::{MutationType, TransactionOption};
-use foundationdb::{Database, Transaction};
+use foundationdb::{Database, FdbError, Transaction};
 use tokio::time::{Instant, timeout_at};
 
 use super::FoundationDbStateStore;
@@ -32,6 +32,7 @@ use super::commit::{
     PreparedCommit, PreparedFailure, supervise_commit, supervise_pre_dispatch_failure,
 };
 use super::range::range_page;
+use super::{classify_native_read_error, record_provider_error_metric};
 use crate::state_store::runtime::OperationHandle;
 use crate::state_store::{
     CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
@@ -150,6 +151,15 @@ pub(super) fn create_raw_transaction(
     limits: &StateStoreLimits,
     deadline: Instant,
 ) -> Result<Transaction, StateStoreError> {
+    create_raw_transaction_with_observer(database, limits, deadline, |_| {})
+}
+
+pub(super) fn create_raw_transaction_with_observer(
+    database: &Database,
+    limits: &StateStoreLimits,
+    deadline: Instant,
+    mut observe_native_error: impl FnMut(FdbError),
+) -> Result<Transaction, StateStoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(deadline_error());
@@ -157,16 +167,28 @@ pub(super) fn create_raw_transaction(
     let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
     let size_limit = i32::try_from(limits.max_transaction_bytes)
         .map_err(|_| limit_error("transaction byte limit exceeds FoundationDB range"))?;
-    let transaction = database.create_trx().map_err(|_| provider_error())?;
+    let transaction = database.create_trx().map_err(|error| {
+        observe_native_error(error);
+        classify_native_read_error(error)
+    })?;
     transaction
         .set_option(TransactionOption::Timeout(timeout_ms))
-        .map_err(|_| provider_error())?;
+        .map_err(|error| {
+            observe_native_error(error);
+            classify_native_read_error(error)
+        })?;
     transaction
         .set_option(TransactionOption::RetryLimit(0))
-        .map_err(|_| provider_error())?;
+        .map_err(|error| {
+            observe_native_error(error);
+            classify_native_read_error(error)
+        })?;
     transaction
         .set_option(TransactionOption::SizeLimit(size_limit))
-        .map_err(|_| provider_error())?;
+        .map_err(|error| {
+            observe_native_error(error);
+            classify_native_read_error(error)
+        })?;
     Ok(transaction)
 }
 
@@ -285,7 +307,9 @@ impl FoundationDbWriteTransaction {
             }
         };
         if Instant::now() >= self.deadline {
-            return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(deadline_error()));
+            let error = deadline_error();
+            record_provider_error_metric(self.metrics.as_ref(), &error);
+            return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(error));
         }
 
         let mut touched = BTreeSet::new();
@@ -294,7 +318,10 @@ impl FoundationDbWriteTransaction {
         for key in &touched {
             let record = match load_record(&transaction, &self.codec, key, self.deadline).await {
                 Ok(record) => record,
-                Err(error) => return CommitPreparation::Immediate(classify_precommit_error(error)),
+                Err(error) => {
+                    record_provider_error_metric(self.metrics.as_ref(), &error);
+                    return CommitPreparation::Immediate(classify_precommit_error(error));
+                }
             };
             base.insert(key.clone(), record);
         }
@@ -381,7 +408,7 @@ async fn load_record(
     let value = timeout_at(deadline, transaction.get(&physical_key, false))
         .await
         .map_err(|_| deadline_error())?
-        .map_err(|_| provider_error())?;
+        .map_err(classify_native_read_error)?;
     ensure_active(deadline)?;
     value
         .map(|value| {
@@ -576,13 +603,6 @@ fn deadline_error() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::DeadlineExceeded,
         "FoundationDB state transaction deadline exceeded",
-    )
-}
-
-fn provider_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::ProviderUnavailable,
-        "FoundationDB state transaction failed",
     )
 }
 
