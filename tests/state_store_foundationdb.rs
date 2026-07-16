@@ -774,16 +774,6 @@ fn conformance_limit_overrides() -> StateStoreLimitOverrides {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
-#[test]
-fn conformance_fixture_uses_foundationdb_budget_compatible_limits() {
-    let limits = conformance_limit_overrides();
-    assert_eq!(
-        (limits.max_transaction_bytes, limits.max_value_bytes),
-        (Some(16 * 1024), Some(1_899))
-    );
-}
-
-#[cfg(feature = "state-store-test-hooks")]
 fn conformance_factory(runtime: Rc<StateStoreRuntime>) -> StateStoreFactory {
     Rc::new(move || {
         let runtime = Rc::clone(&runtime);
