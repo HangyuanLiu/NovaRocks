@@ -10598,6 +10598,14 @@ fn runtime_filter_runtime_dependency_allowlist(
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract"],
         ],
+        "src/runtime_filter/port/transport.rs" => vec![
+            &["std", "error"],
+            &["std", "fmt"],
+            &["crate", "common", "types", "UniqueId"],
+            &["crate", "runtime_filter", "model", "contract", "BindingId"],
+            &["crate", "runtime_filter", "model", "contract", "ChannelId"],
+            &["crate", "runtime_filter", "port", "identity"],
+        ],
         "src/runtime_filter/port/install.rs" => vec![
             &["std", "collections"],
             &["crate", "common", "types", "UniqueId"],

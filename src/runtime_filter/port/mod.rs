@@ -25,4 +25,5 @@ pub(crate) mod producer;
 pub(crate) mod subscription;
 pub(crate) mod support;
 pub(crate) mod topk_summary;
+pub(crate) mod transport;
 pub(crate) mod value_domain;

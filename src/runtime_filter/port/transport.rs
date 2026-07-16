@@ -1,0 +1,788 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::error::Error;
+use std::fmt;
+
+use crate::common::types::UniqueId;
+use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::runtime_filter::port::identity::{
+    DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterEnvelopeKind {
+    Contribution,
+    Artifact,
+    ProducerClosed,
+    Unavailable,
+    Ack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterTransportError {
+    kind: RuntimeFilterTransportErrorKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeFilterTransportErrorKind {
+    ZeroIdentity(&'static str),
+    InvalidSchemaDigestLength(usize),
+    IdentityKindMismatch(RuntimeFilterEnvelopeKind),
+    PayloadRequired(RuntimeFilterEnvelopeKind),
+    PayloadForbidden(RuntimeFilterEnvelopeKind),
+    EmptyRejectionReason,
+}
+
+impl RuntimeFilterTransportError {
+    fn zero_identity(identity: &'static str) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::ZeroIdentity(identity),
+        }
+    }
+
+    fn invalid_schema_digest_length(actual: usize) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::InvalidSchemaDigestLength(actual),
+        }
+    }
+
+    fn identity_kind_mismatch(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::IdentityKindMismatch(kind),
+        }
+    }
+
+    fn payload_required(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::PayloadRequired(kind),
+        }
+    }
+
+    fn payload_forbidden(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::PayloadForbidden(kind),
+        }
+    }
+
+    fn empty_rejection_reason() -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::EmptyRejectionReason,
+        }
+    }
+}
+
+impl fmt::Display for RuntimeFilterTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            RuntimeFilterTransportErrorKind::ZeroIdentity(identity) => {
+                write!(formatter, "runtime filter {identity} must not be zero")
+            }
+            RuntimeFilterTransportErrorKind::InvalidSchemaDigestLength(actual) => write!(
+                formatter,
+                "runtime filter schema digest must contain exactly 32 bytes, got {actual}"
+            ),
+            RuntimeFilterTransportErrorKind::IdentityKindMismatch(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} has an incompatible route identity"
+            ),
+            RuntimeFilterTransportErrorKind::PayloadRequired(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} requires a non-empty payload"
+            ),
+            RuntimeFilterTransportErrorKind::PayloadForbidden(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} forbids a payload"
+            ),
+            RuntimeFilterTransportErrorKind::EmptyRejectionReason => {
+                formatter.write_str("runtime filter rejection reason must not be empty")
+            }
+        }
+    }
+}
+
+impl Error for RuntimeFilterTransportError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContributionRouteIdentity {
+    producer_binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+    partition_id: PartitionId,
+    sequence: ProducerSequence,
+}
+
+impl ContributionRouteIdentity {
+    pub(crate) fn try_new(
+        producer_binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        partition_id: PartitionId,
+        sequence: ProducerSequence,
+    ) -> Result<Self, RuntimeFilterTransportError> {
+        if producer_binding_id.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "producer binding id",
+            ));
+        }
+        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "fragment instance id",
+            ));
+        }
+        if partition_id.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity("partition id"));
+        }
+        if sequence.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "producer sequence",
+            ));
+        }
+        Ok(Self {
+            producer_binding_id,
+            fragment_instance_id,
+            partition_id,
+            sequence,
+        })
+    }
+
+    pub(crate) const fn producer_binding_id(&self) -> BindingId {
+        self.producer_binding_id
+    }
+
+    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    pub(crate) const fn partition_id(&self) -> PartitionId {
+        self.partition_id
+    }
+
+    pub(crate) const fn sequence(&self) -> ProducerSequence {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeliveryRouteIdentity {
+    route_edge_id: RouteEdgeId,
+    sequence: ProducerSequence,
+}
+
+impl DeliveryRouteIdentity {
+    pub(crate) fn try_new(
+        route_edge_id: RouteEdgeId,
+        sequence: ProducerSequence,
+    ) -> Result<Self, RuntimeFilterTransportError> {
+        if route_edge_id.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity("route edge id"));
+        }
+        if sequence.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "delivery sequence",
+            ));
+        }
+        Ok(Self {
+            route_edge_id,
+            sequence,
+        })
+    }
+
+    pub(crate) const fn route_edge_id(&self) -> RouteEdgeId {
+        self.route_edge_id
+    }
+
+    pub(crate) const fn sequence(&self) -> ProducerSequence {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterRouteIdentity {
+    kind: RuntimeFilterRouteIdentityKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeFilterRouteIdentityKind {
+    Contribution(ContributionRouteIdentity),
+    Delivery(DeliveryRouteIdentity),
+}
+
+impl RuntimeFilterRouteIdentity {
+    pub(crate) const fn contribution(identity: ContributionRouteIdentity) -> Self {
+        Self {
+            kind: RuntimeFilterRouteIdentityKind::Contribution(identity),
+        }
+    }
+
+    pub(crate) const fn delivery(identity: DeliveryRouteIdentity) -> Self {
+        Self {
+            kind: RuntimeFilterRouteIdentityKind::Delivery(identity),
+        }
+    }
+
+    pub(crate) const fn as_contribution(&self) -> Option<&ContributionRouteIdentity> {
+        match &self.kind {
+            RuntimeFilterRouteIdentityKind::Contribution(identity) => Some(identity),
+            RuntimeFilterRouteIdentityKind::Delivery(_) => None,
+        }
+    }
+
+    pub(crate) const fn as_delivery(&self) -> Option<&DeliveryRouteIdentity> {
+        match &self.kind {
+            RuntimeFilterRouteIdentityKind::Delivery(identity) => Some(identity),
+            RuntimeFilterRouteIdentityKind::Contribution(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterEnvelope {
+    kind: RuntimeFilterEnvelopeKind,
+    query_id: UniqueId,
+    channel_id: ChannelId,
+    deployment_epoch: DeploymentEpoch,
+    route_identity: RuntimeFilterRouteIdentity,
+    schema_digest: [u8; 32],
+    payload: Vec<u8>,
+}
+
+impl RuntimeFilterEnvelope {
+    pub(crate) fn try_new(
+        kind: RuntimeFilterEnvelopeKind,
+        query_id: UniqueId,
+        channel_id: ChannelId,
+        deployment_epoch: DeploymentEpoch,
+        route_identity: RuntimeFilterRouteIdentity,
+        schema_digest: &[u8],
+        payload: Vec<u8>,
+    ) -> Result<Self, RuntimeFilterTransportError> {
+        if query_id.hi == 0 && query_id.lo == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity("query id"));
+        }
+        if channel_id.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity("channel id"));
+        }
+        if deployment_epoch.get() == 0 {
+            return Err(RuntimeFilterTransportError::zero_identity(
+                "deployment epoch",
+            ));
+        }
+        if schema_digest.len() != 32 {
+            return Err(RuntimeFilterTransportError::invalid_schema_digest_length(
+                schema_digest.len(),
+            ));
+        }
+        let identity_matches = match kind {
+            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
+                route_identity.as_contribution().is_some()
+            }
+            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+                route_identity.as_delivery().is_some()
+            }
+            RuntimeFilterEnvelopeKind::Ack => true,
+        };
+        if !identity_matches {
+            return Err(RuntimeFilterTransportError::identity_kind_mismatch(kind));
+        }
+        let payload_required = matches!(
+            kind,
+            RuntimeFilterEnvelopeKind::Contribution
+                | RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+        );
+        if payload_required && payload.is_empty() {
+            return Err(RuntimeFilterTransportError::payload_required(kind));
+        }
+        if !payload_required && !payload.is_empty() {
+            return Err(RuntimeFilterTransportError::payload_forbidden(kind));
+        }
+
+        let mut fixed_schema_digest = [0; 32];
+        fixed_schema_digest.copy_from_slice(schema_digest);
+        Ok(Self {
+            kind,
+            query_id,
+            channel_id,
+            deployment_epoch,
+            route_identity,
+            schema_digest: fixed_schema_digest,
+            payload,
+        })
+    }
+
+    pub(crate) const fn kind(&self) -> RuntimeFilterEnvelopeKind {
+        self.kind
+    }
+
+    pub(crate) const fn query_id(&self) -> UniqueId {
+        self.query_id
+    }
+
+    pub(crate) const fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    pub(crate) const fn deployment_epoch(&self) -> DeploymentEpoch {
+        self.deployment_epoch
+    }
+
+    pub(crate) const fn route_identity(&self) -> &RuntimeFilterRouteIdentity {
+        &self.route_identity
+    }
+
+    pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
+        &self.schema_digest
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterAcceptStatus {
+    Accepted,
+    Duplicate,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterIngressResult {
+    accept_status: RuntimeFilterAcceptStatus,
+    rejection_reason: Option<String>,
+}
+
+impl RuntimeFilterIngressResult {
+    pub(crate) const fn accepted() -> Self {
+        Self {
+            accept_status: RuntimeFilterAcceptStatus::Accepted,
+            rejection_reason: None,
+        }
+    }
+
+    pub(crate) const fn duplicate() -> Self {
+        Self {
+            accept_status: RuntimeFilterAcceptStatus::Duplicate,
+            rejection_reason: None,
+        }
+    }
+
+    pub(crate) fn rejected(reason: impl Into<String>) -> Result<Self, RuntimeFilterTransportError> {
+        let reason = reason.into();
+        if reason.is_empty() {
+            return Err(RuntimeFilterTransportError::empty_rejection_reason());
+        }
+        Ok(Self {
+            accept_status: RuntimeFilterAcceptStatus::Rejected,
+            rejection_reason: Some(reason),
+        })
+    }
+
+    pub(crate) const fn accept_status(&self) -> RuntimeFilterAcceptStatus {
+        self.accept_status
+    }
+
+    pub(crate) fn rejection_reason(&self) -> Option<&str> {
+        self.rejection_reason.as_deref()
+    }
+}
+
+pub(crate) trait RuntimeFilterEnvelopeIngress: Send + Sync + 'static {
+    fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::common::types::UniqueId;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
+    };
+
+    use super::*;
+
+    fn contribution_route() -> RuntimeFilterRouteIdentity {
+        RuntimeFilterRouteIdentity::contribution(
+            ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                UniqueId { hi: 5, lo: 6 },
+                PartitionId::new(7),
+                ProducerSequence::new(8),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn delivery_route() -> RuntimeFilterRouteIdentity {
+        RuntimeFilterRouteIdentity::delivery(
+            DeliveryRouteIdentity::try_new(RouteEdgeId::new(9), ProducerSequence::new(10)).unwrap(),
+        )
+    }
+
+    fn envelope(
+        kind: RuntimeFilterEnvelopeKind,
+        route_identity: RuntimeFilterRouteIdentity,
+        payload: &[u8],
+    ) -> RuntimeFilterEnvelope {
+        RuntimeFilterEnvelope::try_new(
+            kind,
+            UniqueId { hi: 1, lo: 2 },
+            ChannelId::new(3),
+            DeploymentEpoch::new(4),
+            route_identity,
+            &[11; 32],
+            payload.to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn valid_envelopes_preserve_all_domain_coordinates() {
+        let cases = [
+            (
+                RuntimeFilterEnvelopeKind::Contribution,
+                contribution_route(),
+                &b"contribution"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                &b"artifact"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                contribution_route(),
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                &b"reason"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Ack,
+                contribution_route(),
+                &b""[..],
+            ),
+        ];
+
+        for (kind, route_identity, payload) in cases {
+            let envelope = envelope(kind, route_identity.clone(), payload);
+            assert_eq!(envelope.kind(), kind);
+            assert_eq!(envelope.query_id(), UniqueId { hi: 1, lo: 2 });
+            assert_eq!(envelope.channel_id(), ChannelId::new(3));
+            assert_eq!(envelope.deployment_epoch(), DeploymentEpoch::new(4));
+            assert_eq!(envelope.route_identity(), &route_identity);
+            assert_eq!(envelope.schema_digest(), &[11; 32]);
+            assert_eq!(envelope.payload(), payload);
+        }
+
+        let contribution = contribution_route();
+        let contribution = contribution.as_contribution().unwrap();
+        assert_eq!(contribution.producer_binding_id(), BindingId::new(4));
+        assert_eq!(
+            contribution.fragment_instance_id(),
+            UniqueId { hi: 5, lo: 6 }
+        );
+        assert_eq!(contribution.partition_id(), PartitionId::new(7));
+        assert_eq!(contribution.sequence(), ProducerSequence::new(8));
+
+        let delivery = delivery_route();
+        let delivery = delivery.as_delivery().unwrap();
+        assert_eq!(delivery.route_edge_id(), RouteEdgeId::new(9));
+        assert_eq!(delivery.sequence(), ProducerSequence::new(10));
+    }
+
+    #[test]
+    fn route_identities_reject_zero_coordinates() {
+        for result in [
+            ContributionRouteIdentity::try_new(
+                BindingId::new(0),
+                UniqueId { hi: 5, lo: 6 },
+                PartitionId::new(7),
+                ProducerSequence::new(8),
+            ),
+            ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                UniqueId { hi: 0, lo: 0 },
+                PartitionId::new(7),
+                ProducerSequence::new(8),
+            ),
+            ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                UniqueId { hi: 5, lo: 6 },
+                PartitionId::new(0),
+                ProducerSequence::new(8),
+            ),
+            ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                UniqueId { hi: 5, lo: 6 },
+                PartitionId::new(7),
+                ProducerSequence::new(0),
+            ),
+        ] {
+            assert!(result.is_err());
+        }
+
+        assert!(
+            DeliveryRouteIdentity::try_new(RouteEdgeId::new(0), ProducerSequence::new(10)).is_err()
+        );
+        assert!(
+            DeliveryRouteIdentity::try_new(RouteEdgeId::new(9), ProducerSequence::new(0)).is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_zero_coordinates_and_invalid_digest_lengths() {
+        let common = |query_id, channel_id, deployment_epoch, schema_digest: &[u8]| {
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Contribution,
+                query_id,
+                channel_id,
+                deployment_epoch,
+                contribution_route(),
+                schema_digest,
+                b"payload".to_vec(),
+            )
+        };
+
+        assert!(
+            common(
+                UniqueId { hi: 0, lo: 0 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                &[11; 32],
+            )
+            .is_err()
+        );
+        assert!(
+            common(
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(0),
+                DeploymentEpoch::new(4),
+                &[11; 32],
+            )
+            .is_err()
+        );
+        assert!(
+            common(
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(0),
+                &[11; 32],
+            )
+            .is_err()
+        );
+        assert!(
+            common(
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                &[11; 31],
+            )
+            .is_err()
+        );
+        assert!(
+            common(
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                &[11; 33],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_kind_identity_mismatches() {
+        for (kind, route_identity, payload) in [
+            (
+                RuntimeFilterEnvelopeKind::Contribution,
+                delivery_route(),
+                &b"payload"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Artifact,
+                contribution_route(),
+                &b"payload"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                delivery_route(),
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Unavailable,
+                contribution_route(),
+                &b"reason"[..],
+            ),
+        ] {
+            assert!(
+                RuntimeFilterEnvelope::try_new(
+                    kind,
+                    UniqueId { hi: 1, lo: 2 },
+                    ChannelId::new(3),
+                    DeploymentEpoch::new(4),
+                    route_identity,
+                    &[11; 32],
+                    payload.to_vec(),
+                )
+                .is_err()
+            );
+        }
+
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Ack,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                &[11; 32],
+                Vec::new(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_required_and_forbidden_payload_mismatches() {
+        for (kind, route_identity, payload) in [
+            (
+                RuntimeFilterEnvelopeKind::Contribution,
+                contribution_route(),
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                contribution_route(),
+                &b"payload"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Ack,
+                delivery_route(),
+                &b"payload"[..],
+            ),
+        ] {
+            assert!(
+                RuntimeFilterEnvelope::try_new(
+                    kind,
+                    UniqueId { hi: 1, lo: 2 },
+                    ChannelId::new(3),
+                    DeploymentEpoch::new(4),
+                    route_identity,
+                    &[11; 32],
+                    payload.to_vec(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_result_preserves_exact_accept_taxonomy() {
+        let accepted = RuntimeFilterIngressResult::accepted();
+        assert_eq!(
+            accepted.accept_status(),
+            RuntimeFilterAcceptStatus::Accepted
+        );
+        assert_eq!(accepted.rejection_reason(), None);
+
+        let duplicate = RuntimeFilterIngressResult::duplicate();
+        assert_eq!(
+            duplicate.accept_status(),
+            RuntimeFilterAcceptStatus::Duplicate
+        );
+        assert_eq!(duplicate.rejection_reason(), None);
+
+        let rejected = RuntimeFilterIngressResult::rejected("stale epoch").unwrap();
+        assert_eq!(
+            rejected.accept_status(),
+            RuntimeFilterAcceptStatus::Rejected
+        );
+        assert_eq!(rejected.rejection_reason(), Some("stale epoch"));
+        assert!(RuntimeFilterIngressResult::rejected("").is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingIngress {
+        kinds: Mutex<Vec<RuntimeFilterEnvelopeKind>>,
+    }
+
+    impl RuntimeFilterEnvelopeIngress for RecordingIngress {
+        fn accept(&self, envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
+            self.kinds.lock().unwrap().push(envelope.kind());
+            RuntimeFilterIngressResult::accepted()
+        }
+    }
+
+    #[test]
+    fn trait_object_dispatch_preserves_all_five_real_envelopes_in_order() {
+        let recording = Arc::new(RecordingIngress::default());
+        let ingress: Arc<dyn RuntimeFilterEnvelopeIngress> = recording.clone();
+        for envelope in [
+            envelope(
+                RuntimeFilterEnvelopeKind::Contribution,
+                contribution_route(),
+                b"contribution",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                b"artifact",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                contribution_route(),
+                b"",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                b"reason",
+            ),
+            envelope(RuntimeFilterEnvelopeKind::Ack, delivery_route(), b""),
+        ] {
+            assert_eq!(
+                ingress.accept(envelope).accept_status(),
+                RuntimeFilterAcceptStatus::Accepted
+            );
+        }
+
+        assert_eq!(
+            *recording.kinds.lock().unwrap(),
+            [
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::Ack,
+            ]
+        );
+    }
+}
