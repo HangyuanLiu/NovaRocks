@@ -17,7 +17,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 
@@ -689,53 +688,63 @@ fn decode_final_domain_membership_body(
     ) {
         Ok(domain) => Ok(domain),
         Err(ContributionCodecError::SchemaMismatch) => {
-            let encoded_data_type = infer_membership_data_type(body)?;
-            decode_membership_body(body, &encoded_data_type)?;
+            validate_alternate_membership_body_with_observer(
+                body,
+                &NoopAlternateMembershipMetadataObserver,
+            )?;
             Err(ContributionCodecError::SchemaMismatch)
         }
         Err(error) => Err(error),
     }
 }
 
-fn infer_membership_data_type(body: &[u8]) -> Result<DataType, ContributionCodecError> {
+trait AlternateMembershipMetadataObserver {
+    fn borrowed_timezone(&self, _timezone: &str) {}
+}
+
+struct NoopAlternateMembershipMetadataObserver;
+
+impl AlternateMembershipMetadataObserver for NoopAlternateMembershipMetadataObserver {}
+
+fn validate_alternate_membership_body_with_observer(
+    body: &[u8],
+    observer: &impl AlternateMembershipMetadataObserver,
+) -> Result<(), ContributionCodecError> {
     let mut reader = Reader::new(body);
     let version_len =
         usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
     if reader.read_exact(version_len)? != FINGERPRINT_VERSION_TAG {
         return Err(ContributionCodecError::NonCanonicalPayload);
     }
-    Ok(match reader.read_u8()? {
-        1 => DataType::Boolean,
-        2 => DataType::Int8,
-        3 => DataType::Int16,
-        4 => DataType::Int32,
-        5 => DataType::Int64,
-        6 => DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH),
-        7 => DataType::Float32,
-        8 => DataType::Float64,
-        9 => DataType::Utf8,
-        10 => DataType::Date32,
+    match reader.read_u8()? {
+        1 => validate_canonical_boolean_values(&mut reader)?,
+        2 => validate_canonical_fixed_values(&mut reader, 1, |reader| reader.read_i8())?,
+        3 => validate_canonical_fixed_values(&mut reader, 2, |reader| reader.read_i16())?,
+        4 => validate_canonical_fixed_values(&mut reader, 4, |reader| reader.read_i32())?,
+        5 => validate_canonical_fixed_values(&mut reader, 8, |reader| reader.read_i64())?,
+        6 => validate_canonical_fixed_values(&mut reader, 16, |reader| reader.read_i128())?,
+        7 => validate_canonical_float32_values(&mut reader)?,
+        8 => validate_canonical_float64_values(&mut reader)?,
+        9 => validate_canonical_utf8_values(&mut reader)?,
+        10 => validate_canonical_fixed_values(&mut reader, 4, |reader| reader.read_i32())?,
         11 => {
-            let unit = match reader.read_u8()? {
-                1 => TimeUnit::Second,
-                2 => TimeUnit::Millisecond,
-                3 => TimeUnit::Microsecond,
-                4 => TimeUnit::Nanosecond,
+            match reader.read_u8()? {
+                1..=4 => {}
                 _ => return Err(ContributionCodecError::NonCanonicalPayload),
-            };
-            let timezone = match reader.read_u8()? {
-                0 => None,
+            }
+            match reader.read_u8()? {
+                0 => {}
                 1 => {
                     let len = usize::try_from(reader.read_u64()?)
                         .map_err(|_| ContributionCodecError::LengthOverflow)?;
                     let bytes = reader.read_exact(len)?;
                     let timezone = std::str::from_utf8(bytes)
                         .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
-                    Some(Arc::from(timezone))
+                    observer.borrowed_timezone(timezone);
                 }
                 _ => return Err(ContributionCodecError::NonCanonicalPayload),
-            };
-            DataType::Timestamp(unit, timezone)
+            }
+            validate_canonical_fixed_values(&mut reader, 8, |reader| reader.read_i64())?;
         }
         12 => {
             let precision = reader.read_u8()?;
@@ -743,10 +752,132 @@ fn infer_membership_data_type(body: &[u8]) -> Result<DataType, ContributionCodec
             if !decimal_metadata_is_valid(precision, scale) {
                 return Err(ContributionCodecError::NonCanonicalPayload);
             }
-            DataType::Decimal128(precision, scale)
+            validate_canonical_decimal_values(&mut reader, precision)?;
         }
         _ => return Err(ContributionCodecError::NonCanonicalPayload),
-    })
+    }
+    match reader.read_u8()? {
+        0 | 1 => {}
+        _ => return Err(ContributionCodecError::NonCanonicalPayload),
+    }
+    if !reader.is_empty() {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    Ok(())
+}
+
+fn validate_canonical_boolean_values(
+    reader: &mut Reader<'_>,
+) -> Result<(), ContributionCodecError> {
+    let count = read_fixed_count(reader, 1)?;
+    let mut previous = None;
+    for _ in 0..count {
+        let value = match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ContributionCodecError::NonCanonicalPayload),
+        };
+        validate_strictly_increasing(&mut previous, value)?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_fixed_values<T: Copy + Ord>(
+    reader: &mut Reader<'_>,
+    width: usize,
+    mut read: impl FnMut(&mut Reader<'_>) -> Result<T, ContributionCodecError>,
+) -> Result<(), ContributionCodecError> {
+    let count = read_fixed_count(reader, width)?;
+    let mut previous = None;
+    for _ in 0..count {
+        validate_strictly_increasing(&mut previous, read(reader)?)?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_float32_values(
+    reader: &mut Reader<'_>,
+) -> Result<(), ContributionCodecError> {
+    let count = read_fixed_count(reader, 4)?;
+    let mut previous = None;
+    for _ in 0..count {
+        let bits = reader.read_u32()?;
+        let value = f32::from_bits(bits);
+        if (value == 0.0 && bits != 0) || (value.is_nan() && bits != 0x7fc0_0000) {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        if previous.is_some_and(|previous: f32| previous.total_cmp(&value).is_ge()) {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_canonical_float64_values(
+    reader: &mut Reader<'_>,
+) -> Result<(), ContributionCodecError> {
+    let count = read_fixed_count(reader, 8)?;
+    let mut previous = None;
+    for _ in 0..count {
+        let bits = reader.read_u64()?;
+        let value = f64::from_bits(bits);
+        if (value == 0.0 && bits != 0) || (value.is_nan() && bits != 0x7ff8_0000_0000_0000) {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        if previous.is_some_and(|previous: f64| previous.total_cmp(&value).is_ge()) {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_canonical_utf8_values(reader: &mut Reader<'_>) -> Result<(), ContributionCodecError> {
+    let count = read_count(reader)?;
+    ensure_count_bytes(reader, count, size_of::<u64>())?;
+    let mut previous: Option<&str> = None;
+    for _ in 0..count {
+        let len = usize::try_from(reader.read_u64()?)
+            .map_err(|_| ContributionCodecError::LengthOverflow)?;
+        let value = std::str::from_utf8(reader.read_exact(len)?)
+            .map_err(|_| ContributionCodecError::NonCanonicalPayload)?;
+        if previous.is_some_and(|previous| previous >= value) {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_canonical_decimal_values(
+    reader: &mut Reader<'_>,
+    precision: u8,
+) -> Result<(), ContributionCodecError> {
+    let count = read_fixed_count(reader, 16)?;
+    let exclusive_bound = 10_i128
+        .checked_pow(u32::from(precision))
+        .ok_or(ContributionCodecError::LengthOverflow)?;
+    let mut previous = None;
+    for _ in 0..count {
+        let value = reader.read_i128()?;
+        if value <= -exclusive_bound || value >= exclusive_bound {
+            return Err(ContributionCodecError::NonCanonicalPayload);
+        }
+        validate_strictly_increasing(&mut previous, value)?;
+    }
+    Ok(())
+}
+
+fn validate_strictly_increasing<T: Copy + Ord>(
+    previous: &mut Option<T>,
+    value: T,
+) -> Result<(), ContributionCodecError> {
+    if previous.is_some_and(|previous| previous >= value) {
+        return Err(ContributionCodecError::NonCanonicalPayload);
+    }
+    *previous = Some(value);
+    Ok(())
 }
 
 fn verify_final_domain_scope(
@@ -1006,6 +1137,30 @@ mod tests {
     struct CountingAllocator {
         calls: Cell<usize>,
         exact_len: Cell<usize>,
+    }
+
+    struct BorrowedTimezoneObserver {
+        calls: Cell<usize>,
+        pointer: Cell<usize>,
+        len: Cell<usize>,
+    }
+
+    impl BorrowedTimezoneObserver {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+                pointer: Cell::new(0),
+                len: Cell::new(0),
+            }
+        }
+    }
+
+    impl AlternateMembershipMetadataObserver for BorrowedTimezoneObserver {
+        fn borrowed_timezone(&self, timezone: &str) {
+            self.calls.set(self.calls.get() + 1);
+            self.pointer.set(timezone.as_ptr() as usize);
+            self.len.set(timezone.len());
+        }
     }
 
     impl CountingAllocator {
@@ -2494,6 +2649,190 @@ mod tests {
                 Err(ContributionCodecError::NonCanonicalPayload)
             );
         }
+    }
+
+    #[test]
+    fn final_domain_alternate_timestamp_schema_is_validated_without_owned_metadata() {
+        let contract = final_domain_contract(&DataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some(Arc::from("Asia/Shanghai")),
+        ));
+        let stream = final_domain_stream(483, UniqueId { hi: 481, lo: 482 }, 484);
+        let sequence = ProducerSequence::new(485);
+        let (_, encoded) = encode_final_domain(
+            &contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(
+                MembershipValues::timestamp(
+                    TimeUnit::Millisecond,
+                    Some(Arc::from("Asia/Shanghai")),
+                    [1, 2],
+                ),
+                false,
+            ),
+        );
+        let body = &encoded.payload()[HEADER_LEN + 32..];
+        let observer = BorrowedTimezoneObserver::new();
+
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(body, &observer),
+            Ok(())
+        );
+        assert_eq!(observer.calls.get(), 1);
+        assert_eq!(observer.len.get(), "Asia/Shanghai".len());
+        let body_range = body.as_ptr() as usize..body.as_ptr() as usize + body.len();
+        assert!(body_range.contains(&observer.pointer.get()));
+
+        let installed_contract = final_domain_contract(&DataType::Int64);
+        let (_, installed_encoded) = encode_final_domain(
+            &installed_contract,
+            stream,
+            sequence,
+            ValueDomainDelta::new(MembershipValues::int64([1]), false),
+        );
+        let mut spliced = installed_encoded.payload().to_vec();
+        spliced.truncate(HEADER_LEN + 32);
+        spliced.extend_from_slice(body);
+        let spliced_body_len = spliced.len() - HEADER_LEN;
+        spliced[40..48].copy_from_slice(&(spliced_body_len as u64).to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &spliced,
+                installed_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &installed_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::SchemaMismatch)
+        );
+
+        let mut malformed = body.to_vec();
+        let timezone_offset = 8 + FINGERPRINT_VERSION_TAG.len() + 1 + 1 + 1 + 8;
+        malformed[timezone_offset] = 0xff;
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(
+                &malformed,
+                &BorrowedTimezoneObserver::new(),
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let mut malformed_frame = installed_encoded.payload().to_vec();
+        malformed_frame.truncate(HEADER_LEN + 32);
+        malformed_frame.extend_from_slice(&malformed);
+        let malformed_body_len = malformed_frame.len() - HEADER_LEN;
+        malformed_frame[40..48].copy_from_slice(&(malformed_body_len as u64).to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &malformed_frame,
+                installed_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &installed_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+        let truncated = &body[..timezone_offset + "Asia/Shanghai".len() - 1];
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(
+                truncated,
+                &BorrowedTimezoneObserver::new(),
+            ),
+            Err(ContributionCodecError::Truncated)
+        );
+        let mut truncated_frame = installed_encoded.payload().to_vec();
+        truncated_frame.truncate(HEADER_LEN + 32);
+        truncated_frame.extend_from_slice(truncated);
+        let truncated_body_len = truncated_frame.len() - HEADER_LEN;
+        truncated_frame[40..48].copy_from_slice(&(truncated_body_len as u64).to_be_bytes());
+        assert_eq!(
+            decode_contribution(
+                &truncated_frame,
+                installed_encoded.schema_digest(),
+                ContributionCodecExpectation::FinalDomain {
+                    contract: &installed_contract,
+                    stream,
+                    sequence,
+                },
+                usize::MAX,
+            ),
+            Err(ContributionCodecError::Truncated)
+        );
+    }
+
+    #[test]
+    fn alternate_membership_validator_covers_closed_tags_and_canonical_values() {
+        let cases = vec![
+            MembershipValues::boolean([false, true]),
+            MembershipValues::int8([-1, 1]),
+            MembershipValues::int16([-2, 2]),
+            MembershipValues::int32([-3, 3]),
+            MembershipValues::int64([-4, 4]),
+            MembershipValues::large_int([-5, 5]),
+            MembershipValues::float32([f32::NEG_INFINITY, 0.0, f32::INFINITY, f32::NAN]),
+            MembershipValues::float64([f64::NEG_INFINITY, 0.0, f64::INFINITY, f64::NAN]),
+            MembershipValues::utf8(["a", "b"]),
+            MembershipValues::date32([-6, 6]),
+            MembershipValues::timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC")), [-7, 7]),
+            MembershipValues::decimal128(5, 2, [-999, 999]).unwrap(),
+        ];
+        for values in cases {
+            let (_, _, encoded) = encode_membership(values, true);
+            assert_eq!(
+                validate_alternate_membership_body_with_observer(
+                    &encoded.payload()[HEADER_LEN..],
+                    &NoopAlternateMembershipMetadataObserver,
+                ),
+                Ok(())
+            );
+        }
+
+        let (_, _, int32) = encode_membership(MembershipValues::int32([1, 2]), false);
+        let mut duplicate = int32.payload()[HEADER_LEN..].to_vec();
+        let type_offset = 8 + FINGERPRINT_VERSION_TAG.len();
+        let first_value = type_offset + 1 + 8;
+        let first_bytes: [u8; 4] = duplicate[first_value..first_value + 4].try_into().unwrap();
+        duplicate[first_value + 4..first_value + 8].copy_from_slice(&first_bytes);
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(
+                &duplicate,
+                &NoopAlternateMembershipMetadataObserver,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let (_, _, float) = encode_membership(MembershipValues::float32([0.0, f32::NAN]), false);
+        let mut noncanonical_float = float.payload()[HEADER_LEN..].to_vec();
+        let float_value = type_offset + 1 + 8;
+        noncanonical_float[float_value..float_value + 4]
+            .copy_from_slice(&(-0.0_f32).to_bits().to_be_bytes());
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(
+                &noncanonical_float,
+                &NoopAlternateMembershipMetadataObserver,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
+
+        let (_, _, decimal) =
+            encode_membership(MembershipValues::decimal128(3, 0, [999]).unwrap(), false);
+        let mut decimal_overflow = decimal.payload()[HEADER_LEN..].to_vec();
+        let decimal_value = type_offset + 1 + 2 + 8;
+        decimal_overflow[decimal_value..decimal_value + 16]
+            .copy_from_slice(&1000_i128.to_be_bytes());
+        assert_eq!(
+            validate_alternate_membership_body_with_observer(
+                &decimal_overflow,
+                &NoopAlternateMembershipMetadataObserver,
+            ),
+            Err(ContributionCodecError::NonCanonicalPayload)
+        );
     }
 
     #[test]
