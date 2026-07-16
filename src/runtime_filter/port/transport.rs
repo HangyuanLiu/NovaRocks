@@ -509,6 +509,34 @@ mod tests {
     }
 
     #[test]
+    fn unique_ids_reject_only_the_all_zero_value() {
+        for query_id in [UniqueId { hi: 0, lo: 29 }, UniqueId { hi: 31, lo: 0 }] {
+            let envelope = RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Contribution,
+                query_id,
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                contribution_route(),
+                &[11; 32],
+                b"payload".to_vec(),
+            )
+            .unwrap();
+            assert_eq!(envelope.query_id(), query_id);
+        }
+
+        for fragment_instance_id in [UniqueId { hi: 0, lo: 37 }, UniqueId { hi: 41, lo: 0 }] {
+            let identity = ContributionRouteIdentity::try_new(
+                BindingId::new(4),
+                fragment_instance_id,
+                PartitionId::new(7),
+                ProducerSequence::new(8),
+            )
+            .unwrap();
+            assert_eq!(identity.fragment_instance_id(), fragment_instance_id);
+        }
+    }
+
+    #[test]
     fn route_identities_reject_zero_coordinates() {
         for result in [
             ContributionRouteIdentity::try_new(

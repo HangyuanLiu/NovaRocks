@@ -354,6 +354,51 @@ mod tests {
     }
 
     #[test]
+    fn partial_unique_ids_reach_ingress_as_exact_domain_values() {
+        let cases = [
+            (UniqueId { hi: 0, lo: 29 }, UniqueId { hi: 18, lo: 19 }),
+            (UniqueId { hi: 31, lo: 0 }, UniqueId { hi: 18, lo: 19 }),
+            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 0, lo: 37 }),
+            (UniqueId { hi: 11, lo: 12 }, UniqueId { hi: 41, lo: 0 }),
+        ];
+
+        for (query_id, fragment_instance_id) in cases {
+            let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+            let mut request =
+                valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+            request.query_id = Some(proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            });
+            let Some(proto::filter::runtime_filter_route_identity::Value::Contribution(identity)) =
+                request.route_identity.as_mut().unwrap().value.as_mut()
+            else {
+                unreachable!()
+            };
+            identity.fragment_instance_id = Some(proto::common::UniqueId {
+                hi: fragment_instance_id.hi,
+                lo: fragment_instance_id.lo,
+            });
+
+            let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
+            assert_eq!(
+                response.accept_status,
+                proto::filter::RuntimeFilterAcceptStatus::Accepted as i32
+            );
+
+            let envelopes = ingress.take();
+            assert_eq!(envelopes.len(), 1);
+            let envelope = &envelopes[0];
+            assert_eq!(envelope.query_id(), query_id);
+            let identity = envelope
+                .route_identity()
+                .as_contribution()
+                .expect("contribution identity");
+            assert_eq!(identity.fragment_instance_id(), fragment_instance_id);
+        }
+    }
+
+    #[test]
     fn ingress_results_map_exactly_and_echo_validated_route() {
         let cases = [
             (
