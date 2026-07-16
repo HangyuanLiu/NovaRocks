@@ -179,6 +179,7 @@ mod tests {
             epoch: e,
             participants: BTreeSet::from([pid(0), pid(1)]),
             install_views,
+            routing_shards: BTreeMap::new(),
             role_graph: RoleGraph::default(),
         }
     }
@@ -194,6 +195,7 @@ mod tests {
             // pid(2) is a live backend with no RF role; it must NOT be installed.
             participants: BTreeSet::from([pid(0), pid(1), pid(2)]),
             install_views,
+            routing_shards: BTreeMap::new(),
             role_graph: RoleGraph::default(),
         }
     }

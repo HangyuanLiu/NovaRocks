@@ -36,6 +36,7 @@ use crate::runtime_filter::port::identity::{
 use crate::runtime_filter::port::install::{
     MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
+use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
 /// Deployment-time resource / routing policy. Read-only input to the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,13 +182,14 @@ pub(crate) fn participant_id_for_backend(
 }
 
 /// The compiler's output. Coordinator-side; `role_graph` carries the full
-/// (including remote) topology for RFD-4 to consume, while `install_views`
-/// carries the loopback shards each participant BE installs today.
+/// topology, while `install_views` and `routing_shards` carry the per-participant
+/// views compiled atomically under the same deployment epoch.
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterDeploymentPlan {
     pub epoch: DeploymentEpoch,
     pub participants: BTreeSet<RuntimeFilterParticipantId>,
     pub install_views: BTreeMap<RuntimeFilterParticipantId, RuntimeFilterInstallView>,
+    pub routing_shards: BTreeMap<RuntimeFilterParticipantId, RuntimeFilterRoutingShard>,
     pub role_graph: RoleGraph,
 }
 
