@@ -311,14 +311,12 @@ pub(crate) fn build_analyzer_provider<'a>(
     catalog: &'a InMemoryCatalog,
     catalog_mgr: &'a catalog_mgr::CatalogMgr,
     connectors: &'a crate::connector::ConnectorRegistry,
-    mode: crate::sql::catalog::TableLookupMode,
 ) -> catalog_mgr::provider::CatalogMgrProvider<'a> {
     catalog_mgr::provider::CatalogMgrProvider::new(
         current_catalog,
         catalog,
         catalog_mgr,
         connectors,
-        mode,
     )
 }
 
@@ -1056,7 +1054,6 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &catalog_mgr_snapshot,
                     &connectors_snapshot,
-                    crate::sql::catalog::TableLookupMode::ExplainStats,
                 );
                 let result = if force_logical_explain {
                     explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
@@ -1101,7 +1098,6 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &catalog_mgr_snapshot,
                     &connectors_snapshot,
-                    crate::sql::catalog::TableLookupMode::ExplainStats,
                 );
                 let result = explain_analyze_query(
                     &prepared,
@@ -1185,7 +1181,6 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &catalog_mgr_snapshot,
                     &connectors_snapshot,
-                    crate::sql::catalog::TableLookupMode::SchemaOnly,
                 );
                 self::statistics::observe_query(&self.inner, &prepared, current_database)?;
                 let result = execute_query_with_catalog_provider(
@@ -2930,7 +2925,6 @@ pub(crate) fn execute_query_with_catalog_mgr(
         &catalog_snapshot,
         &catalog_mgr_snapshot,
         &connectors_snapshot,
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     execute_query_with_catalog_provider(
         query,
@@ -3043,7 +3037,6 @@ pub(crate) fn execute_query_as_iceberg_write(
         &catalog_snapshot,
         &catalog_mgr_snapshot,
         &connectors_snapshot,
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
 
     let (resolved, cte_registry, mut factory) =
@@ -4473,6 +4466,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[test]
@@ -4848,7 +4842,7 @@ path = "{metadata_path}"
     }
 
     #[test]
-    fn explain_iceberg_query_uses_catalog_mgr_without_global_registration() {
+    fn explain_costs_iceberg_query_uses_schema_lookup_and_live_stats() {
         struct TestBackend;
         impl crate::connector::backend::CatalogBackend for TestBackend {
             fn name(&self) -> &'static str {
@@ -4903,7 +4897,44 @@ path = "{metadata_path}"
             }
         }
 
-        struct TestSource;
+        struct FixedStatsProvider {
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl crate::connector::stats::TableStatsProvider for FixedStatsProvider {
+            fn estimate_table_statistics(
+                &self,
+                request: &crate::connector::stats::TableStatsRequest,
+            ) -> Result<
+                crate::sql::optimizer::stats_input::BaseTableStatistics,
+                crate::connector::stats::StatsProviderError,
+            > {
+                assert_eq!(request.catalog.as_deref(), Some("ice"));
+                assert_eq!(request.database, "db");
+                assert_eq!(request.table, "parted");
+                assert_eq!(
+                    request.snapshot,
+                    Some(crate::connector::stats::TableSnapshotRef::Current)
+                );
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::sql::optimizer::stats_input::BaseTableStatistics {
+                    row_count: crate::sql::optimizer::stats_input::StatValue::known(
+                        73,
+                        crate::sql::optimizer::statistics::Confidence::Exact,
+                        crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+                    ),
+                    columns: Default::default(),
+                    source: crate::sql::optimizer::stats_input::StatsSource::TestFixture,
+                })
+            }
+        }
+
+        struct TestSource {
+            full_calls: Arc<AtomicUsize>,
+            schema_calls: Arc<AtomicUsize>,
+            stats_requests: Arc<AtomicUsize>,
+        }
+
         impl crate::connector::backend::TableSource for TestSource {
             fn name(&self) -> &'static str {
                 "iceberg"
@@ -4911,8 +4942,17 @@ path = "{metadata_path}"
 
             fn build_table_def(
                 &self,
+                _: &crate::connector::backend::ResolvedTable,
+            ) -> Result<crate::sql::planner::table::TableDef, String> {
+                self.full_calls.fetch_add(1, Ordering::SeqCst);
+                Err("full table builder must not run during EXPLAIN COSTS".to_string())
+            }
+
+            fn build_schema_table_def(
+                &self,
                 table: &crate::connector::backend::ResolvedTable,
             ) -> Result<crate::sql::planner::table::TableDef, String> {
+                self.schema_calls.fetch_add(1, Ordering::SeqCst);
                 let iceberg = crate::sql::planner::table::IcebergTableInfo {
                     catalog: table.catalog.clone(),
                     namespace: table.namespace.clone(),
@@ -4938,13 +4978,28 @@ path = "{metadata_path}"
                     },
                 })
             }
+
+            fn stats_provider(
+                &self,
+            ) -> Option<Arc<dyn crate::connector::stats::TableStatsProvider>> {
+                Some(Arc::new(FixedStatsProvider {
+                    requests: Arc::clone(&self.stats_requests),
+                }))
+            }
         }
 
         let state = Arc::new(StandaloneState::default());
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let schema_calls = Arc::new(AtomicUsize::new(0));
+        let stats_requests = Arc::new(AtomicUsize::new(0));
         {
             let mut connectors = state.connectors.write().expect("connectors");
             connectors.register_catalog_backend(Arc::new(TestBackend));
-            connectors.register_table_source(Arc::new(TestSource));
+            connectors.register_table_source(Arc::new(TestSource {
+                full_calls: Arc::clone(&full_calls),
+                schema_calls: Arc::clone(&schema_calls),
+                stats_requests: Arc::clone(&stats_requests),
+            }));
         }
         {
             let connectors = state.connectors.read().expect("connectors");
@@ -4961,9 +5016,32 @@ path = "{metadata_path}"
             inner: Arc::clone(&state),
         };
 
-        session
-            .execute_in_context("EXPLAIN SELECT id FROM parted", Some("ice"), "db", None)
-            .expect("explain");
+        let StatementResult::Query(result) = session
+            .execute_in_context(
+                "EXPLAIN COSTS SELECT id FROM parted",
+                Some("ice"),
+                "db",
+                None,
+            )
+            .expect("explain costs")
+        else {
+            panic!("EXPLAIN COSTS must return a query result");
+        };
+        let explain_lines = (0..result.row_count())
+            .map(|row| string_cell(&result, row, 0))
+            .collect::<Vec<_>>();
+        assert!(
+            explain_lines.iter().any(|line| {
+                line.contains("TABLE STATS")
+                    && line.contains("table=ice.db.parted")
+                    && line.contains("rows=73")
+                    && line.contains("source=TestFixture")
+            }),
+            "EXPLAIN COSTS must render live connector statistics: {explain_lines:?}"
+        );
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(stats_requests.load(Ordering::SeqCst), 1);
 
         let local = state.catalog.read().expect("catalog");
         assert!(

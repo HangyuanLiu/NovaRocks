@@ -8808,6 +8808,497 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
     );
 }
 
+const EBD_4B3B_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+const EBD_4B3B_ENGINE: &str = "src/engine/mod.rs";
+const EBD_4B3B_SQL_CATALOG: &str = "src/sql/catalog.rs";
+
+fn ebd_4b3b_type_is_table_lookup_mode(ty: &syn::Type) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.last().is_some_and(|segment| segment.ident == "TableLookupMode")
+    )
+}
+
+fn ebd_4b3b_path_ends_with(path: &syn::Path, ident: &str) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == ident)
+}
+
+fn ebd_4b3b_pattern_mentions_explain(pattern: &syn::Pat) -> bool {
+    match pattern {
+        syn::Pat::Ident(pattern) => pattern.ident == "Explain",
+        syn::Pat::Or(pattern) => pattern.cases.iter().any(ebd_4b3b_pattern_mentions_explain),
+        syn::Pat::Path(pattern) => ebd_4b3b_path_ends_with(&pattern.path, "Explain"),
+        syn::Pat::Reference(pattern) => ebd_4b3b_pattern_mentions_explain(&pattern.pat),
+        syn::Pat::Struct(pattern) => ebd_4b3b_path_ends_with(&pattern.path, "Explain"),
+        syn::Pat::Tuple(pattern) => pattern.elems.iter().any(ebd_4b3b_pattern_mentions_explain),
+        syn::Pat::TupleStruct(pattern) => {
+            ebd_4b3b_path_ends_with(&pattern.path, "Explain")
+                || pattern.elems.iter().any(ebd_4b3b_pattern_mentions_explain)
+        }
+        syn::Pat::Type(pattern) => ebd_4b3b_pattern_mentions_explain(&pattern.pat),
+        _ => false,
+    }
+}
+
+fn ebd_4b3b_explain_arm_reads_full_table_payload(expr: &syn::Expr) -> bool {
+    #[derive(Default)]
+    struct ExplainPayloadVisitor {
+        full_builder_calls: usize,
+        files_field_reads: usize,
+        macro_mentions: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ExplainPayloadVisitor {
+        fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = item.func.as_ref()
+                && ebd_4b3b_path_ends_with(&function.path, "build_table_def")
+            {
+                self.full_builder_calls += 1;
+            }
+            syn::visit::visit_expr_call(self, item);
+        }
+
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            if item.method == "build_table_def" {
+                self.full_builder_calls += 1;
+            }
+            syn::visit::visit_expr_method_call(self, item);
+        }
+
+        fn visit_expr_field(&mut self, item: &'ast syn::ExprField) {
+            if matches!(&item.member, syn::Member::Named(member) if member == "files") {
+                self.files_field_reads += 1;
+            }
+            syn::visit::visit_expr_field(self, item);
+        }
+
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            let tokens = item.tokens.to_string();
+            if tokens
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| matches!(token, "build_table_def" | "files"))
+            {
+                self.macro_mentions += 1;
+            }
+            syn::visit::visit_macro(self, item);
+        }
+    }
+
+    let mut visitor = ExplainPayloadVisitor::default();
+    syn::visit::Visit::visit_expr(&mut visitor, expr);
+    visitor.full_builder_calls > 0 || visitor.files_field_reads > 0 || visitor.macro_mentions > 0
+}
+
+fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
+    #[derive(Default)]
+    struct OrdinaryLookupVisitor {
+        schema_only_dispatches: usize,
+        other_dispatches: usize,
+        full_load_calls: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for OrdinaryLookupVisitor {
+        fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = item.func.as_ref()
+                && function.path.segments.last().is_some_and(|segment| {
+                    matches!(
+                        segment.ident.to_string().as_str(),
+                        "build_table_def" | "load_table_for_read"
+                    )
+                })
+            {
+                self.full_load_calls += 1;
+            }
+            syn::visit::visit_expr_call(self, item);
+        }
+
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            match item.method.to_string().as_str() {
+                "build_table_def" | "load_table_for_read" => self.full_load_calls += 1,
+                "get_table_with_mode" => {
+                    let schema_only = item.args.last().is_some_and(|argument| {
+                        matches!(
+                            argument,
+                            syn::Expr::Path(path)
+                                if ebd_4b3b_path_ends_with(&path.path, "SchemaOnly")
+                        )
+                    });
+                    if schema_only {
+                        self.schema_only_dispatches += 1;
+                    } else {
+                        self.other_dispatches += 1;
+                    }
+                }
+                _ => {}
+            }
+            syn::visit::visit_expr_method_call(self, item);
+        }
+    }
+
+    let mut visitor = OrdinaryLookupVisitor::default();
+    syn::visit::Visit::visit_block(&mut visitor, block);
+    visitor.schema_only_dispatches == 1
+        && visitor.other_dispatches == 0
+        && visitor.full_load_calls == 0
+}
+
+fn ebd_4b3b_schema_only_helper_is_metadata_only(block: &syn::Block) -> bool {
+    #[derive(Default)]
+    struct SchemaOnlyArmVisitor {
+        schema_only_arms: usize,
+        valid_schema_only_arms: usize,
+    }
+
+    #[derive(Default)]
+    struct SchemaOnlyBodyVisitor {
+        resolve_calls: usize,
+        to_table_def_calls: usize,
+        forbidden_calls: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SchemaOnlyBodyVisitor {
+        fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(function) = item.func.as_ref()
+                && let Some(segment) = function.path.segments.last()
+            {
+                match segment.ident.to_string().as_str() {
+                    "resolve" => self.resolve_calls += 1,
+                    "to_table_def" => self.to_table_def_calls += 1,
+                    "load_table_for_read"
+                    | "build_table_def"
+                    | "build_schema_table_def"
+                    | "build_metadata_rows_table_def"
+                    | "catalog_backend"
+                    | "table_source" => self.forbidden_calls += 1,
+                    _ => {}
+                }
+            }
+            syn::visit::visit_expr_call(self, item);
+        }
+
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            match item.method.to_string().as_str() {
+                "resolve" => self.resolve_calls += 1,
+                "to_table_def" => self.to_table_def_calls += 1,
+                "load_table_for_read"
+                | "build_table_def"
+                | "build_schema_table_def"
+                | "build_metadata_rows_table_def"
+                | "catalog_backend"
+                | "table_source" => self.forbidden_calls += 1,
+                _ => {}
+            }
+            syn::visit::visit_expr_method_call(self, item);
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SchemaOnlyArmVisitor {
+        fn visit_expr_match(&mut self, item: &'ast syn::ExprMatch) {
+            for arm in &item.arms {
+                let schema_only = matches!(
+                    &arm.pat,
+                    syn::Pat::Path(pattern)
+                        if ebd_4b3b_path_ends_with(&pattern.path, "SchemaOnly")
+                );
+                if schema_only {
+                    self.schema_only_arms += 1;
+                    let mut body = SchemaOnlyBodyVisitor::default();
+                    syn::visit::Visit::visit_expr(&mut body, &arm.body);
+                    if body.resolve_calls == 1
+                        && body.to_table_def_calls == 1
+                        && body.forbidden_calls == 0
+                    {
+                        self.valid_schema_only_arms += 1;
+                    }
+                }
+            }
+            syn::visit::visit_expr_match(self, item);
+        }
+    }
+
+    let mut visitor = SchemaOnlyArmVisitor::default();
+    syn::visit::Visit::visit_block(&mut visitor, block);
+    visitor.schema_only_arms == 1 && visitor.valid_schema_only_arms == 1
+}
+
+fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTreeSet<String> {
+    let mut violations = BTreeSet::new();
+    for source in sources.iter().filter(|source| {
+        matches!(
+            source.path.as_str(),
+            EBD_4B3B_PROVIDER | EBD_4B3B_ENGINE | EBD_4B3B_SQL_CATALOG
+        )
+    }) {
+        let identifiers = ebd_4b3a_identifiers(source);
+        if identifiers.contains("ExplainStats") {
+            violations.insert(format!(
+                "catalog-statistics-lookup-mode: {}|ExplainStats",
+                source.path
+            ));
+        }
+
+        let Ok(file) = syn::parse_file(&source.text) else {
+            violations.insert(format!(
+                "catalog-statistics-lookup-parse-failed: {}",
+                source.path
+            ));
+            continue;
+        };
+
+        struct BoundaryVisitor<'a> {
+            path: &'a str,
+            in_provider_impl: bool,
+            violations: &'a mut BTreeSet<String>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for BoundaryVisitor<'_> {
+            fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+                if self.path == EBD_4B3B_PROVIDER
+                    && item.ident == "CatalogMgrProvider"
+                    && let syn::Fields::Named(fields) = &item.fields
+                {
+                    for field in &fields.named {
+                        if field
+                            .ident
+                            .as_ref()
+                            .is_some_and(|ident| ident == "default_mode")
+                            || ebd_4b3b_type_is_table_lookup_mode(&field.ty)
+                        {
+                            self.violations.insert(format!(
+                                "catalog-statistics-provider-mode-field: {}",
+                                self.path
+                            ));
+                        }
+                    }
+                }
+                syn::visit::visit_item_struct(self, item);
+            }
+
+            fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+                let was_in_provider_impl = self.in_provider_impl;
+                self.in_provider_impl = self.path == EBD_4B3B_PROVIDER
+                    && matches!(
+                        item.self_ty.as_ref(),
+                        syn::Type::Path(path)
+                            if path.path.segments.last().is_some_and(|segment| {
+                                segment.ident == "CatalogMgrProvider"
+                            })
+                    );
+                syn::visit::visit_item_impl(self, item);
+                self.in_provider_impl = was_in_provider_impl;
+            }
+
+            fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+                if self.path == EBD_4B3B_PROVIDER
+                    && item.sig.ident == "new"
+                    && item.sig.inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            syn::FnArg::Typed(argument)
+                                if ebd_4b3b_type_is_table_lookup_mode(&argument.ty)
+                        )
+                    })
+                {
+                    self.violations.insert(format!(
+                        "catalog-statistics-provider-constructor-mode: {}",
+                        self.path
+                    ));
+                }
+                if self.in_provider_impl
+                    && matches!(
+                        item.sig.ident.to_string().as_str(),
+                        "get_table" | "get_table_in_catalog"
+                    )
+                    && !ebd_4b3b_ordinary_lookup_is_schema_only(&item.block)
+                {
+                    self.violations.insert(format!(
+                        "catalog-statistics-ordinary-lookup-shape: {}|{}",
+                        self.path, item.sig.ident
+                    ));
+                }
+                if self.in_provider_impl
+                    && item.sig.ident == "iceberg_table_def"
+                    && !ebd_4b3b_schema_only_helper_is_metadata_only(&item.block)
+                {
+                    self.violations.insert(format!(
+                        "catalog-statistics-schema-only-helper-shape: {}|{}",
+                        self.path, item.sig.ident
+                    ));
+                }
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                if self.path == EBD_4B3B_ENGINE
+                    && item.sig.ident == "build_analyzer_provider"
+                    && item.sig.inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            syn::FnArg::Typed(argument)
+                                if ebd_4b3b_type_is_table_lookup_mode(&argument.ty)
+                        )
+                    })
+                {
+                    self.violations.insert(
+                        "catalog-statistics-analyzer-provider-mode: src/engine/mod.rs".to_string(),
+                    );
+                }
+                syn::visit::visit_item_fn(self, item);
+            }
+
+            fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+                if self.path == EBD_4B3B_ENGINE
+                    && let syn::Expr::Path(function) = item.func.as_ref()
+                    && ebd_4b3b_path_ends_with(&function.path, "build_analyzer_provider")
+                    && item.args.len() != 4
+                {
+                    self.violations.insert(format!(
+                        "catalog-statistics-analyzer-provider-call-shape: {}|args={}",
+                        self.path,
+                        item.args.len()
+                    ));
+                }
+                syn::visit::visit_expr_call(self, item);
+            }
+
+            fn visit_expr_match(&mut self, item: &'ast syn::ExprMatch) {
+                if self.path == EBD_4B3B_ENGINE {
+                    for arm in &item.arms {
+                        if ebd_4b3b_pattern_mentions_explain(&arm.pat)
+                            && ebd_4b3b_explain_arm_reads_full_table_payload(&arm.body)
+                        {
+                            self.violations.insert(
+                                "catalog-statistics-explain-full-payload-read: src/engine/mod.rs"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                syn::visit::visit_expr_match(self, item);
+            }
+        }
+
+        let mut visitor = BoundaryVisitor {
+            path: &source.path,
+            in_provider_impl: false,
+            violations: &mut violations,
+        };
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+    }
+    violations
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_statistics_lookup_rewiring() {
+    let sources = vec![
+        GuardSource::new(
+            EBD_4B3B_SQL_CATALOG,
+            "enum TableLookupMode { SchemaOnly, ExplainStats }",
+        ),
+        GuardSource::new(
+            EBD_4B3B_PROVIDER,
+            r#"
+struct CatalogMgrProvider { default_mode: TableLookupMode }
+impl CatalogMgrProvider {
+    fn new(default_mode: TableLookupMode) -> Self { todo!() }
+    fn iceberg_table_def(&self, mode: &TableLookupMode) {
+        match mode {
+            TableLookupMode::SchemaOnly => {
+                let resolved = backend.load_table_for_read("ice", "db", "t");
+                source.build_table_def(&resolved);
+            }
+            _ => {}
+        }
+    }
+    fn get_table(&self, database: &str, table: &str) {
+        source.build_table_def(&resolved);
+    }
+    fn get_table_in_catalog(&self, catalog: Option<&str>, database: &str, table: &str) {
+        self.get_table_with_mode(catalog, database, table, TableLookupMode::ExplainStats);
+    }
+}
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B3B_ENGINE,
+            r#"
+fn build_analyzer_provider(mode: crate::sql::catalog::TableLookupMode) {}
+fn execute() {
+    build_analyzer_provider(None, &catalog, &mgr, &connectors, mode);
+    match statement {
+        Statement::Explain { .. } => {
+            source.build_table_def(&resolved);
+            let _ = table.files;
+        }
+        _ => {}
+    }
+}
+"#,
+        ),
+    ];
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(violations.iter().any(|item| item.contains("ExplainStats")));
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("provider-mode-field"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("provider-constructor-mode"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("ordinary-lookup-shape"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("schema-only-helper-shape"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("analyzer-provider-mode"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("analyzer-provider-call-shape"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("explain-full-payload-read"))
+    );
+}
+
+#[test]
+fn ebd_4b3b_statistics_lookup_decoupling_is_complete() {
+    let repo = Path::new(manifest_dir());
+    let sources = [EBD_4B3B_PROVIDER, EBD_4B3B_ENGINE, EBD_4B3B_SQL_CATALOG]
+        .into_iter()
+        .map(|relative| {
+            let path = repo.join(relative);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+            GuardSource::new(relative, &text)
+        })
+        .collect::<Vec<_>>();
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3B statistics lookup decoupling failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
 const EBD_4B3C_OWNER: &str = "src/sql/planner/table.rs";
 const EBD_4B3C_CODEGEN_HELPER: &str = "src/sql/codegen/scan/connector.rs";
 const EBD_4B3C_COORDINATOR_ENTRY: &str = "src/coordinator/prepare/scan_preparation.rs";

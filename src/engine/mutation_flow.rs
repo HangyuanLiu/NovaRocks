@@ -322,7 +322,6 @@ fn build_update_mor_change_stream_write_plan(
         &catalog_snapshot,
         &catalog_mgr_snapshot,
         &connectors_snapshot,
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
@@ -3146,7 +3145,6 @@ fn build_merge_mor_change_stream_write_plan(
         &catalog_snapshot,
         &catalog_mgr_snapshot,
         &connectors_snapshot,
-        crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,

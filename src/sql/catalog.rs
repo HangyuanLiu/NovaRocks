@@ -31,7 +31,6 @@ pub enum TableLookupMode {
     IcebergMetadata {
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     },
-    ExplainStats,
 }
 
 /// Catalog abstraction for SQL analysis.
