@@ -13591,6 +13591,660 @@ mod nested {
     }
 }
 
+const EBD_5A1_MEMORY_OWNER: &str = "src/catalog/memory.rs";
+const EBD_5A1_REGISTRY_OWNER: &str = "src/catalog/registry.rs";
+const EBD_5A1_CACHE_OWNER: &str = "src/catalog/schema_cache.rs";
+const EBD_5A1_SERVICE_OWNER: &str = "src/catalog/service.rs";
+const EBD_5A1_SQL_PROVIDER_OWNER: &str = "src/sql/catalog/provider.rs";
+
+const EBD_5A1_REQUIRED_OWNERS: &[(&str, &str)] = &[
+    (EBD_5A1_MEMORY_OWNER, "MemoryCatalog"),
+    (EBD_5A1_REGISTRY_OWNER, "CatalogRegistry"),
+    (EBD_5A1_CACHE_OWNER, "SchemaCache"),
+    (EBD_5A1_SERVICE_OWNER, "CatalogService"),
+    (EBD_5A1_SQL_PROVIDER_OWNER, "CatalogServiceProvider"),
+];
+
+const EBD_5A1_RETIRED_OWNER_SYMBOLS: &[&str] =
+    &["InMemoryCatalog", "CatalogMgr", "CatalogMgrProvider"];
+
+fn ebd_5a1_attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if attribute.path().is_ident("test") {
+            return true;
+        }
+        let syn::Meta::List(list) = &attribute.meta else {
+            return false;
+        };
+        list.path.is_ident("cfg")
+            && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+    })
+}
+
+#[derive(Default)]
+struct Ebd5a1Definitions {
+    items: BTreeMap<(String, String), usize>,
+    macros: BTreeSet<String>,
+}
+
+fn ebd_5a1_definitions(source: &str) -> Ebd5a1Definitions {
+    struct Visitor {
+        definitions: Ebd5a1Definitions,
+    }
+
+    impl Visitor {
+        fn record(&mut self, kind: &str, name: &syn::Ident) {
+            *self
+                .definitions
+                .items
+                .entry((kind.to_string(), name.to_string()))
+                .or_default() += 1;
+        }
+
+        fn record_macro(&mut self, item: &syn::ItemMacro) {
+            let tokens = rust_source_tokens(&item.mac.tokens.to_string());
+            for window in tokens.windows(2) {
+                if matches!(
+                    window[0].text.as_str(),
+                    "struct" | "enum" | "trait" | "type"
+                ) && (EBD_5A1_REQUIRED_OWNERS
+                    .iter()
+                    .any(|(_, symbol)| window[1].text == *symbol)
+                    || EBD_5A1_RETIRED_OWNER_SYMBOLS.contains(&window[1].text.as_str()))
+                {
+                    self.definitions.macros.insert(window[1].text.clone());
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("struct", &item.ident);
+                syn::visit::visit_item_struct(self, item);
+            }
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("enum", &item.ident);
+                syn::visit::visit_item_enum(self, item);
+            }
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("trait", &item.ident);
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("type", &item.ident);
+                syn::visit::visit_item_type(self, item);
+            }
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record_macro(item);
+                syn::visit::visit_item_macro(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return Ebd5a1Definitions::default();
+    };
+    let mut visitor = Visitor {
+        definitions: Ebd5a1Definitions::default(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.definitions
+}
+
+fn ebd_5a1_public_forwarding_reexports(source: &GuardSource) -> BTreeSet<String> {
+    let forwarding_symbols = EBD_5A1_REQUIRED_OWNERS
+        .iter()
+        .map(|(_, symbol)| *symbol)
+        .chain(EBD_5A1_RETIRED_OWNER_SYMBOLS.iter().copied())
+        .collect::<BTreeSet<_>>();
+
+    rust_raw_production_use_statements(&source.text)
+        .into_iter()
+        .filter(|import| import.visibility != "private")
+        .filter_map(|import| {
+            let path = rust_canonical_path_segments_in_scope(
+                &import.path.segments,
+                &source.path,
+                &import.inline_modules,
+            )
+            .unwrap_or(import.path.segments);
+            let aliases_symbol = import
+                .path
+                .alias
+                .as_deref()
+                .is_some_and(|alias| forwarding_symbols.contains(alias));
+            let forwards_symbol = path
+                .iter()
+                .any(|segment| forwarding_symbols.contains(segment.as_str()));
+            let forwards_old_engine_module = path.starts_with(&[
+                "crate".to_string(),
+                "engine".to_string(),
+                "catalog".to_string(),
+            ]) || path.starts_with(&[
+                "crate".to_string(),
+                "engine".to_string(),
+                "catalog_mgr".to_string(),
+            ]);
+            let forwards_canonical_module = [
+                ["crate", "catalog", "memory"].as_slice(),
+                ["crate", "catalog", "registry"].as_slice(),
+                ["crate", "catalog", "schema_cache"].as_slice(),
+                ["crate", "catalog", "service"].as_slice(),
+                ["crate", "sql", "catalog", "provider"].as_slice(),
+            ]
+            .iter()
+            .any(|module| {
+                path.iter()
+                    .map(String::as_str)
+                    .take(module.len())
+                    .eq(module.iter().copied())
+            });
+            (aliases_symbol
+                || forwards_symbol
+                || forwards_old_engine_module
+                || forwards_canonical_module)
+                .then(|| path.join("::"))
+        })
+        .collect()
+}
+
+fn ebd_5a1_production_function_names(source: &str) -> BTreeSet<String> {
+    struct Visitor {
+        names: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.names.insert(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.names.insert(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::new();
+    };
+    let mut visitor = Visitor {
+        names: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.names
+}
+
+fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String> {
+    struct StandaloneStatePath {
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for StandaloneStatePath {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "StandaloneState")
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    #[derive(Default)]
+    struct CatalogRegistrationBody {
+        legacy_registry: bool,
+        service: bool,
+        service_registration: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CatalogRegistrationBody {
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if let syn::Member::Named(name) = &field.member {
+                match name.to_string().as_str() {
+                    "catalog_mgr" => self.legacy_registry = true,
+                    "catalog_service" => self.service = true,
+                    _ => {}
+                }
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path.path.segments.iter().any(|segment| {
+                let name = segment.ident.to_string();
+                matches!(
+                    name.as_str(),
+                    "register_default_catalog_mgr_entries" | "register_iceberg_catalog_mgr_entry"
+                )
+            }) {
+                self.legacy_registry = true;
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if matches!(
+                call.method.to_string().as_str(),
+                "register_catalog" | "unregister_catalog"
+            ) {
+                self.service_registration = true;
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    struct Visitor {
+        helpers: BTreeSet<String>,
+    }
+
+    impl Visitor {
+        fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            let mut state = StandaloneStatePath { found: false };
+            syn::visit::Visit::visit_signature(&mut state, signature);
+            if !state.found {
+                return;
+            }
+            let mut registration = CatalogRegistrationBody::default();
+            syn::visit::Visit::visit_block(&mut registration, block);
+            if registration.legacy_registry
+                || (registration.service && registration.service_registration)
+            {
+                self.helpers.insert(signature.ident.to_string());
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::new();
+    };
+    let mut visitor = Visitor {
+        helpers: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.helpers
+}
+
+fn ebd_5a1_standalone_state_fields(source: &str) -> BTreeMap<String, usize> {
+    struct Visitor {
+        fields: BTreeMap<String, usize>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "StandaloneState" && !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                for field in &item.fields {
+                    if let Some(name) = &field.ident {
+                        *self.fields.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_struct(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeMap::new();
+    };
+    let mut visitor = Visitor {
+        fields: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.fields
+}
+
+fn ebd_5a1_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
+    let sources = sources
+        .iter()
+        .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
+        .map(|source| (source.path.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let definitions = sources
+        .iter()
+        .map(|(path, source)| (*path, ebd_5a1_definitions(&source.text)))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = BTreeSet::new();
+
+    for owner in ENGINE_FILE_OWNERS.iter().filter(|owner| {
+        owner.path == "src/engine/catalog.rs" || owner.path.starts_with("src/engine/catalog_mgr/")
+    }) {
+        if sources.contains_key(owner.path) {
+            violations.insert(format!("catalog-runtime-old-owner: {}", owner.path));
+        }
+    }
+
+    if let Some(engine_mod) = sources.get("src/engine/mod.rs") {
+        for item in rust_module_items(&rust_sanitized_production_text(&engine_mod.text)) {
+            if matches!(item.name.as_str(), "catalog" | "catalog_mgr") {
+                violations.insert(format!(
+                    "catalog-runtime-old-module: src/engine/mod.rs|{}",
+                    item.name
+                ));
+            }
+        }
+    }
+
+    for (path, symbol) in EBD_5A1_REQUIRED_OWNERS {
+        let owner_count = definitions
+            .get(path)
+            .and_then(|items| {
+                items
+                    .items
+                    .get(&("struct".to_string(), (*symbol).to_string()))
+            })
+            .copied()
+            .unwrap_or_default();
+        if owner_count != 1 {
+            violations.insert(format!(
+                "catalog-runtime-owner-count: {path}|struct|{symbol}|expected=1 actual={owner_count}"
+            ));
+        }
+        for (source_path, items) in &definitions {
+            if source_path == path {
+                continue;
+            }
+            let count = items
+                .items
+                .iter()
+                .filter(|((_, name), _)| name == symbol)
+                .map(|(_, count)| count)
+                .sum::<usize>();
+            if count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-secondary-owner: {source_path}|{symbol}|count={count}"
+                ));
+            }
+        }
+    }
+
+    for (path, items) in &definitions {
+        for symbol in EBD_5A1_RETIRED_OWNER_SYMBOLS {
+            let alias_count = items
+                .items
+                .get(&("type".to_string(), (*symbol).to_string()))
+                .copied()
+                .unwrap_or_default();
+            if alias_count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-retired-alias: {path}|{symbol}|count={alias_count}"
+                ));
+            }
+            let owner_count = items
+                .items
+                .iter()
+                .filter(|((kind, name), _)| kind != "type" && name == symbol)
+                .map(|(_, count)| count)
+                .sum::<usize>();
+            if owner_count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-retired-owner: {path}|{symbol}|count={owner_count}"
+                ));
+            }
+        }
+        for symbol in &items.macros {
+            violations.insert(format!(
+                "catalog-runtime-macro-secondary-owner: {path}|{symbol}"
+            ));
+        }
+    }
+
+    for source in sources.values() {
+        for target in ebd_5a1_public_forwarding_reexports(source) {
+            violations.insert(format!(
+                "catalog-runtime-forwarding-reexport: {}|{target}",
+                source.path
+            ));
+        }
+        for function in ebd_5a1_production_function_names(&source.text) {
+            if function.contains("catalog_mgr")
+                || matches!(
+                    function.as_str(),
+                    "build_analyzer_provider" | "execute_query_with_catalog_mgr"
+                )
+            {
+                violations.insert(format!(
+                    "catalog-runtime-retired-helper: {}|{function}",
+                    source.path
+                ));
+            }
+        }
+        if source.path.starts_with("src/connector/") {
+            for helper in ebd_5a1_connector_state_registration_helpers(&source.text) {
+                violations.insert(format!(
+                    "catalog-runtime-connector-state-registration: {}|{helper}",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    for path in [
+        EBD_5A1_MEMORY_OWNER,
+        EBD_5A1_REGISTRY_OWNER,
+        EBD_5A1_CACHE_OWNER,
+        EBD_5A1_SERVICE_OWNER,
+    ] {
+        let Some(source) = sources.get(path) else {
+            continue;
+        };
+        for dependency in rust_production_canonical_paths(&source.text, path) {
+            if dependency.starts_with(&["crate".to_string(), "engine".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "sql".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "connector".to_string()])
+            {
+                violations.insert(format!(
+                    "catalog-runtime-neutral-owner-dependency: {path}|{}",
+                    dependency.join("::")
+                ));
+            }
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        for forbidden in [
+            "CatalogRuntimeMetadata",
+            "ConnectorRegistry",
+            "ResolvedAnalyzerTable",
+            "StandaloneState",
+            "TableDef",
+        ] {
+            if rust_source_tokens(&production)
+                .iter()
+                .any(|token| token.text == forbidden)
+            {
+                violations.insert(format!(
+                    "catalog-runtime-neutral-owner-dependency: {path}|{forbidden}"
+                ));
+            }
+        }
+    }
+
+    let state_fields = sources
+        .get("src/engine/mod.rs")
+        .map(|source| ebd_5a1_standalone_state_fields(&source.text))
+        .unwrap_or_default();
+    let service_count = state_fields
+        .get("catalog_service")
+        .copied()
+        .unwrap_or_default();
+    if service_count != 1 {
+        violations.insert(format!(
+            "catalog-runtime-state-field-count: src/engine/mod.rs|catalog_service|expected=1 actual={service_count}"
+        ));
+    }
+    for forbidden in ["catalog", "catalog_mgr"] {
+        let count = state_fields.get(forbidden).copied().unwrap_or_default();
+        if count != 0 {
+            violations.insert(format!(
+                "catalog-runtime-state-retired-field: src/engine/mod.rs|{forbidden}|count={count}"
+            ));
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn ebd_5a1_catalog_runtime_owner_cutover_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-5A1 catalog runtime owner cutover failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_forwarding_alias_macro_and_state_registration() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            r#"
+pub(crate) struct MemoryCatalog<T> { local: Option<T> }
+#[cfg(test)]
+struct CatalogRegistry<T>(T);
+const COMMENT_NOISE: &str = "struct SchemaCache; state.catalog_mgr.write();";
+"#,
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/fixture.rs",
+            r#"
+struct LocalCatalogRegistry;
+struct LocalSchemaCache;
+#[cfg(test)]
+fn register_catalog(state: &StandaloneState) {
+    state.catalog_mgr.write().unwrap();
+}
+// pub use crate::catalog::service::CatalogService;
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "cfg(test), comments, strings, and unrelated local types must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/catalog.rs",
+        "pub use crate::catalog::service::CatalogService;",
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/catalog/legacy_alias.rs",
+        "type CatalogMgr<M> = CatalogRegistry<M>;",
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/catalog/cache_macro.rs",
+        "macro_rules! define_cache { () => { struct SchemaCache; } }",
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/catalog_registration.rs",
+        r#"
+fn register_catalog(state: &StandaloneState) {
+    state.catalog_mgr.write().unwrap();
+}
+"#,
+    ));
+
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-old-owner",
+        "catalog-runtime-forwarding-reexport",
+        "catalog-runtime-retired-alias",
+        "catalog-runtime-macro-secondary-owner",
+        "catalog-runtime-connector-state-registration",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "EBD-5A1 detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
 #[test]
 fn ebd_4a_catalog_identifier_boundary_is_ast_free() {
     let repo = Path::new(manifest_dir());
