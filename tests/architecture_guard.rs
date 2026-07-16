@@ -44031,16 +44031,18 @@ fn rfd4_m2b2_collect_outward_surface_items(
             syn::Item::Mod(item) => {
                 let nested_outward =
                     outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis);
+                let module_context = qualify(format!(
+                    "mod {} {} {} inline={}",
+                    rfd4_m2b2_normalized_attributes(&item.attrs),
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    item.ident,
+                    item.content.is_some()
+                ));
                 if nested_outward {
-                    entries.insert(qualify(format!(
-                        "mod {} {} {} inline={}",
-                        rfd4_m2b2_normalized_attributes(&item.attrs),
-                        rfd4_m2b2_normalized_node_tokens(&item.vis),
-                        item.ident,
-                        item.content.is_some()
-                    )));
+                    entries.insert(module_context.clone());
                 }
                 if let Some((_, nested)) = &item.content {
+                    let descendant_count = entries.len();
                     let nested_namespace = if namespace.is_empty() {
                         item.ident.to_string()
                     } else {
@@ -44052,6 +44054,9 @@ fn rfd4_m2b2_collect_outward_surface_items(
                         nested_outward,
                         entries,
                     )?;
+                    if entries.len() > descendant_count {
+                        entries.insert(module_context);
+                    }
                 }
             }
             syn::Item::Static(item) => {
@@ -44111,9 +44116,14 @@ fn rfd4_m2b2_collect_outward_surface_items(
                             rfd4_m2b2_normalized_node_tokens(member)
                         )),
                         syn::TraitItem::Fn(member) if trait_outward => Some(format!(
-                            "fn {} {}",
+                            "fn {} {} {}",
                             rfd4_m2b2_normalized_attributes(&member.attrs),
-                            rfd4_m2b2_normalized_node_tokens(&member.sig)
+                            rfd4_m2b2_normalized_node_tokens(&member.sig),
+                            match &member.default {
+                                Some(default) =>
+                                    format!("default {}", rfd4_m2b2_normalized_node_tokens(default)),
+                                None => "required".to_string(),
+                            }
                         )),
                         syn::TraitItem::Type(member) if trait_outward => {
                             Some(format!("type {}", rfd4_m2b2_normalized_node_tokens(member)))
@@ -44192,24 +44202,86 @@ fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String
     let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
     runtime_filter_filter_cfg_file(&mut file)
         .map_err(|_| "production cfg surface is unproven".to_string())?;
-    let mut entries = BTreeSet::new();
+    let mut entries = BTreeSet::from([format!(
+        "file-root {}",
+        rfd4_m2b2_normalized_attributes(&file.attrs)
+    )]);
     rfd4_m2b2_collect_outward_surface_items(&file.items, "", true, &mut entries)?;
+    Ok(entries.into_iter().collect())
+}
+
+fn rfd4_m2b2_external_owner_children(source_rel: &str) -> Option<&'static [&'static str]> {
+    match source_rel {
+        "src/runtime_filter/codec/mod.rs" => Some(&["contribution"]),
+        "src/runtime_filter/port/mod.rs" => Some(&["final_domain", "subscription"]),
+        "src/runtime_filter/router/mod.rs" => Some(&["loopback"]),
+        "src/runtime_filter/service/mod.rs" => {
+            Some(&["materialization", "registry", "subscription"])
+        }
+        _ => None,
+    }
+}
+
+fn rfd4_m2b2_effective_owner_surface_inventory(
+    source_rel: &str,
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let parent_only = matches!(
+        source_rel,
+        "src/runtime_filter/codec/mod.rs"
+            | "src/runtime_filter/port/mod.rs"
+            | "src/runtime_filter/router/mod.rs"
+    );
+    let mut entries = if parent_only {
+        BTreeSet::new()
+    } else {
+        rfd4_m2b2_outward_surface_inventory(text)?
+            .into_iter()
+            .collect()
+    };
+    let Some(children) = rfd4_m2b2_external_owner_children(source_rel) else {
+        return Ok(entries.into_iter().collect());
+    };
+
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg parent-module surface is unproven".to_string())?;
+    if parent_only {
+        entries.insert(format!(
+            "file-root {}",
+            rfd4_m2b2_normalized_attributes(&file.attrs)
+        ));
+    }
+    for item in &file.items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if module.content.is_none() && children.iter().any(|expected| module.ident == *expected) {
+            entries.insert(format!(
+                "external-owner-module {}",
+                rfd4_m2b2_normalized_node_tokens(module)
+            ));
+        }
+    }
     Ok(entries.into_iter().collect())
 }
 
 fn rfd4_m2b2_allowed_owner_surface_violations(source_rel: &str, text: &str) -> Vec<String> {
     let expected = match source_rel {
-        "src/runtime_filter/codec/contribution.rs" => (17, 13014293370287694829),
-        "src/runtime_filter/port/final_domain.rs" => (28, 14801809133929002992),
-        "src/runtime_filter/port/subscription.rs" => (30, 14320434944731310308),
-        "src/runtime_filter/router/loopback.rs" => (6, 10237917817399176402),
-        "src/runtime_filter/service/materialization.rs" => (31, 340993001141409597),
-        "src/runtime_filter/service/mod.rs" => (15, 17500648024670982950),
-        "src/runtime_filter/service/registry.rs" => (54, 6312524613270129975),
-        "src/runtime_filter/service/subscription.rs" => (23, 18199180618639638831),
+        "src/runtime_filter/codec/contribution.rs" => (18, 10198486929407087720),
+        "src/runtime_filter/codec/mod.rs" => (2, 11564291660451389536),
+        "src/runtime_filter/port/final_domain.rs" => (29, 17041071041840420617),
+        "src/runtime_filter/port/mod.rs" => (3, 11417193225267407692),
+        "src/runtime_filter/port/subscription.rs" => (31, 14239332311506517087),
+        "src/runtime_filter/router/loopback.rs" => (7, 600269609696608443),
+        "src/runtime_filter/router/mod.rs" => (2, 8106057199518289267),
+        "src/runtime_filter/service/materialization.rs" => (32, 5198539511492591630),
+        "src/runtime_filter/service/mod.rs" => (19, 6399777452702047743),
+        "src/runtime_filter/service/registry.rs" => (55, 16862598348751505612),
+        "src/runtime_filter/service/subscription.rs" => (24, 9952610218984085948),
         _ => return Vec::new(),
     };
-    let inventory = match rfd4_m2b2_outward_surface_inventory(text) {
+    let inventory = match rfd4_m2b2_effective_owner_surface_inventory(source_rel, text) {
         Ok(inventory) => inventory,
         Err(error) => {
             return vec![format!(
@@ -46216,6 +46288,75 @@ trait PrivateSurfaceTrait {{
     assert!(
         !rfd4_m2b2_allowed_owner_surface_violations(registry_rel, &field_attribute).is_empty(),
         "outward field attributes must be frozen"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_owner_surface_freezes_file_module_and_trait_default_context() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    let file_inner_cfg = format!("#![cfg(any(test, feature = \"surface-file-context\"))]\n{codec}");
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &file_inner_cfg).is_empty(),
+        "allowed-owner file inner cfg attributes must be frozen"
+    );
+
+    let private_module = format!(
+        r#"{codec}
+mod hidden_surface_context {{
+    impl EncodedContribution {{
+        pub(crate) fn hidden_context_method(&self) {{}}
+    }}
+}}
+"#
+    );
+    let private_module_cfg = format!(
+        r#"{codec}
+#[cfg(any(test, feature = "surface-module-context"))]
+mod hidden_surface_context {{
+    impl EncodedContribution {{
+        pub(crate) fn hidden_context_method(&self) {{}}
+    }}
+}}
+"#
+    );
+    assert_ne!(
+        rfd4_m2b2_outward_surface_inventory(&private_module)
+            .expect("parse live codec with private inline ancestor"),
+        rfd4_m2b2_outward_surface_inventory(&private_module_cfg)
+            .expect("parse live codec with cfg private inline ancestor"),
+        "effective private inline-module attrs must qualify descendant impl surfaces"
+    );
+
+    let service_rel = "src/runtime_filter/service/mod.rs";
+    let service = fs::read_to_string(Path::new(manifest_dir()).join(service_rel))
+        .expect("read live runtime-filter service module");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(service_rel, &service).is_empty(),
+        "live service owner baseline must satisfy the outward surface ledger"
+    );
+    let external_parent_cfg = service.replacen(
+        "mod materialization;",
+        "#[cfg(any(test, feature = \"surface-parent-context\"))]\nmod materialization;",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(service_rel, &external_parent_cfg).is_empty(),
+        "external private parent-module attrs controlling a frozen owner must be frozen"
+    );
+
+    let subscription_rel = "src/runtime_filter/port/subscription.rs";
+    let subscription = fs::read_to_string(Path::new(manifest_dir()).join(subscription_rel))
+        .expect("read live subscription owner");
+    let delivery_default = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome) {\n        let _ = (route_edge_id, outcome);\n    }",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &delivery_default).is_empty(),
+        "required ArtifactDelivery methods must not silently gain default behavior"
     );
 }
 
