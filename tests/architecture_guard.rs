@@ -8872,6 +8872,409 @@ std::time::Instant::now
     exact_inventory
 }
 
+fn runtime_filter_task4_bare_path_inventory(source_rel: &str) -> Option<&'static str> {
+    match source_rel {
+        "src/runtime_filter/service/m3b_tests.rs" => Some(
+            r#"
+Arc
+ArmableMemoryAccount
+AtomicBool
+AtomicUsize
+BindingId
+COMPARATOR_ALGORITHM_VERSION
+CONSUMER
+ChannelId
+Clock
+CoverageWitnessId
+CrossChannelTopKEvents
+Err
+Events
+Fixture
+Fn
+Instant
+LivePollOutcome
+LiveTerminal
+LogicalVersion
+MemoryAccountError
+Mutex
+None
+Ok
+Option
+OrderContract
+PRODUCER_A
+PRODUCER_B
+Result
+RouteEdgeId
+RuntimeFilterChannelDeployment
+RuntimeFilterClock
+RuntimeFilterEvent
+RuntimeFilterEventSink
+RuntimeFilterMemoryAccount
+RuntimeFilterPolicyRequirement
+RuntimeFilterService
+RuntimeTopKSummaryContract
+Self
+Some
+TopKReentrantEvents
+TopKSummary
+TopKSummaryRequirement
+UniqueId
+Vec
+accepted
+accepted_bytes
+accepted_summary
+account
+active
+after
+after_account
+after_live
+artifact
+assert
+assert_eq
+assert_ne
+before
+before_account
+binding
+bool
+bundle
+bytes
+channel
+channel_id
+comparator_digest_for_test
+consumer
+contract
+contract_for_submit
+coverage
+deployment
+derive
+direct
+direct_deployment
+direct_witness
+done_tx
+drop
+entered_rx
+entered_tx
+error
+event
+events
+first
+fixture
+fixture_with_account
+i64
+identity
+installed_service_with_sink
+instance
+keys
+live
+lo
+matches
+memory
+nested_first
+nested_second
+outcome
+outer_first
+outer_second
+outer_summary
+panic
+pending
+pending_producer
+plan
+position
+predicate
+producer
+producer_a
+producer_b
+range_contract
+rejected
+release_rx
+release_tx
+replay
+requirement
+runtime_order
+satisfied
+satisfied_producer
+second
+second_summary
+self
+service
+sink
+start
+submit
+submits
+summary
+summary_producer
+terminal
+test
+topk
+topk_contract
+topk_deployment
+topk_deployment_with_ids
+uid
+usize
+value
+values
+vec
+violation
+witnesses
+wrong_contract
+wrong_plan
+"#,
+        ),
+        "src/runtime_filter/service/m3c_tests.rs" => Some(
+            r#"
+AdversarialEvents
+Arc
+ArmableMemoryAccount
+AtomicBool
+AtomicUsize
+BindingId
+BlockingCallMemoryAccount
+CHANNEL
+CONSUMER
+ChannelId
+Clock
+ContributionIdentity
+CoverageWitnessId
+DeploymentEpoch
+Err
+Events
+FinalDomainProducerAdapter
+Fn
+FrozenFinalDomainTestIssuer
+Instant
+MemoryAccountError
+Mutex
+None
+Ok
+Option
+PRODUCER_A
+PRODUCER_B
+PartitionId
+Result
+RuntimeFilterChannelDeployment
+RuntimeFilterClock
+RuntimeFilterEvent
+RuntimeFilterEventSink
+RuntimeFilterMemoryAccount
+RuntimeFilterPolicyRequirement
+RuntimeFilterService
+Self
+Some
+UniqueId
+Vec
+Weak
+assert
+assert_coordinate
+assert_eq
+assert_ne
+barrier
+binding
+block_call
+blocking_memory_account
+bool
+bytes
+call
+cancel_entered
+cancel_input
+cancel_issuer
+cancel_memory
+cancel_producer
+cancel_release
+cancel_service
+cancel_started_rx
+cancel_started_tx
+cancel_thread
+cancel_tx
+cancel_worker
+cancelling_service
+channel
+channel_id
+close_worker
+collecting
+complete_rx
+complete_tx
+complete_worker
+coverage
+deployment_for
+derive
+drop
+duplicate_entered
+duplicate_input
+duplicate_issuer
+duplicate_memory
+duplicate_producer
+duplicate_release
+duplicate_service
+duplicate_tx
+duplicate_worker
+empty_events
+empty_issuer
+empty_live
+empty_producer
+empty_service
+entered
+entered_rx
+entered_tx
+epoch
+event
+events
+expected_losing_terminal
+frozen
+frozen_issuer
+i64
+identity
+input
+installed_service
+installed_service_for
+instance
+instances
+invalid
+issuer
+issuer_a
+issuer_a0
+issuer_a1
+issuer_b
+iteration
+live
+lo
+local_partition_count
+matches
+memory
+next_dispatch_order
+observed
+observed_public
+open_drivers
+open_final
+open_final_with_partitions
+order
+outer_cancel_producer
+outer_input
+outer_producer
+outer_tx
+outer_worker
+panic
+partition
+permutations
+position
+predicate
+producer
+producer_a
+producer_a0
+producer_a1
+producer_b
+producer_instances
+producers
+query_id
+recorded
+reject_blocked
+rejected
+rejected_producer
+rejection_thread
+release
+release_rx
+release_tx
+resource_events
+resource_service
+result_rx
+result_tx
+self
+sequence
+service
+shard
+shard_at
+snapshot
+submission_index
+submissions
+terminal
+terminal_case
+terminal_rx
+terminal_tx
+terminal_worker
+test
+transition
+typed
+u32
+u64
+uid
+unavailable_events
+unavailable_memory
+unavailable_service
+unreachable
+usize
+valid_a
+values
+witness
+wrong_channel_issuer
+wrong_channel_service
+wrong_epoch_issuer
+wrong_epoch_service
+wrong_inputs
+"#,
+        ),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct RuntimeFilterBarePathAudit {
+    paths: BTreeSet<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterBarePathAudit {
+    fn visit_item_use(&mut self, _item: &'ast syn::ItemUse) {}
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none()
+            && path.segments.len() == 1
+            && let Some(segment) = path.segments.first()
+        {
+            self.paths.insert(segment.ident.to_string());
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if item.path.leading_colon.is_none()
+            && item.path.segments.len() == 1
+            && let Some(segment) = item.path.segments.first()
+        {
+            self.paths.insert(segment.ident.to_string());
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
+fn runtime_filter_task4_bare_paths(text: &str) -> Result<BTreeSet<String>, syn::Error> {
+    let file = syn::parse_file(text)?;
+    let mut audit = RuntimeFilterBarePathAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.paths)
+}
+
+fn runtime_filter_task4_bare_path_inventory_violations(
+    source_rel: &str,
+    actual: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(inventory) = runtime_filter_task4_bare_path_inventory(source_rel) else {
+        return Vec::new();
+    };
+    let expected = inventory
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    expected
+        .difference(actual)
+        .map(|path| format!("{source_rel}: stale exact bare path {path}"))
+        .chain(
+            actual
+                .difference(&expected)
+                .map(|path| format!("{source_rel}: unexpected exact bare path {path}")),
+        )
+        .collect()
+}
+
 fn runtime_filter_task4_added_dependency_prefixes(source_rel: &str) -> &'static [&'static str] {
     match source_rel {
         "src/runtime_filter/core/channel.rs" => &[
@@ -9123,6 +9526,11 @@ fn runtime_filter_runtime_dependencies_are_allowed(source_rel: &str, text: &str)
                 runtime_filter_task4_exact_path_ledger(source_rel, &path)
                     .unwrap_or_else(|| runtime_filter_path_is_allowlisted(&path, &allowed_prefixes))
             })
+        && runtime_filter_task4_bare_path_inventory(source_rel).is_none_or(|_| {
+            runtime_filter_task4_bare_paths(text).is_ok_and(|actual| {
+                runtime_filter_task4_bare_path_inventory_violations(source_rel, &actual).is_empty()
+            })
+        })
 }
 
 fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> Vec<String> {
@@ -9259,6 +9667,18 @@ fn runtime_filter_runtime_boundary_violations(source_rel: &str, text: &str) -> V
                 .difference(&actual)
                 .map(|path| format!("{source_rel}: stale exact dependency {path}")),
         );
+    }
+    if runtime_filter_task4_bare_path_inventory(source_rel).is_some() {
+        match runtime_filter_task4_bare_paths(text) {
+            Ok(actual) => violations.extend(runtime_filter_task4_bare_path_inventory_violations(
+                source_rel, &actual,
+            )),
+            Err(error) => {
+                violations.insert(format!(
+                    "{source_rel}: whole-exact bare path source must parse: {error}"
+                ));
+            }
+        }
     }
     let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
     let production_source_tokens = rust_source_tokens(&rust_sanitized_production_text(text));
@@ -13548,7 +13968,12 @@ fn runtime_filter_conformance_manifest_violations(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let exact_test = matches!(definitions.as_slice(), [function] if function.attrs.iter().any(|attribute| attribute.path().is_ident("test")));
+        let exact_test = matches!(
+            definitions.as_slice(),
+            [function]
+                if matches!(function.attrs.as_slice(), [attribute]
+                    if matches!(&attribute.meta, syn::Meta::Path(path) if path.is_ident("test")))
+        );
         let audit = runtime_filter_manifest_function_audit(&file, test_name);
         let audit_debug = format!("{audit:?}");
         if !exact_test || !runtime_filter_manifest_body_has(audit, methods, paths) {
@@ -13908,6 +14333,33 @@ fn runtime_filter_conformance_manifest_rejects_missing_or_fake_surfaces() {
         assert!(
             !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
             "manifest detector must reject {forbidden}"
+        );
+    }
+    for (test_name, disabling_attribute) in [
+        (
+            "m4_join_conformance_uses_graph_compiler_public_ports_and_route_equivalent_artifacts",
+            "#[cfg(any())]",
+        ),
+        (
+            "m4_direct_topn_conformance_delays_until_n_and_preserves_sound_monotonic_bounds",
+            "#[ignore]",
+        ),
+        (
+            "m4_topk_summary_conformance_merges_incomplete_shards_only_after_allof",
+            "#[cfg_attr(test, ignore)]",
+        ),
+        (
+            "m4_aggregate_conformance_requires_frozen_allof_and_separates_empty_unavailable",
+            "#[should_panic]",
+        ),
+    ] {
+        let signature = format!("#[test]\nfn {test_name}");
+        let disabled_signature = format!("#[test]\n{disabling_attribute}\nfn {test_name}");
+        let invalid = harness.replacen(&signature, &disabled_signature, 1);
+        assert_ne!(invalid, harness, "stable owner fixture must be rewritten");
+        assert!(
+            !runtime_filter_conformance_manifest_violations(valid_root, &invalid).is_empty(),
+            "stable owner {test_name} must reject {disabling_attribute}"
         );
     }
     for missing in [
@@ -14691,6 +15143,45 @@ fn runtime_filter_task4_exact_dependency_ledger_rejects_stale_entries() {
             .is_empty(),
         "removing a Task 4 added dependency must report stale exact-ledger entries"
     );
+}
+
+#[test]
+fn runtime_filter_task4_glob_bare_path_inventory_rejects_future_children() {
+    let repo = Path::new(manifest_dir());
+    for source_rel in [
+        "src/runtime_filter/service/m3b_tests.rs",
+        "src/runtime_filter/service/m3c_tests.rs",
+    ] {
+        let source = fs::read_to_string(repo.join(source_rel)).unwrap();
+        assert!(
+            runtime_filter_runtime_boundary_violations(source_rel, &source).is_empty(),
+            "real whole-exact source must establish a clean baseline: {source_rel}"
+        );
+        let mut missing_actual = runtime_filter_task4_bare_paths(&source).unwrap();
+        let removed = missing_actual
+            .iter()
+            .next()
+            .cloned()
+            .expect("whole-exact bare path inventory must not be empty");
+        missing_actual.remove(&removed);
+        assert!(
+            runtime_filter_task4_bare_path_inventory_violations(source_rel, &missing_actual)
+                .iter()
+                .any(|violation| violation.contains("stale exact bare path")),
+            "removing expected bare path {removed} must report stale inventory for {source_rel}"
+        );
+        for future_child in [
+            "fn use_future_glob_child() { FutureGlobChild::new(); }",
+            "fn call_future_glob_child() { future_glob_child(); }",
+            "fn match_future_glob_child(value: usize) { let FutureGlobChild { .. } = value; }",
+        ] {
+            let invalid = format!("{source}\n{future_child}\n");
+            assert!(
+                !runtime_filter_runtime_boundary_violations(source_rel, &invalid).is_empty(),
+                "whole-exact bare path inventory must reject {source_rel}: {future_child}"
+            );
+        }
+    }
 }
 
 #[test]
