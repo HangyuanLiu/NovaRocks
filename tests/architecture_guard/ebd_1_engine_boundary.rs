@@ -8,8 +8,9 @@ use super::{
     production_rs_files_from_entries, rel, rs_files, rust_all_source_canonical_paths,
     rust_canonical_path_segments_in_scope, rust_lexically_sanitized, rust_module_items,
     rust_production_canonical_paths, rust_production_scoped_aliases,
-    rust_raw_production_use_statements, rust_resolve_scoped_paths, rust_sanitized_production_text,
-    rust_source_module_segments, rust_source_tokens, src_dir,
+    rust_raw_production_use_statements, rust_raw_use_statements, rust_resolve_scoped_paths,
+    rust_sanitized_production_text, rust_scoped_aliases, rust_source_module_segments,
+    rust_source_tokens, src_dir,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -745,7 +746,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/connector/starrocks/table/ivm_change_stream.rs",
         &[
-            "crate::engine::QueryResult",
             "crate::engine::StandaloneState",
             "crate::engine::mv::table_ref::IcebergTableRef",
         ],
@@ -766,7 +766,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/connector/starrocks/table/ivm_delta_source.rs",
         &[
-            "crate::engine::QueryResult",
             "crate::engine::StandaloneState",
             "crate::engine::catalog::InMemoryCatalog",
             "crate::engine::execute_query",
@@ -786,8 +785,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
     (
         "src/connector/starrocks/table/mv_ddl.rs",
         &[
-            "crate::engine::QueryResult",
-            "crate::engine::QueryResultColumn",
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
             "crate::engine::catalog::normalize_identifier",
@@ -813,13 +810,11 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::mv::table_ref::IcebergTableRef",
             "crate::engine::mv_flow::refresh_metadata_request_for_create",
             "crate::engine::query_prep::drop_local_table_registration_if_exists",
-            "crate::engine::record_batch_to_chunk",
         ],
     ),
     (
         "src/connector/starrocks/table/mv_refresh.rs",
         &[
-            "crate::engine::QueryResult",
             "crate::engine::ResolvedLocalTableName",
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
@@ -837,7 +832,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::mv_flow::analyze_visible_query",
             "crate::engine::mv_flow::execute_query_for_mv_refresh",
             "crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog",
-            "crate::engine::record_batch_to_chunk",
         ],
     ),
     (
@@ -867,7 +861,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::dictionary::maintenance::mark_starrocks_table_stale",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_agg_state",
-            "crate::engine::record_batch_to_chunk",
             "crate::engine::reorder_insert_rows",
         ],
     ),
@@ -982,16 +975,8 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &["crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors"],
     ),
     (
-        "src/server/encoding.rs",
-        &[
-            "crate::engine::QueryResult",
-            "crate::engine::QueryResultColumn",
-        ],
-    ),
-    (
         "src/server/mod.rs",
         &[
-            "crate::engine::QueryResult",
             "crate::engine::StandaloneNovaRocks",
             "crate::engine::StandaloneOptions",
             "crate::engine::StatementResult",
@@ -1345,8 +1330,6 @@ const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
     "src/engine/mod.rs|crate::engine|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
     "src/engine/mod.rs|crate::engine|pub|ColumnDef|crate::sql::catalog::ColumnDef",
-    "src/engine/mod.rs|crate::engine|pub|QueryResultColumn|crate::runtime::query_result::QueryResultColumn",
-    "src/engine/mod.rs|crate::engine|pub|QueryResult|crate::runtime::query_result::QueryResult",
     "src/engine/mod.rs|crate::engine|pub|ScanSource|crate::sql::catalog::ScanSource",
     "src/engine/mod.rs|crate::engine|pub|TableDef|crate::sql::catalog::TableDef",
 ];
@@ -1504,6 +1487,473 @@ fn additional_query_options_owner_paths<'a>(
         .filter(|source| source.path.starts_with("src/") && source.path != canonical_owner)
         .filter(|source| has_top_level_production_struct(&source.text, "QueryOptions"))
         .map(|source| source.path.clone())
+        .collect()
+}
+
+const EBD_3C_RESULT_SURFACES: &[&str] = &[
+    "QueryResult",
+    "QueryResultColumn",
+    "build_string_query_result",
+    "record_batch_to_chunk",
+];
+
+fn is_legacy_ebd_3c_result_path(path: &[String]) -> bool {
+    path.len() >= 3
+        && path[0] == "crate"
+        && path[1] == "engine"
+        && EBD_3C_RESULT_SURFACES.contains(&path[2].as_str())
+}
+
+fn is_runtime_ebd_3c_result_path(path: &[String]) -> bool {
+    path.len() == 4
+        && path[0] == "crate"
+        && path[1] == "runtime"
+        && path[2] == "query_result"
+        && EBD_3C_RESULT_SURFACES.contains(&path[3].as_str())
+}
+
+fn ebd_3c_forwarded_runtime_paths(path: &[String]) -> Vec<Vec<String>> {
+    if is_runtime_ebd_3c_result_path(path) {
+        return vec![path.to_vec()];
+    }
+    let forwards_module = path
+        == [
+            "crate".to_string(),
+            "runtime".to_string(),
+            "query_result".to_string(),
+        ];
+    let forwards_glob = path
+        == [
+            "crate".to_string(),
+            "runtime".to_string(),
+            "query_result".to_string(),
+            "*".to_string(),
+        ];
+    if !forwards_module && !forwards_glob {
+        return Vec::new();
+    }
+    EBD_3C_RESULT_SURFACES
+        .iter()
+        .map(|surface| {
+            ["crate", "runtime", "query_result", surface]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct Ebd3cDeclaration {
+    visibility: String,
+    name: String,
+    inline_modules: Vec<String>,
+    alias_targets: Option<Vec<RustScopedUsePath>>,
+    audit_targets: Vec<RustScopedUsePath>,
+}
+
+fn ebd_3c_visibility(visibility: &syn::Visibility) -> String {
+    match visibility {
+        syn::Visibility::Inherited => "private".to_string(),
+        syn::Visibility::Public(_) => "pub".to_string(),
+        syn::Visibility::Restricted(restricted) if restricted.path.is_ident("self") => {
+            "private".to_string()
+        }
+        syn::Visibility::Restricted(restricted) => format!(
+            "pub({})",
+            restricted
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        ),
+    }
+}
+
+fn ebd_3c_path_segments(path: &syn::Path) -> Vec<String> {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect()
+}
+
+struct Ebd3cTypePathCollector<'a> {
+    shadows: &'a BTreeSet<String>,
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Ebd3cTypePathCollector<'_> {
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let segments = ebd_3c_path_segments(path);
+        if !segments.is_empty() && !self.shadows.contains(&segments[0]) {
+            self.paths.insert(segments);
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+#[derive(Default)]
+struct Ebd3cExprPathCollector {
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Ebd3cExprPathCollector {
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        let segments = ebd_3c_path_segments(&path.path);
+        if !segments.is_empty() {
+            self.paths.insert(segments);
+        }
+        syn::visit::visit_expr_path(self, path);
+    }
+}
+
+fn ebd_3c_scoped_targets(
+    paths: BTreeSet<Vec<String>>,
+    inline_modules: &[String],
+) -> Vec<RustScopedUsePath> {
+    paths
+        .into_iter()
+        .map(|segments| RustScopedUsePath {
+            segments,
+            inline_modules: inline_modules.to_vec(),
+        })
+        .collect()
+}
+
+fn ebd_3c_push_value_declaration(
+    visibility: String,
+    name: String,
+    expr: &syn::Expr,
+    inline_modules: &[String],
+    declarations: &mut Vec<Ebd3cDeclaration>,
+) {
+    use syn::visit::Visit;
+
+    let mut collector = Ebd3cExprPathCollector::default();
+    collector.visit_expr(expr);
+    declarations.push(Ebd3cDeclaration {
+        visibility,
+        name,
+        inline_modules: inline_modules.to_vec(),
+        alias_targets: None,
+        audit_targets: ebd_3c_scoped_targets(collector.paths, inline_modules),
+    });
+}
+
+fn ebd_3c_collect_declarations(
+    items: &[syn::Item],
+    inline_modules: &mut Vec<String>,
+    declarations: &mut Vec<Ebd3cDeclaration>,
+) {
+    use syn::visit::Visit;
+
+    for item in items {
+        match item {
+            syn::Item::Type(item) => {
+                let shadows = item
+                    .generics
+                    .params
+                    .iter()
+                    .filter_map(|parameter| match parameter {
+                        syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                        syn::GenericParam::Const(parameter) => Some(parameter.ident.to_string()),
+                        syn::GenericParam::Lifetime(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let mut rhs = Ebd3cTypePathCollector {
+                    shadows: &shadows,
+                    paths: BTreeSet::new(),
+                };
+                rhs.visit_type(&item.ty);
+                let alias_targets = ebd_3c_scoped_targets(rhs.paths.clone(), inline_modules);
+
+                let mut audit_paths = rhs.paths;
+                for parameter in &item.generics.params {
+                    match parameter {
+                        syn::GenericParam::Type(parameter) => {
+                            if let Some(default) = &parameter.default {
+                                let mut collector = Ebd3cTypePathCollector {
+                                    shadows: &shadows,
+                                    paths: BTreeSet::new(),
+                                };
+                                collector.visit_type(default);
+                                audit_paths.extend(collector.paths);
+                            }
+                        }
+                        syn::GenericParam::Const(parameter) => {
+                            if let Some(default) = &parameter.default {
+                                let mut collector = Ebd3cExprPathCollector::default();
+                                collector.visit_expr(default);
+                                audit_paths.extend(collector.paths);
+                            }
+                        }
+                        syn::GenericParam::Lifetime(_) => {}
+                    }
+                }
+                declarations.push(Ebd3cDeclaration {
+                    visibility: ebd_3c_visibility(&item.vis),
+                    name: item.ident.to_string(),
+                    inline_modules: inline_modules.clone(),
+                    alias_targets: Some(alias_targets),
+                    audit_targets: ebd_3c_scoped_targets(audit_paths, inline_modules),
+                });
+            }
+            syn::Item::Const(item) => {
+                ebd_3c_push_value_declaration(
+                    ebd_3c_visibility(&item.vis),
+                    item.ident.to_string(),
+                    &item.expr,
+                    inline_modules,
+                    declarations,
+                );
+            }
+            syn::Item::Static(item) => {
+                ebd_3c_push_value_declaration(
+                    ebd_3c_visibility(&item.vis),
+                    item.ident.to_string(),
+                    &item.expr,
+                    inline_modules,
+                    declarations,
+                );
+            }
+            syn::Item::Impl(item) => {
+                for impl_item in &item.items {
+                    let syn::ImplItem::Const(item) = impl_item else {
+                        continue;
+                    };
+                    ebd_3c_push_value_declaration(
+                        ebd_3c_visibility(&item.vis),
+                        item.ident.to_string(),
+                        &item.expr,
+                        inline_modules,
+                        declarations,
+                    );
+                }
+            }
+            syn::Item::Trait(item) => {
+                let visibility = ebd_3c_visibility(&item.vis);
+                for trait_item in &item.items {
+                    let syn::TraitItem::Const(item) = trait_item else {
+                        continue;
+                    };
+                    let Some((_, default)) = &item.default else {
+                        continue;
+                    };
+                    ebd_3c_push_value_declaration(
+                        visibility.clone(),
+                        item.ident.to_string(),
+                        default,
+                        inline_modules,
+                        declarations,
+                    );
+                }
+            }
+            syn::Item::Mod(item) => {
+                let Some((_, items)) = &item.content else {
+                    continue;
+                };
+                inline_modules.push(item.ident.to_string());
+                ebd_3c_collect_declarations(items, inline_modules, declarations);
+                inline_modules.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn ebd_3c_declarations(source: &str) -> Result<Vec<Ebd3cDeclaration>, syn::Error> {
+    let file = syn::parse_file(source)?;
+    let mut declarations = Vec::new();
+    ebd_3c_collect_declarations(&file.items, &mut Vec::new(), &mut declarations);
+    Ok(declarations)
+}
+
+fn source_defines_named_item(source: &str, kind: &str, name: &str) -> bool {
+    let sanitized = rust_lexically_sanitized(source);
+    rust_source_tokens(&sanitized)
+        .windows(2)
+        .any(|tokens| tokens[0].text == kind && tokens[1].text == name)
+}
+
+fn ebd_3c_legacy_paths_in_sources(sources: &[GuardSource]) -> BTreeSet<String> {
+    sources
+        .iter()
+        .flat_map(|source| {
+            rust_all_source_canonical_paths(&source.text, &source.path)
+                .into_iter()
+                .filter(|path| is_legacy_ebd_3c_result_path(path))
+                .map(|path| format!("{}|{}", source.path, path.join("::")))
+        })
+        .collect()
+}
+
+fn ebd_3c_all_source_forwarding_surfaces(source: &GuardSource) -> BTreeSet<String> {
+    let sanitized = rust_lexically_sanitized(&source.text);
+    let aliases = rust_scoped_aliases(&sanitized);
+    let mut surfaces = BTreeSet::new();
+    for import in rust_raw_use_statements(&sanitized)
+        .into_iter()
+        .filter(|import| import.visibility != "private")
+    {
+        let Some(export_scope) = forwarding_export_scope(&source.path, &import.inline_modules)
+        else {
+            continue;
+        };
+        let Some(export_name) =
+            forwarding_export_name(&import.path.segments, import.path.alias.as_deref())
+        else {
+            continue;
+        };
+        let Some(targets) = resolve_forwarding_paths(
+            &import.path.segments,
+            &source.path,
+            &import.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        ) else {
+            continue;
+        };
+        for target in targets {
+            let Some(canonical) = rust_canonical_path_segments_in_scope(
+                &target.segments,
+                &source.path,
+                &target.inline_modules,
+            ) else {
+                continue;
+            };
+            if source.path == "src/runtime/query_result.rs" {
+                continue;
+            }
+            for forwarded in ebd_3c_forwarded_runtime_paths(&canonical) {
+                surfaces.insert(format!(
+                    "{}|{}|{}|{}|{}",
+                    source.path,
+                    export_scope,
+                    import.visibility,
+                    export_name,
+                    forwarded.join("::")
+                ));
+            }
+        }
+    }
+    surfaces
+}
+
+fn ebd_3c_all_source_declaration_surfaces(source: &GuardSource) -> BTreeSet<String> {
+    if source.path == "src/runtime/query_result.rs" {
+        return BTreeSet::new();
+    }
+    let sanitized = rust_lexically_sanitized(&source.text);
+    let declarations = ebd_3c_declarations(&source.text)
+        .unwrap_or_else(|error| panic!("failed to parse {} for EBD-3C: {error}", source.path));
+    let mut aliases = rust_scoped_aliases(&sanitized);
+
+    for import in rust_raw_use_statements(&sanitized)
+        .into_iter()
+        .filter(|import| import.path.segments.last().is_some_and(|leaf| leaf == "*"))
+    {
+        let Some(targets) = resolve_forwarding_paths(
+            &import.path.segments,
+            &source.path,
+            &import.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        ) else {
+            continue;
+        };
+        for target in targets {
+            let Some(canonical) = rust_canonical_path_segments_in_scope(
+                &target.segments,
+                &source.path,
+                &target.inline_modules,
+            ) else {
+                continue;
+            };
+            if canonical
+                != [
+                    "crate".to_string(),
+                    "runtime".to_string(),
+                    "query_result".to_string(),
+                    "*".to_string(),
+                ]
+            {
+                continue;
+            }
+            for surface in EBD_3C_RESULT_SURFACES {
+                aliases
+                    .entry((import.inline_modules.clone(), surface.to_string()))
+                    .or_default()
+                    .push(RustScopedUsePath {
+                        segments: ["crate", "runtime", "query_result", surface]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        inline_modules: Vec::new(),
+                    });
+            }
+        }
+    }
+    for declaration in &declarations {
+        if let Some(alias_targets) = &declaration.alias_targets {
+            aliases.insert(
+                (declaration.inline_modules.clone(), declaration.name.clone()),
+                alias_targets.clone(),
+            );
+        }
+    }
+
+    let mut surfaces = BTreeSet::new();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.visibility != "private")
+    {
+        let Some(export_scope) = forwarding_export_scope(&source.path, &declaration.inline_modules)
+        else {
+            continue;
+        };
+        for target in &declaration.audit_targets {
+            let Some(targets) = resolve_forwarding_paths(
+                &target.segments,
+                &source.path,
+                &target.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            ) else {
+                continue;
+            };
+            for target in targets {
+                let Some(canonical) = rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    &source.path,
+                    &target.inline_modules,
+                ) else {
+                    continue;
+                };
+                if is_runtime_ebd_3c_result_path(&canonical) {
+                    surfaces.insert(format!(
+                        "{}|{}|{}|{}|{}",
+                        source.path,
+                        export_scope,
+                        declaration.visibility,
+                        declaration.name,
+                        canonical.join("::")
+                    ));
+                }
+            }
+        }
+    }
+    surfaces
+}
+
+fn ebd_3c_all_source_alias_surfaces(source: &GuardSource) -> BTreeSet<String> {
+    ebd_3c_all_source_forwarding_surfaces(source)
+        .into_iter()
+        .chain(ebd_3c_all_source_declaration_surfaces(source))
         .collect()
 }
 
@@ -2746,6 +3196,301 @@ fn ebd_3b_runtime_owner_requires_top_level_production_struct() {
         additional_query_options_owner_paths(&sources, "src/runtime/query_options.rs"),
         BTreeSet::from(["src/other.rs".to_string()]),
         "only a second top-level production owner under src must be rejected"
+    );
+}
+
+#[test]
+fn ebd_3c_query_result_boundary_has_one_runtime_owner() {
+    let repo = Path::new(manifest_dir());
+    let owner_rel = "src/runtime/query_result.rs";
+    let owner_text = fs::read_to_string(repo.join(owner_rel)).unwrap();
+    let owner_production = rust_sanitized_production_text(&owner_text);
+    let mut violations = BTreeSet::new();
+
+    for (kind, name) in [
+        ("struct", "QueryResult"),
+        ("struct", "QueryResultColumn"),
+        ("fn", "build_string_query_result"),
+        ("fn", "record_batch_to_chunk"),
+    ] {
+        if !source_defines_named_item(&owner_production, kind, name) {
+            violations.insert(format!("runtime-owner-missing: {kind} {name}"));
+        }
+    }
+
+    for path in rust_production_canonical_paths(&owner_production, owner_rel) {
+        let canonical = path.join("::");
+        if ["crate::engine", "crate::frontend", "crate::server"]
+            .iter()
+            .any(|prefix| canonical == *prefix || canonical.starts_with(&format!("{prefix}::")))
+        {
+            violations.insert(format!("runtime-reverse-dependency: {canonical}"));
+        }
+        if (canonical == "crate::sql" || canonical.starts_with("crate::sql::"))
+            && canonical != "crate::sql::SqlType"
+        {
+            violations.insert(format!("runtime-sql-dependency-growth: {canonical}"));
+        }
+    }
+    if rust_source_tokens(&owner_production)
+        .iter()
+        .any(|token| token.text == "StandaloneState")
+    {
+        violations.insert("runtime-owner-mentions-StandaloneState".to_string());
+    }
+
+    let expected_runtime_sql_edges =
+        BTreeSet::from(["src/runtime/query_result.rs|crate::sql::SqlType".to_string()]);
+    let actual_runtime_sql_edges = rs_files(&repo.join("src/runtime"))
+        .into_iter()
+        .flat_map(|path| {
+            let source = rel(&path);
+            let text = fs::read_to_string(path).unwrap();
+            let production = rust_sanitized_production_text(&text);
+            rust_production_canonical_paths(&production, &source)
+                .into_iter()
+                .filter(|path| path.len() >= 2 && path[0] == "crate" && path[1] == "sql")
+                .map(move |path| format!("{source}|{}", path.join("::")))
+        })
+        .collect::<BTreeSet<_>>();
+    for missing in expected_runtime_sql_edges.difference(&actual_runtime_sql_edges) {
+        violations.insert(format!("runtime-sql-edge-missing: {missing}"));
+    }
+    for unexpected in actual_runtime_sql_edges.difference(&expected_runtime_sql_edges) {
+        violations.insert(format!("runtime-sql-edge-unexpected: {unexpected}"));
+    }
+
+    let guard_rel = "tests/architecture_guard/ebd_1_engine_boundary.rs";
+    let sources = rs_files(&repo.join("src"))
+        .into_iter()
+        .chain(rs_files(&repo.join("tests")))
+        .filter(|path| rel(path) != guard_rel)
+        .map(|path| {
+            let source = rel(&path);
+            let text = fs::read_to_string(path).unwrap();
+            GuardSource::new(&source, &text)
+        })
+        .collect::<Vec<_>>();
+    violations.extend(ebd_3c_legacy_paths_in_sources(&sources));
+
+    for path in rs_files(&repo.join("src")) {
+        let source = rel(&path);
+        let text = fs::read_to_string(path).unwrap();
+        for (kind, name) in [
+            ("struct", "QueryResult"),
+            ("struct", "QueryResultColumn"),
+            ("enum", "QueryResult"),
+            ("enum", "QueryResultColumn"),
+            ("trait", "QueryResult"),
+            ("trait", "QueryResultColumn"),
+            ("type", "QueryResult"),
+            ("type", "QueryResultColumn"),
+            ("fn", "build_string_query_result"),
+            ("fn", "record_batch_to_chunk"),
+        ] {
+            if source_defines_named_item(&text, kind, name) && source != owner_rel {
+                violations.insert(format!("duplicate-result-owner: {source}|{kind} {name}"));
+            }
+        }
+    }
+    violations.extend(sources.iter().flat_map(ebd_3c_all_source_alias_surfaces));
+
+    assert!(
+        violations.is_empty(),
+        "EBD-3C query-result boundary failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_3c_all_source_declaration_detector_covers_alias_test_reexport_and_ignores_noise() {
+    let malicious = GuardSource::new(
+        "src/engine/mod.rs",
+        r#"
+use crate::engine::QueryResult;
+use crate::engine::{QueryResultColumn as LegacyColumn, record_batch_to_chunk};
+#[cfg(test)]
+mod tests {
+    use crate::engine::build_string_query_result as text_result;
+}
+use crate::runtime::query_result as canonical_result;
+#[cfg(test)]
+pub use canonical_result::QueryResult as EngineResult;
+pub type EngineResultAlias = crate::runtime::query_result::QueryResult;
+type PrivateResultAlias = crate::runtime::query_result::QueryResult;
+pub type TransitiveResultAlias = PrivateResultAlias;
+#[cfg(test)]
+pub type EngineColumnAlias = canonical_result::QueryResultColumn;
+#[cfg(test)]
+pub use crate::runtime::query_result as TestResultModule;
+pub use canonical_result::*;
+pub use canonical_result::build_string_query_result as TextResultBuilder;
+pub use canonical_result::record_batch_to_chunk as ChunkBuilder;
+"#,
+    );
+    let legacy = ebd_3c_legacy_paths_in_sources(std::slice::from_ref(&malicious));
+    for expected in [
+        "crate::engine::QueryResult",
+        "crate::engine::QueryResultColumn",
+        "crate::engine::record_batch_to_chunk",
+        "crate::engine::build_string_query_result",
+    ] {
+        assert!(
+            legacy.iter().any(|hit| hit.ends_with(expected)),
+            "missing {expected}: {legacy:?}"
+        );
+    }
+    let forwarding = ebd_3c_all_source_alias_surfaces(&malicious);
+    assert!(
+        forwarding.iter().any(|hit| {
+            hit.contains("|EngineResult|")
+                && hit.ends_with("crate::runtime::query_result::QueryResult")
+        }),
+        "test-only transitive forwarding must fail: {forwarding:?}"
+    );
+    for (export_name, surface) in [
+        ("EngineResultAlias", "QueryResult"),
+        ("TransitiveResultAlias", "QueryResult"),
+        ("EngineColumnAlias", "QueryResultColumn"),
+        ("TextResultBuilder", "build_string_query_result"),
+        ("ChunkBuilder", "record_batch_to_chunk"),
+    ] {
+        assert!(
+            forwarding.iter().any(|hit| {
+                hit.contains(&format!("|{export_name}|"))
+                    && hit.ends_with(&format!("crate::runtime::query_result::{surface}"))
+            }),
+            "renamed alias must fail for {surface}: {forwarding:?}"
+        );
+    }
+    for export_name in ["TestResultModule", "*"] {
+        for surface in EBD_3C_RESULT_SURFACES {
+            assert!(
+                forwarding.iter().any(|hit| {
+                    hit.contains(&format!("|{export_name}|"))
+                        && hit.ends_with(&format!("crate::runtime::query_result::{surface}"))
+                }),
+                "module/glob forwarding must expose {surface}: {forwarding:?}"
+            );
+        }
+    }
+
+    let clean = GuardSource::new(
+        "src/consumer.rs",
+        r##"
+// use crate::engine::QueryResult;
+const DOC: &str = r#"crate::engine::{QueryResult, record_batch_to_chunk}"#;
+fn query_result_local_name() {}
+use crate::runtime::query_result::QueryResult;
+type LocalResult = crate::runtime::query_result::QueryResult;
+"##,
+    );
+    assert!(ebd_3c_legacy_paths_in_sources(std::slice::from_ref(&clean)).is_empty());
+    assert!(ebd_3c_all_source_alias_surfaces(&clean).is_empty());
+
+    assert_query_result_declaration_detector_rejects_generic_defaults_and_callable_aliases();
+    assert_query_result_declaration_detector_respects_generic_shadowing_and_private_consumers();
+}
+
+fn assert_query_result_declaration_detector_rejects_generic_defaults_and_callable_aliases() {
+    let malicious = GuardSource::new(
+        "src/engine/mod.rs",
+        r#"
+pub type DefaultedResult<T = crate::runtime::query_result::QueryResult> = T;
+pub(crate) const STRING_RESULT_FACTORY: fn(&str, Vec<String>)
+    -> Result<crate::runtime::query_result::QueryResult, String> =
+    crate::runtime::query_result::build_string_query_result;
+#[cfg(test)]
+pub static CHUNK_FACTORY: fn(arrow::record_batch::RecordBatch)
+    -> Result<crate::exec::chunk::Chunk, String> =
+    crate::runtime::query_result::record_batch_to_chunk;
+pub const CAST_CHUNK_FACTORY: fn(arrow::record_batch::RecordBatch)
+    -> Result<crate::exec::chunk::Chunk, String> =
+    crate::runtime::query_result::record_batch_to_chunk
+        as fn(arrow::record_batch::RecordBatch)
+            -> Result<crate::exec::chunk::Chunk, String>;
+pub const NESTED_STRING_FACTORY: fn(&str, Vec<String>)
+    -> Result<crate::runtime::query_result::QueryResult, String> = {
+    let factory = crate::runtime::query_result::build_string_query_result;
+    factory
+};
+
+pub struct ResultFactories;
+impl ResultFactories {
+    pub const IMPL_TEXT: fn(&str, Vec<String>)
+        -> Result<crate::runtime::query_result::QueryResult, String> =
+        crate::runtime::query_result::build_string_query_result;
+    pub const IMPL_CHUNK: fn(arrow::record_batch::RecordBatch)
+        -> Result<crate::exec::chunk::Chunk, String> = {
+        crate::runtime::query_result::record_batch_to_chunk
+            as fn(arrow::record_batch::RecordBatch)
+                -> Result<crate::exec::chunk::Chunk, String>
+    };
+    const PRIVATE_TEXT: fn(&str, Vec<String>)
+        -> Result<crate::runtime::query_result::QueryResult, String> =
+        crate::runtime::query_result::build_string_query_result;
+}
+
+pub trait ResultFactoryDefaults {
+    const TRAIT_TEXT: fn(&str, Vec<String>)
+        -> Result<crate::runtime::query_result::QueryResult, String> =
+        crate::runtime::query_result::build_string_query_result;
+}
+"#,
+    );
+
+    let declarations = ebd_3c_all_source_alias_surfaces(&malicious);
+    for (export_name, surface) in [
+        ("DefaultedResult", "QueryResult"),
+        ("STRING_RESULT_FACTORY", "build_string_query_result"),
+        ("CHUNK_FACTORY", "record_batch_to_chunk"),
+        ("CAST_CHUNK_FACTORY", "record_batch_to_chunk"),
+        ("NESTED_STRING_FACTORY", "build_string_query_result"),
+        ("IMPL_TEXT", "build_string_query_result"),
+        ("IMPL_CHUNK", "record_batch_to_chunk"),
+        ("TRAIT_TEXT", "build_string_query_result"),
+    ] {
+        assert!(
+            declarations.iter().any(|hit| {
+                hit.contains(&format!("|{export_name}|"))
+                    && hit.ends_with(&format!("crate::runtime::query_result::{surface}"))
+            }),
+            "visible declaration must fail for {surface}: {declarations:?}"
+        );
+    }
+}
+
+fn assert_query_result_declaration_detector_respects_generic_shadowing_and_private_consumers() {
+    let clean = GuardSource::new(
+        "src/consumer.rs",
+        r#"
+type T = crate::runtime::query_result::QueryResult;
+pub type Identity<T> = T;
+const LOCAL_STRING_FACTORY: fn(&str, Vec<String>)
+    -> Result<crate::runtime::query_result::QueryResult, String> =
+    crate::runtime::query_result::build_string_query_result;
+static LOCAL_CHUNK_FACTORY: fn(arrow::record_batch::RecordBatch)
+    -> Result<crate::exec::chunk::Chunk, String> =
+    crate::runtime::query_result::record_batch_to_chunk;
+
+pub struct CleanFactories;
+impl CleanFactories {
+    const PRIVATE_CHUNK: fn(arrow::record_batch::RecordBatch)
+        -> Result<crate::exec::chunk::Chunk, String> =
+        crate::runtime::query_result::record_batch_to_chunk;
+}
+
+trait PrivateFactoryDefaults {
+    const PRIVATE_TEXT: fn(&str, Vec<String>)
+        -> Result<crate::runtime::query_result::QueryResult, String> =
+        crate::runtime::query_result::build_string_query_result;
+}
+"#,
+    );
+
+    assert!(
+        ebd_3c_all_source_alias_surfaces(&clean).is_empty(),
+        "generic parameters shadow module aliases and private consumers stay allowed"
     );
 }
 

@@ -30,9 +30,10 @@ use crate::connector::iceberg::changes::{
 use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
-use crate::engine::{QueryResult, StandaloneState, execute_query};
+use crate::engine::{StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
+use crate::runtime::query_result::QueryResult;
 
 pub(crate) struct IvmDeltaSourceFiles {
     pub previous_snapshot_id: i64,

@@ -33,6 +33,9 @@ use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::query_result::{
+    QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
+};
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, normalize_identifier};
 use crate::connector::{
@@ -113,7 +116,6 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
-pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::catalog::LegacyRangePartition;
 pub use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
 use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
@@ -347,34 +349,6 @@ pub struct StandaloneStarRocksTableInfo {
 pub(crate) enum StatementResult {
     Query(QueryResult),
     Ok,
-}
-
-pub(crate) fn build_string_query_result(
-    column_name: &str,
-    rows: Vec<String>,
-) -> Result<QueryResult, String> {
-    let column = QueryResultColumn {
-        name: column_name.to_string(),
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: None,
-    };
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        column_name,
-        DataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(StringArray::from(
-            rows.into_iter().map(Some).collect::<Vec<_>>(),
-        ))],
-    )
-    .map_err(|e| format!("build standalone text result failed: {e}"))?;
-    Ok(QueryResult {
-        columns: vec![column],
-        chunks: vec![record_batch_to_chunk(batch)?],
-    })
 }
 
 pub(crate) struct StandaloneState {
@@ -2578,19 +2552,6 @@ where
         return Ok(handle.block_on(future));
     }
     data_block_on(future)
-}
-
-pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
-    let slot_ids = (1..=batch.num_columns())
-        .map(|idx| {
-            u32::try_from(idx)
-                .map(crate::common::ids::SlotId::new)
-                .map_err(|_| "too many output columns".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
-    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
 // ---------------------------------------------------------------------------

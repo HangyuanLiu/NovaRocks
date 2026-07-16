@@ -42,9 +42,10 @@ use crate::engine::mv_flow::analyze_visible_output_types;
 use crate::engine::mv_flow::{
     analyze_visible_query, execute_query_for_mv_refresh, execute_query_for_mv_refresh_with_catalog,
 };
-use crate::engine::{QueryResult, StandaloneState, StatementResult, record_batch_to_chunk};
+use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
+use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
 use crate::connector::starrocks::table::catalog::{
@@ -1348,7 +1349,7 @@ fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String
 
 #[cfg(test)]
 fn query_result_column_to_output_column(
-    column: &crate::engine::QueryResultColumn,
+    column: &crate::runtime::query_result::QueryResultColumn,
 ) -> Result<crate::sql::analysis::OutputColumn, String> {
     Ok(crate::sql::analysis::OutputColumn {
         column_id: crate::sql::column_id::ColumnId::UNSET,
@@ -1889,9 +1890,9 @@ mod tests {
         build_create_tablet_request, build_tablet_schema,
     };
     use crate::engine::catalog::InMemoryCatalog;
-    use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
     use crate::meta::MetaStoreProvider;
+    use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;

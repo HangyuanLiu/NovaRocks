@@ -44,7 +44,7 @@ use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::meta::repository::mv::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::meta::repository::starrocks_txn::StoredStarRocksTxn;
-use crate::runtime::query_result::QueryResult;
+use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
     DeleteDataRequest, DeletePredicatePb, KeysType, PublishVersionRequest, TableSchemaKeyPb,
@@ -56,7 +56,7 @@ use super::catalog::register_starrocks_table_in_catalog;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
-    execute_query, record_batch_to_chunk, reorder_insert_rows,
+    execute_query, reorder_insert_rows,
 };
 use crate::exec::expr::cast_with_special_rules;
 

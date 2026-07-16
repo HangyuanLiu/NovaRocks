@@ -2081,7 +2081,7 @@ fn execute_update_match_query(
 }
 
 fn matched_update_batch_from_query_result(
-    result: crate::engine::QueryResult,
+    result: QueryResult,
 ) -> Result<MatchedUpdateBatch, String> {
     let Some(first_chunk) = result.chunks.first() else {
         return empty_matched_update_batch();

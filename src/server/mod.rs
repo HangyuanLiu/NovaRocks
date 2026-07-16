@@ -50,6 +50,7 @@ use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
 };
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
+use crate::runtime::query_result::QueryResult;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::parser::dialect::StarRocksDialect;
 use crate::sql::parser::dialect::backend::{
@@ -1366,7 +1367,7 @@ fn parenthesized_query(value: &str) -> Option<&str> {
 }
 
 fn query_result_to_user_variable_literal(
-    result: &crate::engine::QueryResult,
+    result: &QueryResult,
 ) -> Result<String, (ErrorKind, String)> {
     if result.columns.len() != 1 {
         return Err((
@@ -1960,7 +1961,7 @@ mod tests {
             vec![array],
         )
         .expect("record batch");
-        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let chunk = crate::runtime::query_result::record_batch_to_chunk(batch).expect("chunk");
         let result = crate::runtime::query_result::QueryResult {
             columns: vec![crate::runtime::query_result::QueryResultColumn {
                 name: "arr".to_string(),
@@ -1989,7 +1990,7 @@ mod tests {
             vec![array],
         )
         .expect("record batch");
-        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let chunk = crate::runtime::query_result::record_batch_to_chunk(batch).expect("chunk");
         let result = crate::runtime::query_result::QueryResult {
             columns: vec![crate::runtime::query_result::QueryResultColumn {
                 name: "arr".to_string(),
