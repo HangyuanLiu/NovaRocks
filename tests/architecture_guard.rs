@@ -11532,15 +11532,69 @@ fn runtime_filter_is_exact_action_dispatch(call: &syn::ExprMethodCall) -> bool {
         && matches!(call.args.last(), Some(syn::Expr::Path(path)) if path.path.is_ident("action"))
 }
 
-fn runtime_filter_expr_is_top_level_action_dispatch(expression: &syn::Expr) -> bool {
+fn runtime_filter_syn_expr_attributes(expression: &syn::Expr) -> Result<&[syn::Attribute], ()> {
+    let attributes = match expression {
+        syn::Expr::Array(expression) => &expression.attrs,
+        syn::Expr::Assign(expression) => &expression.attrs,
+        syn::Expr::Async(expression) => &expression.attrs,
+        syn::Expr::Await(expression) => &expression.attrs,
+        syn::Expr::Binary(expression) => &expression.attrs,
+        syn::Expr::Block(expression) => &expression.attrs,
+        syn::Expr::Break(expression) => &expression.attrs,
+        syn::Expr::Call(expression) => &expression.attrs,
+        syn::Expr::Cast(expression) => &expression.attrs,
+        syn::Expr::Closure(expression) => &expression.attrs,
+        syn::Expr::Const(expression) => &expression.attrs,
+        syn::Expr::Continue(expression) => &expression.attrs,
+        syn::Expr::Field(expression) => &expression.attrs,
+        syn::Expr::ForLoop(expression) => &expression.attrs,
+        syn::Expr::Group(expression) => &expression.attrs,
+        syn::Expr::If(expression) => &expression.attrs,
+        syn::Expr::Index(expression) => &expression.attrs,
+        syn::Expr::Infer(expression) => &expression.attrs,
+        syn::Expr::Let(expression) => &expression.attrs,
+        syn::Expr::Lit(expression) => &expression.attrs,
+        syn::Expr::Loop(expression) => &expression.attrs,
+        syn::Expr::Macro(expression) => &expression.attrs,
+        syn::Expr::Match(expression) => &expression.attrs,
+        syn::Expr::MethodCall(expression) => &expression.attrs,
+        syn::Expr::Paren(expression) => &expression.attrs,
+        syn::Expr::Path(expression) => &expression.attrs,
+        syn::Expr::Range(expression) => &expression.attrs,
+        syn::Expr::RawAddr(expression) => &expression.attrs,
+        syn::Expr::Reference(expression) => &expression.attrs,
+        syn::Expr::Repeat(expression) => &expression.attrs,
+        syn::Expr::Return(expression) => &expression.attrs,
+        syn::Expr::Struct(expression) => &expression.attrs,
+        syn::Expr::Try(expression) => &expression.attrs,
+        syn::Expr::TryBlock(expression) => &expression.attrs,
+        syn::Expr::Tuple(expression) => &expression.attrs,
+        syn::Expr::Unary(expression) => &expression.attrs,
+        syn::Expr::Unsafe(expression) => &expression.attrs,
+        syn::Expr::While(expression) => &expression.attrs,
+        syn::Expr::Yield(expression) => &expression.attrs,
+        syn::Expr::Verbatim(_) => return Err(()),
+        _ => return Err(()),
+    };
+    Ok(attributes)
+}
+
+fn runtime_filter_expr_is_top_level_action_dispatch(expression: &syn::Expr) -> Result<bool, ()> {
+    match runtime_filter_syn_attributes_test_requirement(runtime_filter_syn_expr_attributes(
+        expression,
+    )?) {
+        CfgTestRequirement::RequiresTest => return Ok(false),
+        CfgTestRequirement::Unproven => return Err(()),
+        CfgTestRequirement::ProductionPossible => {}
+    }
     match expression {
-        syn::Expr::MethodCall(call) => runtime_filter_is_exact_action_dispatch(call),
+        syn::Expr::MethodCall(call) => Ok(runtime_filter_is_exact_action_dispatch(call)),
         syn::Expr::Group(group) => runtime_filter_expr_is_top_level_action_dispatch(&group.expr),
         syn::Expr::Paren(paren) => runtime_filter_expr_is_top_level_action_dispatch(&paren.expr),
         syn::Expr::Try(expression) => {
             runtime_filter_expr_is_top_level_action_dispatch(&expression.expr)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -11548,9 +11602,43 @@ fn runtime_filter_expr_is_top_level_action_dispatch(expression: &syn::Expr) -> b
 struct RuntimeFilterFinishBindingAudit {
     all_exact_dispatches: usize,
     shadows_action: bool,
+    cfg_unproven: bool,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterFinishBindingAudit {
+    fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+        let attributes = match statement {
+            syn::Stmt::Local(local) => &local.attrs,
+            syn::Stmt::Item(syn::Item::Verbatim(_)) => {
+                self.cfg_unproven = true;
+                return;
+            }
+            syn::Stmt::Item(item) => runtime_filter_syn_item_attributes(item),
+            syn::Stmt::Expr(expression, _) => {
+                syn::visit::Visit::visit_expr(self, expression);
+                return;
+            }
+            syn::Stmt::Macro(statement) => &statement.attrs,
+        };
+        match runtime_filter_syn_attributes_test_requirement(attributes) {
+            CfgTestRequirement::RequiresTest => {}
+            CfgTestRequirement::Unproven => self.cfg_unproven = true,
+            CfgTestRequirement::ProductionPossible => syn::visit::visit_stmt(self, statement),
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        let Ok(attributes) = runtime_filter_syn_expr_attributes(expression) else {
+            self.cfg_unproven = true;
+            return;
+        };
+        match runtime_filter_syn_attributes_test_requirement(attributes) {
+            CfgTestRequirement::RequiresTest => {}
+            CfgTestRequirement::Unproven => self.cfg_unproven = true,
+            CfgTestRequirement::ProductionPossible => syn::visit::visit_expr(self, expression),
+        }
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if runtime_filter_is_exact_action_dispatch(call) {
             self.all_exact_dispatches += 1;
@@ -11566,14 +11654,40 @@ impl<'ast> syn::visit::Visit<'ast> for RuntimeFilterFinishBindingAudit {
     }
 }
 
-fn runtime_filter_finish_binding_audit(block: &syn::Block) -> (bool, usize, usize) {
+fn runtime_filter_finish_statement_test_requirement(statement: &syn::Stmt) -> CfgTestRequirement {
+    let attributes = match statement {
+        syn::Stmt::Local(local) => &local.attrs,
+        syn::Stmt::Item(syn::Item::Verbatim(_)) => return CfgTestRequirement::Unproven,
+        syn::Stmt::Item(item) => runtime_filter_syn_item_attributes(item),
+        syn::Stmt::Expr(expression, _) => {
+            return runtime_filter_syn_expr_attributes(expression)
+                .map(runtime_filter_syn_attributes_test_requirement)
+                .unwrap_or(CfgTestRequirement::Unproven);
+        }
+        syn::Stmt::Macro(statement) => &statement.attrs,
+    };
+    runtime_filter_syn_attributes_test_requirement(attributes)
+}
+
+fn runtime_filter_finish_binding_audit(block: &syn::Block) -> (bool, usize, usize, bool) {
     let mut full = RuntimeFilterFinishBindingAudit::default();
     syn::visit::Visit::visit_block(&mut full, block);
     let mut top_level_dispatches = 0usize;
     for statement in &block.stmts {
-        if matches!(statement, syn::Stmt::Expr(expression, _) if runtime_filter_expr_is_top_level_action_dispatch(expression))
-        {
-            top_level_dispatches += 1;
+        match runtime_filter_finish_statement_test_requirement(statement) {
+            CfgTestRequirement::RequiresTest => continue,
+            CfgTestRequirement::Unproven => {
+                full.cfg_unproven = true;
+                continue;
+            }
+            CfgTestRequirement::ProductionPossible => {}
+        }
+        if let syn::Stmt::Expr(expression, _) = statement {
+            match runtime_filter_expr_is_top_level_action_dispatch(expression) {
+                Ok(true) => top_level_dispatches += 1,
+                Ok(false) => {}
+                Err(()) => full.cfg_unproven = true,
+            }
         }
         if runtime_filter_statement_definitely_terminates(statement) {
             break;
@@ -11583,6 +11697,7 @@ fn runtime_filter_finish_binding_audit(block: &syn::Block) -> (bool, usize, usiz
         full.shadows_action,
         full.all_exact_dispatches,
         top_level_dispatches,
+        full.cfg_unproven,
     )
 }
 
@@ -11624,7 +11739,13 @@ fn runtime_filter_action_dispatch_boundary_violations(producer: &str) -> Vec<Str
             _ => {}
         }
     }
-    if !matches!(finish_audits.as_slice(), [(false, 1, 1)]) {
+    if finish_audits.iter().any(|audit| audit.3) {
+        violations.push(
+            "Service producer bounded cfg analysis was unproven inside finish; action audit fails closed"
+                .to_string(),
+        );
+    }
+    if !matches!(finish_audits.as_slice(), [(false, 1, 1, false)]) {
         violations.push(
             "Service producer finish must dispatch its input action without shadowing or rebinding"
                 .to_string(),
@@ -15735,6 +15856,64 @@ fn force_sanitizer_failure() {
     assert!(
         !runtime_filter_action_dispatch_boundary_violations(cfg_test_only_impl_finish).is_empty(),
         "a cfg(test)-only impl finish must not satisfy the raw action fallback"
+    );
+    let cfg_test_only_body_dispatch = r#"
+macro_rules! finish_token_decoy {
+    () => {
+        fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+            self.dispatcher.dispatch(self.channel_id, action);
+        }
+    };
+}
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {
+    #[cfg(test)]
+    self.dispatcher.dispatch(self.channel_id, action);
+}
+fn submit(&self) { self.channel.submit().map(|action| self.finish(action)); }
+fn close_partition(&self) { self.channel.close_partition().map(|action| self.finish(action)); }
+fn fail(&self) { self.channel.fail_instance().map(|action| self.finish(action)); }
+fn force_sanitizer_failure() {
+    let _value = 1 + #[cfg(test)] 2;
+}
+"#;
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(cfg_test_only_body_dispatch).is_empty(),
+        "a cfg(test)-only finish body dispatch must not satisfy the raw action fallback"
+    );
+    let nested_cfg_test_only_body_dispatch = cfg_test_only_body_dispatch.replace(
+        "    #[cfg(test)]\n    self.dispatcher.dispatch(self.channel_id, action);",
+        "    {\n        #[cfg(test)]\n        self.dispatcher.dispatch(self.channel_id, action);\n    }",
+    );
+    assert!(
+        !runtime_filter_action_dispatch_boundary_violations(&nested_cfg_test_only_body_dispatch)
+            .is_empty(),
+        "a nested cfg(test)-only finish body dispatch must not satisfy the raw action fallback"
+    );
+    let tautologies = (0..12)
+        .map(|index| format!("any(feature = \"x{index}\", not(feature = \"x{index}\"))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hard_unsatisfiable =
+        format!("#[cfg(all({tautologies}, feature = \"zz\", not(feature = \"zz\")))]");
+    let unproven_body_dispatch = format!(
+        r#"
+fn finish(&self, action: crate::runtime_filter::core::channel::ChannelAction) {{
+    {hard_unsatisfiable}
+    self.dispatcher.dispatch(self.channel_id, action);
+}}
+fn submit(&self) {{ self.channel.submit().map(|action| self.finish(action)); }}
+fn close_partition(&self) {{ self.channel.close_partition().map(|action| self.finish(action)); }}
+fn fail(&self) {{ self.channel.fail_instance().map(|action| self.finish(action)); }}
+fn force_sanitizer_failure() {{
+    let _value = 1 + #[cfg(test)] 2;
+}}
+"#
+    );
+    assert!(
+        runtime_filter_action_dispatch_boundary_violations(&unproven_body_dispatch)
+            .iter()
+            .any(|violation| violation.contains("bounded cfg analysis")),
+        "an unproven finish body expression must fail the raw action fallback closed"
     );
     for bad in [
         good.replace("ChannelAction", "SubmitOutcome"),
