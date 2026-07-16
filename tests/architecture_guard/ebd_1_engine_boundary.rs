@@ -13768,6 +13768,99 @@ fn ebd_5a1_public_forwarding_reexports(source: &GuardSource) -> BTreeSet<String>
         .collect()
 }
 
+fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSet<String> {
+    const RUNTIME_TYPES: &[&str] = &[
+        "MemoryCatalog",
+        "CatalogRegistry",
+        "SchemaCache",
+        "CatalogService",
+    ];
+
+    fn runtime_types(ty: &syn::Type) -> BTreeSet<String> {
+        struct Visitor {
+            found: BTreeSet<String>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Visitor {
+            fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                if let Some(symbol) = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    && RUNTIME_TYPES.contains(&symbol.as_str())
+                {
+                    self.found.insert(symbol);
+                }
+                syn::visit::visit_type_path(self, path);
+            }
+        }
+
+        let mut visitor = Visitor {
+            found: BTreeSet::new(),
+        };
+        syn::visit::Visit::visit_type(&mut visitor, ty);
+        visitor.found
+    }
+
+    struct Visitor<'a> {
+        path: &'a str,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            for symbol in runtime_types(&item.ty) {
+                self.violations.insert(format!(
+                    "catalog-runtime-type-alias: {}|{}|{symbol}",
+                    self.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let canonical_owner = EBD_5A1_REQUIRED_OWNERS
+                .iter()
+                .any(|(path, symbol)| self.path == *path && item.ident == *symbol);
+            if !canonical_owner
+                && matches!(&item.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1)
+            {
+                let field = item.fields.iter().next().expect("single struct field");
+                for symbol in runtime_types(&field.ty) {
+                    self.violations.insert(format!(
+                        "catalog-runtime-wrapper: {}|{}|{symbol}",
+                        self.path, item.ident
+                    ));
+                }
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::new();
+    };
+    let mut visitor = Visitor {
+        path: &source.path,
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.violations
+}
+
 fn ebd_5a1_production_function_names(source: &str) -> BTreeSet<String> {
     struct Visitor {
         names: BTreeSet<String>,
@@ -13785,6 +13878,12 @@ fn ebd_5a1_production_function_names(source: &str) -> BTreeSet<String> {
             if !ebd_5a1_attrs_are_test_only(&item.attrs) {
                 self.names.insert(item.sig.ident.to_string());
                 syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
             }
         }
 
@@ -13806,31 +13905,40 @@ fn ebd_5a1_production_function_names(source: &str) -> BTreeSet<String> {
 }
 
 fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String> {
-    struct StandaloneStatePath {
-        found: bool,
+    #[derive(Default)]
+    struct FunctionNode {
+        accepts_state: bool,
+        touches_catalog_runtime: bool,
+        direct_registration: bool,
+        calls: BTreeSet<String>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for StandaloneStatePath {
+    #[derive(Default)]
+    struct SignatureTypes {
+        state: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for SignatureTypes {
         fn visit_path(&mut self, path: &'ast syn::Path) {
-            if path
-                .segments
-                .iter()
-                .any(|segment| segment.ident == "StandaloneState")
-            {
-                self.found = true;
+            for segment in &path.segments {
+                match segment.ident.to_string().as_str() {
+                    "StandaloneState" => self.state = true,
+                    _ => {}
+                }
             }
             syn::visit::visit_path(self, path);
         }
     }
 
     #[derive(Default)]
-    struct CatalogRegistrationBody {
+    struct FunctionBody {
         legacy_registry: bool,
         service: bool,
         service_registration: bool,
+        calls: BTreeSet<String>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for CatalogRegistrationBody {
+    impl<'ast> syn::visit::Visit<'ast> for FunctionBody {
         fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
             if let syn::Member::Named(name) = &field.member {
                 match name.to_string().as_str() {
@@ -13843,23 +13951,35 @@ fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String
         }
 
         fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-            if path.path.segments.iter().any(|segment| {
-                let name = segment.ident.to_string();
-                matches!(
+            if let Some(name) = path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+            {
+                if matches!(
                     name.as_str(),
                     "register_default_catalog_mgr_entries" | "register_iceberg_catalog_mgr_entry"
-                )
-            }) {
-                self.legacy_registry = true;
+                ) {
+                    self.legacy_registry = true;
+                }
             }
             syn::visit::visit_expr_path(self, path);
         }
 
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref()
+                && let Some(name) = path.path.segments.last()
+            {
+                self.calls.insert(name.ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            if matches!(
-                call.method.to_string().as_str(),
-                "register_catalog" | "unregister_catalog"
-            ) {
+            let method = call.method.to_string();
+            self.calls.insert(method.clone());
+            if matches!(method.as_str(), "register_catalog" | "unregister_catalog") {
                 self.service_registration = true;
             }
             syn::visit::visit_expr_method_call(self, call);
@@ -13867,23 +13987,24 @@ fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String
     }
 
     struct Visitor {
-        helpers: BTreeSet<String>,
+        functions: BTreeMap<String, FunctionNode>,
     }
 
     impl Visitor {
         fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
-            let mut state = StandaloneStatePath { found: false };
-            syn::visit::Visit::visit_signature(&mut state, signature);
-            if !state.found {
-                return;
-            }
-            let mut registration = CatalogRegistrationBody::default();
-            syn::visit::Visit::visit_block(&mut registration, block);
-            if registration.legacy_registry
-                || (registration.service && registration.service_registration)
-            {
-                self.helpers.insert(signature.ident.to_string());
-            }
+            let mut signature_types = SignatureTypes::default();
+            syn::visit::Visit::visit_signature(&mut signature_types, signature);
+            let mut body = FunctionBody::default();
+            syn::visit::Visit::visit_block(&mut body, block);
+            self.functions.insert(
+                signature.ident.to_string(),
+                FunctionNode {
+                    accepts_state: signature_types.state,
+                    touches_catalog_runtime: body.legacy_registry || body.service,
+                    direct_registration: body.legacy_registry || body.service_registration,
+                    calls: body.calls,
+                },
+            );
         }
     }
 
@@ -13902,6 +14023,12 @@ fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String
             }
         }
 
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
         fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
             if !ebd_5a1_attrs_are_test_only(&item.attrs) {
                 syn::visit::visit_item_mod(self, item);
@@ -13913,10 +14040,43 @@ fn ebd_5a1_connector_state_registration_helpers(source: &str) -> BTreeSet<String
         return BTreeSet::new();
     };
     let mut visitor = Visitor {
-        helpers: BTreeSet::new(),
+        functions: BTreeMap::new(),
     };
     syn::visit::Visit::visit_file(&mut visitor, &file);
-    visitor.helpers
+
+    let mut reaches_registration = visitor
+        .functions
+        .iter()
+        .filter(|(_, node)| node.direct_registration)
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut changed = false;
+        for (name, node) in &visitor.functions {
+            if !reaches_registration.contains(name)
+                && node
+                    .calls
+                    .iter()
+                    .any(|callee| reaches_registration.contains(callee))
+            {
+                changed |= reaches_registration.insert(name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    visitor
+        .functions
+        .into_iter()
+        .filter(|(name, node)| {
+            node.accepts_state
+                && node.touches_catalog_runtime
+                && reaches_registration.contains(name)
+        })
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn ebd_5a1_standalone_state_fields(source: &str) -> BTreeMap<String, usize> {
@@ -14051,6 +14211,7 @@ fn ebd_5a1_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     }
 
     for source in sources.values() {
+        violations.extend(ebd_5a1_runtime_alias_and_wrapper_violations(source));
         for target in ebd_5a1_public_forwarding_reexports(source) {
             violations.insert(format!(
                 "catalog-runtime-forwarding-reexport: {}|{target}",
@@ -14241,6 +14402,217 @@ fn register_catalog(state: &StandaloneState) {
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "EBD-5A1 detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_arbitrarily_named_runtime_aliases_and_wrappers() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            r#"
+pub(crate) struct CatalogService<T, M> {
+    local: MemoryCatalog<T>,
+    registry: CatalogRegistry<M>,
+}
+"#,
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            r#"
+pub(crate) struct CatalogServiceProvider<'a, T, M> {
+    service: &'a CatalogService<T, M>,
+    current_catalog: Option<&'a str>,
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            r#"
+struct StandaloneState {
+    catalog_service: Arc<CatalogService<(), ()>>,
+    connectors: Arc<()>,
+}
+
+struct CatalogServiceHolder {
+    catalog_service: Arc<CatalogService<(), ()>>,
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "real service composition fields must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/legacy_registry.rs",
+        r#"
+type LegacyRegistry<M> = CatalogRegistry<M>;
+struct LegacyCache<M>(SchemaCache<M>);
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-type-alias: src/engine/legacy_registry.rs|LegacyRegistry|CatalogRegistry",
+        "catalog-runtime-wrapper: src/engine/legacy_registry.rs|LegacyCache|SchemaCache",
+    ] {
+        assert!(
+            violations.contains(expected),
+            "EBD-5A1 detector missed arbitrary runtime alias/wrapper {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_cross_function_connector_registration_forwarding() {
+    let mut sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+    ];
+    sources.push(GuardSource::new(
+        "src/connector/catalog_forward.rs",
+        r#"
+fn install_catalog(service: &StandaloneCatalogService) {
+    service.register_catalog(build_catalog());
+}
+
+fn forward_catalog(state: &StandaloneState) {
+    install_catalog(&state.catalog_service);
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.contains(
+            "catalog-runtime-connector-state-registration: src/connector/catalog_forward.rs|forward_catalog"
+        ),
+        "EBD-5A1 detector missed cross-function connector registration forwarding: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_excludes_test_only_impls_but_rejects_production_impls() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/engine/test_impl.rs",
+            r#"
+struct OwnerFixture;
+#[cfg(test)]
+impl OwnerFixture {
+    fn execute_query_with_catalog_mgr(&self) {}
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/connector/test_impl.rs",
+            r#"
+struct ConnectorFixture;
+#[cfg(test)]
+impl ConnectorFixture {
+    fn install(&self, state: &StandaloneState) {
+        state.catalog_service.register_catalog(build_catalog());
+    }
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "entire cfg(test) impl blocks must remain excluded: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/production_impl.rs",
+        r#"
+struct ProductionOwner;
+impl ProductionOwner {
+    fn execute_query_with_catalog_mgr(&self) {}
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/production_impl.rs",
+        r#"
+struct ProductionConnector;
+impl ProductionConnector {
+    fn install(&self, state: &StandaloneState) {
+        state.catalog_service.register_catalog(build_catalog());
+    }
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-retired-helper: src/engine/production_impl.rs|execute_query_with_catalog_mgr",
+        "catalog-runtime-connector-state-registration: src/connector/production_impl.rs|install",
+    ] {
+        assert!(
+            violations.contains(expected),
+            "EBD-5A1 detector missed production impl violation {expected}: {violations:?}"
         );
     }
 }
