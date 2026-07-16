@@ -68,6 +68,30 @@ impl WireContributionKind {
     }
 }
 
+fn encode_frame_header(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+    payload.push(kind.tag());
+    payload.push(0);
+}
+
+fn decode_frame_header(
+    reader: &mut Reader<'_>,
+) -> Result<WireContributionKind, ContributionCodecError> {
+    if reader.read_exact(MAGIC.len())? != MAGIC {
+        return Err(ContributionCodecError::Malformed);
+    }
+    if reader.read_u16()? != CODEC_VERSION {
+        return Err(ContributionCodecError::UnknownVersion);
+    }
+    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
+        .ok_or(ContributionCodecError::UnknownKind)?;
+    if reader.read_u8()? != 0 {
+        return Err(ContributionCodecError::InvalidFlags);
+    }
+    Ok(frame_kind)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterContribution {
     Membership(ValueDomainDelta),
@@ -212,17 +236,7 @@ pub(crate) fn decode_contribution(
     }
 
     let mut reader = Reader::new(payload);
-    if reader.read_exact(MAGIC.len())? != MAGIC {
-        return Err(ContributionCodecError::Malformed);
-    }
-    if reader.read_u16()? != CODEC_VERSION {
-        return Err(ContributionCodecError::UnknownVersion);
-    }
-    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
-        .ok_or(ContributionCodecError::UnknownKind)?;
-    if reader.read_u8()? != 0 {
-        return Err(ContributionCodecError::InvalidFlags);
-    }
+    let frame_kind = decode_frame_header(&mut reader)?;
     let frame_digest = reader.read_array::<32>()?;
     let body_len =
         usize::try_from(reader.read_u64()?).map_err(|_| ContributionCodecError::LengthOverflow)?;
@@ -359,10 +373,7 @@ fn encode_contribution_with_allocator(
     };
     let body_len = u64::try_from(body_len).map_err(|_| ContributionCodecError::LengthOverflow)?;
     let mut payload = allocator.allocate(exact_len)?;
-    payload.extend_from_slice(MAGIC);
-    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
-    payload.push(kind.tag());
-    payload.push(0);
+    encode_frame_header(&mut payload, kind);
     payload.extend_from_slice(&schema_digest);
     payload.extend_from_slice(&body_len.to_be_bytes());
     match contribution {

@@ -43706,50 +43706,7 @@ fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
 
 fn rfd4_m2b2_remote_constructor_call_count(text: &str, source_rel: &str) -> usize {
     let sanitized = rust_sanitized_production_text(text);
-    let mut aliases = rust_production_scoped_aliases(text);
-    if let Ok(file) = syn::parse_file(text) {
-        fn collect_type_aliases(
-            items: &[syn::Item],
-            inline_modules: &mut Vec<String>,
-            aliases: &mut RustScopedAliases,
-        ) {
-            for item in items {
-                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
-                    continue;
-                }
-                match item {
-                    syn::Item::Mod(item_mod) => {
-                        let Some((_, items)) = &item_mod.content else {
-                            continue;
-                        };
-                        inline_modules.push(item_mod.ident.to_string());
-                        collect_type_aliases(items, inline_modules, aliases);
-                        inline_modules.pop();
-                    }
-                    syn::Item::Type(item_type) => {
-                        let syn::Type::Path(target) = item_type.ty.as_ref() else {
-                            continue;
-                        };
-                        let target = RustScopedUsePath {
-                            segments: target
-                                .path
-                                .segments
-                                .iter()
-                                .map(|segment| segment.ident.to_string())
-                                .collect(),
-                            inline_modules: inline_modules.clone(),
-                        };
-                        aliases
-                            .entry((inline_modules.clone(), item_type.ident.to_string()))
-                            .or_default()
-                            .push(target);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        collect_type_aliases(&file.items, &mut Vec::new(), &mut aliases);
-    }
+    let aliases = rust_production_scoped_aliases(text);
     rust_raw_non_use_paths(&sanitized)
         .into_iter()
         .flat_map(|path| {
@@ -43782,6 +43739,47 @@ fn rfd4_m2b2_remote_constructor_call_count(text: &str, source_rel: &str) -> usiz
         .count()
 }
 
+fn rfd4_m2b2_direct_production_path_reference(
+    text: &str,
+    expected_prefix: &[&str],
+) -> Result<bool, String> {
+    struct PathAudit {
+        expected_prefix: Vec<String>,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for PathAudit {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments.len() >= self.expected_prefix.len()
+                && segments
+                    .iter()
+                    .zip(&self.expected_prefix)
+                    .all(|(actual, expected)| actual == expected)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg path ownership is unproven".to_string())?;
+    let mut audit = PathAudit {
+        expected_prefix: expected_prefix
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect(),
+        found: false,
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.found)
+}
+
 fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> Vec<String> {
     const CODEC_OWNER: &str = "src/runtime_filter/codec/contribution.rs";
     const DEFINITION_OWNER: &str = "src/runtime_filter/port/final_domain.rs";
@@ -43799,7 +43797,7 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
         let call_count = rfd4_m2b2_remote_constructor_call_count(text, source_rel);
         let canonical_paths = rust_production_canonical_paths(text, source_rel);
         let canonical_fence_reference = canonical_paths.iter().any(|path| {
-            path.len() == 5
+            path.len() >= 5
                 && rfd4_m2b2_path_starts_with(
                     path,
                     &[
@@ -43809,83 +43807,45 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                         "final_domain",
                         "CompletionFence",
                     ],
+                )
+        }) || rfd4_m2b2_direct_production_path_reference(
+            text,
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "CompletionFence",
+            ],
+        )
+        .unwrap_or(true);
+        let final_domain_glob = canonical_paths.iter().any(|path| {
+            path.last().is_some_and(|segment| segment == "*")
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &["crate", "runtime_filter", "port", "final_domain"],
                 )
         });
         let remote_name_occurrences = tokens
             .iter()
             .filter(|token| token.as_str() == "try_from_remote_codec")
             .count();
-        let canonical_remote = canonical_paths.iter().any(|path| {
-            path.len() == 6
-                && rfd4_m2b2_path_starts_with(
-                    path,
-                    &[
-                        "crate",
-                        "runtime_filter",
-                        "port",
-                        "final_domain",
-                        "CompletionFence",
-                        "try_from_remote_codec",
-                    ],
+        let public_final_domain_namespace = rust_production_scoped_use_statements(text)
+            .into_iter()
+            .any(|statement| {
+                rust_canonical_use_segments_in_scope(
+                    &statement.import,
+                    source_rel,
+                    &statement.inline_modules,
                 )
-        });
-        let final_domain_glob = canonical_paths.iter().any(|path| {
-            rfd4_m2b2_path_starts_with(path, &["crate", "runtime_filter", "port", "final_domain"])
-                && path.last().is_some_and(|last| last == "*")
-        });
-        let public_fence_facade =
-            rust_production_scoped_use_statements(text)
-                .into_iter()
-                .any(|statement| {
-                    rust_use_visibility(&statement.import) != "private"
-                        && rust_canonical_use_segments_in_scope(
-                            &statement.import,
-                            source_rel,
-                            &statement.inline_modules,
+                .is_some_and(|path| {
+                    path.len() == 4
+                        && rfd4_m2b2_path_starts_with(
+                            &path,
+                            &["crate", "runtime_filter", "port", "final_domain"],
                         )
-                        .is_some_and(|path| {
-                            (path.len() == 4
-                                && rfd4_m2b2_path_starts_with(
-                                    &path,
-                                    &["crate", "runtime_filter", "port", "final_domain"],
-                                ))
-                                || (path.len() == 5
-                                    && rfd4_m2b2_path_starts_with(
-                                        &path,
-                                        &[
-                                            "crate",
-                                            "runtime_filter",
-                                            "port",
-                                            "final_domain",
-                                            "CompletionFence",
-                                        ],
-                                    ))
-                        })
-                });
-        #[derive(Default)]
-        struct RemoteMacroAudit {
-            contains_remote_constructor: bool,
-        }
-        impl<'ast> syn::visit::Visit<'ast> for RemoteMacroAudit {
-            fn visit_item(&mut self, item: &'ast syn::Item) {
-                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
-                    return;
-                }
-                syn::visit::visit_item(self, item);
-            }
-
-            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-                if rust_use_tokens(&mac.tokens.to_string())
-                    .iter()
-                    .any(|token| token == "try_from_remote_codec")
-                {
-                    self.contains_remote_constructor = true;
-                }
-                syn::visit::visit_macro(self, mac);
-            }
-        }
-        let mut macro_audit = RemoteMacroAudit::default();
-        syn::visit::Visit::visit_file(&mut macro_audit, parsed.as_ref().expect("checked above"));
+                })
+            });
 
         match source_rel.as_str() {
             DEFINITION_OWNER => {
@@ -43920,14 +43880,9 @@ fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> V
                 }
             }
             _ => {
-                if call_count != 0
-                    || canonical_remote
-                    || final_domain_glob
-                    || public_fence_facade
-                    || (canonical_fence_reference && macro_audit.contains_remote_constructor)
-                {
+                if canonical_fence_reference || final_domain_glob || public_final_domain_namespace {
                     violations.push(format!(
-                        "{source_rel}: remote completion-fence reconstruction escaped the codec owner"
+                        "{source_rel}: canonical CompletionFence ownership escaped final_domain and contribution codec"
                     ));
                 }
                 if tokens.iter().any(|token| token == "try_from_remote_codec") {
@@ -44150,150 +44105,42 @@ fn rfd4_m2b2_wire_tag_maps(
     Ok((encode, decode))
 }
 
+fn rfd4_m2b2_named_function_tokens(text: &str, name: &str) -> Option<Vec<String>> {
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    let starts = tokens
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["fn", name]).then_some(index))
+        .collect::<Vec<_>>();
+    let [start] = starts.as_slice() else {
+        return None;
+    };
+    let open = (*start..tokens.len()).find(|index| tokens[*index] == "{")?;
+    let mut depth = 0usize;
+    for index in open..tokens.len() {
+        match tokens[index].as_str() {
+            "{" => depth += 1,
+            "}" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(tokens[*start..=index].to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rfd4_m2b2_token_sequence_count(tokens: &[String], expected: &str) -> usize {
+    let expected = rust_use_tokens(expected);
+    tokens
+        .windows(expected.len())
+        .filter(|window| *window == expected)
+        .count()
+}
+
 fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
-    fn expr_is_path(expression: &syn::Expr, expected: &str) -> bool {
-        matches!(unwrap_expr(expression), syn::Expr::Path(path) if path.path.is_ident(expected))
-    }
-
-    fn unwrap_expr(mut expression: &syn::Expr) -> &syn::Expr {
-        loop {
-            expression = match expression {
-                syn::Expr::Group(group) => &group.expr,
-                syn::Expr::Paren(paren) => &paren.expr,
-                syn::Expr::Try(value) => &value.expr,
-                _ => return expression,
-            };
-        }
-    }
-
-    fn method_call<'a>(expression: &'a syn::Expr, method: &str) -> Option<&'a syn::ExprMethodCall> {
-        match unwrap_expr(expression) {
-            syn::Expr::MethodCall(call) if call.method == method => Some(call),
-            _ => None,
-        }
-    }
-
-    fn reads_magic(expression: &syn::Expr) -> bool {
-        let Some(read) = method_call(expression, "read_exact") else {
-            return false;
-        };
-        expr_is_path(&read.receiver, "reader")
-            && read.args.len() == 1
-            && read.args.first().is_some_and(|argument| {
-                method_call(argument, "len")
-                    .is_some_and(|len| len.args.is_empty() && expr_is_path(&len.receiver, "MAGIC"))
-            })
-    }
-
-    fn reads_wire_tag(expression: &syn::Expr) -> bool {
-        method_call(expression, "read_u8")
-            .is_some_and(|read| read.args.is_empty() && expr_is_path(&read.receiver, "reader"))
-    }
-
-    fn compares_magic_read(expression: &syn::Expr) -> bool {
-        let syn::Expr::Binary(binary) = unwrap_expr(expression) else {
-            return false;
-        };
-        matches!(binary.op, syn::BinOp::Ne(_))
-            && ((reads_magic(&binary.left) && expr_is_path(&binary.right, "MAGIC"))
-                || (reads_magic(&binary.right) && expr_is_path(&binary.left, "MAGIC")))
-    }
-
-    fn calls_from_live_wire_tag(expression: &syn::Expr) -> bool {
-        #[derive(Default)]
-        struct FromTagAudit {
-            found: bool,
-        }
-        impl<'ast> syn::visit::Visit<'ast> for FromTagAudit {
-            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                if let syn::Expr::Path(function) = call.func.as_ref() {
-                    let segments = function
-                        .path
-                        .segments
-                        .iter()
-                        .map(|segment| segment.ident.to_string())
-                        .collect::<Vec<_>>();
-                    if segments
-                        .ends_with(&["WireContributionKind".to_string(), "from_tag".to_string()])
-                        && call.args.len() == 1
-                        && call.args.first().is_some_and(reads_wire_tag)
-                    {
-                        self.found = true;
-                    }
-                }
-                syn::visit::visit_expr_call(self, call);
-            }
-        }
-        let mut audit = FromTagAudit::default();
-        syn::visit::Visit::visit_expr(&mut audit, expression);
-        audit.found
-    }
-
-    #[derive(Default)]
-    struct FrameExecutionAudit {
-        decoder_binds_live_from_tag: bool,
-        decoder_compares_magic_read: bool,
-        encoder_magic_index: Option<usize>,
-        encoder_tag_index: Option<usize>,
-        encoder_writes_alternate_literal_magic: bool,
-    }
-    impl FrameExecutionAudit {
-        fn visit_encoder(&mut self, block: &syn::Block) {
-            for (index, statement) in block.stmts.iter().enumerate() {
-                let syn::Stmt::Expr(expression, _) = statement else {
-                    continue;
-                };
-                let Some(call) = method_call(expression, "extend_from_slice")
-                    .or_else(|| method_call(expression, "push"))
-                else {
-                    continue;
-                };
-                if !expr_is_path(&call.receiver, "payload") || call.args.len() != 1 {
-                    continue;
-                }
-                let argument = call.args.first().expect("checked above");
-                if call.method == "extend_from_slice" && expr_is_path(argument, "MAGIC") {
-                    self.encoder_magic_index = Some(index);
-                } else if call.method == "extend_from_slice"
-                    && matches!(
-                        unwrap_expr(argument),
-                        syn::Expr::Lit(literal) if matches!(literal.lit, syn::Lit::ByteStr(_))
-                    )
-                {
-                    self.encoder_writes_alternate_literal_magic = true;
-                } else if call.method == "push"
-                    && method_call(argument, "tag").is_some_and(|tag| {
-                        tag.args.is_empty() && expr_is_path(&tag.receiver, "kind")
-                    })
-                {
-                    self.encoder_tag_index = Some(index);
-                }
-            }
-        }
-
-        fn visit_decoder(&mut self, block: &syn::Block) {
-            for statement in &block.stmts {
-                match statement {
-                    syn::Stmt::Expr(syn::Expr::If(if_expression), _)
-                        if compares_magic_read(&if_expression.cond) =>
-                    {
-                        self.decoder_compares_magic_read = true;
-                    }
-                    syn::Stmt::Local(local)
-                        if matches!(&local.pat, syn::Pat::Ident(binding) if binding.ident == "frame_kind")
-                            && local
-                                .init
-                                .as_ref()
-                                .is_some_and(|init| calls_from_live_wire_tag(&init.expr)) =>
-                    {
-                        self.decoder_binds_live_from_tag = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
     let file = match syn::parse_file(text) {
         Ok(file) => file,
         Err(error) => return vec![format!("contribution codec source must parse: {error}")],
@@ -44302,7 +44149,7 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
     let mut correct_magic = 0usize;
     let mut tag_is_single_match = false;
     let mut from_tag_is_single_match = false;
-    let mut execution = FrameExecutionAudit::default();
+    let mut decoder_frame_kind_bindings = 0usize;
     for item in &file.items {
         match item {
             syn::Item::Const(item_const) if item_const.ident == "MAGIC" => {
@@ -44315,13 +44162,20 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
                     correct_magic += 1;
                 }
             }
-            syn::Item::Fn(function)
-                if function.sig.ident == "encode_contribution_with_allocator" =>
-            {
-                execution.visit_encoder(&function.block);
-            }
             syn::Item::Fn(function) if function.sig.ident == "decode_contribution" => {
-                execution.visit_decoder(&function.block);
+                struct FrameKindBindingAudit<'a>(&'a mut usize);
+                impl<'ast> syn::visit::Visit<'ast> for FrameKindBindingAudit<'_> {
+                    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                        if pattern.ident == "frame_kind" {
+                            *self.0 += 1;
+                        }
+                        syn::visit::visit_pat_ident(self, pattern);
+                    }
+                }
+                syn::visit::Visit::visit_block(
+                    &mut FrameKindBindingAudit(&mut decoder_frame_kind_bindings),
+                    &function.block,
+                );
             }
             syn::Item::Impl(item_impl) => {
                 let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
@@ -44364,22 +44218,6 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
             "MAGIC must be one named b\"NRFC\" const, found named={named_magic}, correct={correct_magic}"
         ));
     }
-    if execution.encoder_magic_index.is_none()
-        || execution.encoder_tag_index.is_none()
-        || execution.encoder_magic_index >= execution.encoder_tag_index
-        || execution.encoder_writes_alternate_literal_magic
-    {
-        violations.push("common encoder must write MAGIC before the live kind.tag() byte".into());
-    }
-    if !execution.decoder_compares_magic_read {
-        violations.push("common decoder must compare the exact MAGIC-sized read with MAGIC".into());
-    }
-    if !execution.decoder_binds_live_from_tag {
-        violations.push(
-            "common decoder must bind frame_kind from WireContributionKind::from_tag(reader.read_u8())"
-                .into(),
-        );
-    }
     if !tag_is_single_match {
         violations.push("WireContributionKind::tag must be exactly one exhaustive match".into());
     }
@@ -44387,53 +44225,141 @@ fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
         violations
             .push("WireContributionKind::from_tag must be exactly one exhaustive match".into());
     }
+
+    let expected_encoder = r#"
+fn encode_frame_header(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+    payload.push(kind.tag());
+    payload.push(0);
+}
+"#;
+    if rfd4_m2b2_named_function_tokens(text, "encode_frame_header")
+        != rfd4_m2b2_named_function_tokens(expected_encoder, "encode_frame_header")
+    {
+        violations.push("encode_frame_header must retain its complete canonical shape".into());
+    }
+
+    let expected_decoder = r#"
+fn decode_frame_header(
+    reader: &mut Reader<'_>,
+) -> Result<WireContributionKind, ContributionCodecError> {
+    if reader.read_exact(MAGIC.len())? != MAGIC {
+        return Err(ContributionCodecError::Malformed);
+    }
+    if reader.read_u16()? != CODEC_VERSION {
+        return Err(ContributionCodecError::UnknownVersion);
+    }
+    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
+        .ok_or(ContributionCodecError::UnknownKind)?;
+    if reader.read_u8()? != 0 {
+        return Err(ContributionCodecError::InvalidFlags);
+    }
+    Ok(frame_kind)
+}
+"#;
+    if rfd4_m2b2_named_function_tokens(text, "decode_frame_header")
+        != rfd4_m2b2_named_function_tokens(expected_decoder, "decode_frame_header")
+    {
+        violations.push("decode_frame_header must retain its complete canonical shape".into());
+    }
+
+    let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    let encoder_tokens =
+        rfd4_m2b2_named_function_tokens(text, "encode_contribution_with_allocator")
+            .unwrap_or_default();
+    if rfd4_m2b2_token_sequence_count(&encoder_tokens, "encode_frame_header(&mut payload, kind);")
+        != 1
+        || rfd4_m2b2_token_sequence_count(&production_tokens, "encode_frame_header(") != 2
+    {
+        violations.push("the common encoder must call only the canonical header encoder".into());
+    }
+
+    let decoder_tokens =
+        rfd4_m2b2_named_function_tokens(text, "decode_contribution").unwrap_or_default();
+    let canonical_decode_binding = rfd4_m2b2_token_sequence_count(
+        &decoder_tokens,
+        "let frame_kind = decode_frame_header(&mut reader)?;",
+    ) == 1;
+    let checks_expected_kind = rfd4_m2b2_token_sequence_count(
+        &decoder_tokens,
+        "if frame_kind != expectation_kind(expectation)",
+    ) == 1;
+    let dispatches_on_kind =
+        rfd4_m2b2_token_sequence_count(&decoder_tokens, "match (frame_kind, expectation)") == 1;
+    if !canonical_decode_binding
+        || !checks_expected_kind
+        || !dispatches_on_kind
+        || decoder_frame_kind_bindings != 1
+        || rfd4_m2b2_token_sequence_count(&production_tokens, "decode_frame_header(") != 2
+    {
+        violations.push(
+            "the common decoder must bind and use exactly one canonical decoded frame_kind".into(),
+        );
+    }
     violations
 }
 
 fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -> Vec<String> {
     const OWNER: &str = "src/runtime_filter/port/subscription.rs";
-    fn is_delivery_path(path: &[String]) -> bool {
-        (path.len() == 5
-            && (rfd4_m2b2_path_starts_with(
-                path,
-                &[
-                    "crate",
-                    "runtime_filter",
-                    "port",
-                    "subscription",
-                    "ArtifactDelivery",
-                ],
-            ) || rfd4_m2b2_path_starts_with(
-                path,
-                &[
-                    "crate",
-                    "runtime_filter",
-                    "port",
-                    "subscription",
-                    "ArtifactDeliveryOutcome",
-                ],
-            )))
-            || (path.len() == 4
-                && rfd4_m2b2_path_starts_with(
-                    path,
-                    &["crate", "runtime_filter", "port", "subscription"],
-                ))
-            || (path.len() == 5
-                && rfd4_m2b2_path_starts_with(
-                    path,
-                    &["crate", "runtime_filter", "port", "subscription", "*"],
-                ))
-    }
+    const TRAIT_OWNERS: &[&str] = &[
+        "src/runtime_filter/port/subscription.rs",
+        "src/runtime_filter/router/loopback.rs",
+        "src/runtime_filter/service/registry.rs",
+        "src/runtime_filter/service/subscription.rs",
+    ];
+    const OUTCOME_OWNERS: &[&str] = &[
+        "src/runtime_filter/port/subscription.rs",
+        "src/runtime_filter/router/loopback.rs",
+        "src/runtime_filter/service/materialization.rs",
+        "src/runtime_filter/service/mod.rs",
+        "src/runtime_filter/service/registry.rs",
+        "src/runtime_filter/service/subscription.rs",
+    ];
+    const TRAIT: &[&str] = &[
+        "crate",
+        "runtime_filter",
+        "port",
+        "subscription",
+        "ArtifactDelivery",
+    ];
+    const OUTCOME: &[&str] = &[
+        "crate",
+        "runtime_filter",
+        "port",
+        "subscription",
+        "ArtifactDeliveryOutcome",
+    ];
 
     let mut violations = Vec::new();
     for (source_rel, text) in sources {
-        if source_rel == OWNER {
+        if syn::parse_file(text).is_err() {
+            violations.push(format!(
+                "{source_rel}: ArtifactDelivery ownership audit must parse source"
+            ));
             continue;
         }
+        let canonical_paths = rust_production_canonical_paths(text, source_rel);
+        let references_trait = canonical_paths
+            .iter()
+            .any(|path| rfd4_m2b2_path_starts_with(path, TRAIT))
+            || rfd4_m2b2_direct_production_path_reference(text, TRAIT).unwrap_or(true);
+        let references_outcome = canonical_paths
+            .iter()
+            .any(|path| rfd4_m2b2_path_starts_with(path, OUTCOME))
+            || rfd4_m2b2_direct_production_path_reference(text, OUTCOME).unwrap_or(true);
+        if references_trait && !TRAIT_OWNERS.contains(&source_rel.as_str()) {
+            violations.push(format!(
+                "{source_rel}: canonical ArtifactDelivery ownership escaped its exact ledger"
+            ));
+        }
+        if references_outcome && !OUTCOME_OWNERS.contains(&source_rel.as_str()) {
+            violations.push(format!(
+                "{source_rel}: canonical ArtifactDeliveryOutcome ownership escaped its exact ledger"
+            ));
+        }
+
         for statement in rust_production_scoped_use_statements(text) {
-            if rust_use_visibility(&statement.import) == "private" {
-                continue;
-            }
             let Some(path) = rust_canonical_use_segments_in_scope(
                 &statement.import,
                 source_rel,
@@ -44441,126 +44367,18 @@ fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -
             ) else {
                 continue;
             };
-            if is_delivery_path(&path) {
+            if source_rel != OWNER
+                && path.len() == 4
+                && rfd4_m2b2_path_starts_with(
+                    &path,
+                    &["crate", "runtime_filter", "port", "subscription"],
+                )
+            {
                 violations.push(format!(
-                    "{source_rel}: ArtifactDelivery facade {}",
+                    "{source_rel}: subscription namespace facade {}",
                     path.join("::")
                 ));
             }
-        }
-
-        let Ok(file) = syn::parse_file(text) else {
-            if rust_use_tokens(text).iter().any(|token| {
-                matches!(
-                    token.as_str(),
-                    "ArtifactDelivery" | "ArtifactDeliveryOutcome"
-                )
-            }) {
-                violations.push(format!(
-                    "{source_rel}: ArtifactDelivery facade audit must parse source"
-                ));
-            }
-            continue;
-        };
-        let aliases = rust_production_scoped_aliases(text);
-        struct DeliveryPathAudit<'a> {
-            aliases: &'a RustScopedAliases,
-            found: bool,
-            inline_modules: &'a [String],
-            source_rel: &'a str,
-        }
-        impl<'ast> syn::visit::Visit<'ast> for DeliveryPathAudit<'_> {
-            fn visit_path(&mut self, path: &'ast syn::Path) {
-                let segments = path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.to_string())
-                    .collect::<Vec<_>>();
-                let resolved = rust_resolve_scoped_paths(
-                    &segments,
-                    self.inline_modules,
-                    self.aliases,
-                    &mut BTreeSet::new(),
-                    0,
-                )
-                .unwrap_or_else(|| {
-                    vec![RustScopedUsePath {
-                        segments,
-                        inline_modules: self.inline_modules.to_vec(),
-                    }]
-                });
-                self.found |= resolved.into_iter().any(|path| {
-                    rust_canonical_path_segments_in_scope(
-                        &path.segments,
-                        self.source_rel,
-                        &path.inline_modules,
-                    )
-                    .is_some_and(|path| is_delivery_path(&path))
-                });
-                syn::visit::visit_path(self, path);
-            }
-        }
-        fn audit_facade_items(
-            items: &[syn::Item],
-            source_rel: &str,
-            aliases: &RustScopedAliases,
-            inline_modules: &mut Vec<String>,
-        ) -> bool {
-            for item in items {
-                if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
-                    continue;
-                }
-                match item {
-                    syn::Item::Mod(item_mod) => {
-                        let Some((_, items)) = &item_mod.content else {
-                            continue;
-                        };
-                        inline_modules.push(item_mod.ident.to_string());
-                        let found = audit_facade_items(items, source_rel, aliases, inline_modules);
-                        inline_modules.pop();
-                        if found {
-                            return true;
-                        }
-                    }
-                    syn::Item::Type(item_type)
-                        if !matches!(item_type.vis, syn::Visibility::Inherited) =>
-                    {
-                        let mut audit = DeliveryPathAudit {
-                            aliases,
-                            found: false,
-                            inline_modules,
-                            source_rel,
-                        };
-                        syn::visit::Visit::visit_type(&mut audit, &item_type.ty);
-                        if audit.found {
-                            return true;
-                        }
-                    }
-                    syn::Item::Trait(item_trait)
-                        if !matches!(item_trait.vis, syn::Visibility::Inherited) =>
-                    {
-                        let mut audit = DeliveryPathAudit {
-                            aliases,
-                            found: false,
-                            inline_modules,
-                            source_rel,
-                        };
-                        for bound in &item_trait.supertraits {
-                            syn::visit::Visit::visit_type_param_bound(&mut audit, bound);
-                        }
-                        if audit.found {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            false
-        }
-        if audit_facade_items(&file.items, source_rel, &aliases, &mut Vec::new()) {
-            violations.push(format!(
-                "{source_rel}: ArtifactDelivery type or trait facade"
-            ));
         }
     }
     violations.sort();
@@ -44754,7 +44572,7 @@ fn rfd4_m2b2_transport_router_adapter_and_codec_dependencies_stay_separated() {
 
 #[test]
 fn rfd4_m2b2_remote_completion_fence_reconstruction_has_one_production_caller() {
-    let sources = rs_files(&src_dir())
+    let sources = production_rs_files_from_entries(&src_dir(), &[src_dir().join("lib.rs")])
         .into_iter()
         .map(|path| {
             let source_rel = rel(&path);
@@ -44762,6 +44580,35 @@ fn rfd4_m2b2_remote_completion_fence_reconstruction_has_one_production_caller() 
             (source_rel, text)
         })
         .collect::<Vec<_>>();
+    let owners = sources
+        .iter()
+        .filter_map(|(source_rel, text)| {
+            rust_production_canonical_paths(text, source_rel)
+                .iter()
+                .any(|path| {
+                    path.len() >= 5
+                        && rfd4_m2b2_path_starts_with(
+                            path,
+                            &[
+                                "crate",
+                                "runtime_filter",
+                                "port",
+                                "final_domain",
+                                "CompletionFence",
+                            ],
+                        )
+                })
+                .then(|| source_rel.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        owners,
+        BTreeSet::from([
+            "src/runtime_filter/codec/contribution.rs".to_string(),
+            "src/runtime_filter/port/final_domain.rs".to_string(),
+        ]),
+        "canonical CompletionFence production owner ledger drifted"
+    );
     let violations = rfd4_m2b2_remote_reconstruction_violations(&sources);
     assert!(
         violations.is_empty(),
@@ -44817,7 +44664,7 @@ fn rfd4_m2b2_new_owner_graph_has_no_sender_retry_delivery_or_legacy_bridge() {
         violations.join("\n")
     );
 
-    let sources = rs_files(&src_dir())
+    let sources = production_rs_files_from_entries(&src_dir(), &[src_dir().join("lib.rs")])
         .into_iter()
         .map(|path| {
             let source_rel = rel(&path);
@@ -44825,6 +44672,53 @@ fn rfd4_m2b2_new_owner_graph_has_no_sender_retry_delivery_or_legacy_bridge() {
             (source_rel, text)
         })
         .collect::<Vec<_>>();
+    let canonical_owners = |symbol: &str| {
+        sources
+            .iter()
+            .filter_map(|(source_rel, text)| {
+                let canonical_reference = rust_production_canonical_paths(text, source_rel)
+                    .iter()
+                    .any(|path| {
+                        path.len() >= 5
+                            && rfd4_m2b2_path_starts_with(
+                                path,
+                                &["crate", "runtime_filter", "port", "subscription", symbol],
+                            )
+                    });
+                let declares_owner = source_rel == "src/runtime_filter/port/subscription.rs"
+                    && match symbol {
+                        "ArtifactDelivery" => rust_named_trait_declaration_count(text, symbol) == 1,
+                        "ArtifactDeliveryOutcome" => {
+                            rust_named_type_declaration_count(text, symbol) == 1
+                        }
+                        _ => false,
+                    };
+                (canonical_reference || declares_owner).then(|| source_rel.clone())
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        canonical_owners("ArtifactDelivery"),
+        BTreeSet::from([
+            "src/runtime_filter/port/subscription.rs".to_string(),
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            "src/runtime_filter/service/registry.rs".to_string(),
+            "src/runtime_filter/service/subscription.rs".to_string(),
+        ]),
+        "canonical ArtifactDelivery production owner ledger drifted"
+    );
+    assert_eq!(
+        canonical_owners("ArtifactDeliveryOutcome"),
+        BTreeSet::from([
+            "src/runtime_filter/port/subscription.rs".to_string(),
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            "src/runtime_filter/service/materialization.rs".to_string(),
+            "src/runtime_filter/service/mod.rs".to_string(),
+            "src/runtime_filter/service/registry.rs".to_string(),
+            "src/runtime_filter/service/subscription.rs".to_string(),
+        ]),
+        "canonical ArtifactDeliveryOutcome production owner ledger drifted"
+    );
     let facade_violations = rfd4_m2b2_artifact_delivery_facade_violations(&sources);
     assert!(
         facade_violations.is_empty(),
@@ -44992,12 +44886,12 @@ fn f() {
 }
 "#;
     assert!(
-        rfd4_m2b2_remote_reconstruction_violations(&[(
+        !rfd4_m2b2_remote_reconstruction_violations(&[(
             "src/runtime_filter/service/producer.rs".into(),
             canonical_import_with_unrelated_local_method.into(),
         )])
         .is_empty(),
-        "canonical fence references must not poison unrelated local method calls"
+        "canonical CompletionFence ownership must remain default-deny outside its exact owners"
     );
 
     let cfg_test_only = r#"
@@ -45123,6 +45017,54 @@ macro_rules! hidden_rebuild {
         "cross-file final_domain namespace facades must be rejected"
     );
 
+    let public_type_facade = vec![
+        (
+            "src/runtime_filter/fence_facade.rs".to_string(),
+            "pub(crate) type HiddenFence = crate::runtime_filter::port::final_domain::CompletionFence;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::fence_facade::HiddenFence; fn f() { let _ = HiddenFence::try_from_remote_codec; }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&public_type_facade).is_empty(),
+        "public cross-file CompletionFence type facades must fail at their source"
+    );
+
+    let separate_private_parent_facade = vec![
+        (
+            "src/runtime_filter/fence_parent.rs".to_string(),
+            "use crate::runtime_filter::port::final_domain::CompletionFence as HiddenFence; mod child;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/fence_parent/child.rs".to_string(),
+            "fn f() { let _ = super::HiddenFence::try_from_remote_codec; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&separate_private_parent_facade).is_empty(),
+        "private parent CompletionFence facades must fail before a separate child consumes them"
+    );
+
+    let separate_private_namespace_parent = vec![
+        (
+            "src/runtime_filter/fence_parent.rs".to_string(),
+            "use crate::runtime_filter::port::final_domain as hidden; mod child;".to_string(),
+        ),
+        (
+            "src/runtime_filter/fence_parent/child.rs".to_string(),
+            "fn f() { let _ = super::hidden::CompletionFence::try_from_remote_codec; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&separate_private_namespace_parent).is_empty(),
+        "private parent final_domain namespace facades must fail at their source"
+    );
+
     let private_ancestor_facade = r#"
 use crate::runtime_filter::port::final_domain::CompletionFence as HiddenFence;
 mod child {
@@ -45138,6 +45080,25 @@ mod child {
         )])
         .is_empty(),
         "private ancestor aliases must not hide child-module reconstruction"
+    );
+
+    let local_shadow_macro = r#"
+struct CompletionFence;
+impl CompletionFence {
+    fn try_from_remote_codec() {}
+}
+macro_rules! call_local {
+    () => { CompletionFence::try_from_remote_codec() };
+}
+fn f() { call_local!(); }
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            local_shadow_macro.into(),
+        )])
+        .is_empty(),
+        "local-shadow macro calls must not be treated as canonical fence reconstruction"
     );
 }
 
@@ -45299,6 +45260,89 @@ fn decode_contribution(reader: &mut Reader) {
         !rfd4_m2b2_nrfc_execution_violations(decoupled_decoder).is_empty(),
         "decoder must compare the exact MAGIC read and feed the live wire byte into from_tag"
     );
+
+    let canonical_header_flow = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+const CODEC_VERSION: u16 = 1;
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 { match self { Self::Membership => 1, Self::OrderedBound => 2, Self::TopKSummary => 3, Self::FinalDomain => 4 } }
+    const fn from_tag(tag: u8) -> Option<Self> { match tag { 1 => Some(Self::Membership), 2 => Some(Self::OrderedBound), 3 => Some(Self::TopKSummary), 4 => Some(Self::FinalDomain), _ => None } }
+}
+fn encode_frame_header(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+    payload.push(kind.tag());
+    payload.push(0);
+}
+fn decode_frame_header(
+    reader: &mut Reader<'_>,
+) -> Result<WireContributionKind, ContributionCodecError> {
+    if reader.read_exact(MAGIC.len())? != MAGIC {
+        return Err(ContributionCodecError::Malformed);
+    }
+    if reader.read_u16()? != CODEC_VERSION {
+        return Err(ContributionCodecError::UnknownVersion);
+    }
+    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
+        .ok_or(ContributionCodecError::UnknownKind)?;
+    if reader.read_u8()? != 0 {
+        return Err(ContributionCodecError::InvalidFlags);
+    }
+    Ok(frame_kind)
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    encode_frame_header(&mut payload, kind);
+}
+fn decode_contribution(reader: &mut Reader, expectation: Expectation) -> Result<(), ContributionCodecError> {
+    let frame_kind = decode_frame_header(&mut reader)?;
+    if frame_kind != expectation_kind(expectation) { return Err(ContributionCodecError::KindMismatch); }
+    match (frame_kind, expectation) { _ => {} }
+    Ok(())
+}
+"#;
+    assert!(
+        rfd4_m2b2_nrfc_execution_violations(canonical_header_flow).is_empty(),
+        "the decision fixture must model the complete canonical header flow"
+    );
+
+    let live_header_overwrite = canonical_header_flow.replacen(
+        "    payload.push(0);",
+        "    payload.push(0);\n    payload.clear();",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&live_header_overwrite).is_empty(),
+        "live header clear/overwrite after canonical writes must be rejected"
+    );
+
+    let early_return_between_header_writes = canonical_header_flow.replacen(
+        "    payload.extend_from_slice(MAGIC);",
+        "    payload.extend_from_slice(MAGIC);\n    return;",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&early_return_between_header_writes).is_empty(),
+        "an early return between canonical header writes must be rejected"
+    );
+
+    let dead_nested_from_tag = canonical_header_flow.replace(
+        "    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)\n        .ok_or(ContributionCodecError::UnknownKind)?;",
+        "    let frame_kind = { if false { let _ = WireContributionKind::from_tag(reader.read_u8()?); } WireContributionKind::Membership };",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&dead_nested_from_tag).is_empty(),
+        "a dead nested from_tag call must not establish the live decoded kind"
+    );
+
+    let shadowed_frame_kind = canonical_header_flow.replace(
+        "    if frame_kind != expectation_kind(expectation)",
+        "    let frame_kind = WireContributionKind::Membership;\n    if frame_kind != expectation_kind(expectation)",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&shadowed_frame_kind).is_empty(),
+        "the decoded frame_kind must not be ignored or shadowed"
+    );
 }
 
 #[test]
@@ -45363,6 +45407,67 @@ fn rfd4_m2b2_artifact_delivery_facade_detector_rejects_cross_file_reexports() {
     assert!(
         !rfd4_m2b2_artifact_delivery_facade_violations(&namespace_facade).is_empty(),
         "subscription namespace facades must be rejected"
+    );
+
+    let private_parent = vec![
+        (
+            "src/runtime_filter/delivery_parent.rs".to_string(),
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery as HiddenDelivery; mod child;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/delivery_parent/child.rs".to_string(),
+            "fn f(value: &dyn super::HiddenDelivery) { let _ = value; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&private_parent).is_empty(),
+        "private-parent ArtifactDelivery facades must fail at their source"
+    );
+
+    let private_namespace_parent = vec![
+        (
+            "src/runtime_filter/delivery_parent.rs".to_string(),
+            "use crate::runtime_filter::port::subscription as hidden; mod child;".to_string(),
+        ),
+        (
+            "src/runtime_filter/delivery_parent/child.rs".to_string(),
+            "fn f(value: &dyn super::hidden::ArtifactDelivery) { let _ = value; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&private_namespace_parent).is_empty(),
+        "private-parent subscription namespace facades must fail at their source"
+    );
+
+    let associated_facade = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) trait Wrapper { type Delivery: crate::runtime_filter::port::subscription::ArtifactDelivery; fn outcome(&self) -> crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome; }"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&associated_facade).is_empty(),
+        "associated ArtifactDelivery/Outcome surfaces must be rejected"
+    );
+
+    let wrapper_function = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) fn wrap(value: std::sync::Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>) -> crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome { todo!() }"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_function).is_empty(),
+        "wrapper functions must not expose ArtifactDelivery/Outcome"
+    );
+
+    let wrapper_struct = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) struct Wrapper(std::sync::Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>);"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_struct).is_empty(),
+        "wrapper structs must not expose ArtifactDelivery"
     );
 }
 
