@@ -65,6 +65,8 @@ pub(crate) enum DeploymentError {
     UnknownBackend { backend_idx: usize },
     /// The live backend snapshot contains the same backend id more than once.
     DuplicateBackend { backend_idx: usize },
+    /// A live backend id cannot be represented by the native participant id.
+    BackendIdOutOfRange { backend_idx: usize },
     /// A routing participant has no endpoint in the live backend snapshot.
     UnknownRouteParticipant {
         participant: RuntimeFilterParticipantId,
@@ -109,6 +111,12 @@ impl fmt::Display for DeploymentError {
             }
             Self::DuplicateBackend { backend_idx } => {
                 write!(f, "duplicate backend index {backend_idx}")
+            }
+            Self::BackendIdOutOfRange { backend_idx } => {
+                write!(
+                    f,
+                    "backend index {backend_idx} does not fit runtime filter participant identity"
+                )
             }
             Self::UnknownRouteParticipant { participant } => {
                 write!(
@@ -163,6 +171,14 @@ impl fmt::Display for DeploymentError {
 }
 
 impl std::error::Error for DeploymentError {}
+
+pub(crate) fn participant_id_for_backend(
+    backend_idx: usize,
+) -> Result<RuntimeFilterParticipantId, DeploymentError> {
+    let participant = u32::try_from(backend_idx)
+        .map_err(|_| DeploymentError::BackendIdOutOfRange { backend_idx })?;
+    Ok(RuntimeFilterParticipantId::new(participant))
+}
 
 /// The compiler's output. Coordinator-side; `role_graph` carries the full
 /// (including remote) topology for RFD-4 to consume, while `install_views`

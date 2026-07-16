@@ -20,8 +20,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::common::types::UniqueId;
 use crate::coordinator::scheduler::LiveBackendSnapshot;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime_filter::deployment::role_graph::{RoleGraph, RouteEdge, RouteKind};
-use crate::runtime_filter::deployment::{BindingInstanceIndex, DeploymentError};
+use crate::runtime_filter::deployment::role_graph::{
+    ChannelRoleGraph, RoleGraph, RouteEdge, RouteKind,
+};
+use crate::runtime_filter::deployment::{
+    BindingInstanceIndex, DeploymentError, participant_id_for_backend,
+};
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
 use crate::runtime_filter::port::routing::{
@@ -90,6 +94,141 @@ fn invalid_routing_shard(detail: impl Into<String>) -> DeploymentError {
     }
 }
 
+fn has_binding(
+    roles: &BTreeMap<RuntimeFilterParticipantId, BTreeSet<BindingId>>,
+    participant: RuntimeFilterParticipantId,
+    binding: BindingId,
+) -> bool {
+    roles
+        .get(&participant)
+        .is_some_and(|bindings| bindings.contains(&binding))
+}
+
+fn validate_role_graph_channel(
+    channel_id: ChannelId,
+    channel: &ChannelRoleGraph,
+) -> Result<(), DeploymentError> {
+    let mut has_direct = false;
+    let mut has_to_aggregator = false;
+    let mut has_from_aggregator = false;
+    for edge in &channel.routes {
+        match edge.kind {
+            RouteKind::Loopback | RouteKind::ReplicaDirect => {
+                has_direct = true;
+                if !has_binding(&channel.producers, edge.from.participant, edge.from.binding) {
+                    return Err(invalid_routing_shard(format!(
+                        "direct source is not a producer on channel {} edge {}: participant {} binding {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.from.participant.get(),
+                        edge.from.binding.get()
+                    )));
+                }
+                if !has_binding(&channel.consumers, edge.to.participant, edge.to.binding) {
+                    return Err(invalid_routing_shard(format!(
+                        "direct target is not a consumer on channel {} edge {}: participant {} binding {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.to.participant.get(),
+                        edge.to.binding.get()
+                    )));
+                }
+            }
+            RouteKind::ToAggregator => {
+                has_to_aggregator = true;
+                let Some(aggregator) = channel.aggregator else {
+                    return Err(invalid_routing_shard(format!(
+                        "channel {} has aggregator route without an aggregator",
+                        channel_id.get()
+                    )));
+                };
+                if !has_binding(&channel.producers, edge.from.participant, edge.from.binding) {
+                    return Err(invalid_routing_shard(format!(
+                        "ToAggregator source is not a producer on channel {} edge {}: participant {} binding {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.from.participant.get(),
+                        edge.from.binding.get()
+                    )));
+                }
+                if edge.to.participant != aggregator {
+                    return Err(invalid_routing_shard(format!(
+                        "ToAggregator target participant {} does not match channel {} aggregator {} on edge {}",
+                        edge.to.participant.get(),
+                        channel_id.get(),
+                        aggregator.get(),
+                        edge.edge_id.get()
+                    )));
+                }
+                if edge.from.binding != edge.to.binding {
+                    return Err(invalid_routing_shard(format!(
+                        "ToAggregator binding mismatch on channel {} edge {}: source {} target {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.from.binding.get(),
+                        edge.to.binding.get()
+                    )));
+                }
+            }
+            RouteKind::FromAggregator => {
+                has_from_aggregator = true;
+                let Some(aggregator) = channel.aggregator else {
+                    return Err(invalid_routing_shard(format!(
+                        "channel {} has aggregator route without an aggregator",
+                        channel_id.get()
+                    )));
+                };
+                if edge.from.participant != aggregator {
+                    return Err(invalid_routing_shard(format!(
+                        "FromAggregator source participant {} does not match channel {} aggregator {} on edge {}",
+                        edge.from.participant.get(),
+                        channel_id.get(),
+                        aggregator.get(),
+                        edge.edge_id.get()
+                    )));
+                }
+                if !has_binding(&channel.consumers, edge.to.participant, edge.to.binding) {
+                    return Err(invalid_routing_shard(format!(
+                        "FromAggregator target is not a consumer on channel {} edge {}: participant {} binding {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.to.participant.get(),
+                        edge.to.binding.get()
+                    )));
+                }
+                if edge.from.binding != edge.to.binding {
+                    return Err(invalid_routing_shard(format!(
+                        "FromAggregator binding mismatch on channel {} edge {}: source {} target {}",
+                        channel_id.get(),
+                        edge.edge_id.get(),
+                        edge.from.binding.get(),
+                        edge.to.binding.get()
+                    )));
+                }
+            }
+        }
+    }
+    match channel.aggregator {
+        Some(aggregator) if has_direct => Err(invalid_routing_shard(format!(
+            "channel {} aggregator {} mixes direct and aggregator routes",
+            channel_id.get(),
+            aggregator.get()
+        ))),
+        Some(aggregator) if !has_to_aggregator || !has_from_aggregator => {
+            Err(invalid_routing_shard(format!(
+                "channel {} aggregator {} requires both ToAggregator and FromAggregator routes",
+                channel_id.get(),
+                aggregator.get()
+            )))
+        }
+        None if has_to_aggregator || has_from_aggregator => Err(invalid_routing_shard(format!(
+            "channel {} has aggregator route without an aggregator",
+            channel_id.get()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn project_routing_shards(
     epoch: DeploymentEpoch,
     role_graph: &RoleGraph,
@@ -97,8 +236,14 @@ pub(crate) fn project_routing_shards(
     backends: &LiveBackendSnapshot,
 ) -> Result<BTreeMap<RuntimeFilterParticipantId, RuntimeFilterRoutingShard>, DeploymentError> {
     let mut endpoints = BTreeMap::new();
+    let mut backend_ids = BTreeSet::new();
     for (backend_idx, socket_addr) in backends.entries() {
-        let participant = RuntimeFilterParticipantId::new(*backend_idx as u32);
+        if !backend_ids.insert(*backend_idx) {
+            return Err(DeploymentError::DuplicateBackend {
+                backend_idx: *backend_idx,
+            });
+        }
+        let participant = participant_id_for_backend(*backend_idx)?;
         if endpoints
             .insert(participant, RuntimeEndpoint::from_socket_addr(*socket_addr))
             .is_some()
@@ -139,6 +284,7 @@ pub(crate) fn project_routing_shards(
                 )));
             }
         }
+        validate_role_graph_channel(*channel_id, channel)?;
     }
 
     let mut per_participant: BTreeMap<
@@ -148,6 +294,9 @@ pub(crate) fn project_routing_shards(
 
     for (channel_id, channel) in &role_graph.channels {
         for (participant, bindings) in &channel.producers {
+            if bindings.is_empty() {
+                continue;
+            }
             endpoint_for(&endpoints, *participant)?;
             let builder = per_participant
                 .entry(*participant)
@@ -162,6 +311,9 @@ pub(crate) fn project_routing_shards(
             );
         }
         for (participant, bindings) in &channel.consumers {
+            if bindings.is_empty() {
+                continue;
+            }
             endpoint_for(&endpoints, *participant)?;
             let builder = per_participant
                 .entry(*participant)
@@ -277,6 +429,12 @@ pub(crate) fn project_routing_shards(
     for (participant, channels) in per_participant {
         let mut channel_views = BTreeMap::new();
         for (channel_id, builder) in channels {
+            if builder.local_roles.is_empty()
+                && builder.inbound_edges.is_empty()
+                && builder.outbound_edges.is_empty()
+            {
+                continue;
+            }
             let view = RuntimeFilterChannelRoutingView::new(
                 channel_id,
                 builder.local_roles,
@@ -286,6 +444,9 @@ pub(crate) fn project_routing_shards(
             )
             .map_err(|error| invalid_routing_shard(error.to_string()))?;
             channel_views.insert(channel_id, view);
+        }
+        if channel_views.is_empty() {
+            continue;
         }
         let shard = RuntimeFilterRoutingShard::new(epoch, participant, channel_views)
             .map_err(|error| invalid_routing_shard(error.to_string()))?;
@@ -745,5 +906,251 @@ mod tests {
                 fragment_instance_id: finst(100),
             })
         );
+    }
+
+    #[test]
+    fn projector_rejects_backend_ids_that_do_not_fit_participant_identity() {
+        let backend_idx =
+            usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit backend identity");
+        let backends =
+            LiveBackendSnapshot::new(vec![(backend_idx, "10.0.0.1:9060".parse().unwrap())]);
+
+        assert_eq!(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &RoleGraph::default(),
+                &BTreeMap::new(),
+                &backends,
+            ),
+            Err(DeploymentError::BackendIdOutOfRange { backend_idx })
+        );
+    }
+
+    #[test]
+    fn empty_role_entries_do_not_create_empty_routing_shards() {
+        let channel_id = ChannelId::new(1);
+        let mut channel = ChannelRoleGraph::empty(channel_id);
+        channel.producers.insert(pid(2), BTreeSet::new());
+        channel.consumers.insert(pid(7), BTreeSet::new());
+        let graph = RoleGraph {
+            channels: BTreeMap::from([(channel_id, channel)]),
+        };
+
+        let shards = project_routing_shards(
+            DeploymentEpoch::new(9),
+            &graph,
+            &BTreeMap::new(),
+            &backends(),
+        )
+        .expect("empty role entries are ignored");
+
+        assert!(shards.is_empty(), "empty roles must not create shards");
+    }
+
+    #[test]
+    fn producer_index_does_not_keep_an_empty_channel_alive() {
+        let channel_id = ChannelId::new(1);
+        let producer_binding = BindingId::new(10);
+        let graph = RoleGraph {
+            channels: BTreeMap::from([(channel_id, ChannelRoleGraph::empty(channel_id))]),
+        };
+        let instances = BTreeMap::from([(
+            (channel_id, producer_binding, pid(2)),
+            BTreeSet::from([finst(100)]),
+        )]);
+
+        let shards =
+            project_routing_shards(DeploymentEpoch::new(9), &graph, &instances, &backends())
+                .expect("unreferenced instance index is ignored");
+
+        assert!(
+            shards.is_empty(),
+            "producer index alone must not create a shard"
+        );
+    }
+
+    fn invalid_shard_detail(error: DeploymentError) -> String {
+        match error {
+            DeploymentError::InvalidRoutingShard { detail } => detail,
+            other => panic!("expected InvalidRoutingShard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projector_rejects_aggregator_participant_and_redundant_binding_mismatch() {
+        let (graph, instances) = all_of_fixture();
+
+        let mut participant_mismatch = graph.clone();
+        participant_mismatch
+            .channels
+            .get_mut(&ChannelId::new(1))
+            .unwrap()
+            .routes[1]
+            .to
+            .participant = pid(7);
+        let detail = invalid_shard_detail(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &participant_mismatch,
+                &instances,
+                &backends(),
+            )
+            .expect_err("ToAggregator target must be the declared aggregator"),
+        );
+        assert!(detail.contains("ToAggregator target participant"));
+
+        let mut binding_mismatch = graph;
+        binding_mismatch
+            .channels
+            .get_mut(&ChannelId::new(1))
+            .unwrap()
+            .routes[1]
+            .to
+            .binding = BindingId::new(99);
+        let detail = invalid_shard_detail(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &binding_mismatch,
+                &instances,
+                &backends(),
+            )
+            .expect_err("ToAggregator redundant binding must be preserved"),
+        );
+        assert!(detail.contains("ToAggregator binding mismatch"));
+    }
+
+    #[test]
+    fn projector_rejects_direct_edges_without_real_producer_and_consumer_roles() {
+        let channel_id = ChannelId::new(1);
+        let mut channel = ChannelRoleGraph::empty(channel_id);
+        channel
+            .producers
+            .insert(pid(2), BTreeSet::from([BindingId::new(10)]));
+        channel
+            .consumers
+            .insert(pid(7), BTreeSet::from([BindingId::new(20)]));
+        channel.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(1),
+            kind: RouteKind::ReplicaDirect,
+            from: RouteEndpoint {
+                participant: pid(2),
+                binding: BindingId::new(99),
+            },
+            to: RouteEndpoint {
+                participant: pid(7),
+                binding: BindingId::new(20),
+            },
+        });
+        let graph = RoleGraph {
+            channels: BTreeMap::from([(channel_id, channel)]),
+        };
+
+        let detail = invalid_shard_detail(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &graph,
+                &BTreeMap::new(),
+                &backends(),
+            )
+            .expect_err("direct source must be a declared producer"),
+        );
+        assert!(detail.contains("direct source is not a producer"));
+    }
+
+    #[test]
+    fn projector_requires_complete_aggregator_legs_and_forbids_undeclared_aggregator_edges() {
+        let channel_id = ChannelId::new(1);
+        let mut missing_from = ChannelRoleGraph::empty(channel_id);
+        missing_from
+            .producers
+            .insert(pid(2), BTreeSet::from([BindingId::new(10)]));
+        missing_from.aggregator = Some(pid(2));
+        missing_from.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(1),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: pid(2),
+                binding: BindingId::new(10),
+            },
+            to: RouteEndpoint {
+                participant: pid(2),
+                binding: BindingId::new(10),
+            },
+        });
+        let graph = RoleGraph {
+            channels: BTreeMap::from([(channel_id, missing_from)]),
+        };
+        let detail = invalid_shard_detail(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &graph,
+                &BTreeMap::new(),
+                &backends(),
+            )
+            .expect_err("declared aggregator needs both route legs"),
+        );
+        assert!(detail.contains("requires both ToAggregator and FromAggregator"));
+
+        let mut undeclared = ChannelRoleGraph::empty(channel_id);
+        undeclared
+            .producers
+            .insert(pid(2), BTreeSet::from([BindingId::new(10)]));
+        undeclared.routes.push(RouteEdge {
+            channel: channel_id,
+            edge_id: RouteEdgeId::new(1),
+            kind: RouteKind::ToAggregator,
+            from: RouteEndpoint {
+                participant: pid(2),
+                binding: BindingId::new(10),
+            },
+            to: RouteEndpoint {
+                participant: pid(2),
+                binding: BindingId::new(10),
+            },
+        });
+        let graph = RoleGraph {
+            channels: BTreeMap::from([(channel_id, undeclared)]),
+        };
+        let detail = invalid_shard_detail(
+            project_routing_shards(
+                DeploymentEpoch::new(9),
+                &graph,
+                &BTreeMap::new(),
+                &backends(),
+            )
+            .expect_err("aggregator routes require a declared aggregator"),
+        );
+        assert!(detail.contains("has aggregator route without an aggregator"));
+    }
+
+    #[test]
+    fn projector_rejects_direct_routes_mixed_with_declared_aggregator_strategy() {
+        let (mut graph, instances) = all_of_fixture();
+        graph
+            .channels
+            .get_mut(&ChannelId::new(1))
+            .unwrap()
+            .routes
+            .push(RouteEdge {
+                channel: ChannelId::new(1),
+                edge_id: RouteEdgeId::new(5),
+                kind: RouteKind::ReplicaDirect,
+                from: RouteEndpoint {
+                    participant: pid(2),
+                    binding: BindingId::new(10),
+                },
+                to: RouteEndpoint {
+                    participant: pid(2),
+                    binding: BindingId::new(20),
+                },
+            });
+
+        let detail = invalid_shard_detail(
+            project_routing_shards(DeploymentEpoch::new(9), &graph, &instances, &backends())
+                .expect_err("aggregator and direct routing strategies are mutually exclusive"),
+        );
+        assert!(detail.contains("mixes direct and aggregator routes"));
     }
 }
