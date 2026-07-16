@@ -17,7 +17,8 @@
 
 -- Migrated from dev/test/sql/test_agg/R/test_agg_compressed_key
 -- Test Objective:
--- Preserve legacy low-cardinality coverage in a self-contained sql-tests case.
+-- Preserve aggregate and 128-bit LARGEINT correctness coverage without
+-- coupling it to low-cardinality dictionary or optimizer-statistics behavior.
 -- query 1
 -- @skip_result_check=true
 USE ${case_db};
@@ -78,342 +79,171 @@ set pipeline_dop=2;
 USE ${case_db};
 select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
--- Populate stats before the EXPLAIN assertions below. R0 retired the
--- standalone native low-cardinality rewrite, so string columns must not
--- reintroduce FE-compatible DECODE plan nodes.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE all_t0;
-
 -- query 8
--- @result_not_contains=DECODE
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t0;
-
--- query 9
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c1 FROM all_t0;
-
--- query 10
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM all_t0;
-
--- query 11
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c3 FROM all_t0;
-
--- query 12
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c4 FROM all_t0;
-
--- query 13
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c5 FROM all_t0;
-
--- query 14
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c6 FROM all_t0;
-
--- query 15
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t0;
-
--- query 16
 USE ${case_db};
 select distinct c9,c10,c11,c12,c13,c14,c15,c16 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
--- query 17
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c11 FROM all_t0;
-
--- query 18
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c12 FROM all_t0;
-
--- query 19
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c13 FROM all_t0;
-
--- query 20
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c14 FROM all_t0;
-
--- query 21
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c15 FROM all_t0;
-
--- query 22
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c16 FROM all_t0;
-
--- query 23
+-- query 9
 USE ${case_db};
 select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
 
--- query 24
--- @result_not_contains=DECODE
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t0;
-
--- query 25
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c17 FROM all_t0;
-
--- query 26
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c18 FROM all_t0;
-
--- query 27
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t0;
-
--- query 28
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c14 FROM all_t0;
-
--- query 29
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c23 FROM all_t0;
-
--- query 30
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c24 FROM all_t0;
-
--- query 31
+-- query 10
 USE ${case_db};
 select c1, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3;
 
--- query 32
+-- query 11
 USE ${case_db};
 select c1, c2, sum(c1) from all_t0 group by 1,2 order by 1,2,3 limit 3;
 
--- query 33
+-- query 12
 USE ${case_db};
 select c2, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 34
+-- query 13
 USE ${case_db};
 select c3, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 35
+-- query 14
 USE ${case_db};
 select c4, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 36
+-- query 15
 USE ${case_db};
 select c5, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 37
+-- query 16
 USE ${case_db};
 select c6, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 38
+-- query 17
 USE ${case_db};
 select c7, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 39
+-- query 18
 USE ${case_db};
 select c8, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 40
+-- query 19
 USE ${case_db};
 select c9, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 41
+-- query 20
 USE ${case_db};
 select c13, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 42
+-- query 21
 USE ${case_db};
 select c14, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 43
+-- query 22
 USE ${case_db};
 select c14, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 44
+-- query 23
 USE ${case_db};
 select c16, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 45
+-- query 24
 USE ${case_db};
 select c17, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 46
+-- query 25
 USE ${case_db};
 select c18, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 47
+-- query 26
 USE ${case_db};
 select c19, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
--- query 48
+-- query 27
 USE ${case_db};
 select c2, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 49
+-- query 28
 USE ${case_db};
 select c3, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 50
+-- query 29
 USE ${case_db};
 select c4, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 51
+-- query 30
 USE ${case_db};
 select c5, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 52
+-- query 31
 USE ${case_db};
 select c6, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 53
+-- query 32
 USE ${case_db};
 select c7, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 54
+-- query 33
 USE ${case_db};
 select c8, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 55
+-- query 34
 USE ${case_db};
 select c9, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 56
+-- query 35
 USE ${case_db};
 select c13, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 57
+-- query 36
 USE ${case_db};
 select c14, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 58
+-- query 37
 USE ${case_db};
 select c14, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 59
+-- query 38
 USE ${case_db};
 select c16, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 60
+-- query 39
 USE ${case_db};
 select c17, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 61
+-- query 40
 USE ${case_db};
 select c18, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 62
+-- query 41
 USE ${case_db};
 select c19, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
--- query 63
+-- query 42
 USE ${case_db};
 select c3, c4, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
 
--- query 64
+-- query 43
 USE ${case_db};
 select c3, c5, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
 
--- query 65
+-- query 44
 USE ${case_db};
 select c3, c7, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
 
--- query 66
+-- query 45
 USE ${case_db};
 select c1,c2,c3,c4,c5,c6,c8,sum(c1) from all_t0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 30, 1;
 
--- query 67
+-- query 46
 USE ${case_db};
 select c1,c2,c3,c4,c5,c6,c8,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11 order by 1,2,3,4,5,6,7,8,9,10,11 limit 30, 1;
 
--- query 68
+-- query 47
 USE ${case_db};
 select c1,c2,c3,c4,c5,c6,c8,c11,c12,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11,12,13 order by 1,2,3,4,5,6,7,8,9,10,11,12,13 limit 30,1;
 
--- query 69
+-- query 48
 USE ${case_db};
 select c1,c2,c3,c4,c5,c6,c8, sum(c1) from all_t0 where c10 > 0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 1;
 
--- query 70
+-- query 49
 -- @skip_result_check=true
 USE ${case_db};
 create table all_decimal (
@@ -424,110 +254,72 @@ create table all_decimal (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 71
+-- query 50
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_decimal SELECT x%100, x%200, x%200, x%200 FROM TABLE(generate_series(1,  30000)) as g(x);
 
--- query 72
+-- query 51
 USE ${case_db};
 select distinct c1,c2,c3,c4 from all_decimal order by 1,2,3,4 limit 100,3;
 
--- Populate dictionary + per-column stats before the min-max / Decode
--- assertions below. NovaRocks standalone needs explicit ANALYZE FULL.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE all_decimal;
-
--- query 73
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c1 FROM all_decimal;
-
--- query 74
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM all_decimal;
-
--- query 75
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c3 FROM all_decimal;
-
--- query 76
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c4 FROM all_decimal;
-
--- query 77
+-- query 52
 USE ${case_db};
 select c1, sum(c1) from all_decimal group by 1 order by 1, 2 limit 1;
 
--- query 78
+-- query 53
 USE ${case_db};
 select c2, sum(c1) from all_decimal group by 1 order by 1, 2 limit 1;
 
--- query 79
+-- query 54
 USE ${case_db};
 select c3, sum(c1) from all_decimal group by 1 order by 1, 2 limit 1;
 
--- query 80
+-- query 55
 USE ${case_db};
 select c4, sum(c1) from all_decimal group by 1 order by 1, 2 limit 1;
 
--- query 81
+-- query 56
 USE ${case_db};
 select c1, c2, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 82
+-- query 57
 USE ${case_db};
 select c1, c3, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 83
+-- query 58
 USE ${case_db};
 select c1, c4, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 84
+-- query 59
 USE ${case_db};
 select c2, c3, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 85
+-- query 60
 USE ${case_db};
 select c2, c4, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 86
+-- query 61
 USE ${case_db};
 select c3, c4, sum(c1) from all_decimal group by 1,2 order by 1,2,3 limit 1;
 
--- query 87
+-- query 62
 USE ${case_db};
 select c1, c2, c3, sum(c1) from all_decimal group by 1,2,3 order by 1,2,3,4 limit 1;
 
--- query 88
+-- query 63
 USE ${case_db};
 select c1, c2, c4, sum(c1) from all_decimal group by 1,2,3 order by 1,2,3,4 limit 1;
 
--- query 89
+-- query 64
 USE ${case_db};
 select c2, c3, c4, sum(c1) from all_decimal group by 1,2,3 order by 1,2,3,4 limit 1;
 
--- query 90
+-- query 65
 USE ${case_db};
 select c1, c2, c3, c4, sum(c1) from all_decimal group by 1,2,3,4 order by 1,2,3,4,5 limit 1;
 
--- query 91
+-- query 66
 -- @skip_result_check=true
 USE ${case_db};
 create table all_numbers_t0 (
@@ -544,374 +336,208 @@ create table all_numbers_t0 (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 92
+-- query 67
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (-128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728, -128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728);
 
--- query 93
+-- query 68
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
--- query 94
+-- query 69
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (null, null, null, null, null, 0, 0, 0, 0, 0);
 
--- query 95
+-- query 70
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_numbers_t0 SELECT x%128, x%200, x%200, x%200, x%200, x%128, x%200, x%200, x%200, x%200 FROM TABLE(generate_series(1,  30000)) as g(x);
 
--- query 96
+-- query 71
 USE ${case_db};
 select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
 
--- Populate dictionary + per-column stats before the min-max assertions
--- below. NovaRocks standalone needs explicit ANALYZE FULL.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE all_numbers_t0;
-
--- query 97
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c1 FROM all_numbers_t0;
-
--- query 98
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM all_numbers_t0;
-
--- query 99
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c3 FROM all_numbers_t0;
-
--- query 100
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c4 FROM all_numbers_t0;
-
--- query 101
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c5 FROM all_numbers_t0;
-
--- query 102
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c13 FROM all_numbers_t0;
-
--- query 103
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c14 FROM all_numbers_t0;
-
--- query 104
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c15 FROM all_numbers_t0;
-
--- query 105
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c16 FROM all_numbers_t0;
-
--- query 106
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c17 FROM all_numbers_t0;
-
--- query 107
+-- query 72
 USE ${case_db};
 select distinct c1 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 108
+-- query 73
 USE ${case_db};
 select distinct c2 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 109
+-- query 74
 USE ${case_db};
 select distinct c3 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 110
+-- query 75
 USE ${case_db};
 select distinct c4 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 111
+-- query 76
 USE ${case_db};
 select distinct c5 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 112
+-- query 77
 USE ${case_db};
 select distinct c13 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 113
+-- query 78
 USE ${case_db};
 select distinct c14 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 114
+-- query 79
 USE ${case_db};
 select distinct c15 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 115
+-- query 80
 USE ${case_db};
 select distinct c16 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 116
+-- query 81
 USE ${case_db};
 select distinct c17 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 117
+-- query 82
 USE ${case_db};
 select distinct c1 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 118
+-- query 83
 USE ${case_db};
 select distinct c2,c1 from all_numbers_t0 order by 1,2 limit 30,1;
 
--- query 119
+-- query 84
 USE ${case_db};
 select distinct c3,c2,c1 from all_numbers_t0 order by 1,2,3 limit 30,1;
 
--- query 120
+-- query 85
 USE ${case_db};
 select distinct c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4 limit 30,1;
 
--- query 121
+-- query 86
 USE ${case_db};
 select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
 
--- query 122
+-- query 87
 USE ${case_db};
 select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1;
 
--- query 123
+-- query 88
 USE ${case_db};
 select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1;
 
--- query 124
+-- query 89
 USE ${case_db};
 select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1;
 
--- query 125
+-- query 90
 USE ${case_db};
 select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1;
 
--- query 126
+-- query 91
 USE ${case_db};
 select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
 
--- query 127
+-- query 92
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727, 127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727);
 
--- query 128
+-- query 93
 USE ${case_db};
 select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
 
--- query 129
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c1 FROM all_numbers_t0;
-
--- query 130
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM all_numbers_t0;
-
--- query 131
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c3 FROM all_numbers_t0;
-
--- query 132
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c4 FROM all_numbers_t0;
-
--- query 133
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c5 FROM all_numbers_t0;
-
--- query 134
+-- query 94
 USE ${case_db};
 select distinct c17,c16,c15,c14,c13 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
 
--- query 135
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c13 FROM all_numbers_t0;
-
--- query 136
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c14 FROM all_numbers_t0;
-
--- query 137
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c15 FROM all_numbers_t0;
-
--- query 138
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c16 FROM all_numbers_t0;
-
--- query 139
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c17 FROM all_numbers_t0;
-
--- query 140
+-- query 95
 USE ${case_db};
 select distinct c1 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 141
+-- query 96
 USE ${case_db};
 select distinct c2 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 142
+-- query 97
 USE ${case_db};
 select distinct c3 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 143
+-- query 98
 USE ${case_db};
 select distinct c4 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 144
+-- query 99
 USE ${case_db};
 select distinct c5 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 145
+-- query 100
 USE ${case_db};
 select distinct c13 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 146
+-- query 101
 USE ${case_db};
 select distinct c14 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 147
+-- query 102
 USE ${case_db};
 select distinct c15 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 148
+-- query 103
 USE ${case_db};
 select distinct c16 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 149
+-- query 104
 USE ${case_db};
 select distinct c17 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 150
+-- query 105
 USE ${case_db};
 select distinct c1 from all_numbers_t0 order by 1 limit 30,1;
 
--- query 151
+-- query 106
 USE ${case_db};
 select distinct c2,c1 from all_numbers_t0 order by 1,2 limit 30,1;
 
--- query 152
+-- query 107
 USE ${case_db};
 select distinct c3,c2,c1 from all_numbers_t0 order by 1,2,3 limit 30,1;
 
--- query 153
+-- query 108
 USE ${case_db};
 select distinct c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4 limit 30,1;
 
--- query 154
+-- query 109
 USE ${case_db};
 select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
 
--- query 155
+-- query 110
 USE ${case_db};
 select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1;
 
--- query 156
+-- query 111
 USE ${case_db};
 select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1;
 
--- query 157
+-- query 112
 USE ${case_db};
 select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1;
 
--- query 158
+-- query 113
 USE ${case_db};
 select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1;
 
--- query 159
+-- query 114
 USE ${case_db};
 select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
 
--- query 160
+-- query 115
 USE ${case_db};
 select distinct c2,c1 from all_numbers_t0 where c2 = 7 order by 1,2 limit 1;
 
--- query 161
+-- query 116
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE agged_table (
@@ -920,31 +546,31 @@ CREATE TABLE agged_table (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 162
+-- query 117
 -- @skip_result_check=true
 USE ${case_db};
 insert into agged_table values(1,10);
 
--- query 163
+-- query 118
 -- @skip_result_check=true
 USE ${case_db};
 -- Append-table setup already inserted the single expected value.
 
--- query 164
+-- query 119
 -- @skip_result_check=true
 USE ${case_db};
 -- Append-table setup already inserted the single expected value.
 
--- query 165
+-- query 120
 -- @skip_result_check=true
 USE ${case_db};
 -- Append-table setup already inserted the single expected value.
 
--- query 166
+-- query 121
 USE ${case_db};
 select distinct k2 from agged_table;
 
--- query 167
+-- query 122
 -- @skip_result_check=true
 USE ${case_db};
 CREATE TABLE trand (
@@ -953,51 +579,25 @@ CREATE TABLE trand (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 168
+-- query 123
 -- @skip_result_check=true
 USE ${case_db};
 insert into trand values(1,1);
 
--- Populate stats after the first insert before the min-max assertion.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE trand;
-
--- query 169
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT k1 FROM trand;
-
--- query 170
+-- query 124
 USE ${case_db};
 select k1 from trand group by k1;
 
--- query 171
+-- query 125
 -- @skip_result_check=true
 USE ${case_db};
 insert into trand values(2,2);
 
--- Re-collect stats after the second insert before the min-max assertion.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE trand;
-
--- query 172
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT k1 FROM trand;
-
--- query 173
+-- query 126
 USE ${case_db};
 select k1 from trand group by k1;
 
--- query 174
+-- query 127
 -- @skip_result_check=true
 USE ${case_db};
 create table all_t1 (
@@ -1028,377 +628,179 @@ create table all_t1 (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 175
+-- query 128
 -- @skip_result_check=true
 USE ${case_db};
 insert into all_t1 SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM TABLE(generate_series(1,  300000)) as g(x);
 
--- query 176
+-- query 129
 USE ${case_db};
 select distinct c1, c2, c3, c4, c5, c6, c7, c8 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
 
--- Populate dictionary + per-column stats before the min-max assertions below.
--- NovaRocks standalone needs explicit ANALYZE FULL.
--- @skip_result_check=true
-USE ${case_db};
-ANALYZE FULL TABLE all_t1;
-
--- query 177
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c1 FROM all_t1;
-
--- query 178
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM all_t1;
-
--- query 179
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c3 FROM all_t1;
-
--- query 180
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c4 FROM all_t1;
-
--- query 181
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c5 FROM all_t1;
-
--- query 182
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c6 FROM all_t1;
-
--- query 183
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c7 FROM all_t1;
-
--- query 184
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c8 FROM all_t1;
-
--- query 185
+-- query 130
 USE ${case_db};
 select distinct c9, c10, c11, c12, c13, c14, c15, c16 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
 
--- query 186
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c9 FROM all_t1;
-
--- query 187
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c10 FROM all_t1;
-
--- query 188
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c11 FROM all_t1;
-
--- query 189
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c12 FROM all_t1;
-
--- query 190
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c13 FROM all_t1;
-
--- query 191
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c14 FROM all_t1;
-
--- query 192
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c15 FROM all_t1;
-
--- query 193
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c16 FROM all_t1;
-
--- query 194
+-- query 131
 USE ${case_db};
 select distinct c17, c18, c19, c20, c21, c22, c23, c24 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
 
--- query 195
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c17 FROM all_t1;
-
--- query 196
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c18 FROM all_t1;
-
--- query 197
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c19 FROM all_t1;
-
--- query 198
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c20 FROM all_t1;
-
--- query 199
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c21 FROM all_t1;
-
--- query 200
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c22 FROM all_t1;
-
--- query 201
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c23 FROM all_t1;
-
--- query 202
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_contains=min-max stats
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c24 FROM all_t1;
-
--- query 203
+-- query 132
 -- @skip_result_check=true
 USE ${case_db};
 set group_concat_max_len=65535;
 
--- query 204
+-- query 133
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_t0 GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 1' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 205
+-- query 134
 USE ${case_db};
 WITH result AS (
     SELECT c2, COUNT(*) AS cnt FROM all_t0 GROUP BY c2 ORDER BY c2 LIMIT 100
 ) SELECT 'Test Case 2' AS test_name, MD5(GROUP_CONCAT(CAST(c2 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 206
+-- query 135
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_decimal GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 25' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 207
+-- query 136
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_numbers_t0 GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 29' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 208
+-- query 137
 USE ${case_db};
 WITH result AS (
     SELECT c1, c2, c3, COUNT(*) AS cnt FROM all_t0 GROUP BY c1, c2, c3 ORDER BY c1, c2, c3 LIMIT 100
 ) SELECT 'Test Case 39' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c2 AS STRING) || ':' || CAST(c3 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 209
+-- query 138
 USE ${case_db};
 WITH result AS (
     SELECT c6, c7, c8, COUNT(*) AS cnt FROM all_t0 GROUP BY c6, c7, c8 ORDER BY c6, c7, c8 LIMIT 100
 ) SELECT 'Test Case 40' AS test_name, MD5(GROUP_CONCAT(CAST(c6 AS STRING) || ':' || CAST(c7 AS STRING) || ':' || c8 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 210
+-- query 139
 USE ${case_db};
 WITH result AS (
     SELECT c13, c14, c15, COUNT(*) AS cnt FROM all_t0 GROUP BY c13, c14, c15 ORDER BY c13, c14, c15 LIMIT 100
 ) SELECT 'Test Case 42' AS test_name, MD5(GROUP_CONCAT(CAST(c13 AS STRING) || ':' || CAST(c14 AS STRING) || ':' || CAST(c15 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 211
+-- query 140
 USE ${case_db};
 WITH result AS (
     SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100
 ) SELECT 'Test Case 51' AS test_name, MD5(GROUP_CONCAT(c9 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 212
+-- query 141
 USE ${case_db};
 WITH result AS (
     SELECT c9, COUNT(*) AS cnt FROM all_t1 GROUP BY c9 ORDER BY c9 LIMIT 1000
 ) SELECT 'Test Case 52' AS test_name, MD5(GROUP_CONCAT(CAST(c9 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 213
+-- query 142
 USE ${case_db};
 WITH result AS (
     SELECT c18, COUNT(*) AS cnt FROM all_t0 GROUP BY c18 ORDER BY c18 LIMIT 100
 ) SELECT 'Test Case 53' AS test_name, MD5(GROUP_CONCAT(CAST(c18 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 214
+-- query 143
 USE ${case_db};
 WITH result AS (
     SELECT c13, COUNT(*) AS cnt FROM all_t0 GROUP BY c13 ORDER BY c13 LIMIT 100
 ) SELECT 'Test Case 54' AS test_name, MD5(GROUP_CONCAT(CAST(c13 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 215
+-- query 144
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_t0 GROUP BY c1 ORDER BY c1 NULLS FIRST LIMIT 100
 ) SELECT 'Test Case 55' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 216
+-- query 145
 USE ${case_db};
 WITH result AS (
     SELECT c5, COUNT(*) AS cnt FROM all_t0 GROUP BY c5 ORDER BY c5 NULLS FIRST LIMIT 100
 ) SELECT 'Test Case 56' AS test_name, MD5(GROUP_CONCAT(CAST(c5 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 217
+-- query 146
 USE ${case_db};
 WITH result AS (
     SELECT c1, c5, COUNT(*) AS cnt FROM all_numbers_t0 GROUP BY c1, c5 ORDER BY c1, c5 NULLS FIRST LIMIT 100
 ) SELECT 'Test Case 57' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c5 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 218
+-- query 147
 USE ${case_db};
 WITH result AS (
     SELECT c1, c13, COUNT(*) AS cnt FROM all_t0 GROUP BY c1, c13 ORDER BY c1, c13 NULLS FIRST LIMIT 100
 ) SELECT 'Test Case 58' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c13 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 219
+-- query 148
 USE ${case_db};
 WITH result AS (
     SELECT c1, c2, COUNT(*) AS cnt FROM all_t0 GROUP BY ROLLUP (c1, c2) ORDER BY 1,2,3 LIMIT 100
 ) SELECT 'Test Case 59' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c2 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 220
+-- query 149
 USE ${case_db};
 WITH result AS (
     SELECT c3, c6, COUNT(*) AS cnt FROM all_t0 GROUP BY CUBE(c3, c6) ORDER BY 1,2,3 LIMIT 100
 ) SELECT 'Test Case 60' AS test_name, MD5(GROUP_CONCAT(CAST(c3 AS STRING) || ':' || CAST(c6 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 221
+-- query 150
 USE ${case_db};
 WITH result AS (
     SELECT c13, c14, COUNT(*) AS cnt FROM all_numbers_t0 GROUP BY ROLLUP (c13, c14) ORDER BY 1,2,3 LIMIT 100
 ) SELECT 'Test Case 61' AS test_name, MD5(GROUP_CONCAT(CAST(c13 AS STRING) || ':' || CAST(c14 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 222
+-- query 151
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_t0 GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 62' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 223
+-- query 152
 USE ${case_db};
 WITH result AS (
     SELECT c1, COUNT(*) AS cnt FROM all_t0 WHERE c1 > 200 GROUP BY c1 ORDER BY c1 LIMIT 100
 ) SELECT 'Test Case 89' AS test_name, MD5('empty') AS result_hash FROM result LIMIT 1;
 
--- query 224
+-- query 153
 USE ${case_db};
 WITH result AS (
     SELECT k1, COUNT(*) AS cnt FROM trand GROUP BY k1 ORDER BY k1
 ) SELECT 'Test Case 90' AS test_name, MD5(GROUP_CONCAT(CAST(k1 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 225
+-- query 154
 USE ${case_db};
 WITH result AS (
     SELECT c8, COUNT(*) AS cnt FROM all_t0 GROUP BY c8 ORDER BY c8 LIMIT 100
 ) SELECT 'Test Case 93' AS test_name, MD5(GROUP_CONCAT(c8 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 226
+-- query 155
 USE ${case_db};
 WITH result AS (
     SELECT c20, COUNT(*) AS cnt FROM all_t0 GROUP BY c20 ORDER BY c20 LIMIT 100
 ) SELECT 'Test Case 94' AS test_name, MD5(GROUP_CONCAT(c20 || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 227
+-- query 156
 USE ${case_db};
 WITH result AS (
     SELECT c1, c5, c9, c13, c17, COUNT(*) AS cnt FROM all_t1 GROUP BY c1, c5, c9, c13, c17 ORDER BY c1, c5, c9, c13, c17 LIMIT 1000
 ) SELECT 'Test Case 95' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c5 AS STRING) || ':' || CAST(c9 AS STRING) || ':' || CAST(c13 AS STRING) || ':' || CAST(c17 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 228
+-- query 157
 USE ${case_db};
 WITH result AS (
     SELECT c1, c2, c3, c4, c5, COUNT(*) AS cnt FROM all_numbers_t0 GROUP BY c1, c2, c3, c4, c5 ORDER BY c1, c2, c3, c4, c5 LIMIT 100
 ) SELECT 'Test Case 96' AS test_name, MD5(GROUP_CONCAT(CAST(c1 AS STRING) || ':' || CAST(c2 AS STRING) || ':' || CAST(c3 AS STRING) || ':' || CAST(c4 AS STRING) || ':' || CAST(c5 AS STRING) || ':' || CAST(cnt AS STRING))) AS result_hash FROM result;
 
--- query 229
+-- query 158
 USE ${case_db};
 WITH result AS (
     SELECT c13, c14, c15, c16, c17, COUNT(*) AS cnt FROM all_numbers_t0 GROUP BY c13, c14, c15, c16, c17 ORDER BY c13, c14, c15, c16, c17 LIMIT 100
