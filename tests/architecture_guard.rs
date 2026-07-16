@@ -9927,6 +9927,13 @@ fn runtime_filter_transport_use_expands_visibility(import: &str) -> bool {
     )
 }
 
+fn runtime_filter_transport_cfg_requires_test(attributes: &[syn::Attribute]) -> bool {
+    matches!(
+        runtime_filter_syn_attributes_test_requirement(attributes),
+        CfgTestRequirement::RequiresTest
+    )
+}
+
 fn runtime_filter_transport_extern_self_alias_violations(
     source_rel: &str,
     text: &str,
@@ -9937,24 +9944,79 @@ fn runtime_filter_transport_extern_self_alias_violations(
     }
     impl<'ast> syn::visit::Visit<'ast> for ExternSelfAudit {
         fn visit_item(&mut self, item: &'ast syn::Item) {
-            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            if runtime_filter_transport_cfg_requires_test(runtime_filter_syn_item_attributes(item))
+            {
                 return;
             }
             syn::visit::visit_item(self, item);
         }
 
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if runtime_filter_transport_cfg_requires_test(runtime_filter_impl_item_attributes(item))
+            {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if runtime_filter_transport_cfg_requires_test(runtime_filter_trait_item_attributes(
+                item,
+            )) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
+        }
+
+        fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+            if runtime_filter_transport_cfg_requires_test(runtime_filter_foreign_item_attributes(
+                item,
+            )) {
+                return;
+            }
+            syn::visit::visit_foreign_item(self, item);
+        }
+
         fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
-            if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_stmt_attrs(statement)) {
                 return;
             }
             syn::visit::visit_stmt(self, statement);
         }
 
         fn visit_expr(&mut self, expression: &'ast syn::Expr) {
-            if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expression)) {
+            if runtime_filter_transport_cfg_requires_test(nfe_4_syn_expr_attrs(expression)) {
                 return;
             }
             syn::visit::visit_expr(self, expression);
+        }
+
+        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+            if runtime_filter_transport_cfg_requires_test(&arm.attrs) {
+                return;
+            }
+            syn::visit::visit_arm(self, arm);
+        }
+
+        fn visit_field(&mut self, field: &'ast syn::Field) {
+            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
+                return;
+            }
+            syn::visit::visit_field(self, field);
+        }
+
+        fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+            if runtime_filter_transport_cfg_requires_test(&variant.attrs) {
+                return;
+            }
+            syn::visit::visit_variant(self, variant);
+        }
+
+        fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+            if runtime_filter_transport_cfg_requires_test(&field.attrs) {
+                return;
+            }
+            syn::visit::visit_field_value(self, field);
         }
 
         fn visit_item_extern_crate(&mut self, extern_crate: &'ast syn::ItemExternCrate) {
@@ -16958,6 +17020,38 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
             "fn leak() { #[cfg_attr(test, allow(dead_code))] { extern crate self as root; } }",
         ),
         (
+            adapter,
+            "struct S; impl S { fn leak() { extern crate self as root; } }",
+        ),
+        (
+            adapter,
+            "trait T { fn leak() { extern crate self as root; } }",
+        ),
+        (
+            adapter,
+            "fn leak(value: u8) { match value { #[cfg(any(test, feature = \"compat\"))] 0 => { extern crate self as root; }, _ => {} } }",
+        ),
+        (
+            adapter,
+            "unsafe extern \"C\" { #[cfg_attr(test, allow(dead_code))] fn leak(_: [u8; { extern crate self as root; 0 }]); }",
+        ),
+        (
+            adapter,
+            "struct S { field: [u8; { extern crate self as root; 0 }] }",
+        ),
+        (
+            adapter,
+            "enum E { Variant = { extern crate self as root; 0 } }",
+        ),
+        (
+            adapter,
+            "struct S { value: () } fn leak() { let _ = S { value: { extern crate self as root; () } }; }",
+        ),
+        (
+            adapter,
+            "fn leak() { #[cfg_attr(feature = \"compat\", cfg(test))] { extern crate self as root; } }",
+        ),
+        (
             "src/service/grpc_server.rs",
             "fn leak() { extern crate self as root; let _: Option<root::runtime_filter::port::transport::RuntimeFilterEnvelope> = None; }",
         ),
@@ -17014,6 +17108,14 @@ fn rfd4_m1_transport_ingress_detector_is_named_adapter_only_and_default_deny() {
         "fn f() { #[cfg(test)] { extern crate self as root; } }",
         "fn f() { #[cfg(test)] async { extern crate self as root; }; }",
         "fn f() { #[cfg(test)] let _alias = async { extern crate self as root; }; }",
+        "struct S; impl S { #[cfg(test)] fn fixture() { extern crate self as root; } }",
+        "trait T { #[cfg(test)] fn fixture() { extern crate self as root; } }",
+        "fn f(value: u8) { match value { #[cfg(test)] 0 => { extern crate self as root; }, _ => {} } }",
+        "unsafe extern \"C\" { #[cfg(test)] fn fixture(_: [u8; { extern crate self as root; 0 }]); }",
+        "struct S { #[cfg(test)] field: [u8; { extern crate self as root; 0 }] }",
+        "enum E { #[cfg(test)] Variant = { extern crate self as root; 0 } }",
+        "struct S { value: () } fn f() { let _ = S { #[cfg(test)] value: { extern crate self as root; () } }; }",
+        "fn f() { #[cfg_attr(not(test), cfg(test))] { extern crate self as root; } }",
         "extern crate reqwest;",
         "extern crate reqwest as network;",
     ] {
