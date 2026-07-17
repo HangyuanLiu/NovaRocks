@@ -919,6 +919,23 @@ impl CommitHookControl {
     }
 }
 
+#[cfg(feature = "state-store-test-hooks")]
+impl Drop for CommitHookControl {
+    fn drop(&mut self) {
+        let mut armed = NEXT_COMMIT_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if armed
+            .as_ref()
+            .is_some_and(|armed| Arc::ptr_eq(armed, &self.hook))
+        {
+            *armed = None;
+        }
+        self.hook.release.notify_one();
+    }
+}
+
 const fn commit_unknown() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::ProviderUnavailable,

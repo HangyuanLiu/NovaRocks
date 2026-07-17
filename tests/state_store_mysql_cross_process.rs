@@ -20,7 +20,7 @@
     feature = "state-store-test-hooks"
 ))]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -31,22 +31,329 @@ use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
 
 const HELPER: &str = env!("CARGO_BIN_EXE_state-store-mysql-helper");
+const TEST_DIAGNOSTIC_CAP_BYTES: usize = 1024;
+const HELPER_DIAGNOSTIC_CAP_BYTES: usize = 64 * 1024;
+const HELPER_TOTAL_DEADLINE: Duration = Duration::from_secs(15);
 
-fn run_helper(input: &[u8], configure: impl FnOnce(&mut Command)) -> Output {
-    let mut command = Command::new(HELPER);
+enum HelperEnvironment<'a> {
+    Empty,
+    Ordinary { database: &'a str },
+}
+
+struct BoundedCommandOutput {
+    output: Output,
+    pid: u32,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+struct CappedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl CappedCapture {
+    fn empty() -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8], cap: usize) {
+        let retained = cap.saturating_sub(self.bytes.len()).min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..retained]);
+        self.truncated |= retained < chunk.len();
+    }
+}
+
+fn run_command_bounded(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    deadline: Duration,
+    diagnostic_cap: usize,
+) -> BoundedCommandOutput {
+    run_command_bounded_observed(command, input, deadline, diagnostic_cap, |_| {})
+}
+
+fn run_command_bounded_observed(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    deadline: Duration,
+    diagnostic_cap: usize,
+    observe: impl FnOnce(u32),
+) -> BoundedCommandOutput {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure(&mut command);
-    let mut child = command.spawn().expect("spawn MySQL state store helper");
-    child
-        .stdin
-        .take()
-        .expect("take helper stdin")
-        .write_all(input)
-        .expect("write helper input");
-    child.wait_with_output().expect("wait for helper output")
+    let mut child = command.spawn().expect("spawn bounded child");
+    let pid = child.id();
+    observe(pid);
+    let stdin = child.stdin.take().expect("take bounded child stdin");
+    let stdout = child.stdout.take().expect("take bounded child stdout");
+    let stderr = child.stderr.take().expect("take bounded child stderr");
+    let writer = if let Some(input) = input {
+        let input = input.to_vec();
+        Some(std::thread::spawn(move || {
+            let mut stdin = stdin;
+            stdin.write_all(&input)
+        }))
+    } else {
+        drop(stdin);
+        None
+    };
+    let stdout_reader = spawn_capped_reader(stdout, diagnostic_cap);
+    let stderr_reader = spawn_capped_reader(stderr, diagnostic_cap);
+    let stop_at = std::time::Instant::now() + deadline;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().expect("poll bounded child") {
+            break (status, false);
+        }
+        if std::time::Instant::now() >= stop_at {
+            let _ = child.kill();
+            break (child.wait().expect("wait for killed bounded child"), true);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(writer) = writer {
+        let write_result = writer.join().expect("join bounded child stdin writer");
+        if !timed_out {
+            write_result.expect("write bounded child input");
+        }
+    }
+    let stdout = stdout_reader
+        .join()
+        .expect("join bounded child stdout reader");
+    let stderr = stderr_reader
+        .join()
+        .expect("join bounded child stderr reader");
+    BoundedCommandOutput {
+        output: Output {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        },
+        pid,
+        timed_out,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    }
+}
+
+fn spawn_capped_reader(
+    mut reader: impl Read + Send + 'static,
+    cap: usize,
+) -> JoinHandle<CappedCapture> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(cap.min(8192));
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer).expect("read bounded child stream");
+            if read == 0 {
+                break;
+            }
+            let remaining = cap.saturating_sub(bytes.len());
+            let retained = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            truncated |= retained < read;
+        }
+        CappedCapture { bytes, truncated }
+    })
+}
+
+fn spawn_interactive_stdout(
+    mut reader: impl Read + Send + 'static,
+    sender: mpsc::Sender<String>,
+    capture: Arc<Mutex<CappedCapture>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        let mut pending = Vec::new();
+        loop {
+            let read = reader.read(&mut buffer).expect("read helper stdout");
+            if read == 0 {
+                break;
+            }
+            capture
+                .lock()
+                .expect("lock helper stdout capture")
+                .append(&buffer[..read], HELPER_DIAGNOSTIC_CAP_BYTES);
+            for byte in &buffer[..read] {
+                if *byte == b'\n' {
+                    let line = String::from_utf8(std::mem::take(&mut pending));
+                    if line.ok().is_none_or(|line| sender.send(line).is_err()) {
+                        return;
+                    }
+                } else if pending.len() < HELPER_DIAGNOSTIC_CAP_BYTES {
+                    pending.push(*byte);
+                }
+            }
+        }
+    })
+}
+
+fn spawn_interactive_capture(
+    mut reader: impl Read + Send + 'static,
+    capture: Arc<Mutex<CappedCapture>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .expect("read helper diagnostic stream");
+            if read == 0 {
+                break;
+            }
+            capture
+                .lock()
+                .expect("lock helper diagnostic capture")
+                .append(&buffer[..read], HELPER_DIAGNOSTIC_CAP_BYTES);
+        }
+    })
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    return Path::new(&format!("/proc/{pid}")).exists();
+    #[cfg(not(target_os = "linux"))]
+    return Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| output.status.success());
+}
+
+fn run_helper(input: &[u8], environment: HelperEnvironment<'_>) -> Output {
+    run_helper_observed(input, environment, |_| {})
+}
+
+fn run_helper_observed(
+    input: &[u8],
+    environment: HelperEnvironment<'_>,
+    observe: impl FnOnce(u32),
+) -> Output {
+    let mut command = Command::new(HELPER);
+    command.env_clear();
+    if let HelperEnvironment::Ordinary { database } = environment {
+        configure_ordinary_helper(&mut command, database);
+    }
+    let result = run_command_bounded_observed(
+        &mut command,
+        Some(input),
+        HELPER_TOTAL_DEADLINE,
+        HELPER_DIAGNOSTIC_CAP_BYTES,
+        observe,
+    );
+    let diagnostics = redact_test_material(&format!(
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&result.output.stdout),
+        String::from_utf8_lossy(&result.output.stderr)
+    ));
+    assert!(
+        !result.timed_out,
+        "helper exceeded total deadline: {diagnostics}"
+    );
+    assert!(
+        !result.stdout_truncated && !result.stderr_truncated,
+        "helper diagnostics exceeded cap: {diagnostics}"
+    );
+    result.output
+}
+
+#[test]
+fn mysql_helper_pure_protocol_child_has_empty_environment() {
+    let leak_canary = required_process_env("SS3_HELPER_ENV_LEAK_CANARY");
+    let output = run_helper_observed(
+        b"{\"id\":1,\"command\":\"Shutdown\"}\n",
+        HelperEnvironment::Empty,
+        |pid| {
+            let environment = process_environment(pid);
+            assert!(
+                !contains_bytes(&environment, leak_canary.as_bytes()),
+                "pure protocol helper inherited parent environment"
+            );
+        },
+    );
+    assert!(output.status.success());
+}
+
+#[test]
+fn mysql_helper_runner_times_out_silent_child_without_leaking_process() {
+    let mut command = Command::new("/bin/sleep");
+    command.arg("1");
+    let started = std::time::Instant::now();
+    let result = run_command_bounded(
+        &mut command,
+        None,
+        Duration::from_millis(100),
+        TEST_DIAGNOSTIC_CAP_BYTES,
+    );
+    assert!(result.timed_out, "silent child must hit the total deadline");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "silent child timeout must be bounded"
+    );
+    assert!(
+        !process_is_alive(result.pid),
+        "timed-out child must be reaped"
+    );
+}
+
+#[test]
+fn mysql_helper_runner_caps_stderr_flood_and_reaps_child() {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "i=0; while [ $i -lt 10000 ]; do echo helper-stdout-flood; echo helper-stderr-flood >&2; i=$((i + 1)); done",
+    ]);
+    let result = run_command_bounded(
+        &mut command,
+        None,
+        Duration::from_secs(5),
+        TEST_DIAGNOSTIC_CAP_BYTES,
+    );
+    assert!(!result.timed_out, "finite stderr flood child must finish");
+    assert!(
+        result.stdout_truncated,
+        "stdout flood must report truncation"
+    );
+    assert!(
+        result.stderr_truncated,
+        "stderr flood must report truncation"
+    );
+    assert!(result.output.stdout.len() <= TEST_DIAGNOSTIC_CAP_BYTES);
+    assert!(result.output.stderr.len() <= TEST_DIAGNOSTIC_CAP_BYTES);
+    assert!(!process_is_alive(result.pid), "flood child must be reaped");
+}
+
+#[test]
+fn mysql_helper_interactive_timeout_kills_child_without_diagnostic_deadlock() {
+    let mut helper = HelperProcess::spawn_silent_for_test(Duration::from_secs(1));
+    let pid = helper.id();
+    let started = std::time::Instant::now();
+    let diagnostic = helper
+        .receive_with_timeout(Duration::from_millis(100))
+        .expect_err("silent interactive child must time out");
+    assert!(diagnostic.contains("timed out"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "interactive timeout must not block on diagnostics"
+    );
+    assert!(!process_is_alive(pid), "interactive child must be reaped");
+}
+
+#[test]
+fn mysql_helper_interactive_drop_reaps_live_child() {
+    let helper = HelperProcess::spawn_silent_for_test(Duration::from_secs(1));
+    let pid = helper.id();
+    drop(helper);
+    assert!(
+        !process_is_alive(pid),
+        "dropped helper child must be reaped"
+    );
 }
 
 fn response_lines(output: &Output) -> Vec<JsonValue> {
@@ -58,7 +365,11 @@ fn response_lines(output: &Output) -> Vec<JsonValue> {
 }
 
 fn assert_terminal_protocol_error(input: &[u8], expected_code: &str) {
-    let output = run_helper(input, |_| {});
+    assert_terminal_protocol_error_with_id(input, expected_code, 1);
+}
+
+fn assert_terminal_protocol_error_with_id(input: &[u8], expected_code: &str, expected_id: u64) {
+    let output = run_helper(input, HelperEnvironment::Empty);
     assert!(
         !output.status.success(),
         "invalid protocol input must terminate the helper"
@@ -72,13 +383,31 @@ fn assert_terminal_protocol_error(input: &[u8], expected_code: &str) {
     assert_eq!(responses[0]["ok"], false);
     assert_eq!(responses[0]["event"], "Error");
     assert_eq!(responses[0]["code"], expected_code);
-    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["id"], expected_id);
     assert!(responses[0]["pid"].as_u64().is_some_and(|pid| pid > 0));
 }
 
 #[test]
+fn mysql_helper_protocol_correlates_only_unique_top_level_u64_id() {
+    for (input, expected_id) in [
+        (r#"{"command":"Crash", "id" : 7}"#, 7),
+        (r#"{"command":"Crash","probe":true,"id":8}"#, 8),
+        (r#"{"probe":{"id":99},"command":"Crash","id":9}"#, 9),
+        (r#"{"id":10,"command":"Crash","id":11}"#, 0),
+        (r#"{"command":"Crash"}"#, 0),
+        (r#"{"id":"12","command":"Crash"}"#, 0),
+    ] {
+        let input = format!("{input}\n");
+        assert_terminal_protocol_error_with_id(input.as_bytes(), "InvalidJson", expected_id);
+    }
+}
+
+#[test]
 fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
-    let output = run_helper(b"{\"id\":1,\"command\":\"Shutdown\"}\n", |_| {});
+    let output = run_helper(
+        b"{\"id\":1,\"command\":\"Shutdown\"}\n",
+        HelperEnvironment::Empty,
+    );
     assert!(output.status.success(), "Shutdown must exit successfully");
     let responses = response_lines(&output);
     assert_eq!(responses.len(), 1, "Shutdown must emit one response");
@@ -118,15 +447,16 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
         b"{\"id\":1,\"command\":\"Delete\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"precondition\":{\"version\":\"00\",\"unexpected\":true}}\n",
         "InvalidJson",
     );
-    assert_terminal_protocol_error(
+    assert_terminal_protocol_error_with_id(
         b"{\"id\":1,\"id\":1,\"command\":\"Shutdown\"}\n",
         "InvalidJson",
+        0,
     );
     let oversized = format!(
         "{{\"id\":1,\"command\":\"Put\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"value\":\"{}\",\"precondition\":\"Any\"}}\n",
         "00".repeat(90_000)
     );
-    assert_terminal_protocol_error(oversized.as_bytes(), "LineTooLong");
+    assert_terminal_protocol_error_with_id(oversized.as_bytes(), "LineTooLong", 0);
     let oversized_key = format!(
         "{{\"id\":1,\"command\":\"Get\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"{}\"}}\n",
         "00".repeat(3_073)
@@ -135,21 +465,16 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
 
     let canaries = [
         "ordinary-password-canary",
-        "provisioner-password-canary",
         "mysql://credential-canary@database-canary",
         "database-canary",
         "logical-key-canary",
         "logical-value-canary",
     ];
-    let output = run_helper(b"{\"id\":1,\"command\":\"Crash\"}\n", |command| {
-        command
-            .env("NOVAROCKS_MYSQL_PASSWORD", canaries[0])
-            .env("NOVA_MYSQL_PROVISIONER_PASSWORD", canaries[1])
-            .env("NOVAROCKS_MYSQL_DSN", canaries[2])
-            .env("NOVAROCKS_MYSQL_DATABASE", canaries[3])
-            .env("NOVAROCKS_LOGICAL_KEY", canaries[4])
-            .env("NOVAROCKS_LOGICAL_VALUE", canaries[5]);
-    });
+    let diagnostic_probe = format!(
+        "{{\"id\":1,\"command\":\"Crash\",\"password\":\"{}\",\"dsn\":\"{}\",\"database\":\"{}\",\"key\":\"{}\",\"value\":\"{}\"}}\n",
+        canaries[0], canaries[1], canaries[2], canaries[3], canaries[4]
+    );
+    let output = run_helper(diagnostic_probe.as_bytes(), HelperEnvironment::Empty);
     let diagnostics = [output.stdout, output.stderr].concat();
     for canary in canaries {
         assert!(
@@ -165,8 +490,8 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
 fn mysql_helper_open_failure_shuts_down_runtime_and_exits_deterministically() {
     let output = run_helper(
         b"{\"id\":1,\"command\":\"Open\",\"cluster_id\":\"cross-process-open-failure\"}\n",
-        |command| {
-            command.env("NOVAROCKS_MYSQL_DATABASE", "missing_cross_process_database");
+        HelperEnvironment::Ordinary {
+            database: "missing_cross_process_database",
         },
     );
     assert!(
@@ -195,6 +520,11 @@ fn mysql_helper_open_failure_shuts_down_runtime_and_exits_deterministically() {
 #[test]
 fn mysql_cross_process_suite() {
     run_mysql_cross_process_suite();
+}
+
+#[test]
+fn mysql_helper_response_loss_predispatch_terminal_is_bounded() {
+    predispatch_tombstone_response_loss_case();
 }
 
 struct TestDatabase {
@@ -238,66 +568,46 @@ struct HelperProcess {
     stdin: ChildStdin,
     responses: mpsc::Receiver<String>,
     stdout_reader: Option<JoinHandle<()>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout: Arc<Mutex<CappedCapture>>,
+    stderr: Arc<Mutex<CappedCapture>>,
     stderr_reader: Option<JoinHandle<()>>,
     next_id: u64,
 }
 
 impl HelperProcess {
+    fn spawn_silent_for_test(duration: Duration) -> Self {
+        let mut command = Command::new("/bin/sleep");
+        command.arg(duration.as_secs_f64().to_string());
+        Self::spawn_command(command)
+    }
+
     fn spawn(database: &str) -> Self {
-        let password_env = required_process_env("NOVAROCKS_MYSQL_PASSWORD_ENV");
-        let password = required_process_env(&password_env);
         let mut command = Command::new(HELPER);
+        command.env_clear();
+        configure_ordinary_helper(&mut command, database);
+        Self::spawn_command(command)
+    }
+
+    fn spawn_command(mut command: Command) -> Self {
         command
-            .env_clear()
-            .env(
-                "NOVAROCKS_MYSQL_HOST",
-                required_process_env("NOVAROCKS_MYSQL_HOST"),
-            )
-            .env(
-                "NOVAROCKS_MYSQL_PORT",
-                required_process_env("NOVAROCKS_MYSQL_PORT"),
-            )
-            .env(
-                "NOVAROCKS_MYSQL_USERNAME",
-                required_process_env("NOVAROCKS_MYSQL_USERNAME"),
-            )
-            .env("NOVAROCKS_MYSQL_PASSWORD_ENV", &password_env)
-            .env(&password_env, password)
-            .env("NOVAROCKS_MYSQL_DATABASE", database)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn MySQL state store helper");
+        let mut child = command.spawn().expect("spawn interactive helper child");
         let stdin = child.stdin.take().expect("take helper stdin");
         let stdout = child.stdout.take().expect("take helper stdout");
         let child_stderr = child.stderr.take().expect("take helper stderr");
         let (sender, responses) = mpsc::channel();
-        let stdout_reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let stderr_sink = Arc::clone(&stderr);
-        let stderr_reader = std::thread::spawn(move || {
-            let mut reader = BufReader::new(child_stderr);
-            std::io::copy(
-                &mut reader,
-                &mut *stderr_sink.lock().expect("lock helper stderr"),
-            )
-            .expect("capture helper stderr");
-        });
+        let stdout_capture = Arc::new(Mutex::new(CappedCapture::empty()));
+        let stderr = Arc::new(Mutex::new(CappedCapture::empty()));
+        let stdout_reader = spawn_interactive_stdout(stdout, sender, Arc::clone(&stdout_capture));
+        let stderr_reader = spawn_interactive_capture(child_stderr, Arc::clone(&stderr));
         Self {
             child,
             stdin,
             responses,
             stdout_reader: Some(stdout_reader),
+            stdout: stdout_capture,
             stderr,
             stderr_reader: Some(stderr_reader),
             next_id: 0,
@@ -318,18 +628,44 @@ impl HelperProcess {
         response
     }
 
+    fn request_with_timeout(
+        &mut self,
+        mut command: JsonValue,
+        timeout: Duration,
+    ) -> Result<JsonValue, String> {
+        self.next_id += 1;
+        command["id"] = json!(self.next_id);
+        self.send(&command);
+        let response = self.receive_with_timeout(timeout)?;
+        if response["id"] != self.next_id {
+            return Err("helper response identifier mismatch".to_owned());
+        }
+        Ok(response)
+    }
+
     fn send(&mut self, command: &JsonValue) {
         serde_json::to_writer(&mut self.stdin, &command).expect("encode helper request");
         self.stdin.write_all(b"\n").expect("write JSONL delimiter");
         self.stdin.flush().expect("flush helper request");
     }
 
-    fn receive(&self) -> JsonValue {
-        let line = self
-            .responses
-            .recv_timeout(Duration::from_secs(15))
-            .unwrap_or_else(|_| panic!("helper response timed out: {}", self.safe_stderr()));
-        serde_json::from_str(&line).expect("decode helper response")
+    fn receive(&mut self) -> JsonValue {
+        self.receive_with_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"))
+    }
+
+    fn receive_with_timeout(&mut self, timeout: Duration) -> Result<JsonValue, String> {
+        let line = match self.responses.recv_timeout(timeout) {
+            Ok(line) => line,
+            Err(_) => {
+                self.terminate_and_join();
+                return Err(format!(
+                    "helper response timed out: {}",
+                    self.safe_diagnostics()
+                ));
+            }
+        };
+        serde_json::from_str(&line).map_err(|_| "helper returned invalid JSON".to_owned())
     }
 
     fn request_unchecked(&mut self, mut command: JsonValue) -> JsonValue {
@@ -355,7 +691,11 @@ impl HelperProcess {
         let response = self.request(json!({"command": "Shutdown"}));
         assert_eq!(response["event"], "Shutdown");
         let status = self.child.wait().expect("wait for helper shutdown");
-        assert!(status.success(), "helper shutdown failed");
+        assert!(
+            status.success(),
+            "helper shutdown failed: {}",
+            self.safe_diagnostics()
+        );
         self.join_readers();
         assert!(self.safe_stderr().is_empty(), "unexpected helper stderr");
     }
@@ -366,10 +706,13 @@ impl HelperProcess {
             if let Some(status) = self.child.try_wait().expect("poll helper exit") {
                 break status;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "helper must exit after a terminal protocol error"
-            );
+            if std::time::Instant::now() >= deadline {
+                self.terminate_and_join();
+                panic!(
+                    "helper must exit after a terminal protocol error: {}",
+                    self.safe_diagnostics()
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(!status.success(), "terminal helper error must be nonzero");
@@ -378,8 +721,23 @@ impl HelperProcess {
 
     fn safe_stderr(&self) -> String {
         let stderr = self.stderr.lock().expect("lock helper stderr");
-        let raw = String::from_utf8_lossy(&stderr);
-        redact_test_material(&raw)
+        render_capture(&stderr)
+    }
+
+    fn safe_diagnostics(&self) -> String {
+        let stdout = self.stdout.lock().expect("lock helper stdout");
+        let stderr = self.stderr.lock().expect("lock helper stderr");
+        format!(
+            "stdout={} stderr={}",
+            render_capture(&stdout),
+            render_capture(&stderr)
+        )
+    }
+
+    fn terminate_and_join(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.join_readers();
     }
 
     fn join_readers(&mut self) {
@@ -396,12 +754,39 @@ fn required_process_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("required MySQL fixture variable is missing"))
 }
 
+fn configure_ordinary_helper(command: &mut Command, database: &str) {
+    let password_env = required_process_env("NOVAROCKS_MYSQL_PASSWORD_ENV");
+    let password = required_process_env(&password_env);
+    command
+        .env(
+            "NOVAROCKS_MYSQL_HOST",
+            required_process_env("NOVAROCKS_MYSQL_HOST"),
+        )
+        .env(
+            "NOVAROCKS_MYSQL_PORT",
+            required_process_env("NOVAROCKS_MYSQL_PORT"),
+        )
+        .env(
+            "NOVAROCKS_MYSQL_USERNAME",
+            required_process_env("NOVAROCKS_MYSQL_USERNAME"),
+        )
+        .env("NOVAROCKS_MYSQL_PASSWORD_ENV", &password_env)
+        .env(&password_env, password)
+        .env("NOVAROCKS_MYSQL_DATABASE", database);
+}
+
 impl Drop for HelperProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.join_readers();
+        self.terminate_and_join();
     }
+}
+
+fn render_capture(capture: &CappedCapture) -> String {
+    let mut rendered = redact_test_material(&String::from_utf8_lossy(&capture.bytes));
+    if capture.truncated {
+        rendered.push_str("<truncated>");
+    }
+    rendered
 }
 
 fn redact_test_material(raw: &str) -> String {
@@ -421,6 +806,7 @@ fn redact_test_material(raw: &str) -> String {
 }
 
 fn run_mysql_cross_process_suite() {
+    predispatch_tombstone_response_loss_case();
     same_key_cas_case();
     write_skew_case();
     range_phantom_case();
@@ -429,6 +815,42 @@ fn run_mysql_cross_process_suite() {
     change_order_case();
     cluster_and_database_mismatch_case();
     request_identifier_case();
+}
+
+fn predispatch_tombstone_response_loss_case() {
+    let (_database, mut left, mut right) = open_pair("predispatch-loss");
+    let transaction_id = Uuid::now_v7();
+    assert_eq!(
+        resolve(&mut right, transaction_id)["resolution"],
+        "NotCommitted"
+    );
+    begin(
+        &mut left,
+        transaction_id,
+        "predispatch tombstone response loss",
+    );
+    put(
+        &mut left,
+        transaction_id,
+        b"predispatch/key",
+        b"must-not-publish",
+        json!("Any"),
+    );
+    let response = left
+        .request_with_timeout(
+            json!({
+                "command": "Commit",
+                "transaction_id": transaction_id,
+                "lose_response": true,
+            }),
+            Duration::from_secs(2),
+        )
+        .expect("predispatch terminal commit must return before hook deadline");
+    assert_eq!(response["event"], "Commit");
+    assert_ne!(response["outcome"], "Committed");
+    seed(&mut left, &[(b"predispatch/next", b"committed")]);
+    left.shutdown();
+    right.shutdown();
 }
 
 fn open_pair(case_id: &str) -> (TestDatabase, HelperProcess, HelperProcess) {
@@ -452,6 +874,20 @@ fn open_pair(case_id: &str) -> (TestDatabase, HelperProcess, HelperProcess) {
 }
 
 fn assert_no_provisioner_environment(pid: u32) {
+    let environment = process_environment(pid);
+    for forbidden in [
+        b"NOVA_MYSQL_PROVISIONER_USERNAME".as_slice(),
+        b"NOVA_MYSQL_PROVISIONER_PASSWORD".as_slice(),
+        b"NOVA_MYSQL_COMPOSE_ENV".as_slice(),
+    ] {
+        assert!(
+            !contains_bytes(&environment, forbidden),
+            "helper inherited provisioner environment"
+        );
+    }
+}
+
+fn process_environment(pid: u32) -> Vec<u8> {
     #[cfg(target_os = "linux")]
     let environment =
         std::fs::read(format!("/proc/{pid}/environ")).expect("read helper process environment");
@@ -461,18 +897,13 @@ fn assert_no_provisioner_environment(pid: u32) {
         .output()
         .expect("inspect helper process environment")
         .stdout;
-    for forbidden in [
-        b"NOVA_MYSQL_PROVISIONER_USERNAME".as_slice(),
-        b"NOVA_MYSQL_PROVISIONER_PASSWORD".as_slice(),
-        b"NOVA_MYSQL_COMPOSE_ENV".as_slice(),
-    ] {
-        assert!(
-            !environment
-                .windows(forbidden.len())
-                .any(|window| window == forbidden),
-            "helper inherited provisioner environment"
-        );
-    }
+    environment
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn begin(helper: &mut HelperProcess, transaction_id: Uuid, description: &str) {

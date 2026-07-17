@@ -16,30 +16,33 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use super::test_support::MysqlCommitTestApi;
 use crate::state_store::limits::{MAX_VALUE_BYTES, MYSQL_MAX_KEY_BYTES};
-use crate::state_store::runtime::MysqlRuntime;
 use crate::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
     Direction as StoreDirection, FeDeploymentView, Key, KeyRange, MySqlClientConfig, MySqlTlsMode,
     Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreConfig,
-    StateStoreError, StateStoreLimitOverrides, StateStoreProviderConfig, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    StateStoreError, StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime,
+    TransactionId, Value, VersionToken, WriteTransaction, open_state_store,
 };
 
 const MAX_LINE_BYTES: usize = 160 * 1024;
 const MAX_KEY_HEX_BYTES: usize = MYSQL_MAX_KEY_BYTES * 2;
 const MAX_VALUE_HEX_BYTES: usize = MAX_VALUE_BYTES * 2;
 const MAX_TOKEN_HEX_BYTES: usize = 16 * 1024;
+const COMMIT_HOOK_DEADLINE: Duration = Duration::from_secs(5);
+const COMMIT_OWNER_DEADLINE: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum Direction {
@@ -268,7 +271,7 @@ impl Response {
 
 #[derive(Default)]
 struct HelperState {
-    runtime: Option<MysqlRuntime>,
+    runtime: Option<StateStoreRuntime>,
     store: Option<Arc<dyn StateStore>>,
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
     next_id: u64,
@@ -364,23 +367,23 @@ impl HelperState {
         }
         let database = required_env(id, "NOVAROCKS_MYSQL_DATABASE")?;
         let config = client_config(id)?;
-        let mut runtime = MysqlRuntime::boot(config)
+        let mut runtime = StateStoreRuntime::mysql(config)
             .map_err(|error| ProtocolError::state_store(id, "OpenFailed", &error))?;
-        let store = match runtime
-            .open_store(
-                &StateStoreConfig {
-                    cluster_id,
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Mysql { database },
-                },
-                deployment(),
-            )
-            .await
+        let store = match open_state_store(
+            &runtime,
+            StateStoreConfig {
+                cluster_id,
+                limits: StateStoreLimitOverrides::default(),
+                provider: StateStoreProviderConfig::Mysql { database },
+            },
+            deployment(),
+        )
+        .await
         {
             Ok(store) => store,
             Err(error) => {
                 let mut primary = ProtocolError::state_store(id, "OpenFailed", &error);
-                if let Err(shutdown_error) = runtime.shutdown(Duration::from_secs(5)).await {
+                if let Err(shutdown_error) = runtime.shutdown().await {
                     primary.error_kind = Some(format!(
                         "{:?}+Shutdown{:?}",
                         error.kind(),
@@ -528,12 +531,34 @@ impl HelperState {
             .ok_or_else(|| invalid_order(id))?;
         let outcome = if lose_response {
             let control = MysqlCommitTestApi::arm_shared_post_dispatch(true);
-            let owner = tokio::spawn(async move { transaction.commit().await });
-            control.wait_dispatched().await;
-            control.allow_provider_progress();
-            owner.await.map_err(|_| {
-                ProtocolError::new(id, "CommitFailed", "commit supervisor stopped unexpectedly")
-            })?
+            let mut owner = tokio::spawn(async move { transaction.commit().await });
+            tokio::select! {
+                result = &mut owner => supervised_commit_result(id, result)?,
+                () = control.wait_dispatched() => {
+                    control.allow_provider_progress();
+                    match tokio::time::timeout(COMMIT_OWNER_DEADLINE, &mut owner).await {
+                        Ok(result) => supervised_commit_result(id, result)?,
+                        Err(_) => {
+                            owner.abort();
+                            let _ = owner.await;
+                            return Err(ProtocolError::new(
+                                id,
+                                "CommitFailed",
+                                "commit supervisor deadline exceeded",
+                            ));
+                        }
+                    }
+                }
+                () = tokio::time::sleep(COMMIT_HOOK_DEADLINE) => {
+                    owner.abort();
+                    let _ = owner.await;
+                    return Err(ProtocolError::new(
+                        id,
+                        "CommitFailed",
+                        "commit hook deadline exceeded",
+                    ));
+                }
+            }
         } else {
             transaction.commit().await
         };
@@ -594,7 +619,7 @@ impl HelperState {
         self.store.take();
         if let Some(mut runtime) = self.runtime.take() {
             runtime
-                .shutdown(Duration::from_secs(5))
+                .shutdown()
                 .await
                 .map_err(|error| ProtocolError::state_store(id, "ShutdownFailed", &error))?;
         }
@@ -614,6 +639,15 @@ impl HelperState {
             .get_mut(&transaction_id)
             .ok_or_else(|| invalid_order(id))
     }
+}
+
+fn supervised_commit_result(
+    id: u64,
+    result: Result<CommitOutcome, tokio::task::JoinError>,
+) -> Result<CommitOutcome, ProtocolError> {
+    result.map_err(|_| {
+        ProtocolError::new(id, "CommitFailed", "commit supervisor stopped unexpectedly")
+    })
 }
 
 fn client_config(id: u64) -> Result<MySqlClientConfig, ProtocolError> {
@@ -653,8 +687,8 @@ fn configuration_error(id: u64) -> ProtocolError {
 
 fn deployment() -> FeDeploymentView {
     FeDeploymentView {
-        active_fe_count: NonZeroUsize::new(2).expect("two is non-zero"),
-        topology_revision: Bytes::from_static(b"mysql-cross-process-clients"),
+        active_fe_count: NonZeroUsize::new(1).expect("one is non-zero"),
+        topology_revision: Bytes::from_static(b"mysql-helper-client-topology"),
     }
 }
 
@@ -756,22 +790,43 @@ fn parse_request(line: &[u8]) -> Result<Request, ProtocolError> {
 }
 
 fn extract_id(line: &[u8]) -> u64 {
-    let marker = b"\"id\":";
-    let Some(start) = line
-        .windows(marker.len())
-        .position(|window| window == marker)
-    else {
-        return 0;
-    };
-    let digits = &line[start + marker.len()..];
-    let end = digits
-        .iter()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(digits.len());
-    std::str::from_utf8(&digits[..end])
-        .ok()
-        .and_then(|digits| digits.parse().ok())
-        .unwrap_or(0)
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    let id =
+        serde::de::Deserializer::deserialize_map(&mut deserializer, TopLevelIdVisitor).unwrap_or(0);
+    if deserializer.end().is_ok() { id } else { 0 }
+}
+
+struct TopLevelIdVisitor;
+
+impl<'de> Visitor<'de> for TopLevelIdVisitor {
+    type Value = u64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with at most one unsigned integer id")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut id = None;
+        let mut invalid = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "id" {
+                let value = map.next_value::<serde_json::Value>()?;
+                if id.is_some() {
+                    invalid = true;
+                } else if let Some(value) = value.as_u64() {
+                    id = Some(value);
+                } else {
+                    invalid = true;
+                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(if invalid { 0 } else { id.unwrap_or(0) })
+    }
 }
 
 async fn write_response(response: &Response) -> Result<(), ()> {
@@ -879,5 +934,20 @@ pub fn run_stdio() -> i32 {
             eprintln!("state-store-mysql-helper: runtime startup failed");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_deployment_models_one_fe_client() {
+        let deployment = deployment();
+        assert_eq!(deployment.active_fe_count.get(), 1);
+        assert_eq!(
+            deployment.topology_revision,
+            Bytes::from_static(b"mysql-helper-client-topology")
+        );
     }
 }
