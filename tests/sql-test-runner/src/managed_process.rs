@@ -16,7 +16,10 @@
 // under the License.
 
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    target_pointer_width = "64"
+))]
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -32,8 +35,25 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
 const LOG_TAIL_BYTES: usize = 8 * 1024;
+const FILE_SNAPSHOT_ATTEMPTS: usize = 3;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const OUTPUT_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn short_output_join_deadline() -> Instant {
+    Instant::now()
+        .checked_add(OUTPUT_JOIN_TIMEOUT)
+        .unwrap_or_else(Instant::now)
+}
+
+#[cfg(test)]
+fn wait_siginfo_abi_supported(target_os: &str, target_arch: &str, pointer_width: u8) -> bool {
+    match target_os {
+        "linux" | "android" => pointer_width == 64 && !matches!(target_arch, "mips" | "mips64"),
+        "macos" | "ios" => pointer_width == 64,
+        _ => false,
+    }
+}
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -79,6 +99,20 @@ compile_error!(
 ))]
 compile_error!("ManagedProcess does not have a verified waitid siginfo_t layout for MIPS");
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(target_pointer_width = "64")
+))]
+compile_error!(
+    "ManagedProcess waitid siginfo_t support is limited to verified 64-bit Linux/Android ABIs; 32-bit and x32 targets are unsupported"
+);
+
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    not(target_pointer_width = "64")
+))]
+compile_error!("ManagedProcess waitid siginfo_t support is limited to verified 64-bit Apple ABIs");
+
 #[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "kill"]
@@ -88,7 +122,10 @@ unsafe extern "C" {
 
 // Darwin's siginfo_t layout is declared in <sys/signal.h>. The trailing
 // padding covers si_value, si_band, and the reserved words that follow them.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    target_pointer_width = "64"
+))]
 #[repr(C)]
 struct WaitSiginfo {
     signal: i32,
@@ -121,26 +158,34 @@ struct WaitSiginfo {
     remaining: [u8; 100],
 }
 
+// Unsupported Unix targets get no guessed C layout. This opaque placeholder
+// only keeps name resolution deterministic while the compile_error! above
+// rejects the target before any waitid call can be built.
 #[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    not(any(target_arch = "mips", target_arch = "mips64")),
-    target_pointer_width = "32"
+    unix,
+    not(any(
+        all(
+            any(target_os = "macos", target_os = "ios"),
+            target_pointer_width = "64"
+        ),
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_arch = "mips", target_arch = "mips64")),
+            target_pointer_width = "64"
+        )
+    ))
 ))]
 #[repr(C)]
 struct WaitSiginfo {
-    signal: i32,
-    error: i32,
-    code: i32,
-    union_alignment: [usize; 0],
-    pid: i32,
-    uid: u32,
-    status: i32,
-    remaining: [u8; 104],
+    unsupported: [u8; 0],
 }
 
 #[cfg(unix)]
 impl WaitSiginfo {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        target_pointer_width = "64"
+    ))]
     fn zeroed() -> Self {
         Self {
             signal: 0,
@@ -173,23 +218,34 @@ impl WaitSiginfo {
     }
 
     #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        not(any(target_arch = "mips", target_arch = "mips64")),
-        target_pointer_width = "32"
+        unix,
+        not(any(
+            all(
+                any(target_os = "macos", target_os = "ios"),
+                target_pointer_width = "64"
+            ),
+            all(
+                any(target_os = "linux", target_os = "android"),
+                not(any(target_arch = "mips", target_arch = "mips64")),
+                target_pointer_width = "64"
+            )
+        ))
     ))]
     fn zeroed() -> Self {
-        Self {
-            signal: 0,
-            error: 0,
-            code: 0,
-            union_alignment: [],
-            pid: 0,
-            uid: 0,
-            status: 0,
-            remaining: [0; 104],
-        }
+        Self { unsupported: [] }
     }
 
+    #[cfg(any(
+        all(
+            any(target_os = "macos", target_os = "ios"),
+            target_pointer_width = "64"
+        ),
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_arch = "mips", target_arch = "mips64")),
+            target_pointer_width = "64"
+        )
+    ))]
     fn observed_exit_status(&self) -> Result<Option<ObservedExitStatus>> {
         if self.signal == 0 {
             return Ok(None);
@@ -203,16 +259,32 @@ impl WaitSiginfo {
             ),
         }
     }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            all(
+                any(target_os = "macos", target_os = "ios"),
+                target_pointer_width = "64"
+            ),
+            all(
+                any(target_os = "linux", target_os = "android"),
+                not(any(target_arch = "mips", target_arch = "mips64")),
+                target_pointer_width = "64"
+            )
+        ))
+    ))]
+    fn observed_exit_status(&self) -> Result<Option<ObservedExitStatus>> {
+        bail!("waitid siginfo_t is unsupported on this Unix ABI")
+    }
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservedExitStatus {
     ExitCode(i32),
     Signal(i32),
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for ObservedExitStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -353,30 +425,54 @@ impl FileGeneration {
 
 impl FileReadinessSnapshot {
     fn read(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        let mut last_unstable = None;
+        for _ in 0..FILE_SNAPSHOT_ATTEMPTS {
+            match Self::read_once_with_hook(path, || {}) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    last_unstable = Some(error);
+                    thread::yield_now();
+                }
+                result => return result,
+            }
+        }
+        Err(last_unstable.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "readiness file did not produce a stable snapshot",
+            )
+        }))
+    }
+
+    fn read_once_with_hook(
+        path: &std::path::Path,
+        after_initial_metadata: impl FnOnce(),
+    ) -> std::io::Result<Option<Self>> {
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
+        let initial_metadata = file.metadata()?;
+        let initial_generation = FileGeneration::from_metadata(&initial_metadata);
+        after_initial_metadata();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let metadata = file.metadata()?;
-        if metadata.len() != bytes.len() as u64 {
+        let final_metadata = file.metadata()?;
+        let final_generation = FileGeneration::from_metadata(&final_metadata);
+        if initial_generation != final_generation || final_metadata.len() != bytes.len() as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 format!(
-                    "readiness file changed while reading: metadata length {} != bytes read {}",
-                    metadata.len(),
-                    bytes.len()
+                    "readiness file changed while reading: initial={initial_generation:?} final={final_generation:?} bytes_read={}",
+                    bytes.len(),
                 ),
             ));
         }
-        let modified = metadata.modified().ok();
-        let generation = FileGeneration::from_metadata(&metadata);
+        let modified = final_metadata.modified().ok();
         Ok(Some(Self {
             bytes,
             modified,
-            generation,
+            generation: final_generation,
         }))
     }
 }
@@ -403,27 +499,50 @@ impl ReadinessBaseline {
         let Self::File { snapshot: baseline } = self else {
             return false;
         };
-        let fresh_bytes = match baseline {
-            None => current.bytes.as_slice(),
+        let needle = needle.as_bytes();
+        match baseline {
+            None => bytes_contain(current.bytes.as_slice(), needle),
             Some(baseline) if current.generation == baseline.generation => {
                 if current.bytes == baseline.bytes {
                     return false;
                 }
-                current.bytes.as_slice()
+                bytes_contain(current.bytes.as_slice(), needle)
             }
             Some(baseline)
                 if current.generation.same_file_as(&baseline.generation)
                     && current.bytes.len() > baseline.bytes.len()
                     && current.bytes.starts_with(&baseline.bytes) =>
             {
-                &current.bytes[baseline.bytes.len()..]
+                let overlap = needle.len().saturating_sub(1).min(baseline.bytes.len());
+                let overlap_start = baseline.bytes.len() - overlap;
+                let scan = &current.bytes[overlap_start..];
+                let suffix_boundary = baseline.bytes.len() - overlap_start;
+                bytes_match_ending_after(scan, needle, suffix_boundary)
             }
             // A replacement inode or an in-place rewrite is a new generation,
             // so scan the full contents even when it preserves bytes or mtime.
-            Some(_) => current.bytes.as_slice(),
-        };
-        String::from_utf8_lossy(fresh_bytes).contains(needle)
+            Some(_) => bytes_contain(current.bytes.as_slice(), needle),
+        }
     }
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn bytes_match_ending_after(haystack: &[u8], needle: &[u8], boundary: usize) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .any(|(start, window)| window == needle && start + needle.len() > boundary)
 }
 
 pub(crate) struct ManagedProcess {
@@ -611,22 +730,46 @@ impl ManagedProcess {
 
     pub(crate) fn assert_log_contains(&self, needle: &str) -> Result<()> {
         self.ensure_output_io_ok("assert durable log contents")?;
-        match self.log_file.lock() {
-            Ok(mut log_file) => {
-                if let Err(error) = log_file.flush() {
+        let flush_deadline = short_output_join_deadline();
+        loop {
+            match self.log_file.try_lock() {
+                Ok(mut log_file) => {
+                    if let Err(error) = log_file.flush() {
+                        record_output_io_error(
+                            &self.output_io_error,
+                            format!(
+                                "flush durable process log {}: {error}",
+                                self.log_path.display()
+                            ),
+                        );
+                    }
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < flush_deadline => {
+                    thread::sleep(
+                        flush_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(POLL_INTERVAL),
+                    );
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
                     record_output_io_error(
                         &self.output_io_error,
                         format!(
-                            "flush durable process log {}: {error}",
+                            "durable process log writer is busy for {}",
                             self.log_path.display()
                         ),
                     );
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    record_output_io_error(
+                        &self.output_io_error,
+                        format!("lock durable process log {}", self.log_path.display()),
+                    );
+                    break;
                 }
             }
-            Err(_) => record_output_io_error(
-                &self.output_io_error,
-                format!("lock durable process log {}", self.log_path.display()),
-            ),
         }
         self.ensure_output_io_ok("assert durable log contents")?;
         let log = fs::read_to_string(&self.log_path)
@@ -658,36 +801,44 @@ impl ManagedProcess {
     }
 
     pub(crate) fn stop(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let graceful_deadline = started.checked_add(STOP_TIMEOUT).unwrap_or(started);
+        let cleanup_deadline = graceful_deadline
+            .checked_add(OUTPUT_JOIN_TIMEOUT)
+            .unwrap_or(graceful_deadline);
         if self.stopped {
-            self.join_output_threads();
+            self.join_output_threads_until(short_output_join_deadline());
             return self.ensure_output_io_ok("stop process");
         }
         #[cfg(unix)]
         {
             if self.process_group.awaiting_reap() {
-                self.reap_after_final_group_signal("retry wait after final group signal")?;
+                self.reap_after_final_group_signal(
+                    "retry wait after final group signal",
+                    short_output_join_deadline(),
+                )?;
                 return self.ensure_output_io_ok("stop process");
             }
             self.signal_group(SIGTERM)?;
-            let deadline = Instant::now() + STOP_TIMEOUT;
             loop {
                 if self.leader_exit_observed()? {
                     self.finish_group_with_signal(
                         SIGKILL,
                         "wait for process-group cleanup after SIGTERM",
+                        short_output_join_deadline(),
                     )?;
                     return self.ensure_output_io_ok("stop process");
                 }
-                if Instant::now() >= deadline {
+                if Instant::now() >= graceful_deadline {
                     break;
                 }
                 thread::sleep(
-                    deadline
+                    graceful_deadline
                         .saturating_duration_since(Instant::now())
                         .min(POLL_INTERVAL),
                 );
             }
-            self.finish_group_with_signal(SIGKILL, "wait after SIGKILL timeout")?;
+            self.finish_group_with_signal(SIGKILL, "wait after SIGKILL timeout", cleanup_deadline)?;
             return self.ensure_output_io_ok("stop process");
         }
 
@@ -698,23 +849,31 @@ impl ManagedProcess {
                 let _ = self.child.wait()?;
             }
             self.stopped = true;
-            self.join_output_threads();
+            self.join_output_threads_until(short_output_join_deadline());
             self.ensure_output_io_ok("stop process")
         }
     }
 
     pub(crate) fn kill_now(&mut self) -> Result<()> {
+        let cleanup_deadline = short_output_join_deadline();
         if self.stopped {
-            self.join_output_threads();
+            self.join_output_threads_until(cleanup_deadline);
             return self.ensure_output_io_ok("kill process");
         }
         #[cfg(unix)]
         {
             if self.process_group.awaiting_reap() {
-                self.reap_after_final_group_signal("retry wait after final group signal")?;
+                self.reap_after_final_group_signal(
+                    "retry wait after final group signal",
+                    cleanup_deadline,
+                )?;
                 return self.ensure_output_io_ok("kill process");
             }
-            self.finish_group_with_signal(SIGKILL, "wait after immediate SIGKILL")?;
+            self.finish_group_with_signal(
+                SIGKILL,
+                "wait after immediate SIGKILL",
+                cleanup_deadline,
+            )?;
             return self.ensure_output_io_ok("kill process");
         }
         #[cfg(not(unix))]
@@ -728,7 +887,7 @@ impl ManagedProcess {
                 .wait()
                 .with_context(|| format!("wait for {} after immediate kill", self.label))?;
             self.stopped = true;
-            self.join_output_threads();
+            self.join_output_threads_until(cleanup_deadline);
             self.ensure_output_io_ok("kill process")
         }
     }
@@ -741,14 +900,7 @@ impl ManagedProcess {
     ) -> Result<String> {
         self.ensure_output_io_ok("collect runtime diagnostics")?;
         let pid = self.pid();
-        #[cfg(unix)]
-        let exit_status = self.leader_exit_status_observed().with_context(|| {
-            format!("inspect {label} pid={pid} endpoint={endpoint} process status")
-        })?;
-        #[cfg(not(unix))]
-        bail!(
-            "non-reaping runtime diagnostics are unsupported on this platform for {label} pid={pid} endpoint={endpoint}"
-        );
+        let exit_status = self.runtime_exit_status(label, pid, endpoint)?;
         let stdout_tail = self.stdout_tail();
         let stderr_tail = self.stderr_tail();
         if let Some(exit_status) = exit_status {
@@ -763,6 +915,28 @@ impl ManagedProcess {
         ))
     }
 
+    #[cfg(unix)]
+    fn runtime_exit_status(
+        &self,
+        label: &str,
+        pid: u32,
+        endpoint: &str,
+    ) -> Result<Option<ObservedExitStatus>> {
+        self.leader_exit_status_observed().with_context(|| {
+            format!("inspect {label} pid={pid} endpoint={endpoint} process status")
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn runtime_exit_status(
+        &self,
+        label: &str,
+        pid: u32,
+        endpoint: &str,
+    ) -> Result<Option<ObservedExitStatus>> {
+        unsupported_runtime_exit_status(label, pid, endpoint)
+    }
+
     fn wait_for_ready(
         &mut self,
         marker: &ReadyMarker,
@@ -774,8 +948,13 @@ impl ManagedProcess {
         loop {
             #[cfg(unix)]
             if self.leader_exit_observed()? {
-                let status = self
-                    .finish_group_with_signal(SIGKILL, "wait after exit before readiness marker")?;
+                let status = self.finish_group_with_signal(
+                    SIGKILL,
+                    "wait after exit before readiness marker",
+                    Instant::now()
+                        .checked_add(OUTPUT_JOIN_TIMEOUT)
+                        .unwrap_or_else(Instant::now),
+                )?;
                 bail!(
                     "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
                     self.label,
@@ -786,7 +965,11 @@ impl ManagedProcess {
             }
             #[cfg(not(unix))]
             if let Some(status) = self.child.try_wait()? {
-                self.join_output_threads();
+                self.join_output_threads_until(
+                    Instant::now()
+                        .checked_add(OUTPUT_JOIN_TIMEOUT)
+                        .unwrap_or_else(Instant::now),
+                );
                 bail!(
                     "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
                     self.label,
@@ -810,6 +993,9 @@ impl ManagedProcess {
                             let status = self.finish_group_with_signal(
                                 SIGKILL,
                                 "wait after stdout closed before readiness marker",
+                                Instant::now()
+                                    .checked_add(OUTPUT_JOIN_TIMEOUT)
+                                    .unwrap_or_else(Instant::now),
                             )?;
                             bail!(
                                 "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
@@ -821,7 +1007,11 @@ impl ManagedProcess {
                         }
                         #[cfg(not(unix))]
                         if let Some(status) = self.child.try_wait()? {
-                            self.join_output_threads();
+                            self.join_output_threads_until(
+                                Instant::now()
+                                    .checked_add(OUTPUT_JOIN_TIMEOUT)
+                                    .unwrap_or_else(Instant::now),
+                            );
                             bail!(
                                 "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
                                 self.label,
@@ -867,27 +1057,42 @@ impl ManagedProcess {
         }
     }
 
-    fn join_output_threads(&self) {
-        self.join_reader_thread(&self.stdout_thread, "stdout", true);
-        self.join_reader_thread(&self.stderr_thread, "stderr", true);
+    fn join_output_threads_until(&self, deadline: Instant) {
+        loop {
+            self.harvest_finished_output_threads();
+            if !self.has_attached_output_threads() {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+        }
+        self.harvest_finished_output_threads();
+        self.detach_reader_thread(&self.stdout_thread, "stdout");
+        self.detach_reader_thread(&self.stderr_thread, "stderr");
     }
 
     fn harvest_finished_output_threads(&self) {
-        self.join_reader_thread(&self.stdout_thread, "stdout", false);
-        self.join_reader_thread(&self.stderr_thread, "stderr", false);
+        self.harvest_reader_thread(&self.stdout_thread, "stdout");
+        self.harvest_reader_thread(&self.stderr_thread, "stderr");
     }
 
-    fn join_reader_thread(
+    fn has_attached_output_threads(&self) -> bool {
+        [&self.stdout_thread, &self.stderr_thread]
+            .into_iter()
+            .any(|slot| slot.lock().map_or(true, |slot| slot.is_some()))
+    }
+
+    fn harvest_reader_thread(
         &self,
         thread_slot: &Mutex<Option<thread::JoinHandle<()>>>,
         stream_name: &str,
-        wait: bool,
     ) {
         let handle = match thread_slot.lock() {
             Ok(mut slot) => {
-                let should_join = slot
-                    .as_ref()
-                    .is_some_and(|handle| wait || handle.is_finished());
+                let should_join = slot.as_ref().is_some_and(|handle| handle.is_finished());
                 should_join.then(|| slot.take()).flatten()
             }
             Err(_) => {
@@ -906,6 +1111,31 @@ impl ManagedProcess {
                 format!(
                     "{stream_name} reader thread panicked: {}",
                     panic_payload_message(payload.as_ref())
+                ),
+            );
+        }
+    }
+
+    fn detach_reader_thread(
+        &self,
+        thread_slot: &Mutex<Option<thread::JoinHandle<()>>>,
+        stream_name: &str,
+    ) {
+        let detached = match thread_slot.lock() {
+            Ok(mut slot) => slot.take().is_some(),
+            Err(_) => {
+                record_output_io_error(
+                    &self.output_io_error,
+                    format!("lock {stream_name} reader thread handle"),
+                );
+                false
+            }
+        };
+        if detached {
+            record_output_io_error(
+                &self.output_io_error,
+                format!(
+                    "timed out waiting for {stream_name} reader thread; detached blocked reader"
                 ),
             );
         }
@@ -1014,14 +1244,23 @@ impl ManagedProcess {
     }
 
     #[cfg(unix)]
-    fn finish_group_with_signal(&mut self, signal: i32, wait_context: &str) -> Result<ExitStatus> {
+    fn finish_group_with_signal(
+        &mut self,
+        signal: i32,
+        wait_context: &str,
+        cleanup_deadline: Instant,
+    ) -> Result<ExitStatus> {
         self.signal_group(signal)?;
         self.process_group.record_final_group_signal()?;
-        self.reap_after_final_group_signal(wait_context)
+        self.reap_after_final_group_signal(wait_context, cleanup_deadline)
     }
 
     #[cfg(unix)]
-    fn reap_after_final_group_signal(&mut self, wait_context: &str) -> Result<ExitStatus> {
+    fn reap_after_final_group_signal(
+        &mut self,
+        wait_context: &str,
+        cleanup_deadline: Instant,
+    ) -> Result<ExitStatus> {
         self.process_group.permit_reap()?;
         let status = self
             .child
@@ -1029,7 +1268,7 @@ impl ManagedProcess {
             .with_context(|| format!("{wait_context} for {}", self.label))?;
         self.process_group.record_reaped()?;
         self.stopped = true;
-        self.join_output_threads();
+        self.join_output_threads_until(cleanup_deadline);
         Ok(status)
     }
 }
@@ -1050,63 +1289,81 @@ fn spawn_reader<R: Read + Send + 'static>(
     ready_tx: Option<mpsc::SyncSender<()>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        let mut marker_scan = String::new();
-        let mut ready_sent = false;
-        loop {
-            let count = match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) => {
-                    record_output_io_error(
+        run_reader_with_panic_boundary(stream_name, &output_io_error, || {
+            let mut buffer = [0_u8; 4096];
+            let mut marker_scan = String::new();
+            let mut ready_sent = false;
+            loop {
+                let count = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) => {
+                        record_output_io_error(
+                            &output_io_error,
+                            format!("read managed process {stream_name}: {error}"),
+                        );
+                        break;
+                    }
+                };
+                let chunk = &buffer[..count];
+                match tail.lock() {
+                    Ok(mut output) => push_bounded_log_chunk(&mut output, chunk, LOG_TAIL_BYTES),
+                    Err(_) => record_output_io_error(
                         &output_io_error,
-                        format!("read managed process {stream_name}: {error}"),
-                    );
-                    break;
+                        format!("{stream_name} tail lock poisoned"),
+                    ),
                 }
-            };
-            let chunk = &buffer[..count];
-            match tail.lock() {
-                Ok(mut output) => push_bounded_log_chunk(&mut output, chunk, LOG_TAIL_BYTES),
-                Err(_) => record_output_io_error(
-                    &output_io_error,
-                    format!("{stream_name} tail lock poisoned"),
-                ),
-            }
-            match log_file.lock() {
-                Ok(mut log) => {
-                    if let Err(error) = log.write_all(chunk) {
-                        record_output_io_error(
-                            &output_io_error,
-                            format!("write durable process log from {stream_name}: {error}"),
-                        );
-                    } else if let Err(error) = log.flush() {
-                        record_output_io_error(
-                            &output_io_error,
-                            format!("flush durable process log from {stream_name}: {error}"),
-                        );
+                match log_file.lock() {
+                    Ok(mut log) => {
+                        if let Err(error) = log.write_all(chunk) {
+                            record_output_io_error(
+                                &output_io_error,
+                                format!("write durable process log from {stream_name}: {error}"),
+                            );
+                        } else if let Err(error) = log.flush() {
+                            record_output_io_error(
+                                &output_io_error,
+                                format!("flush durable process log from {stream_name}: {error}"),
+                            );
+                        }
+                    }
+                    Err(_) => record_output_io_error(
+                        &output_io_error,
+                        format!("lock durable process log for {stream_name}"),
+                    ),
+                }
+                if !ready_sent && let Some(marker) = ready_marker.as_deref() {
+                    marker_scan.push_str(&String::from_utf8_lossy(chunk));
+                    if marker_scan.contains(marker) {
+                        if let Some(ready_tx) = ready_tx.as_ref() {
+                            let _ = ready_tx.try_send(());
+                        }
+                        ready_sent = true;
+                        marker_scan.clear();
+                    } else {
+                        let scan_capacity = LOG_TAIL_BYTES.max(marker.len().saturating_mul(2));
+                        truncate_front(&mut marker_scan, scan_capacity);
                     }
                 }
-                Err(_) => record_output_io_error(
-                    &output_io_error,
-                    format!("lock durable process log for {stream_name}"),
-                ),
             }
-            if !ready_sent && let Some(marker) = ready_marker.as_deref() {
-                marker_scan.push_str(&String::from_utf8_lossy(chunk));
-                if marker_scan.contains(marker) {
-                    if let Some(ready_tx) = ready_tx.as_ref() {
-                        let _ = ready_tx.try_send(());
-                    }
-                    ready_sent = true;
-                    marker_scan.clear();
-                } else {
-                    let scan_capacity = LOG_TAIL_BYTES.max(marker.len().saturating_mul(2));
-                    truncate_front(&mut marker_scan, scan_capacity);
-                }
-            }
-        }
+        });
     })
+}
+
+fn run_reader_with_panic_boundary(
+    stream_name: &str,
+    output_io_error: &SharedOutputIoError,
+    body: impl FnOnce(),
+) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        record_output_io_error(
+            output_io_error,
+            format!(
+                "{stream_name} reader thread panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+        );
+    }
 }
 
 fn record_output_io_error(errors: &SharedOutputIoError, error: String) {
@@ -1115,6 +1372,16 @@ fn record_output_io_error(errors: &SharedOutputIoError, error: String) {
     {
         *first_error = Some(error);
     }
+}
+
+fn unsupported_runtime_exit_status(
+    label: &str,
+    pid: u32,
+    endpoint: &str,
+) -> Result<Option<ObservedExitStatus>> {
+    bail!(
+        "non-reaping runtime diagnostics are unsupported on this platform for {label} pid={pid} endpoint={endpoint}"
+    )
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -1167,13 +1434,14 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 mod tests {
     use super::{
         FileReadinessSnapshot, ManagedProcess, ProcessGroupOwnership, ReadinessBaseline,
-        ReadyMarker, WaitSiginfo,
+        ReadyMarker, WaitSiginfo, run_reader_with_panic_boundary, unsupported_runtime_exit_status,
+        wait_siginfo_abi_supported,
     };
     use std::fs;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1313,6 +1581,50 @@ mod tests {
 
     struct PanicOnFirstWrite;
 
+    struct BlockingLogWriter {
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct BlockAfterFirstWrite {
+        writes: usize,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        file: fs::File,
+    }
+
+    impl Write for BlockingLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().expect("lock blocking writer release");
+            while !*released {
+                released = wake.wait(released).expect("wait for writer release");
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for BlockAfterFirstWrite {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                return self.file.write(buffer);
+            }
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().expect("lock late writer release");
+            while !*released {
+                released = wake.wait(released).expect("wait for late writer release");
+            }
+            self.file.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
     impl Write for PanicOnFirstWrite {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
             panic!("injected pre-readiness stdout reader panic");
@@ -1375,7 +1687,10 @@ mod tests {
 
     #[test]
     fn wait_siginfo_layout_matches_the_supported_platform_abi() {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(all(
+            any(target_os = "macos", target_os = "ios"),
+            target_pointer_width = "64"
+        ))]
         {
             assert_eq!(std::mem::size_of::<WaitSiginfo>(), 104);
             assert_eq!(std::mem::align_of::<WaitSiginfo>(), 8);
@@ -1400,14 +1715,18 @@ mod tests {
             any(target_os = "linux", target_os = "android"),
             target_pointer_width = "32"
         ))]
-        {
-            assert_eq!(std::mem::size_of::<WaitSiginfo>(), 128);
-            assert_eq!(std::mem::align_of::<WaitSiginfo>(), 4);
-            assert_eq!(std::mem::offset_of!(WaitSiginfo, signal), 0);
-            assert_eq!(std::mem::offset_of!(WaitSiginfo, code), 8);
-            assert_eq!(std::mem::offset_of!(WaitSiginfo, pid), 12);
-            assert_eq!(std::mem::offset_of!(WaitSiginfo, status), 20);
-        }
+        compile_error!("32-bit Linux/Android waitid layouts must be rejected before tests run");
+    }
+
+    #[test]
+    fn wait_siginfo_abi_policy_rejects_unverified_32_bit_targets() {
+        assert!(wait_siginfo_abi_supported("linux", "x86_64", 64));
+        assert!(wait_siginfo_abi_supported("macos", "aarch64", 64));
+        assert!(!wait_siginfo_abi_supported("linux", "x86_64", 32));
+        assert!(!wait_siginfo_abi_supported("android", "x86_64", 32));
+        assert!(!wait_siginfo_abi_supported("macos", "x86", 32));
+        assert!(!wait_siginfo_abi_supported("ios", "arm", 32));
+        assert!(!wait_siginfo_abi_supported("linux", "mips64", 64));
     }
 
     #[test]
@@ -1437,6 +1756,18 @@ mod tests {
         process
             .kill_now()
             .expect("cleanup after non-reaping runtime diagnostics");
+    }
+
+    #[test]
+    fn non_unix_runtime_diagnostic_compile_contract_rejects_unsupported_probe() {
+        let error = unsupported_runtime_exit_status("fixture", 42, "local")
+            .expect_err("unsupported non-Unix semantics must return an explicit error");
+        assert!(
+            error
+                .to_string()
+                .contains("non-reaping runtime diagnostics are unsupported"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1631,6 +1962,37 @@ mod tests {
     }
 
     #[test]
+    fn reader_panic_is_recorded_before_readiness_sender_disconnects() {
+        let errors: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
+        let readiness_sender = Some(ready_tx);
+
+        run_reader_with_panic_boundary("stdout", &errors, || {
+            panic!("directed readiness disconnect panic");
+        });
+
+        let recorded = errors
+            .lock()
+            .expect("lock recorded reader panic")
+            .clone()
+            .expect("panic must be recorded while readiness sender is still alive");
+        assert!(
+            recorded.contains("directed readiness disconnect panic"),
+            "{recorded}"
+        );
+        assert!(
+            matches!(ready_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "readiness sender must still be connected after panic recording"
+        );
+
+        drop(readiness_sender);
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn managed_process_log_assertion_surfaces_reader_thread_panic() {
         let temp = TempDir::new("assert-reader-panic");
         let mut process = spawn_reader_panic_fixture(&temp);
@@ -1773,6 +2135,201 @@ mod tests {
         );
     }
 
+    fn escaped_pipe_holder_command(pid_path: &Path, hold_seconds: u64) -> Command {
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(
+                "import pathlib, subprocess, sys, time; child = subprocess.Popen(['/bin/sleep', sys.argv[2]], start_new_session=True); pathlib.Path(sys.argv[1]).write_text(str(child.pid)); print('READY', flush=True); time.sleep(30)",
+            )
+            .arg(pid_path)
+            .arg(hold_seconds.to_string());
+        command
+    }
+
+    fn force_kill_fixture(pid: u32) {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+
+    #[test]
+    fn managed_process_kill_is_bounded_when_escaped_descendant_holds_pipes() {
+        let temp = TempDir::new("kill-escaped-pipe-holder");
+        let escaped_pid_path = temp.path().join("escaped.pid");
+        let mut process = ManagedProcess::spawn(
+            "kill escaped pipe holder fixture".to_string(),
+            escaped_pipe_holder_command(&escaped_pid_path, 2),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn escaped pipe holder fixture");
+        let escaped_pid = fs::read_to_string(&escaped_pid_path)
+            .expect("read escaped fixture pid")
+            .parse::<u32>()
+            .expect("parse escaped fixture pid");
+
+        let started = Instant::now();
+        let error = process
+            .kill_now()
+            .expect_err("escaped pipe holder must produce a bounded reader cleanup error");
+        let elapsed = started.elapsed();
+        force_kill_fixture(escaped_pid);
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "elapsed={elapsed:?}; {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for stdout reader thread"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn managed_process_stop_is_bounded_when_escaped_descendant_holds_pipes() {
+        let temp = TempDir::new("stop-escaped-pipe-holder");
+        let escaped_pid_path = temp.path().join("escaped.pid");
+        let mut process = ManagedProcess::spawn(
+            "stop escaped pipe holder fixture".to_string(),
+            escaped_pipe_holder_command(&escaped_pid_path, 2),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn escaped pipe holder fixture");
+        let escaped_pid = fs::read_to_string(&escaped_pid_path)
+            .expect("read escaped fixture pid")
+            .parse::<u32>()
+            .expect("parse escaped fixture pid");
+
+        let started = Instant::now();
+        let error = process
+            .stop()
+            .expect_err("escaped pipe holder must produce a bounded reader cleanup error");
+        let elapsed = started.elapsed();
+        force_kill_fixture(escaped_pid);
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "elapsed={elapsed:?}; {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for stdout reader thread"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn managed_process_drop_is_bounded_when_escaped_descendant_holds_pipes() {
+        let temp = TempDir::new("drop-escaped-pipe-holder");
+        let escaped_pid_path = temp.path().join("escaped.pid");
+        let process = ManagedProcess::spawn(
+            "drop escaped pipe holder fixture".to_string(),
+            escaped_pipe_holder_command(&escaped_pid_path, 2),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn escaped pipe holder fixture");
+        let escaped_pid = fs::read_to_string(&escaped_pid_path)
+            .expect("read escaped fixture pid")
+            .parse::<u32>()
+            .expect("parse escaped fixture pid");
+
+        let started = Instant::now();
+        drop(process);
+        let elapsed = started.elapsed();
+        force_kill_fixture(escaped_pid);
+
+        assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    }
+
+    #[test]
+    fn managed_process_spawn_cleanup_is_bounded_when_durable_writer_blocks() {
+        let temp = TempDir::new("blocking-durable-writer");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_after_delay = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            let (lock, wake) = &*release_after_delay;
+            *lock.lock().expect("lock writer release") = true;
+            wake.notify_all();
+        });
+
+        let started = Instant::now();
+        let error = ManagedProcess::spawn_with_log_writer(
+            "blocking durable writer fixture".to_string(),
+            shell("printf 'READY\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_millis(100),
+            temp.path().join("fixture.log"),
+            Box::new(BlockingLogWriter {
+                release: Arc::clone(&release),
+            }),
+        )
+        .expect_err("blocking durable writer must fail within the cleanup deadline");
+        let elapsed = started.elapsed();
+        releaser.join().expect("join blocking writer releaser");
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "elapsed={elapsed:?}; {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for stdout reader thread"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn managed_process_log_assertion_is_bounded_when_durable_writer_blocks() {
+        let temp = TempDir::new("blocking-late-durable-writer");
+        let log_path = temp.path().join("fixture.log");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_after_delay = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            let (lock, wake) = &*release_after_delay;
+            *lock.lock().expect("lock late writer release") = true;
+            wake.notify_all();
+        });
+        let mut process = ManagedProcess::spawn_with_log_writer(
+            "blocking late durable writer fixture".to_string(),
+            shell("printf 'READY\n'; sleep 0.1; printf 'LATE_OUTPUT\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            log_path.clone(),
+            Box::new(BlockAfterFirstWrite {
+                writes: 0,
+                release: Arc::clone(&release),
+                file: fs::File::create(&log_path).expect("create blocking writer log"),
+            }),
+        )
+        .expect("first durable write permits readiness");
+        assert!(wait_until(Duration::from_secs(1), || process
+            .stdout_tail()
+            .contains("LATE_OUTPUT")));
+
+        let started = Instant::now();
+        let error = process
+            .assert_log_contains("READY")
+            .expect_err("log assertion must not block behind the durable writer");
+        let elapsed = started.elapsed();
+        let _ = process.kill_now();
+        releaser.join().expect("join late writer releaser");
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "elapsed={elapsed:?}; {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("durable process log writer is busy"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn managed_process_supports_file_readiness_markers() {
         let temp = TempDir::new("file-ready");
@@ -1852,6 +2409,32 @@ mod tests {
         )
         .expect("marker appended after spawn becomes ready");
         process.kill_now().expect("kill appended marker fixture");
+    }
+
+    #[test]
+    fn managed_process_accepts_file_marker_split_across_append_boundary() {
+        let temp = TempDir::new("append-boundary-file-ready");
+        let ready_path = temp.path().join("ready.txt");
+        fs::write(&ready_path, "existing prefix FILE_RE").expect("write file baseline");
+        let command = shell_with_arg(
+            "sleep 0.05; printf 'ADY suffix\n' >> \"$1\"; sleep 30",
+            &ready_path,
+        );
+
+        let mut process = ManagedProcess::spawn(
+            "append-boundary file marker fixture".to_string(),
+            command,
+            ReadyMarker::FileContains {
+                path: ready_path,
+                needle: "FILE_READY".to_string(),
+            },
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("marker split across baseline and appended suffix becomes ready");
+        process
+            .kill_now()
+            .expect("kill append-boundary marker fixture");
     }
 
     #[test]
@@ -1967,6 +2550,28 @@ mod tests {
         assert!(
             baseline.file_contains_fresh_marker(&current, "FILE_READY"),
             "same bytes and mtime must still be fresh after an in-place rewrite"
+        );
+    }
+
+    #[test]
+    fn file_readiness_rejects_a_generation_changed_during_the_same_handle_read() {
+        let temp = TempDir::new("concurrent-snapshot-rewrite");
+        let ready_path = temp.path().join("ready.txt");
+        let old_bytes = vec![b'A'; 32 * 1024];
+        let new_bytes = vec![b'B'; old_bytes.len()];
+        fs::write(&ready_path, &old_bytes).expect("write snapshot baseline");
+
+        let error = FileReadinessSnapshot::read_once_with_hook(&ready_path, || {
+            fs::write(&ready_path, &new_bytes).expect("rewrite snapshot during read");
+        })
+        .expect_err("a read spanning two file generations must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("readiness file changed while reading"),
+            "{error}"
         );
     }
 
