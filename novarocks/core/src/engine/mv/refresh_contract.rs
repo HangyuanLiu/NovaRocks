@@ -143,6 +143,73 @@ mod tests {
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
 
+    #[test]
+    fn apply_key_contract_constructor_matrix_is_stable() {
+        use crate::mv::persistence::schema::{
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+            JOIN_APPLY_KEY_COLUMN_NAME,
+        };
+
+        let cases = [
+            (
+                ApplyKeyContract::projection_filter(),
+                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::Int64,
+                RewriteEvidence::None,
+                true,
+                false,
+            ),
+            (
+                ApplyKeyContract::union_projection_filter(),
+                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::BranchInt64,
+                RewriteEvidence::None,
+                false,
+                false,
+            ),
+            (
+                ApplyKeyContract::join_projection_filter(),
+                JOIN_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::Utf8,
+                RewriteEvidence::None,
+                false,
+                false,
+            ),
+            (
+                ApplyKeyContract::aggregate_group_row(),
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::Utf8,
+                RewriteEvidence::Aggregate,
+                false,
+                true,
+            ),
+            (
+                ApplyKeyContract::join_aggregate_group_row(),
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::Utf8,
+                RewriteEvidence::JoinAggregate,
+                false,
+                true,
+            ),
+            (
+                ApplyKeyContract::branch_union_aggregate_group_row(),
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeyValueType::BranchUtf8,
+                RewriteEvidence::Aggregate,
+                false,
+                true,
+            ),
+        ];
+
+        for (actual, column_name, value_type, rewrite_evidence, rebuild, preload) in cases {
+            assert_eq!(actual.column_name, column_name);
+            assert_eq!(actual.value_type, value_type);
+            assert_eq!(actual.rewrite_evidence, rewrite_evidence);
+            assert_eq!(actual.allow_full_rebuild_on_policy_full_refresh, rebuild);
+            assert_eq!(actual.preload_locator_for_change_stream_deletes, preload);
+        }
+    }
+
     struct TestIcebergCatalog;
 
     impl PlannerTableProvider for TestIcebergCatalog {
