@@ -43,7 +43,7 @@ It now has two first-class modes:
 
 - **Standalone SQL engine mode**
   - Runs without StarRocks FE.
-  - Provides a MySQL-compatible local server through `standalone-server`.
+  - Provides a MySQL-compatible local server through `standalone`.
   - Owns SQL parsing, analysis, planning, codegen, catalog state, Iceberg catalog
     dispatch, managed-lake metadata, and SQL test execution.
 
@@ -139,7 +139,7 @@ SQL client / SQL test runner
 
 - `src/main.rs`
   Process entry. Dispatches FE-compatible modes (`run`, `start`, `stop`,
-  `restart`) and the `standalone-server` mode.
+  `restart`) and the `standalone` mode.
 
 - `src/server/mod.rs`
   MySQL-compatible standalone server, session context, SQL batch splitting,
@@ -333,7 +333,7 @@ SQL client / SQL test runner
 
 ### 5.2 Standalone SQL Path
 
-1. A MySQL client or SQL test runner connects to `standalone-server`
+1. A MySQL client or SQL test runner connects to `standalone`
    (`src/server/mod.rs`).
 2. The standalone server resolves session state (`USE`, `SET catalog`,
    timeouts, current database) and forwards supported statements to
@@ -445,7 +445,7 @@ Docker Compose project configured by
 `docker/iceberg-rest/shared.env`; the default shared service ports are MinIO
 `9000`, MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each
 worktree still gets its own generated runtime entry and a separate NovaRocks
-standalone-server port.
+standalone port.
 
 Do not guess the NovaRocks server port. Always discover the active worktree
 environment from the fixed generated entry:
@@ -485,12 +485,12 @@ docker/iceberg-rest/up.sh --prepare-only
 docker/iceberg-rest/status.sh
 ```
 
-Start standalone-server against the generated config:
+Start standalone against the generated config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
 When backgrounding the server (e.g. inside an automated test driver), wait
@@ -500,7 +500,7 @@ process that already owned the port:
 
 ```bash
 LOG=/tmp/novarocks-server.log
-NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone-server \
+NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone \
   --config "$NOVAROCKS_STANDALONE_CONFIG" >"$LOG" 2>&1 &
 SRV_PID=$!
 # Wait up to 60 s for the server to bind. If bind fails the line never
@@ -508,7 +508,7 @@ SRV_PID=$!
 for i in $(seq 1 60); do
   if grep -q '^NOVAROCKS_READY ' "$LOG"; then break; fi
   if ! kill -0 "$SRV_PID" 2>/dev/null; then
-    echo "standalone-server died during startup; tail of $LOG:" >&2
+    echo "standalone died during startup; tail of $LOG:" >&2
     tail -20 "$LOG" >&2
     exit 1
   fi
@@ -624,14 +624,14 @@ MySQL-compatible standalone server. Do not assume a fixed port in Codex
 workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
 entry exists.
 
-**Start standalone-server (no external FE needed):**
+**Start standalone (no external FE needed):**
 
 ```bash
 # Debug: fast compile, slow query (for fix verification)
-NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
 
 # Release: slow compile, fast query (for suite testing)
-NO_PROXY=127.0.0.1,localhost cargo run --release -- standalone-server --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --port 9030
 ```
 
 When the local test environment is active:
@@ -639,7 +639,7 @@ When the local test environment is active:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
 When starting a server manually inside a Codex worktree, prefer the generated

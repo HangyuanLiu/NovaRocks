@@ -614,8 +614,8 @@ Use:
 \`\`\`bash
 source "$current_link/env.sh"
 docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
-cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
-cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
@@ -682,8 +682,8 @@ $docker_state
 Use:
   source "$current_link/env.sh"
 $docker_start_hint
-  cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_CONFIG"
-  cargo run -- standalone-server --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+  cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
+  cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
   cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify

@@ -33,7 +33,7 @@ The project currently has two first-class execution modes:
 
 2. **Standalone SQL engine mode**
    - NovaRocks can parse and execute SQL without StarRocks FE.
-   - `standalone-server` exposes a MySQL-compatible endpoint for SQL clients and
+   - `standalone` exposes a MySQL-compatible endpoint for SQL clients and
      SQL regression tests.
    - The standalone engine has its own in-process catalog, Iceberg catalog
      registry, managed-lake metadata store, and connector-backed DDL/DML flows.
@@ -280,14 +280,14 @@ Run a local standalone SQL server without StarRocks FE:
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --port 9030
+cargo run -p novarocks-server -- standalone --port 9030
 ```
 
 Or use a config file:
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config ./novarocks.toml
+cargo run -p novarocks-server -- standalone --config ./novarocks.toml
 ```
 
 Connect with a MySQL client:
@@ -330,12 +330,12 @@ Useful generated values:
 - `NOVAROCKS_SPARK_V3_SMOKE_SQL`
 - `NOVAROCKS_SPARK_SQL`
 
-Start standalone-server with the generated object-store config:
+Start standalone with the generated object-store config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
 Generate an Iceberg format-v3 table through Spark using the same REST Catalog
@@ -351,7 +351,7 @@ Spark uses the Docker-network endpoints `http://rest:8181` and
 `http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
 The Docker services are shared across worktrees by default and use the
 service-default host ports configured in `docker/iceberg-rest/shared.env`;
-the NovaRocks standalone-server port is allocated per worktree.
+the NovaRocks standalone port is allocated per worktree.
 
 Run the cross-engine Iceberg compatibility SQL suite:
 

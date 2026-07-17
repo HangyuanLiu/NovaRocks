@@ -19,27 +19,27 @@ under the License.
 
 # 快速上手
 
-> 5 分钟跑通一个 Iceberg v3 表：起 standalone-server → 建表 → 写入 → 查询 → 时间旅行。
+> 5 分钟跑通一个 Iceberg v3 表：起 standalone → 建表 → 写入 → 查询 → 时间旅行。
 
 ---
 
 ## 前置
 
 - Rust toolchain（参考 `CLAUDE.md` 的"Build Mode"段）
-- 一个 MySQL CLI（用于连接 standalone-server）
+- 一个 MySQL CLI（用于连接 standalone）
 
 > 当前版本仅推荐 **Hadoop catalog**（写本地 / HDFS / S3 / OSS）。REST catalog 客户端基础已经就位但 engine 流程未切换，端到端 fixture 待补，详见 [Catalog 接入](catalog.md)。
 
 ---
 
-## 1. 启动 standalone-server
+## 1. 启动 standalone
 
 ```bash
 # Debug build（编译快，查询慢，适合学习与功能验证）
-NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
 
 # Release build（编译慢，查询快，适合性能测试）
-NO_PROXY=127.0.0.1,localhost cargo run --release -- standalone-server --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --port 9030
 ```
 
 服务监听 `127.0.0.1:9030`（MySQL wire 协议）。

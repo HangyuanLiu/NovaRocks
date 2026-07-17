@@ -44,14 +44,14 @@ references; see the spawn-out task in the project notes.
 
 ## Running
 
-Bring up the docker fixture and standalone-server, then run the suite:
+Bring up the docker fixture and standalone, then run the suite:
 
 ```bash
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG" &
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG" &
 until nc -z 127.0.0.1 "$NOVA_ENV_MYSQL_PORT"; do sleep 1; done
 
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \

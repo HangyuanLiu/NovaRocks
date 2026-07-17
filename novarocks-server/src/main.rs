@@ -37,21 +37,21 @@ struct StandaloneServerCliArgs {
 }
 
 fn print_main_usage() {
-    eprintln!("Usage: novarocks [run|start|stop|restart|standalone-server] [--config <path>]");
+    eprintln!("Usage: novarocks [run|start|stop|restart|standalone] [--config <path>]");
     eprintln!("  run       - Run in foreground (default)");
     eprintln!("  start     - Run in background as daemon");
     eprintln!("  stop      - Stop running daemon");
     eprintln!("  restart   - Restart daemon");
-    eprintln!("  standalone-server - Run a local MySQL-compatible standalone server");
+    eprintln!("  standalone - Run a local MySQL-compatible standalone server");
 }
 
 fn print_standalone_server_usage() {
     eprintln!(
-        "Usage: novarocks standalone-server [--port <port>] [--config <path>] [--role <fe|be|all-in-one>]"
+        "Usage: novarocks standalone [--port <port>] [--config <path>] [--role <fe|be|all-in-one>]"
     );
     eprintln!("Example:");
-    eprintln!("  novarocks standalone-server --port 9030 --config /etc/novarocks/novarocks.toml");
-    eprintln!("  novarocks standalone-server --role be --config /etc/novarocks/novarocks.toml");
+    eprintln!("  novarocks standalone --port 9030 --config /etc/novarocks/novarocks.toml");
+    eprintln!("  novarocks standalone --role be --config /etc/novarocks/novarocks.toml");
 }
 
 /// Build the tracing EnvFilter expression from config: prefer the explicit
@@ -111,7 +111,7 @@ fn parse_standalone_server_args(
             "--help" | "-h" => return Ok(None),
             other => {
                 return Err(format!(
-                    "unknown standalone-server arg: {other} (try `novarocks standalone-server --help`)"
+                    "unknown standalone arg: {other} (try `novarocks standalone --help`)"
                 ));
             }
         }
@@ -296,7 +296,7 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     let (cfg, role, resolved_config_path) = load_config_and_resolve_role(&cli)?;
 
     // Install the global config and initialize the tracing subscriber before
-    // starting the server. Without this, standalone-server runs with no logging
+    // starting the server. Without this, standalone runs with no logging
     // (init_with_level is otherwise only called on the FE-compatible run/start
     // path), so log_filter/log_level/sys_log_dir from the config are ignored.
     novarocks::common::app_config::install_preloaded_config(cfg.clone());
@@ -560,7 +560,7 @@ fn main() {
         "run"
     };
 
-    if mode == "standalone-server" {
+    if mode == "standalone" {
         match parse_standalone_server_args(&args[idx..]) {
             Ok(Some(cli)) => {
                 if let Err(err) = run_standalone_server_cli(cli) {
@@ -991,8 +991,8 @@ mod tests {
             "novarocks.toml".to_string(),
         ];
         let parsed = parse_standalone_server_args(&args)
-            .expect("parse standalone-server args")
-            .expect("standalone-server args");
+            .expect("parse standalone args")
+            .expect("standalone args");
         assert_eq!(
             parsed,
             StandaloneServerCliArgs {
@@ -1006,8 +1006,8 @@ mod tests {
     #[test]
     fn parse_standalone_server_args_accepts_empty() {
         let parsed = parse_standalone_server_args(&[])
-            .expect("parse standalone-server args")
-            .expect("standalone-server args");
+            .expect("parse standalone args")
+            .expect("standalone args");
         assert_eq!(
             parsed,
             StandaloneServerCliArgs {
@@ -1022,7 +1022,7 @@ mod tests {
     fn parse_standalone_server_args_rejects_unknown_flag() {
         let args = vec!["--unknown".to_string()];
         let err = parse_standalone_server_args(&args).expect_err("unknown flag must fail");
-        assert!(err.contains("unknown standalone-server arg"));
+        assert!(err.contains("unknown standalone arg"));
     }
 
     #[test]

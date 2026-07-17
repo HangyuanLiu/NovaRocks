@@ -42,7 +42,7 @@ pub mod service;
 pub mod sql;
 pub mod state_store;
 pub mod types;
-pub mod version;
+pub use novarocks_version as version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::app_config as novarocks_config;
 pub use common::logging as novarocks_logging;
