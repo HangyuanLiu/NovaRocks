@@ -42,7 +42,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     fn submit_fragment(
         &self,
         backend_idx: usize,
-        submission: FragmentSubmission,
+        submission: NativeFragmentEnvelope,
     ) -> Result<(), String>;
 
     /// Poll for the next result chunk from the root fragment on the given backend.
@@ -66,12 +66,12 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
     }
 }
 
-pub(crate) struct FragmentSubmission {
+pub(crate) struct NativeFragmentEnvelope {
     plan: crate::proto::plan::PlanFragment,
     instance_params: crate::proto::novarocks::InstanceParams,
 }
 
-impl FragmentSubmission {
+impl NativeFragmentEnvelope {
     pub(crate) fn new(
         plan: crate::proto::plan::PlanFragment,
         instance_params: crate::proto::novarocks::InstanceParams,
@@ -131,8 +131,8 @@ mod tests {
     use crate::proto::common::UniqueId as ProtoUniqueId;
 
     #[test]
-    fn fragment_submission_requires_native_plan_and_instance_params() {
-        let submission = FragmentSubmission::new(
+    fn native_fragment_envelope_preserves_native_plan_and_instance_params() {
+        let envelope = NativeFragmentEnvelope::new(
             crate::proto::plan::PlanFragment {
                 fragment_id: 9,
                 ..Default::default()
@@ -146,14 +146,14 @@ mod tests {
         );
 
         assert_eq!(
-            submission.query_id().expect("native query id"),
+            envelope.query_id().expect("native query id"),
             UniqueId { hi: 7, lo: 9 }
         );
         assert_eq!(
-            submission.fragment_instance_id().expect("native finst id"),
+            envelope.fragment_instance_id().expect("native finst id"),
             UniqueId { hi: 7, lo: 11 }
         );
-        let (plan, instance_params) = submission.into_parts();
+        let (plan, instance_params) = envelope.into_parts();
         assert_eq!(plan.fragment_id, 9);
         assert_eq!(instance_params.backend_num, 3);
     }

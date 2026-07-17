@@ -42,7 +42,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
+use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
 use crate::coordinator::prepare::runtime_filter_binding::PreparedRuntimeFilterBindingRole;
 use crate::coordinator::prepare::{
@@ -557,8 +557,10 @@ impl ExecutionCoordinator {
         // Collect submissions by fragment, then submit consumers before
         // producers. This ensures downstream exchange receivers/result buffers
         // are registered before an upstream producer can fail or send data.
-        let mut submissions_by_fragment: BTreeMap<FragmentId, Vec<(usize, FragmentSubmission)>> =
-            BTreeMap::new();
+        let mut submissions_by_fragment: BTreeMap<
+            FragmentId,
+            Vec<(usize, NativeFragmentEnvelope)>,
+        > = BTreeMap::new();
         let mut expected_writers = Vec::new();
 
         for (&fragment_id, placements) in &plan.by_fragment {
@@ -656,7 +658,8 @@ impl ExecutionCoordinator {
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,
                     )?;
-                let submission = FragmentSubmission::new(native_fragment, native_instance_params);
+                let submission =
+                    NativeFragmentEnvelope::new(native_fragment, native_instance_params);
 
                 submissions_by_fragment
                     .entry(fragment_id)
@@ -679,7 +682,7 @@ impl ExecutionCoordinator {
         // topological order in reverse (root first) so downstream exchange
         // receivers / result buffers register before any upstream producer can
         // send. The order is the planner-sealed projection, not recomputed here.
-        let mut submissions: Vec<(usize, FragmentSubmission)> = Vec::new();
+        let mut submissions: Vec<(usize, NativeFragmentEnvelope)> = Vec::new();
         for &fragment_id in prepared.scheduling_view().topological_order().iter().rev() {
             if let Some(mut fragment_submissions) = submissions_by_fragment.remove(&fragment_id) {
                 submissions.append(&mut fragment_submissions);
@@ -1598,7 +1601,7 @@ impl Drop for QueryStateRegistrationGuard {
 // ---------------------------------------------------------------------------
 
 fn prevalidate_fragment_submissions(
-    submissions: &[(usize, FragmentSubmission)],
+    submissions: &[(usize, NativeFragmentEnvelope)],
     expected_query_id: UniqueId,
     expected_root_fragment_id: FragmentId,
     root_backend_idx: usize,
@@ -1675,7 +1678,7 @@ fn prevalidate_fragment_submissions(
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
     tracker: &mut InFlightTracker,
-    submissions: Vec<(usize, FragmentSubmission)>,
+    submissions: Vec<(usize, NativeFragmentEnvelope)>,
     execution_root_fragment_id: FragmentId,
     root_backend_idx: usize,
     root_finst_id: UniqueId,
@@ -2264,8 +2267,8 @@ mod native_contract_tests {
         fragment_id: FragmentId,
         query_id: UniqueId,
         fragment_instance_id: UniqueId,
-    ) -> FragmentSubmission {
-        FragmentSubmission::new(
+    ) -> NativeFragmentEnvelope {
+        NativeFragmentEnvelope::new(
             native_plan::PlanFragment {
                 fragment_id,
                 ..Default::default()
@@ -2288,8 +2291,8 @@ mod native_contract_tests {
         fragment_id: FragmentId,
         query_id: Option<UniqueId>,
         fragment_instance_id: UniqueId,
-    ) -> FragmentSubmission {
-        FragmentSubmission::new(
+    ) -> NativeFragmentEnvelope {
+        NativeFragmentEnvelope::new(
             native_plan::PlanFragment {
                 fragment_id,
                 ..Default::default()
@@ -2369,7 +2372,7 @@ mod native_contract_tests {
         fn submit_fragment(
             &self,
             backend_idx: usize,
-            submission: FragmentSubmission,
+            submission: NativeFragmentEnvelope,
         ) -> Result<(), String> {
             let call = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_on_submit == Some(call) {
@@ -2890,7 +2893,7 @@ mod native_contract_tests {
             hi: 94_000,
             lo: 94_001,
         };
-        let malformed = FragmentSubmission::new(
+        let malformed = NativeFragmentEnvelope::new(
             native_plan::PlanFragment {
                 fragment_id: 7,
                 ..Default::default()
