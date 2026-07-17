@@ -445,7 +445,7 @@ impl StandaloneNovaRocks {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         #[cfg(test)]
-        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        crate::coordinator::cluster::replace_backend_registry_for_test(None);
         match opts.config_path.as_deref() {
             Some(path) => {
                 novarocks_config::init_from_path(path)
@@ -482,7 +482,7 @@ impl StandaloneNovaRocks {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
         #[cfg(test)]
-        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        crate::coordinator::cluster::replace_backend_registry_for_test(None);
         novarocks_config::install_preloaded_config(cfg);
         #[cfg(test)]
         return Self::open_body(opts, _test_guard);
@@ -2575,7 +2575,7 @@ fn ensure_mainline_distributed_execution(
 /// floor (never panics). NOT a standalone-specific branch: all-in-one is a
 /// test shell that registers one loopback BE; goldens pin SET to the real N.
 fn live_effective_backend_count() -> f64 {
-    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
         let entries = registry.live_endpoints();
         if !entries.is_empty() {
             return (entries.len() as f64).max(1.0);
@@ -3737,7 +3737,7 @@ fn coordinated_execution_services() -> Result<
     let (dispatcher, scheduler) = match role {
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
-            let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries);
+            let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries);
             let (dispatcher, scheduler) =
                 dispatch_and_scheduler_from_live_backend_snapshot(snapshot)?;
             let dispatcher = Arc::new(dispatcher);
@@ -3763,7 +3763,7 @@ fn coordinated_execution_services() -> Result<
 }
 
 fn dispatch_and_scheduler_from_live_backend_snapshot(
-    snapshot: crate::coordinator::scheduler::LiveBackendSnapshot,
+    snapshot: crate::coordinator::cluster::LiveBackendSnapshot,
 ) -> Result<
     (
         crate::service::grpc_fragment_dispatcher::RemoteDispatcher,
@@ -3865,7 +3865,7 @@ fn with_fe_error_context(err: String) -> String {
 #[cfg(test)]
 pub(crate) struct StandaloneLoopbackTestBackend {
     pub(crate) exchange_port: u16,
-    _registry_guard: crate::runtime::backend_registry::BackendRegistryTestGuard,
+    _registry_guard: crate::coordinator::cluster::BackendRegistryTestGuard,
     _test_guard: TestSerializationGuard,
 }
 
@@ -3873,7 +3873,7 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 pub(crate) fn install_all_in_one_loopback_backend_for_test()
 -> Result<StandaloneLoopbackTestBackend, String> {
     let test_guard = acquire_standalone_test_guard();
-    let registry_guard = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+    let registry_guard = crate::coordinator::cluster::BackendRegistryTestGuard::new();
     let cfg = crate::novarocks_config::install_default_for_test();
     let exchange_port = ensure_standalone_exchange_server()?;
     let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
@@ -8835,7 +8835,7 @@ path = "meta/operations.sqlite"
     fn dispatcher_for_role_all_in_one_ok() {
         use crate::common::app_config::ClusterRole;
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
         crate::engine::backend_ops::install_all_in_one_backend_registry(
             "127.0.0.1:19070".parse().unwrap(),
             3,
@@ -8848,7 +8848,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn all_in_one_dispatcher_uses_remote_registry() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.role = ClusterRole::AllInOne;
@@ -8867,9 +8867,9 @@ path = "meta/operations.sqlite"
     #[test]
     fn coordinated_execution_services_use_one_live_backend_snapshot() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        use crate::coordinator::cluster::{BackendRegistry, BackendState};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.role = ClusterRole::Fe;
         cfg.cluster.backends.clear();
@@ -8878,7 +8878,7 @@ path = "meta/operations.sqlite"
         let endpoint = "127.0.0.1:19072".parse().unwrap();
         let registry = Arc::new(BackendRegistry::new(3));
         registry.restore_backend(2, endpoint, BackendState::Live);
-        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
 
         let (execution_ports, scheduler) =
             super::coordinated_execution_services().expect("coordinated services");
@@ -8895,7 +8895,7 @@ path = "meta/operations.sqlite"
         let first = "127.0.0.1:19073".parse().unwrap();
         let second = "127.0.0.1:19079".parse().unwrap();
         let entries = vec![(2usize, first), (11usize, second)];
-        let snapshot = crate::coordinator::scheduler::LiveBackendSnapshot::new(entries.clone());
+        let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries.clone());
 
         let (dispatcher, scheduler) =
             super::dispatch_and_scheduler_from_live_backend_snapshot(snapshot)
@@ -8923,14 +8923,14 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_live_registry_over_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
-        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        use crate::coordinator::cluster::{BackendRegistry, BackendState};
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19080".to_string()]);
         let registry = Arc::new(BackendRegistry::new(3));
         registry.restore_backend(2, "127.0.0.1:19081".parse().unwrap(), BackendState::Live);
         registry.restore_backend(3, "127.0.0.1:19082".parse().unwrap(), BackendState::Live);
-        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
 
         assert_eq!(super::live_effective_backend_count(), 2.0);
     }
@@ -8938,7 +8938,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_absent() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(
             7,
@@ -8951,11 +8951,11 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_prefers_runtime_config_when_registry_empty() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
-        let registry = Arc::new(crate::runtime::backend_registry::BackendRegistry::new(3));
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
+        let registry = Arc::new(crate::coordinator::cluster::BackendRegistry::new(3));
 
         install_optimizer_backend_count_config(7, vec!["127.0.0.1:19085".to_string()]);
-        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
 
         assert_eq!(super::live_effective_backend_count(), 7.0);
     }
@@ -8963,7 +8963,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn live_effective_backend_count_defaults_to_one_without_registry_or_runtime_config() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
 
         install_optimizer_backend_count_config(0, Vec::new());
 
@@ -9264,9 +9264,9 @@ path = "meta/operations.sqlite"
     #[test]
     fn dispatcher_for_role_fe_uses_live_registry_backend_ids() {
         let _guard = super::acquire_standalone_test_guard();
-        let _registry = crate::runtime::backend_registry::BackendRegistryTestGuard::new();
+        let _registry = crate::coordinator::cluster::BackendRegistryTestGuard::new();
         use crate::common::app_config::{ClusterRole, NovaRocksConfig};
-        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        use crate::coordinator::cluster::{BackendRegistry, BackendState};
         let mut cfg = NovaRocksConfig::default();
         cfg.cluster.role = ClusterRole::Fe;
         cfg.cluster.backends.clear();
@@ -9274,7 +9274,7 @@ path = "meta/operations.sqlite"
 
         let registry = Arc::new(BackendRegistry::new(3));
         registry.restore_backend(2, "127.0.0.1:19072".parse().unwrap(), BackendState::Live);
-        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
 
         let dispatcher = super::dispatcher_for_role(ClusterRole::Fe).expect("dispatcher");
         assert_eq!(dispatcher.backend_count(), 1);

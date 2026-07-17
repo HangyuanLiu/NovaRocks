@@ -60,6 +60,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
+use crate::coordinator::cluster::{LiveBackend, LiveBackendSnapshot};
 use crate::coordinator::prepare::{FragmentSchedulingView, PreparedFragment};
 use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
@@ -72,27 +73,6 @@ use crate::sql::planner::distributed::{
 pub(crate) use runtime_filter::{
     PlannedRuntimeFilter, RuntimeFilterPlanResult, plan_runtime_filters,
 };
-
-pub(crate) type LiveBackend = (usize, SocketAddr);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LiveBackendSnapshot {
-    entries: Vec<LiveBackend>,
-}
-
-impl LiveBackendSnapshot {
-    pub(crate) fn new(entries: Vec<LiveBackend>) -> Self {
-        Self { entries }
-    }
-
-    pub(crate) fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
-        Self::new(backends.into_iter().enumerate().collect())
-    }
-
-    pub(crate) fn entries(&self) -> &[LiveBackend] {
-        &self.entries
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 struct IncomingEdge {

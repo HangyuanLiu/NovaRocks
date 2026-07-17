@@ -1428,9 +1428,8 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
-    use crate::coordinator::scheduler::{
-        FragmentInstancePlacement, LiveBackendSnapshot, SchedulingPlan,
-    };
+    use crate::coordinator::cluster::LiveBackendSnapshot;
+    use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::deployment::compiler::compile;
     use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;

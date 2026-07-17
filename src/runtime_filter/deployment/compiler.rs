@@ -18,7 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::common::types::UniqueId;
-use crate::coordinator::scheduler::{LiveBackendSnapshot, SchedulingPlan};
+use crate::coordinator::cluster::LiveBackendSnapshot;
+use crate::coordinator::scheduler::SchedulingPlan;
 use crate::runtime_filter::deployment::role_graph::{
     ChannelRoleInputs, ConsumerPlacement, ProducerPlacement, RoleGraph, RouteEdgeAllocator,
     build_channel_role_graph,

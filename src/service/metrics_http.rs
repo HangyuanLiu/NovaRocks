@@ -27,7 +27,7 @@ use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, register_int_gauge_vec,
 };
 
-use crate::runtime::backend_registry::{BackendState, backend_registry};
+use crate::coordinator::cluster::{BackendState, backend_registry};
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(

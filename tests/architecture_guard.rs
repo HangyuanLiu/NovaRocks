@@ -8680,8 +8680,8 @@ arrow::datatypes::DataType
 arrow::datatypes::DataType::Int64
 crate::common::types::UniqueId
 crate::coordinator::scheduler::FragmentInstancePlacement
-crate::coordinator::scheduler::LiveBackendSnapshot
-crate::coordinator::scheduler::LiveBackendSnapshot::from_endpoints
+crate::coordinator::cluster::LiveBackendSnapshot
+crate::coordinator::cluster::LiveBackendSnapshot::from_endpoints
 crate::coordinator::scheduler::SchedulingPlan
 crate::runtime_filter::deployment::compiler
 crate::runtime_filter::deployment::compiler::compile
@@ -27994,15 +27994,21 @@ fn coor_1_grpc_report_ingress_uses_coordinator_port() {
 #[test]
 fn coor_2_scheduler_owner_is_top_level_and_snapshot_is_shared() {
     let repo = Path::new(manifest_dir());
+    let cluster_path = repo.join("src/coordinator/cluster/mod.rs");
     let scheduler_path = repo.join("src/coordinator/scheduler/mod.rs");
     let legacy_path = repo.join(["src/runtime/", "scheduler.rs"].concat());
+    assert!(cluster_path.is_file());
     assert!(scheduler_path.is_file());
     assert!(!legacy_path.exists());
+    let cluster = rust_sanitized_production_text(
+        &fs::read_to_string(cluster_path).expect("read coordinator cluster"),
+    );
     let scheduler = rust_sanitized_production_text(
         &fs::read_to_string(scheduler_path).expect("read coordinator scheduler"),
     );
+    assert!(cluster.contains("pub(crate) struct LiveBackendSnapshot"));
+    assert!(!scheduler.contains("struct LiveBackendSnapshot"));
     for required in [
-        "pub(crate) struct LiveBackendSnapshot",
         "pub(crate) struct FragmentScheduler",
         "pub(crate) struct SchedulingPlan",
         "pub(crate) struct FragmentInstancePlacement",
@@ -35482,7 +35488,7 @@ fn rfd4_m2a_routing_dependency_is_allowed(source_rel: &str, dependency: &[String
             &["std", "collections", "BTreeMap"],
             &["std", "collections", "BTreeSet"],
             &["crate", "common", "types", "UniqueId"],
-            &["crate", "coordinator", "scheduler", "LiveBackendSnapshot"],
+            &["crate", "coordinator", "cluster", "LiveBackendSnapshot"],
             &["crate", "runtime", "endpoint", "RuntimeEndpoint"],
             &[
                 "crate",
@@ -36291,7 +36297,7 @@ struct RoleRouter {
 }
 
 #[cfg(test)]
-use crate::coordinator::scheduler::LiveBackendSnapshot;
+use crate::coordinator::cluster::LiveBackendSnapshot;
 #[cfg(test)]
 pub use crate::runtime_filter::deployment::compiler as HiddenCompiler;
 #[cfg(test)]
@@ -46388,6 +46394,8 @@ fn rfd4_m2b2_live_runtime_filter_root_freezes_owner_child_declarations() {
         "runtime-filter root attrs controlling the service owner must be frozen"
     );
 }
+#[path = "architecture_guard/ebd_5b1_cluster_membership_owner.rs"]
+mod ebd_5b1_cluster_membership_owner;
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
 mod ebd_1_engine_boundary;

@@ -21,10 +21,30 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static GLOBAL_REGISTRY: OnceLock<Mutex<Option<Arc<BackendRegistry>>>> = OnceLock::new();
 
-pub type BeId = u32;
+pub(crate) type BeId = u32;
+pub(crate) type LiveBackend = (usize, SocketAddr);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiveBackendSnapshot {
+    entries: Vec<LiveBackend>,
+}
+
+impl LiveBackendSnapshot {
+    pub(crate) fn new(entries: Vec<LiveBackend>) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
+        Self::new(backends.into_iter().enumerate().collect())
+    }
+
+    pub(crate) fn entries(&self) -> &[LiveBackend] {
+        &self.entries
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendState {
+pub(crate) enum BackendState {
     Registering,
     Live,
     Lost,
@@ -32,22 +52,22 @@ pub enum BackendState {
 }
 
 #[derive(Clone, Debug)]
-pub struct BackendEntry {
-    pub be_id: BeId,
-    pub endpoint: SocketAddr,
-    pub state: BackendState,
-    pub start_epoch: u64,
-    pub last_heartbeat_ms: i64,
-    pub missed_heartbeats: u32,
-    pub last_err: Option<String>,
-    pub version: String,
-    pub num_cores: u32,
+pub(crate) struct BackendEntry {
+    pub(crate) be_id: BeId,
+    pub(crate) endpoint: SocketAddr,
+    pub(crate) state: BackendState,
+    pub(crate) start_epoch: u64,
+    pub(crate) last_heartbeat_ms: i64,
+    pub(crate) missed_heartbeats: u32,
+    pub(crate) last_err: Option<String>,
+    pub(crate) version: String,
+    pub(crate) num_cores: u32,
     // Incremented by FE/all-in-one dispatchers when fragments are assigned.
-    pub scheduled_fragments: u64,
+    pub(crate) scheduled_fragments: u64,
 }
 
 #[derive(Clone, Debug)]
-pub enum HeartbeatOutcome {
+pub(crate) enum HeartbeatOutcome {
     Ok {
         start_epoch: u64,
         version: String,
@@ -61,7 +81,7 @@ pub enum HeartbeatOutcome {
 
 #[cfg(test)]
 impl HeartbeatOutcome {
-    pub fn ok(start_epoch: u64, now_ms: i64) -> Self {
+    pub(crate) fn ok(start_epoch: u64, now_ms: i64) -> Self {
         Self::Ok {
             start_epoch,
             version: "test".to_string(),
@@ -70,7 +90,7 @@ impl HeartbeatOutcome {
         }
     }
 
-    pub fn failed(err: &str) -> Self {
+    pub(crate) fn failed(err: &str) -> Self {
         Self::Failed {
             err: err.to_string(),
         }
@@ -78,7 +98,7 @@ impl HeartbeatOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RegistryEvent {
+pub(crate) enum RegistryEvent {
     BackendLost {
         be_id: BeId,
     },
@@ -89,7 +109,7 @@ pub enum RegistryEvent {
     },
 }
 
-pub struct BackendRegistry {
+pub(crate) struct BackendRegistry {
     inner: Mutex<RegistryInner>,
 }
 
@@ -101,7 +121,7 @@ struct RegistryInner {
 }
 
 impl BackendRegistry {
-    pub fn new(timeout_retries: u32) -> Self {
+    pub(crate) fn new(timeout_retries: u32) -> Self {
         Self {
             inner: Mutex::new(RegistryInner {
                 timeout_retries: timeout_retries.max(1),
@@ -112,11 +132,11 @@ impl BackendRegistry {
         }
     }
 
-    pub fn add_backend(&self, endpoint: SocketAddr) -> BeId {
+    pub(crate) fn add_backend(&self, endpoint: SocketAddr) -> BeId {
         self.add_backend_with_state(endpoint, BackendState::Registering)
     }
 
-    pub fn add_backend_with_state(&self, endpoint: SocketAddr, state: BackendState) -> BeId {
+    pub(crate) fn add_backend_with_state(&self, endpoint: SocketAddr, state: BackendState) -> BeId {
         let mut inner = self.inner.lock().unwrap();
         if let Some(be_id) = inner.endpoint_to_id.get(&endpoint) {
             return *be_id;
@@ -146,7 +166,7 @@ impl BackendRegistry {
         be_id
     }
 
-    pub fn restore_backend(&self, be_id: BeId, endpoint: SocketAddr, state: BackendState) {
+    pub(crate) fn restore_backend(&self, be_id: BeId, endpoint: SocketAddr, state: BackendState) {
         let mut inner = self.inner.lock().unwrap();
         if inner.entries.contains_key(&be_id) {
             return;
@@ -173,13 +193,13 @@ impl BackendRegistry {
         inner.endpoint_to_id.insert(endpoint, be_id);
     }
 
-    pub fn seed_from_config(&self, endpoints: &[SocketAddr]) {
+    pub(crate) fn seed_from_config(&self, endpoints: &[SocketAddr]) {
         for endpoint in endpoints {
             self.add_backend(*endpoint);
         }
     }
 
-    pub fn apply_heartbeat_result(
+    pub(crate) fn apply_heartbeat_result(
         &self,
         be_id: BeId,
         outcome: HeartbeatOutcome,
@@ -230,7 +250,7 @@ impl BackendRegistry {
         }
     }
 
-    pub fn live_endpoints(&self) -> Vec<(BeId, SocketAddr)> {
+    pub(crate) fn live_endpoints(&self) -> Vec<(BeId, SocketAddr)> {
         self.inner
             .lock()
             .unwrap()
@@ -242,7 +262,7 @@ impl BackendRegistry {
             .collect()
     }
 
-    pub fn snapshot(&self) -> Vec<BackendEntry> {
+    pub(crate) fn snapshot(&self) -> Vec<BackendEntry> {
         self.inner
             .lock()
             .unwrap()
@@ -252,7 +272,7 @@ impl BackendRegistry {
             .collect()
     }
 
-    pub fn all_for_heartbeat(&self) -> Vec<(BeId, SocketAddr)> {
+    pub(crate) fn all_for_heartbeat(&self) -> Vec<(BeId, SocketAddr)> {
         self.inner
             .lock()
             .unwrap()
@@ -264,7 +284,7 @@ impl BackendRegistry {
             .collect()
     }
 
-    pub fn mark_decommissioning(&self, endpoint: SocketAddr) -> Result<BeId, String> {
+    pub(crate) fn mark_decommissioning(&self, endpoint: SocketAddr) -> Result<BeId, String> {
         let mut inner = self.inner.lock().unwrap();
         let Some(be_id) = inner.endpoint_to_id.get(&endpoint).copied() else {
             return Err(format!("backend {endpoint} not found"));
@@ -275,7 +295,7 @@ impl BackendRegistry {
         Ok(be_id)
     }
 
-    pub fn remove(&self, be_id: BeId) {
+    pub(crate) fn remove(&self, be_id: BeId) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.remove(&be_id) {
             // A removed endpoint may be added again, but logical ids are never reused.
@@ -283,14 +303,14 @@ impl BackendRegistry {
         }
     }
 
-    pub fn record_scheduled_fragment(&self, be_id: BeId) {
+    pub(crate) fn record_scheduled_fragment(&self, be_id: BeId) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.get_mut(&be_id) {
             entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
         }
     }
 
-    pub fn count_live(&self) -> usize {
+    pub(crate) fn count_live(&self) -> usize {
         self.inner
             .lock()
             .unwrap()
@@ -300,7 +320,7 @@ impl BackendRegistry {
             .count()
     }
 
-    pub fn count_by_state(&self, state: BackendState) -> usize {
+    pub(crate) fn count_by_state(&self, state: BackendState) -> usize {
         self.inner
             .lock()
             .unwrap()
@@ -312,7 +332,7 @@ impl BackendRegistry {
 }
 
 /// Install the process registry for FE and all-in-one dispatch. Idempotent: first writer wins.
-pub fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
+pub(crate) fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
     let mut guard = global_registry_cell().lock().unwrap();
     if guard.is_none() {
         *guard = Some(reg);
@@ -322,7 +342,7 @@ pub fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
 }
 
 /// The process registry, if installed by role=fe or all-in-one startup.
-pub fn backend_registry() -> Option<Arc<BackendRegistry>> {
+pub(crate) fn backend_registry() -> Option<Arc<BackendRegistry>> {
     global_registry_cell().lock().unwrap().clone()
 }
 
@@ -331,7 +351,7 @@ fn global_registry_cell() -> &'static Mutex<Option<Arc<BackendRegistry>>> {
 }
 
 #[cfg(test)]
-pub fn replace_backend_registry_for_test(reg: Option<Arc<BackendRegistry>>) {
+pub(crate) fn replace_backend_registry_for_test(reg: Option<Arc<BackendRegistry>>) {
     *global_registry_cell().lock().unwrap() = reg;
 }
 
