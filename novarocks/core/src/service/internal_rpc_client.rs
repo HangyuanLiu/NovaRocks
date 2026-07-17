@@ -19,6 +19,7 @@ use std::ffi::CString;
 use prost::Message;
 
 use crate::common::types::UniqueId;
+use crate::runtime::query_context::QueryId;
 use crate::service::engine_ffi::NovaRocksRustBuf;
 
 pub use crate::proto;
@@ -41,6 +42,14 @@ unsafe extern "C" {
         out_err: *mut NovaRocksRustBuf,
     ) -> i32;
     fn novarocks_compat_lookup(
+        host: *const std::os::raw::c_char,
+        port: u16,
+        ptr: *const u8,
+        len: usize,
+        out_resp: *mut NovaRocksRustBuf,
+        out_err: *mut NovaRocksRustBuf,
+    ) -> i32;
+    fn novarocks_compat_lookup_close(
         host: *const std::os::raw::c_char,
         port: u16,
         ptr: *const u8,
@@ -85,6 +94,20 @@ fn status_error(status: Option<&proto::starrocks::StatusPb>, rpc: &str) -> Resul
         return Err(format!("{rpc} returned status_code={}", status.status_code));
     }
     Err(format!("{rpc} failed: {}", status.error_msgs.join("; ")))
+}
+
+fn lookup_close_log_line(result: Result<(), &str>) -> String {
+    match result {
+        Ok(()) => "compat_rpc method=lookup_close direction=send status=ok".to_string(),
+        Err(error) => {
+            format!("compat_rpc method=lookup_close direction=send status=error error={error}")
+        }
+    }
+}
+
+fn lookup_close_status_error(status: Option<&proto::starrocks::StatusPb>) -> Result<(), String> {
+    let status = status.ok_or_else(|| "lookup_close response missing status".to_string())?;
+    status_error(Some(status), "lookup_close")
 }
 
 fn runtime_filter_request_to_compat(
@@ -315,6 +338,44 @@ pub fn lookup(
     Ok(proto::filter::LookupResponse { status, columns })
 }
 
+pub fn lookup_close(
+    dest_host: &str,
+    dest_port: u16,
+    query_id: QueryId,
+    lookup_node_id: i32,
+) -> Result<(), String> {
+    let request = proto::starrocks::PLookUpCloseRequest {
+        query_id: Some(proto::starrocks::PUniqueId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        }),
+        lookup_node_id: Some(lookup_node_id),
+    };
+    #[cfg(test)]
+    if let Some(result) = maybe_lookup_close_hook(dest_host, dest_port, request.clone()) {
+        return result;
+    }
+    let response: proto::starrocks::PLookUpCloseResponse = match call_unary(
+        dest_host,
+        dest_port,
+        request,
+        "lookup_close",
+        novarocks_compat_lookup_close,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("[WARN] {}", lookup_close_log_line(Err(error.as_str())));
+            return Err(error);
+        }
+    };
+    let result = lookup_close_status_error(response.status.as_ref());
+    match &result {
+        Ok(()) => eprintln!("[INFO] {}", lookup_close_log_line(Ok(()))),
+        Err(error) => eprintln!("[WARN] {}", lookup_close_log_line(Err(error.as_str()))),
+    }
+    result
+}
+
 #[cfg(test)]
 type TransmitChunkHook = std::sync::Arc<
     dyn Fn(
@@ -363,6 +424,11 @@ type LookupWireHook = std::sync::Arc<
 >;
 
 #[cfg(test)]
+type LookupCloseHook = std::sync::Arc<
+    dyn Fn(&str, u16, proto::starrocks::PLookUpCloseRequest) -> Result<(), String> + Send + Sync,
+>;
+
+#[cfg(test)]
 fn transmit_chunk_hook() -> &'static std::sync::Mutex<Option<TransmitChunkHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TransmitChunkHook>>> =
         std::sync::OnceLock::new();
@@ -394,6 +460,13 @@ fn lookup_hook() -> &'static std::sync::Mutex<Option<LookupHook>> {
 #[cfg(test)]
 fn lookup_wire_hook() -> &'static std::sync::Mutex<Option<LookupWireHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LookupWireHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn lookup_close_hook() -> &'static std::sync::Mutex<Option<LookupCloseHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<LookupCloseHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -467,6 +540,19 @@ fn maybe_lookup_wire_hook(
 }
 
 #[cfg(test)]
+fn maybe_lookup_close_hook(
+    host: &str,
+    port: u16,
+    params: proto::starrocks::PLookUpCloseRequest,
+) -> Option<Result<(), String>> {
+    let hook = lookup_close_hook()
+        .lock()
+        .expect("lookup close hook lock")
+        .clone();
+    hook.map(|hook| hook(host, port, params))
+}
+
+#[cfg(test)]
 pub(crate) fn test_hook_lock() -> std::sync::MutexGuard<'static, ()> {
     test_hook_mutex()
         .lock()
@@ -486,6 +572,7 @@ pub(crate) fn clear_test_hooks() {
         .expect("transmit_runtime_filter wire hook lock") = None;
     *lookup_hook().lock().expect("lookup hook lock") = None;
     *lookup_wire_hook().lock().expect("lookup wire hook lock") = None;
+    *lookup_close_hook().lock().expect("lookup close hook lock") = None;
 }
 
 #[cfg(test)]
@@ -548,6 +635,17 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn set_lookup_close_hook<F>(hook: F)
+where
+    F: Fn(&str, u16, proto::starrocks::PLookUpCloseRequest) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+{
+    *lookup_close_hook().lock().expect("lookup close hook lock") = Some(std::sync::Arc::new(hook));
+}
+
+#[cfg(test)]
 fn set_lookup_wire_hook<F>(hook: F)
 where
     F: Fn(
@@ -567,6 +665,35 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn lookup_close_error_status_never_uses_success_marker() {
+        let error = "lookup context missing";
+        let marker = lookup_close_log_line(Err(error));
+
+        assert!(marker.contains("status=error"), "{marker}");
+        assert!(!marker.contains("status=ok"), "{marker}");
+        assert!(marker.contains(error), "{marker}");
+    }
+
+    #[test]
+    fn lookup_close_requires_explicit_ok_status() {
+        let missing = lookup_close_status_error(None).expect_err("missing status is not success");
+        assert!(missing.contains("missing status"), "{missing}");
+
+        let non_ok = proto::starrocks::StatusPb {
+            status_code: 13,
+            error_msgs: vec!["lookup context missing".to_string()],
+        };
+        let error = lookup_close_status_error(Some(&non_ok)).expect_err("non-OK status");
+        assert!(error.contains("lookup context missing"), "{error}");
+
+        let ok = proto::starrocks::StatusPb {
+            status_code: 0,
+            error_msgs: Vec::new(),
+        };
+        lookup_close_status_error(Some(&ok)).expect("explicit OK status");
+    }
 
     #[test]
     fn test_transmit_runtime_filter_accepts_native_request_and_maps_starrocks_wire_request() {

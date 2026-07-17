@@ -17,10 +17,12 @@
 
 use crate::compat_artifact::CompatArtifact;
 use crate::managed_process::{ManagedProcess, ReadyMarker};
+use crate::session::mysql_value_to_string;
 use crate::types::{CompatBeEndpoint, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use std::ffi::OsStr;
 use std::fs;
 use std::net::TcpListener;
 #[cfg(unix)]
@@ -41,6 +43,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FE_CONFIG_KEYS: &[&str] = &[
+    "enable_load_volume_from_conf",
     "cloud_native_storage_type",
     "cloud_native_hdfs_url",
     "aws_s3_path",
@@ -264,6 +267,88 @@ fn validate_java_runtime() -> Result<()> {
     validate_java_version_output(&combined)
 }
 
+fn getopt_supports_required_long_options(path: &Path) -> bool {
+    Command::new(path)
+        .args([
+            "-n",
+            "starrocks-fe",
+            "-o",
+            "",
+            "-l",
+            "logconsole",
+            "--",
+            "--logconsole",
+        ])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "--logconsole --"
+        })
+}
+
+fn configure_fe_getopt_path_from(
+    command: &mut Command,
+    inherited_path: Option<&OsStr>,
+    extra_candidates: &[PathBuf],
+) -> Result<PathBuf> {
+    let inherited_dirs = inherited_path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut candidates = inherited_dirs
+        .iter()
+        .map(|directory| directory.join("getopt"))
+        .collect::<Vec<_>>();
+    for candidate in extra_candidates {
+        if !candidates.contains(candidate) {
+            candidates.push(candidate.clone());
+        }
+    }
+    let selected = candidates
+        .iter()
+        .find(|candidate| candidate.is_file() && getopt_supports_required_long_options(candidate))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "StarRocks FE start_fe.sh requires GNU-compatible getopt long-option semantics; checked {}",
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let selected_dir = selected
+        .parent()
+        .context("selected getopt path has no parent directory")?;
+    let mut command_path = vec![selected_dir.to_path_buf()];
+    command_path.extend(
+        inherited_dirs
+            .into_iter()
+            .filter(|directory| directory != selected_dir),
+    );
+    command.env(
+        "PATH",
+        std::env::join_paths(command_path).context("join FE command PATH")?,
+    );
+    Ok(selected)
+}
+
+fn configure_fe_getopt_path(command: &mut Command) -> Result<PathBuf> {
+    let mut extra_candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    extra_candidates.extend([
+        PathBuf::from("/opt/homebrew/opt/gnu-getopt/bin/getopt"),
+        PathBuf::from("/usr/local/opt/gnu-getopt/bin/getopt"),
+    ]);
+    configure_fe_getopt_path_from(
+        command,
+        std::env::var_os("PATH").as_deref(),
+        &extra_candidates,
+    )
+}
+
 pub(crate) fn render_fe_conf(base: &str, runtime_fe_home: &Path, ports: &FePorts) -> String {
     let mut copied = Vec::new();
     for line in base.lines() {
@@ -290,11 +375,100 @@ pub(crate) fn render_fe_conf(base: &str, runtime_fe_home: &Path, ports: &FePorts
     format!("{}\n", copied.join("\n"))
 }
 
+fn fe_conf_value(base: &str, expected_key: &str) -> Option<String> {
+    base.lines().rev().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != expected_key {
+            return None;
+        }
+        let value = value
+            .split_once(" #")
+            .map_or(value, |(value, _)| value)
+            .trim();
+        Some(
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+                .unwrap_or(value)
+                .trim()
+                .to_string(),
+        )
+    })
+}
+
+fn fe_conf_bool(base: &str, key: &str) -> bool {
+    fe_conf_value(base, key).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn validate_builtin_s3_storage_config(base: &str) -> Result<()> {
+    if !fe_conf_bool(base, "enable_load_volume_from_conf") {
+        bail!(
+            "StarRocks FE shared-data compatibility requires enable_load_volume_from_conf=true so the builtin storage volume becomes the default"
+        );
+    }
+    let storage_type = fe_conf_value(base, "cloud_native_storage_type").unwrap_or_default();
+    if !storage_type.eq_ignore_ascii_case("s3") {
+        bail!(
+            "StarRocks FE shared-data compatibility requires cloud_native_storage_type=S3; found {storage_type:?}"
+        );
+    }
+    let path = fe_conf_value(base, "aws_s3_path").unwrap_or_default();
+    let bucket_and_path = path.strip_prefix("s3://").unwrap_or(&path);
+    let bucket = bucket_and_path.split('/').next().unwrap_or_default();
+    if bucket.is_empty() || bucket.chars().any(char::is_whitespace) {
+        bail!("StarRocks FE shared-data compatibility requires a valid aws_s3_path with a bucket");
+    }
+    let endpoint = fe_conf_value(base, "aws_s3_endpoint").unwrap_or_default();
+    let region = fe_conf_value(base, "aws_s3_region").unwrap_or_default();
+    if endpoint.is_empty() && region.is_empty() {
+        bail!(
+            "StarRocks FE shared-data compatibility requires a non-empty aws_s3_endpoint or aws_s3_region"
+        );
+    }
+
+    let uses_default = fe_conf_bool(base, "aws_s3_use_aws_sdk_default_behavior");
+    let uses_instance_profile = fe_conf_bool(base, "aws_s3_use_instance_profile");
+    let access_key = fe_conf_value(base, "aws_s3_access_key").unwrap_or_default();
+    let secret_key = fe_conf_value(base, "aws_s3_secret_key").unwrap_or_default();
+    let role_arn = fe_conf_value(base, "aws_s3_iam_role_arn").unwrap_or_default();
+    let valid_static_credentials =
+        !access_key.is_empty() && !secret_key.is_empty() && role_arn.is_empty();
+    if !uses_default && !uses_instance_profile && !valid_static_credentials {
+        bail!(
+            "StarRocks FE shared-data compatibility requires a valid AWS credential mode: SDK default behavior, instance profile, or an access-key/secret-key pair without an IAM role"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn create_isolated_fe_home(
     source_home: &Path,
     runtime_home: &Path,
     ports: &FePorts,
 ) -> Result<()> {
+    let base_conf_path = source_home.join("conf/fe.conf");
+    let base_conf = if base_conf_path.is_file() {
+        fs::read_to_string(&base_conf_path)
+            .with_context(|| format!("read {}", base_conf_path.display()))?
+    } else {
+        String::new()
+    };
+    validate_builtin_s3_storage_config(&base_conf).with_context(|| {
+        format!(
+            "validate builtin storage configuration in {}",
+            base_conf_path.display()
+        )
+    })?;
+
     fs::create_dir_all(runtime_home)
         .with_context(|| format!("create isolated FE home {}", runtime_home.display()))?;
     #[cfg(unix)]
@@ -302,18 +476,10 @@ pub(crate) fn create_isolated_fe_home(
         symlink(source_home.join(name), runtime_home.join(name))
             .with_context(|| format!("symlink immutable StarRocks FE directory {name}"))?;
     }
-    let source_conf = source_home.join("conf");
     let runtime_conf = runtime_home.join("conf");
     fs::create_dir_all(&runtime_conf)?;
     fs::create_dir_all(runtime_home.join("log"))?;
     fs::create_dir_all(runtime_home.join("meta"))?;
-    let base_conf_path = source_conf.join("fe.conf");
-    let base_conf = if base_conf_path.is_file() {
-        fs::read_to_string(&base_conf_path)
-            .with_context(|| format!("read {}", base_conf_path.display()))?
-    } else {
-        String::new()
-    };
     let rendered = render_fe_conf(&base_conf, runtime_home, ports);
     if !rendered.lines().any(|line| {
         line.split_once('=')
@@ -664,13 +830,13 @@ fn query_backends(
         .unwrap_or_default();
     let values = rows
         .into_iter()
-        .map(|row| {
-            (0..row.len())
-                .map(|index| row.get::<String, usize>(index).unwrap_or_default())
-                .collect::<Vec<_>>()
-        })
+        .map(|row| render_show_backends_values(&row.unwrap()))
         .collect();
     Ok((headers, values))
+}
+
+fn render_show_backends_values(values: &[mysql::Value]) -> Vec<String> {
+    values.iter().map(mysql_value_to_string).collect()
 }
 
 fn wait_for_topology(
@@ -797,6 +963,7 @@ impl StarRocksCompatServerHandle {
         reserved.release_ports(&topology.fe.all_ports())?;
 
         let mut fe_command = Command::new(runtime_fe_home.join("bin/start_fe.sh"));
+        configure_fe_getopt_path(&mut fe_command)?;
         fe_command.arg("--logconsole").current_dir(&runtime_fe_home);
         let mut fe_process = spawn_managed_process(
             "StarRocks FE".to_string(),
@@ -1146,7 +1313,16 @@ mod tests {
         fs::write(home.join("lib/fe-core-main.jar"), b"jar").expect("write jar");
         fs::write(
             home.join("conf/fe.conf"),
-            "run_mode = shared_nothing\ncloud_native_storage_type = S3\n",
+            concat!(
+                "run_mode = shared_nothing\n",
+                "enable_load_volume_from_conf = true\n",
+                "cloud_native_storage_type = S3\n",
+                "aws_s3_path = s3://test-bucket/compat\n",
+                "aws_s3_endpoint = http://127.0.0.1:9000\n",
+                "aws_s3_region = us-east-1\n",
+                "aws_s3_access_key = test-access\n",
+                "aws_s3_secret_key = test-secret\n",
+            ),
         )
         .expect("write fe.conf");
         home
@@ -1214,6 +1390,43 @@ mod tests {
     }
 
     #[test]
+    fn fe_command_uses_a_getopt_with_gnu_long_option_semantics() {
+        let temp = TestDir::new("gnu-getopt");
+        let bsd_dir = temp.path().join("bsd/bin");
+        let gnu_dir = temp.path().join("gnu/bin");
+        fs::create_dir_all(&bsd_dir).expect("create BSD getopt directory");
+        fs::create_dir_all(&gnu_dir).expect("create GNU getopt directory");
+        write_executable(
+            &bsd_dir.join("getopt"),
+            "#!/bin/sh\necho ' -- test -o  -l logconsole -- --logconsole'\n",
+        );
+        write_executable(
+            &gnu_dir.join("getopt"),
+            "#!/bin/sh\necho ' --logconsole --'\n",
+        );
+
+        let mut command = Command::new("start_fe.sh");
+        let selected = configure_fe_getopt_path_from(
+            &mut command,
+            Some(bsd_dir.as_os_str()),
+            &[gnu_dir.join("getopt")],
+        )
+        .expect("GNU-compatible getopt must be selected");
+
+        assert_eq!(selected, gnu_dir.join("getopt"));
+        let configured_path = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "PATH").then(|| value.expect("PATH value").to_os_string())
+            })
+            .expect("FE command PATH override");
+        assert_eq!(
+            std::env::split_paths(&configured_path).collect::<Vec<_>>(),
+            vec![gnu_dir, bsd_dir]
+        );
+    }
+
+    #[test]
     fn reserved_topology_has_four_fe_ports_and_six_distinct_ports_per_be() {
         let reserved = ReservedCompatPorts::new().expect("reserve topology ports");
         let topology = reserved.topology();
@@ -1249,6 +1462,7 @@ mod tests {
         let base = r#"
 sys_log_level = DEBUG
 run_mode = shared_nothing
+enable_load_volume_from_conf = true
 cloud_native_storage_type = S3
 aws_s3_path = s3://bucket/prefix
 aws_s3_endpoint = http://127.0.0.1:9000
@@ -1270,10 +1484,96 @@ query_port = 9030
         assert!(rendered.contains("priority_networks = 127.0.0.1/32"));
         assert!(rendered.contains("proc_profile_cpu_enable = false"));
         assert!(rendered.contains("proc_profile_mem_enable = false"));
+        assert!(rendered.contains("enable_load_volume_from_conf = true"));
         assert!(rendered.contains("cloud_native_storage_type = S3"));
         assert!(rendered.contains("aws_s3_endpoint = http://127.0.0.1:9000"));
         assert!(!rendered.contains("sys_log_level"));
         assert_eq!(rendered.matches("query_port = ").count(), 1);
+    }
+
+    #[test]
+    fn builtin_s3_storage_preflight_accepts_supported_credential_modes() {
+        let common = r#"
+enable_load_volume_from_conf = true
+cloud_native_storage_type = S3
+aws_s3_path = s3://test-bucket/compat
+aws_s3_endpoint = http://127.0.0.1:9000
+"#;
+        for credentials in [
+            "aws_s3_access_key = test-access\naws_s3_secret_key = test-secret\n",
+            "aws_s3_use_aws_sdk_default_behavior = true\n",
+            "aws_s3_use_instance_profile = true\n",
+            "aws_s3_use_instance_profile = true\naws_s3_iam_role_arn = arn:aws:iam::123456789012:role/test\n",
+        ] {
+            validate_builtin_s3_storage_config(&format!("{common}{credentials}"))
+                .expect("supported S3 credential mode");
+        }
+    }
+
+    #[test]
+    fn builtin_s3_storage_preflight_accepts_bare_bucket_path_and_last_assignment() {
+        let config = r#"
+enable_load_volume_from_conf = false
+enable_load_volume_from_conf = true
+cloud_native_storage_type = HDFS
+cloud_native_storage_type = S3
+aws_s3_path = test-bucket/compat
+aws_s3_endpoint = http://127.0.0.1:9000
+aws_s3_access_key = test-access
+aws_s3_secret_key = test-secret
+"#;
+        validate_builtin_s3_storage_config(config)
+            .expect("bare bucket path and final assignments must match FE semantics");
+    }
+
+    #[test]
+    fn builtin_s3_storage_preflight_rejects_incomplete_config_without_leaking_credentials() {
+        let valid = r#"
+enable_load_volume_from_conf = true
+cloud_native_storage_type = S3
+aws_s3_path = s3://test-bucket/compat
+aws_s3_region = us-east-1
+aws_s3_access_key = private-access
+aws_s3_secret_key = private-secret
+"#;
+        validate_builtin_s3_storage_config(valid).expect("complete S3 config");
+
+        for (label, config, expected) in [
+            (
+                "disabled builtin volume",
+                valid.replace(
+                    "enable_load_volume_from_conf = true",
+                    "enable_load_volume_from_conf = false",
+                ),
+                "enable_load_volume_from_conf=true",
+            ),
+            (
+                "missing path",
+                valid.replace("aws_s3_path = s3://test-bucket/compat\n", ""),
+                "aws_s3_path",
+            ),
+            (
+                "missing endpoint and region",
+                valid.replace("aws_s3_region = us-east-1\n", ""),
+                "aws_s3_endpoint or aws_s3_region",
+            ),
+            (
+                "incomplete static credentials",
+                valid.replace("aws_s3_secret_key = private-secret\n", ""),
+                "valid AWS credential mode",
+            ),
+            (
+                "unsupported access-key assume role",
+                format!("{valid}aws_s3_iam_role_arn = arn:aws:iam::123456789012:role/test\n"),
+                "valid AWS credential mode",
+            ),
+        ] {
+            let error = validate_builtin_s3_storage_config(&config).expect_err(label);
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{label}: {message}");
+            assert!(!message.contains("private-access"), "{label}: {message}");
+            assert!(!message.contains("private-secret"), "{label}: {message}");
+        }
     }
 
     #[test]
@@ -1366,6 +1666,18 @@ query_port = 9030
         let live_rows = topology_rows(&expected, "Live");
         validate_compat_topology(&expected, &status_headers, &live_rows)
             .expect("Status=Live fallback");
+    }
+
+    #[test]
+    fn show_backends_value_rendering_is_null_safe() {
+        assert_eq!(
+            render_show_backends_values(&[
+                mysql::Value::Int(7),
+                mysql::Value::NULL,
+                mysql::Value::Bytes(b"true".to_vec()),
+            ]),
+            vec!["7", "NULL", "true"]
+        );
     }
 
     #[test]

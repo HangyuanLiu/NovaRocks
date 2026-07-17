@@ -155,7 +155,6 @@ struct TInternalScanRange {
   // skip local disk data cache when access page data
   15: optional bool skip_disk_cache = false;
   16: optional i64 gtid
-  17: optional string catalog_name;
 }
 
 enum TFileFormatType {

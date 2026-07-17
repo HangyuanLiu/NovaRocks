@@ -29,9 +29,7 @@ use arrow_buffer::i256;
 
 use crate::common::largeint;
 use crate::connector::MinMaxPredicate;
-use crate::connector::starrocks::fe_v2_meta::{
-    LakeTableIdentity, resolve_tablet_paths_for_lake_meta_scan,
-};
+use crate::connector::starrocks::fe_v2_meta::resolve_tablet_paths_for_lake_meta_scan;
 use crate::connector::starrocks::{
     ObjectStoreProfile, build_native_object_store_profile_from_properties,
 };
@@ -52,7 +50,6 @@ use crate::runtime::query_context::QueryId;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 
-use super::lake_scan::record_internal_catalog_name;
 use crate::connector::starrocks::fe_v2_meta::lake_scan_object_store_properties;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +171,6 @@ pub(crate) fn lower_lake_meta_scan_node(
 
     let mut tablet_versions: HashMap<i64, i64> = HashMap::new();
     let mut tablet_row_count_hints: HashMap<i64, i64> = HashMap::new();
-    let mut internal_catalog_name: Option<String> = None;
     let mut internal_db_name: Option<String> = None;
     let mut internal_table_name: Option<String> = None;
     let mut min_partition_id: Option<i64> = None;
@@ -193,12 +189,6 @@ pub(crate) fn lower_lake_meta_scan_node(
                 node.node_id
             ));
         };
-        record_internal_catalog_name(
-            &mut internal_catalog_name,
-            internal.catalog_name.as_deref(),
-            "LAKE_META_SCAN_NODE",
-            node.node_id,
-        )?;
         if internal.tablet_id <= 0 {
             return Err(format!(
                 "LAKE_META_SCAN_NODE has invalid tablet_id={}",
@@ -317,20 +307,13 @@ pub(crate) fn lower_lake_meta_scan_node(
     } else {
         table_desc.table_name.trim().to_string()
     };
-    let catalog = internal_catalog_name.ok_or_else(|| {
-        format!(
-            "LAKE_META_SCAN_NODE node_id={} missing catalog_name in effective scan ranges",
-            node.node_id
-        )
-    })?;
-    let table_identity = LakeTableIdentity {
-        catalog,
+    let table_identity = super::lake_scan::internal_lake_table_identity(
         db_name,
         table_name,
-        db_id: 0,
-        table_id: table_desc.id,
+        0,
+        table_desc.id,
         schema_id,
-    };
+    );
     let query_id = Some(QueryId {
         hi: exec_params.query_id.hi,
         lo: exec_params.query_id.lo,
@@ -1493,11 +1476,30 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
 
+    use super::super::lake_scan::internal_lake_table_identity;
     use super::MetaMetricKind;
     use super::parse_metric_name;
     use super::rewrite_chunk_slots_for_output_schema;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::ChunkSlotSchema;
+
+    #[test]
+    fn lake_meta_scan_without_catalog_builds_protocol_table_identity() {
+        let identity = internal_lake_table_identity(
+            "analytics".to_string(),
+            "column_stats".to_string(),
+            0,
+            404,
+            505,
+        );
+
+        assert_eq!(identity.catalog, "default_catalog");
+        assert_eq!(identity.db_name, "analytics");
+        assert_eq!(identity.table_name, "column_stats");
+        assert_eq!(identity.table_id, 404);
+        assert_eq!(identity.schema_id, 505);
+        assert_eq!(identity.cache_key(), "default_catalog:0:404:505");
+    }
 
     #[test]
     fn parse_rows_metric() {

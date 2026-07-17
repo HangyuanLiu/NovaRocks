@@ -981,10 +981,11 @@ fn run_explain_directive_checks(
 fn run_compat_directives_for_successful_step(
     step: &SqlStep,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    snapshot: &compat_directive::BeLogSnapshot,
     log: &mut String,
 ) -> Result<(), String> {
     match server_handle.lock() {
-        Ok(server_handle) => compat_directive::run(step, server_handle.as_ref(), log)
+        Ok(server_handle) => compat_directive::run(step, server_handle.as_ref(), snapshot, log)
             .map_err(|error| format!("compatibility directive failed: {error:#}")),
         Err(_) => Err("server handle mutex is poisoned".to_string()),
     }
@@ -995,6 +996,7 @@ fn finish_expected_error_step(
     matched_expected_error: bool,
     last_failure: &str,
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    snapshot: &compat_directive::BeLogSnapshot,
     log: &mut String,
 ) -> bool {
     if !matched_expected_error {
@@ -1005,7 +1007,9 @@ fn finish_expected_error_step(
         );
         return false;
     }
-    if let Err(reason) = run_compat_directives_for_successful_step(step, server_handle, log) {
+    if let Err(reason) =
+        run_compat_directives_for_successful_step(step, server_handle, snapshot, log)
+    {
         let _ = writeln!(log, "    ❌ FAIL: {reason}");
         return false;
     }
@@ -1356,6 +1360,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        let compat_snapshot = match ctx.server_handle.lock() {
+            Ok(server_handle) => compat_directive::snapshot(&step.meta, server_handle.as_ref()),
+            Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
+        };
+        let compat_snapshot = match compat_snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                case_failed = true;
+                let _ = writeln!(
+                    log,
+                    "    ❌ failed to snapshot compatibility evidence before step {}: {error:#}",
+                    step.query_number
+                );
+                break;
+            }
+        };
+
         match ctx.mode {
             Mode::Verify => {
                 let retry_count = step_retry_count(step);
@@ -1482,6 +1503,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         matched_expected_error,
                         &last_failure,
                         &ctx.server_handle,
+                        &compat_snapshot,
                         &mut log,
                     ) {
                         case_failed = true;
@@ -1502,6 +1524,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let compat_ok = run_compat_directives_for_successful_step(
                             step,
                             &ctx.server_handle,
+                            &compat_snapshot,
                             &mut log,
                         );
                         let compat_ok = match compat_ok {
@@ -1730,8 +1753,28 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
+                let expected_error_compat_ok = if matched_expected_error
+                    && ctx.record_from == RecordFrom::Target
+                {
+                    match run_compat_directives_for_successful_step(
+                        step,
+                        &ctx.server_handle,
+                        &compat_snapshot,
+                        &mut log,
+                    ) {
+                        Ok(()) => true,
+                        Err(reason) => {
+                            case_failed = true;
+                            last_failure = reason;
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    if matched_expected_error {
+                    if matched_expected_error && expected_error_compat_ok {
                         let _ = writeln!(
                             log,
                             "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
@@ -1742,7 +1785,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if step.meta.expect_error.is_some() {
-                    if matched_expected_error {
+                    if matched_expected_error && expected_error_compat_ok {
                         let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
                         case_failed = true;
@@ -1761,8 +1804,26 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        let compat_ok = if ctx.record_from == RecordFrom::Target {
+                            match run_compat_directives_for_successful_step(
+                                step,
+                                &ctx.server_handle,
+                                &compat_snapshot,
+                                &mut log,
+                            ) {
+                                Ok(()) => true,
+                                Err(reason) => {
+                                    case_failed = true;
+                                    let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
                         // @explain_*: validate during record too.
-                        let explain_ok = if !step.meta.explain_contains.is_empty()
+                        let explain_ok = compat_ok
+                            && if !step.meta.explain_contains.is_empty()
                             || !step.meta.explain_not_contains.is_empty()
                         {
                             match run_explain_directive_checks(
@@ -2725,6 +2786,17 @@ fn run() -> Result<i32> {
 
         for case in &cases {
             for step in &case.steps {
+                if let Err(error) = compat_directive::validate_record_source(
+                    &step.meta,
+                    cli.mode,
+                    cli.record_from,
+                ) {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
                 if let Err(error) =
                     compat_directive::validate_execution_mode(&step.meta, cli.mode)
                 {
@@ -3348,6 +3420,7 @@ mod tests {
             true,
             "planned rejection",
             &server_handle,
+            &crate::compat_directive::BeLogSnapshot::default(),
             &mut log,
         );
 
@@ -3409,6 +3482,7 @@ mod tests {
             true,
             "[ProtocolDecodeError] planned rejection",
             &server_handle,
+            &crate::compat_directive::BeLogSnapshot::default(),
             &mut log,
         ));
 
@@ -4077,7 +4151,10 @@ enable_path_style_access = true
         let inc = exec(&["k", "c"], &[&["a", "2"]]);
         let full = exec(&["k", "c"], &[&["a", "3"]]);
         let msg = super::imv_equivalence_failure("m", &inc, &full, None).expect("diff");
-        assert!(msg.contains("incremental result != full recompute"), "{msg}");
+        assert!(
+            msg.contains("incremental result != full recompute"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::ScanMorsel;
+use crate::exec::row_position::RowPositionType;
 use crate::formats::{
     build_format_iter, parquet::ParquetReadCachePolicy, parquet::ParquetScanConfig,
     parquet::ParquetSlotKind,
@@ -38,7 +39,9 @@ use crate::fs::scan_context::{FileScanContext, FileScanRange};
 #[cfg(feature = "compat")]
 use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
-use crate::runtime::descriptor_snapshot::{is_iceberg_v3_row_position, lookup_file_format_config};
+use crate::runtime::descriptor_snapshot::{
+    is_iceberg_v3_row_position, is_lake_row_position, lookup_file_format_config,
+};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 
 #[derive(Clone, Debug)]
@@ -346,6 +349,71 @@ pub(crate) fn execute_lookup_request(
         out.push((slot, ordered));
     }
     Ok(out)
+}
+
+fn dispatch_position_lookup<T, R, Lake, Iceberg>(
+    row_position_type: RowPositionType,
+    request: T,
+    lake: Lake,
+    iceberg: Iceberg,
+) -> R
+where
+    Lake: FnOnce(T) -> R,
+    Iceberg: FnOnce(T) -> R,
+{
+    if is_lake_row_position(row_position_type) {
+        lake(request)
+    } else {
+        iceberg(request)
+    }
+}
+
+pub(crate) fn execute_position_lookup_request(
+    query_id: QueryId,
+    tuple_id: i32,
+    request_columns: HashMap<SlotId, ArrayRef>,
+) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+    let row_position_type = query_context_manager()
+        .row_pos_desc(query_id, tuple_id)
+        .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?
+        .row_position_type;
+    dispatch_position_lookup(
+        row_position_type,
+        request_columns,
+        |request| execute_lake_lookup_request(query_id, tuple_id, request),
+        |request| execute_lookup_request(query_id, tuple_id, request),
+    )
+}
+
+#[cfg(test)]
+mod position_lookup_dispatch_tests {
+    use std::cell::Cell;
+
+    use super::dispatch_position_lookup;
+    use crate::exec::row_position::RowPositionType;
+
+    #[test]
+    fn lake_row_position_requests_use_the_lake_lookup_path() {
+        let lake_calls = Cell::new(0);
+        let iceberg_calls = Cell::new(0);
+
+        let result = dispatch_position_lookup(
+            RowPositionType::Lake,
+            17,
+            |request| {
+                lake_calls.set(lake_calls.get() + 1);
+                request + 1
+            },
+            |request| {
+                iceberg_calls.set(iceberg_calls.get() + 1);
+                request - 1
+            },
+        );
+
+        assert_eq!(result, 18);
+        assert_eq!(lake_calls.get(), 1);
+        assert_eq!(iceberg_calls.get(), 0);
+    }
 }
 
 /// Execute a lake (PRIMARY KEY cloud-native) late-materialization lookup.

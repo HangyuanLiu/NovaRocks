@@ -14,71 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::{BTreeMap, HashMap};
-
-use crate::common::ids::SlotId;
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
 use crate::lower::compat::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::compat::node::Lowered;
+use crate::lower::compat::node::lookup::lower_row_pos_descs;
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 use std::collections::HashSet;
-
-fn row_position_type_from_thrift(
-    value: crate::thrift::descriptors::TRowPositionType,
-) -> Result<crate::exec::row_position::RowPositionType, String> {
-    match value {
-        crate::thrift::descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION => {
-            Ok(RowPositionType::Iceberg)
-        }
-        crate::thrift::descriptors::TRowPositionType::LAKE_ROW_POSITION => {
-            Ok(RowPositionType::Lake)
-        }
-        other => Err(format!("unsupported row position type: {other:?}")),
-    }
-}
-
-fn lower_row_pos_descs(
-    descs: &BTreeMap<i32, descriptors::TRowPositionDescriptor>,
-) -> Result<HashMap<i32, RowPositionDescriptor>, String> {
-    let mut out = HashMap::new();
-    for (tuple_id, desc) in descs {
-        let row_position_type = desc
-            .row_position_type
-            .ok_or_else(|| "missing row_position_type".to_string())?;
-        let row_position_type = row_position_type_from_thrift(row_position_type)?;
-        let row_source_slot = desc
-            .row_source_slot
-            .ok_or_else(|| "missing row_source_slot".to_string())?;
-        let row_source_slot = SlotId::try_from(row_source_slot)?;
-        let fetch_ref_slots = desc
-            .fetch_ref_slots
-            .as_ref()
-            .ok_or_else(|| "missing fetch_ref_slots".to_string())?
-            .iter()
-            .map(|v| SlotId::try_from(*v))
-            .collect::<Result<Vec<_>, _>>()?;
-        let lookup_ref_slots = desc
-            .lookup_ref_slots
-            .as_ref()
-            .ok_or_else(|| "missing lookup_ref_slots".to_string())?
-            .iter()
-            .map(|v| SlotId::try_from(*v))
-            .collect::<Result<Vec<_>, _>>()?;
-        out.insert(
-            *tuple_id,
-            RowPositionDescriptor {
-                row_position_type,
-                row_source_slot,
-                fetch_ref_slots,
-                lookup_ref_slots,
-            },
-        );
-    }
-    Ok(out)
-}
 
 pub(crate) fn lower_fetch_node(
     mut children: Vec<Lowered>,

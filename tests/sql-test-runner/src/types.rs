@@ -113,6 +113,8 @@ pub struct QueryMeta {
     pub be_log_contains: Vec<String>,
     /// Require the total non-overlapping substring count across all BE logs.
     pub be_log_count_at_least: Vec<(String, usize)>,
+    /// Require a substring to appear in at least this many distinct BE logs.
+    pub be_log_be_count_at_least: Vec<(String, usize)>,
     /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
     pub compat_probes: Vec<String>,
 }
@@ -121,6 +123,7 @@ impl QueryMeta {
     pub fn has_compat_directives(&self) -> bool {
         !self.be_log_contains.is_empty()
             || !self.be_log_count_at_least.is_empty()
+            || !self.be_log_be_count_at_least.is_empty()
             || !self.compat_probes.is_empty()
     }
 }

@@ -354,6 +354,8 @@ mod tests {
             None::<i32>,
             None::<bool>,
             None::<Vec<internal_service::TExecDebugOption>>,
+            None::<BTreeMap<i32, i32>>,
+            None::<BTreeMap<i32, crate::thrift::descriptors::TNodesInfo>>,
         )
     }
 

@@ -95,6 +95,7 @@ pub(crate) struct QueryContext {
     pending_runtime_filters: Vec<PendingRuntimeFilter>,
     runtime_filter_service: Arc<RuntimeFilterService>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+    pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
     #[cfg(feature = "compat")]
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
@@ -109,6 +110,12 @@ pub(crate) enum LegacyRuntimeFilterExecutionClaim {
     NativeDisabled,
     #[cfg(feature = "compat")]
     Compat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LookupFetcherLifecycle {
+    Exact(usize),
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +172,7 @@ impl QueryContext {
             pending_runtime_filters: Vec::new(),
             runtime_filter_service,
             row_pos_descs: HashMap::new(),
+            lookup_fetchers: HashMap::new(),
             glm_contexts: HashMap::new(),
             #[cfg(feature = "compat")]
             lake_glm_contexts: HashMap::new(),
@@ -197,6 +205,10 @@ impl QueryContext {
 
     pub(crate) fn is_dead(&self) -> bool {
         self.num_active_fragments == 0
+            && self
+                .lookup_fetchers
+                .values()
+                .all(|lifecycle| matches!(lifecycle, LookupFetcherLifecycle::Exact(0)))
             && (self.cancelled_by_fe
                 || self
                     .total_fragments
@@ -344,12 +356,77 @@ impl QueryContext {
         self.runtime_filter_service.clone()
     }
 
-    pub(crate) fn set_row_pos_descs(&mut self, descs: HashMap<i32, RowPositionDescriptor>) {
-        self.row_pos_descs = descs;
+    pub(crate) fn merge_row_pos_descs(
+        &mut self,
+        descs: HashMap<i32, RowPositionDescriptor>,
+    ) -> Result<(), String> {
+        for (tuple_id, incoming) in &descs {
+            if let Some(existing) = self.row_pos_descs.get(tuple_id) {
+                if existing.row_position_type != incoming.row_position_type
+                    || existing.row_source_slot != incoming.row_source_slot
+                    || existing.fetch_ref_slots != incoming.fetch_ref_slots
+                    || existing.lookup_ref_slots != incoming.lookup_ref_slots
+                {
+                    return Err(format!(
+                        "conflicting row position descriptor for tuple_id={tuple_id}"
+                    ));
+                }
+            }
+        }
+        for (tuple_id, incoming) in descs {
+            self.row_pos_descs.entry(tuple_id).or_insert(incoming);
+        }
+        Ok(())
     }
 
     pub(crate) fn row_pos_desc(&self, tuple_id: i32) -> Option<RowPositionDescriptor> {
         self.row_pos_descs.get(&tuple_id).cloned()
+    }
+
+    pub(crate) fn register_lookup_fetchers(
+        &mut self,
+        lifecycles: &HashMap<i32, LookupFetcherLifecycle>,
+    ) {
+        for (node_id, incoming) in lifecycles {
+            self.lookup_fetchers
+                .entry(*node_id)
+                .and_modify(|existing| {
+                    *existing = match (*existing, *incoming) {
+                        (
+                            LookupFetcherLifecycle::Exact(current),
+                            LookupFetcherLifecycle::Exact(new),
+                        ) => LookupFetcherLifecycle::Exact(current.max(new)),
+                        (LookupFetcherLifecycle::Unknown, LookupFetcherLifecycle::Exact(new)) => {
+                            LookupFetcherLifecycle::Exact(new)
+                        }
+                        (
+                            LookupFetcherLifecycle::Exact(current),
+                            LookupFetcherLifecycle::Unknown,
+                        ) => LookupFetcherLifecycle::Exact(current),
+                        (LookupFetcherLifecycle::Unknown, LookupFetcherLifecycle::Unknown) => {
+                            LookupFetcherLifecycle::Unknown
+                        }
+                    };
+                })
+                .or_insert(*incoming);
+        }
+    }
+
+    pub(crate) fn complete_lookup_fetcher(&mut self, node_id: i32) -> Result<(), String> {
+        let lifecycle = self
+            .lookup_fetchers
+            .get_mut(&node_id)
+            .ok_or_else(|| format!("lookup node {node_id} is not registered"))?;
+        let LookupFetcherLifecycle::Exact(count) = lifecycle else {
+            // Without the FE-provided peer-fragment count, a close cannot prove that
+            // it is the last fetch fragment. Keep the dispatcher until bounded expiry.
+            return Ok(());
+        };
+        if *count == 0 {
+            return Ok(());
+        }
+        *count -= 1;
+        Ok(())
     }
 
     pub(crate) fn register_glm_scan_ranges(
@@ -932,10 +1009,47 @@ impl QueryContextManager {
         query_id: QueryId,
         descs: HashMap<i32, RowPositionDescriptor>,
     ) -> Result<(), String> {
+        self.with_context_mut(query_id, |ctx| ctx.merge_row_pos_descs(descs))
+    }
+
+    pub(crate) fn register_lookup_fetchers(
+        &self,
+        query_id: QueryId,
+        lifecycles: HashMap<i32, LookupFetcherLifecycle>,
+    ) -> Result<(), String> {
         self.with_context_mut(query_id, |ctx| {
-            ctx.set_row_pos_descs(descs);
+            ctx.register_lookup_fetchers(&lifecycles);
             Ok(())
         })
+    }
+
+    pub(crate) fn complete_lookup_fetcher(
+        &self,
+        query_id: QueryId,
+        node_id: i32,
+    ) -> Result<(), String> {
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if let Some(ctx) = guard.active.get_mut(&query_id) {
+                ctx.complete_lookup_fetcher(node_id)?;
+                None
+            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
+                ctx.complete_lookup_fetcher(node_id)?;
+                if ctx.is_dead() {
+                    guard.second_chance.remove(&query_id)
+                } else {
+                    None
+                }
+            } else {
+                return Err(format!("QueryContext not found: query_id={query_id}"));
+            }
+        };
+        if let Some(ctx) = removed {
+            ctx.runtime_filter_service().shutdown();
+            drop(ctx);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+        }
+        Ok(())
     }
 
     pub(crate) fn register_glm_scan_ranges(
@@ -1490,6 +1604,131 @@ fn remove_runtime_filter_lifecycle(query_id: QueryId) {
         .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
 }
 
+#[cfg(test)]
+mod lookup_lifecycle_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{LookupFetcherLifecycle, QueryContextManager, QueryContextManagerInner, QueryId};
+
+    fn test_manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn lookup_context_survives_all_fragments_until_last_fetcher_closes() {
+        let manager = test_manager();
+        let query_id = QueryId { hi: 901, lo: 902 };
+        for _ in 0..2 {
+            manager
+                .get_or_register(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("fragment context");
+        }
+        {
+            let mut guard = manager.inner.lock().expect("query ctx manager lock");
+            guard
+                .active
+                .get_mut(&query_id)
+                .expect("active query")
+                .total_fragments = Some(2);
+        }
+        manager
+            .register_lookup_fetchers(
+                query_id,
+                HashMap::from([(3, LookupFetcherLifecycle::Exact(1))]),
+            )
+            .expect("lookup lifecycle");
+
+        manager.finish_fragment(query_id);
+        manager.finish_fragment(query_id);
+
+        {
+            let guard = manager.inner.lock().expect("query ctx manager lock");
+            assert!(!guard.active.contains_key(&query_id));
+            assert!(guard.second_chance.contains_key(&query_id));
+        }
+
+        manager
+            .complete_lookup_fetcher(query_id, 3)
+            .expect("last fetcher close");
+
+        let guard = manager.inner.lock().expect("query ctx manager lock");
+        assert!(!guard.active.contains_key(&query_id));
+        assert!(!guard.second_chance.contains_key(&query_id));
+    }
+
+    #[test]
+    fn duplicate_fragment_registration_does_not_double_lookup_fetchers() {
+        let manager = test_manager();
+        let query_id = QueryId { hi: 911, lo: 912 };
+        manager
+            .get_or_register(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("query context");
+
+        for _ in 0..2 {
+            manager
+                .register_lookup_fetchers(
+                    query_id,
+                    HashMap::from([(7, LookupFetcherLifecycle::Exact(2))]),
+                )
+                .expect("idempotent registration");
+        }
+
+        manager
+            .complete_lookup_fetcher(query_id, 7)
+            .expect("first close");
+        manager
+            .complete_lookup_fetcher(query_id, 7)
+            .expect("second close");
+        manager
+            .complete_lookup_fetcher(query_id, 7)
+            .expect("duplicate close is idempotent");
+    }
+
+    #[test]
+    fn unknown_lookup_fetcher_count_keeps_context_until_bounded_expiry() {
+        let manager = test_manager();
+        let query_id = QueryId { hi: 921, lo: 922 };
+        manager
+            .get_or_register(query_id, false, Duration::ZERO, Duration::from_secs(5))
+            .expect("query context");
+        manager
+            .register_lookup_fetchers(
+                query_id,
+                HashMap::from([(8, LookupFetcherLifecycle::Unknown)]),
+            )
+            .expect("unknown lookup lifecycle");
+
+        manager.finish_fragment(query_id);
+        manager
+            .complete_lookup_fetcher(query_id, 8)
+            .expect("unknown close is acknowledged conservatively");
+
+        {
+            let guard = manager.inner.lock().expect("query ctx manager lock");
+            assert!(guard.second_chance.contains_key(&query_id));
+        }
+        manager.clean_expired();
+        let guard = manager.inner.lock().expect("query ctx manager lock");
+        assert!(!guard.second_chance.contains_key(&query_id));
+    }
+}
+
 static QUERY_CONTEXT_MANAGER: OnceLock<Arc<QueryContextManager>> = OnceLock::new();
 
 pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
@@ -2027,6 +2266,69 @@ mod runtime_filter_lifecycle_cleanup_tests {
         mgr.clean_expired();
 
         assert!(registry.snapshot(query_key).is_none());
+    }
+}
+
+#[cfg(test)]
+mod row_position_descriptor_tests {
+    use std::collections::HashMap;
+
+    use super::{QueryContext, QueryId};
+    use crate::common::ids::SlotId;
+    use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
+
+    fn descriptor(row_source_slot: u32) -> RowPositionDescriptor {
+        RowPositionDescriptor {
+            row_position_type: RowPositionType::Lake,
+            row_source_slot: SlotId::new(row_source_slot),
+            fetch_ref_slots: vec![SlotId::new(12), SlotId::new(13), SlotId::new(14)],
+            lookup_ref_slots: vec![SlotId::new(15)],
+        }
+    }
+
+    #[test]
+    fn row_position_registration_is_idempotent_and_merges_distinct_tuples() {
+        let mut context = QueryContext::new(
+            QueryId { hi: 71, lo: 72 },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        context
+            .merge_row_pos_descs(HashMap::from([(3, descriptor(11))]))
+            .expect("register lookup descriptor");
+        context
+            .merge_row_pos_descs(HashMap::from([(3, descriptor(11)), (4, descriptor(21))]))
+            .expect("idempotent registration and distinct tuple merge");
+
+        assert_eq!(
+            context.row_pos_desc(3).unwrap().row_source_slot,
+            SlotId::new(11)
+        );
+        assert_eq!(
+            context.row_pos_desc(4).unwrap().row_source_slot,
+            SlotId::new(21)
+        );
+    }
+
+    #[test]
+    fn row_position_registration_rejects_conflicting_tuple_metadata() {
+        let mut context = QueryContext::new(
+            QueryId { hi: 73, lo: 74 },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        context
+            .merge_row_pos_descs(HashMap::from([(3, descriptor(11))]))
+            .expect("register lookup descriptor");
+
+        let error = context
+            .merge_row_pos_descs(HashMap::from([(3, descriptor(21)), (4, descriptor(31))]))
+            .expect_err("conflicting metadata must fail");
+        assert_eq!(error, "conflicting row position descriptor for tuple_id=3");
+        assert!(
+            context.row_pos_desc(4).is_none(),
+            "a rejected registration must not leave partial metadata"
+        );
     }
 }
 

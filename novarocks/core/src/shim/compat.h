@@ -108,6 +108,12 @@ int32_t novarocks_rs_lookup(const uint8_t* ptr,
                             NovaRocksRustBuf* out_resp,
                             NovaRocksRustBuf* out_err);
 
+// internal_service.proto PLookUpCloseRequest -> PLookUpCloseResponse (protobuf bytes).
+int32_t novarocks_rs_lookup_close(const uint8_t* ptr,
+                                  size_t len,
+                                  NovaRocksRustBuf* out_resp,
+                                  NovaRocksRustBuf* out_err);
+
 // internal_service.proto PUpdateFailPointStatusRequest -> PUpdateFailPointStatusResponse (protobuf bytes).
 int32_t novarocks_rs_update_fail_point_status(const uint8_t* ptr,
                                               size_t len,
@@ -282,6 +288,13 @@ int32_t novarocks_compat_lookup(const char* host,
                                 size_t len,
                                 NovaRocksRustBuf* out_resp,
                                 NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_lookup_close(const char* host,
+                                      uint16_t port,
+                                      const uint8_t* ptr,
+                                      size_t len,
+                                      NovaRocksRustBuf* out_resp,
+                                      NovaRocksRustBuf* out_err);
 
 void novarocks_compat_free_buf(uint8_t* ptr, size_t len);
 

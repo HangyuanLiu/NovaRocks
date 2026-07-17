@@ -196,13 +196,15 @@ impl FetchProcessor {
                     request_columns.insert(*slot_id, taken);
                 }
 
-                let response_columns = if is_lake {
-                    execute_lake_lookup(query_id, *tuple_id, request_columns)?
-                } else if self.is_local_backend(*backend_id)? {
-                    execute_lookup_request(query_id, *tuple_id, request_columns)?
-                } else {
-                    self.lookup_remote(query_id, *tuple_id, &request_columns, *backend_id)?
-                };
+                let local_backend_id = self.local_backend_id()?;
+                let response_columns = self.dispatch_lookup(
+                    query_id,
+                    *tuple_id,
+                    request_columns,
+                    is_lake,
+                    *backend_id,
+                    local_backend_id,
+                )?;
 
                 let mut response_map = HashMap::new();
                 for (slot, array) in response_columns {
@@ -249,12 +251,30 @@ impl FetchProcessor {
         Chunk::try_new_with_columns(output_chunk_schema, output_columns)
     }
 
-    fn is_local_backend(&self, backend_id: i32) -> Result<bool, String> {
+    fn local_backend_id(&self) -> Result<i32, String> {
         let local = crate::runtime::backend_id::backend_id()
             .ok_or_else(|| "backend_id is not initialized".to_string())?;
-        let local = i32::try_from(local)
-            .map_err(|_| format!("backend_id {} does not fit in int32", local))?;
-        Ok(local == backend_id)
+        i32::try_from(local).map_err(|_| format!("backend_id {} does not fit in int32", local))
+    }
+
+    fn dispatch_lookup(
+        &self,
+        query_id: QueryId,
+        tuple_id: i32,
+        request_columns: HashMap<SlotId, ArrayRef>,
+        is_lake: bool,
+        backend_id: i32,
+        local_backend_id: i32,
+    ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+        if local_backend_id == backend_id {
+            if is_lake {
+                execute_lake_lookup(query_id, tuple_id, request_columns)
+            } else {
+                execute_lookup_request(query_id, tuple_id, request_columns)
+            }
+        } else {
+            self.lookup_remote(query_id, tuple_id, &request_columns, backend_id)
+        }
     }
 
     fn lookup_remote(
@@ -324,7 +344,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use arrow::array::{ArrayRef, Int32Array};
+
     use super::FetchProcessor;
+    use crate::common::ids::SlotId;
     use crate::proto;
     use crate::runtime::descriptor_snapshot_thrift::test_lookup_nodes_info;
     use crate::runtime::query_context::QueryId;
@@ -371,6 +394,53 @@ mod tests {
         assert_eq!(req.query_id, Some(proto::common::UniqueId { hi: 1, lo: 2 }));
         assert_eq!(req.lookup_node_id, 2);
         assert_eq!(req.request_tuple_id, 3);
+        internal_rpc_client::clear_test_hooks();
+    }
+
+    #[test]
+    fn non_local_lake_rows_are_dispatched_to_remote_lookup() {
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
+        let _hook_guard = internal_rpc_client::test_hook_lock();
+        internal_rpc_client::clear_test_hooks();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_hook = Arc::clone(&captured);
+        internal_rpc_client::set_lookup_hook(move |host, port, req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port, req));
+            Ok(proto::filter::LookupResponse {
+                status: Some(proto::common::Status {
+                    code: 0,
+                    message: String::new(),
+                }),
+                columns: Vec::new(),
+            })
+        });
+        let processor = FetchProcessor {
+            name: "FETCH (test)".to_string(),
+            node_id: 1,
+            target_node_id: 2,
+            row_pos_descs: HashMap::new(),
+            nodes_info: Some(test_lookup_nodes_info(9, "remote-host", 9911)),
+            pending_output: None,
+            finishing: false,
+            output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+        };
+        let request_columns = HashMap::from([(
+            SlotId::new(12),
+            Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+        )]);
+
+        processor
+            .dispatch_lookup(QueryId { hi: 11, lo: 12 }, 3, request_columns, true, 9, 8)
+            .expect("non-local lake rows must use remote lookup");
+
+        let captured = captured.lock().expect("captured lock");
+        let (host, port, request) = captured.as_ref().expect("remote lookup request");
+        assert_eq!(host, "remote-host");
+        assert_eq!(*port, 9911);
+        assert_eq!(request.request_tuple_id, 3);
+        assert_eq!(request.request_columns.len(), 1);
         internal_rpc_client::clear_test_hooks();
     }
 }

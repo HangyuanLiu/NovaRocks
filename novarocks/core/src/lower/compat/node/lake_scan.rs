@@ -21,6 +21,7 @@ use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
     lake_scan_execution_properties,
 };
+use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::scan::LakeGlmScanInfo;
@@ -46,10 +47,9 @@ use crate::thrift::{descriptors, internal_service, plan_nodes, runtime_filter, t
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///
 /// FE-compatible lake scan lowering consumes tablet ids, versions, schema ids,
-/// row-count hints, and catalog identity from Thrift descriptors and
-/// `per_node_scan_ranges`. Lowering must not read process-local StarRocks
-/// catalog configuration because FE-compatible plans need explicit execution
-/// descriptors.
+/// row-count hints, and table identity from Thrift descriptors and
+/// `per_node_scan_ranges`. `TInternalScanRange` is an internal OLAP/Lake
+/// protocol type, so its catalog identity is always `default_catalog`.
 pub(crate) fn lower_lake_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
@@ -125,12 +125,15 @@ pub(crate) fn lower_lake_scan_node(
 
     // Detect lake GLM virtual column slots (synthesized by scan runner, not in storage).
     // They must be excluded from the storage schemas so the native reader ignores them.
-    let slot_desc_lookup: HashMap<types::TSlotId, &descriptors::TSlotDescriptor> = desc_tbl
+    let slot_desc_lookup: HashMap<
+        (types::TTupleId, types::TSlotId),
+        &descriptors::TSlotDescriptor,
+    > = desc_tbl
         .slot_descriptors
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(|s| s.id.map(|id| (id, s)))
+        .filter_map(|s| Some(((s.parent?, s.id?), s)))
         .collect();
 
     let mut source_id_info: Option<(SlotId, arrow::datatypes::Field)> = None;
@@ -141,9 +144,9 @@ pub(crate) fn lower_lake_scan_node(
     // Separate virtual cols from storage cols; produce a storage-only order
     let mut storage_order: Vec<(types::TTupleId, types::TSlotId)> =
         Vec::with_capacity(scan_layout.order.len());
-    for entry @ (_tup_id, slot_id_raw) in &scan_layout.order {
+    for entry @ (tuple_id_raw, slot_id_raw) in &scan_layout.order {
         let found_virtual = 'check: {
-            let Some(s) = slot_desc_lookup.get(slot_id_raw) else {
+            let Some(s) = slot_desc_lookup.get(&(*tuple_id_raw, *slot_id_raw)) else {
                 break 'check false;
             };
             let Ok(slot_id) = SlotId::try_from(*slot_id_raw) else {
@@ -260,7 +263,6 @@ pub(crate) fn lower_lake_scan_node(
 
     let mut ranges = Vec::new();
     let mut refs = Vec::new();
-    let mut internal_catalog_name: Option<String> = None;
     let mut internal_db_name: Option<String> = None;
     let mut internal_table_name: Option<String> = None;
     let mut has_more = false;
@@ -277,12 +279,6 @@ pub(crate) fn lower_lake_scan_node(
                 node.node_id
             ));
         };
-        record_internal_catalog_name(
-            &mut internal_catalog_name,
-            internal.catalog_name.as_deref(),
-            "LAKE_SCAN_NODE",
-            node.node_id,
-        )?;
         let version = internal
             .version
             .parse::<i64>()
@@ -400,16 +396,7 @@ pub(crate) fn lower_lake_scan_node(
             table_id, table_desc.id
         ));
     }
-    let catalog = if refs.is_empty() {
-        internal_catalog_name.unwrap_or_default()
-    } else {
-        internal_catalog_name.ok_or_else(|| {
-            format!(
-                "LAKE_SCAN_NODE node_id={} missing catalog_name in effective scan ranges",
-                node.node_id
-            )
-        })?
-    };
+    let catalog = INTERNAL_CATALOG_NAME.to_string();
     if (db_name == "__unknown_db__" || table_name == "__unknown_table__")
         && let Some((cached_db_name, cached_table_name)) =
             find_cached_table_identity_names(&catalog, db_id, table_id)
@@ -421,14 +408,13 @@ pub(crate) fn lower_lake_scan_node(
             table_name = cached_table_name;
         }
     }
-    let table_identity = LakeTableIdentity {
-        catalog,
-        db_name: db_name.clone(),
-        table_name: table_name.clone(),
+    let table_identity = internal_lake_table_identity(
+        db_name.clone(),
+        table_name.clone(),
         db_id,
         table_id,
         schema_id,
-    };
+    );
 
     let query_id = Some(QueryId {
         hi: exec_params.query_id.hi,
@@ -467,6 +453,29 @@ pub(crate) fn lower_lake_scan_node(
         "LAKE_SCAN_NODE node_id={} resolved {} tablets via Starlet AddShard cache",
         node.node_id,
         refs.len()
+    );
+    let compat_output_slots = original_out_layout
+        .order
+        .iter()
+        .map(|(tuple_id, slot_id)| {
+            let name = slot_desc_lookup
+                .get(&(*tuple_id, *slot_id))
+                .map(|slot| slot_display_name_from_desc(slot))
+                .unwrap_or_else(|| "<missing>".to_string());
+            format!("{tuple_id}:{slot_id}:{name}")
+        })
+        .collect::<Vec<_>>();
+    let compat_row_position_slots = lake_row_position_spec.as_ref().map(|spec| {
+        [
+            spec.source_id_slot.as_u32(),
+            spec.tablet_id_slot.as_u32(),
+            spec.rss_id_slot.as_u32(),
+            spec.row_id_slot.as_u32(),
+        ]
+    });
+    eprintln!(
+        "compat_scan node_type=LAKE_SCAN_NODE node_id={} tuple_id={} output_slots={:?} row_position_slots={:?}",
+        node.node_id, tuple_id, compat_output_slots, compat_row_position_slots
     );
 
     // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
@@ -666,33 +675,27 @@ fn normalize_optional_table_name(name: &str, unknown_sentinel: &str) -> Option<S
     }
 }
 
-pub(crate) fn record_internal_catalog_name(
-    current: &mut Option<String>,
-    catalog_name: Option<&str>,
-    node_label: &str,
-    node_id: i32,
-) -> Result<(), String> {
-    let candidate = catalog_name
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            format!("{node_label} node_id={node_id} missing catalog_name in internal_scan_range")
-        })?;
-    if let Some(existing) = current.as_deref() {
-        if existing != candidate {
-            return Err(format!(
-                "{node_label} node_id={node_id} has inconsistent catalog_name: {existing} vs {candidate}"
-            ));
-        }
-    } else {
-        *current = Some(candidate.to_string());
+pub(super) fn internal_lake_table_identity(
+    db_name: String,
+    table_name: String,
+    db_id: i64,
+    table_id: i64,
+    schema_id: i64,
+) -> LakeTableIdentity {
+    LakeTableIdentity {
+        catalog: INTERNAL_CATALOG_NAME.to_string(),
+        db_name,
+        table_name,
+        db_id,
+        table_id,
+        schema_id,
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::lower_lake_scan_node;
+    use super::{internal_lake_table_identity, lower_lake_scan_node};
+    use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::lower::compat::test_support::DescriptorTableBuilder;
@@ -722,6 +725,8 @@ mod tests {
             pipeline_sink_dop: None,
             report_when_finish: None,
             exec_debug_options: None,
+            per_look_up_num_fetchers: None,
+            per_fetch_target_nodes: None,
         }
     }
 
@@ -734,6 +739,55 @@ mod tests {
         builder.add_table(table_id, "db", "tbl", 1);
         builder.add_tuple(tuple_id, Some(table_id));
         builder.add_slot(slot_id, tuple_id, "v", &DataType::Int32, true, 0);
+        builder.build()
+    }
+
+    fn lake_glm_desc_table_with_shadowed_slot_ids(
+        tuple_id: i32,
+        shadow_tuple_id: i32,
+        table_id: i64,
+    ) -> descriptors::TDescriptorTable {
+        let mut builder = DescriptorTableBuilder::new();
+        builder.add_table(table_id, "db", "tbl", 1);
+        builder.add_tuple(tuple_id, Some(table_id));
+        builder.add_slot(1, tuple_id, "k", &DataType::Int32, false, 0);
+        builder.add_slot(11, tuple_id, "_source_id_", &DataType::Int32, false, 0);
+        builder.add_slot(12, tuple_id, "_tablet_id_", &DataType::Int64, false, 0);
+        builder.add_slot(13, tuple_id, "_rss_id_", &DataType::Int32, false, 0);
+        builder.add_slot(14, tuple_id, "_row_id_", &DataType::Int64, false, 0);
+        builder.add_tuple(shadow_tuple_id, None);
+        builder.add_slot(
+            11,
+            shadow_tuple_id,
+            "shadow_source",
+            &DataType::Int32,
+            false,
+            0,
+        );
+        builder.add_slot(
+            12,
+            shadow_tuple_id,
+            "shadow_tablet",
+            &DataType::Int64,
+            false,
+            0,
+        );
+        builder.add_slot(
+            13,
+            shadow_tuple_id,
+            "shadow_rss",
+            &DataType::Int32,
+            false,
+            0,
+        );
+        builder.add_slot(
+            14,
+            shadow_tuple_id,
+            "shadow_row",
+            &DataType::Int64,
+            false,
+            0,
+        );
         builder.build()
     }
 
@@ -822,5 +876,57 @@ mod tests {
         let morsels = scan.build_morsels().expect("build empty morsels");
         assert!(morsels.morsels.is_empty());
         assert!(!morsels.has_more);
+    }
+
+    #[test]
+    fn lake_glm_virtual_slots_are_resolved_within_the_scan_tuple() {
+        let node_id = 11;
+        let tuple_id = 1;
+        let db_id = 100;
+        let table_id = 200;
+        let node = lake_plan_node(node_id, tuple_id, db_id, table_id);
+        let desc_tbl = lake_glm_desc_table_with_shadowed_slot_ids(tuple_id, 2, table_id);
+        let tuple_slots = HashMap::from([(tuple_id, vec![1, 11, 12, 13, 14])]);
+        let exec_params = empty_scan_exec_params(node_id);
+        let mut arena = ExprArena::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+
+        let lowered = lower_lake_scan_node(
+            &node,
+            Some(&desc_tbl),
+            &tuple_slots,
+            &HashMap::new(),
+            Some(&exec_params),
+            None,
+            &mut arena,
+            &connectors,
+            &HashMap::new(),
+            None,
+            None,
+        )
+        .expect("lake GLM scan should lower");
+
+        let ExecNodeKind::Scan(scan) = lowered.node.kind else {
+            panic!("expected scan node");
+        };
+        assert_eq!(
+            scan.output_chunk_schema().slot_ids(),
+            &[crate::common::ids::SlotId::new(1)]
+        );
+        assert!(scan.lake_row_position().is_some());
+    }
+
+    #[test]
+    fn internal_scan_range_without_catalog_builds_protocol_table_identity() {
+        let identity =
+            internal_lake_table_identity("sales".to_string(), "orders".to_string(), 101, 202, 303);
+
+        assert_eq!(identity.catalog, INTERNAL_CATALOG_NAME);
+        assert_eq!(identity.db_name, "sales");
+        assert_eq!(identity.table_name, "orders");
+        assert_eq!(identity.db_id, 101);
+        assert_eq!(identity.table_id, 202);
+        assert_eq!(identity.schema_id, 303);
+        assert_eq!(identity.cache_key(), "default_catalog:101:202:303");
     }
 }

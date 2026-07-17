@@ -80,7 +80,7 @@ pub(crate) use jdbc_scan::lower_jdbc_scan_node;
 pub(crate) use lake_meta_scan::lower_lake_meta_scan_node;
 #[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
-pub(crate) use lookup::lower_lookup_node;
+pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
 pub(crate) use mysql_scan::lower_mysql_scan_node;
 pub(crate) use nestloop_join::lower_nestloop_join_node;
 pub(crate) use project::lower_project_node;

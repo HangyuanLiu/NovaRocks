@@ -1082,6 +1082,19 @@ public:
                               [cntl, request, response]() { run_lookup(cntl, request, response); });
     }
 
+    void lookup_close(google::protobuf::RpcController* controller,
+                      const starrocks::PLookUpCloseRequest* request,
+                      starrocks::PLookUpCloseResponse* response,
+                      google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task("lookup_close",
+                              response,
+                              done,
+                              [cntl, request, response]() {
+                                  run_lookup_close(cntl, request, response);
+                              });
+    }
+
 private:
     template <typename Response>
     static void finish_query_rpc_error(Response* response,
@@ -1185,6 +1198,7 @@ private:
             return;
         }
 
+        std::cerr << "[INFO] compat_ingress method=exec_plan_fragment" << std::endl;
         status_ok(response->mutable_status());
     }
 
@@ -1216,6 +1230,7 @@ private:
                        "rust submit_exec_batch_plan_fragments failed");
             return;
         }
+        std::cerr << "[INFO] compat_ingress method=exec_batch_plan_fragments" << std::endl;
         status_ok(response->mutable_status());
     }
 
@@ -1259,6 +1274,9 @@ private:
         }
         if (!response->has_status()) {
             status_ok(response->mutable_status());
+        }
+        if (request->eos()) {
+            std::cerr << "[INFO] compat_exchange_receive eos=true" << std::endl;
         }
     }
 
@@ -1316,6 +1334,7 @@ private:
         if (!response->has_status()) {
             status_ok(response->mutable_status());
         }
+        std::cerr << "[INFO] compat_rpc method=transmit_runtime_filter" << std::endl;
     }
 
     static void run_lookup(brpc::Controller* cntl,
@@ -1343,6 +1362,50 @@ private:
         if (!response->has_status()) {
             status_ok(response->mutable_status());
         }
+        std::cerr << "[INFO] compat_rpc method=lookup" << std::endl;
+    }
+
+    static void run_lookup_close(brpc::Controller* cntl,
+                                 const starrocks::PLookUpCloseRequest* request,
+                                 starrocks::PLookUpCloseResponse* response) {
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing lookup_close request/response");
+            }
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing lookup_close request/response");
+            }
+            return;
+        }
+
+        std::string err;
+        if (!invoke_lookup_close(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            std::cerr << "[WARN] compat_rpc method=lookup_close direction=receive status=error error="
+                      << err << std::endl;
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+        if (response->has_status() &&
+            response->status().status_code() ==
+                    static_cast<int32_t>(starrocks::TStatusCode::OK)) {
+            std::cerr << "[INFO] compat_rpc method=lookup_close direction=receive status=ok"
+                      << std::endl;
+        } else {
+            const int32_t status_code = response->has_status()
+                                                ? response->status().status_code()
+                                                : static_cast<int32_t>(
+                                                          starrocks::TStatusCode::INTERNAL_ERROR);
+            std::cerr
+                    << "[WARN] compat_rpc method=lookup_close direction=receive status=error status_code="
+                    << status_code << std::endl;
+        }
     }
 
     static bool invoke_transmit_chunk(const starrocks::PTransmitChunkParams& request,
@@ -1367,6 +1430,13 @@ private:
                               starrocks::PLookUpResponse* response,
                               std::string* err) {
         return invoke_rust_unary_rpc(request, response, novarocks_rs_lookup, "lookup", err);
+    }
+
+    static bool invoke_lookup_close(const starrocks::PLookUpCloseRequest& request,
+                                    starrocks::PLookUpCloseResponse* response,
+                                    std::string* err) {
+        return invoke_rust_unary_rpc(
+                request, response, novarocks_rs_lookup_close, "lookup_close", err);
     }
 
     static bool invoke_update_fail_point_status(
@@ -2633,6 +2703,28 @@ int32_t novarocks_compat_lookup(const char* host,
             out_err,
             "lookup",
             &starrocks::PInternalService_Stub::lookup);
+}
+
+int32_t novarocks_compat_lookup_close(const char* host,
+                                      uint16_t port,
+                                      const uint8_t* ptr,
+                                      size_t len,
+                                      NovaRocksRustBuf* out_resp,
+                                      NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PLookUpCloseRequest,
+                                       starrocks::PLookUpCloseResponse>(
+            host,
+            port,
+            ptr,
+            len,
+            out_resp,
+            out_err,
+            "lookup_close",
+            &starrocks::PInternalService_Stub::lookup_close,
+            [](brpc::Controller* cntl, const starrocks::PLookUpCloseRequest&) {
+                cntl->set_timeout_ms(2000);
+                cntl->set_max_retry(0);
+            });
 }
 
 extern "C" void novarocks_compat_notify_fetch_ready(int64_t finst_id_hi, int64_t finst_id_lo) {

@@ -257,6 +257,26 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 meta.be_log_count_at_least
                     .push((pattern.to_string(), count));
             }
+            "be_log_be_count_at_least" => {
+                let (pattern, count) = raw_value.rsplit_once(',').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "@be_log_be_count_at_least requires <pattern>,<positive-count>"
+                    )
+                })?;
+                let pattern = pattern.trim();
+                if pattern.is_empty() {
+                    bail!("@be_log_be_count_at_least pattern must not be empty");
+                }
+                let count_raw = count.trim();
+                let count = count_raw.parse::<usize>().with_context(|| {
+                    format!("invalid @be_log_be_count_at_least count: {count_raw}")
+                })?;
+                if count == 0 {
+                    bail!("@be_log_be_count_at_least count must be positive");
+                }
+                meta.be_log_be_count_at_least
+                    .push((pattern.to_string(), count));
+            }
             "compat_probe" => {
                 meta.compat_probes.push(raw_value);
             }
@@ -354,6 +374,11 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             base.be_log_count_at_least.clone()
         } else {
             override_meta.be_log_count_at_least.clone()
+        },
+        be_log_be_count_at_least: if override_meta.be_log_be_count_at_least.is_empty() {
+            base.be_log_be_count_at_least.clone()
+        } else {
+            override_meta.be_log_be_count_at_least.clone()
         },
         compat_probes: if override_meta.compat_probes.is_empty() {
             base.compat_probes.clone()
@@ -902,6 +927,7 @@ mod opt5_directive_tests {
         let lines = vec![
             "-- @be_log_contains=compat_ingress method=exec_batch_plan_fragments".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
+            "-- @be_log_be_count_at_least=compat_exchange_receive eos=true,2".to_string(),
             "-- @compat_probe=malformed-runtime-filter".to_string(),
         ];
 
@@ -914,6 +940,10 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.be_log_count_at_least,
             vec![("runtime_filter_receive".to_string(), 2)]
+        );
+        assert_eq!(
+            meta.be_log_be_count_at_least,
+            vec![("compat_exchange_receive eos=true".to_string(), 2)]
         );
         assert_eq!(
             meta.compat_probes,
