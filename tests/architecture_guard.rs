@@ -46389,6 +46389,182 @@ fn rfd4_m2b2_live_runtime_filter_root_freezes_owner_child_declarations() {
     );
 }
 
+const PBF_1A_ERROR_OWNERS: [(&str, &str, &str); 3] = [
+    (
+        "src/protocol/common/error.rs",
+        "src/protocol/mod.rs",
+        "common",
+    ),
+    ("src/exec/fragment/error.rs", "src/exec/mod.rs", "fragment"),
+    (
+        "src/runtime/fragment/error.rs",
+        "src/runtime/mod.rs",
+        "fragment",
+    ),
+];
+
+const PBF_1A_TOP_LEVEL_ERRORS: [&str; 6] = [
+    "TransportDecodeError",
+    "ProtocolError",
+    "ExecPlanBuildError",
+    "FragmentBindingError",
+    "FragmentLaunchError",
+    "FragmentExecutionError",
+];
+
+fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static str] {
+    if source_rel.starts_with("src/protocol/common/") {
+        &[
+            "exec",
+            "runtime",
+            "connector",
+            "service",
+            "coordinator",
+            "sql",
+            "proto",
+            "protobuf",
+            "prost",
+            "thrift",
+        ]
+    } else if source_rel.starts_with("src/exec/fragment/") {
+        &[
+            "protocol", "runtime", "proto", "protobuf", "prost", "thrift",
+        ]
+    } else {
+        &["protocol", "proto", "protobuf", "prost", "thrift"]
+    }
+}
+
+fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut owner_sources = Vec::new();
+
+    for (owner_rel, parent_rel, module) in PBF_1A_ERROR_OWNERS {
+        let owner_path = repo.join(owner_rel);
+        let owner = match fs::read_to_string(&owner_path) {
+            Ok(owner) => owner,
+            Err(error) => {
+                violations.push(format!("missing PBF-1A owner `{owner_rel}`: {error}"));
+                continue;
+            }
+        };
+        let production = rust_sanitized_production_text(&owner);
+        if production.trim().is_empty() {
+            violations.push(format!(
+                "PBF-1A owner `{owner_rel}` has an empty production source inventory"
+            ));
+        }
+        if let Err(error) = syn::parse_file(&owner) {
+            violations.push(format!("PBF-1A owner `{owner_rel}` must parse: {error}"));
+        }
+        if rfd4_m2a_has_forbidden_source_indirection(&production) {
+            violations.push(format!(
+                "PBF-1A owner `{owner_rel}` must not use #[path] or include! source indirection"
+            ));
+        }
+        violations.extend(
+            production_crate_self_alias_violations(owner_rel, &owner)
+                .into_iter()
+                .map(|violation| format!("PBF-1A owner `{owner_rel}`: {violation}")),
+        );
+        let forbidden = pbf_1a_forbidden_dependency_segments(owner_rel);
+        for path in rust_production_canonical_paths(&owner, owner_rel) {
+            if let Some(segment) = path
+                .iter()
+                .find(|segment| forbidden.contains(&segment.as_str()))
+            {
+                violations.push(format!(
+                    "PBF-1A owner `{owner_rel}` has forbidden `{segment}` dependency `{}`",
+                    path.join("::")
+                ));
+            }
+        }
+        owner_sources.push((owner_rel, owner));
+
+        let parent_path = repo.join(parent_rel);
+        match fs::read_to_string(&parent_path) {
+            Ok(parent) => {
+                if !rust_module_item_declarations(&parent).contains(module) {
+                    violations.push(format!(
+                        "PBF-1A module `{module}` is missing from `{parent_rel}`"
+                    ));
+                }
+                if rfd4_m2a_has_forbidden_source_indirection(&rust_sanitized_production_text(
+                    &parent,
+                )) {
+                    violations.push(format!(
+                        "PBF-1A parent `{parent_rel}` must not use #[path] or include! source indirection"
+                    ));
+                }
+            }
+            Err(error) => violations.push(format!(
+                "PBF-1A parent module `{parent_rel}` is unreadable: {error}"
+            )),
+        }
+
+        let child_rel = owner_path
+            .parent()
+            .expect("PBF-1A owner has a parent")
+            .join("mod.rs");
+        match fs::read_to_string(&child_rel) {
+            Ok(child) => {
+                if !rust_module_item_declarations(&child).contains("error") {
+                    violations.push(format!(
+                        "PBF-1A module `error` is missing from `{}`",
+                        child_rel.strip_prefix(repo).unwrap().display()
+                    ));
+                }
+                if rfd4_m2a_has_forbidden_source_indirection(&rust_sanitized_production_text(
+                    &child,
+                )) {
+                    violations.push(format!(
+                        "PBF-1A child module `{}` must not use #[path] or include! source indirection",
+                        child_rel.strip_prefix(repo).unwrap().display()
+                    ));
+                }
+            }
+            Err(error) => violations.push(format!(
+                "PBF-1A child module `{}` is unreadable: {error}",
+                child_rel.strip_prefix(repo).unwrap().display()
+            )),
+        }
+    }
+
+    let production_sources = rs_files(&repo.join("src"))
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .collect::<Vec<_>>();
+    if production_sources.is_empty() {
+        violations.push("PBF-1A production source inventory is empty".to_string());
+    }
+    for name in PBF_1A_TOP_LEVEL_ERRORS {
+        let count = production_sources
+            .iter()
+            .map(|source| rust_named_type_declaration_count(source, name))
+            .sum::<usize>();
+        if count != 1 {
+            violations.push(format!(
+                "PBF-1A top-level error `{name}` must have exactly one production declaration; found {count}"
+            ));
+        }
+    }
+
+    if owner_sources.is_empty() {
+        violations.push("PBF-1A guarded owner inventory is empty".to_string());
+    }
+    violations
+}
+
+#[test]
+fn pbf_1a_fragment_error_vocabulary_has_layered_owners() {
+    let violations = pbf_1a_error_vocabulary_violations(Path::new(manifest_dir()));
+    assert!(
+        violations.is_empty(),
+        "PBF-1A fragment error vocabulary must keep layered, unique, fail-closed owners:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
 mod ebd_1_engine_boundary;
 
