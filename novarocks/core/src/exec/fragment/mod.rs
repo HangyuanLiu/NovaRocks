@@ -16,3 +16,4 @@
 // under the License.
 
 pub(crate) mod error;
+pub(crate) mod program;
