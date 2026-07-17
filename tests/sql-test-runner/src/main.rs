@@ -25,6 +25,7 @@ mod results;
 mod runner;
 mod session;
 mod shell;
+mod suite_manifest;
 mod types;
 
 use crate::benchmark_bootstrap::{
@@ -47,6 +48,7 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
+use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -2304,34 +2306,13 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    // Resolve selected suites
-    let suite_names: Vec<String> = if cli.suite.eq_ignore_ascii_case("all") {
-        suite_configs.keys().cloned().collect()
-    } else {
-        cli.suite
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect()
-    };
-
-    let all_available: Vec<String> = suite_configs.keys().cloned().collect();
-    for name in &suite_names {
-        if !suite_configs.contains_key(name) {
-            println!(
-                "❌ ERROR: unknown suite '{}'; available suites: {}",
-                name,
-                all_available.join(", ")
-            );
+    let suite_names = match select_suite_names(&cli.suite, &suite_configs) {
+        Ok(suite_names) => suite_names,
+        Err(error) => {
+            println!("❌ ERROR: {error}");
             return Ok(1);
         }
-    }
-
-    if suite_names.is_empty() {
-        println!("❌ ERROR: no suites selected");
-        return Ok(1);
-    }
+    };
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;

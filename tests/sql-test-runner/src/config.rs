@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::suite_manifest::SuiteManifest;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -502,6 +503,7 @@ pub fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConf
                 .join("cleanup.sql")
                 .exists()
                 .then(|| path.join("cleanup.sql")),
+            manifest: SuiteManifest::load(&path.join("suite.toml"))?,
         };
         suite_configs.insert(name, config);
     }

@@ -1704,6 +1704,7 @@ dependencies = [
  "mysql",
  "rayon",
  "regex",
+ "serde",
  "toml",
 ]
 

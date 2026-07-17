@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::suite_manifest::SuiteManifest;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +32,7 @@ pub struct SuiteConfig {
     pub verify_default: bool,
     pub init_sql: Option<PathBuf>,
     pub cleanup_sql: Option<PathBuf>,
+    pub manifest: SuiteManifest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
