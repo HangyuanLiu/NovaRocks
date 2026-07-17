@@ -1224,7 +1224,7 @@ fn join_grpc_server_thread(handle: JoinHandle<()>) -> Result<(), String> {
 }
 
 pub fn stop_grpc_server() -> Result<(), String> {
-    let (shutdown_tx, join_handle, stop_requested) = {
+    let (shutdown_tx, join_handle, stop_requested, failure_rx) = {
         let mut state = grpc_server_state()
             .lock()
             .map_err(|_| "lock grpc server state failed".to_string())?;
@@ -1237,11 +1237,11 @@ pub fn stop_grpc_server() -> Result<(), String> {
         }
         state.started = false;
         state.bound_port = None;
-        state.failure_rx = None;
         (
             state.shutdown_tx.take(),
             state.join_handle.take(),
             state.stop_requested.take(),
+            state.failure_rx.take(),
         )
     };
 
@@ -1251,8 +1251,20 @@ pub fn stop_grpc_server() -> Result<(), String> {
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(true);
     }
-    if let Some(handle) = join_handle {
-        join_grpc_server_thread(handle)?;
+    let join_result = match join_handle {
+        Some(handle) => join_grpc_server_thread(handle),
+        None => Ok(()),
+    };
+
+    let mut failures = Vec::new();
+    if let Some(receiver) = failure_rx {
+        failures.extend(receiver.try_iter());
+    }
+    if let Err(error) = join_result {
+        failures.push(error);
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
     }
     Ok(())
 }
@@ -1574,6 +1586,105 @@ mod tests {
         assert!(super::grpc_server_bound_port().is_err());
         *super::grpc_server_state().lock().expect("reset grpc state") =
             super::GrpcServerState::default();
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn grpc_stop_reports_failure_queued_after_final_poll() {
+        let _guard = super::grpc_server_test_guard()
+            .lock()
+            .expect("lock grpc server test");
+        super::stop_grpc_server().expect("stop prior grpc server");
+        let (failure_tx, failure_rx) = mpsc::channel();
+        {
+            let mut state = super::grpc_server_state().lock().expect("lock grpc state");
+            state.started = true;
+            state.bound_port = Some(19080);
+            state.stop_requested = Some(Arc::new(AtomicBool::new(false)));
+            state.failure_rx = Some(failure_rx);
+            state.join_handle = Some(std::thread::spawn(|| {}));
+        }
+
+        assert_eq!(
+            super::poll_grpc_server_failure().expect("final main-loop failure poll"),
+            None
+        );
+        failure_tx
+            .send("injected failure after final poll".to_string())
+            .expect("queue failure before stop");
+
+        let error = super::stop_grpc_server()
+            .expect_err("stop must preserve a failure queued at the shutdown boundary");
+        assert!(
+            error.contains("injected failure after final poll"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn grpc_stop_does_not_report_normal_completion_after_stop_request() {
+        let _guard = super::grpc_server_test_guard()
+            .lock()
+            .expect("lock grpc server test");
+        super::stop_grpc_server().expect("stop prior grpc server");
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_requested_for_thread = Arc::clone(&stop_requested);
+        let join_handle = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build shutdown test runtime")
+                .block_on(shutdown_rx.changed())
+                .expect("receive test shutdown request");
+            assert!(*shutdown_rx.borrow(), "shutdown flag must be set");
+            assert!(
+                stop_requested_for_thread.load(std::sync::atomic::Ordering::Acquire),
+                "stop flag must precede shutdown"
+            );
+            drop(failure_tx);
+        });
+        {
+            let mut state = super::grpc_server_state().lock().expect("lock grpc state");
+            state.started = true;
+            state.bound_port = Some(19080);
+            state.shutdown_tx = Some(shutdown_tx);
+            state.stop_requested = Some(stop_requested);
+            state.failure_rx = Some(failure_rx);
+            state.join_handle = Some(join_handle);
+        }
+
+        super::stop_grpc_server().expect("requested shutdown completion is not a failure");
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn grpc_stop_aggregates_supervisor_failure_before_join_panic() {
+        let _guard = super::grpc_server_test_guard()
+            .lock()
+            .expect("lock grpc server test");
+        super::stop_grpc_server().expect("stop prior grpc server");
+        let (failure_tx, failure_rx) = mpsc::channel();
+        failure_tx
+            .send("injected supervised failure".to_string())
+            .expect("queue supervised failure");
+        drop(failure_tx);
+        {
+            let mut state = super::grpc_server_state().lock().expect("lock grpc state");
+            state.started = true;
+            state.bound_port = Some(19080);
+            state.stop_requested = Some(Arc::new(AtomicBool::new(false)));
+            state.failure_rx = Some(failure_rx);
+            state.join_handle = Some(std::thread::spawn(|| panic!("injected join panic")));
+        }
+
+        let error = super::stop_grpc_server()
+            .expect_err("supervisor failure and join panic must both reach the caller");
+        assert_eq!(
+            error,
+            "injected supervised failure; grpc server thread panicked: injected join panic"
+        );
     }
 
     #[test]
