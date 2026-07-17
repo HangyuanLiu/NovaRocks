@@ -46403,16 +46403,24 @@ const PBF_1A_ERROR_OWNERS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-const PBF_1A_UNIQUE_VOCABULARY: [&str; 9] = [
+const PBF_1A_UNIQUE_VOCABULARY: [&str; 17] = [
+    "ProtocolFamily",
+    "FieldPath",
+    "FieldPathSegment",
     "TransportDecodeError",
+    "TransportDecodeErrorKind",
     "ProtocolError",
+    "ProtocolErrorKind",
     "ExecPlanBuildError",
     "ExecPlanInvariant",
     "FragmentBindingError",
     "FragmentBindingTarget",
     "FragmentBindingErrorKind",
     "FragmentLaunchError",
+    "FragmentLaunchStage",
+    "FragmentLaunchErrorKind",
     "FragmentExecutionError",
+    "FragmentExecutionErrorKind",
 ];
 
 fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static str] {
@@ -46747,6 +46755,25 @@ fn pbf_1a_read_source_inventory(
     (sources, violations)
 }
 
+fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    if production_sources.is_empty() {
+        violations.push("PBF-1A production source inventory is empty".to_string());
+    }
+    for name in PBF_1A_UNIQUE_VOCABULARY {
+        let count = production_sources
+            .iter()
+            .map(|(_, source)| rust_named_type_declaration_count(source, name))
+            .sum::<usize>();
+        if count != 1 {
+            violations.push(format!(
+                "PBF-1A vocabulary `{name}` must have exactly one production declaration; found {count}"
+            ));
+        }
+    }
+    violations
+}
+
 fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
     let mut violations = Vec::new();
     let mut owner_sources = Vec::new();
@@ -46827,20 +46854,7 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
     let (production_sources, inventory_violations) =
         pbf_1a_read_source_inventory(repo, &production_paths);
     violations.extend(inventory_violations);
-    if production_sources.is_empty() {
-        violations.push("PBF-1A production source inventory is empty".to_string());
-    }
-    for name in PBF_1A_UNIQUE_VOCABULARY {
-        let count = production_sources
-            .iter()
-            .map(|(_, source)| rust_named_type_declaration_count(source, name))
-            .sum::<usize>();
-        if count != 1 {
-            violations.push(format!(
-                "PBF-1A top-level error `{name}` must have exactly one production declaration; found {count}"
-            ));
-        }
-    }
+    violations.extend(pbf_1a_unique_vocabulary_violations(&production_sources));
 
     if owner_sources.is_empty() {
         violations.push("PBF-1A guarded owner inventory is empty".to_string());
@@ -46983,6 +46997,53 @@ fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports(
             .iter()
             .any(|violation| violation.contains("legacy glob")),
         "a private legacy-owner glob must fail closed: {legacy_glob:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_dependency_detector_rejects_alias_grouped_imports_and_reexports() {
+    for invalid in [
+        "pub(crate) mod error; use crate::runtime as lifecycle;",
+        "pub(crate) mod error; use crate::{runtime::query_context::QueryContext, std::fmt};",
+        "pub(crate) mod error; pub(crate) use crate::runtime::RuntimeState;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/common/mod.rs", invalid, "error");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("forbidden `runtime` dependency")),
+            "alias, grouped import, and re-export must not bypass dependency ownership: {invalid}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_duplicate_and_empty_inventories() {
+    let duplicate = vec![
+        (
+            "src/first.rs".to_string(),
+            "pub(crate) struct FragmentLaunchError;".to_string(),
+        ),
+        (
+            "src/second.rs".to_string(),
+            "pub(crate) struct FragmentLaunchError;".to_string(),
+        ),
+    ];
+    let duplicate_violations = pbf_1a_unique_vocabulary_violations(&duplicate);
+    assert!(
+        duplicate_violations.iter().any(|violation| {
+            violation.contains("`FragmentLaunchError`") && violation.contains("found 2")
+        }),
+        "a duplicate vocabulary owner must fail: {duplicate_violations:?}"
+    );
+
+    let empty_violations = pbf_1a_unique_vocabulary_violations(&[]);
+    assert!(
+        empty_violations
+            .iter()
+            .any(|violation| violation.contains("production source inventory is empty")),
+        "an empty production inventory must fail closed: {empty_violations:?}"
     );
 }
 
