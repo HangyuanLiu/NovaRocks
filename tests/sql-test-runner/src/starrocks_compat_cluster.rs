@@ -287,30 +287,6 @@ pub(crate) fn render_fe_conf(base: &str, runtime_fe_home: &Path, ports: &FePorts
     format!("{}\n", copied.join("\n"))
 }
 
-fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("create directory {}", destination.display()))?;
-    for entry in
-        fs::read_dir(source).with_context(|| format!("read directory {}", source.display()))?
-    {
-        let entry = entry?;
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_directory(&entry.path(), &destination_path)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &destination_path).with_context(|| {
-                format!(
-                    "copy {} to {}",
-                    entry.path().display(),
-                    destination_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn create_isolated_fe_home(
     source_home: &Path,
     runtime_home: &Path,
@@ -325,11 +301,7 @@ pub(crate) fn create_isolated_fe_home(
     }
     let source_conf = source_home.join("conf");
     let runtime_conf = runtime_home.join("conf");
-    if source_conf.is_dir() {
-        copy_directory(&source_conf, &runtime_conf)?;
-    } else {
-        fs::create_dir_all(&runtime_conf)?;
-    }
+    fs::create_dir_all(&runtime_conf)?;
     fs::create_dir_all(runtime_home.join("log"))?;
     fs::create_dir_all(runtime_home.join("meta"))?;
     let base_conf_path = source_conf.join("fe.conf");
@@ -521,32 +493,53 @@ fn wait_for_fe_mysql(
     fe_process: &mut ManagedProcess,
     fe_config: &Path,
 ) -> Result<()> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    wait_for_fe_mysql_with(
+        STARTUP_TIMEOUT,
+        || {
+            fe_process
+                .runtime_diagnostic(
+                    "StarRocks FE",
+                    &format!("mysql://127.0.0.1:{query_port}"),
+                    fe_config,
+                )
+                .map(|_| ())
+        },
+        |io_timeout| {
+            let mut connection =
+                MysqlConn::new(mysql_options(user, password, query_port, io_timeout))
+                    .context("connect and authenticate StarRocks FE MySQL")?;
+            connection
+                .query_drop("SELECT 1")
+                .context("execute StarRocks FE MySQL health check SELECT 1")
+        },
+        thread::sleep,
+    )
+    .with_context(|| format!("StarRocks FE MySQL did not become ready at 127.0.0.1:{query_port}"))
+}
+
+fn wait_for_fe_mysql_with<H, Q, S>(
+    timeout: Duration,
+    mut process_health: H,
+    mut connect_and_select: Q,
+    mut sleep: S,
+) -> Result<()>
+where
+    H: FnMut() -> Result<()>,
+    Q: FnMut(Duration) -> Result<()>,
+    S: FnMut(Duration),
+{
+    let deadline = Instant::now() + timeout;
     loop {
-        fe_process.runtime_diagnostic(
-            "StarRocks FE",
-            &format!("mysql://127.0.0.1:{query_port}"),
-            fe_config,
-        )?;
+        process_health()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let io_timeout = remaining
             .min(Duration::from_secs(2))
             .max(Duration::from_millis(1));
-        match MysqlConn::new(mysql_options(user, password, query_port, io_timeout)) {
-            Ok(mut connection) => {
-                connection
-                    .query_drop("SELECT 1")
-                    .context("authenticate and health-check StarRocks FE MySQL")?;
-                return Ok(());
-            }
-            Err(error) if Instant::now() < deadline => {
-                let _ = error;
-                thread::sleep(POLL_INTERVAL.min(remaining));
-            }
+        match connect_and_select(io_timeout) {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => sleep(POLL_INTERVAL.min(remaining)),
             Err(error) => {
-                bail!(
-                    "timed out authenticating StarRocks FE MySQL at 127.0.0.1:{query_port}: {error}"
-                );
+                bail!("timed out waiting for MySQL connect plus SELECT 1: {error:#}")
             }
         }
     }
@@ -1306,5 +1299,74 @@ query_port = 9030
         }
         let conf = fs::read_to_string(runtime.join("conf/fe.conf")).expect("runtime fe.conf");
         assert!(conf.contains("run_mode = shared_data"));
+    }
+
+    #[test]
+    fn isolated_fe_conf_is_fresh_allowlisted_and_accepts_readonly_source() {
+        let temp = TestDir::new("isolated-fe-conf");
+        let source = create_fe_home(temp.path());
+        fs::write(
+            source.join("conf/hadoop_env.sh"),
+            "export SHOULD_NOT_COPY=1\n",
+        )
+        .expect("write optional hadoop env");
+        fs::create_dir_all(source.join("conf/nested")).expect("create nested source conf");
+        fs::write(source.join("conf/nested/secret.txt"), "do not copy")
+            .expect("write unexpected source conf");
+        let mut source_conf_permissions = fs::metadata(source.join("conf"))
+            .expect("source conf metadata")
+            .permissions();
+        source_conf_permissions.set_mode(0o555);
+        fs::set_permissions(source.join("conf"), source_conf_permissions)
+            .expect("make source conf readonly");
+        let mut source_fe_conf_permissions = fs::metadata(source.join("conf/fe.conf"))
+            .expect("source fe.conf metadata")
+            .permissions();
+        source_fe_conf_permissions.set_mode(0o444);
+        fs::set_permissions(source.join("conf/fe.conf"), source_fe_conf_permissions)
+            .expect("make source fe.conf readonly");
+
+        let runtime = temp.path().join("runtime/fe");
+        create_isolated_fe_home(
+            &source,
+            &runtime,
+            &FePorts {
+                http: 18030,
+                rpc: 19020,
+                query: 19030,
+                edit_log: 19010,
+            },
+        )
+        .expect("readonly source must still create isolated FE home");
+
+        let copied = fs::read_dir(runtime.join("conf"))
+            .expect("read runtime conf")
+            .map(|entry| entry.expect("runtime conf entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(copied, vec![std::ffi::OsString::from("fe.conf")]);
+    }
+
+    #[test]
+    fn fe_mysql_health_check_retries_transient_select_failure() {
+        let mut health_checks = 0usize;
+        let mut mysql_attempts = 0usize;
+        wait_for_fe_mysql_with(
+            Duration::from_secs(1),
+            || {
+                health_checks += 1;
+                Ok(())
+            },
+            |_| {
+                mysql_attempts += 1;
+                if mysql_attempts == 1 {
+                    bail!("transient SELECT 1 failure");
+                }
+                Ok(())
+            },
+            |_| {},
+        )
+        .expect("transient MySQL health failure must be retried");
+        assert_eq!(mysql_attempts, 2);
+        assert_eq!(health_checks, 2);
     }
 }

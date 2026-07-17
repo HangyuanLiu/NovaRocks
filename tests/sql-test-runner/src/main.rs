@@ -2314,6 +2314,49 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn shutdown_server_handle(server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>) -> Result<()> {
+    let mut errors = Vec::new();
+    match server_handle.lock() {
+        Ok(mut handle) => {
+            if let Err(error) = handle.shutdown() {
+                errors.push(format!("shutdown failed: {error:#}"));
+            }
+            let residual = handle.residual_process_ids();
+            if !residual.is_empty() {
+                errors.push(format!(
+                    "residual server process IDs after shutdown: {residual:?}"
+                ));
+            }
+        }
+        Err(_) => errors.push("server handle lock poisoned during shutdown".to_string()),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
+}
+
+fn finish_run_with_server_cleanup(
+    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    primary_result: Result<i32>,
+) -> Result<i32> {
+    let cleanup_result = shutdown_server_handle(&server_handle);
+    match (primary_result, cleanup_result) {
+        (Ok(exit_code), Ok(())) => Ok(exit_code),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(0), Err(cleanup)) => Err(anyhow::anyhow!(
+            "server lifecycle cleanup failed: {cleanup:#}"
+        )),
+        (Ok(exit_code), Err(cleanup)) => Err(anyhow::anyhow!(
+            "run exited with code {exit_code}; server lifecycle cleanup failed: {cleanup:#}"
+        )),
+        (Err(primary), Err(cleanup)) => Err(anyhow::anyhow!(
+            "run failed: {primary:#}; server lifecycle cleanup failed: {cleanup:#}"
+        )),
+    }
+}
+
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
@@ -2401,26 +2444,27 @@ fn run() -> Result<i32> {
         &runner_config,
         compat_artifact,
     )?;
+    let launched_target_port = server_handle.target_port();
+    let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
+    let server_handle = Arc::new(Mutex::new(server_handle));
+    let primary_result = (|| -> Result<i32> {
 
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
     let target_port = resolve_effective_target_port(
-        server_handle.target_port(),
+        launched_target_port,
         cli.port.as_deref(),
         &runner_config,
     )?;
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
 
-    let target_host = server_handle
-        .target_host()
-        .map(ToOwned::to_owned)
+    let target_host = launched_target_host
         .or_else(|| cli.host.clone())
         .or_else(|| env_optional("STARUST_TEST_HOST"))
         .or_else(|| runner_config.cluster.get("host").cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let server_handle = Arc::new(Mutex::new(server_handle));
     let target_user = cli
         .user
         .clone()
@@ -2927,28 +2971,13 @@ fn run() -> Result<i32> {
     }
     println!("{}", "=".repeat(72));
 
-    let lifecycle_error = {
-        let mut handle = server_handle
-            .lock()
-            .map_err(|_| anyhow::anyhow!("server handle lock poisoned during shutdown"))?;
-        handle.shutdown().and_then(|()| {
-            let residual = handle.residual_process_ids();
-            if residual.is_empty() {
-                Ok(())
-            } else {
-                bail!("residual server process IDs after shutdown: {residual:?}")
-            }
-        })
-    };
-    if let Err(error) = &lifecycle_error {
-        println!("❌ ERROR: server lifecycle cleanup failed: {error:#}");
-    }
-
-    if grand_failed > 0 || !all_cleanup_errors.is_empty() || lifecycle_error.is_err() {
+    if grand_failed > 0 || !all_cleanup_errors.is_empty() {
         return Ok(1);
     }
 
     Ok(0)
+    })();
+    finish_run_with_server_cleanup(server_handle, primary_result)
 }
 
 #[cfg(test)]
@@ -3318,6 +3347,42 @@ mod tests {
                 .contains("starrocks-compat mode requires --cluster-size 3"),
             "{error:#}"
         );
+    }
+
+    struct CleanupFailureServer;
+
+    impl crate::cluster::ServerHandle for CleanupFailureServer {
+        fn target_host(&self) -> Option<&str> {
+            Some("127.0.0.1")
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            Some(9030)
+        }
+
+        fn residual_process_ids(&self) -> Vec<u32> {
+            vec![4242]
+        }
+
+        fn shutdown(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("injected shutdown failure")
+        }
+    }
+
+    #[test]
+    fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
+        let server: std::sync::Arc<
+            std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
+        let error = super::finish_run_with_server_cleanup(
+            server,
+            Err(anyhow::anyhow!("injected execution failure")),
+        )
+        .expect_err("primary and cleanup failures must be returned together");
+        let message = format!("{error:#}");
+        assert!(message.contains("injected execution failure"), "{message}");
+        assert!(message.contains("injected shutdown failure"), "{message}");
+        assert!(message.contains("4242"), "{message}");
     }
 
     #[test]

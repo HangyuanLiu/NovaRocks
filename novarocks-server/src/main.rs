@@ -547,6 +547,32 @@ fn open_daemon_stdout_log() -> Result<(File, String), String> {
     Ok((file, log_path.display().to_string()))
 }
 
+#[cfg(feature = "compat")]
+fn start_compat_be_services_and_ready_marker<G, H, B, C>(
+    start_grpc: G,
+    start_heartbeat: H,
+    start_backend: B,
+    start_brpc: C,
+    heartbeat_port: u16,
+    brpc_port: u16,
+    grpc_port: u16,
+    pid: u32,
+) -> Result<String, String>
+where
+    G: FnOnce() -> Result<(), String>,
+    H: FnOnce() -> Result<(), String>,
+    B: FnOnce() -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
+{
+    start_grpc().map_err(|error| format!("start grpc/http/starlet listeners: {error}"))?;
+    start_heartbeat().map_err(|error| format!("start heartbeat listener: {error}"))?;
+    start_backend().map_err(|error| format!("start backend listener: {error}"))?;
+    start_brpc().map_err(|error| format!("start brpc listener: {error}"))?;
+    Ok(format!(
+        "NOVAROCKS_READY role=compat-be heartbeat_port={heartbeat_port} brpc_port={brpc_port} grpc_port={grpc_port} pid={pid}"
+    ))
+}
+
 fn main() {
     raise_nofile_limit();
 
@@ -782,11 +808,6 @@ fn main() {
             #[cfg(feature = "compat")]
             novarocks::service::frontend_rpc::init_frontend_rpc_manager();
 
-            // Start NovaRocks gRPC servers first to guarantee Starlet endpoint is online
-            // before heartbeat reports ports to FE.
-            novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
-
-            // Start Rust heartbeat service
             #[cfg(feature = "compat")]
             {
                 let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
@@ -802,21 +823,10 @@ fn main() {
                         .effective_be_mem_limit_bytes()
                         .expect("resolve BE memory limit"),
                 };
-                novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg)
-                    .expect("start heartbeat server");
-
-                // Start Rust BackendService (StarRocks BE be_port)
                 let backend_cfg = novarocks::service::backend_service::BackendServiceConfig {
                     host: server.host.clone(),
                     be_port: server.be_port,
                 };
-                novarocks::service::backend_service::start_backend_service(backend_cfg)
-                    .expect("start backend service");
-            }
-
-            // Start C++ brpc service (for query execution) — only with compat feature.
-            #[cfg(feature = "compat")]
-            {
                 let compat_cfg = novarocks::service::compat::CompatConfig {
                     host: server.host.as_str(),
                     heartbeat_port: server.heartbeat_port,
@@ -827,14 +837,25 @@ fn main() {
                     debug_exec_batch_plan_json: cfg.debug.exec_batch_plan_json,
                     log_level: log_level_num,
                 };
-                novarocks::service::compat::start(&compat_cfg).expect("start compat");
+                let ready_marker = start_compat_be_services_and_ready_marker(
+                    || novarocks::start_grpc_server(server.host.as_str()),
+                    || novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg),
+                    || novarocks::service::backend_service::start_backend_service(backend_cfg),
+                    || {
+                        novarocks::service::compat::start(&compat_cfg)
+                            .map_err(|error| error.to_string())
+                    },
+                    server.heartbeat_port,
+                    server.brpc_port,
+                    server.grpc_port,
+                    pid,
+                )
+                .expect("start compatibility BE listeners");
+                println!("{ready_marker}");
             }
 
-            #[cfg(feature = "compat")]
-            println!(
-                "NOVAROCKS_READY role=compat-be heartbeat_port={} brpc_port={} grpc_port={} pid={}",
-                server.heartbeat_port, server.brpc_port, server.grpc_port, pid
-            );
+            #[cfg(not(feature = "compat"))]
+            novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");
             #[cfg(feature = "compat")]
             println!(
                 "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, grpc_port={}, starlet_port={})",
@@ -1066,6 +1087,54 @@ mod tests {
         let args = vec!["--role".to_string(), "master".to_string()];
         let err = parse_standalone_server_args(&args).expect_err("invalid role must fail");
         assert!(err.contains("invalid --role value"));
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_ready_marker_requires_every_service_start_to_succeed() {
+        for fail_at in 0..4 {
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let start = |stage| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if stage == fail_at {
+                    Err(format!("injected service {stage} bind failure"))
+                } else {
+                    Ok(())
+                }
+            };
+            let error = super::start_compat_be_services_and_ready_marker(
+                || start(0),
+                || start(1),
+                || start(2),
+                || start(3),
+                19050,
+                18060,
+                19080,
+                42,
+            )
+            .expect_err("failed listener startup must not produce a ready marker");
+            assert!(error.contains(&format!("service {fail_at}")), "{error}");
+            assert_eq!(
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+                fail_at + 1
+            );
+        }
+
+        let marker = super::start_compat_be_services_and_ready_marker(
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+            19050,
+            18060,
+            19080,
+            42,
+        )
+        .expect("all listener starts produce marker");
+        assert_eq!(
+            marker,
+            "NOVAROCKS_READY role=compat-be heartbeat_port=19050 brpc_port=18060 grpc_port=19080 pid=42"
+        );
     }
 
     #[test]

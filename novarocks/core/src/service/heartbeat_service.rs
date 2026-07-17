@@ -14,12 +14,24 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::io::ErrorKind;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::SystemTime;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
-use thrift::protocol::{TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory};
-use thrift::server::TServer;
-use thrift::transport::{TBufferedReadTransportFactory, TBufferedWriteTransportFactory};
+use threadpool::ThreadPool;
+use thrift::protocol::{
+    TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory, TInputProtocolFactory,
+    TOutputProtocolFactory,
+};
+use thrift::server::TProcessor;
+use thrift::transport::{
+    TBufferedReadTransportFactory, TBufferedWriteTransportFactory, TIoChannel,
+    TReadTransportFactory, TTcpChannel, TWriteTransportFactory,
+};
 
 use crate::runtime::backend_id as backend_id_store;
 use crate::service::disk_report;
@@ -48,6 +60,27 @@ pub struct HeartbeatConfig {
 struct HeartbeatHandler {
     config: HeartbeatConfig,
     start_time: SystemTime,
+}
+
+#[derive(Default)]
+struct HeartbeatServerState {
+    started: bool,
+    stop: Option<Arc<AtomicBool>>,
+    join_handle: Option<JoinHandle<()>>,
+    wake_addr: Option<String>,
+}
+
+fn heartbeat_server_state() -> &'static Mutex<HeartbeatServerState> {
+    static STATE: OnceLock<Mutex<HeartbeatServerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HeartbeatServerState::default()))
+}
+
+fn shutdown_probe_host(bind_host: &str) -> String {
+    match bind_host {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "::1".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn backend_host_for_fe(advertise_host: &str) -> String {
@@ -138,43 +171,160 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
         config.starlet_port
     );
 
-    let handler = HeartbeatHandler::new(config);
-    let processor = HeartbeatServiceSyncProcessor::new(handler);
+    let mut state = heartbeat_server_state()
+        .lock()
+        .map_err(|_| "lock heartbeat service state failed".to_string())?;
+    if state.started {
+        return Ok(());
+    }
+    let listener = TcpListener::bind(&addr)
+        .map_err(|error| format!("HeartbeatService bind error on {addr}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("HeartbeatService set_nonblocking failed on {addr}: {error}"))?;
 
-    let mut server = TServer::new(
-        TBufferedReadTransportFactory::new(),
-        TBinaryInputProtocolFactory::new(),
-        TBufferedWriteTransportFactory::new(),
-        TBinaryOutputProtocolFactory::new(),
-        processor,
-        4,
+    let processor = Arc::new(HeartbeatServiceSyncProcessor::new(HeartbeatHandler::new(
+        config,
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let wake_addr = format!(
+        "{}:{}",
+        shutdown_probe_host(&host),
+        listener
+            .local_addr()
+            .map_err(|error| format!("read HeartbeatService bound address failed: {error}"))?
+            .port()
     );
 
-    thread::Builder::new()
+    let join_handle = thread::Builder::new()
         .name("heartbeat-server".to_string())
         .spawn(move || {
             tracing::info!("Heartbeat service listening on {}", addr_for_log);
-            if let Err(e) = server.listen(&addr) {
-                tracing::error!("Heartbeat server error: {}", e);
+            let worker_pool = ThreadPool::with_name("HeartbeatService processor".to_owned(), 4);
+            while !stop_for_thread.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if stop_for_thread.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let processor = Arc::clone(&processor);
+                        worker_pool.execute(move || {
+                            let channel = TTcpChannel::with_stream(stream);
+                            let (read_channel, write_channel) = match channel.split() {
+                                Ok(channels) => channels,
+                                Err(error) => {
+                                    tracing::warn!("split heartbeat channel failed: {error}");
+                                    return;
+                                }
+                            };
+                            let read_transport =
+                                TBufferedReadTransportFactory::new().create(Box::new(read_channel));
+                            let mut input =
+                                TBinaryInputProtocolFactory::new().create(read_transport);
+                            let write_transport = TBufferedWriteTransportFactory::new()
+                                .create(Box::new(write_channel));
+                            let mut output =
+                                TBinaryOutputProtocolFactory::new().create(write_transport);
+                            loop {
+                                match processor.process(&mut *input, &mut *output) {
+                                    Ok(()) => {}
+                                    Err(thrift::Error::Transport(ref error))
+                                        if error.kind == thrift::TransportErrorKind::EndOfFile =>
+                                    {
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!("heartbeat processor error: {error:?}");
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        if !stop_for_thread.load(Ordering::Acquire) {
+                            tracing::error!("Heartbeat server accept error: {error}");
+                        }
+                    }
+                }
             }
         })
         .map_err(|e| format!("Failed to spawn heartbeat thread: {}", e))?;
+
+    state.started = true;
+    state.stop = Some(stop);
+    state.join_handle = Some(join_handle);
+    state.wake_addr = Some(wake_addr);
 
     Ok(())
 }
 
 pub fn stop_heartbeat_server() {
-    // Keep heartbeat implementation aligned with the proven TServer path.
-    // Process shutdown will terminate the background heartbeat thread.
+    let (stop, wake_addr, join_handle) = {
+        let mut state = match heartbeat_server_state().lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if !state.started {
+            return;
+        }
+        state.started = false;
+        (
+            state.stop.take(),
+            state.wake_addr.take(),
+            state.join_handle.take(),
+        )
+    };
+    if let Some(stop) = stop {
+        stop.store(true, Ordering::Release);
+    }
+    if let Some(wake_addr) = wake_addr {
+        let _ = TcpStream::connect(wake_addr);
+    }
+    if let Some(join_handle) = join_handle {
+        let _ = join_handle.join();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HeartbeatConfig, HeartbeatHandler, backend_host_for_fe};
+    use super::{
+        HeartbeatConfig, HeartbeatHandler, backend_host_for_fe, start_heartbeat_server,
+        stop_heartbeat_server,
+    };
     use crate::thrift::{
         heartbeat_service::{HeartbeatServiceSyncHandler, TMasterInfo},
         types,
     };
+    use std::net::TcpListener;
+    use std::sync::{LazyLock, Mutex};
+
+    static HEARTBEAT_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn heartbeat_start_fails_synchronously_when_port_is_occupied() {
+        let _guard = HEARTBEAT_TEST_GUARD.lock().expect("lock heartbeat test");
+        stop_heartbeat_server();
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve heartbeat port");
+        let port = occupied.local_addr().expect("heartbeat address").port();
+        let error = start_heartbeat_server(HeartbeatConfig {
+            host: "127.0.0.1".to_string(),
+            advertise_host: "127.0.0.1".to_string(),
+            heartbeat_port: port,
+            be_port: 9060,
+            brpc_port: 8060,
+            http_port: 8040,
+            starlet_port: 9070,
+            mem_limit_bytes: 1024,
+        })
+        .expect_err("occupied heartbeat port must fail before readiness");
+        assert!(error.contains("bind"), "{error}");
+        stop_heartbeat_server();
+    }
 
     #[test]
     fn backend_host_for_fe_uses_advertise_host() {

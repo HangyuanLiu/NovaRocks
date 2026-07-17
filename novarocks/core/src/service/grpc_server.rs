@@ -37,6 +37,8 @@ use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic::transport::Server;
 
+#[cfg(feature = "compat")]
+use crate::common::config::grpc_port;
 use crate::common::config::http_port;
 #[cfg(feature = "compat")]
 use crate::common::config::starlet_port;
@@ -870,6 +872,18 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
 }
 
 pub fn start_grpc_server(host: &str) -> Result<(), String> {
+    #[cfg(feature = "compat")]
+    {
+        return start_grpc_server_on_ports(host, http_port(), grpc_port(), starlet_port());
+    }
+    #[cfg(not(feature = "compat"))]
+    {
+        start_grpc_http_server(host, http_port())
+    }
+}
+
+#[cfg(not(feature = "compat"))]
+fn start_grpc_http_server(host: &str, grpc_http_port: u16) -> Result<(), String> {
     {
         let state = grpc_server_state()
             .lock()
@@ -880,26 +894,10 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
     }
 
     let host = host.to_string();
-    let grpc_http_port = http_port();
-    #[cfg(feature = "compat")]
-    let grpc_starlet_port = starlet_port();
-    #[cfg(feature = "compat")]
-    validate_grpc_ports(grpc_http_port, grpc_starlet_port)?;
-    ensure_bindable(&host, grpc_http_port, "novarocks grpc/http")?;
-    #[cfg(feature = "compat")]
-    ensure_bindable(&host, grpc_starlet_port, "starlet grpc")?;
+    let std_listener = bind_tcp_listener(&host, grpc_http_port, "novarocks grpc/http")?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let join_handle = std::thread::spawn(move || {
-        #[cfg(feature = "compat")]
-        info!(
-            target: "novarocks::grpc",
-            host = %host,
-            http_port = grpc_http_port,
-            starlet_port = grpc_starlet_port,
-            "starting grpc servers"
-        );
-        #[cfg(not(feature = "compat"))]
         info!(
             target: "novarocks::grpc",
             host = %host,
@@ -914,70 +912,29 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             .expect("build grpc server runtime");
 
         rt.block_on(async move {
-            #[cfg(feature = "compat")]
-            let (http_addr, starlet_addr) =
-                grpc_server_bind_addrs(&host, grpc_http_port, grpc_starlet_port)
-                    .expect("parse grpc server bind addrs");
-            #[cfg(not(feature = "compat"))]
-            let http_addr =
-                parse_grpc_bind_addr(&host, grpc_http_port).expect("parse grpc/http bind addr");
+            let listener =
+                TokioTcpListener::from_std(std_listener).expect("create grpc/http tokio listener");
             let mut http_shutdown = shutdown_rx.clone();
-            #[cfg(feature = "compat")]
-            let mut starlet_shutdown = shutdown_rx.clone();
 
             let svc = GrpcService::full_execution();
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
             let app = build_novarocks_http_app(Routes::new(svc));
-            let novarocks_server = Server::builder()
-                .accept_http1(true)
-                .add_routes(Routes::from(app))
-                .serve_with_shutdown(http_addr, async move {
-                    while !*http_shutdown.borrow() {
-                        if http_shutdown.changed().await.is_err() {
-                            break;
-                        }
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                while !*http_shutdown.borrow() {
+                    if http_shutdown.changed().await.is_err() {
+                        break;
                     }
-                });
-
-            #[cfg(feature = "compat")]
-            {
-                let starlet = StarletGrpcService;
-                let starlet = proto::staros::starlet_server::StarletServer::new(starlet)
-                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let starlet_server = Server::builder().add_service(starlet).serve_with_shutdown(
-                    starlet_addr,
-                    async move {
-                        while !*starlet_shutdown.borrow() {
-                            if starlet_shutdown.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    },
+                }
+            });
+            if let Err(e) = server.await {
+                error!(
+                    target: "novarocks::grpc",
+                    error = %e,
+                    http_port = grpc_http_port,
+                    "grpc server stopped"
                 );
-
-                if let Err(e) = tokio::try_join!(novarocks_server, starlet_server) {
-                    error!(
-                        target: "novarocks::grpc",
-                        error = %e,
-                        http_port = grpc_http_port,
-                        starlet_port = grpc_starlet_port,
-                        "grpc server stopped"
-                    );
-                }
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                if let Err(e) = novarocks_server.await {
-                    error!(
-                        target: "novarocks::grpc",
-                        error = %e,
-                        http_port = grpc_http_port,
-                        "grpc server stopped"
-                    );
-                }
             }
         });
     });
@@ -990,6 +947,181 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
     }
     state.started = true;
     state.bound_port = Some(grpc_http_port);
+    state.shutdown_tx = Some(shutdown_tx);
+    state.join_handle = Some(join_handle);
+    Ok(())
+}
+
+#[cfg(feature = "compat")]
+fn start_grpc_server_on_ports(
+    host: &str,
+    http_port: u16,
+    grpc_port: u16,
+    starlet_port: u16,
+) -> Result<(), String> {
+    {
+        let state = grpc_server_state()
+            .lock()
+            .map_err(|_| "lock grpc server state failed".to_string())?;
+        if state.started {
+            return Ok(());
+        }
+    }
+    validate_compat_grpc_ports(http_port, grpc_port, starlet_port)?;
+    let http_listener = bind_tcp_listener(host, http_port, "novarocks http")?;
+    let grpc_listener = bind_tcp_listener(host, grpc_port, "novarocks grpc")?;
+    let starlet_listener = bind_tcp_listener(host, starlet_port, "starlet grpc")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .build()
+        .map_err(|error| format!("build compat grpc server runtime failed: {error}"))?;
+    let host = host.to_string();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
+    let join_handle = std::thread::Builder::new()
+        .name("compat-grpc-server".to_string())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let http_listener = match TokioTcpListener::from_std(http_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "create novarocks http tokio listener failed: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let grpc_listener = match TokioTcpListener::from_std(grpc_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "create novarocks grpc tokio listener failed: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let starlet_listener = match TokioTcpListener::from_std(starlet_listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "create starlet grpc tokio listener failed: {error}"
+                        )));
+                        return;
+                    }
+                };
+                info!(
+                    target: "novarocks::grpc",
+                    host = %host,
+                    http_port,
+                    grpc_port,
+                    starlet_port,
+                    "starting compat http and grpc servers"
+                );
+
+                let http_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
+                    GrpcService::full_execution(),
+                )
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                let http_app = build_novarocks_http_app(Routes::new(http_svc));
+                let grpc_svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
+                    GrpcService::full_execution(),
+                )
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                let starlet_svc =
+                    proto::staros::starlet_server::StarletServer::new(StarletGrpcService)
+                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+
+                let mut http_shutdown = shutdown_rx.clone();
+                let mut grpc_shutdown = shutdown_rx.clone();
+                let mut starlet_shutdown = shutdown_rx.clone();
+                let http_server =
+                    axum::serve(http_listener, http_app).with_graceful_shutdown(async move {
+                        while !*http_shutdown.borrow() {
+                            if http_shutdown.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                let grpc_server = Server::builder()
+                    .add_service(grpc_svc)
+                    .serve_with_incoming_shutdown(
+                        futures::stream::unfold(grpc_listener, |listener| async move {
+                            let accepted = listener.accept().await.map(|(stream, _)| stream);
+                            Some((accepted, listener))
+                        }),
+                        async move {
+                            while !*grpc_shutdown.borrow() {
+                                if grpc_shutdown.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        },
+                    );
+                let starlet_server = Server::builder()
+                    .add_service(starlet_svc)
+                    .serve_with_incoming_shutdown(
+                        futures::stream::unfold(starlet_listener, |listener| async move {
+                            let accepted = listener.accept().await.map(|(stream, _)| stream);
+                            Some((accepted, listener))
+                        }),
+                        async move {
+                            while !*starlet_shutdown.borrow() {
+                                if starlet_shutdown.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        },
+                    );
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                let http_server =
+                    async move { http_server.await.map_err(|error| error.to_string()) };
+                let grpc_server =
+                    async move { grpc_server.await.map_err(|error| error.to_string()) };
+                let starlet_server =
+                    async move { starlet_server.await.map_err(|error| error.to_string()) };
+                if let Err(error) = tokio::try_join!(http_server, grpc_server, starlet_server) {
+                    error!(
+                        target: "novarocks::grpc",
+                        error = %error,
+                        http_port,
+                        grpc_port,
+                        starlet_port,
+                        "compat grpc server stopped"
+                    );
+                }
+            });
+        })
+        .map_err(|error| format!("spawn compat grpc server thread failed: {error}"))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = join_handle.join();
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = join_handle.join();
+            return Err(format!("compat grpc readiness channel closed: {error}"));
+        }
+    }
+    let mut state = grpc_server_state()
+        .lock()
+        .map_err(|_| "lock grpc server state failed".to_string())?;
+    if state.started {
+        let _ = shutdown_tx.send(true);
+        let _ = join_handle.join();
+        return Ok(());
+    }
+    state.started = true;
+    state.bound_port = Some(grpc_port);
     state.shutdown_tx = Some(shutdown_tx);
     state.join_handle = Some(join_handle);
     Ok(())
@@ -1036,6 +1168,27 @@ fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> 
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "compat")]
+fn validate_compat_grpc_ports(
+    http_port: u16,
+    grpc_port: u16,
+    starlet_port: u16,
+) -> Result<(), String> {
+    validate_grpc_ports(http_port, starlet_port)?;
+    if grpc_port == http_port || grpc_port == starlet_port {
+        return Err(format!(
+            "invalid config: server.grpc_port ({grpc_port}) must differ from server.http_port ({http_port}) and server.starlet_port ({starlet_port})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn grpc_server_test_guard() -> &'static Mutex<()> {
+    static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 /// Parse a gRPC bind address from a host string and port.
@@ -1228,6 +1381,54 @@ fn start_standalone_grpc_server(
 mod tests {
     use super::{ensure_bindable, parse_grpc_bind_addr, validate_grpc_ports};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_start_binds_http_grpc_and_starlet_before_returning() {
+        let _guard = super::grpc_server_test_guard()
+            .lock()
+            .expect("lock grpc server test");
+        super::stop_grpc_server();
+        let reserve = || {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+            let port = listener.local_addr().expect("reserved address").port();
+            drop(listener);
+            port
+        };
+        let http_port = reserve();
+        let grpc_port = reserve();
+        let starlet_port = reserve();
+
+        super::start_grpc_server_on_ports("127.0.0.1", http_port, grpc_port, starlet_port)
+            .expect("start compat listeners");
+
+        for port in [http_port, grpc_port, starlet_port] {
+            TcpListener::bind(("127.0.0.1", port))
+                .expect_err("returned readiness must retain listener ownership");
+        }
+        super::stop_grpc_server();
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_start_reports_occupied_grpc_port_before_returning() {
+        let _guard = super::grpc_server_test_guard()
+            .lock()
+            .expect("lock grpc server test");
+        super::stop_grpc_server();
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy grpc port");
+        let grpc_port = occupied.local_addr().expect("occupied address").port();
+        let reserve = || {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
+            let port = listener.local_addr().expect("reserved address").port();
+            drop(listener);
+            port
+        };
+        let error = super::start_grpc_server_on_ports("127.0.0.1", reserve(), grpc_port, reserve())
+            .expect_err("occupied grpc port must fail before readiness");
+        assert!(error.contains("grpc"), "{error}");
+        super::stop_grpc_server();
+    }
 
     #[test]
     fn test_validate_grpc_ports_accept_distinct_ports() {
