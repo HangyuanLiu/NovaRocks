@@ -46755,19 +46755,58 @@ fn pbf_1a_read_source_inventory(
     (sources, violations)
 }
 
+fn pbf_1a_expected_vocabulary_owner_rel(name: &str) -> Option<String> {
+    pbf_1a_expected_vocabulary_owner(name).map(|owner| format!("src/{}.rs", owner[1..].join("/")))
+}
+
 fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) -> Vec<String> {
     let mut violations = Vec::new();
     if production_sources.is_empty() {
         violations.push("PBF-1A production source inventory is empty".to_string());
     }
     for name in PBF_1A_UNIQUE_VOCABULARY {
-        let count = production_sources
+        let declaration_counts = production_sources
             .iter()
-            .map(|(_, source)| rust_named_type_declaration_count(source, name))
+            .map(|(source_rel, source)| {
+                (
+                    source_rel.as_str(),
+                    rust_named_type_declaration_count(source, name),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_count = declaration_counts
+            .iter()
+            .map(|(_, count)| count)
             .sum::<usize>();
-        if count != 1 {
+        if total_count != 1 {
             violations.push(format!(
-                "PBF-1A vocabulary `{name}` must have exactly one production declaration; found {count}"
+                "PBF-1A vocabulary `{name}` must have exactly one production declaration; found {total_count}"
+            ));
+        }
+
+        let Some(expected_owner) = pbf_1a_expected_vocabulary_owner_rel(name) else {
+            violations.push(format!(
+                "PBF-1A vocabulary `{name}` has no expected production owner"
+            ));
+            continue;
+        };
+        let expected_count = declaration_counts
+            .iter()
+            .find_map(|(source_rel, count)| (*source_rel == expected_owner).then_some(*count))
+            .unwrap_or(0);
+        let actual_owners = declaration_counts
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(source_rel, count)| format!("{source_rel} ({count})"))
+            .collect::<Vec<_>>();
+        if expected_count != 1
+            || declaration_counts
+                .iter()
+                .any(|(source_rel, count)| *source_rel != expected_owner && *count > 0)
+        {
+            violations.push(format!(
+                "PBF-1A vocabulary `{name}` must be declared exactly once in `{expected_owner}` and nowhere else; found expected-owner count {expected_count}, actual owners [{}]",
+                actual_owners.join(", ")
             ));
         }
     }
@@ -47044,6 +47083,26 @@ fn pbf_1a_unique_vocabulary_detector_rejects_duplicate_and_empty_inventories() {
             .iter()
             .any(|violation| violation.contains("production source inventory is empty")),
         "an empty production inventory must fail closed: {empty_violations:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_a_declaration_moved_to_the_wrong_owner() {
+    let moved = vec![
+        ("src/protocol/common/error.rs".to_string(), String::new()),
+        (
+            "src/runtime/fragment/error.rs".to_string(),
+            "pub(crate) struct ProtocolError;".to_string(),
+        ),
+    ];
+    let violations = pbf_1a_unique_vocabulary_violations(&moved);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("`ProtocolError`")
+                && violation.contains("src/protocol/common/error.rs")
+                && violation.contains("src/runtime/fragment/error.rs")
+        }),
+        "a declaration moved to a different layer must identify both expected and actual owners: {violations:?}"
     );
 }
 
