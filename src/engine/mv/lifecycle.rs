@@ -22,69 +22,11 @@ use std::error::Error;
 use std::fmt;
 
 use crate::catalog::identifier::TableIdentity;
+use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MvStorageEngine {
-    StarRocks,
-    Iceberg,
-}
-
-impl MvStorageEngine {
-    pub(crate) fn as_sql_str(self) -> &'static str {
-        match self {
-            Self::StarRocks => "starrocks",
-            Self::Iceberg => "iceberg",
-        }
-    }
-
-    pub(crate) fn backend_name(self) -> &'static str {
-        match self {
-            Self::StarRocks => "starrocks",
-            Self::Iceberg => "iceberg",
-        }
-    }
-
-    pub(crate) fn from_sql_str(value: &str) -> Result<Self, String> {
-        match value.to_ascii_lowercase().as_str() {
-            "starrocks" => Err(
-                "materialized view storage_engine='starrocks' is no longer supported; use storage_engine='iceberg'"
-                    .to_string(),
-            ),
-            "iceberg" => Ok(Self::Iceberg),
-            _ => Err(format!(
-                "unknown materialized view storage_engine `{value}`"
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvTarget {
-    pub catalog: Option<String>,
-    pub database: String,
-    pub name: String,
-}
-
-impl MvTarget {
-    pub(crate) fn display_name(&self) -> String {
-        match self.catalog.as_deref() {
-            Some(catalog) => format!("{catalog}.{}.{}", self.database, self.name),
-            None => format!("{}.{}", self.database, self.name),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshMode {
-    Noop,
-    Full,
-    Incremental,
-    Rebuild,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CreateMvRequest {

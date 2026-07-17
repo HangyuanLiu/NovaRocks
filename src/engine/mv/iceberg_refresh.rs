@@ -65,8 +65,7 @@ use crate::engine::mv::iceberg_target_apply::{
     iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::engine::mv::lifecycle::{
-    BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvStorageEngine, MvTarget,
-    RefreshError, RefreshMode, RefreshPlan,
+    BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
@@ -101,6 +100,7 @@ use crate::meta::repository::mv_contract::MvPartitionContract;
 use crate::meta::repository::mv_descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
+use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -21743,7 +21743,7 @@ mod tests {
             .expect("create projection/filter UNION ALL iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
@@ -21798,7 +21798,7 @@ mod tests {
         );
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_orders");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
@@ -21874,7 +21874,7 @@ mod tests {
             "ice.sales.orders",
         );
 
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
@@ -21974,7 +21974,7 @@ mod tests {
             &env.current_db,
             &format!("DELETE FROM {catalog}.sales.orders WHERE id = 10"),
         );
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some(catalog.to_string()),
             database: "analytics".to_string(),
             name: "mv_union_orders".to_string(),
@@ -22332,7 +22332,7 @@ mod tests {
             .expect("create aggregate-over-UNION-ALL iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_union_fact_region");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_union_fact_region".to_string(),
@@ -22612,7 +22612,7 @@ mod tests {
         assert!(mv.last_refresh_snapshots.is_empty());
         assert!(mv.last_refresh_table_uuids.is_empty());
 
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_orders".to_string(),
@@ -22690,7 +22690,7 @@ mod tests {
             "unexpected refresh error: {err}"
         );
 
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_orders".to_string(),
@@ -22737,7 +22737,7 @@ mod tests {
             "unexpected join refresh error: {err}"
         );
 
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_join_orders".to_string(),
@@ -23196,7 +23196,7 @@ mod tests {
             .expect("first refresh");
         insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
 
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_orders".to_string(),
@@ -23245,7 +23245,7 @@ mod tests {
         insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_orders".to_string(),
@@ -23277,7 +23277,7 @@ mod tests {
             .expect("create join iceberg mv");
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_join_orders");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_join_orders".to_string(),
@@ -23326,7 +23326,7 @@ mod tests {
         txn.commit().expect("commit mv definition");
 
         let stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
-        let target = crate::engine::mv::lifecycle::MvTarget {
+        let target = crate::mv::model::MvTarget {
             catalog: Some("ice".to_string()),
             database: "analytics".to_string(),
             name: "mv_orders".to_string(),

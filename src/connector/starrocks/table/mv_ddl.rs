@@ -74,8 +74,9 @@ use crate::engine::mv::agg_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
 use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
-use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
+use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::mv::model::MvStorageEngine;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.

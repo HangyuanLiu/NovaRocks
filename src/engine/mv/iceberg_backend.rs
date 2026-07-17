@@ -23,9 +23,9 @@ use crate::connector::backend::MvBackend;
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{
     BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-    MvListRow, MvStorageEngine, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan,
-    RefreshRequest,
+    MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
 };
+use crate::mv::model::MvStorageEngine;
 
 pub(crate) struct IcebergMvBackend {
     state: Weak<StandaloneState>,

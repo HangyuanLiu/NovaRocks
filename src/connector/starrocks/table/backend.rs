@@ -30,9 +30,10 @@ use crate::connector::backend::{
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{
     BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-    MvListRow, MvStorageEngine, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome, RefreshPlan,
-    RefreshRequest, StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
+    MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
+    StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
+use crate::mv::model::{MvStorageEngine, RefreshMode};
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::sql::planner::table::TableDef;
 

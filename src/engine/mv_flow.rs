@@ -21,14 +21,14 @@ use std::sync::Arc;
 
 use crate::catalog::identifier::normalize_identifier;
 use crate::engine::mv::lifecycle::{
-    CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
-    RefreshError, RefreshRequest,
+    CreateMvRequest, DropMvRequest, ListMvsRequest, RefreshCtx, RefreshError, RefreshRequest,
 };
 use crate::engine::statement::{AlterIcebergPropertiesStmt, PropertiesOp};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
@@ -56,10 +56,10 @@ mod lifecycle_tests {
     use crate::connector::backend::MvBackend;
     use crate::engine::mv::lifecycle::{
         BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-        MvListRow, MvStorageEngine, MvTarget, RefreshCtx, RefreshError, RefreshMode,
-        RefreshOutcome, RefreshPlan, RefreshRequest, StarRocksTableRefreshOutcome,
-        StarRocksTableRefreshPlan,
+        MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
+        StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
     };
+    use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 
     #[derive(Default)]
     struct Calls {

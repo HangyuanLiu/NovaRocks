@@ -477,8 +477,8 @@ pub(crate) fn topological_upstream_order_for_edges(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvRefreshDependencyStep {
     pub(crate) object: MvDependencyObjectRef,
-    pub(crate) target: crate::engine::mv::lifecycle::MvTarget,
-    pub(crate) storage_engine: crate::engine::mv::lifecycle::MvStorageEngine,
+    pub(crate) target: crate::mv::model::MvTarget,
+    pub(crate) storage_engine: crate::mv::model::MvStorageEngine,
 }
 
 pub(crate) fn refresh_step_for_dependency_object(
@@ -491,12 +491,8 @@ pub(crate) fn refresh_step_for_dependency_object(
         ));
     }
     let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::StarRocks => {
-            crate::engine::mv::lifecycle::MvStorageEngine::StarRocks
-        }
-        MvDependencyStorageEngine::Iceberg => {
-            crate::engine::mv::lifecycle::MvStorageEngine::Iceberg
-        }
+        MvDependencyStorageEngine::StarRocks => crate::mv::model::MvStorageEngine::StarRocks,
+        MvDependencyStorageEngine::Iceberg => crate::mv::model::MvStorageEngine::Iceberg,
         MvDependencyStorageEngine::ExternalTable => {
             return Err(format!(
                 "external table cannot be refreshed as materialized view: {}",
@@ -506,7 +502,7 @@ pub(crate) fn refresh_step_for_dependency_object(
     };
     Ok(MvRefreshDependencyStep {
         object: object.clone(),
-        target: crate::engine::mv::lifecycle::MvTarget {
+        target: crate::mv::model::MvTarget {
             catalog: object.catalog.clone(),
             database: object.database_or_namespace.clone(),
             name: object.name.clone(),
