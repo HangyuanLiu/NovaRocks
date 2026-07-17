@@ -26,6 +26,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
+
 const NIDL_D3B_BASELINE_PATH: &str = "tests/proto_schema_baseline/novarocks_schema.json";
 const NIDL_D3B_WRITE_BASELINE_ENV: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE";
 const NIDL_D3B_WRITE_BASELINE_COMMAND: &str = "NOVA_WRITE_PROTO_SCHEMA_BASELINE=1 cargo test --test architecture_guard nidl_d3b_current_schema_matches_baseline -- --nocapture";
@@ -8035,6 +8037,89 @@ fn runtime_filter_query_context_export_surface_violations(text: &str) -> Vec<Str
 
 fn runtime_filter_task4_whole_exact_inventory(source_rel: &str) -> Option<&'static str> {
     let exact_inventory = match source_rel {
+        "src/runtime_filter/codec/mod.rs" => Some(""),
+        "src/runtime_filter/codec/contribution.rs" => Some(
+            r#"
+arrow::datatypes::DataType
+arrow::datatypes::DataType::Boolean
+arrow::datatypes::DataType::Date32
+arrow::datatypes::DataType::Decimal128
+arrow::datatypes::DataType::FixedSizeBinary
+arrow::datatypes::DataType::Float32
+arrow::datatypes::DataType::Float64
+arrow::datatypes::DataType::Int16
+arrow::datatypes::DataType::Int32
+arrow::datatypes::DataType::Int64
+arrow::datatypes::DataType::Int8
+arrow::datatypes::DataType::Timestamp
+arrow::datatypes::DataType::Utf8
+arrow::datatypes::TimeUnit
+arrow::datatypes::TimeUnit::Microsecond
+arrow::datatypes::TimeUnit::Millisecond
+arrow::datatypes::TimeUnit::Nanosecond
+arrow::datatypes::TimeUnit::Second
+crate::common::largeint::LARGEINT_BYTE_WIDTH
+crate::runtime_filter::port::artifact::ArtifactMembershipSchema
+crate::runtime_filter::port::final_domain::CompletionFence
+crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec
+crate::runtime_filter::port::final_domain::FinalDomainError
+crate::runtime_filter::port::final_domain::FinalDomainError::ContractMismatch
+crate::runtime_filter::port::final_domain::FinalDomainError::DomainSchemaMismatch
+crate::runtime_filter::port::final_domain::FinalDomainShard
+crate::runtime_filter::port::final_domain::FinalDomainShard::try_new
+crate::runtime_filter::port::final_domain::RuntimeCompletionFenceContract
+crate::runtime_filter::port::identity::ProducerSequence
+crate::runtime_filter::port::identity::ProducerStreamId
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate
+crate::runtime_filter::port::ordered_bound::OrderedBoundUpdate::new
+crate::runtime_filter::port::ordered_bound::OrderedScalar
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Boolean
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Date32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Decimal128
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int16
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int32
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int64
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Int8
+crate::runtime_filter::port::ordered_bound::OrderedScalar::LargeInt
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Timestamp
+crate::runtime_filter::port::ordered_bound::OrderedScalar::Utf8
+crate::runtime_filter::port::ordered_bound::OrderedTuple
+crate::runtime_filter::port::ordered_bound::OrderedTuple::try_from_codec
+crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
+crate::runtime_filter::port::producer::RuntimeContractViolationKind
+crate::runtime_filter::port::producer::RuntimeContractViolationKind::TypeMismatch
+crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract
+crate::runtime_filter::port::topk_summary::TopKSummary
+crate::runtime_filter::port::topk_summary::TopKSummary::try_new
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::FINGERPRINT_VERSION_TAG
+crate::runtime_filter::port::value_domain::MembershipValues
+crate::runtime_filter::port::value_domain::MembershipValues::boolean
+crate::runtime_filter::port::value_domain::MembershipValues::date32
+crate::runtime_filter::port::value_domain::MembershipValues::decimal128
+crate::runtime_filter::port::value_domain::MembershipValues::float32
+crate::runtime_filter::port::value_domain::MembershipValues::float64
+crate::runtime_filter::port::value_domain::MembershipValues::int16
+crate::runtime_filter::port::value_domain::MembershipValues::int32
+crate::runtime_filter::port::value_domain::MembershipValues::int64
+crate::runtime_filter::port::value_domain::MembershipValues::int8
+crate::runtime_filter::port::value_domain::MembershipValues::large_int
+crate::runtime_filter::port::value_domain::MembershipValues::timestamp
+crate::runtime_filter::port::value_domain::MembershipValues::utf8
+crate::runtime_filter::port::value_domain::ValueDomainDelta
+crate::runtime_filter::port::value_domain::ValueDomainDelta::new
+std::cmp::Ordering::Equal
+std::cmp::Ordering::Greater
+std::cmp::Ordering::Less
+std::error::Error
+std::fmt
+std::fmt::Display
+std::fmt::Formatter
+std::fmt::Result
+std::mem::size_of
+std::str::from_utf8
+"#,
+        ),
         "src/runtime_filter/core/ordered_reducer.rs" => Some(
             r#"
 crate::common::types::UniqueId
@@ -8193,6 +8278,9 @@ crate::runtime_filter::model::contract::SortDirection
 crate::runtime_filter::model::contract::SortDirection::Ascending
 crate::runtime_filter::model::contract::SortDirection::Descending
 crate::runtime_filter::port::artifact::encode_schema
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::ContributionSizeError::LengthExceedsCanonicalRange
+crate::runtime_filter::port::value_domain::ContributionSizeError::SizeOverflow
 sha2::Digest
 sha2::Sha256
 sha2::Sha256::digest
@@ -8213,6 +8301,9 @@ crate::runtime_filter::port::ordered_bound::OrderedTuple
 crate::runtime_filter::port::ordered_bound::OrderedTupleError
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract
 crate::runtime_filter::port::ordered_bound::RuntimeOrderContract::try_from_plan
+crate::runtime_filter::port::value_domain::ContributionSizeError
+crate::runtime_filter::port::value_domain::ContributionSizeError::LengthExceedsCanonicalRange
+crate::runtime_filter::port::value_domain::ContributionSizeError::SizeOverflow
 sha2::Digest
 sha2::Sha256
 sha2::Sha256::new
@@ -9505,6 +9596,7 @@ fn runtime_filter_task4_added_dependency_prefixes(source_rel: &str) -> &'static 
             "crate::runtime_filter::port::producer::RuntimeContractViolation",
             "crate::runtime_filter::port::producer::RuntimeContractViolationKind",
         ],
+        "src/runtime_filter/port/transport.rs" => &["std::num::NonZeroU32"],
         "src/runtime_filter/port/value_domain.rs" => {
             &["crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain"]
         }
@@ -9536,6 +9628,12 @@ fn runtime_filter_task4_exact_path_ledger(source_rel: &str, canonical: &[String]
 
 fn runtime_filter_task4_added_exact_inventory(source_rel: &str) -> Option<&'static str> {
     let exact_added_inventory = match source_rel {
+        "src/runtime_filter/port/transport.rs" => {
+            r#"
+std::num::NonZeroU32
+std::num::NonZeroU32::new
+"#
+        }
         "src/runtime_filter/core/channel.rs" => {
             r#"
 crate::runtime_filter::core::ordered_reducer::OrderedApplyOutcome
@@ -10492,6 +10590,7 @@ fn runtime_filter_runtime_dependency_allowlist(
         return Some(Vec::new());
     }
     let allowed: Vec<&'static [&'static str]> = match source_rel {
+        "src/runtime_filter/codec/mod.rs" | "src/runtime_filter/codec/contribution.rs" => vec![],
         "src/runtime_filter/core/mod.rs" => vec![],
         "src/runtime_filter/core/channel.rs" => vec![
             &["std", "collections", "BTreeMap"],
@@ -11084,6 +11183,7 @@ fn runtime_filter_runtime_dependency_allowlist(
         "src/runtime_filter/port/transport.rs" => vec![
             &["std", "error"],
             &["std", "fmt"],
+            &["std", "num", "NonZeroU32"],
             &["crate", "common", "types", "UniqueId"],
             &["crate", "runtime_filter", "model", "contract", "BindingId"],
             &["crate", "runtime_filter", "model", "contract", "ChannelId"],
@@ -15682,7 +15782,7 @@ fn runtime_filter_channel_service_boundaries_are_default_deny_and_harness_only()
     let mut violations = Vec::new();
     for path in rs_files(&runtime_filter) {
         let source_rel = rel(&path);
-        if ["core", "materializer", "port", "router", "service"]
+        if ["codec", "core", "materializer", "port", "router", "service"]
             .into_iter()
             .any(|namespace| {
                 source_rel == format!("src/runtime_filter/{namespace}.rs")
@@ -20590,6 +20690,13 @@ fn rfd4_m1_runtime_filter_envelope_schema_is_typed_and_additive() {
             ),
             (6, "schema_digest", "bytes", "singular", None),
             (7, "payload", "bytes", "singular", None),
+            (
+                8,
+                "producer_open",
+                "RuntimeFilterProducerOpenMetadata",
+                "singular",
+                None,
+            ),
         ]
     );
     assert_eq!(
@@ -20808,6 +20915,49 @@ fn rfd4_m1_runtime_filter_envelope_schema_is_typed_and_additive() {
     .expect("runtime-filter envelope schema region comments should parse");
     assert!(!envelope_region.contains("is_partial"), "{envelope_region}");
     assert!(!envelope_region.contains("starrocks"), "{envelope_region}");
+}
+
+#[test]
+fn rfd4_m2b2_proto_declares_exact_producer_open_metadata() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let filter = &schema.files["idl/novarocks/filter.proto"];
+    let metadata = filter
+        .messages
+        .get("RuntimeFilterProducerOpenMetadata")
+        .expect("producer-open metadata message must exist");
+
+    assert_eq!(
+        metadata
+            .fields
+            .values()
+            .map(|field| (
+                field.number,
+                field.name.as_str(),
+                field.type_name.as_str(),
+                field.label.as_str(),
+                field.oneof.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(1, "local_partition_count", "uint32", "singular", None,)]
+    );
+}
+
+#[test]
+fn rfd4_m2b2_envelope_schema_adds_producer_open_at_field_eight() {
+    let schema =
+        parse_current_novarocks_proto_schema().expect("current native proto schema should parse");
+    let filter = &schema.files["idl/novarocks/filter.proto"];
+    let envelope = &filter.messages["RuntimeFilterEnvelope"];
+    let producer_open = envelope
+        .fields
+        .get(&8)
+        .expect("envelope producer_open field must exist");
+
+    assert_eq!(producer_open.number, 8);
+    assert_eq!(producer_open.type_name, "RuntimeFilterProducerOpenMetadata");
+    assert_eq!(producer_open.label, "singular");
+    assert_eq!(producer_open.oneof, None);
 }
 
 #[test]
@@ -43271,6 +43421,2972 @@ fn coordinator_scheduler_sealed_topology() {
             "test drift must not create production scheduler surface `{forbidden}`"
         );
     }
+}
+
+fn rfd4_m2b2_path_starts_with(path: &[String], prefix: &[&str]) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn rfd4_m2b2_path_is_concrete_contribution(path: &[String]) -> bool {
+    const CONCRETE: [&[&str]; 5] = [
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "value_domain",
+            "ValueDomainDelta",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "ordered_bound",
+            "OrderedBoundUpdate",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "topk_summary",
+            "TopKSummary",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "port",
+            "final_domain",
+            "FinalDomainShard",
+        ],
+        &[
+            "crate",
+            "runtime_filter",
+            "codec",
+            "contribution",
+            "RuntimeFilterContribution",
+        ],
+    ];
+    const CONCRETE_GLOBS: [&[&str]; 5] = [
+        &["crate", "runtime_filter", "port", "value_domain", "*"],
+        &["crate", "runtime_filter", "port", "ordered_bound", "*"],
+        &["crate", "runtime_filter", "port", "topk_summary", "*"],
+        &["crate", "runtime_filter", "port", "final_domain", "*"],
+        &["crate", "runtime_filter", "codec", "contribution", "*"],
+    ];
+    CONCRETE
+        .iter()
+        .any(|expected| path.len() == expected.len() && rfd4_m2b2_path_starts_with(path, expected))
+        || CONCRETE_GLOBS.iter().any(|expected| {
+            path.len() == expected.len() && rfd4_m2b2_path_starts_with(path, expected)
+        })
+}
+
+fn rfd4_m2b2_production_call_names(text: &str) -> Result<BTreeSet<String>, syn::Error> {
+    #[derive(Default)]
+    struct CallAudit {
+        names: BTreeSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for CallAudit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref()
+                && let Some(last) = path.path.segments.last()
+            {
+                self.names.insert(last.ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.names.insert(call.method.to_string());
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    let file = syn::parse_file(text)?;
+    let mut audit = CallAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.names)
+}
+
+fn rfd4_m2b2_source_violations(source_rel: &str, text: &str) -> Vec<String> {
+    const ADAPTER: &str = "src/service/grpc_runtime_filter_adapter.rs";
+    let is_transport = source_rel == "src/runtime_filter/port/transport.rs";
+    let is_router = source_rel.starts_with("src/runtime_filter/router/");
+    let is_adapter = source_rel == ADAPTER;
+    let is_codec = matches!(
+        source_rel,
+        "src/runtime_filter/codec/mod.rs" | "src/runtime_filter/codec/contribution.rs"
+    );
+    let is_new_owner = is_adapter || is_codec;
+
+    let mut violations = Vec::new();
+    let production = rust_sanitized_production_text(text);
+    if rfd4_m2a_has_forbidden_source_indirection(&production) {
+        violations.push(format!(
+            "{source_rel}: guarded owner must not hide dependencies behind include!/path"
+        ));
+    }
+    for alias_violation in production_crate_self_alias_violations(source_rel, text) {
+        violations.push(format!("{source_rel}: {alias_violation}"));
+    }
+
+    let paths = rust_production_canonical_paths(text, source_rel);
+    let mut artifact_delivery_dependency = false;
+    for path in paths {
+        if (is_transport || is_router || is_adapter)
+            && rfd4_m2b2_path_is_concrete_contribution(&path)
+        {
+            violations.push(format!(
+                "{source_rel}: concrete contribution dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_codec
+            && [
+                &["crate", "service"][..],
+                &["crate", "runtime", "query_context"][..],
+                &["crate", "runtime_filter", "router"][..],
+                &["crate", "runtime_filter", "service"][..],
+                &["crate", "proto"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: codec dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_adapter
+            && [
+                &["crate", "runtime_filter", "codec", "contribution"][..],
+                &["crate", "runtime_filter", "core"][..],
+                &["crate", "runtime_filter", "router"][..],
+                &["crate", "runtime_filter", "service"][..],
+                &["crate", "runtime", "query_context"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: adapter authority dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_new_owner
+            && [
+                &["crate", "service", "grpc_client"][..],
+                &["crate", "service", "internal_rpc_client"][..],
+                &["crate", "service", "exchange_sender"][..],
+                &["crate", "runtime_filter", "service", "materialization"][..],
+            ]
+            .iter()
+            .any(|prefix| rfd4_m2b2_path_starts_with(&path, prefix))
+        {
+            violations.push(format!(
+                "{source_rel}: out-of-scope delivery dependency {}",
+                path.join("::")
+            ));
+        }
+
+        if is_new_owner
+            && path.last().is_some_and(|last| {
+                matches!(
+                    last.as_str(),
+                    "TransmitRuntimeFilterRequest" | "TransmitRuntimeFilterResponse"
+                )
+            })
+        {
+            violations.push(format!(
+                "{source_rel}: legacy runtime-filter bridge {}",
+                path.join("::")
+            ));
+        }
+
+        if is_new_owner
+            && ([
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDelivery",
+                ][..],
+                &[
+                    "crate",
+                    "runtime_filter",
+                    "port",
+                    "subscription",
+                    "ArtifactDeliveryOutcome",
+                ][..],
+                &["crate", "runtime_filter", "port", "subscription", "*"][..],
+            ]
+            .iter()
+            .any(|expected| {
+                path.len() == expected.len() && rfd4_m2b2_path_starts_with(&path, expected)
+            }))
+        {
+            artifact_delivery_dependency = true;
+            violations.push(format!(
+                "{source_rel}: out-of-scope artifact delivery dependency {}",
+                path.join("::")
+            ));
+        }
+    }
+
+    let calls = match rfd4_m2b2_production_call_names(text) {
+        Ok(calls) => calls,
+        Err(error) => {
+            violations.push(format!(
+                "{source_rel}: guarded production source must parse: {error}"
+            ));
+            return violations;
+        }
+    };
+    if is_adapter {
+        for forbidden in [
+            "authorize_contribution",
+            "authorize_delivery",
+            "close_partition",
+            "decode_contribution",
+            "get_query_context",
+            "get_query_context_second_chance",
+            "open_producer",
+            "runtime_filter_service",
+            "submit",
+            "submit_bound",
+            "submit_final_domain",
+            "submit_summary",
+        ] {
+            if calls.contains(forbidden) {
+                violations.push(format!("{source_rel}: forbidden adapter call {forbidden}"));
+            }
+        }
+    }
+    if is_new_owner {
+        for forbidden in [
+            "deliver_artifact",
+            "enqueue_retry",
+            "retry_delivery",
+            "send_runtime_filter",
+            "transmit_runtime_filter",
+        ] {
+            if calls.contains(forbidden) {
+                violations.push(format!(
+                    "{source_rel}: out-of-scope owner-graph call {forbidden}"
+                ));
+            }
+        }
+        if artifact_delivery_dependency {
+            for forbidden in ["deliver", "deliver_live"] {
+                if calls.contains(forbidden) {
+                    violations.push(format!(
+                        "{source_rel}: out-of-scope artifact delivery call {forbidden}"
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn rfd4_m2b2_remote_constructor_call_count(text: &str, source_rel: &str) -> usize {
+    let sanitized = rust_sanitized_production_text(text);
+    let aliases = rust_production_scoped_aliases(text);
+    rust_raw_non_use_paths(&sanitized)
+        .into_iter()
+        .flat_map(|path| {
+            rust_resolve_scoped_paths(
+                &path.segments,
+                &path.inline_modules,
+                &aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| vec![path])
+        })
+        .filter_map(|path| {
+            rust_canonical_path_segments_in_scope(&path.segments, source_rel, &path.inline_modules)
+        })
+        .filter(|path| {
+            path.len() == 6
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "final_domain",
+                        "CompletionFence",
+                        "try_from_remote_codec",
+                    ],
+                )
+        })
+        .count()
+}
+
+fn rfd4_m2b2_direct_production_path_reference(
+    text: &str,
+    expected_prefix: &[&str],
+) -> Result<bool, String> {
+    struct PathAudit {
+        expected_prefix: Vec<String>,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for PathAudit {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let segments = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments.len() >= self.expected_prefix.len()
+                && segments
+                    .iter()
+                    .zip(&self.expected_prefix)
+                    .all(|(actual, expected)| actual == expected)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg path ownership is unproven".to_string())?;
+    let mut audit = PathAudit {
+        expected_prefix: expected_prefix
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect(),
+        found: false,
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.found)
+}
+
+fn rfd4_m2b2_visibility_is_outward(visibility: &syn::Visibility) -> bool {
+    match visibility {
+        syn::Visibility::Public(_) => true,
+        syn::Visibility::Restricted(restricted) => !restricted.path.is_ident("self"),
+        syn::Visibility::Inherited => false,
+    }
+}
+
+fn rfd4_m2b2_normalized_node_tokens(node: &impl ToTokens) -> String {
+    rust_use_tokens(&node.to_token_stream().to_string()).join(" ")
+}
+
+fn rfd4_m2b2_normalized_attributes(attributes: &[syn::Attribute]) -> String {
+    attributes
+        .iter()
+        .map(rfd4_m2b2_normalized_node_tokens)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn rfd4_m2b2_stable_ledger_digest(entries: &[String]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut digest = OFFSET_BASIS;
+    for entry in entries {
+        for byte in (entry.len() as u64)
+            .to_le_bytes()
+            .into_iter()
+            .chain(entry.bytes())
+        {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(PRIME);
+        }
+    }
+    digest
+}
+
+fn rfd4_m2b2_collect_outward_surface_items(
+    items: &[syn::Item],
+    namespace: &str,
+    outward_namespace: bool,
+    entries: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let qualify = |surface: String| {
+        if namespace.is_empty() {
+            surface
+        } else {
+            format!("{namespace}::{surface}")
+        }
+    };
+    for item in items {
+        match item {
+            syn::Item::Const(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "const {} {} {} {} : {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        item.ident,
+                        rfd4_m2b2_normalized_node_tokens(&item.generics),
+                        rfd4_m2b2_normalized_node_tokens(&item.ty)
+                    )));
+                }
+            }
+            syn::Item::Enum(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "enum {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::ExternCrate(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "extern-crate {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::Fn(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "fn {} {} {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        rfd4_m2b2_normalized_node_tokens(&item.sig)
+                    )));
+                }
+            }
+            syn::Item::ForeignMod(item) => {
+                let mut members = Vec::new();
+                for member in &item.items {
+                    match member {
+                        syn::ForeignItem::Fn(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "fn {} {} {}",
+                                    rfd4_m2b2_normalized_attributes(&member.attrs),
+                                    rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                    rfd4_m2b2_normalized_node_tokens(&member.sig)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Static(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "static {} {} {} {} : {}",
+                                    rfd4_m2b2_normalized_attributes(&member.attrs),
+                                    rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                    rfd4_m2b2_normalized_node_tokens(&member.mutability),
+                                    member.ident,
+                                    rfd4_m2b2_normalized_node_tokens(&member.ty)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Type(member) => {
+                            if outward_namespace && rfd4_m2b2_visibility_is_outward(&member.vis) {
+                                members.push(format!(
+                                    "type {}",
+                                    rfd4_m2b2_normalized_node_tokens(member)
+                                ));
+                            }
+                        }
+                        syn::ForeignItem::Macro(member) => members.push(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::ForeignItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified foreign surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::ForeignItem surface variant"
+                            ));
+                        }
+                    }
+                }
+                if !members.is_empty() {
+                    let mut header = item.clone();
+                    header.items.clear();
+                    let header = rfd4_m2b2_normalized_node_tokens(&header);
+                    entries.insert(qualify(format!("foreign {header}")));
+                    for member in members {
+                        entries.insert(qualify(format!("foreign-member {header} :: {member}")));
+                    }
+                }
+            }
+            syn::Item::Impl(item) => {
+                let mut header = item.clone();
+                header.items.clear();
+                let header = rfd4_m2b2_normalized_node_tokens(&header);
+                let trait_impl = item.trait_.is_some();
+                let mut members = Vec::new();
+                for member in &item.items {
+                    match member {
+                        syn::ImplItem::Const(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            let surface = format!(
+                                "const {} {} {} {} : {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                member.ident,
+                                rfd4_m2b2_normalized_node_tokens(&member.generics),
+                                rfd4_m2b2_normalized_node_tokens(&member.ty)
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
+                        }
+                        syn::ImplItem::Fn(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            let surface = format!(
+                                "fn {} {} {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                rfd4_m2b2_normalized_node_tokens(&member.sig)
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
+                        }
+                        syn::ImplItem::Type(member)
+                            if trait_impl || rfd4_m2b2_visibility_is_outward(&member.vis) =>
+                        {
+                            let surface = format!(
+                                "type {} {} {} {} = {}",
+                                rfd4_m2b2_normalized_attributes(&member.attrs),
+                                rfd4_m2b2_normalized_node_tokens(&member.vis),
+                                member.ident,
+                                rfd4_m2b2_normalized_node_tokens(&member.generics),
+                                rfd4_m2b2_normalized_node_tokens(&member.ty)
+                            );
+                            members.push(match &member.defaultness {
+                                Some(defaultness) => format!(
+                                    "{} {surface}",
+                                    rfd4_m2b2_normalized_node_tokens(defaultness)
+                                ),
+                                None => surface,
+                            });
+                        }
+                        syn::ImplItem::Macro(member) => members.push(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::ImplItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified impl surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
+                            ));
+                        }
+                        syn::ImplItem::Const(_) | syn::ImplItem::Fn(_) | syn::ImplItem::Type(_) => {
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::ImplItem surface variant"
+                            ));
+                        }
+                    }
+                }
+                if !members.is_empty() {
+                    entries.insert(qualify(format!("impl {header}")));
+                    for member in members {
+                        entries.insert(qualify(format!("impl-member {header} :: {member}")));
+                    }
+                }
+            }
+            syn::Item::Macro(item) => {
+                entries.insert(qualify(format!(
+                    "macro {}",
+                    rfd4_m2b2_normalized_node_tokens(item)
+                )));
+            }
+            syn::Item::Mod(item) => {
+                let nested_outward =
+                    outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis);
+                let module_context = qualify(format!(
+                    "mod {} {} {} inline={}",
+                    rfd4_m2b2_normalized_attributes(&item.attrs),
+                    rfd4_m2b2_normalized_node_tokens(&item.vis),
+                    item.ident,
+                    item.content.is_some()
+                ));
+                if nested_outward {
+                    entries.insert(module_context.clone());
+                }
+                if let Some((_, nested)) = &item.content {
+                    let descendant_count = entries.len();
+                    let nested_namespace = if namespace.is_empty() {
+                        item.ident.to_string()
+                    } else {
+                        format!("{namespace}::{}", item.ident)
+                    };
+                    rfd4_m2b2_collect_outward_surface_items(
+                        nested,
+                        &nested_namespace,
+                        nested_outward,
+                        entries,
+                    )?;
+                    if entries.len() > descendant_count {
+                        entries.insert(module_context);
+                    }
+                }
+            }
+            syn::Item::Static(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "static {} {} {} {} : {}",
+                        rfd4_m2b2_normalized_attributes(&item.attrs),
+                        rfd4_m2b2_normalized_node_tokens(&item.vis),
+                        rfd4_m2b2_normalized_node_tokens(&item.mutability),
+                        item.ident,
+                        rfd4_m2b2_normalized_node_tokens(&item.ty)
+                    )));
+                }
+            }
+            syn::Item::Struct(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    let mut surface = item.clone();
+                    match &mut surface.fields {
+                        syn::Fields::Named(fields) => {
+                            let mut outward = syn::punctuated::Punctuated::new();
+                            for field in std::mem::take(&mut fields.named) {
+                                if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                    outward.push(field);
+                                }
+                            }
+                            fields.named = outward;
+                        }
+                        syn::Fields::Unnamed(fields) => {
+                            let mut outward = syn::punctuated::Punctuated::new();
+                            for field in std::mem::take(&mut fields.unnamed) {
+                                if rfd4_m2b2_visibility_is_outward(&field.vis) {
+                                    outward.push(field);
+                                }
+                            }
+                            fields.unnamed = outward;
+                        }
+                        syn::Fields::Unit => {}
+                    }
+                    entries.insert(qualify(format!(
+                        "struct {}",
+                        rfd4_m2b2_normalized_node_tokens(&surface)
+                    )));
+                }
+            }
+            syn::Item::Trait(item) => {
+                let trait_outward = outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis);
+                let mut header = item.clone();
+                header.items.clear();
+                let header = rfd4_m2b2_normalized_node_tokens(&header);
+                if trait_outward {
+                    entries.insert(qualify(format!("trait {header}")));
+                }
+                for member in &item.items {
+                    let surface = match member {
+                        syn::TraitItem::Const(member) if trait_outward => Some(format!(
+                            "const {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::TraitItem::Fn(member) if trait_outward => Some(format!(
+                            "fn {} {} {}",
+                            rfd4_m2b2_normalized_attributes(&member.attrs),
+                            rfd4_m2b2_normalized_node_tokens(&member.sig),
+                            match &member.default {
+                                Some(default) =>
+                                    format!("default {}", rfd4_m2b2_normalized_node_tokens(default)),
+                                None => "required".to_string(),
+                            }
+                        )),
+                        syn::TraitItem::Type(member) if trait_outward => {
+                            Some(format!("type {}", rfd4_m2b2_normalized_node_tokens(member)))
+                        }
+                        syn::TraitItem::Macro(member) => Some(format!(
+                            "macro {}",
+                            rfd4_m2b2_normalized_node_tokens(member)
+                        )),
+                        syn::TraitItem::Verbatim(tokens) => {
+                            return Err(format!(
+                                "{namespace}: unclassified trait surface tokens: {}",
+                                rust_use_tokens(&tokens.to_string()).join(" ")
+                            ));
+                        }
+                        syn::TraitItem::Const(_)
+                        | syn::TraitItem::Fn(_)
+                        | syn::TraitItem::Type(_) => None,
+                        _ => {
+                            return Err(format!(
+                                "{namespace}: unhandled syn::TraitItem surface variant"
+                            ));
+                        }
+                    };
+                    if let Some(surface) = surface {
+                        entries.insert(qualify(format!("trait-member {header} :: {surface}")));
+                    }
+                }
+            }
+            syn::Item::TraitAlias(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "trait-alias {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::Type(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "type {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::Union(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "union {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::Use(item) => {
+                if outward_namespace && rfd4_m2b2_visibility_is_outward(&item.vis) {
+                    entries.insert(qualify(format!(
+                        "use {}",
+                        rfd4_m2b2_normalized_node_tokens(item)
+                    )));
+                }
+            }
+            syn::Item::Verbatim(tokens) => {
+                return Err(format!(
+                    "{namespace}: unclassified outward item tokens: {}",
+                    rust_use_tokens(&tokens.to_string()).join(" ")
+                ));
+            }
+            _ => {
+                return Err(format!("{namespace}: unhandled syn::Item surface variant"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rfd4_m2b2_outward_surface_inventory(text: &str) -> Result<Vec<String>, String> {
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg surface is unproven".to_string())?;
+    let mut entries = BTreeSet::from([format!(
+        "file-root {}",
+        rfd4_m2b2_normalized_attributes(&file.attrs)
+    )]);
+    rfd4_m2b2_collect_outward_surface_items(&file.items, "", true, &mut entries)?;
+    Ok(entries.into_iter().collect())
+}
+
+fn rfd4_m2b2_external_owner_children(source_rel: &str) -> Option<&'static [&'static str]> {
+    match source_rel {
+        "src/runtime_filter/mod.rs" => Some(&["codec", "port", "router", "service"]),
+        "src/runtime_filter/codec/mod.rs" => Some(&["contribution"]),
+        "src/runtime_filter/port/mod.rs" => Some(&["final_domain", "subscription"]),
+        "src/runtime_filter/router/mod.rs" => Some(&["loopback"]),
+        "src/runtime_filter/service/mod.rs" => {
+            Some(&["materialization", "registry", "subscription"])
+        }
+        _ => None,
+    }
+}
+
+fn rfd4_m2b2_effective_owner_surface_inventory(
+    source_rel: &str,
+    text: &str,
+) -> Result<Vec<String>, String> {
+    let parent_only = matches!(
+        source_rel,
+        "src/runtime_filter/mod.rs"
+            | "src/runtime_filter/codec/mod.rs"
+            | "src/runtime_filter/port/mod.rs"
+            | "src/runtime_filter/router/mod.rs"
+    );
+    let mut entries = if parent_only {
+        BTreeSet::new()
+    } else {
+        rfd4_m2b2_outward_surface_inventory(text)?
+            .into_iter()
+            .collect()
+    };
+    let Some(children) = rfd4_m2b2_external_owner_children(source_rel) else {
+        return Ok(entries.into_iter().collect());
+    };
+
+    let mut file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    runtime_filter_filter_cfg_file(&mut file)
+        .map_err(|_| "production cfg parent-module surface is unproven".to_string())?;
+    if parent_only {
+        entries.insert(format!(
+            "file-root {}",
+            rfd4_m2b2_normalized_attributes(&file.attrs)
+        ));
+    }
+    for item in &file.items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if module.content.is_none() && children.iter().any(|expected| module.ident == *expected) {
+            entries.insert(format!(
+                "external-owner-module {}",
+                rfd4_m2b2_normalized_node_tokens(module)
+            ));
+        }
+    }
+    Ok(entries.into_iter().collect())
+}
+
+fn rfd4_m2b2_allowed_owner_surface_violations(source_rel: &str, text: &str) -> Vec<String> {
+    let expected = match source_rel {
+        "src/runtime_filter/mod.rs" => (5, 10131374070505018865),
+        "src/runtime_filter/codec/contribution.rs" => (18, 10198486929407087720),
+        "src/runtime_filter/codec/mod.rs" => (2, 11564291660451389536),
+        "src/runtime_filter/port/final_domain.rs" => (29, 17041071041840420617),
+        "src/runtime_filter/port/mod.rs" => (3, 11417193225267407692),
+        "src/runtime_filter/port/subscription.rs" => (31, 14239332311506517087),
+        "src/runtime_filter/router/loopback.rs" => (7, 600269609696608443),
+        "src/runtime_filter/router/mod.rs" => (2, 8106057199518289267),
+        "src/runtime_filter/service/materialization.rs" => (32, 5198539511492591630),
+        "src/runtime_filter/service/mod.rs" => (19, 6399777452702047743),
+        "src/runtime_filter/service/registry.rs" => (55, 16862598348751505612),
+        "src/runtime_filter/service/subscription.rs" => (24, 9952610218984085948),
+        _ => return Vec::new(),
+    };
+    let inventory = match rfd4_m2b2_effective_owner_surface_inventory(source_rel, text) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return vec![format!(
+                "{source_rel}: allowed-owner outward surface must parse: {error}"
+            )];
+        }
+    };
+    let actual = (inventory.len(), rfd4_m2b2_stable_ledger_digest(&inventory));
+    if actual == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{source_rel}: outward surface ledger drifted: expected={expected:?}, actual={actual:?}, inventory={inventory:#?}"
+        )]
+    }
+}
+
+fn rfd4_m2b2_remote_reconstruction_violations(sources: &[(String, String)]) -> Vec<String> {
+    const CODEC_OWNER: &str = "src/runtime_filter/codec/contribution.rs";
+    const DEFINITION_OWNER: &str = "src/runtime_filter/port/final_domain.rs";
+    let mut violations = Vec::new();
+    for (source_rel, text) in sources {
+        violations.extend(rfd4_m2b2_allowed_owner_surface_violations(source_rel, text));
+        let production = rust_sanitized_production_text(text);
+        let tokens = rust_use_tokens(&production);
+        let parsed = syn::parse_file(text);
+        if let Err(error) = &parsed {
+            violations.push(format!(
+                "{source_rel}: remote reconstruction audit must parse production source: {error}"
+            ));
+            continue;
+        }
+        let call_count = rfd4_m2b2_remote_constructor_call_count(text, source_rel);
+        let canonical_paths = rust_production_canonical_paths(text, source_rel);
+        let canonical_fence_reference = canonical_paths.iter().any(|path| {
+            path.len() >= 5
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &[
+                        "crate",
+                        "runtime_filter",
+                        "port",
+                        "final_domain",
+                        "CompletionFence",
+                    ],
+                )
+        }) || rfd4_m2b2_direct_production_path_reference(
+            text,
+            &[
+                "crate",
+                "runtime_filter",
+                "port",
+                "final_domain",
+                "CompletionFence",
+            ],
+        )
+        .unwrap_or(true);
+        let final_domain_glob = canonical_paths.iter().any(|path| {
+            path.last().is_some_and(|segment| segment == "*")
+                && rfd4_m2b2_path_starts_with(
+                    path,
+                    &["crate", "runtime_filter", "port", "final_domain"],
+                )
+        });
+        let remote_name_occurrences = tokens
+            .iter()
+            .filter(|token| token.as_str() == "try_from_remote_codec")
+            .count();
+        let public_final_domain_namespace = rust_production_scoped_use_statements(text)
+            .into_iter()
+            .any(|statement| {
+                rust_canonical_use_segments_in_scope(
+                    &statement.import,
+                    source_rel,
+                    &statement.inline_modules,
+                )
+                .is_some_and(|path| {
+                    path.len() == 4
+                        && rfd4_m2b2_path_starts_with(
+                            &path,
+                            &["crate", "runtime_filter", "port", "final_domain"],
+                        )
+                })
+            });
+
+        match source_rel.as_str() {
+            DEFINITION_OWNER => {
+                let declarations =
+                    rust_named_function_declaration_count(&production, "try_from_remote_codec");
+                if declarations != 1 {
+                    violations.push(format!(
+                        "{source_rel}: expected one remote constructor declaration, found {declarations}"
+                    ));
+                }
+                if call_count != 0 {
+                    violations.push(format!(
+                        "{source_rel}: definition owner must not call remote reconstruction, found {call_count} call(s)"
+                    ));
+                }
+                if remote_name_occurrences != 1 {
+                    violations.push(format!(
+                        "{source_rel}: definition owner must contain only the remote constructor declaration, found {remote_name_occurrences} method-name token(s)"
+                    ));
+                }
+            }
+            CODEC_OWNER => {
+                if call_count != 1 {
+                    violations.push(format!(
+                        "{source_rel}: contribution codec must make exactly one remote constructor call, found {call_count}"
+                    ));
+                }
+                if remote_name_occurrences != 1 {
+                    violations.push(format!(
+                        "{source_rel}: contribution codec must contain exactly one remote constructor method-name token, found {remote_name_occurrences}"
+                    ));
+                }
+            }
+            _ => {
+                if canonical_fence_reference || final_domain_glob || public_final_domain_namespace {
+                    violations.push(format!(
+                        "{source_rel}: canonical CompletionFence ownership escaped final_domain and contribution codec"
+                    ));
+                }
+                if tokens.iter().any(|token| token == "try_from_remote_codec") {
+                    let extern_alias =
+                        !production_crate_self_alias_violations(source_rel, text).is_empty();
+                    if extern_alias {
+                        violations.push(format!(
+                            "{source_rel}: extern-crate alias may hide remote reconstruction"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn rfd4_m2b2_tail_expr(block: &syn::Block) -> Option<&syn::Expr> {
+    match block.stmts.last()? {
+        syn::Stmt::Expr(expression, None) => Some(expression),
+        _ => None,
+    }
+}
+
+fn rfd4_m2b2_matches_tokens(expression: &syn::Expr) -> Option<Vec<String>> {
+    let syn::Expr::Macro(expression) = expression else {
+        return None;
+    };
+    expression
+        .mac
+        .path
+        .is_ident("matches")
+        .then(|| rust_use_tokens(&expression.mac.tokens.to_string()))
+}
+
+fn rfd4_m2b2_open_payload_matrix_violations(text: &str) -> Vec<String> {
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => return vec![format!("transport production source must parse: {error}")],
+    };
+    let expected_open = rust_use_tokens("self, Self::Contribution | Self::ProducerClosed");
+    let expected_payload = rust_use_tokens(
+        "kind, RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable",
+    );
+    let mut open = Vec::new();
+    let mut payload = Vec::new();
+
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        let owner = self_ty
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string());
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if owner.as_deref() == Some("RuntimeFilterEnvelopeKind")
+                && method.sig.ident == "requires_producer_open"
+                && let Some(expression) = rfd4_m2b2_tail_expr(&method.block)
+                && let Some(tokens) = rfd4_m2b2_matches_tokens(expression)
+            {
+                open.push(tokens);
+            }
+            if owner.as_deref() == Some("RuntimeFilterEnvelope") && method.sig.ident == "try_new" {
+                for statement in &method.block.stmts {
+                    let syn::Stmt::Local(local) = statement else {
+                        continue;
+                    };
+                    let syn::Pat::Ident(binding) = &local.pat else {
+                        continue;
+                    };
+                    if binding.ident != "payload_required" {
+                        continue;
+                    }
+                    if let Some(init) = &local.init
+                        && let Some(tokens) = rfd4_m2b2_matches_tokens(init.expr.as_ref())
+                    {
+                        payload.push(tokens);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    if open != [expected_open] {
+        violations.push(format!("producer-open kind set drifted: {open:?}"));
+    }
+    if payload != [expected_payload] {
+        violations.push(format!("payload-bearing kind set drifted: {payload:?}"));
+    }
+    violations
+}
+
+fn rfd4_m2b2_nrfc_magic_count(text: &str) -> Result<usize, syn::Error> {
+    #[derive(Default)]
+    struct MagicAudit {
+        count: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for MagicAudit {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            if production_cfg_requires_test(runtime_filter_syn_item_attributes(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_expr_lit(&mut self, expression: &'ast syn::ExprLit) {
+            if let syn::Lit::ByteStr(value) = &expression.lit
+                && value.value() == b"NRFC"
+            {
+                self.count += 1;
+            }
+            syn::visit::visit_expr_lit(self, expression);
+        }
+    }
+
+    let file = syn::parse_file(text)?;
+    let mut audit = MagicAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    Ok(audit.count)
+}
+
+fn rfd4_m2b2_wire_tag_maps(
+    text: &str,
+) -> Result<(BTreeMap<String, u8>, BTreeMap<u8, String>), String> {
+    let file = syn::parse_file(text).map_err(|error| error.to_string())?;
+    let mut encode = BTreeMap::new();
+    let mut decode = BTreeMap::new();
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        if self_ty
+            .path
+            .segments
+            .last()
+            .is_none_or(|segment| segment.ident != "WireContributionKind")
+        {
+            continue;
+        }
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            let Some(syn::Expr::Match(expression)) = rfd4_m2b2_tail_expr(&method.block) else {
+                continue;
+            };
+            if method.sig.ident == "tag" {
+                for arm in &expression.arms {
+                    let syn::Pat::Path(kind) = &arm.pat else {
+                        continue;
+                    };
+                    let Some(kind) = kind.path.segments.last() else {
+                        continue;
+                    };
+                    let syn::Expr::Lit(value) = arm.body.as_ref() else {
+                        continue;
+                    };
+                    let syn::Lit::Int(value) = &value.lit else {
+                        continue;
+                    };
+                    encode.insert(
+                        kind.ident.to_string(),
+                        value
+                            .base10_parse::<u8>()
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            } else if method.sig.ident == "from_tag" {
+                for arm in &expression.arms {
+                    let syn::Pat::Lit(tag) = &arm.pat else {
+                        continue;
+                    };
+                    let syn::Lit::Int(tag) = &tag.lit else {
+                        continue;
+                    };
+                    let syn::Expr::Call(some) = arm.body.as_ref() else {
+                        continue;
+                    };
+                    let syn::Expr::Path(function) = some.func.as_ref() else {
+                        continue;
+                    };
+                    if function
+                        .path
+                        .segments
+                        .last()
+                        .is_none_or(|segment| segment.ident != "Some")
+                        || some.args.len() != 1
+                    {
+                        continue;
+                    }
+                    let Some(syn::Expr::Path(kind)) = some.args.first() else {
+                        continue;
+                    };
+                    let Some(kind) = kind.path.segments.last() else {
+                        continue;
+                    };
+                    decode.insert(
+                        tag.base10_parse::<u8>()
+                            .map_err(|error| error.to_string())?,
+                        kind.ident.to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok((encode, decode))
+}
+
+fn rfd4_m2b2_named_function_tokens(text: &str, name: &str) -> Option<Vec<String>> {
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    let starts = tokens
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["fn", name]).then_some(index))
+        .collect::<Vec<_>>();
+    let [start] = starts.as_slice() else {
+        return None;
+    };
+    let open = (*start..tokens.len()).find(|index| tokens[*index] == "{")?;
+    let mut depth = 0usize;
+    for index in open..tokens.len() {
+        match tokens[index].as_str() {
+            "{" => depth += 1,
+            "}" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(tokens[*start..=index].to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rfd4_m2b2_token_sequence_count(tokens: &[String], expected: &str) -> usize {
+    let expected = rust_use_tokens(expected);
+    tokens
+        .windows(expected.len())
+        .filter(|window| *window == expected)
+        .count()
+}
+
+fn rfd4_m2b2_nrfc_execution_violations(text: &str) -> Vec<String> {
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => return vec![format!("contribution codec source must parse: {error}")],
+    };
+    let mut named_magic = 0usize;
+    let mut correct_magic = 0usize;
+    let mut tag_is_single_match = false;
+    let mut from_tag_is_single_match = false;
+    let mut decoder_frame_kind_bindings = 0usize;
+    for item in &file.items {
+        match item {
+            syn::Item::Const(item_const) if item_const.ident == "MAGIC" => {
+                named_magic += 1;
+                if matches!(
+                    item_const.expr.as_ref(),
+                    syn::Expr::Lit(literal)
+                        if matches!(&literal.lit, syn::Lit::ByteStr(value) if value.value() == b"NRFC")
+                ) {
+                    correct_magic += 1;
+                }
+            }
+            syn::Item::Fn(function) if function.sig.ident == "decode_contribution" => {
+                struct FrameKindBindingAudit<'a>(&'a mut usize);
+                impl<'ast> syn::visit::Visit<'ast> for FrameKindBindingAudit<'_> {
+                    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                        if pattern.ident == "frame_kind" {
+                            *self.0 += 1;
+                        }
+                        syn::visit::visit_pat_ident(self, pattern);
+                    }
+                }
+                syn::visit::Visit::visit_block(
+                    &mut FrameKindBindingAudit(&mut decoder_frame_kind_bindings),
+                    &function.block,
+                );
+            }
+            syn::Item::Impl(item_impl) => {
+                let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+                    continue;
+                };
+                if self_ty
+                    .path
+                    .segments
+                    .last()
+                    .is_none_or(|segment| segment.ident != "WireContributionKind")
+                {
+                    continue;
+                }
+                for item in &item_impl.items {
+                    let syn::ImplItem::Fn(method) = item else {
+                        continue;
+                    };
+                    if method.sig.ident == "tag" {
+                        tag_is_single_match = method.block.stmts.len() == 1
+                            && matches!(
+                                rfd4_m2b2_tail_expr(&method.block),
+                                Some(syn::Expr::Match(_))
+                            );
+                    } else if method.sig.ident == "from_tag" {
+                        from_tag_is_single_match = method.block.stmts.len() == 1
+                            && matches!(
+                                rfd4_m2b2_tail_expr(&method.block),
+                                Some(syn::Expr::Match(_))
+                            );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut violations = Vec::new();
+    if named_magic != 1 || correct_magic != 1 {
+        violations.push(format!(
+            "MAGIC must be one named b\"NRFC\" const, found named={named_magic}, correct={correct_magic}"
+        ));
+    }
+    if !tag_is_single_match {
+        violations.push("WireContributionKind::tag must be exactly one exhaustive match".into());
+    }
+    if !from_tag_is_single_match {
+        violations
+            .push("WireContributionKind::from_tag must be exactly one exhaustive match".into());
+    }
+
+    let expected_encoder = r#"
+fn encode_frame_header(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.extend_from_slice(&CODEC_VERSION.to_be_bytes());
+    payload.push(kind.tag());
+    payload.push(0);
+}
+"#;
+    if rfd4_m2b2_named_function_tokens(text, "encode_frame_header")
+        != rfd4_m2b2_named_function_tokens(expected_encoder, "encode_frame_header")
+    {
+        violations.push("encode_frame_header must retain its complete canonical shape".into());
+    }
+
+    let expected_decoder = r#"
+fn decode_frame_header(
+    reader: &mut Reader<'_>,
+) -> Result<WireContributionKind, ContributionCodecError> {
+    if reader.read_exact(MAGIC.len())? != MAGIC {
+        return Err(ContributionCodecError::Malformed);
+    }
+    if reader.read_u16()? != CODEC_VERSION {
+        return Err(ContributionCodecError::UnknownVersion);
+    }
+    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)
+        .ok_or(ContributionCodecError::UnknownKind)?;
+    if reader.read_u8()? != 0 {
+        return Err(ContributionCodecError::InvalidFlags);
+    }
+    Ok(frame_kind)
+}
+"#;
+    if rfd4_m2b2_named_function_tokens(text, "decode_frame_header")
+        != rfd4_m2b2_named_function_tokens(expected_decoder, "decode_frame_header")
+    {
+        violations.push("decode_frame_header must retain its complete canonical shape".into());
+    }
+
+    let production_tokens = rust_use_tokens(&rust_sanitized_production_text(text));
+    let encoder_tokens =
+        rfd4_m2b2_named_function_tokens(text, "encode_contribution_with_allocator")
+            .unwrap_or_default();
+    let encoder_shape = (
+        encoder_tokens.len(),
+        rfd4_m2b2_stable_ledger_digest(&encoder_tokens),
+    );
+    let expected_encoder_shape = (536, 14172689981760313839);
+    if encoder_shape != expected_encoder_shape {
+        violations.push(format!(
+            "encode_contribution_with_allocator complete token body drifted: expected={expected_encoder_shape:?}, actual={encoder_shape:?}"
+        ));
+    }
+    if rfd4_m2b2_token_sequence_count(&encoder_tokens, "encode_frame_header(&mut payload, kind);")
+        != 1
+        || rfd4_m2b2_token_sequence_count(&production_tokens, "encode_frame_header(") != 2
+    {
+        violations.push("the common encoder must call only the canonical header encoder".into());
+    }
+
+    let decoder_tokens =
+        rfd4_m2b2_named_function_tokens(text, "decode_contribution").unwrap_or_default();
+    let decoder_shape = (
+        decoder_tokens.len(),
+        rfd4_m2b2_stable_ledger_digest(&decoder_tokens),
+    );
+    let expected_decoder_shape = (447, 10274494198063611699);
+    if decoder_shape != expected_decoder_shape {
+        violations.push(format!(
+            "decode_contribution complete token body drifted: expected={expected_decoder_shape:?}, actual={decoder_shape:?}"
+        ));
+    }
+    let canonical_decode_binding = rfd4_m2b2_token_sequence_count(
+        &decoder_tokens,
+        "let frame_kind = decode_frame_header(&mut reader)?;",
+    ) == 1;
+    let checks_expected_kind = rfd4_m2b2_token_sequence_count(
+        &decoder_tokens,
+        "if frame_kind != expectation_kind(expectation)",
+    ) == 1;
+    let dispatches_on_kind =
+        rfd4_m2b2_token_sequence_count(&decoder_tokens, "match (frame_kind, expectation)") == 1;
+    if !canonical_decode_binding
+        || !checks_expected_kind
+        || !dispatches_on_kind
+        || decoder_frame_kind_bindings != 1
+        || rfd4_m2b2_token_sequence_count(&production_tokens, "decode_frame_header(") != 2
+    {
+        violations.push(
+            "the common decoder must bind and use exactly one canonical decoded frame_kind".into(),
+        );
+    }
+    violations
+}
+
+fn rfd4_m2b2_artifact_delivery_facade_violations(sources: &[(String, String)]) -> Vec<String> {
+    const OWNER: &str = "src/runtime_filter/port/subscription.rs";
+    const TRAIT_OWNERS: &[&str] = &[
+        "src/runtime_filter/port/subscription.rs",
+        "src/runtime_filter/router/loopback.rs",
+        "src/runtime_filter/service/registry.rs",
+        "src/runtime_filter/service/subscription.rs",
+    ];
+    const OUTCOME_OWNERS: &[&str] = &[
+        "src/runtime_filter/port/subscription.rs",
+        "src/runtime_filter/router/loopback.rs",
+        "src/runtime_filter/service/materialization.rs",
+        "src/runtime_filter/service/mod.rs",
+        "src/runtime_filter/service/registry.rs",
+        "src/runtime_filter/service/subscription.rs",
+    ];
+    const TRAIT: &[&str] = &[
+        "crate",
+        "runtime_filter",
+        "port",
+        "subscription",
+        "ArtifactDelivery",
+    ];
+    const OUTCOME: &[&str] = &[
+        "crate",
+        "runtime_filter",
+        "port",
+        "subscription",
+        "ArtifactDeliveryOutcome",
+    ];
+
+    let mut violations = Vec::new();
+    for (source_rel, text) in sources {
+        violations.extend(rfd4_m2b2_allowed_owner_surface_violations(source_rel, text));
+        if syn::parse_file(text).is_err() {
+            violations.push(format!(
+                "{source_rel}: ArtifactDelivery ownership audit must parse source"
+            ));
+            continue;
+        }
+        let canonical_paths = rust_production_canonical_paths(text, source_rel);
+        let references_trait = canonical_paths
+            .iter()
+            .any(|path| rfd4_m2b2_path_starts_with(path, TRAIT))
+            || rfd4_m2b2_direct_production_path_reference(text, TRAIT).unwrap_or(true);
+        let references_outcome = canonical_paths
+            .iter()
+            .any(|path| rfd4_m2b2_path_starts_with(path, OUTCOME))
+            || rfd4_m2b2_direct_production_path_reference(text, OUTCOME).unwrap_or(true);
+        if references_trait && !TRAIT_OWNERS.contains(&source_rel.as_str()) {
+            violations.push(format!(
+                "{source_rel}: canonical ArtifactDelivery ownership escaped its exact ledger"
+            ));
+        }
+        if references_outcome && !OUTCOME_OWNERS.contains(&source_rel.as_str()) {
+            violations.push(format!(
+                "{source_rel}: canonical ArtifactDeliveryOutcome ownership escaped its exact ledger"
+            ));
+        }
+
+        for statement in rust_production_scoped_use_statements(text) {
+            let Some(path) = rust_canonical_use_segments_in_scope(
+                &statement.import,
+                source_rel,
+                &statement.inline_modules,
+            ) else {
+                continue;
+            };
+            if source_rel != OWNER
+                && path.len() == 4
+                && rfd4_m2b2_path_starts_with(
+                    &path,
+                    &["crate", "runtime_filter", "port", "subscription"],
+                )
+            {
+                violations.push(format!(
+                    "{source_rel}: subscription namespace facade {}",
+                    path.join("::")
+                ));
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn rfd4_m2b2_final_domain_authority_violations(text: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct AuthorityCallAudit {
+        calls_private_issue: bool,
+        reads_proof: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for AuthorityCallAudit {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                if segments.ends_with(&["CompletionFence".to_string(), "issue".to_string()]) {
+                    self.calls_private_issue = true;
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if matches!(field.base.as_ref(), syn::Expr::Path(path) if path.path.is_ident("proof")) {
+                self.reads_proof = true;
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+    }
+
+    let file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "final-domain production source must parse: {error}"
+            )];
+        }
+    };
+    let mut private_issue = false;
+    let mut remote_constructor = false;
+    let mut authority_chain = false;
+    for item in file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let syn::Type::Path(self_ty) = item_impl.self_ty.as_ref() else {
+            continue;
+        };
+        let Some(owner) = self_ty.path.segments.last() else {
+            continue;
+        };
+        for item in item_impl.items {
+            let syn::ImplItem::Fn(method) = item else {
+                continue;
+            };
+            if owner.ident == "CompletionFence" && method.sig.ident == "issue" {
+                private_issue = matches!(method.vis, syn::Visibility::Inherited)
+                    && method.sig.inputs.len() == 3;
+            }
+            if owner.ident == "CompletionFence" && method.sig.ident == "try_from_remote_codec" {
+                remote_constructor = matches!(method.vis, syn::Visibility::Restricted(_))
+                    && method.sig.inputs.len() == 4;
+            }
+            if owner.ident == "CompletionFenceAuthority" && method.sig.ident == "issue" {
+                let has_proof = method.sig.inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        syn::FnArg::Typed(argument)
+                            if matches!(argument.pat.as_ref(), syn::Pat::Ident(binding) if binding.ident == "proof")
+                    )
+                });
+                let mut audit = AuthorityCallAudit::default();
+                syn::visit::Visit::visit_block(&mut audit, &method.block);
+                authority_chain = has_proof && audit.reads_proof && audit.calls_private_issue;
+            }
+        }
+    }
+    let mut violations = Vec::new();
+    if !private_issue {
+        violations
+            .push("CompletionFence::issue must remain private with the frozen signature".into());
+    }
+    if !remote_constructor {
+        violations.push(
+            "CompletionFence::try_from_remote_codec must remain crate-restricted with four inputs"
+                .into(),
+        );
+    }
+    if !authority_chain {
+        violations.push(
+            "CompletionFenceAuthority::issue must consume proof state before the private issue path"
+                .into(),
+        );
+    }
+    violations
+}
+
+#[test]
+fn rfd4_m2b2_open_metadata_matrix_and_producer_closed_payload_are_frozen() {
+    let transport = fs::read_to_string(src_dir().join("runtime_filter/port/transport.rs"))
+        .expect("read runtime-filter transport");
+    let violations = rfd4_m2b2_open_payload_matrix_violations(&transport);
+    assert!(
+        violations.is_empty(),
+        "producer-open/payload matrix drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_nrfc_magic_and_wire_tags_have_one_codec_owner() {
+    let codec_owner = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_owner))
+        .expect("read contribution codec");
+    let expected_encode = BTreeMap::from([
+        ("FinalDomain".to_string(), 4),
+        ("Membership".to_string(), 1),
+        ("OrderedBound".to_string(), 2),
+        ("TopKSummary".to_string(), 3),
+    ]);
+    let expected_decode = expected_encode
+        .iter()
+        .map(|(kind, tag)| (*tag, kind.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let (encode, decode) =
+        rfd4_m2b2_wire_tag_maps(&codec).expect("parse contribution wire-tag maps");
+    assert_eq!(encode, expected_encode);
+    assert_eq!(decode, expected_decode);
+    let execution_violations = rfd4_m2b2_nrfc_execution_violations(&codec);
+    assert!(
+        execution_violations.is_empty(),
+        "NRFC/tag declarations must be bound to encoder and decoder execution:\n{}",
+        execution_violations.join("\n")
+    );
+
+    let mut owners = Vec::new();
+    for path in rs_files(&src_dir()) {
+        let source_rel = rel(&path);
+        let text = fs::read_to_string(&path).expect("read Rust source");
+        let magic_count =
+            rfd4_m2b2_nrfc_magic_count(&text).expect("guarded Rust source must parse");
+        let production = rust_sanitized_production_text(&text);
+        let wire_kind_count = rust_use_tokens(&production)
+            .iter()
+            .filter(|token| token.as_str() == "WireContributionKind")
+            .count();
+        if magic_count > 0 || wire_kind_count > 0 {
+            owners.push(source_rel);
+        }
+    }
+    assert_eq!(owners, vec![codec_owner.to_string()]);
+}
+
+#[test]
+fn rfd4_m2b2_transport_router_adapter_and_codec_dependencies_stay_separated() {
+    let mut sources = vec![
+        "src/runtime_filter/port/transport.rs".to_string(),
+        "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+        "src/runtime_filter/codec/mod.rs".to_string(),
+        "src/runtime_filter/codec/contribution.rs".to_string(),
+    ];
+    sources.extend(
+        rs_files(&src_dir().join("runtime_filter/router"))
+            .into_iter()
+            .map(|path| rel(&path)),
+    );
+    sources.sort();
+    sources.dedup();
+
+    let violations = sources
+        .into_iter()
+        .flat_map(|source_rel| {
+            let text = fs::read_to_string(Path::new(manifest_dir()).join(&source_rel))
+                .expect("read guarded owner");
+            rfd4_m2b2_source_violations(&source_rel, &text)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "M2B2 dependency boundaries drifted:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_remote_completion_fence_reconstruction_has_one_production_caller() {
+    let sources = production_rs_files_from_entries(&src_dir(), &[src_dir().join("lib.rs")])
+        .into_iter()
+        .map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("read Rust source");
+            (source_rel, text)
+        })
+        .collect::<Vec<_>>();
+    let owners = sources
+        .iter()
+        .filter_map(|(source_rel, text)| {
+            rust_production_canonical_paths(text, source_rel)
+                .iter()
+                .any(|path| {
+                    path.len() >= 5
+                        && rfd4_m2b2_path_starts_with(
+                            path,
+                            &[
+                                "crate",
+                                "runtime_filter",
+                                "port",
+                                "final_domain",
+                                "CompletionFence",
+                            ],
+                        )
+                })
+                .then(|| source_rel.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        owners,
+        BTreeSet::from([
+            "src/runtime_filter/codec/contribution.rs".to_string(),
+            "src/runtime_filter/port/final_domain.rs".to_string(),
+        ]),
+        "canonical CompletionFence production owner ledger drifted"
+    );
+    let violations = rfd4_m2b2_remote_reconstruction_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "remote completion-fence reconstruction authority drifted:\n{}",
+        violations.join("\n")
+    );
+
+    let final_domain = fs::read_to_string(src_dir().join("runtime_filter/port/final_domain.rs"))
+        .expect("read final-domain port");
+    let authority_violations = rfd4_m2b2_final_domain_authority_violations(&final_domain);
+    assert!(
+        authority_violations.is_empty(),
+        "local frozen-proof authority drifted:\n{}",
+        authority_violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_grpc_adapter_remains_an_opaque_injected_ingress() {
+    let source_rel = "src/service/grpc_runtime_filter_adapter.rs";
+    let adapter = fs::read_to_string(Path::new(manifest_dir()).join(source_rel))
+        .expect("read gRPC runtime-filter adapter");
+    let production = rust_sanitized_production_text(&adapter);
+    assert!(
+        production.contains("ingress.accept(envelope)"),
+        "adapter must forward one opaque envelope to its injected ingress"
+    );
+    let violations = rfd4_m2b2_source_violations(source_rel, &adapter);
+    assert!(
+        violations.is_empty(),
+        "gRPC adapter acquired Core or codec authority:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_new_owner_graph_has_no_sender_retry_delivery_or_legacy_bridge() {
+    let violations = [
+        "src/runtime_filter/codec/mod.rs",
+        "src/runtime_filter/codec/contribution.rs",
+        "src/service/grpc_runtime_filter_adapter.rs",
+    ]
+    .into_iter()
+    .flat_map(|source_rel| {
+        let text = fs::read_to_string(Path::new(manifest_dir()).join(source_rel))
+            .expect("read M2B2 owner");
+        rfd4_m2b2_source_violations(source_rel, &text)
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "M2B2 owner graph acquired out-of-scope delivery dependencies:\n{}",
+        violations.join("\n")
+    );
+
+    let sources = production_rs_files_from_entries(&src_dir(), &[src_dir().join("lib.rs")])
+        .into_iter()
+        .map(|path| {
+            let source_rel = rel(&path);
+            let text = fs::read_to_string(path).expect("read Rust source");
+            (source_rel, text)
+        })
+        .collect::<Vec<_>>();
+    let canonical_owners = |symbol: &str| {
+        sources
+            .iter()
+            .filter_map(|(source_rel, text)| {
+                let canonical_reference = rust_production_canonical_paths(text, source_rel)
+                    .iter()
+                    .any(|path| {
+                        path.len() >= 5
+                            && rfd4_m2b2_path_starts_with(
+                                path,
+                                &["crate", "runtime_filter", "port", "subscription", symbol],
+                            )
+                    });
+                let declares_owner = source_rel == "src/runtime_filter/port/subscription.rs"
+                    && match symbol {
+                        "ArtifactDelivery" => rust_named_trait_declaration_count(text, symbol) == 1,
+                        "ArtifactDeliveryOutcome" => {
+                            rust_named_type_declaration_count(text, symbol) == 1
+                        }
+                        _ => false,
+                    };
+                (canonical_reference || declares_owner).then(|| source_rel.clone())
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        canonical_owners("ArtifactDelivery"),
+        BTreeSet::from([
+            "src/runtime_filter/port/subscription.rs".to_string(),
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            "src/runtime_filter/service/registry.rs".to_string(),
+            "src/runtime_filter/service/subscription.rs".to_string(),
+        ]),
+        "canonical ArtifactDelivery production owner ledger drifted"
+    );
+    assert_eq!(
+        canonical_owners("ArtifactDeliveryOutcome"),
+        BTreeSet::from([
+            "src/runtime_filter/port/subscription.rs".to_string(),
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            "src/runtime_filter/service/materialization.rs".to_string(),
+            "src/runtime_filter/service/mod.rs".to_string(),
+            "src/runtime_filter/service/registry.rs".to_string(),
+            "src/runtime_filter/service/subscription.rs".to_string(),
+        ]),
+        "canonical ArtifactDeliveryOutcome production owner ledger drifted"
+    );
+    let facade_violations = rfd4_m2b2_artifact_delivery_facade_violations(&sources);
+    assert!(
+        facade_violations.is_empty(),
+        "ArtifactDelivery facade escaped its subscription owner:\n{}",
+        facade_violations.join("\n")
+    );
+}
+
+#[test]
+fn rfd4_m2b2_detector_rejects_alias_reexport_glob_inline_and_extern_crate_bypasses() {
+    let invalid = [
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::codec::contribution::decode_contribution as decode; fn f() { let _ = decode; }",
+        ),
+        (
+            "src/runtime_filter/port/transport.rs",
+            "pub(crate) use crate::runtime_filter::port::value_domain::ValueDomainDelta as Delta;",
+        ),
+        (
+            "src/runtime_filter/router/role_graph.rs",
+            "use crate::runtime_filter::port::topk_summary::*;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "mod hidden { use crate::service::grpc_server as live; fn f() { let _ = live; } }",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "extern crate self as nova; use nova::runtime_filter::router::RoleRouter;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "#[path = \"hidden.rs\"] mod hidden;",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "include!(\"hidden.rs\");",
+        ),
+        ("src/runtime_filter/codec/contribution.rs", "fn malformed("),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "#[cfg(any(test, feature = \"hidden\"))] use crate::service::grpc_server;",
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery as Delivery; fn f(_: &dyn Delivery) {}",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "pub(crate) use crate::runtime_filter::port::subscription::{ArtifactDelivery, ArtifactDeliveryOutcome};",
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs",
+            "use crate::runtime_filter::port::subscription::*; fn f(delivery: &dyn ArtifactDelivery, outcome: ArtifactDeliveryOutcome) { delivery.deliver(crate::runtime_filter::port::identity::RouteEdgeId::new(1), outcome); }",
+        ),
+        (
+            "src/runtime_filter/codec/contribution.rs",
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery; fn f(delivery: &dyn ArtifactDelivery) { delivery.deliver_live(todo!(), None, todo!()); }",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        assert!(
+            !rfd4_m2b2_source_violations(source_rel, source).is_empty(),
+            "detector missed forbidden production bypass in {source_rel}: {source}"
+        );
+    }
+
+    let cfg_test_only = r#"
+#[cfg(test)]
+mod tests {
+    use crate::runtime_filter::codec::contribution::decode_contribution;
+    use crate::runtime_filter::router::RoleRouter;
+}
+"#;
+    assert!(
+        rfd4_m2b2_source_violations("src/service/grpc_runtime_filter_adapter.rs", cfg_test_only,)
+            .is_empty(),
+        "definite cfg(test) fixtures must not count as production dependencies"
+    );
+
+    let unrelated_local_delivery = r#"
+struct LocalDelivery;
+impl LocalDelivery {
+    fn deliver(&self) {}
+    fn deliver_live(&self) {}
+}
+fn f(delivery: &LocalDelivery) {
+    delivery.deliver();
+    delivery.deliver_live();
+}
+"#;
+    assert!(
+        rfd4_m2b2_source_violations(
+            "src/service/grpc_runtime_filter_adapter.rs",
+            unrelated_local_delivery,
+        )
+        .is_empty(),
+        "unrelated local deliver methods must not be treated as artifact delivery"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_remote_reconstruction_detector_covers_alias_glob_facade_type_alias_and_cfg() {
+    let invalid = [
+        (
+            "src/runtime_filter/service/producer.rs",
+            "use crate::runtime_filter::port::final_domain::CompletionFence as Fence; fn f() { let _ = Fence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "use crate::runtime_filter::port::final_domain::*; fn f() { let _ = CompletionFence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "pub(crate) use crate::runtime_filter::port::final_domain::CompletionFence as RemoteFence;",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "type Fence = crate::runtime_filter::port::final_domain::CompletionFence; fn f() { let _ = Fence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "extern crate self as nova; fn f() { let _ = nova::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec; }",
+        ),
+        (
+            "src/runtime_filter/service/producer.rs",
+            "#[cfg(any(test, feature = \"remote\"))] fn f() { let _ = crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec; }",
+        ),
+    ];
+    for (source_rel, source) in invalid {
+        let violations =
+            rfd4_m2b2_remote_reconstruction_violations(&[(source_rel.into(), source.into())]);
+        assert!(
+            !violations.is_empty(),
+            "remote reconstruction detector missed {source_rel}: {source}"
+        );
+    }
+
+    let local_shadow = r#"
+struct CompletionFence;
+impl CompletionFence {
+    fn try_from_remote_codec() {}
+}
+fn f() { CompletionFence::try_from_remote_codec(); }
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            local_shadow.into(),
+        )])
+        .is_empty(),
+        "same-named local types must not be treated as the canonical remote fence"
+    );
+
+    let canonical_import_with_unrelated_local_method = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+struct LocalFence;
+impl LocalFence {
+    fn try_from_remote_codec() {}
+}
+fn f() {
+    let _ = std::mem::size_of::<CompletionFence>();
+    LocalFence::try_from_remote_codec();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            canonical_import_with_unrelated_local_method.into(),
+        )])
+        .is_empty(),
+        "canonical CompletionFence ownership must remain default-deny outside its exact owners"
+    );
+
+    let cfg_test_only = r#"
+#[cfg(test)]
+fn f() {
+    let _ = crate::runtime_filter::port::final_domain::CompletionFence::try_from_remote_codec;
+}
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            cfg_test_only.into(),
+        )])
+        .is_empty(),
+        "definite cfg(test) remote reconstruction fixtures must be ignored"
+    );
+
+    let parse_failure = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/service/producer.rs".into(),
+        "fn malformed(".into(),
+    )]);
+    assert!(
+        !parse_failure.is_empty(),
+        "remote reconstruction audit must fail closed on parse errors"
+    );
+
+    let definition_owner_wrapper = r#"
+struct CompletionFence;
+struct CompletionFenceContractDigest;
+struct ProducerStreamId;
+struct ProducerSequence;
+struct FinalDomainError;
+impl CompletionFence {
+    pub(crate) fn try_from_remote_codec(
+        _: CompletionFenceContractDigest,
+        _: ProducerStreamId,
+        _: ProducerSequence,
+        _: [u8; 32],
+    ) -> Result<Self, FinalDomainError> {
+        todo!()
+    }
+}
+fn rebuild(
+    digest: CompletionFenceContractDigest,
+    stream: ProducerStreamId,
+    sequence: ProducerSequence,
+    encoded: [u8; 32],
+) -> Result<CompletionFence, FinalDomainError> {
+    CompletionFence::try_from_remote_codec(digest, stream, sequence, encoded)
+}
+"#;
+    let definition_owner_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/port/final_domain.rs".into(),
+        definition_owner_wrapper.into(),
+    )]);
+    assert!(
+        !definition_owner_violations.is_empty(),
+        "the definition owner must not gain a second production reconstruction caller"
+    );
+
+    let macro_bypass = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+macro_rules! rebuild {
+    ($fence:ty, $digest:expr, $stream:expr, $sequence:expr, $encoded:expr) => {
+        <$fence>::try_from_remote_codec($digest, $stream, $sequence, $encoded)
+    };
+}
+fn f() {
+    let _ = rebuild!(CompletionFence, todo!(), todo!(), todo!(), [0; 32]);
+}
+"#;
+    let macro_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/service/producer.rs".into(),
+        macro_bypass.into(),
+    )]);
+    assert!(
+        !macro_violations.is_empty(),
+        "macro-expanded canonical CompletionFence reconstruction must be rejected"
+    );
+
+    let definition_owner_macro = r#"
+struct CompletionFence;
+struct CompletionFenceContractDigest;
+struct ProducerStreamId;
+struct ProducerSequence;
+struct FinalDomainError;
+impl CompletionFence {
+    pub(crate) fn try_from_remote_codec(
+        _: CompletionFenceContractDigest,
+        _: ProducerStreamId,
+        _: ProducerSequence,
+        _: [u8; 32],
+    ) -> Result<Self, FinalDomainError> {
+        todo!()
+    }
+}
+macro_rules! hidden_rebuild {
+    () => { CompletionFence::try_from_remote_codec(todo!(), todo!(), todo!(), [0; 32]) };
+}
+"#;
+    let definition_macro_violations = rfd4_m2b2_remote_reconstruction_violations(&[(
+        "src/runtime_filter/port/final_domain.rs".into(),
+        definition_owner_macro.into(),
+    )]);
+    assert!(
+        !definition_macro_violations.is_empty(),
+        "definition owner must contain only the constructor declaration token"
+    );
+
+    let namespace_facade = vec![
+        (
+            "src/runtime_filter/fence_facade.rs".to_string(),
+            "pub(crate) use crate::runtime_filter::port::final_domain as fd;".to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::fence_facade::fd; fn f() { let _ = fd::CompletionFence::try_from_remote_codec; }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&namespace_facade).is_empty(),
+        "cross-file final_domain namespace facades must be rejected"
+    );
+
+    let public_type_facade = vec![
+        (
+            "src/runtime_filter/fence_facade.rs".to_string(),
+            "pub(crate) type HiddenFence = crate::runtime_filter::port::final_domain::CompletionFence;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::fence_facade::HiddenFence; fn f() { let _ = HiddenFence::try_from_remote_codec; }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&public_type_facade).is_empty(),
+        "public cross-file CompletionFence type facades must fail at their source"
+    );
+
+    let separate_private_parent_facade = vec![
+        (
+            "src/runtime_filter/fence_parent.rs".to_string(),
+            "use crate::runtime_filter::port::final_domain::CompletionFence as HiddenFence; mod child;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/fence_parent/child.rs".to_string(),
+            "fn f() { let _ = super::HiddenFence::try_from_remote_codec; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&separate_private_parent_facade).is_empty(),
+        "private parent CompletionFence facades must fail before a separate child consumes them"
+    );
+
+    let separate_private_namespace_parent = vec![
+        (
+            "src/runtime_filter/fence_parent.rs".to_string(),
+            "use crate::runtime_filter::port::final_domain as hidden; mod child;".to_string(),
+        ),
+        (
+            "src/runtime_filter/fence_parent/child.rs".to_string(),
+            "fn f() { let _ = super::hidden::CompletionFence::try_from_remote_codec; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&separate_private_namespace_parent).is_empty(),
+        "private parent final_domain namespace facades must fail at their source"
+    );
+
+    let private_ancestor_facade = r#"
+use crate::runtime_filter::port::final_domain::CompletionFence as HiddenFence;
+mod child {
+    fn f() {
+        let _ = super::HiddenFence::try_from_remote_codec;
+    }
+}
+"#;
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            private_ancestor_facade.into(),
+        )])
+        .is_empty(),
+        "private ancestor aliases must not hide child-module reconstruction"
+    );
+
+    let local_shadow_macro = r#"
+struct CompletionFence;
+impl CompletionFence {
+    fn try_from_remote_codec() {}
+}
+macro_rules! call_local {
+    () => { CompletionFence::try_from_remote_codec() };
+}
+fn f() { call_local!(); }
+"#;
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&[(
+            "src/runtime_filter/service/producer.rs".into(),
+            local_shadow_macro.into(),
+        )])
+        .is_empty(),
+        "local-shadow macro calls must not be treated as canonical fence reconstruction"
+    );
+
+    let allowed_owner_laundering = vec![
+        (
+            "src/runtime_filter/codec/contribution.rs".to_string(),
+            r#"
+use crate::runtime_filter::port::final_domain::CompletionFence;
+pub(crate) type HiddenFence = CompletionFence;
+pub(crate) struct FenceWrapper(pub(crate) CompletionFence);
+impl FenceWrapper {
+    pub(crate) fn rebuild() {
+        let _ = CompletionFence::try_from_remote_codec(todo!(), todo!(), todo!(), [0; 32]);
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            "src/runtime_filter/service/producer.rs".to_string(),
+            "use crate::runtime_filter::codec::contribution::FenceWrapper; fn f() { FenceWrapper::rebuild(); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&allowed_owner_laundering).is_empty(),
+        "an allowed CompletionFence owner must not launder reconstruction through new outward surfaces"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_nrfc_execution_detector_rejects_dead_or_bypassed_declarations() {
+    let dead_declarations = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>) {
+    payload.extend_from_slice(b"ALT!");
+    payload.push(9);
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(4) == b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(dead_declarations).is_empty(),
+        "dead correct declarations must not mask hardcoded alternate execution"
+    );
+
+    let early_return = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        if false { return 9; }
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        if false { return None; }
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.push(kind.tag());
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(MAGIC.len()) == MAGIC;
+    let _ = WireContributionKind::from_tag(reader.read_u8());
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(early_return).is_empty(),
+        "tag methods must be one exhaustive match without prefix statements"
+    );
+
+    let dead_correct_execution = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    if false {
+        payload.extend_from_slice(MAGIC);
+        payload.push(kind.tag());
+    }
+    payload.extend_from_slice(b"ALT!");
+    payload.push(9);
+}
+fn decode_contribution(reader: &mut Reader) {
+    if false {
+        let _ = reader.read_exact(MAGIC.len()) != MAGIC;
+        let _ = WireContributionKind::from_tag(reader.read_u8());
+    }
+    let _ = reader.read_exact(4) != b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(dead_correct_execution).is_empty(),
+        "dead correct calls must not mask live alternate frame execution"
+    );
+
+    let decoupled_decoder = r#"
+const MAGIC: &[u8; 4] = b"NRFC";
+enum WireContributionKind { Membership, OrderedBound, TopKSummary, FinalDomain }
+impl WireContributionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Membership => 1,
+            Self::OrderedBound => 2,
+            Self::TopKSummary => 3,
+            Self::FinalDomain => 4,
+        }
+    }
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Membership),
+            2 => Some(Self::OrderedBound),
+            3 => Some(Self::TopKSummary),
+            4 => Some(Self::FinalDomain),
+            _ => None,
+        }
+    }
+}
+fn encode_contribution_with_allocator(payload: &mut Vec<u8>, kind: WireContributionKind) {
+    payload.extend_from_slice(MAGIC);
+    payload.push(kind.tag());
+}
+fn decode_contribution(reader: &mut Reader) {
+    let _ = reader.read_exact(MAGIC.len());
+    let _ = MAGIC != MAGIC;
+    let _ = WireContributionKind::from_tag(1);
+    let _ = reader.read_exact(4) != b"ALT!";
+    let _ = reader.read_u8();
+}
+"#;
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(decoupled_decoder).is_empty(),
+        "decoder must compare the exact MAGIC read and feed the live wire byte into from_tag"
+    );
+
+    let canonical_header_flow =
+        fs::read_to_string(src_dir().join("runtime_filter/codec/contribution.rs"))
+            .expect("read live contribution codec");
+    assert!(
+        rfd4_m2b2_nrfc_execution_violations(&canonical_header_flow).is_empty(),
+        "the decision fixture must model the complete canonical header flow"
+    );
+
+    let live_header_overwrite = canonical_header_flow.replacen(
+        "    payload.push(0);",
+        "    payload.push(0);\n    payload.clear();",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&live_header_overwrite).is_empty(),
+        "live header clear/overwrite after canonical writes must be rejected"
+    );
+
+    let early_return_between_header_writes = canonical_header_flow.replacen(
+        "    payload.extend_from_slice(MAGIC);",
+        "    payload.extend_from_slice(MAGIC);\n    return;",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&early_return_between_header_writes).is_empty(),
+        "an early return between canonical header writes must be rejected"
+    );
+
+    let dead_nested_from_tag = canonical_header_flow.replace(
+        "    let frame_kind = WireContributionKind::from_tag(reader.read_u8()?)\n        .ok_or(ContributionCodecError::UnknownKind)?;",
+        "    let frame_kind = { if false { let _ = WireContributionKind::from_tag(reader.read_u8()?); } WireContributionKind::Membership };",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&dead_nested_from_tag).is_empty(),
+        "a dead nested from_tag call must not establish the live decoded kind"
+    );
+
+    let shadowed_frame_kind = canonical_header_flow.replace(
+        "    if frame_kind != expectation_kind(expectation)",
+        "    let frame_kind = WireContributionKind::Membership;\n    if frame_kind != expectation_kind(expectation)",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&shadowed_frame_kind).is_empty(),
+        "the decoded frame_kind must not be ignored or shadowed"
+    );
+
+    let codec = canonical_header_flow;
+    let caller_overwrites_header = runtime_filter_replace_in_function_body(
+        &codec,
+        "encode_contribution_with_allocator",
+        "    encode_frame_header(&mut payload, kind);",
+        "    encode_frame_header(&mut payload, kind);\n    payload.clear();\n    payload.extend_from_slice(b\"ALT!\");",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&caller_overwrites_header).is_empty(),
+        "the common encoder must not mutate the canonical header after its helper returns"
+    );
+
+    let decoder_early_return = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    let frame_kind = decode_frame_header(&mut reader)?;",
+        "    let frame_kind = decode_frame_header(&mut reader)?;\n    return Err(ContributionCodecError::Malformed);",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&decoder_early_return).is_empty(),
+        "the common decoder must not return before consuming the canonical header result"
+    );
+
+    let dead_expected_kind_check = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    if frame_kind != expectation_kind(expectation) {\n        return Err(ContributionCodecError::KindMismatch);\n    }",
+        "    if false {\n        if frame_kind != expectation_kind(expectation) {\n            return Err(ContributionCodecError::KindMismatch);\n        }\n    }\n    if frame_kind != WireContributionKind::Membership {\n        return Err(ContributionCodecError::KindMismatch);\n    }",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&dead_expected_kind_check).is_empty(),
+        "dead canonical decoder tokens must not mask a live alternate kind check"
+    );
+
+    let alternate_dispatch = runtime_filter_replace_in_function_body(
+        &codec,
+        "decode_contribution",
+        "    let contribution = match (frame_kind, expectation) {",
+        "    if false {\n        let _ = match (frame_kind, expectation) { _ => unreachable!() };\n    }\n    let contribution = match (WireContributionKind::Membership, expectation) {",
+    );
+    assert!(
+        !rfd4_m2b2_nrfc_execution_violations(&alternate_dispatch).is_empty(),
+        "dead canonical dispatch tokens must not mask a live alternate dispatch"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_artifact_delivery_facade_detector_rejects_cross_file_reexports() {
+    let sources = vec![
+        (
+            "src/runtime_filter/facade.rs".to_string(),
+            "pub(crate) use crate::runtime_filter::port::subscription::ArtifactDelivery as HiddenDelivery;"
+                .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::facade::HiddenDelivery; fn f(delivery: &dyn HiddenDelivery) { delivery.deliver(todo!(), todo!()); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&sources).is_empty(),
+        "cross-file ArtifactDelivery facades must be rejected before adapter resolution"
+    );
+
+    let local = vec![(
+        "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+        "struct LocalDelivery; impl LocalDelivery { fn deliver(&self) {} }".to_string(),
+    )];
+    assert!(
+        rfd4_m2b2_artifact_delivery_facade_violations(&local).is_empty(),
+        "unrelated local delivery helpers must remain allowed"
+    );
+
+    let type_alias = vec![
+        (
+            "src/runtime_filter/facade.rs".to_string(),
+            "pub(crate) type HiddenDelivery = dyn crate::runtime_filter::port::subscription::ArtifactDelivery;"
+                .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::facade::HiddenDelivery; fn f(delivery: &HiddenDelivery) { delivery.deliver(todo!(), todo!()); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&type_alias).is_empty(),
+        "public ArtifactDelivery type aliases must be rejected"
+    );
+
+    let wrapper_trait = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) trait HiddenDelivery: crate::runtime_filter::port::subscription::ArtifactDelivery {}"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_trait).is_empty(),
+        "public wrapper traits must not facade ArtifactDelivery"
+    );
+
+    let namespace_facade = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) use crate::runtime_filter::port::subscription as hidden;".to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&namespace_facade).is_empty(),
+        "subscription namespace facades must be rejected"
+    );
+
+    let private_parent = vec![
+        (
+            "src/runtime_filter/delivery_parent.rs".to_string(),
+            "use crate::runtime_filter::port::subscription::ArtifactDelivery as HiddenDelivery; mod child;"
+                .to_string(),
+        ),
+        (
+            "src/runtime_filter/delivery_parent/child.rs".to_string(),
+            "fn f(value: &dyn super::HiddenDelivery) { let _ = value; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&private_parent).is_empty(),
+        "private-parent ArtifactDelivery facades must fail at their source"
+    );
+
+    let private_namespace_parent = vec![
+        (
+            "src/runtime_filter/delivery_parent.rs".to_string(),
+            "use crate::runtime_filter::port::subscription as hidden; mod child;".to_string(),
+        ),
+        (
+            "src/runtime_filter/delivery_parent/child.rs".to_string(),
+            "fn f(value: &dyn super::hidden::ArtifactDelivery) { let _ = value; }".to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&private_namespace_parent).is_empty(),
+        "private-parent subscription namespace facades must fail at their source"
+    );
+
+    let associated_facade = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) trait Wrapper { type Delivery: crate::runtime_filter::port::subscription::ArtifactDelivery; fn outcome(&self) -> crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome; }"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&associated_facade).is_empty(),
+        "associated ArtifactDelivery/Outcome surfaces must be rejected"
+    );
+
+    let wrapper_function = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) fn wrap(value: std::sync::Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>) -> crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome { todo!() }"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_function).is_empty(),
+        "wrapper functions must not expose ArtifactDelivery/Outcome"
+    );
+
+    let wrapper_struct = vec![(
+        "src/runtime_filter/facade.rs".to_string(),
+        "pub(crate) struct Wrapper(std::sync::Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>);"
+            .to_string(),
+    )];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&wrapper_struct).is_empty(),
+        "wrapper structs must not expose ArtifactDelivery"
+    );
+
+    let allowed_owner_laundering = vec![
+        (
+            "src/runtime_filter/router/loopback.rs".to_string(),
+            r#"
+pub(crate) type HiddenDelivery = dyn crate::runtime_filter::port::subscription::ArtifactDelivery;
+pub(crate) trait HiddenDeliveryTrait: crate::runtime_filter::port::subscription::ArtifactDelivery {}
+pub(crate) struct DeliveryWrapper(pub(crate) Box<HiddenDelivery>);
+impl DeliveryWrapper {
+    pub(crate) fn deliver_hidden(&self) {}
+}
+"#
+            .to_string(),
+        ),
+        (
+            "src/service/grpc_runtime_filter_adapter.rs".to_string(),
+            "use crate::runtime_filter::router::loopback::DeliveryWrapper; fn f(value: &DeliveryWrapper) { value.deliver_hidden(); }"
+                .to_string(),
+        ),
+    ];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&allowed_owner_laundering).is_empty(),
+        "an allowed ArtifactDelivery owner must not launder delivery through new outward surfaces"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_allowed_owners_reject_macro_and_foreign_impl_laundering() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let final_domain_rel = "src/runtime_filter/port/final_domain.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    let final_domain = fs::read_to_string(Path::new(manifest_dir()).join(final_domain_rel))
+        .expect("read live final-domain owner");
+    let baseline = vec![
+        (codec_rel.to_string(), codec.clone()),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        rfd4_m2b2_remote_reconstruction_violations(&baseline).is_empty(),
+        "live CompletionFence owner baseline must satisfy the surface ledger"
+    );
+
+    let exported_fence_macro = format!(
+        r#"{codec}
+#[macro_export]
+macro_rules! hidden_completion_fence_type {{
+    () => {{ crate::runtime_filter::port::final_domain::CompletionFence }};
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), exported_fence_macro),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "a live allowed CompletionFence owner must reject exported type-position macro laundering"
+    );
+
+    let nested_exported_fence_macro = format!(
+        r#"{codec}
+mod hidden_macro_owner {{
+    #[macro_export]
+    macro_rules! nested_hidden_completion_fence_type {{
+        () => {{ crate::runtime_filter::port::final_domain::CompletionFence }};
+    }}
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), nested_exported_fence_macro),
+        (final_domain_rel.to_string(), final_domain.clone()),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "an exported macro inside a private live-owner module must remain in the frozen surface"
+    );
+
+    let foreign_fence_impl = format!(
+        r#"{codec}
+impl crate::runtime_filter::port::final_domain::CompletionFence {{
+    pub(crate) fn hidden_fence_surface(&self) {{}}
+}}
+"#
+    );
+    let mutated = vec![
+        (codec_rel.to_string(), foreign_fence_impl),
+        (final_domain_rel.to_string(), final_domain),
+    ];
+    assert!(
+        !rfd4_m2b2_remote_reconstruction_violations(&mutated).is_empty(),
+        "a live allowed CompletionFence owner must reject foreign-type visible impl laundering"
+    );
+
+    let loopback_rel = "src/runtime_filter/router/loopback.rs";
+    let loopback = fs::read_to_string(Path::new(manifest_dir()).join(loopback_rel))
+        .expect("read live loopback owner");
+    let baseline = vec![(loopback_rel.to_string(), loopback.clone())];
+    assert!(
+        rfd4_m2b2_artifact_delivery_facade_violations(&baseline).is_empty(),
+        "live ArtifactDelivery owner baseline must satisfy the surface ledger"
+    );
+
+    let exported_delivery_macro = format!(
+        r#"{loopback}
+#[macro_export]
+macro_rules! hidden_artifact_delivery_type {{
+    () => {{ dyn crate::runtime_filter::port::subscription::ArtifactDelivery }};
+}}
+"#
+    );
+    let mutated = vec![(loopback_rel.to_string(), exported_delivery_macro)];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&mutated).is_empty(),
+        "a live allowed ArtifactDelivery owner must reject exported type-position macro laundering"
+    );
+
+    let foreign_delivery_impl = format!(
+        r#"{loopback}
+impl crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome {{
+    pub(crate) fn hidden_delivery_surface(&self) {{}}
+}}
+"#
+    );
+    let mutated = vec![(loopback_rel.to_string(), foreign_delivery_impl)];
+    assert!(
+        !rfd4_m2b2_artifact_delivery_facade_violations(&mutated).is_empty(),
+        "a live allowed ArtifactDelivery owner must reject foreign-type visible impl laundering"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_owner_surface_freezes_macros_and_production_attributes() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &codec).is_empty(),
+        "live codec baseline must satisfy the outward surface ledger"
+    );
+
+    let top_level_attribute = codec.replacen(
+        "pub(crate) fn encoded_contribution_len(",
+        "#[deprecated]\npub(crate) fn encoded_contribution_len(",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &top_level_attribute).is_empty(),
+        "top-level outward function attributes must be frozen"
+    );
+
+    let production_cfg_attribute = codec.replacen(
+        "pub(crate) fn encoded_contribution_len(",
+        "#[cfg(any(test, feature = \"surface-guard-fixture\"))]\npub(crate) fn encoded_contribution_len(",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &production_cfg_attribute)
+            .is_empty(),
+        "production-possible cfg attributes must remain in the frozen surface"
+    );
+
+    let associated_attribute = codec.replacen(
+        "    pub(crate) fn payload(&self) -> &[u8] {",
+        "    #[deprecated]\n    pub(crate) fn payload(&self) -> &[u8] {",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &associated_attribute).is_empty(),
+        "visible inherent associated-item attributes must be frozen"
+    );
+
+    let associated_defaultness = codec.replacen(
+        "    pub(crate) fn payload(&self) -> &[u8] {",
+        "    pub(crate) default fn payload(&self) -> &[u8] {",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &associated_defaultness).is_empty(),
+        "visible inherent associated-item defaultness must be frozen"
+    );
+
+    let impl_macro = format!(
+        r#"{codec}
+impl EncodedContribution {{
+    expose_encoded_contribution_surface!();
+}}
+"#
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &impl_macro).is_empty(),
+        "impl macros that may expose associated items must be frozen"
+    );
+
+    let private_trait_macro = format!(
+        r#"{codec}
+trait PrivateSurfaceTrait {{
+    expose_private_trait_surface!();
+}}
+"#
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &private_trait_macro).is_empty(),
+        "all trait macros in an allowed owner must be frozen even when the trait is private"
+    );
+
+    let subscription_rel = "src/runtime_filter/port/subscription.rs";
+    let subscription = fs::read_to_string(Path::new(manifest_dir()).join(subscription_rel))
+        .expect("read live subscription owner");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &subscription).is_empty(),
+        "live subscription baseline must satisfy the outward surface ledger"
+    );
+    let trait_attribute = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    #[deprecated]\n    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &trait_attribute).is_empty(),
+        "outward trait-member attributes must be frozen"
+    );
+    let trait_macro = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);\n    expose_artifact_delivery_surface!();",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &trait_macro).is_empty(),
+        "trait macros that may expose associated items must be frozen"
+    );
+
+    let registry_rel = "src/runtime_filter/service/registry.rs";
+    let registry = fs::read_to_string(Path::new(manifest_dir()).join(registry_rel))
+        .expect("read live registry owner");
+    let field_attribute = registry.replacen(
+        "    pub(super) channel_id: ChannelId,",
+        "    #[deprecated]\n    pub(super) channel_id: ChannelId,",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(registry_rel, &field_attribute).is_empty(),
+        "outward field attributes must be frozen"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_owner_surface_freezes_file_module_and_trait_default_context() {
+    let codec_rel = "src/runtime_filter/codec/contribution.rs";
+    let codec = fs::read_to_string(Path::new(manifest_dir()).join(codec_rel))
+        .expect("read live contribution codec");
+    let file_inner_cfg = format!("#![cfg(any(test, feature = \"surface-file-context\"))]\n{codec}");
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(codec_rel, &file_inner_cfg).is_empty(),
+        "allowed-owner file inner cfg attributes must be frozen"
+    );
+
+    let private_module = format!(
+        r#"{codec}
+mod hidden_surface_context {{
+    impl EncodedContribution {{
+        pub(crate) fn hidden_context_method(&self) {{}}
+    }}
+}}
+"#
+    );
+    let private_module_cfg = format!(
+        r#"{codec}
+#[cfg(any(test, feature = "surface-module-context"))]
+mod hidden_surface_context {{
+    impl EncodedContribution {{
+        pub(crate) fn hidden_context_method(&self) {{}}
+    }}
+}}
+"#
+    );
+    assert_ne!(
+        rfd4_m2b2_outward_surface_inventory(&private_module)
+            .expect("parse live codec with private inline ancestor"),
+        rfd4_m2b2_outward_surface_inventory(&private_module_cfg)
+            .expect("parse live codec with cfg private inline ancestor"),
+        "effective private inline-module attrs must qualify descendant impl surfaces"
+    );
+
+    let service_rel = "src/runtime_filter/service/mod.rs";
+    let service = fs::read_to_string(Path::new(manifest_dir()).join(service_rel))
+        .expect("read live runtime-filter service module");
+    assert!(
+        rfd4_m2b2_allowed_owner_surface_violations(service_rel, &service).is_empty(),
+        "live service owner baseline must satisfy the outward surface ledger"
+    );
+    let external_parent_cfg = service.replacen(
+        "mod materialization;",
+        "#[cfg(any(test, feature = \"surface-parent-context\"))]\nmod materialization;",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(service_rel, &external_parent_cfg).is_empty(),
+        "external private parent-module attrs controlling a frozen owner must be frozen"
+    );
+
+    let subscription_rel = "src/runtime_filter/port/subscription.rs";
+    let subscription = fs::read_to_string(Path::new(manifest_dir()).join(subscription_rel))
+        .expect("read live subscription owner");
+    let delivery_default = subscription.replacen(
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome);",
+        "    fn deliver(&self, route_edge_id: RouteEdgeId, outcome: ArtifactDeliveryOutcome) {\n        let _ = (route_edge_id, outcome);\n    }",
+        1,
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(subscription_rel, &delivery_default).is_empty(),
+        "required ArtifactDelivery methods must not silently gain default behavior"
+    );
+}
+
+#[test]
+fn rfd4_m2b2_live_runtime_filter_root_freezes_owner_child_declarations() {
+    let root_rel = "src/runtime_filter/mod.rs";
+    let root = fs::read_to_string(Path::new(manifest_dir()).join(root_rel))
+        .expect("read live runtime-filter root module");
+    let baseline_violations = rfd4_m2b2_allowed_owner_surface_violations(root_rel, &root);
+    assert!(
+        baseline_violations.is_empty(),
+        "live runtime-filter root baseline must satisfy the owner-child declaration ledger: {baseline_violations:#?}"
+    );
+
+    let service_cfg = root.replacen(
+        "pub(crate) mod service;",
+        "#[cfg(any(test, feature = \"surface-root-context\"))]\npub(crate) mod service;",
+        1,
+    );
+    assert_ne!(
+        service_cfg, root,
+        "live service declaration mutation must apply"
+    );
+    assert!(
+        !rfd4_m2b2_allowed_owner_surface_violations(root_rel, &service_cfg).is_empty(),
+        "runtime-filter root attrs controlling the service owner must be frozen"
+    );
 }
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]

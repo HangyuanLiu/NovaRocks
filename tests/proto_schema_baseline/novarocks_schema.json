@@ -1469,6 +1469,13 @@
               "type_name": "bytes",
               "label": "singular",
               "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "producer_open",
+              "type_name": "RuntimeFilterProducerOpenMetadata",
+              "label": "singular",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -1494,6 +1501,19 @@
               "number": 3,
               "name": "rejection_reason",
               "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterProducerOpenMetadata": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "local_partition_count",
+              "type_name": "uint32",
               "label": "singular",
               "oneof": null
             }

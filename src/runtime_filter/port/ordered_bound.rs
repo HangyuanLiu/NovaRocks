@@ -27,6 +27,7 @@ use crate::runtime_filter::model::contract::{
 };
 
 use super::artifact::encode_schema;
+use super::value_domain::ContributionSizeError;
 
 const ORDER_CONTRACT_VERSION: u16 = 1;
 pub(crate) const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
@@ -168,7 +169,11 @@ impl OrderedTuple {
     }
 
     pub(crate) fn visit_canonical(&self, mut visitor: impl FnMut(&[u8])) {
-        visitor(&(self.values.len() as u64).to_be_bytes());
+        visitor(
+            &u64::try_from(self.values.len())
+                .expect("ordered tuple arity must fit canonical u64")
+                .to_be_bytes(),
+        );
         for value in self.values() {
             match value {
                 None => visitor(&[0]),
@@ -178,6 +183,38 @@ impl OrderedTuple {
                 }
             }
         }
+    }
+
+    pub(crate) fn canonical_codec_len(&self) -> Result<usize, ContributionSizeError> {
+        self.validate_canonical_u64_lengths()?;
+        let mut bytes = Some(0usize);
+        self.visit_canonical(|part| {
+            bytes = bytes.and_then(|bytes| bytes.checked_add(part.len()));
+        });
+        bytes.ok_or(ContributionSizeError::SizeOverflow)
+    }
+
+    pub(crate) fn encode_canonical_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        let exact_len = self.canonical_codec_len()?;
+        let start = output.len();
+        self.visit_canonical(|part| output.extend_from_slice(part));
+        debug_assert_eq!(output.len() - start, exact_len);
+        Ok(())
+    }
+
+    fn validate_canonical_u64_lengths(&self) -> Result<(), ContributionSizeError> {
+        u64::try_from(self.values.len())
+            .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+        for value in self.values.iter().flatten() {
+            if let OrderedScalar::Utf8(value) = value {
+                u64::try_from(value.len())
+                    .map_err(|_| ContributionSizeError::LengthExceedsCanonicalRange)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -225,6 +262,17 @@ impl OrderedBoundUpdate {
             bytes = bytes.and_then(|bytes| bytes.checked_add(part.len()));
         });
         bytes
+    }
+
+    pub(crate) fn canonical_contribution_len(&self) -> Result<usize, ContributionSizeError> {
+        self.bound.canonical_codec_len()
+    }
+
+    pub(crate) fn encode_bound_canonical_into(
+        &self,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ContributionSizeError> {
+        self.bound.encode_canonical_into(output)
     }
 }
 
@@ -511,7 +559,11 @@ fn visit_ordered_scalar(value: &OrderedScalar, visitor: &mut impl FnMut(&[u8])) 
             visitor(&value.to_be_bytes());
         }
         OrderedScalar::Utf8(value) => {
-            visitor(&(value.len() as u64).to_be_bytes());
+            visitor(
+                &u64::try_from(value.len())
+                    .expect("ordered UTF-8 scalar length must fit canonical u64")
+                    .to_be_bytes(),
+            );
             visitor(value.as_bytes());
         }
     }
@@ -838,5 +890,44 @@ mod tests {
         assert_eq!(first.replay_digest(), same.replay_digest());
         assert_ne!(first.replay_digest(), different_bound.replay_digest());
         assert_ne!(first.replay_digest(), different_contract.replay_digest());
+    }
+
+    #[test]
+    fn ordered_bound_codec_body_is_exact_canonical_tuple() {
+        let contract = mixed_key_contract();
+        let update = OrderedBoundUpdate::new(
+            &contract,
+            tuple(&contract, [Some(OrderedScalar::Utf8("codec".into())), None]),
+        )
+        .unwrap();
+        let mut encoded = Vec::new();
+
+        update.encode_bound_canonical_into(&mut encoded).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&2_u64.to_be_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&5_u64.to_be_bytes());
+        expected.extend_from_slice(b"codec");
+        expected.push(0);
+        assert_eq!(encoded, expected);
+        assert_eq!(update.canonical_contribution_len(), Ok(encoded.len()));
+        assert!(
+            update.canonical_contribution_bytes().unwrap()
+                > update.canonical_contribution_len().unwrap()
+        );
+    }
+
+    #[test]
+    fn ordered_tuple_codec_helpers_match_canonical_visitor() {
+        let contract = mixed_key_contract();
+        let tuple = tuple(&contract, [Some(OrderedScalar::Utf8("codec".into())), None]);
+        let mut visited = Vec::new();
+        tuple.visit_canonical(|part| visited.extend_from_slice(part));
+        let mut encoded = Vec::new();
+
+        assert_eq!(tuple.encode_canonical_into(&mut encoded), Ok(()));
+        assert_eq!(tuple.canonical_codec_len(), Ok(visited.len()));
+        assert_eq!(encoded, visited);
     }
 }
