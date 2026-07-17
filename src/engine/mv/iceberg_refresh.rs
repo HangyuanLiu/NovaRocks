@@ -15917,12 +15917,7 @@ pub(crate) fn drop_iceberg_mv(
         &target.namespace,
         &target.table,
     )?;
-    crate::engine::delete_iceberg_table_if_needed(
-        state,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
+    drop_iceberg_mv_metadata(state, &target)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
         &target.namespace,
@@ -15936,6 +15931,37 @@ pub(crate) fn drop_iceberg_mv(
         target.table
     );
     Ok(StatementResult::Ok)
+}
+
+fn drop_iceberg_mv_metadata(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for iceberg mv drop".to_string())?;
+    let mut txn = provider
+        .begin_write("drop iceberg mv metadata")
+        .map_err(|e| format!("open iceberg mv drop transaction failed: {e}"))?;
+    let dropped = state
+        .mv_repo
+        .drop_by_target(
+            txn.as_mut(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
+        .map_err(|e| format!("drop iceberg mv metadata failed: {e}"))?;
+    if !dropped {
+        return Err(format!(
+            "materialized view {}.{}.{} metadata disappeared during drop",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    txn.commit()
+        .map_err(|e| format!("commit iceberg mv drop metadata failed: {e}"))?;
+    Ok(())
 }
 
 fn preflight_iceberg_mv_drop(
@@ -22942,8 +22968,42 @@ mod tests {
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
 
+        let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition before drop");
+        let mv_id = definition.mv_id;
+        assert!(!list_mv_dependency_names(&env.state, mv_id).is_empty());
+
         let stmt = parse_drop_mv("DROP MATERIALIZED VIEW mv_orders");
         drop_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt).expect("drop mv");
+
+        let provider = env
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read metadata");
+        assert!(
+            env.state
+                .mv_repo
+                .load_by_id(read.as_ref(), mv_id)
+                .expect("load definition")
+                .is_none()
+        );
+        assert!(
+            env.state
+                .mv_repo
+                .list_dependencies_by_downstream(read.as_ref(), mv_id)
+                .expect("list dependencies")
+                .is_empty()
+        );
+        assert!(
+            env.state
+                .mv_repo
+                .list_partition_states(read.as_ref(), mv_id)
+                .expect("list partition states")
+                .is_empty()
+        );
+        drop(read);
 
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
