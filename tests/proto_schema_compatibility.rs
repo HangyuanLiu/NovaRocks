@@ -1157,7 +1157,7 @@ fn compare_proto_schema_to_baseline(current: &ProtoSchema, baseline: &ProtoSchem
             ));
             for service_name in current_file.services.keys() {
                 violations.push(format!(
-                    "{path} service {service_name} new service is not allowed; D3B only allows extending existing NovaRocksGrpc"
+                    "{path} service {service_name} new service is not allowed; the compatibility contract only allows extending existing NovaRocksGrpc"
                 ));
             }
         }
@@ -1603,7 +1603,7 @@ fn compare_proto_services_to_baseline(
     for service_name in current_file.services.keys() {
         if !baseline_file.services.contains_key(service_name) {
             violations.push(format!(
-                "{path} service {service_name} new service is not allowed; D3B only allows extending existing NovaRocksGrpc"
+                "{path} service {service_name} new service is not allowed; the compatibility contract only allows extending existing NovaRocksGrpc"
             ));
         }
     }

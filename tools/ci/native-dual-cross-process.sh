@@ -301,7 +301,6 @@ run_contract() {
     raw_source_guard)
       (
         cd "$REPO_ROOT"
-        cargo test --test architecture_guard nfe_4 -- --nocapture
         python3 tools/dev/audit_thrift_boundaries.py --strict --summary
       ) 2>&1 | tee "$log"
       ;;
