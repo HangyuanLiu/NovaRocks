@@ -1,11 +1,11 @@
--- query 4
+-- query 3
 status	c	total
 NULL	2	100
 CANCELLED	1	50
 NEW	1	20
 PAID	2	40
 
--- query 5
+-- query 4
 status	region	c
 NULL	east	1
 NULL	west	1
@@ -14,6 +14,6 @@ NEW	west	1
 PAID	east	1
 PAID	west	1
 
--- query 6
+-- query 5
 min(status)	max(status)
 CANCELLED	PAID

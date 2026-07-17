@@ -1025,18 +1025,10 @@ pub(crate) fn execute_drop_database_statement(
             Some(&target.namespace),
         )?;
     }
-    // Capture the dictionary owners for every table in this namespace BEFORE
-    // dropping the backend namespace, so we can issue the metadata-store
-    // teardown after the drop succeeds.
-    let owners_pre_drop =
-        crate::engine::dictionary::maintenance::collect_namespace_owners(state, &target);
     match backend.drop_namespace(&target.catalog, &target.namespace, force) {
         Ok(()) => {
             if target.backend_name == "iceberg" {
                 delete_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
-            }
-            for owner in owners_pre_drop {
-                crate::engine::dictionary::maintenance::drop_table_dictionaries(state, &owner)?;
             }
             Ok(StatementResult::Ok)
         }
@@ -1102,12 +1094,6 @@ pub(crate) fn execute_drop_table_statement(
         Err(err) => return Err(err),
     }
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(state, &dependency_ref)?;
-    // Resolve the dictionary owner BEFORE the backend `drop_table` call so we
-    // still have access to the table's metadata (db_id/table_id or table_uuid)
-    // when issuing the metadata-store drop. After the backend drop, the
-    // standalone catalog and StarRocks runtime no longer hold the table.
-    let dict_owner_pre_drop =
-        crate::engine::dictionary::maintenance::resolve_target_owner(state, &target);
     match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
         Ok(()) => {
             if target.backend_name == "iceberg" {
@@ -1128,9 +1114,6 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
-            }
-            if let Some(owner) = dict_owner_pre_drop {
-                crate::engine::dictionary::maintenance::drop_table_dictionaries(state, &owner)?;
             }
             Ok(StatementResult::Ok)
         }

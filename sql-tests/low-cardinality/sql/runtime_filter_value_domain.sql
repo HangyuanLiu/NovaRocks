@@ -17,7 +17,7 @@
 
 -- @tags=low-cardinality,dictionary,runtime-filter
 -- Runtime filters keep value-domain semantics over low-cardinality string data
--- without relying on standalone native dictionary rewrites.
+-- carried directly from Parquet dictionary pages.
 
 CREATE TABLE ${case_db}.dict_rf_probe_t (
   id INT,
@@ -44,9 +44,6 @@ INSERT INTO ${case_db}.dict_rf_build_t VALUES
   ('NEW', 'N'),
   ('CLOSED', 'Y'),
   (NULL, 'Y');
-
-ANALYZE FULL TABLE ${case_db}.dict_rf_probe_t;
-ANALYZE FULL TABLE ${case_db}.dict_rf_build_t;
 
 SET global_runtime_filter_build_max_size = 10737418240;
 SET global_runtime_filter_probe_min_selectivity = 0.0;

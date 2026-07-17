@@ -118,7 +118,7 @@ NULL	NULL	NULL
 7	77777	7
 8	88888	8
 
--- query 46
+-- query 44
 max(c3)	sc3	c2
 NULL	NULL	NULL
 0	0	0
@@ -131,31 +131,31 @@ NULL	NULL	NULL
 7	77777	7
 8	88888	8
 
+-- query 48
+count(*)
+10
+
+-- query 49
+count(*)
+10
+
 -- query 50
 count(*)
 10
 
--- query 51
-count(*)
-10
-
 -- query 52
-count(*)
-10
+sum(c3)
+
+-- query 53
+sum(c3)
 
 -- query 54
 sum(c3)
 
--- query 55
-sum(c3)
-
--- query 56
-sum(c3)
-
--- query 59
+-- query 57
 count(*)
 10
 
--- query 60
+-- query 58
 count(*)
 10

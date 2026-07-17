@@ -114,26 +114,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-11",
     },
     EngineFileOwner {
-        path: "src/engine/dictionary/maintenance.rs",
-        target_owner: "dictionary",
-        migration_task: "EBD-8",
-    },
-    EngineFileOwner {
-        path: "src/engine/dictionary/mod.rs",
-        target_owner: "dictionary",
-        migration_task: "EBD-8",
-    },
-    EngineFileOwner {
-        path: "src/engine/dictionary/model.rs",
-        target_owner: "dictionary",
-        migration_task: "EBD-8",
-    },
-    EngineFileOwner {
-        path: "src/engine/dictionary/rebuild.rs",
-        target_owner: "dictionary",
-        migration_task: "EBD-8",
-    },
-    EngineFileOwner {
         path: "src/engine/dml_change_stream.rs",
         target_owner: "dml",
         migration_task: "EBD-12B",
@@ -497,9 +477,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/catalog_mgr/mod.rs||external|path=default|metadata",
     "src/engine/catalog_mgr/mod.rs||external|path=default|provider",
     "src/engine/catalog_mgr/mod.rs||external|path=default|schema_cache",
-    "src/engine/dictionary/mod.rs||external|path=default|maintenance",
-    "src/engine/dictionary/mod.rs||external|path=default|model",
-    "src/engine/dictionary/mod.rs||external|path=default|rebuild",
     "src/engine/mod.rs||external|path=default|aggregate",
     "src/engine/mod.rs||external|path=default|backend_ops",
     "src/engine/mod.rs||external|path=default|backend_resolver",
@@ -507,7 +484,6 @@ const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
     "src/engine/mod.rs||external|path=default|catalog_mgr",
     "src/engine/mod.rs||external|path=default|delete_flow",
     "src/engine/mod.rs||external|path=default|delete_predicate_translate",
-    "src/engine/mod.rs||external|path=default|dictionary",
     "src/engine/mod.rs||external|path=default|dml_change_stream",
     "src/engine/mod.rs||external|path=default|equality_delete_flow",
     "src/engine/mod.rs||external|path=default|iceberg_change_stream_write",
@@ -805,7 +781,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneState",
             "crate::engine::StatementResult",
             "crate::engine::build_local_insert_batch",
-            "crate::engine::dictionary::maintenance::mark_starrocks_table_stale",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_agg_state",
             "crate::engine::reorder_insert_rows",
@@ -1094,18 +1069,6 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &["crate::engine::StandaloneState"],
     ),
     (
-        "src/engine/dictionary/maintenance.rs",
-        &["crate::engine::StandaloneState"],
-    ),
-    (
-        "src/engine/dictionary/mod.rs",
-        &["crate::engine::StandaloneState"],
-    ),
-    (
-        "src/engine/dictionary/rebuild.rs",
-        &["crate::engine::StandaloneState"],
-    ),
-    (
         "src/engine/dml_change_stream.rs",
         &["crate::engine::StandaloneState"],
     ),
@@ -1256,15 +1219,7 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
     ),
 ];
 
-const FORWARDING_REEXPORTS: &[&str] = &[
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryOwner|crate::sql::common::dictionary::DictionaryOwner",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionarySnapshot|crate::sql::common::dictionary::DictionarySnapshot",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryState|crate::sql::common::dictionary::DictionaryState",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryValue|crate::sql::common::dictionary::DictionaryValue",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryWatermark|crate::sql::common::dictionary::DictionaryWatermark",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|QueryDictionarySelection|crate::sql::common::dictionary::QueryDictionarySelection",
-    "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
-];
+const FORWARDING_REEXPORTS: &[&str] = &[];
 
 const CURRENT_ENGINE_BOUNDARY_BASELINE: EngineBoundaryBaseline = EngineBoundaryBaseline {
     file_owners: ENGINE_FILE_OWNERS,
@@ -2432,7 +2387,6 @@ fn target_owner_is_allowed(target_owner: &str) -> bool {
         "catalog",
         "connector",
         "coordinator",
-        "dictionary",
         "dml",
         "formats",
         "frontend",
@@ -2473,17 +2427,13 @@ fn baseline_arrays_are_canonical() -> bool {
 fn ebd_1_engine_migration_firewall_matches_source_tree() {
     let actual = current_source_tree_snapshot();
     assert!(
-        actual.engine_files.len() >= 88,
+        actual.engine_files.len() >= 80,
         "EBD-1 must scan the full engine tree, found only {} files",
         actual.engine_files.len()
     );
     assert!(
         !actual.external_engine_dependencies.is_empty(),
         "EBD-1 engine dependency scan must be non-vacuous"
-    );
-    assert!(
-        !actual.forwarding_reexports.is_empty(),
-        "EBD-1 must retain the known forwarding debt until its owner task removes it"
     );
     assert!(
         actual.lower_layer_frontend_dependencies.is_empty(),

@@ -86,7 +86,6 @@ pub(crate) fn optimize(
     scalar_arena: ScalarArena,
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
-    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
@@ -96,7 +95,6 @@ pub(crate) fn optimize(
         scalar_arena,
         stats_input,
         factory,
-        dictionary_provider,
         mv_candidates,
         PhysicalPropertySet::gather(),
     )
@@ -120,7 +118,6 @@ pub(crate) fn optimize_with_root_distribution(
         scalar_arena,
         stats_input,
         factory,
-        None,
         Vec::new(),
         root_required,
     )
@@ -131,7 +128,6 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
-    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<OptimizedOperatorNode, String> {
     // Migration-only entry point for callers that still build unbound scan
@@ -143,7 +139,6 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
         scalar_arena,
         stats_input,
         factory,
-        dictionary_provider,
         mv_candidates,
         PhysicalPropertySet::gather(),
     )
@@ -167,7 +162,6 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
         scalar_arena,
         stats_input,
         factory,
-        None,
         Vec::new(),
         root_required,
     )
@@ -178,7 +172,6 @@ fn optimize_with_root_property(
     scalar_arena: ScalarArena,
     stats_input: OptimizerStatsInput,
     factory: ColumnRefFactory,
-    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
 ) -> Result<OptimizedOperatorNode, String> {
@@ -200,9 +193,6 @@ fn optimize_with_root_property(
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
-    if let Some(provider) = resolve_dictionary_provider(dictionary_provider) {
-        rewrite_ctx.set_dictionary_provider(provider);
-    }
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
@@ -374,20 +364,6 @@ fn optimizer_rejects_unbound_scan_stats() {
         err.contains("optimizer scan statistics are not bound"),
         "unexpected error: {err}"
     );
-}
-
-/// Resolve which dictionary provider should be attached to the rewrite context
-/// for this `optimize()` call.
-///
-/// Precedence: an explicit `parameter` (passed by the caller) wins over
-/// any `with_dictionary_provider` TLS binding. The parameter wins even
-/// when it is a provider that returns `None` for every column, so
-/// production sites that pass `None` deliberately fall through to TLS
-/// instead of overriding it with a silent no-op.
-fn resolve_dictionary_provider(
-    parameter: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
-) -> Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>> {
-    parameter.or_else(rewrite::context::current_dictionary_provider)
 }
 
 /// True if `name` is the stable name of any rule that participates in
@@ -681,8 +657,8 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let optimized_tree = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
-            .expect("optimize values");
+        let optimized_tree =
+            optimize_logical(plan, &HashMap::new(), factory, Vec::new()).expect("optimize values");
         let optimized_tree_debug = format!("{optimized_tree:?}");
         assert!(optimized_tree_debug.contains("PhysicalValues"));
     }
@@ -990,42 +966,25 @@ mod is_known_rule_name_tests {
         assert!(is_known_rule_name("CommonSubexpressionReuse"));
     }
 
-    // --- Item 4 (Important): provider precedence tests for optimize() ---
-
-    use std::sync::Arc;
-
     use arrow::datatypes::DataType;
 
     use crate::catalog::schema::ColumnDef;
-    use crate::engine::dictionary::model::{
-        DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue, DictionaryWatermark,
-    };
-    use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+    use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-    use crate::sql::optimizer::rewrite::context::{
-        QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
-        with_dictionary_provider,
-    };
     use crate::sql::planner::table::{ScanSource, TableDef};
-    use std::cell::RefCell;
 
-    use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarNode};
     use crate::sql::optimizer::stats_input::{
         BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
         StatsSource,
     };
-    use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
-    use crate::sql::planner::optimizer_bridge::logical::{
-        to_logical_plan, to_optimizer_expr, try_to_optimizer_expr,
-    };
-    use crate::sql::planner::payload::{AggregateCall, PlanScanNode};
+    use crate::sql::planner::logical::LogicalPlanNode;
+    use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
 
     fn optimize_logical(
         plan: LogicalPlanNode,
         table_stats: &HashMap<String, TableStatistics>,
         factory: ColumnRefFactory,
-        dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
         mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
@@ -1035,7 +994,6 @@ mod is_known_rule_name_tests {
             scalar_arena,
             table_stats,
             factory,
-            dictionary_provider,
             mv_candidates,
         )
     }
@@ -1356,7 +1314,6 @@ mod is_known_rule_name_tests {
             query_scalars,
             &stats,
             ColumnRefFactory::new(),
-            None,
             vec![candidate],
         )
         .expect("optimize");
@@ -1365,190 +1322,6 @@ mod is_known_rule_name_tests {
             plan_contains_mv_scan(&optimized_tree, "or_mv"),
             "optimizer should select the cheaper exact OR MV alternative, got {optimized_tree:#?}"
         );
-    }
-
-    struct AlwaysSomeProvider;
-    impl QueryDictionaryProvider for AlwaysSomeProvider {
-        fn load_active_snapshot(
-            &self,
-            _table: &TableDef,
-            _database: &str,
-            column_name: &str,
-        ) -> Result<Option<DictionarySnapshot>, String> {
-            Ok(Some(DictionarySnapshot {
-                dictionary_id: 1,
-                owner: DictionaryOwner::StarRocksTable {
-                    database: "db".to_string(),
-                    table: "t".to_string(),
-                    db_id: 1,
-                    table_id: 2,
-                },
-                column_id: Some(10),
-                column_name: column_name.to_string(),
-                data_type: DataType::Utf8,
-                version: 1,
-                watermark: DictionaryWatermark::Iceberg {
-                    snapshot_id: None,
-                    schema_id: 0,
-                },
-                values: vec![DictionaryValue {
-                    id: 1,
-                    bytes: b"a".to_vec(),
-                }],
-                null_id: 0,
-                state: DictionaryState::Active,
-                order_preserving: true,
-            }))
-        }
-    }
-
-    struct AlwaysNoneProvider;
-    impl QueryDictionaryProvider for AlwaysNoneProvider {
-        fn load_active_snapshot(
-            &self,
-            _table: &TableDef,
-            _database: &str,
-            _column_name: &str,
-        ) -> Result<Option<DictionarySnapshot>, String> {
-            Ok(None)
-        }
-    }
-
-    /// Build the minimal Aggregate(Scan) shape that the rewrite rule
-    /// can act on: GROUP BY on the string column `s`.
-    fn agg_over_string_scan() -> LogicalPlanNode {
-        // Use deterministic non-UNSET column IDs so that intern_typed succeeds.
-        let s_id = ColumnId::new_for_test(1);
-        let cnt_id = ColumnId::new_for_test(2);
-        let table = TableDef {
-            name: "t".to_string(),
-            columns: vec![ColumnDef {
-                name: "s".to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
-        };
-        let s_col = OutputColumn {
-            column_id: s_id,
-            name: "s".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            is_internal: false,
-        };
-        let scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
-                database: "db".to_string(),
-                table: table,
-                alias: None,
-                columns: vec![s_col.clone()],
-                predicates: vec![],
-                required_columns: None,
-                variant_columns: vec![],
-                mv_rewritten_from: None,
-            }),
-            vec![],
-            None,
-        );
-        let s_ref = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: s_id,
-                qualifier: None,
-                column: "s".to_string(),
-            },
-            data_type: DataType::Utf8,
-            nullable: false,
-        };
-        LogicalPlanNode::new(
-            LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![s_ref],
-                aggregates: vec![AggregateCall {
-                    name: "count".to_string(),
-                    args: vec![],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![],
-                    output_column_id: cnt_id,
-                }],
-                output_columns: vec![
-                    s_col,
-                    OutputColumn {
-                        column_id: cnt_id,
-                        name: "cnt".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                ],
-                already_pushed: false,
-            }),
-            vec![scan],
-            None,
-        )
-    }
-
-    /// Run the query rewrite pipeline against `agg_over_string_scan`
-    /// using the same precedence rule that `optimize()` applies.
-    fn rewrite_with(parameter: Option<Arc<dyn QueryDictionaryProvider>>) -> LogicalPlanNode {
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        if let Some(provider) = resolve_dictionary_provider(parameter) {
-            ctx.set_dictionary_provider(provider);
-        }
-        ctx.set_query_stats_input(
-            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
-                &HashMap::new(),
-            ),
-        );
-        let pipeline = query_rewrite_pipeline();
-        let mut scalars = ScalarArena::new();
-        let opt_plan = to_optimizer_expr(&agg_over_string_scan(), &mut scalars);
-        let arena_rc = Rc::new(RefCell::new(scalars));
-        ctx.set_scalar_arena(arena_rc.clone());
-        let opt_result = pipeline.rewrite(opt_plan, &mut ctx).unwrap();
-        let arena = arena_rc.borrow();
-        to_logical_plan(opt_result, &arena)
-    }
-
-    fn assert_no_native_dict_rewrite(rewritten: &LogicalPlanNode, context: &str) {
-        let LogicalPlanKind::Aggregate(_) = &rewritten.kind else {
-            panic!("{context}: expected aggregate root, got {rewritten:?}")
-        };
-        let LogicalPlanKind::Scan(_) = &rewritten.unary_input().kind else {
-            panic!(
-                "{context}: expected scan child, got {:?}",
-                rewritten.unary_input()
-            )
-        };
-    }
-
-    #[test]
-    fn optimize_with_none_provider_does_not_rewrite() {
-        // Sanity: ensure TLS is unset for this thread.
-        assert!(current_dictionary_provider().is_none());
-        let rewritten = rewrite_with(None);
-        assert_no_native_dict_rewrite(&rewritten, "no provider");
-    }
-
-    #[test]
-    fn optimize_with_tls_provider_does_not_rewrite_after_legacy_removal() {
-        let provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysSomeProvider);
-        let rewritten = with_dictionary_provider(provider, || rewrite_with(None));
-        assert_no_native_dict_rewrite(&rewritten, "TLS provider");
-    }
-
-    #[test]
-    fn optimize_parameter_provider_does_not_rewrite_after_legacy_removal() {
-        let tls_provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysSomeProvider);
-        let param_provider: Arc<dyn QueryDictionaryProvider> = Arc::new(AlwaysNoneProvider);
-        let rewritten =
-            with_dictionary_provider(tls_provider, || rewrite_with(Some(param_provider.clone())));
-        assert_no_native_dict_rewrite(&rewritten, "parameter provider");
     }
 
     #[test]
@@ -1572,7 +1345,7 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let optimized_tree = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
+        let optimized_tree = optimize_logical(plan, &HashMap::new(), factory, Vec::new())
             .expect("optimize assert one row");
         let optimized_tree_debug = format!("{optimized_tree:?}");
         assert!(optimized_tree_debug.contains("PhysicalAssertOneRow"));
@@ -1646,13 +1419,7 @@ mod is_known_rule_name_tests {
             ..Default::default()
         };
         let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
-            optimize_logical(
-                plan,
-                &HashMap::new(),
-                ColumnRefFactory::new(),
-                None,
-                Vec::new(),
-            )
+            optimize_logical(plan, &HashMap::new(), ColumnRefFactory::new(), Vec::new())
         })
         .expect_err("backstop must reject the residual apply");
         assert!(
@@ -1732,7 +1499,6 @@ mod is_known_rule_name_tests {
             logical.clone(),
             &HashMap::new(),
             ColumnRefFactory::new(),
-            None,
             Vec::new(),
         )
         .expect("default optimize");
@@ -1888,7 +1654,7 @@ mod is_known_rule_name_tests {
             "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",
             rewrite_ctx.trace().events()
         );
-        let optimized_tree = optimize_logical(logical, &HashMap::new(), factory, None, Vec::new())
+        let optimized_tree = optimize_logical(logical, &HashMap::new(), factory, Vec::new())
             .expect("optimize ranking window");
 
         assert!(
@@ -1983,14 +1749,10 @@ mod is_known_rule_name_tests {
 
         // optimize: M1b's decorrelation rules must rewrite the Apply to a
         // join; no ApplyException error, no residual Apply.
-        let optimized_tree = optimize_logical(
-            plan,
-            &HashMap::new(),
-            ColumnRefFactory::new(),
-            None,
-            Vec::new(),
-        )
-        .expect("optimize must succeed: M1b decorrelates correlated aggregate scalar subquery");
+        let optimized_tree =
+            optimize_logical(plan, &HashMap::new(), ColumnRefFactory::new(), Vec::new()).expect(
+                "optimize must succeed: M1b decorrelates correlated aggregate scalar subquery",
+            );
 
         let physical_debug = format!("{optimized_tree:?}");
         // The correlated aggregate scalar path becomes a LEFT OUTER JOIN (HashJoin or NestLoop).

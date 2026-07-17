@@ -435,7 +435,6 @@ mod tests {
             ScalarArena::new(),
             &plan.snapshot,
             ColumnRefFactory::default(),
-            None,
             Vec::new(),
         )
         .expect("optimizer should consume bound catalog stats");

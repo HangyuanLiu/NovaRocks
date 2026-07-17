@@ -246,28 +246,15 @@ USE ${case_db};
 select * from (select max(c3), sum(c3) sc3, c1 from t5 group by c1 limit 10) t order by 3;
 
 -- query 44
--- @skip_result_check=true
-USE ${case_db};
-analyze full table t5;
-
--- query 45
--- R0 retired native low-cardinality DECODE plan nodes; after ANALYZE FULL,
--- aggregate coverage must not reintroduce that legacy shape.
--- @result_not_contains=DECODE
--- @skip_result_check=true
-USE ${case_db};
-EXPLAIN VERBOSE SELECT DISTINCT c2 FROM t5;
-
--- query 46
 USE ${case_db};
 select * from (select max(c3), sum(c3) sc3, c2 from t5 group by c2 limit 10) t order by 3;
 
--- query 47
+-- query 45
 -- @skip_result_check=true
 USE ${case_db};
 set streaming_preaggregation_mode="force_streaming";
 
--- query 48
+-- query 46
 -- @skip_result_check=true
 USE ${case_db};
 create table t6 (
@@ -278,24 +265,24 @@ create table t6 (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 49
+-- query 47
 -- @skip_result_check=true
 USE ${case_db};
 insert into t6 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  10000));
 
--- query 50
+-- query 48
 USE ${case_db};
 select count(*) from (select sum(c3) from t6 group by c1, c2 limit 10) t;
 
--- query 51
+-- query 49
 USE ${case_db};
 select count(*) from (select sum(c3) from t6 group by c1, c2, c3 limit 10) t;
 
--- query 52
+-- query 50
 USE ${case_db};
 select count(*) from (select sum(c3) from t6 group by c2, c1 limit 10) t;
 
--- query 53
+-- query 51
 -- @skip_result_check=true
 USE ${case_db};
 create table tempty (
@@ -306,19 +293,19 @@ create table tempty (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 54
+-- query 52
 USE ${case_db};
 select sum(c3) from tempty group by c1, c2 limit 10;
 
--- query 55
+-- query 53
 USE ${case_db};
 select sum(c3) from tempty group by c1, c2, c3 limit 10;
 
--- query 56
+-- query 54
 USE ${case_db};
 select sum(c3) from tempty group by c2, c1 limit 10;
 
--- query 57
+-- query 55
 -- @skip_result_check=true
 USE ${case_db};
 create table tarray (
@@ -328,15 +315,15 @@ create table tarray (
 )
 TBLPROPERTIES ("format-version" = "3");
 
--- query 58
+-- query 56
 -- @skip_result_check=true
 USE ${case_db};
 insert into tarray SELECT generate_series, [generate_series], generate_series FROM TABLE(generate_series(1,  10000));
 
--- query 59
+-- query 57
 USE ${case_db};
 select count(*) from (select sum(c3) from tarray group by c1, c3 limit 10) t;
 
--- query 60
+-- query 58
 USE ${case_db};
 select count(*) from (select sum(c3) from tarray group by c1 limit 10) t;

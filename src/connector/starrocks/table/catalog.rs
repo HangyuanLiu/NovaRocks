@@ -1259,9 +1259,8 @@ mod tests {
     }
 
     /// `starrocks_table_def` must populate `ScanSource::StarRocks { db_id, table_id }`
-    /// from the runtime's identity fields. The dict-rewrite hot path
-    /// (`DictionaryQueryProvider::owner_for`) reads these values directly to
-    /// avoid taking `state.starrocks_table.read()` on every Scan column.
+    /// from the runtime's identity fields so downstream planning retains stable
+    /// table identity without relying on mutable names.
     #[test]
     fn starrocks_table_def_carries_runtime_ids_in_scan_source() {
         let runtime = sample_runtime_with_ids(12_345, 67_890);

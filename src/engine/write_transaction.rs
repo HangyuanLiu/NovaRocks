@@ -86,7 +86,7 @@ pub(crate) struct IcebergWriteTransactionOutcome {
 }
 
 /// The side-effecting dependencies of a write transaction. Real implementation
-/// (PR-2) wraps the execution coordinator + typed commit service + cache/dict
+/// (PR-2) wraps the execution coordinator + typed commit service + cache
 /// finalization; tests inject a fake.
 pub(crate) trait IcebergWriteTransactionExecutor {
     /// Run the coordinated writer plan, returning the writer outcome.
@@ -102,7 +102,7 @@ pub(crate) trait IcebergWriteTransactionExecutor {
         write_commit: &WriteCommitInput,
     ) -> Result<CommitOutcome, CommitServiceError>;
 
-    /// Post-commit finalization (cache invalidation, dictionary stale marking).
+    /// Post-commit finalization (cache invalidation).
     fn finalize(&self, spec: &IcebergWriteTransactionSpec) -> Result<(), String>;
 }
 
@@ -223,8 +223,7 @@ impl IcebergWriteCommitExecutor {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)?;
-        crate::engine::dictionary::maintenance::mark_target_stale(&self.state, &self.target)
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 
