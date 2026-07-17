@@ -46897,8 +46897,11 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
             let is_std_include = canonical
                 .as_ref()
                 .is_ok_and(|path| pbf_1a_path_is_std_include(path));
-            let is_unproven_include_alias =
-                canonical.is_err() && path.last().is_some_and(|segment| segment == "include");
+            let is_unproven_include_alias = canonical.is_err()
+                && (path.last().is_some_and(|segment| segment == "include")
+                    || path
+                        .first()
+                        .is_some_and(|segment| self.ambiguous_aliases.contains(segment)));
             if is_bare_include || is_std_include || is_unproven_include_alias {
                 self.findings.push("include! macro".to_string());
             }
@@ -47548,6 +47551,17 @@ owner::include!("diagnostic-only");
         "an unrelated grouped self alias must remain outside std::include! provenance: {unrelated_grouped_violations:?}"
     );
 
+    let unrelated_macro_name = r#"
+macro_rules! load { ($value:literal) => { $value }; }
+const _: &str = load!("diagnostic-only");
+"#;
+    let unrelated_macro_violations =
+        pbf_1a_source_indirection_violations("src/protocol/common/error.rs", unrelated_macro_name);
+    assert!(
+        unrelated_macro_violations.is_empty(),
+        "an ordinary macro name without ambiguous alias provenance must remain legal: {unrelated_macro_violations:?}"
+    );
+
     for invalid in [
         "#[path = \"legacy.rs\"] mod error;",
         "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
@@ -47563,6 +47577,7 @@ owner::include!("diagnostic-only");
         "use std::{self as owner}; owner::include!(\"legacy.rs\");",
         "use r#std::{self as r#owner}; r#owner::r#include!(\"legacy.rs\");",
         "use std::{self as owner}; use owner::{self as chained}; chained::include!(\"legacy.rs\");",
+        "mod left { use std::include as load; load!(\"legacy.rs\"); } mod right { use std::format as load; }",
     ] {
         let violations =
             pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
