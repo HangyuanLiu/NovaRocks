@@ -21,7 +21,8 @@ use std::path::Path;
 use super::{
     manifest_dir, rel, rs_files, rust_all_source_canonical_paths, rust_lexically_sanitized,
     rust_module_items, rust_production_canonical_paths, rust_production_use_statements,
-    rust_sanitized_production_text, rust_source_module_segments, rust_source_tokens,
+    rust_raw_use_statements, rust_sanitized_production_text, rust_source_module_segments,
+    rust_source_tokens,
 };
 
 const OWNER: &str = "src/coordinator/cluster/mod.rs";
@@ -188,11 +189,19 @@ fn ebd_5b1_retired_path_violations(source_rel: &str, source: &str) -> Vec<String
 
 fn ebd_5b1_scheduler_snapshot_violations(source: &str) -> Vec<String> {
     let production = rust_sanitized_production_text(source);
-    let mut violations = ["type LiveBackend =", "struct LiveBackendSnapshot"]
+    let tokens = rust_source_tokens(&production)
         .into_iter()
-        .filter(|definition| production.contains(definition))
-        .map(|definition| format!("scheduler still owns {definition}"))
+        .map(|token| token.text)
         .collect::<Vec<_>>();
+    let mut violations = [
+        ("type", "LiveBackend"),
+        ("type", "LiveBackendSnapshot"),
+        ("struct", "LiveBackendSnapshot"),
+    ]
+    .into_iter()
+    .filter(|(kind, name)| tokens.windows(2).any(|pair| pair == [*kind, *name]))
+    .map(|(kind, name)| format!("scheduler still owns {kind} {name}"))
+    .collect::<Vec<_>>();
     let cluster_prefix = "crate::coordinator::cluster";
     violations.extend(
         rust_production_use_statements(source)
@@ -304,11 +313,25 @@ fn ebd_5b1_owner_definition_violations(sources: &[(&str, &str)]) -> Vec<String> 
 }
 
 fn ebd_5b1_runtime_module_violations(source: &str) -> Vec<String> {
-    rust_module_items(source)
+    let mut violations = rust_module_items(source)
         .into_iter()
         .filter(|module| module.name == "backend_registry")
         .map(|_| "runtime retains backend_registry module/forwarder".to_string())
-        .collect()
+        .collect::<Vec<_>>();
+    violations.extend(
+        rust_raw_use_statements(&rust_lexically_sanitized(source))
+            .into_iter()
+            .filter(|import| import.path.alias.as_deref() == Some("backend_registry"))
+            .map(|import| {
+                format!(
+                    "runtime recreates backend_registry alias: {} as backend_registry",
+                    import.path.segments.join("::")
+                )
+            }),
+    );
+    violations.sort();
+    violations.dedup();
+    violations
 }
 
 fn ebd_5b1_cluster_membership_boundary_violations(repo: &Path) -> Vec<String> {
@@ -540,6 +563,24 @@ fn ebd_5b1_detector_rejects_secondary_owner_alias_indirection_and_decoys() {
         .is_empty(),
         "private scheduler consumption must remain allowed"
     );
+    for scheduler_type_alias in [
+        "pub(crate) type LiveBackendSnapshot = crate::coordinator::cluster::LiveBackendSnapshot;",
+        "type LiveBackend = crate::coordinator::cluster::LiveBackend;",
+    ] {
+        assert!(
+            !ebd_5b1_scheduler_snapshot_violations(scheduler_type_alias).is_empty(),
+            "scheduler type alias must not recreate snapshot ownership: {scheduler_type_alias}"
+        );
+    }
+    for decoy in [
+        "#[cfg(test)] type LiveBackendSnapshot = ();",
+        "const NOTE: &str = \"type LiveBackendSnapshot = ();\";",
+    ] {
+        assert!(
+            ebd_5b1_scheduler_snapshot_violations(decoy).is_empty(),
+            "scheduler type-alias decoy must be ignored: {decoy}"
+        );
+    }
 
     let owner = r#"
 type BeId = u32;
@@ -571,6 +612,26 @@ struct LiveBackendSnapshot;
         !ebd_5b1_runtime_module_violations(&forwarding).is_empty(),
         "runtime forwarding module must be rejected"
     );
+    for runtime_alias in [
+        "pub(crate) use crate::coordinator::cluster as backend_registry;",
+        "pub(crate) use crate::coordinator::{cluster as backend_registry};",
+        "pub(crate) use crate::coordinator::cluster::{self as backend_registry};",
+        "#[cfg(test)] pub(crate) use crate::coordinator::cluster as backend_registry;",
+    ] {
+        assert!(
+            !ebd_5b1_runtime_module_violations(runtime_alias).is_empty(),
+            "runtime alias must not recreate the retired backend_registry path: {runtime_alias}"
+        );
+    }
+    for decoy in [
+        "const NOTE: &str = \"use crate::coordinator::cluster as backend_registry;\";",
+        "const RAW: &str = r#\"use crate::coordinator::cluster as backend_registry;\"#;",
+    ] {
+        assert!(
+            ebd_5b1_runtime_module_violations(decoy).is_empty(),
+            "runtime alias decoy must be ignored: {decoy}"
+        );
+    }
 
     let live_snapshot = "LiveBackendSnapshot";
     let real_consumer = format!(
