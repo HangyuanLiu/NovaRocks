@@ -495,15 +495,6 @@ pub(crate) fn mark_query_failed(query_id: &UniqueId, reason: String) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn test_clear_registry() {
-    registry()
-        .queries
-        .lock()
-        .expect("write coordinator registry lock")
-        .clear();
-}
-
-#[cfg(test)]
 pub(crate) struct WriteRegistryTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     registered_queries: Vec<UniqueId>,
@@ -521,19 +512,26 @@ impl WriteRegistryTestGuard {
         Ok(coord)
     }
 
-    pub(crate) fn unregister_query(&mut self, query_id: &UniqueId) {
+    pub(crate) fn unregister_query(&mut self, query_id: &UniqueId) -> bool {
+        let Some(index) = self
+            .registered_queries
+            .iter()
+            .position(|registered| registered == query_id)
+        else {
+            return false;
+        };
         unregister_query(query_id);
-        self.registered_queries.retain(|id| id != query_id);
+        self.registered_queries.remove(index);
+        true
     }
 }
 
 #[cfg(test)]
 impl Drop for WriteRegistryTestGuard {
     fn drop(&mut self) {
-        for query_id in self.registered_queries.iter().rev() {
-            unregister_query(query_id);
+        while let Some(query_id) = self.registered_queries.pop() {
+            unregister_query(&query_id);
         }
-        test_clear_registry();
     }
 }
 
@@ -543,7 +541,6 @@ pub(crate) fn write_registry_test_guard() -> WriteRegistryTestGuard {
     let lock = REGISTRY_TEST_LOCK
         .lock()
         .expect("write coordinator registry test lock");
-    test_clear_registry();
     WriteRegistryTestGuard {
         _lock: lock,
         registered_queries: Vec::new(),
@@ -1090,7 +1087,7 @@ mod tests {
             .expect("commit input");
         assert_eq!(commit.write_id, query_id);
 
-        guard.unregister_query(&query_id);
+        assert!(guard.unregister_query(&query_id));
         let err = handle_fragment_report_exec_status(report(
             &writer,
             true,
@@ -1215,6 +1212,80 @@ mod tests {
         let err = register_query(query_id.clone(), vec![writer])
             .expect_err("duplicate query registration must fail");
         assert!(err.contains("already registered"), "{err}");
+    }
+
+    #[test]
+    fn write_registry_test_guard_preserves_unrelated_registration() {
+        let query_a = id(960, 961);
+        let writer_a = key(960, 961, 962, 963, 0);
+        let registration_a =
+            RegisteredWriteCoordinator::register(query_a.clone(), vec![writer_a.clone()])
+                .expect("register unrelated production-style coordinator");
+
+        let query_b = id(970, 971);
+        let writer_b = key(970, 971, 972, 973, 0);
+        let query_c = id(980, 981);
+        let writer_c = key(980, 981, 982, 983, 0);
+        let replacement_b = {
+            let mut guard = write_registry_test_guard();
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer_a)).unwrap(),
+                WriterReportLookup::Expected
+            );
+            assert!(!guard.unregister_query(&query_a));
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer_a)).unwrap(),
+                WriterReportLookup::Expected
+            );
+
+            guard
+                .register_query(query_b.clone(), vec![writer_b.clone()])
+                .expect("register explicitly removed guard-owned coordinator");
+            assert!(guard.unregister_query(&query_b));
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer_b)).unwrap(),
+                WriterReportLookup::UnknownQuery {
+                    query_id: query_b.clone()
+                }
+            );
+            let replacement_b =
+                RegisteredWriteCoordinator::register(query_b.clone(), vec![writer_b.clone()])
+                    .expect("replace explicitly removed guard-owned coordinator");
+
+            guard
+                .register_query(query_c.clone(), vec![writer_c.clone()])
+                .expect("register drop-cleaned guard-owned coordinator");
+            assert_eq!(
+                lookup_native_writer_report(&native_report(&writer_c)).unwrap(),
+                WriterReportLookup::Expected
+            );
+            drop(guard);
+            replacement_b
+        };
+
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer_c)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id: query_c }
+        );
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer_a)).unwrap(),
+            WriterReportLookup::Expected
+        );
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer_b)).unwrap(),
+            WriterReportLookup::Expected
+        );
+
+        drop(replacement_b);
+        drop(registration_a);
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer_b)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id: query_b }
+        );
+        assert_eq!(
+            lookup_native_writer_report(&native_report(&writer_a)).unwrap(),
+            WriterReportLookup::UnknownQuery { query_id: query_a }
+        );
     }
 
     #[test]
