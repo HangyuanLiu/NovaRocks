@@ -1516,21 +1516,14 @@ impl MysqlWriteActorState {
             Err(_) => LocalPrepareCleanup::Unknown,
         };
         let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-        let terminalization = match timeout_at(
+        let terminalization = super::commit::terminalize_undispatched(
+            Arc::clone(&self.pool),
+            &self.codec,
+            self.transaction_id,
+            reservation_token,
             cleanup_deadline,
-            super::commit::terminalize_undispatched(
-                Arc::clone(&self.pool),
-                &self.codec,
-                self.transaction_id,
-                reservation_token,
-                cleanup_deadline,
-            ),
         )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(_) => Err(terminalization_deadline_error()),
-        };
+        .await;
         classify_prepare_failure(PrepareFailureEvidence {
             prepare_error,
             local_cleanup,
@@ -2002,13 +1995,6 @@ fn classify_prepare_failure(evidence: PrepareFailureEvidence) -> CommitOutcome {
         }
         Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
     }
-}
-
-const fn terminalization_deadline_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::DeadlineExceeded,
-        "MySQL commit terminalization exceeded its independent cleanup deadline",
-    )
 }
 
 const fn conflict(message: &'static str) -> StateStoreError {

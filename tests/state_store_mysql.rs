@@ -3140,6 +3140,96 @@ async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkou
 
 #[cfg(feature = "state-store-test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection() {
+    let database = TestDatabase::provision("prepare_terminalize_row_lock", "locked_ledger");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 2;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let transaction_id = transaction_id();
+    MysqlCommitTestApi::fail_next_prepare_after_reservation(MysqlPrepareRollbackFailure::Error);
+    let terminalization = MysqlCommitTestApi::arm_terminalization();
+    let mut writer = store
+        .begin_write(transaction_id, "terminalization row lock timeout")
+        .await
+        .expect("begin locked terminalization writer");
+    writer
+        .put(
+            key(Bytes::from_static(b"prepare/terminalize-row-lock")),
+            value(Bytes::from_static(b"must-not-commit")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage locked terminalization mutation");
+    let waiter = tokio::spawn(async move { writer.commit().await });
+    terminalization.wait_dispatched().await;
+    let blocker = MysqlCommitTestApi::hold_ledger_lock(&runtime, &database.name, transaction_id)
+        .await
+        .expect("lock own pending ledger row");
+    MysqlStatementTestApi::reset_last_explicit_destroy();
+    let terminalization_query = MysqlCommitTestApi::arm_terminalization_query();
+    terminalization.allow_provider_progress();
+    terminalization_query.wait_dispatched().await;
+    let terminalization_connection = terminalization_query.connection_id();
+    assert_ne!(terminalization_connection, 0);
+    let started = tokio::time::Instant::now();
+    let outcome = waiter.await.expect("join locked terminalization waiter");
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::CommitUnknown(ref error)
+                if error.kind() == StateStoreErrorKind::DeadlineExceeded
+        ),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1_500));
+    blocker.release().await.expect("release pending ledger row");
+    assert_eq!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve locked terminalization timeout"),
+        novarocks::state_store::CommitResolution::Unresolved
+    );
+
+    let mut first = hold_connection(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("checkout first connection after terminalization timeout");
+    let first_id = first
+        .connection_id(Duration::from_secs(4))
+        .await
+        .expect("read first post-timeout connection ID");
+    let mut second = hold_connection(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("checkout second connection after terminalization timeout");
+    let second_id = second
+        .connection_id(Duration::from_secs(4))
+        .await
+        .expect("read second post-timeout connection ID");
+    eprintln!(
+        "MYSQL_TERMINALIZATION_TIMEOUT_CONNECTIONS terminalization={terminalization_connection} post=[{first_id},{second_id}]"
+    );
+    assert_ne!(first_id, terminalization_connection);
+    assert_ne!(second_id, terminalization_connection);
+    drop(first);
+    drop(second);
+    active_readiness(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("provider remains protocol-clean after terminalization timeout");
+    assert_eq!(
+        MysqlStatementTestApi::last_explicitly_destroyed_connection_id(),
+        terminalization_connection,
+        "timed-out terminalization connection must be explicitly destroyed"
+    );
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
     let database = TestDatabase::provision("prepare_committed_precedence", "committed");
     let mut runtime =

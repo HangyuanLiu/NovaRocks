@@ -34,6 +34,8 @@ use super::error::MysqlNativeError;
 
 #[cfg(feature = "state-store-test-hooks")]
 static STATEMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static LAST_EXPLICITLY_DESTROYED_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_statement() {
     #[cfg(feature = "state-store-test-hooks")]
@@ -43,6 +45,16 @@ pub(crate) fn record_statement() {
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) fn statement_count_for_test() -> u64 {
     STATEMENT_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn reset_last_explicit_destroy_for_test() {
+    LAST_EXPLICITLY_DESTROYED_CONNECTION_ID.store(0, Ordering::Release);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn last_explicitly_destroyed_connection_id_for_test() -> u64 {
+    LAST_EXPLICITLY_DESTROYED_CONNECTION_ID.load(Ordering::Acquire)
 }
 
 pub(crate) trait PoolLifecycle: Send + Sync {
@@ -410,6 +422,9 @@ impl MysqlPoolConnection {
 
     pub(crate) async fn destroy_in_place(&mut self) {
         if let Some(connection) = self.connection.take() {
+            #[cfg(feature = "state-store-test-hooks")]
+            LAST_EXPLICITLY_DESTROYED_CONNECTION_ID
+                .store(u64::from(connection.id()), Ordering::Release);
             let _ = tokio::time::timeout(Duration::from_secs(1), connection.disconnect()).await;
         }
     }

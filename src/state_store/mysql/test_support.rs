@@ -76,6 +76,11 @@ pub struct MysqlHeldAdvisoryLock {
 pub struct MysqlHeldKvLock {
     inner: Option<super::txn::MysqlHeldKvLock>,
 }
+#[cfg(feature = "state-store-test-hooks")]
+pub struct MysqlHeldCommitLedgerLock {
+    connection: Option<MysqlPoolConnection>,
+    operation: Option<MysqlTestHandle>,
+}
 
 pub struct MysqlTransactionTestApi;
 pub struct MysqlWriteTestApi;
@@ -107,6 +112,14 @@ impl MysqlStatementTestApi {
 
     pub fn last_write_actor_connection_id() -> u64 {
         super::txn::last_write_actor_connection_id_for_test()
+    }
+
+    pub fn reset_last_explicit_destroy() {
+        super::client::reset_last_explicit_destroy_for_test();
+    }
+
+    pub fn last_explicitly_destroyed_connection_id() -> u64 {
+        super::client::last_explicitly_destroyed_connection_id_for_test()
     }
 }
 
@@ -521,6 +534,30 @@ impl MysqlCommitTestApi {
         MysqlPostDispatchTestControl {
             inner: super::commit::arm_cleanup_hook(),
         }
+    }
+
+    pub fn arm_terminalization_query() -> MysqlPostDispatchTestControl {
+        MysqlPostDispatchTestControl {
+            inner: super::commit::arm_terminalize_query_hook(),
+        }
+    }
+
+    pub async fn hold_ledger_lock(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        transaction_id: TransactionId,
+    ) -> Result<MysqlHeldCommitLedgerLock, StateStoreError> {
+        let operation = acquire_operation(runtime)?;
+        let connection = super::commit::hold_ledger_lock_for_test(
+            runtime.mysql_test_pool(database)?,
+            transaction_id,
+            tokio::time::Instant::now() + Duration::from_secs(8),
+        )
+        .await?;
+        Ok(MysqlHeldCommitLedgerLock {
+            connection: Some(connection),
+            operation: Some(operation),
+        })
     }
 
     pub async fn force_committed_ledger(
@@ -1102,6 +1139,10 @@ impl MysqlPostDispatchTestControl {
     pub fn allow_provider_progress(&self) {
         self.inner.release();
     }
+
+    pub fn connection_id(&self) -> u64 {
+        self.inner.connection_id()
+    }
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1217,6 +1258,25 @@ impl MysqlHeldKvLock {
             })?
             .release()
             .await
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+impl MysqlHeldCommitLedgerLock {
+    pub async fn release(mut self) -> Result<(), StateStoreError> {
+        let connection = self.connection.take().ok_or_else(|| {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "MySQL held commit ledger connection is missing",
+            )
+        })?;
+        let result = super::commit::release_ledger_lock_for_test(
+            connection,
+            tokio::time::Instant::now() + Duration::from_secs(4),
+        )
+        .await;
+        drop(self.operation.take());
+        result
     }
 }
 
@@ -1486,6 +1546,32 @@ impl MysqlHeldConnection {
             connection: Some(connection),
             operation: Some(operation),
         }
+    }
+
+    #[cfg(feature = "state-store-test-hooks")]
+    pub async fn connection_id(&mut self, deadline: Duration) -> Result<u64, StateStoreError> {
+        let connection = self.connection.take().ok_or_else(|| {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "MySQL held connection is missing",
+            )
+        })?;
+        let result = super::client::execute_owned_with_deadline(
+            connection,
+            tokio::time::Instant::now() + deadline,
+            |connection| Box::pin(connection.query_first("SELECT CONNECTION_ID()")),
+        )
+        .await;
+        let (connection, connection_id) = result?;
+        self.connection = Some(connection);
+        connection_id
+            .map_err(super::error::MysqlNativeError::into_public)?
+            .ok_or_else(|| {
+                StateStoreError::new(
+                    StateStoreErrorKind::Corruption,
+                    "MySQL held connection ID query returned no row",
+                )
+            })
     }
 }
 

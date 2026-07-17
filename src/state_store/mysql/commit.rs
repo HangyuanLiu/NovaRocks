@@ -99,6 +99,10 @@ static LOSE_NEXT_AUXILIARY_COMMIT_RESPONSE: std::sync::atomic::AtomicBool =
 #[cfg(feature = "state-store-test-hooks")]
 static NEXT_CLEANUP_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::new();
 #[cfg(feature = "state-store-test-hooks")]
+static NEXT_TERMINALIZE_QUERY_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::new();
+#[cfg(feature = "state-store-test-hooks")]
+const TERMINALIZE_QUERY_DEADLINE_LAG: Duration = Duration::from_millis(250);
+#[cfg(feature = "state-store-test-hooks")]
 static NEXT_RESOLVE_RESERVATION_RACE_HOOK: OnceLock<
     Mutex<Option<Arc<ResolveReservationRaceHook>>>,
 > = OnceLock::new();
@@ -382,7 +386,9 @@ pub(super) async fn terminalize_undispatched(
     #[cfg(feature = "state-store-test-hooks")]
     if let Some(hook) = take_cleanup_hook() {
         hook.reached.notify_one();
-        hook.release.notified().await;
+        if timeout_at(deadline, hook.release.notified()).await.is_err() {
+            return Err(deadline_error());
+        }
     }
     let mut connection = begin_serializable(pool, deadline).await?;
     let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
@@ -542,12 +548,47 @@ async fn read_ledger_for_update(
     transaction_bytes: Vec<u8>,
     deadline: Instant,
 ) -> Result<Option<(u8, Option<Vec<u8>>, Option<u64>)>, StateStoreError> {
-    execute(connection, deadline, move |connection| {
-        Box::pin(connection.exec_first(
-            "SELECT state, reservation_token, revision
-             FROM state_store_commits WHERE transaction_id = ? FOR UPDATE",
-            (transaction_bytes,),
-        ))
+    #[cfg(feature = "state-store-test-hooks")]
+    let terminalize_query_hook = take_terminalize_query_hook();
+    #[cfg(feature = "state-store-test-hooks")]
+    if let Some(hook) = terminalize_query_hook.as_ref() {
+        let connection_id: Option<u64> = execute(connection, deadline, |connection| {
+            Box::pin(connection.query_first("SELECT CONNECTION_ID()"))
+        })
+        .await?;
+        hook.connection_id.store(
+            connection_id.ok_or_else(|| {
+                StateStoreError::new(
+                    StateStoreErrorKind::Corruption,
+                    "MySQL terminalization connection ID query returned no row",
+                )
+            })?,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    #[cfg(feature = "state-store-test-hooks")]
+    let query_deadline = if terminalize_query_hook.is_some() {
+        // Deterministically expose an outer-timeout cancellation racing the statement disposer.
+        deadline + TERMINALIZE_QUERY_DEADLINE_LAG
+    } else {
+        deadline
+    };
+    #[cfg(not(feature = "state-store-test-hooks"))]
+    let query_deadline = deadline;
+    execute(connection, query_deadline, move |connection| {
+        Box::pin(async move {
+            #[cfg(feature = "state-store-test-hooks")]
+            if let Some(hook) = terminalize_query_hook {
+                hook.reached.notify_one();
+            }
+            connection
+                .exec_first(
+                    "SELECT state, reservation_token, revision
+                     FROM state_store_commits WHERE transaction_id = ? FOR UPDATE",
+                    (transaction_bytes,),
+                )
+                .await
+        })
     })
     .await
 }
@@ -824,6 +865,64 @@ pub(super) fn arm_cleanup_hook() -> CommitHookControl {
 }
 
 #[cfg(feature = "state-store-test-hooks")]
+pub(super) fn arm_terminalize_query_hook() -> CommitHookControl {
+    let hook = Arc::new(CommitHook {
+        mode: CommitHookMode::HoldAfterSuccess,
+        reached: Notify::new(),
+        release: Notify::new(),
+        connection_id: std::sync::atomic::AtomicU64::new(0),
+        driver_error_observed: std::sync::atomic::AtomicBool::new(false),
+    });
+    *NEXT_TERMINALIZE_QUERY_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&hook));
+    CommitHookControl { hook }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn take_terminalize_query_hook() -> Option<Arc<CommitHook>> {
+    NEXT_TERMINALIZE_QUERY_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) async fn hold_ledger_lock_for_test(
+    pool: Arc<dyn PoolLifecycle>,
+    transaction_id: TransactionId,
+    deadline: Instant,
+) -> Result<MysqlPoolConnection, StateStoreError> {
+    let mut connection = begin_serializable(pool, deadline).await?;
+    let transaction_bytes = transaction_id.as_uuid().as_bytes().to_vec();
+    let row: Option<u8> = execute(&mut connection, deadline, move |connection| {
+        Box::pin(connection.exec_first(
+            "SELECT state FROM state_store_commits
+             WHERE transaction_id = ? FOR UPDATE",
+            (transaction_bytes,),
+        ))
+    })
+    .await?;
+    row.ok_or_else(|| {
+        StateStoreError::new(
+            StateStoreErrorKind::Internal,
+            "MySQL test ledger row is missing before lock",
+        )
+    })?;
+    Ok(connection)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(super) async fn release_ledger_lock_for_test(
+    connection: MysqlPoolConnection,
+    deadline: Instant,
+) -> Result<(), StateStoreError> {
+    rollback_connection(connection, deadline).await
+}
+
+#[cfg(feature = "state-store-test-hooks")]
 pub(super) fn arm_resolve_reservation_race() -> ResolveReservationRaceControl {
     let hook = Arc::new(ResolveReservationRaceHook {
         observed: std::sync::atomic::AtomicUsize::new(0),
@@ -922,15 +1021,21 @@ impl CommitHookControl {
 #[cfg(feature = "state-store-test-hooks")]
 impl Drop for CommitHookControl {
     fn drop(&mut self) {
-        let mut armed = NEXT_COMMIT_HOOK
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if armed
-            .as_ref()
-            .is_some_and(|armed| Arc::ptr_eq(armed, &self.hook))
-        {
-            *armed = None;
+        for slot in [
+            &NEXT_COMMIT_HOOK,
+            &NEXT_CLEANUP_HOOK,
+            &NEXT_TERMINALIZE_QUERY_HOOK,
+        ] {
+            let mut armed = slot
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if armed
+                .as_ref()
+                .is_some_and(|armed| Arc::ptr_eq(armed, &self.hook))
+            {
+                *armed = None;
+            }
         }
         self.hook.release.notify_one();
     }
