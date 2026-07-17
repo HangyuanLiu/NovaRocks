@@ -46814,7 +46814,10 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
     }
 
     impl NamespaceAliasAudit {
-        fn record(&mut self, local: String, target: Vec<String>) {
+        fn record(&mut self, local: String, mut target: Vec<String>) {
+            if target.len() > 1 && target.last().is_some_and(|segment| segment == "self") {
+                target.pop();
+            }
             if target.as_slice() == [local.as_str()] {
                 return;
             }
@@ -47532,6 +47535,19 @@ owner::include!("diagnostic-only");
         "an unrelated namespace alias with an include-named macro must not be mistaken for std::include!: {unrelated_violations:?}"
     );
 
+    let unrelated_grouped_self_alias = r#"
+use crate::diagnostics::{self as owner};
+owner::include!("diagnostic-only");
+"#;
+    let unrelated_grouped_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        unrelated_grouped_self_alias,
+    );
+    assert!(
+        unrelated_grouped_violations.is_empty(),
+        "an unrelated grouped self alias must remain outside std::include! provenance: {unrelated_grouped_violations:?}"
+    );
+
     for invalid in [
         "#[path = \"legacy.rs\"] mod error;",
         "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
@@ -47544,6 +47560,9 @@ owner::include!("diagnostic-only");
         "extern crate std as owner; owner::include!(\"legacy.rs\");",
         "use r#std as r#owner; r#owner::r#include!(\"legacy.rs\");",
         "use std as owner; use owner as chained; chained::include!(\"legacy.rs\");",
+        "use std::{self as owner}; owner::include!(\"legacy.rs\");",
+        "use r#std::{self as r#owner}; r#owner::r#include!(\"legacy.rs\");",
+        "use std::{self as owner}; use owner::{self as chained}; chained::include!(\"legacy.rs\");",
     ] {
         let violations =
             pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
