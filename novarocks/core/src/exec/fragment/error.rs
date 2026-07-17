@@ -104,6 +104,7 @@ pub(crate) enum FragmentBindingErrorKind {
     MissingAssignment,
     ExtraAssignment,
     WrongAssignmentKind,
+    InvalidAssignment,
     SchemaMismatch,
     LayoutMismatch,
     ExpressionMismatch,
@@ -117,6 +118,7 @@ impl fmt::Display for FragmentBindingErrorKind {
             Self::MissingAssignment => f.write_str("missing assignment"),
             Self::ExtraAssignment => f.write_str("extra assignment"),
             Self::WrongAssignmentKind => f.write_str("wrong assignment kind"),
+            Self::InvalidAssignment => f.write_str("invalid assignment"),
             Self::SchemaMismatch => f.write_str("schema mismatch"),
             Self::LayoutMismatch => f.write_str("layout mismatch"),
             Self::ExpressionMismatch => f.write_str("expression mismatch"),
@@ -244,6 +246,10 @@ mod tests {
             (
                 FragmentBindingErrorKind::WrongAssignmentKind,
                 "wrong assignment kind",
+            ),
+            (
+                FragmentBindingErrorKind::InvalidAssignment,
+                "invalid assignment",
             ),
             (FragmentBindingErrorKind::SchemaMismatch, "schema mismatch"),
             (FragmentBindingErrorKind::LayoutMismatch, "layout mismatch"),
