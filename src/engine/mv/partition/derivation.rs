@@ -27,10 +27,11 @@ use std::collections::BTreeSet;
 
 use crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout;
 use crate::exec::chunk::Chunk;
-use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField};
+use crate::mv::persistence::schema as mv_schema;
 #[cfg(test)]
 use crate::runtime::query_result::record_batch_to_chunk;
+use mv_schema::{ExpressionKind, MvSchemaContract};
 
 /// Reasons aggregate-delta partition derivation can refuse a delta batch.
 /// Every variant carries enough context for the refresh error message to
@@ -97,10 +98,10 @@ impl std::fmt::Display for AffectedPartitionError {
 impl std::error::Error for AffectedPartitionError {}
 
 pub(crate) fn contract_transform_to_iceberg(
-    transform: &crate::meta::repository::mv_contract::MvPartitionTransformContract,
+    transform: &mv_schema::MvPartitionTransformContract,
     field: &str,
 ) -> Result<iceberg::spec::Transform, AffectedPartitionError> {
-    use crate::meta::repository::mv_contract::MvPartitionTransformContract as C;
+    use mv_schema::MvPartitionTransformContract as C;
     match transform {
         C::Identity => Ok(iceberg::spec::Transform::Identity),
         C::Year => Ok(iceberg::spec::Transform::Year),
@@ -570,7 +571,7 @@ mod tests {
 
     // --- Moved from aggregate_delta.rs: AffectedPartitionError display test ---
 
-    use crate::meta::repository::mv_contract::MvPartitionTransformContract;
+    use mv_schema::MvPartitionTransformContract;
 
     #[test]
     fn affected_partition_error_display_includes_field_and_reason() {
@@ -636,7 +637,7 @@ mod tests {
 
     // --- Test fixture: copied verbatim from aggregate_delta.rs:720-799 ---
 
-    use crate::meta::repository::mv_contract::{
+    use mv_schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract, MvSchemaContract,
         OutputColumnLineage, OutputContract, TargetContract, TargetVisibleColumn,
@@ -1384,7 +1385,7 @@ mod tests {
 
     #[test]
     fn derive_accepts_join_aggregate_pure_column_lineage() {
-        use crate::meta::repository::mv_contract::QualifiedFieldLineage;
+        use mv_schema::QualifiedFieldLineage;
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         let mut contract =
             count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
@@ -1417,7 +1418,7 @@ mod tests {
 
     #[test]
     fn derive_rejects_join_aggregate_multi_base_field_lineage() {
-        use crate::meta::repository::mv_contract::QualifiedFieldLineage;
+        use mv_schema::QualifiedFieldLineage;
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         let mut contract =
             count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);

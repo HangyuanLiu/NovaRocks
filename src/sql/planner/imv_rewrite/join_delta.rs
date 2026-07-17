@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
-use crate::meta::repository::mv_contract::{
+use crate::mv::persistence::schema::{
     BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
 };
 use crate::sql::analysis::{
@@ -886,7 +886,7 @@ fn build_join_payload_columns(
 }
 
 fn build_join_key_pairs(
-    join_contract: &crate::meta::repository::mv_contract::JoinContract,
+    join_contract: &crate::mv::persistence::schema::JoinContract,
     left_base_contract: &BaseContract,
     right_base_contract: &BaseContract,
     left_base_fqn: &str,
@@ -919,7 +919,7 @@ fn build_join_key_pairs(
 }
 
 fn predicate_lineage_for_actual_sides<'a>(
-    predicate: &'a crate::meta::repository::mv_contract::JoinPredicateLineage,
+    predicate: &'a crate::mv::persistence::schema::JoinPredicateLineage,
     left_base_fqn: &str,
     right_base_fqn: &str,
 ) -> Result<(&'a QualifiedFieldLineage, &'a QualifiedFieldLineage), String> {

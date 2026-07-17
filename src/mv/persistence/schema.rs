@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! IVM-A11 MV schema / field-id contract.
+//! Persisted MV schema / field-id contract.
 //!
 //! Persisted inside `StoredMvDefinition.schema_contract`. Captures base
 //! referenced fields + output lineage + target schema mapping at CREATE
@@ -931,7 +931,10 @@ mod tests {
         assert_eq!(reencoded["join"], serde_json::Value::Null);
         assert_eq!(reencoded["aggregate"], serde_json::Value::Null);
         assert_eq!(reencoded["branch"], serde_json::Value::Null);
-        assert_eq!(reencoded["base"]["alias_at_create"], serde_json::Value::Null);
+        assert_eq!(
+            reencoded["base"]["alias_at_create"],
+            serde_json::Value::Null
+        );
         assert_eq!(
             reencoded["output"]["columns"][0]["expression"]["referenced_base_fields"],
             serde_json::json!([])

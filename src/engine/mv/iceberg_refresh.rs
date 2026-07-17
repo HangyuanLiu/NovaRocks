@@ -96,11 +96,11 @@ use crate::meta::repository::mv::{
     ReplaceMvPartitionStatesRequest, StoredMvDefinition, StoredMvRefresh, StoredMvRefreshPolicy,
     UpdateMvPartitionContractRequest,
 };
-use crate::meta::repository::mv_contract::MvPartitionContract;
-use crate::meta::repository::mv_descriptor::{
+use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
-use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::persistence::schema as mv_schema;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -109,6 +109,7 @@ use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
 };
+use mv_schema::MvPartitionContract;
 
 pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
@@ -629,7 +630,7 @@ fn validate_branch_union_aggregate_base_refs(base_refs: &[TableIdentity]) -> Res
 }
 
 fn validate_aggregate_schema_contract_for_base(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
@@ -677,7 +678,7 @@ fn validate_aggregate_schema_contract_for_base(
 
 fn validate_branch_union_contract(
     target: &IcebergMvTarget,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     query_branch_count: usize,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -715,9 +716,7 @@ fn validate_branch_union_contract(
             query_branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source
-        != crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-    {
+    if branch_contract.inner_apply_key_source != mv_schema::ApplyKeySource::GroupRowId {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch contract must use GroupRowId inner apply keys",
             target.catalog, target.namespace, target.table
@@ -775,7 +774,7 @@ fn validate_branch_union_contract(
 /// an error; a match is accepted.
 fn validate_union_projection_base_refs(
     base_refs: &[TableIdentity],
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
 ) -> Result<(), String> {
     let contract_fqns = schema_contract
         .bases
@@ -803,7 +802,7 @@ fn validate_union_projection_base_refs(
 /// contract-recorded count and the caller-supplied count is still an error.
 fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     branch_count: usize,
     base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
@@ -840,9 +839,7 @@ fn validate_union_projection_schema_contract_for_base(
             branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source
-        != crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
-    {
+    if branch_contract.inner_apply_key_source != mv_schema::ApplyKeySource::BaseRowId {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract must use BaseRowId inner apply keys",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
@@ -928,14 +925,10 @@ fn validate_union_projection_schema_contract_for_base(
 
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
-) -> crate::meta::repository::mv_contract::ApplyKeySource {
+) -> mv_schema::ApplyKeySource {
     match branch_kind {
-        UnionBranchKind::Aggregate => {
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-        }
-        UnionBranchKind::ProjectionFilter => {
-            crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
-        }
+        UnionBranchKind::Aggregate => mv_schema::ApplyKeySource::GroupRowId,
+        UnionBranchKind::ProjectionFilter => mv_schema::ApplyKeySource::BaseRowId,
     }
 }
 
@@ -1107,19 +1100,11 @@ fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static st
     }
 }
 
-fn create_apply_key_contract_source(
-    apply_key: &ApplyKeyContract,
-) -> crate::meta::repository::mv_contract::ApplyKeySource {
+fn create_apply_key_contract_source(apply_key: &ApplyKeyContract) -> mv_schema::ApplyKeySource {
     match apply_key.column_name {
-        ICEBERG_MV_APPLY_KEY_COLUMN => {
-            crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
-        }
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN => {
-            crate::meta::repository::mv_contract::ApplyKeySource::JoinRowKey
-        }
-        ICEBERG_MV_GROUP_APPLY_KEY_COLUMN => {
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-        }
+        ICEBERG_MV_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::BaseRowId,
+        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::JoinRowKey,
+        ICEBERG_MV_GROUP_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::GroupRowId,
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
     }
 }
@@ -1427,7 +1412,7 @@ fn build_iceberg_mv_schema_contract(
     target: &IcebergMvTarget,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
-) -> Result<crate::meta::repository::mv_contract::MvSchemaContract, String> {
+) -> Result<mv_schema::MvSchemaContract, String> {
     let target_apply_key_column = refresh_contract.apply_key.column_name;
     let target_apply_key_source = create_apply_key_contract_source(&refresh_contract.apply_key);
     let target_contract = target_contract(
@@ -1477,10 +1462,10 @@ struct NonBranchContractCore {
     /// applied (e.g. a projection/filter base narrowed to its lineage fields,
     /// or both join bases narrowed to their join lineage fields). For a fan-in
     /// aggregate these are the full fan-in base schemas (Mixed output).
-    bases: Vec<crate::meta::repository::mv_contract::BaseContract>,
-    output: crate::meta::repository::mv_contract::OutputContract,
-    join: Option<crate::meta::repository::mv_contract::JoinContract>,
-    aggregate: Option<crate::meta::repository::mv_contract::AggregateStateContract>,
+    bases: Vec<mv_schema::BaseContract>,
+    output: mv_schema::OutputContract,
+    join: Option<mv_schema::JoinContract>,
+    aggregate: Option<mv_schema::AggregateStateContract>,
 }
 
 /// Build a full (branch-free) schema contract for a non-branch identity over
@@ -1495,8 +1480,8 @@ fn build_non_branch_schema_contract(
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    target: crate::meta::repository::mv_contract::TargetContract,
-) -> Result<crate::meta::repository::mv_contract::MvSchemaContract, String> {
+    target: mv_schema::TargetContract,
+) -> Result<mv_schema::MvSchemaContract, String> {
     let core = build_non_branch_contract_core(
         identity,
         query,
@@ -1515,7 +1500,7 @@ fn build_non_branch_schema_contract(
     } else {
         core.bases
     };
-    Ok(crate::meta::repository::mv_contract::MvSchemaContract {
+    Ok(mv_schema::MvSchemaContract {
         contract_version: core.contract_version,
         base,
         bases,
@@ -1563,7 +1548,7 @@ fn build_non_branch_contract_core(
                     None,
                     lineage.base_fields.clone(),
                 )],
-                output: crate::meta::repository::mv_contract::OutputContract {
+                output: mv_schema::OutputContract {
                     columns: lineage.output_columns,
                     filter: lineage.filter,
                 },
@@ -1585,7 +1570,7 @@ fn build_non_branch_contract_core(
             Ok(NonBranchContractCore {
                 contract_version: 2,
                 bases: vec![left_contract, right_contract],
-                output: crate::meta::repository::mv_contract::OutputContract {
+                output: mv_schema::OutputContract {
                     columns: join.output_columns,
                     filter: join.filter,
                 },
@@ -1725,19 +1710,17 @@ fn validate_composed_aggregate_join_operator(
 
 fn mixed_output_contract(
     output_columns: &[crate::sql::analysis::OutputColumn],
-) -> crate::meta::repository::mv_contract::OutputContract {
-    crate::meta::repository::mv_contract::OutputContract {
+) -> mv_schema::OutputContract {
+    mv_schema::OutputContract {
         columns: output_columns
             .iter()
-            .map(
-                |_| crate::meta::repository::mv_contract::OutputColumnLineage {
-                    expression: crate::meta::repository::mv_contract::ExpressionLineage {
-                        kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
-                        referenced_base_field_ids: Vec::new(),
-                        referenced_base_fields: Vec::new(),
-                    },
+            .map(|_| mv_schema::OutputColumnLineage {
+                expression: mv_schema::ExpressionLineage {
+                    kind: mv_schema::ExpressionKind::Mixed,
+                    referenced_base_field_ids: Vec::new(),
+                    referenced_base_fields: Vec::new(),
                 },
-            )
+            })
             .collect(),
         filter: None,
     }
@@ -1786,7 +1769,7 @@ fn build_aggregate_contract_core(
         return Ok(NonBranchContractCore {
             contract_version: 3,
             bases: vec![left_contract, right_contract],
-            output: crate::meta::repository::mv_contract::OutputContract {
+            output: mv_schema::OutputContract {
                 columns: join.output_columns,
                 filter: join.filter,
             },
@@ -1827,22 +1810,20 @@ fn build_aggregate_contract_core(
         Ok(NonBranchContractCore {
             contract_version: 3,
             bases,
-            output: crate::meta::repository::mv_contract::OutputContract {
+            output: mv_schema::OutputContract {
                 // Precise branch-aware output lineage for aggregate fan-in is not
                 // available yet. Keep full base schemas and mark outputs as mixed so
                 // refresh validates base schema compatibility conservatively.
                 columns: analysis
                     .output_columns
                     .iter()
-                    .map(
-                        |_| crate::meta::repository::mv_contract::OutputColumnLineage {
-                            expression: crate::meta::repository::mv_contract::ExpressionLineage {
-                                kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
-                                referenced_base_field_ids: Vec::new(),
-                                referenced_base_fields: Vec::new(),
-                            },
+                    .map(|_| mv_schema::OutputColumnLineage {
+                        expression: mv_schema::ExpressionLineage {
+                            kind: mv_schema::ExpressionKind::Mixed,
+                            referenced_base_field_ids: Vec::new(),
+                            referenced_base_fields: Vec::new(),
                         },
-                    )
+                    })
                     .collect(),
                 filter: None,
             },
@@ -1888,7 +1869,7 @@ fn build_aggregate_contract_core(
                 None,
                 lineage.base_fields.clone(),
             )],
-            output: crate::meta::repository::mv_contract::OutputContract {
+            output: mv_schema::OutputContract {
                 columns: lineage.output_columns,
                 filter: lineage.filter,
             },
@@ -1911,8 +1892,8 @@ fn build_join_base_contracts_and_lineage(
     )],
 ) -> Result<
     (
-        crate::meta::repository::mv_contract::BaseContract,
-        crate::meta::repository::mv_contract::BaseContract,
+        mv_schema::BaseContract,
+        mv_schema::BaseContract,
         crate::sql::analyzer::mv_lineage::JoinLineageResult,
     ),
     String,
@@ -1979,8 +1960,8 @@ fn build_branch_union_schema_contract(
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    target: crate::meta::repository::mv_contract::TargetContract,
-) -> Result<crate::meta::repository::mv_contract::MvSchemaContract, String> {
+    target: mv_schema::TargetContract,
+) -> Result<mv_schema::MvSchemaContract, String> {
     let branch_id_field_id = target_field_id_by_column(target_loaded, ICEBERG_MV_BRANCH_ID_COLUMN)?;
     let branch_count = union_branch_count(canonical_query);
     let first_branch_resolved = first_union_branch_resolved_query(&analysis.resolved_query)?;
@@ -2033,11 +2014,11 @@ fn build_branch_union_schema_contract(
                 )
             })?;
             let base = all_bases.first().cloned().expect("non-empty checked above");
-            crate::meta::repository::mv_contract::MvSchemaContract {
+            mv_schema::MvSchemaContract {
                 contract_version: 1,
                 base,
                 bases: all_bases,
-                output: crate::meta::repository::mv_contract::OutputContract {
+                output: mv_schema::OutputContract {
                     columns: lineage.output_columns,
                     filter: lineage.filter,
                 },
@@ -2082,7 +2063,7 @@ fn build_branch_union_schema_contract(
             let base = bases.first().cloned().ok_or_else(|| {
                 "UNION ALL aggregate iceberg MV schema contract requires loaded bases".to_string()
             })?;
-            crate::meta::repository::mv_contract::MvSchemaContract {
+            mv_schema::MvSchemaContract {
                 contract_version: core.contract_version,
                 base,
                 bases,
@@ -2105,21 +2086,17 @@ fn build_branch_union_schema_contract(
     };
 
     let inner_apply_key_source = match inner {
-        TargetIdentity::BaseRowId => {
-            crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
-        }
-        TargetIdentity::GroupRowId(_) => {
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-        }
+        TargetIdentity::BaseRowId => mv_schema::ApplyKeySource::BaseRowId,
+        TargetIdentity::GroupRowId(_) => mv_schema::ApplyKeySource::GroupRowId,
         other => {
             return Err(format!(
                 "iceberg MV UNION ALL branch inner apply key undefined for identity {other:?}"
             ));
         }
     };
-    contract.branch = Some(crate::meta::repository::mv_contract::BranchUnionContract {
-        branch_id_column: crate::meta::repository::mv_contract::BranchIdColumnContract {
-            column_name: crate::meta::repository::mv_contract::BRANCH_ID_COLUMN_NAME.into(),
+    contract.branch = Some(mv_schema::BranchUnionContract {
+        branch_id_column: mv_schema::BranchIdColumnContract {
+            column_name: mv_schema::BRANCH_ID_COLUMN_NAME.into(),
             target_field_id: branch_id_field_id,
         },
         branch_count,
@@ -2249,9 +2226,9 @@ fn first_branch_loaded_bases(
 /// branch-aggregate base narrowing (only the first branch's base(s) narrowed)
 /// while generalizing to composed branches (a join branch narrows two bases).
 fn overlay_narrowed_bases(
-    mut all_bases: Vec<crate::meta::repository::mv_contract::BaseContract>,
-    narrowed: Vec<crate::meta::repository::mv_contract::BaseContract>,
-) -> Vec<crate::meta::repository::mv_contract::BaseContract> {
+    mut all_bases: Vec<mv_schema::BaseContract>,
+    narrowed: Vec<mv_schema::BaseContract>,
+) -> Vec<mv_schema::BaseContract> {
     for narrow in narrowed {
         if let Some(slot) = all_bases
             .iter_mut()
@@ -2287,32 +2264,30 @@ fn base_contract(
     base_ref: &TableIdentity,
     loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     alias_at_create: Option<String>,
-    fields: Vec<crate::meta::repository::mv_contract::BaseFieldRecord>,
-) -> crate::meta::repository::mv_contract::BaseContract {
-    crate::meta::repository::mv_contract::BaseContract {
+    fields: Vec<mv_schema::BaseFieldRecord>,
+) -> mv_schema::BaseContract {
+    mv_schema::BaseContract {
         table_fqn: base_ref.fqn(),
         table_uuid: loaded_base.table.metadata().uuid().to_string(),
         alias_at_create,
         schema_id_at_create: loaded_base.table.metadata().current_schema_id(),
-        schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot { fields },
+        schema_at_create: mv_schema::BaseSchemaSnapshot { fields },
     }
 }
 
 fn base_fields_from_current_schema(
     schema: &iceberg::spec::Schema,
-) -> Vec<crate::meta::repository::mv_contract::BaseFieldRecord> {
+) -> Vec<mv_schema::BaseFieldRecord> {
     schema
         .as_struct()
         .fields()
         .iter()
-        .map(
-            |field| crate::meta::repository::mv_contract::BaseFieldRecord {
-                field_id: field.id,
-                name_at_create: field.name.clone(),
-                type_signature: format!("{}", field.field_type),
-                required: field.required,
-            },
-        )
+        .map(|field| mv_schema::BaseFieldRecord {
+            field_id: field.id,
+            name_at_create: field.name.clone(),
+            type_signature: format!("{}", field.field_type),
+            required: field.required,
+        })
         .collect()
 }
 
@@ -2338,9 +2313,9 @@ fn target_contract(
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
     hidden_apply_key_column_name: &str,
-    hidden_apply_key_source: crate::meta::repository::mv_contract::ApplyKeySource,
-) -> Result<crate::meta::repository::mv_contract::TargetContract, String> {
-    Ok(crate::meta::repository::mv_contract::TargetContract {
+    hidden_apply_key_source: mv_schema::ApplyKeySource,
+) -> Result<mv_schema::TargetContract, String> {
+    Ok(mv_schema::TargetContract {
         table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
         table_uuid: target_loaded.table.metadata().uuid().to_string(),
         schema_id_at_create: target_loaded.table.metadata().current_schema_id(),
@@ -2362,7 +2337,7 @@ fn target_contract(
                             col.name
                         )
                     })?;
-                Ok(crate::meta::repository::mv_contract::TargetVisibleColumn {
+                Ok(mv_schema::TargetVisibleColumn {
                     output_name: col.name.clone(),
                     target_field_id: field.id,
                     type_signature: format!("{}", field.field_type),
@@ -2370,7 +2345,7 @@ fn target_contract(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
-        hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
+        hidden_apply_key: mv_schema::HiddenApplyKeyContract {
             column_name: hidden_apply_key_column_name.to_string(),
             target_field_id: actual_apply_key_field_id,
             source: hidden_apply_key_source,
@@ -2381,13 +2356,13 @@ fn target_contract(
 
 fn target_partition_contract(
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-) -> Result<crate::meta::repository::mv_contract::MvPartitionContract, String> {
+) -> Result<mv_schema::MvPartitionContract, String> {
     target_partition_contract_from_table(&target_loaded.table)
 }
 
 fn target_partition_contract_from_table(
     table: &iceberg::table::Table,
-) -> Result<crate::meta::repository::mv_contract::MvPartitionContract, String> {
+) -> Result<mv_schema::MvPartitionContract, String> {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     let spec = metadata.default_partition_spec();
@@ -2399,17 +2374,15 @@ fn target_partition_contract_from_table(
                 field.name, field.source_id
             )
         })?;
-        fields.push(
-            crate::meta::repository::mv_contract::MvPartitionFieldContract {
-                partition_field_id: field.field_id,
-                partition_field_name: field.name.clone(),
-                source_target_field_id: field.source_id,
-                source_column_name: source.name.clone(),
-                transform: mv_partition_transform_contract(&field.transform)?,
-            },
-        );
+        fields.push(mv_schema::MvPartitionFieldContract {
+            partition_field_id: field.field_id,
+            partition_field_name: field.name.clone(),
+            source_target_field_id: field.source_id,
+            source_column_name: source.name.clone(),
+            transform: mv_partition_transform_contract(&field.transform)?,
+        });
     }
-    Ok(crate::meta::repository::mv_contract::MvPartitionContract {
+    Ok(mv_schema::MvPartitionContract {
         target_spec_id: spec.spec_id(),
         fields,
     })
@@ -2417,36 +2390,22 @@ fn target_partition_contract_from_table(
 
 fn mv_partition_transform_contract(
     transform: &iceberg::spec::Transform,
-) -> Result<crate::meta::repository::mv_contract::MvPartitionTransformContract, String> {
+) -> Result<mv_schema::MvPartitionTransformContract, String> {
     match transform {
-        iceberg::spec::Transform::Identity => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Identity)
-        }
-        iceberg::spec::Transform::Year => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Year)
-        }
-        iceberg::spec::Transform::Month => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Month)
-        }
-        iceberg::spec::Transform::Day => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Day)
-        }
-        iceberg::spec::Transform::Hour => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Hour)
-        }
-        iceberg::spec::Transform::Bucket(num_buckets) => Ok(
-            crate::meta::repository::mv_contract::MvPartitionTransformContract::Bucket {
+        iceberg::spec::Transform::Identity => Ok(mv_schema::MvPartitionTransformContract::Identity),
+        iceberg::spec::Transform::Year => Ok(mv_schema::MvPartitionTransformContract::Year),
+        iceberg::spec::Transform::Month => Ok(mv_schema::MvPartitionTransformContract::Month),
+        iceberg::spec::Transform::Day => Ok(mv_schema::MvPartitionTransformContract::Day),
+        iceberg::spec::Transform::Hour => Ok(mv_schema::MvPartitionTransformContract::Hour),
+        iceberg::spec::Transform::Bucket(num_buckets) => {
+            Ok(mv_schema::MvPartitionTransformContract::Bucket {
                 num_buckets: *num_buckets,
-            },
-        ),
-        iceberg::spec::Transform::Truncate(width) => Ok(
-            crate::meta::repository::mv_contract::MvPartitionTransformContract::Truncate {
-                width: *width,
-            },
-        ),
-        iceberg::spec::Transform::Void => {
-            Ok(crate::meta::repository::mv_contract::MvPartitionTransformContract::Void)
+            })
         }
+        iceberg::spec::Transform::Truncate(width) => {
+            Ok(mv_schema::MvPartitionTransformContract::Truncate { width: *width })
+        }
+        iceberg::spec::Transform::Void => Ok(mv_schema::MvPartitionTransformContract::Void),
         iceberg::spec::Transform::Unknown => {
             Err("iceberg MV target partition contract cannot persist unknown transform".to_string())
         }
@@ -2456,7 +2415,7 @@ fn mv_partition_transform_contract(
 fn aggregate_contract(
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-) -> Result<crate::meta::repository::mv_contract::AggregateStateContract, String> {
+) -> Result<mv_schema::AggregateStateContract, String> {
     let fields = target_loaded
         .table
         .metadata()
@@ -2476,35 +2435,31 @@ fn aggregate_contract(
                         column.name
                     )
                 })?;
-            Ok(
-                crate::meta::repository::mv_contract::AggregateStateColumnContract {
-                    column_name: column.name.clone(),
-                    target_field_id: target_field.id,
-                    type_signature: format!("{}", target_field.field_type),
-                    nullable: !target_field.required,
-                    role: aggregate_state_role_contract(column.state_role),
-                },
-            )
+            Ok(mv_schema::AggregateStateColumnContract {
+                column_name: column.name.clone(),
+                target_field_id: target_field.id,
+                type_signature: format!("{}", target_field.field_type),
+                nullable: !target_field.required,
+                role: aggregate_state_role_contract(column.state_role),
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(
-        crate::meta::repository::mv_contract::AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: layout.row_id_column.column.name.clone(),
-            state_columns,
-        },
-    )
+    Ok(mv_schema::AggregateStateContract {
+        state_layout_version: 1,
+        row_id_column_name: layout.row_id_column.column.name.clone(),
+        state_columns,
+    })
 }
 
 fn aggregate_state_role_contract(
     role: crate::mv::model::AggregateStateRole,
-) -> crate::meta::repository::mv_contract::AggregateStateRoleContract {
+) -> mv_schema::AggregateStateRoleContract {
     match role {
         crate::mv::model::AggregateStateRole::Single => {
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
+            mv_schema::AggregateStateRoleContract::Single
         }
         crate::mv::model::AggregateStateRole::RetractionCount => {
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
+            mv_schema::AggregateStateRoleContract::RetractionCount
         }
     }
 }
@@ -3787,7 +3742,7 @@ fn refresh_iceberg_union_projection_mv(
     base_refs: &[TableIdentity],
     canonical_select_query: &sqlparser::ast::Query,
     branch_count: usize,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     validate_union_projection_base_refs(base_refs, schema_contract)?;
@@ -4169,7 +4124,7 @@ fn refresh_iceberg_aggregate_mv(
 fn validate_aggregate_schema_contract_metadata<'a>(
     target: &IcebergMvTarget,
     mv_definition: &'a StoredMvDefinition,
-) -> Result<&'a crate::meta::repository::mv_contract::MvSchemaContract, String> {
+) -> Result<&'a mv_schema::MvSchemaContract, String> {
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -4203,7 +4158,7 @@ fn refresh_single_aggregate_iceberg_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
@@ -4448,7 +4403,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// The aggregate-call surface is sourced from the focused extractor
     /// (`extract_aggregate_sql_calls`), not the legacy classifier.
     FanIn {
-        schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
+        schema_contract: &'a mv_schema::MvSchemaContract,
         aggregate_calls: &'a crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     },
     /// Aggregate over a composed multi-base relation, such as a nested join or
@@ -4456,7 +4411,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// rewrite-merge path; the apply-key evidence decides whether join-delta
     /// proof is required.
     ComposedAggregate {
-        schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
+        schema_contract: &'a mv_schema::MvSchemaContract,
         aggregate_calls: &'a crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
@@ -4806,7 +4761,7 @@ fn refresh_join_aggregate_iceberg_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     _apply_key: ApplyKeyContract,
@@ -5052,7 +5007,7 @@ fn base_snapshot_statuses_for_plan(
 }
 
 fn noop_affected_partitions(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
 ) -> crate::mv::model::AffectedTargetPartitions {
     if is_unpartitioned_mv_contract(schema_contract) {
         crate::mv::model::AffectedTargetPartitions::Unpartitioned
@@ -5100,7 +5055,7 @@ fn merge_affected_partition_results(
 }
 
 fn plan_multi_base_affected_partitions<'a>(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     mode: RefreshMode,
     base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
@@ -5169,7 +5124,7 @@ fn plan_multi_base_affected_partitions<'a>(
 }
 
 fn plan_aggregate_mv_affected_partitions(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     mode: RefreshMode,
     previous_snapshot_id: Option<i64>,
     current_snapshot_id: Option<i64>,
@@ -5219,9 +5174,7 @@ fn plan_aggregate_mv_affected_partitions(
     }
 }
 
-fn is_unpartitioned_mv_contract(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> bool {
+fn is_unpartitioned_mv_contract(schema_contract: &mv_schema::MvSchemaContract) -> bool {
     schema_contract
         .target
         .partition
@@ -5673,7 +5626,7 @@ fn plan_iceberg_union_projection_mv_refresh(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     branch_count: usize,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
 ) -> Result<RefreshPlan, RefreshError> {
     validate_union_projection_base_refs(base_refs, schema_contract).map_err(RefreshError::user)?;
 
@@ -5848,7 +5801,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &sqlparser::ast::Query,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
 ) -> Result<RefreshPlan, RefreshError> {
     // The branch-union variant validates the branch count (off the AST, so a
     // composed branch union is supported) + the resolved base-ref set; the
@@ -6419,7 +6372,7 @@ fn begin_staged_iceberg_mv_repartition_intent(
     base_snapshots: BTreeMap<String, i64>,
     staging_branch: &str,
     previous_default_spec_id: i32,
-    previous_partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
+    previous_partition_contract: Option<&mv_schema::MvPartitionContract>,
 ) -> Result<i64, String> {
     let provider = state
         .metadata_provider
@@ -7853,7 +7806,7 @@ fn finalize_iceberg_mv_refresh_with_partition_contract(
     base_snapshots: std::collections::BTreeMap<String, i64>,
     base_table_uuids: std::collections::BTreeMap<String, String>,
     target_snapshot_id: i64,
-    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    partition_contract: &mv_schema::MvPartitionContract,
     partition_state: IcebergMvPartitionStateFinalize<'_>,
 ) -> Result<(), String> {
     finalize_iceberg_mv_refresh_with_metadata_update(
@@ -8022,7 +7975,7 @@ fn finalize_iceberg_mv_refresh_with_metadata_update(
     base_snapshots: std::collections::BTreeMap<String, i64>,
     base_table_uuids: std::collections::BTreeMap<String, String>,
     target_snapshot_id: i64,
-    partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
+    partition_contract: Option<&mv_schema::MvPartitionContract>,
     partition_state: IcebergMvPartitionStateFinalize<'_>,
 ) -> Result<(), String> {
     record_iceberg_mv_metadata_only_publish(state, refresh_id, target_snapshot_id)?;
@@ -8820,7 +8773,7 @@ fn build_union_projection_repartition_payload(
     current_database: &str,
     select_sql: &str,
     canonical_select_query: &sqlparser::ast::Query,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let branch_count = schema_contract
@@ -9358,7 +9311,7 @@ fn commit_rebuild_payload(
     refresh_id: i64,
     mv_definition: &StoredMvDefinition,
     payload: RepartitionRebuildPayload,
-    partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
+    partition_contract: Option<&mv_schema::MvPartitionContract>,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let total_rows: i64 = payload
@@ -9570,7 +9523,7 @@ fn commit_repartition_rebuild_payload(
     refresh_id: i64,
     mv_definition: &StoredMvDefinition,
     payload: RepartitionRebuildPayload,
-    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     commit_rebuild_payload(
@@ -9603,7 +9556,7 @@ fn rebuild_iceberg_mv(
     base_ref: &TableIdentity,
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
-    partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
+    partition_contract: Option<&mv_schema::MvPartitionContract>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks_with_catalog(
@@ -10168,7 +10121,7 @@ fn expected_main_snapshot_id_from_table(table: &iceberg::table::Table) -> Option
 }
 
 fn ensure_schema_contract_compatible_for_refresh(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -10189,7 +10142,7 @@ fn ensure_schema_contract_compatible_for_refresh(
 
 fn validate_repartition_schema_contract(
     state: &Arc<StandaloneState>,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_refs: &[TableIdentity],
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -10264,7 +10217,7 @@ fn validate_repartition_schema_contract(
 }
 
 fn validate_aggregate_repartition_schema_contract_for_base(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
@@ -10288,7 +10241,7 @@ fn validate_aggregate_repartition_schema_contract_for_base(
 }
 
 fn validate_repartition_base_schema_contract(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
@@ -10570,7 +10523,7 @@ fn join_base_refs_for_aliases<'a>(
 }
 
 fn join_base_refs_for_schema_contract<'a>(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     base_refs: &'a [TableIdentity],
 ) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
     let join = schema_contract
@@ -10680,7 +10633,7 @@ impl JoinSchemaContractDecision {
 
 fn validate_join_base_schema_contract_for_rebind(
     base_fqn: &str,
-    base_contract: &crate::meta::repository::mv_contract::BaseContract,
+    base_contract: &mv_schema::BaseContract,
     current_schema: &iceberg::spec::Schema,
 ) -> Result<Vec<crate::engine::mv::schema_contract::RebindColumn>, String> {
     let current_schema = current_schema.as_struct();
@@ -10721,7 +10674,7 @@ fn validate_join_base_schema_contract_for_rebind(
 }
 
 fn validate_join_schema_contract(
-    contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    contract: &mv_schema::MvSchemaContract,
     bases: &[(&TableIdentity, &iceberg::table::Table); 2],
     target_table: &iceberg::table::Table,
 ) -> Result<JoinSchemaContractDecision, String> {
@@ -10921,7 +10874,7 @@ fn repartition_iceberg_join_mv_overwrite(
     refresh_id: i64,
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
-    partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
+    partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
@@ -11861,7 +11814,7 @@ fn rewrite_outcome_rule_changed(
 #[cfg(test)]
 mod partition_planning_tests {
     use super::*;
-    use crate::meta::repository::mv_contract::{
+    use mv_schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
@@ -12795,7 +12748,7 @@ struct JoinFullRefreshApplyInput {
 
 fn build_join_full_refresh_apply_input(
     plan: crate::sql::planner::logical::LogicalPlanNode,
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
 ) -> Result<JoinFullRefreshApplyInput, String> {
@@ -12858,7 +12811,7 @@ fn build_join_full_refresh_apply_input(
 }
 
 fn validate_join_full_refresh_payload_columns(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     payload_columns: &[OutputColumn],
 ) -> Result<(), String> {
     if payload_columns.len() != schema_contract.target.visible_columns.len() {
@@ -12969,7 +12922,7 @@ fn join_full_refresh_row_id_column(
 }
 
 fn build_join_full_refresh_key_pairs(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &mv_schema::MvSchemaContract,
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
     left_scan: &JoinFullRefreshBaseScan,
@@ -13014,9 +12967,9 @@ fn build_join_full_refresh_key_pairs(
 }
 
 fn schema_base_contract_for_fqn<'a>(
-    bases: &'a [crate::meta::repository::mv_contract::BaseContract],
+    bases: &'a [mv_schema::BaseContract],
     table_fqn: &str,
-) -> Result<&'a crate::meta::repository::mv_contract::BaseContract, String> {
+) -> Result<&'a mv_schema::BaseContract, String> {
     let matches = bases
         .iter()
         .filter(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
@@ -13033,13 +12986,13 @@ fn schema_base_contract_for_fqn<'a>(
 }
 
 fn join_predicate_lineage_for_sides<'a>(
-    predicate: &'a crate::meta::repository::mv_contract::JoinPredicateLineage,
+    predicate: &'a mv_schema::JoinPredicateLineage,
     left_base_fqn: &str,
     right_base_fqn: &str,
 ) -> Result<
     (
-        &'a crate::meta::repository::mv_contract::QualifiedFieldLineage,
-        &'a crate::meta::repository::mv_contract::QualifiedFieldLineage,
+        &'a mv_schema::QualifiedFieldLineage,
+        &'a mv_schema::QualifiedFieldLineage,
     ),
     String,
 > {
@@ -13069,9 +13022,9 @@ fn join_predicate_lineage_for_sides<'a>(
 }
 
 fn current_scan_field_name(
-    base_contract: &crate::meta::repository::mv_contract::BaseContract,
+    base_contract: &mv_schema::BaseContract,
     scan: &JoinFullRefreshBaseScan,
-    lineage: &crate::meta::repository::mv_contract::QualifiedFieldLineage,
+    lineage: &mv_schema::QualifiedFieldLineage,
     role: &str,
 ) -> Result<String, String> {
     if !lineage
@@ -16432,13 +16385,13 @@ mod tests {
     #[test]
     fn join_base_schema_contract_returns_rebind_for_rename() {
         let ty = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_contract = crate::meta::repository::mv_contract::BaseContract {
+        let base_contract = mv_schema::BaseContract {
             table_fqn: "ice.db.fact".to_string(),
             table_uuid: "uuid".to_string(),
             alias_at_create: Some("f".to_string()),
             schema_id_at_create: 1,
-            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                fields: vec![crate::meta::repository::mv_contract::BaseFieldRecord {
+            schema_at_create: mv_schema::BaseSchemaSnapshot {
+                fields: vec![mv_schema::BaseFieldRecord {
                     field_id: 2,
                     name_at_create: "dim_id".to_string(),
                     type_signature: format!("{ty}"),
@@ -16492,8 +16445,8 @@ mod tests {
     fn test_join_projection_schema_contract(
         left_fqn: &str,
         right_fqn: &str,
-    ) -> crate::meta::repository::mv_contract::MvSchemaContract {
-        use crate::meta::repository::mv_contract::{
+    ) -> mv_schema::MvSchemaContract {
+        use mv_schema::{
             ApplyKeySource, HiddenApplyKeyContract, JoinContract, JoinContractKind,
             JoinPredicateLineage, MvSchemaContract, OutputContract, QualifiedFieldLineage,
             TargetContract,
@@ -16539,15 +16492,13 @@ mod tests {
         }
     }
 
-    fn test_base_contract(table_fqn: &str) -> crate::meta::repository::mv_contract::BaseContract {
-        crate::meta::repository::mv_contract::BaseContract {
+    fn test_base_contract(table_fqn: &str) -> mv_schema::BaseContract {
+        mv_schema::BaseContract {
             table_fqn: table_fqn.to_string(),
             table_uuid: format!("{table_fqn}-uuid"),
             alias_at_create: None,
             schema_id_at_create: 1,
-            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                fields: Vec::new(),
-            },
+            schema_at_create: mv_schema::BaseSchemaSnapshot { fields: Vec::new() },
         }
     }
 
@@ -17639,7 +17590,7 @@ mod tests {
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
+            mv_schema::ApplyKeySource::GroupRowId
         );
     }
 
@@ -19197,9 +19148,7 @@ mod tests {
         .expect("alter target partition spec");
     }
 
-    fn sorted_base_field_ids(
-        contract: &crate::meta::repository::mv_contract::BaseContract,
-    ) -> Vec<i32> {
+    fn sorted_base_field_ids(contract: &mv_schema::BaseContract) -> Vec<i32> {
         contract
             .schema_at_create
             .fields
@@ -21396,11 +21345,11 @@ mod tests {
         assert_eq!(contract.contract_version, 3);
         assert_eq!(
             contract.target.hidden_apply_key.column_name,
-            crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
+            mv_schema::ApplyKeySource::GroupRowId
         );
         assert_eq!(contract.target.hidden_apply_key.target_field_id, 1);
         assert_eq!(sorted_base_field_ids(&contract.base), vec![2, 3]);
@@ -21414,7 +21363,7 @@ mod tests {
         assert_eq!(aggregate.state_layout_version, 1);
         assert_eq!(
             aggregate.row_id_column_name,
-            crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(aggregate.state_columns.len(), 2);
         assert_eq!(aggregate.state_columns[0].column_name, "__agg_state_c");
@@ -21423,7 +21372,7 @@ mod tests {
         assert!(!aggregate.state_columns[0].nullable);
         assert_eq!(
             aggregate.state_columns[0].role,
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
+            mv_schema::AggregateStateRoleContract::Single
         );
         assert_eq!(aggregate.state_columns[1].column_name, "__agg_state_s");
         assert_eq!(aggregate.state_columns[1].target_field_id, 6);
@@ -21431,7 +21380,7 @@ mod tests {
         assert!(!aggregate.state_columns[1].nullable);
         assert_eq!(
             aggregate.state_columns[1].role,
-            crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
+            mv_schema::AggregateStateRoleContract::Single
         );
     }
 
@@ -21462,11 +21411,11 @@ mod tests {
         assert!(contract.aggregate.is_some());
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
+            mv_schema::ApplyKeySource::GroupRowId
         );
         assert_eq!(
             contract.target.hidden_apply_key.column_name,
-            crate::meta::repository::mv_contract::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
 
         let fact_contract = contract
@@ -21503,13 +21452,11 @@ mod tests {
         );
         assert_eq!(
             contract.output.columns[1].expression.referenced_base_fields,
-            vec![
-                crate::meta::repository::mv_contract::QualifiedFieldLineage {
-                    table_fqn: "ice.sales.fact".to_string(),
-                    qualifier_at_create: "f".to_string(),
-                    field_id: 3,
-                }
-            ]
+            vec![mv_schema::QualifiedFieldLineage {
+                table_fqn: "ice.sales.fact".to_string(),
+                qualifier_at_create: "f".to_string(),
+                field_id: 3,
+            }]
         );
     }
 
@@ -21689,14 +21636,14 @@ mod tests {
         assert_eq!(contract.bases.len(), 2);
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
+            mv_schema::ApplyKeySource::BaseRowId
         );
         assert_eq!(contract.target.hidden_apply_key.target_field_id, 3);
         let branch = contract.branch.expect("branch contract");
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            crate::meta::repository::mv_contract::ApplyKeySource::BaseRowId
+            mv_schema::ApplyKeySource::BaseRowId
         );
         assert_eq!(
             branch.branch_id_column.column_name,
@@ -22244,14 +22191,14 @@ mod tests {
 
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
+            mv_schema::ApplyKeySource::GroupRowId
         );
         assert!(contract.aggregate.is_some());
         let branch = contract.branch.expect("branch contract");
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
+            mv_schema::ApplyKeySource::GroupRowId
         );
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
     }
@@ -22360,7 +22307,7 @@ mod tests {
 
     #[test]
     fn union_branch_inner_apply_key_maps_kind_to_source() {
-        use crate::meta::repository::mv_contract::ApplyKeySource;
+        use mv_schema::ApplyKeySource;
 
         assert_eq!(
             union_branch_inner_apply_key(UnionBranchKind::Aggregate),

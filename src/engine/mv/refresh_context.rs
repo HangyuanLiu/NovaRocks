@@ -40,10 +40,11 @@ use crate::connector::iceberg::scan_model::{
 };
 use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::meta::repository::mv::StoredMvDefinition;
-use crate::meta::repository::mv_contract::MvSchemaContract;
+use crate::mv::persistence::schema as mv_schema;
 use crate::sql::planner::table::{
     IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
 };
+use mv_schema::MvSchemaContract;
 
 use super::iceberg_refresh::IcebergMvTarget;
 
@@ -475,7 +476,7 @@ fn explicit_cast_type(expr: &sqlparser::ast::Expr) -> Result<Option<DataType>, S
 
 fn aggregate_input_type_from_lineage(
     contract: &MvSchemaContract,
-    lineage: &crate::meta::repository::mv_contract::ExpressionLineage,
+    lineage: &mv_schema::ExpressionLineage,
 ) -> Result<Option<DataType>, String> {
     if let [qualified] = lineage.referenced_base_fields.as_slice() {
         let Some(field) = base_contracts(contract)
@@ -529,9 +530,7 @@ fn aggregate_input_type_from_lineage(
     Ok(None)
 }
 
-fn base_contracts(
-    contract: &MvSchemaContract,
-) -> Vec<&crate::meta::repository::mv_contract::BaseContract> {
+fn base_contracts(contract: &MvSchemaContract) -> Vec<&mv_schema::BaseContract> {
     if contract.bases.is_empty() {
         vec![&contract.base]
     } else {
@@ -1315,31 +1314,21 @@ fn target_partition_value_to_mv_value(
 }
 
 fn target_contract_transform_text(
-    transform: &crate::meta::repository::mv_contract::MvPartitionTransformContract,
+    transform: &mv_schema::MvPartitionTransformContract,
 ) -> Option<String> {
     match transform {
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Identity => {
-            Some("identity".to_string())
+        mv_schema::MvPartitionTransformContract::Identity => Some("identity".to_string()),
+        mv_schema::MvPartitionTransformContract::Year => Some("year".to_string()),
+        mv_schema::MvPartitionTransformContract::Month => Some("month".to_string()),
+        mv_schema::MvPartitionTransformContract::Day => Some("day".to_string()),
+        mv_schema::MvPartitionTransformContract::Hour => Some("hour".to_string()),
+        mv_schema::MvPartitionTransformContract::Bucket { num_buckets } => {
+            Some(format!("bucket({num_buckets})"))
         }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Year => {
-            Some("year".to_string())
-        }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Month => {
-            Some("month".to_string())
-        }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Day => {
-            Some("day".to_string())
-        }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Hour => {
-            Some("hour".to_string())
-        }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Bucket {
-            num_buckets,
-        } => Some(format!("bucket({num_buckets})")),
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Truncate { width } => {
+        mv_schema::MvPartitionTransformContract::Truncate { width } => {
             Some(format!("truncate({width})"))
         }
-        crate::meta::repository::mv_contract::MvPartitionTransformContract::Void => None,
+        mv_schema::MvPartitionTransformContract::Void => None,
     }
 }
 
@@ -1487,14 +1476,14 @@ pub(crate) mod tests_support {
     use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
     use crate::meta::repository::mv::StoredMvDefinition;
-    use crate::meta::repository::mv_contract::{
+    use crate::sql::planner::table::{
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
+    };
+    use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
         OutputContract, TargetContract, TargetVisibleColumn,
-    };
-    use crate::sql::planner::table::{
-        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
 
     use super::*;
@@ -2001,7 +1990,7 @@ mod tests {
 
     use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::meta::repository::mv_contract::{
+    use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
     };

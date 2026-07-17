@@ -39,12 +39,6 @@ use novarocks::meta::repository::mv::{
     StoredMvRefreshPolicy, UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
-use novarocks::meta::repository::mv_contract::{
-    ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-    ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
-    MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
-    TargetContract, TargetVisibleColumn,
-};
 use novarocks::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksDatabaseRequest,
     CreateStarRocksTableLayoutRequest, CreateStarRocksTableRequest, StageStarRocksMvRefreshRequest,
@@ -60,6 +54,12 @@ use novarocks::meta::repository::{
 use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
     SqliteMetaStoreProvider,
+};
+use novarocks::mv::persistence::schema::{
+    ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+    ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+    MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+    TargetContract, TargetVisibleColumn,
 };
 use serde::{Deserialize, Serialize};
 

@@ -24,8 +24,6 @@ pub mod iceberg_operation;
 pub mod id_scopes;
 pub mod job;
 pub mod mv;
-pub mod mv_contract;
-pub mod mv_descriptor;
 pub mod starrocks_table;
 pub mod starrocks_txn;
 

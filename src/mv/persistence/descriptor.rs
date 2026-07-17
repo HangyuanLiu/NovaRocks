@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::meta::repository::mv_contract::MvSchemaContract;
+use crate::mv::persistence::schema::MvSchemaContract;
 
 pub const MV_DESCRIPTOR_VERSION: u16 = 1;
 pub const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn schema_contract_typed_round_trips() {
-        use crate::meta::repository::mv_contract::{
+        use crate::mv::persistence::schema::{
             ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
             ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
             OutputContract, TargetContract, TargetVisibleColumn,

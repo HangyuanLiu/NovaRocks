@@ -373,7 +373,7 @@ mod tests {
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, JoinContract, JoinContractKind,
@@ -631,7 +631,7 @@ mod tests {
     }
 
     fn aggregate_mv_ctx_customized(
-        mutate: impl FnOnce(&mut crate::meta::repository::mv_contract::MvSchemaContract),
+        mutate: impl FnOnce(&mut crate::mv::persistence::schema::MvSchemaContract),
     ) -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
@@ -724,7 +724,7 @@ mod tests {
     }
 
     fn partitioned_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
-        use crate::meta::repository::mv_contract::{
+        use crate::mv::persistence::schema::{
             MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
         };
         aggregate_mv_ctx_customized(|contract| {
@@ -2461,7 +2461,7 @@ mod tests {
 
     #[test]
     fn imv_pipeline_annotates_not_derivable_for_non_pure_partition_lineage() {
-        use crate::meta::repository::mv_contract::{
+        use crate::mv::persistence::schema::{
             ExpressionKind, MvPartitionContract, MvPartitionFieldContract,
             MvPartitionTransformContract,
         };
