@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::common::ids::SlotId;
 use crate::exec::node::RuntimeFilterProbeSpec;
-use crate::exec::node::join::JoinRuntimeFilterSpec;
+use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter, StarrocksRuntimeFilterType,
@@ -278,7 +278,11 @@ impl RuntimeFilterHub {
         self.wait_timeout_ms.store(wait_ms, Ordering::Release);
     }
 
-    pub(crate) fn register_filter_specs(&self, node_id: i32, specs: &[JoinRuntimeFilterSpec]) {
+    pub(crate) fn register_filter_specs(
+        &self,
+        node_id: i32,
+        specs: &[CompatJoinRuntimeFilterSpec],
+    ) {
         let _ = node_id;
         if specs.is_empty() {
             return;

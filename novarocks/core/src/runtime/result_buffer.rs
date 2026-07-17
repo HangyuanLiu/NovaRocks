@@ -707,7 +707,7 @@ mod tests {
         let query_id = QueryId { hi: 101, lo: 202 };
         let finst_id = UniqueId { hi: 303, lo: 404 };
         let mgr = query_context_manager();
-        mgr.ensure_context(
+        mgr.ensure_native_context(
             query_id,
             false,
             Duration::from_secs(5),

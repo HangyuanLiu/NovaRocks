@@ -370,7 +370,6 @@ fn placement(
         endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
         scan_ranges: BTreeMap::new(),
         destinations: Vec::new(),
-        runtime_filter_prober_params: BTreeMap::new(),
         per_exch_num_senders: BTreeMap::new(),
     }
 }

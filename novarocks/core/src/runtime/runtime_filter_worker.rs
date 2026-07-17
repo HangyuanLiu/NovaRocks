@@ -446,7 +446,7 @@ mod tests {
 
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::node::join::JoinRuntimeFilterSpec;
+    use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::runtime_filter::{
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeEmptyFilter, RuntimeFilterType,
@@ -548,7 +548,7 @@ mod tests {
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.register_filter_specs(
             100,
-            &[JoinRuntimeFilterSpec {
+            &[CompatJoinRuntimeFilterSpec {
                 filter_id,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),
@@ -643,7 +643,7 @@ mod tests {
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.register_filter_specs(
             100,
-            &[JoinRuntimeFilterSpec {
+            &[CompatJoinRuntimeFilterSpec {
                 filter_id,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),
@@ -705,7 +705,7 @@ mod tests {
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.register_filter_specs(
             100,
-            &[JoinRuntimeFilterSpec {
+            &[CompatJoinRuntimeFilterSpec {
                 filter_id,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),
@@ -755,7 +755,7 @@ mod tests {
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.register_filter_specs(
             100,
-            &[JoinRuntimeFilterSpec {
+            &[CompatJoinRuntimeFilterSpec {
                 filter_id,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),

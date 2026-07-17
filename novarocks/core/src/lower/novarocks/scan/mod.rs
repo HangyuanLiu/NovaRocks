@@ -143,7 +143,8 @@ mod tests {
     use arrow::datatypes::DataType;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-    use super::super::node::NodeLoweringContext;
+    use super::super::node::{NodeLoweringContext, lower_proto_node_with_bindings};
+    use super::super::runtime_filter_binding::RuntimeFilterBindingLookupLedger;
     use super::schema::iceberg_arrow_schema_from_output_columns;
     use crate::common::ids::SlotId;
     #[cfg(feature = "compat")]
@@ -158,6 +159,8 @@ mod tests {
     use crate::exec::node::scan::ScanMorsel;
     use crate::formats::FileFormatConfig;
     use crate::proto::{common, expr, novarocks, plan};
+    use crate::runtime_filter::model::contract::NullSemantics;
+    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
     use crate::types::native_proto::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
@@ -237,8 +240,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: columns.clone(),
@@ -284,8 +286,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns,
@@ -373,6 +374,65 @@ mod tests {
                 column: Some(name.to_string()),
             })),
         }
+    }
+
+    fn membership_consumer_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
+        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
+            .expect("membership schema");
+        plan::RuntimeFilterBinding {
+            binding_id,
+            channel_id: 9,
+            node_id,
+            apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
+            expression: Some(column_ref(1, "id", DataType::Int64)),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                    plan::RuntimeFilterMembershipContract {
+                        canonical_schema: schema.canonical_bytes().to_vec(),
+                        schema_digest: schema.digest().bytes().to_vec(),
+                    },
+                )),
+            }),
+            reduction: Some(plan::RuntimeFilterReductionContract {
+                kind: Some(plan::runtime_filter_reduction_contract::Kind::SetUnion(
+                    true,
+                )),
+            }),
+            role: Some(plan::runtime_filter_binding::Role::Consumer(
+                plan::RuntimeFilterConsumerRole {
+                    capabilities: vec![
+                        i32::from(plan::RuntimeFilterArtifactCapability::Membership),
+                        i32::from(plan::RuntimeFilterArtifactCapability::EmptyDomain),
+                    ],
+                    activation: Some(plan::RuntimeFilterConsumerActivation {
+                        kind: Some(
+                            plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
+                        ),
+                    }),
+                },
+            )),
+        }
+    }
+
+    fn lower_delta_scan_with_binding(
+        node: &mut plan::DistributedNode,
+    ) -> super::super::node::LoweredNode {
+        node.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: node.fragment_id,
+            bindings: vec![membership_consumer_binding(1, node.node_id)],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(node.fragment_id, Some(&table))
+            .expect("decode delta-scan consumer table");
+        let lowered = lower_proto_node_with_bindings(
+            node,
+            &mut ExprArena::default(),
+            &NodeLoweringContext::default(),
+            &mut ledger,
+        )
+        .expect("lower delta scan with dormant leaf-local consumer");
+        ledger.finish().expect("delta-scan consumer consumed");
+        lowered
     }
 
     fn file_range() -> novarocks::ScanRangeParams {
@@ -705,8 +765,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![scan],
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: vec![output_column(1, "id", DataType::Int64)],
@@ -1478,6 +1537,37 @@ mod tests {
         };
         assert_eq!(scan.node_id, 10);
         assert_eq!(scan.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn lowers_iceberg_delta_table_scan_with_leaf_local_dormant_consumer() {
+        let mut node = scan_node(iceberg_delta_table_source());
+        let lowered = lower_delta_scan_with_binding(&mut node);
+        let ExecNodeKind::IcebergDeltaScan(scan) = lowered.node.kind else {
+            panic!("expected IcebergDeltaScan");
+        };
+        assert_eq!(scan.native_runtime_filter_specs().len(), 1);
+    }
+
+    #[test]
+    fn lowers_filtered_iceberg_delta_table_scan_with_leaf_local_dormant_consumer() {
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int64)],
+            vec![greater_than(
+                column_ref(1, "id", DataType::Int64),
+                int_literal(10),
+            )],
+            Vec::new(),
+            iceberg_delta_table_source(),
+        );
+        let lowered = lower_delta_scan_with_binding(&mut node);
+        let ExecNodeKind::Filter(filter) = lowered.node.kind else {
+            panic!("expected Filter wrapper");
+        };
+        let ExecNodeKind::IcebergDeltaScan(scan) = filter.input.kind else {
+            panic!("expected Filter input IcebergDeltaScan");
+        };
+        assert_eq!(scan.native_runtime_filter_specs().len(), 1);
     }
 
     #[test]

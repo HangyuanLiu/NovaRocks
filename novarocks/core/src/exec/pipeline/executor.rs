@@ -21,7 +21,7 @@
 //! - Bridges fragment context, driver executor, and terminal sink orchestration.
 //!
 //! Key exported interfaces:
-//! - Functions: `execute_plan_with_pipeline`.
+//! - Functions: fixed native and compat pipeline execution entrypoints.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -36,7 +36,9 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::builder::build_pipeline_graph_for_exec_plan_with_root_sink_dop;
+#[cfg(feature = "compat")]
+use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
+use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::dependency::DependencyManager;
 use super::fragment_context::{FragmentContext, FragmentFeAddress};
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
@@ -46,7 +48,7 @@ use super::pipeline::Pipeline;
 use crate::runtime::profile::Profiler;
 
 /// Execute one plan fragment through pipeline runtime and return the terminal sink outcome.
-pub(crate) fn execute_plan_with_pipeline(
+pub(crate) fn execute_native_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -59,7 +61,7 @@ pub(crate) fn execute_plan_with_pipeline(
     fe_addr: Option<FragmentFeAddress>,
     backend_num: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_with_root_sink_dop(
+    execute_native_plan_with_pipeline_with_root_sink_dop(
         plan,
         debug,
         time_slice,
@@ -75,7 +77,7 @@ pub(crate) fn execute_plan_with_pipeline(
     )
 }
 
-pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
+pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -89,12 +91,115 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
+    execute_plan_with_pipeline_in_mode(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        PipelineExecutionMode::NativeDisabled,
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn execute_compat_plan_with_pipeline(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+) -> Result<(), String> {
+    execute_compat_plan_with_pipeline_with_root_sink_dop(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        None,
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+) -> Result<(), String> {
+    execute_plan_with_pipeline_in_mode(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        PipelineExecutionMode::Compat,
+    )
+}
+
+enum PipelineExecutionMode {
+    NativeDisabled,
+    #[cfg(feature = "compat")]
+    Compat,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_plan_with_pipeline_in_mode(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+    mode: PipelineExecutionMode,
+) -> Result<(), String> {
     let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
-    let runtime_filter_hub = match query_id {
-        Some(qid) => {
-            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid) {
-                hub
+    #[cfg(feature = "compat")]
+    let runtime_filter_hub = match (&mode, query_id) {
+        (PipelineExecutionMode::NativeDisabled, _) => None,
+        (PipelineExecutionMode::Compat, Some(qid)) => {
+            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid)? {
+                Some(hub)
             } else {
                 let hub = Arc::new(
                     crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
@@ -102,36 +207,54 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
                         qid,
                     ),
                 );
-                let _ = query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub));
-                hub
+                query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub))?;
+                Some(hub)
             }
         }
-        None => Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
-            DependencyManager::new(),
+        (PipelineExecutionMode::Compat, None) => Some(Arc::new(
+            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(DependencyManager::new()),
         )),
     };
-    runtime_filter_hub.set_wait_timeouts(
-        runtime_state.runtime_filter_scan_wait_timeout(),
-        runtime_state.runtime_filter_wait_timeout(),
-    );
-    if let Some(qid) = query_id {
-        if let Some(params) = runtime_state.runtime_filter_params().cloned() {
-            let _ = query_context_manager().set_runtime_filter_params(qid, params);
+    #[cfg(feature = "compat")]
+    if let Some(runtime_filter_hub) = runtime_filter_hub.as_ref() {
+        runtime_filter_hub.set_wait_timeouts(
+            runtime_state.runtime_filter_scan_wait_timeout(),
+            runtime_state.runtime_filter_wait_timeout(),
+        );
+        if let Some(qid) = query_id {
+            if let Some(params) = runtime_state.runtime_filter_params().cloned() {
+                query_context_manager().set_runtime_filter_params(qid, params)?;
+            }
+            query_context_manager().get_or_create_runtime_filter_worker(qid)?;
         }
-        let _ = query_context_manager().get_or_create_runtime_filter_worker(qid);
     }
 
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
-    let graph = build_pipeline_graph_for_exec_plan_with_root_sink_dop(
-        &plan,
-        debug,
-        dep_manager.clone(),
-        exchange_finst_id,
-        pipeline_dop,
-        root_sink_dop,
-        Arc::clone(&runtime_filter_hub),
-    )?;
+    let graph = match mode {
+        PipelineExecutionMode::NativeDisabled => {
+            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
+                &plan,
+                debug,
+                dep_manager.clone(),
+                exchange_finst_id,
+                pipeline_dop,
+                root_sink_dop,
+            )?
+        }
+        #[cfg(feature = "compat")]
+        PipelineExecutionMode::Compat => {
+            build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
+                &plan,
+                debug,
+                dep_manager.clone(),
+                exchange_finst_id,
+                pipeline_dop,
+                root_sink_dop,
+                runtime_filter_hub.expect("compat runtime-filter hub"),
+            )?
+        }
+    };
 
     let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(
@@ -235,7 +358,7 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -251,18 +374,298 @@ mod tests {
         AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
         WindowFunctionSpec, WindowType,
     };
-    use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
+    use crate::exec::node::join::{
+        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
+        NativeJoinRuntimeFilterProducerSpec,
+    };
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
+    use crate::exec::node::runtime_filter::{
+        NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
+        NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    };
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::runtime::query_context::{QueryId, query_context_manager};
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime_filter::model::contract::{
+        ArtifactCapability, CompletionRequirement, ConsumerActivation, ContributionKind,
+    };
 
-    use super::execute_plan_with_pipeline;
+    use super::execute_native_plan_with_pipeline;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    #[test]
+    fn dormant_native_filter_fails_open_for_local_shard_missing_key() {
+        let query_id = QueryId { hi: 80_007, lo: 29 };
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let lifecycle = RuntimeFilterLifecycleRegistry::global();
+        lifecycle.remove_query(query_key);
+        let context_manager = query_context_manager();
+        for _ in 0..2 {
+            context_manager
+                .get_or_register_native(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("register shared NativeDisabled query context");
+        }
+        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
+            Err(error) => error,
+            Ok(_) => panic!("NativeDisabled context must reject legacy hub access"),
+        };
+        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
+        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
+            Err(error) => error,
+            Ok(_) => panic!("NativeDisabled context must reject legacy worker access"),
+        };
+        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
+        let initial_lifecycle = lifecycle
+            .snapshot(query_key)
+            .expect("query context installs an empty lifecycle event sink");
+        assert!(initial_lifecycle.filters.is_empty());
+        assert!(initial_lifecycle.channel_events.is_empty());
+
+        let full_build_domain = BTreeSet::from([11_i64, 29]);
+        let local_producer_domain = BTreeSet::from([11_i64]);
+        let consumer_input = vec![11_i64, 29];
+        assert!(full_build_domain.contains(&29));
+        assert!(!local_producer_domain.contains(&29));
+        assert_eq!(
+            consumer_input
+                .iter()
+                .copied()
+                .filter(|key| local_producer_domain.contains(key))
+                .collect::<Vec<_>>(),
+            vec![11],
+            "a local-only artifact would incorrectly reject a valid remote-shard match"
+        );
+
+        let probe_schema = Arc::new(Schema::new(vec![Field::new(
+            "probe_key",
+            DataType::Int64,
+            false,
+        )]));
+        let build_schema = Arc::new(Schema::new(vec![Field::new(
+            "build_key",
+            DataType::Int64,
+            false,
+        )]));
+        let join_schema = Arc::new(Schema::new(vec![
+            Field::new("probe_key", DataType::Int64, false),
+            Field::new("build_key", DataType::Int64, false),
+        ]));
+        let probe_batch = RecordBatch::try_new(
+            Arc::clone(&probe_schema),
+            vec![Arc::new(Int64Array::from(vec![11]))],
+        )
+        .expect("probe batch");
+        let build_batch = RecordBatch::try_new(
+            Arc::clone(&build_schema),
+            vec![Arc::new(Int64Array::from(vec![11]))],
+        )
+        .expect("local build batch");
+        let mut producer_arena = ExprArena::default();
+        let probe_expr =
+            producer_arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let build_expr =
+            producer_arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let contract = NativeRuntimeFilterContract::Membership {
+            canonical_schema: Arc::from([]),
+            schema_digest: [0; 32],
+        };
+        let producer_plan = ExecPlan {
+            arena: producer_arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Join(JoinNode {
+                    left: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: Chunk::try_new_with_chunk_schema(
+                                probe_batch,
+                                chunk_schema_of(&probe_schema, &[SlotId::new(1)]),
+                            )
+                            .expect("probe chunk"),
+                            node_id: 1,
+                        }),
+                    }),
+                    right: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: Chunk::try_new_with_chunk_schema(
+                                build_batch,
+                                chunk_schema_of(&build_schema, &[SlotId::new(2)]),
+                            )
+                            .expect("build chunk"),
+                            node_id: 2,
+                        }),
+                    }),
+                    node_id: 3,
+                    join_type: JoinType::Inner,
+                    distribution_mode: JoinDistributionMode::Partitioned,
+                    left_chunk_schema: chunk_schema_of(&probe_schema, &[SlotId::new(1)]),
+                    right_chunk_schema: chunk_schema_of(&build_schema, &[SlotId::new(2)]),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
+                    probe_keys: vec![probe_expr],
+                    build_keys: vec![build_expr],
+                    eq_null_safe: vec![false],
+                    residual_predicate: None,
+                    runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                        producers: vec![NativeJoinRuntimeFilterProducerSpec {
+                            binding_id: 7,
+                            channel_id: 9,
+                            build_expr_id: build_expr,
+                            build_key_index: 0,
+                            contribution_kinds: BTreeSet::from([
+                                ContributionKind::ValueDomainDelta,
+                                ContributionKind::ProducerClosed,
+                            ]),
+                            completion_requirement: CompletionRequirement::ProducerClosed,
+                            contract: contract.clone(),
+                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                        }],
+                    },
+                }),
+            },
+        };
+        let producer_handle = ResultSinkHandle::new();
+        execute_native_plan_with_pipeline(
+            producer_plan,
+            false,
+            Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(producer_handle.clone())),
+            None,
+            None,
+            1,
+            Arc::new(RuntimeState::default()),
+            Some(query_id),
+            None,
+            None,
+        )
+        .expect("execute dormant producer fragment");
+        assert_eq!(
+            producer_handle
+                .take_chunks()
+                .iter()
+                .map(Chunk::len)
+                .sum::<usize>(),
+            1
+        );
+        let producer_lifecycle = lifecycle
+            .snapshot(query_key)
+            .expect("producer shares the query lifecycle event sink");
+        assert!(producer_lifecycle.filters.is_empty());
+        assert!(producer_lifecycle.channel_events.is_empty());
+
+        let consumer_schema = Arc::new(Schema::new(vec![Field::new(
+            "consumer_key",
+            DataType::Int64,
+            false,
+        )]));
+        let consumer_batch = RecordBatch::try_new(
+            Arc::clone(&consumer_schema),
+            vec![Arc::new(Int64Array::from(consumer_input.clone()))],
+        )
+        .expect("consumer batch");
+        let mut consumer_arena = ExprArena::default();
+        let consumer_expr =
+            consumer_arena.push_typed(ExprNode::SlotId(SlotId::new(4)), DataType::Int64);
+        let consumer_plan = ExecPlan {
+            arena: consumer_arena,
+            root: ExecNode {
+                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: Chunk::try_new_with_chunk_schema(
+                                consumer_batch,
+                                chunk_schema_of(&consumer_schema, &[SlotId::new(4)]),
+                            )
+                            .expect("consumer chunk"),
+                            node_id: 4,
+                        }),
+                    }),
+                    owner_node_id: 4,
+                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                        binding_id: 7,
+                        channel_id: 9,
+                        expr_id: consumer_expr,
+                        activation: ConsumerActivation::BlockingSnapshot,
+                        capabilities: BTreeSet::from([
+                            ArtifactCapability::Membership,
+                            ArtifactCapability::EmptyDomain,
+                        ]),
+                        contract,
+                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                    }],
+                }),
+            },
+        };
+        let consumer_handle = ResultSinkHandle::new();
+        execute_native_plan_with_pipeline(
+            consumer_plan,
+            false,
+            Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(consumer_handle.clone())),
+            None,
+            None,
+            1,
+            Arc::new(RuntimeState::default()),
+            Some(query_id),
+            None,
+            None,
+        )
+        .expect("execute dormant consumer fragment");
+
+        let output = consumer_handle
+            .take_chunks()
+            .into_iter()
+            .flat_map(|chunk| {
+                chunk.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("consumer output Int64")
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output, consumer_input);
+        let consumer_lifecycle = lifecycle
+            .snapshot(query_key)
+            .expect("consumer shares the query lifecycle event sink");
+        assert!(consumer_lifecycle.filters.is_empty());
+        assert!(consumer_lifecycle.channel_events.is_empty());
+        let hub_error = match context_manager.get_runtime_filter_hub(query_id) {
+            Err(error) => error,
+            Ok(_) => panic!("NativeDisabled context must remain hub-free"),
+        };
+        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
+        let worker_error = match context_manager.get_runtime_filter_worker(query_id) {
+            Err(error) => error,
+            Ok(_) => panic!("NativeDisabled context must remain worker-free"),
+        };
+        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
+        context_manager.cancel_query(query_id, "test cleanup".to_string());
+        context_manager.finish_fragment(query_id);
+        context_manager.finish_fragment(query_id);
+        assert!(
+            context_manager
+                .get_runtime_filter_hub(query_id)
+                .expect("query context removed after both fragments finish")
+                .is_none()
+        );
+        lifecycle.remove_query(query_key);
     }
 
     #[test]
@@ -325,7 +728,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -445,7 +848,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -561,7 +964,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -683,7 +1086,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -825,14 +1228,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: Some(residual),
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -998,14 +1404,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1155,14 +1564,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1312,7 +1724,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1438,7 +1850,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),

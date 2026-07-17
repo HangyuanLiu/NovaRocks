@@ -22,7 +22,7 @@
 //!
 //! Key exported interfaces:
 //! - Types: `PipelinePlan`, `PipelineGraph`.
-//! - Functions: `build_pipeline_graph_for_exec_plan`, `build_pipeline_graph_for_exec_plan_with_dop`.
+//! - Functions: fixed native and compat pipeline graph builders.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -35,7 +35,10 @@ use crate::exec::node::aggregate::{AggregateNode, StreamingPreaggregationMode};
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode};
 use crate::exec::node::filter::FilterNode;
-use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
+use crate::exec::node::join::{
+    CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
+    JoinType,
+};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::project::ProjectNode;
@@ -99,9 +102,29 @@ struct PipelineBuildResult {
 struct PipelineBuildContext {
     arena: Arc<ExprArena>,
     dep_manager: DependencyManager,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
+    runtime_filter_execution: PipelineRuntimeFilterExecution,
     next_pipeline_id: i32,
     pipeline_dop: i32,
+}
+
+enum PipelineRuntimeFilterExecution {
+    NativeDisabled,
+    #[cfg(feature = "compat")]
+    Compat {
+        hub: Arc<RuntimeFilterHub>,
+    },
+}
+
+impl PipelineBuildContext {
+    #[cfg(feature = "compat")]
+    fn compat_runtime_filter_hub(&self) -> Result<&Arc<RuntimeFilterHub>, String> {
+        match &self.runtime_filter_execution {
+            PipelineRuntimeFilterExecution::Compat { hub } => Ok(hub),
+            PipelineRuntimeFilterExecution::NativeDisabled => {
+                Err("native pipeline cannot access legacy runtime-filter hub".to_string())
+            }
+        }
+    }
 }
 
 impl PipelineBuildContext {
@@ -114,58 +137,117 @@ impl PipelineBuildContext {
 
 #[allow(dead_code)]
 /// Build a pipeline graph from an execution plan using the default degree of parallelism.
-pub(crate) fn build_pipeline_graph_for_exec_plan(
+pub(crate) fn build_native_pipeline_graph_for_exec_plan(
     plan: &ExecPlan,
     _debug: bool,
     dep_manager: DependencyManager,
     exchange_finst_id: Option<(i64, i64)>,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
 ) -> Result<PipelineGraph, String> {
     let default_dop = crate::runtime::exec_env::calc_pipeline_dop(0);
-    build_pipeline_graph_for_exec_plan_with_dop(
+    build_native_pipeline_graph_for_exec_plan_with_dop(
         plan,
         _debug,
         dep_manager,
         exchange_finst_id,
         default_dop,
-        runtime_filter_hub,
     )
 }
 
 /// Build a pipeline graph from an execution plan with an explicit degree of parallelism.
-pub(crate) fn build_pipeline_graph_for_exec_plan_with_dop(
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
     plan: &ExecPlan,
     _debug: bool,
     dep_manager: DependencyManager,
     _exchange_finst_id: Option<(i64, i64)>,
     pipeline_dop: i32,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
 ) -> Result<PipelineGraph, String> {
-    build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+    build_pipeline_graph_in_mode(
         plan,
         _debug,
         dep_manager,
         _exchange_finst_id,
         pipeline_dop,
         None,
+        PipelineRuntimeFilterExecution::NativeDisabled,
+    )
+}
+
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
+    plan: &ExecPlan,
+    debug: bool,
+    dep_manager: DependencyManager,
+    exchange_finst_id: Option<(i64, i64)>,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+) -> Result<PipelineGraph, String> {
+    build_pipeline_graph_in_mode(
+        plan,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        pipeline_dop,
+        root_sink_dop,
+        PipelineRuntimeFilterExecution::NativeDisabled,
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_dop(
+    plan: &ExecPlan,
+    debug: bool,
+    dep_manager: DependencyManager,
+    exchange_finst_id: Option<(i64, i64)>,
+    pipeline_dop: i32,
+    runtime_filter_hub: Arc<RuntimeFilterHub>,
+) -> Result<PipelineGraph, String> {
+    build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
+        plan,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        pipeline_dop,
+        None,
         runtime_filter_hub,
     )
 }
 
-pub(crate) fn build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+#[cfg(feature = "compat")]
+pub(crate) fn build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
+    plan: &ExecPlan,
+    debug: bool,
+    dep_manager: DependencyManager,
+    exchange_finst_id: Option<(i64, i64)>,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    runtime_filter_hub: Arc<RuntimeFilterHub>,
+) -> Result<PipelineGraph, String> {
+    build_pipeline_graph_in_mode(
+        plan,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        pipeline_dop,
+        root_sink_dop,
+        PipelineRuntimeFilterExecution::Compat {
+            hub: runtime_filter_hub,
+        },
+    )
+}
+
+fn build_pipeline_graph_in_mode(
     plan: &ExecPlan,
     _debug: bool,
     dep_manager: DependencyManager,
     _exchange_finst_id: Option<(i64, i64)>,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
+    runtime_filter_execution: PipelineRuntimeFilterExecution,
 ) -> Result<PipelineGraph, String> {
     let arena = Arc::new(plan.arena.clone());
     let mut ctx = PipelineBuildContext {
         arena,
         dep_manager,
-        runtime_filter_hub,
+        runtime_filter_execution,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
     };
@@ -418,6 +500,9 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         }
         ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
         ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            output_chunk_schema_for_node(&consumer.input)
+        }
         ExecNodeKind::IcebergDeltaScan(scan) => Some(Arc::clone(&scan.output_chunk_schema)),
         #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
@@ -546,6 +631,9 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            build_pipeline_for_node(&consumer.input, ctx)
+        }
         ExecNodeKind::AssertNumRows(AssertNumRowsNode {
             input,
             node_id,
@@ -817,6 +905,12 @@ fn build_pipeline_for_node(
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             let output_slots = output_chunk_schema.slot_ids();
+            let legacy_topn_rf_specs: Vec<crate::exec::node::aggregate::TopNRuntimeFilterSpec> =
+                match &ctx.runtime_filter_execution {
+                    PipelineRuntimeFilterExecution::NativeDisabled => Vec::new(),
+                    #[cfg(feature = "compat")]
+                    PipelineRuntimeFilterExecution::Compat { .. } => topn_rf_specs.clone(),
+                };
 
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
@@ -848,17 +942,34 @@ fn build_pipeline_for_node(
                     func.input_is_intermediate = false;
                 }
 
-                let partial_agg_factory = Box::new(AggregateProcessorFactory::new(
-                    *node_id,
-                    Arc::clone(&ctx.arena),
-                    group_by.clone(),
-                    partial_functions,
-                    true,
-                    false,
-                    output_chunk_schema.clone(),
-                    topn_rf_specs.clone(),
-                    Some(Arc::clone(&ctx.runtime_filter_hub)),
-                ));
+                let partial_agg_factory: Box<dyn OperatorFactory> =
+                    match &ctx.runtime_filter_execution {
+                        PipelineRuntimeFilterExecution::NativeDisabled => {
+                            Box::new(AggregateProcessorFactory::new_native(
+                                *node_id,
+                                Arc::clone(&ctx.arena),
+                                group_by.clone(),
+                                partial_functions,
+                                true,
+                                false,
+                                output_chunk_schema.clone(),
+                            ))
+                        }
+                        #[cfg(feature = "compat")]
+                        PipelineRuntimeFilterExecution::Compat { hub } => {
+                            Box::new(AggregateProcessorFactory::new_compat(
+                                *node_id,
+                                Arc::clone(&ctx.arena),
+                                group_by.clone(),
+                                partial_functions,
+                                true,
+                                false,
+                                output_chunk_schema.clone(),
+                                legacy_topn_rf_specs.clone(),
+                                Arc::clone(hub),
+                            ))
+                        }
+                    };
 
                 build.pipeline.factories.push(partial_agg_factory);
 
@@ -886,7 +997,7 @@ fn build_pipeline_for_node(
                 build
                     .pipeline
                     .factories
-                    .push(Box::new(AggregateProcessorFactory::new(
+                    .push(Box::new(AggregateProcessorFactory::new_native(
                         *node_id,
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
@@ -894,8 +1005,6 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
-                        Vec::new(),
-                        None,
                     )));
                 return Ok(build);
             }
@@ -905,17 +1014,33 @@ fn build_pipeline_for_node(
                 for func in &mut partial_functions {
                     func.input_is_intermediate = false;
                 }
-                let local_factory = Box::new(AggregateProcessorFactory::new(
-                    *node_id,
-                    Arc::clone(&ctx.arena),
-                    group_by.clone(),
-                    partial_functions,
-                    true,
-                    false,
-                    output_chunk_schema.clone(),
-                    topn_rf_specs.clone(),
-                    Some(Arc::clone(&ctx.runtime_filter_hub)),
-                ));
+                let local_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
+                    PipelineRuntimeFilterExecution::NativeDisabled => {
+                        Box::new(AggregateProcessorFactory::new_native(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            partial_functions,
+                            true,
+                            false,
+                            output_chunk_schema.clone(),
+                        ))
+                    }
+                    #[cfg(feature = "compat")]
+                    PipelineRuntimeFilterExecution::Compat { hub } => {
+                        Box::new(AggregateProcessorFactory::new_compat(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            partial_functions,
+                            true,
+                            false,
+                            output_chunk_schema.clone(),
+                            legacy_topn_rf_specs.clone(),
+                            Arc::clone(hub),
+                        ))
+                    }
+                };
                 build.pipeline.factories.push(local_factory);
 
                 let partition_count = 1usize;
@@ -948,7 +1073,7 @@ fn build_pipeline_for_node(
                 }
                 downstream
                     .factories
-                    .push(Box::new(AggregateProcessorFactory::new(
+                    .push(Box::new(AggregateProcessorFactory::new_native(
                         *node_id,
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
@@ -956,8 +1081,6 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
-                        Vec::new(),
-                        None,
                     )));
 
                 let mut extra_pipelines = build.extra_pipelines;
@@ -980,17 +1103,33 @@ fn build_pipeline_for_node(
                 Some(StreamingPreaggregationMode::ForcePreaggregation)
             ) {
                 let streaming_state = AggregateStreamingState::new(dop.max(1) as usize);
-                let sink_factory = Box::new(AggregateStreamingSinkFactory::new(
-                    *node_id,
-                    Arc::clone(&ctx.arena),
-                    group_by.clone(),
-                    functions.clone(),
-                    !*need_finalize,
-                    output_chunk_schema.clone(),
-                    topn_rf_specs.clone(),
-                    Some(Arc::clone(&ctx.runtime_filter_hub)),
-                    streaming_state.clone(),
-                ));
+                let sink_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
+                    PipelineRuntimeFilterExecution::NativeDisabled => {
+                        Box::new(AggregateStreamingSinkFactory::new_native(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            functions.clone(),
+                            !*need_finalize,
+                            output_chunk_schema.clone(),
+                            streaming_state.clone(),
+                        ))
+                    }
+                    #[cfg(feature = "compat")]
+                    PipelineRuntimeFilterExecution::Compat { hub } => {
+                        Box::new(AggregateStreamingSinkFactory::new_compat(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            functions.clone(),
+                            !*need_finalize,
+                            output_chunk_schema.clone(),
+                            legacy_topn_rf_specs.clone(),
+                            Arc::clone(hub),
+                            streaming_state.clone(),
+                        ))
+                    }
+                };
                 build.pipeline.factories.push(sink_factory);
                 build.pipeline.needs_sink = false;
 
@@ -1011,17 +1150,33 @@ fn build_pipeline_for_node(
                 });
             }
 
-            let agg_factory = Box::new(AggregateProcessorFactory::new(
-                *node_id,
-                Arc::clone(&ctx.arena),
-                group_by.clone(),
-                functions.clone(),
-                !*need_finalize,
-                false,
-                output_chunk_schema.clone(),
-                topn_rf_specs.clone(),
-                Some(Arc::clone(&ctx.runtime_filter_hub)),
-            ));
+            let agg_factory: Box<dyn OperatorFactory> = match &ctx.runtime_filter_execution {
+                PipelineRuntimeFilterExecution::NativeDisabled => {
+                    Box::new(AggregateProcessorFactory::new_native(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        group_by.clone(),
+                        functions.clone(),
+                        !*need_finalize,
+                        false,
+                        output_chunk_schema.clone(),
+                    ))
+                }
+                #[cfg(feature = "compat")]
+                PipelineRuntimeFilterExecution::Compat { hub } => {
+                    Box::new(AggregateProcessorFactory::new_compat(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        group_by.clone(),
+                        functions.clone(),
+                        !*need_finalize,
+                        false,
+                        output_chunk_schema.clone(),
+                        legacy_topn_rf_specs.clone(),
+                        Arc::clone(hub),
+                    ))
+                }
+            };
 
             if *need_finalize && dop > 1 {
                 let partition_count = if group_by.is_empty() { 1 } else { dop as usize };
@@ -1082,10 +1237,37 @@ fn build_pipeline_for_node(
             build_keys,
             eq_null_safe,
             residual_predicate,
-            runtime_filters,
+            runtime_filter_execution,
         }) => {
-            ctx.runtime_filter_hub
-                .register_filter_specs(*node_id, runtime_filters);
+            match (runtime_filter_execution, &ctx.runtime_filter_execution) {
+                (
+                    JoinRuntimeFilterExecution::Native { .. },
+                    PipelineRuntimeFilterExecution::NativeDisabled,
+                ) => {}
+                #[cfg(feature = "compat")]
+                (
+                    JoinRuntimeFilterExecution::Compat { .. },
+                    PipelineRuntimeFilterExecution::Compat { .. },
+                ) => {}
+                _ => {
+                    return Err(format!(
+                        "join node_id={node_id} runtime-filter execution mode conflicts with pipeline mode"
+                    ));
+                }
+            }
+            let runtime_filters: Vec<CompatJoinRuntimeFilterSpec> = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { .. } => Vec::new(),
+                #[cfg(feature = "compat")]
+                JoinRuntimeFilterExecution::Compat { legacy_specs } => legacy_specs.clone(),
+            };
+            #[cfg(feature = "compat")]
+            if matches!(
+                runtime_filter_execution,
+                JoinRuntimeFilterExecution::Compat { .. }
+            ) {
+                ctx.compat_runtime_filter_hub()?
+                    .register_filter_specs(*node_id, &runtime_filters);
+            }
             let left_build = build_pipeline_for_node(left, ctx)?;
             let right_build = build_pipeline_for_node(right, ctx)?;
 
@@ -1121,39 +1303,73 @@ fn build_pipeline_for_node(
                     probe_dop,
                 ));
 
-                probe_build.pipeline.factories.push(Box::new(
-                    BroadcastJoinProbeProcessorFactory::new(
-                        Arc::clone(&ctx.arena),
-                        *join_type,
-                        probe_keys.clone(),
-                        *residual_predicate,
-                        probe_is_left,
-                        has_equi_keys,
-                        Arc::clone(left_chunk_schema),
-                        Arc::clone(right_chunk_schema),
-                        Arc::clone(join_scope_chunk_schema),
-                        Arc::clone(&join_state),
-                    ),
-                ));
+                let probe_factory = match runtime_filter_execution {
+                    JoinRuntimeFilterExecution::Native { .. } => {
+                        BroadcastJoinProbeProcessorFactory::new_native(
+                            Arc::clone(&ctx.arena),
+                            *join_type,
+                            probe_keys.clone(),
+                            *residual_predicate,
+                            probe_is_left,
+                            has_equi_keys,
+                            Arc::clone(left_chunk_schema),
+                            Arc::clone(right_chunk_schema),
+                            Arc::clone(join_scope_chunk_schema),
+                            Arc::clone(&join_state),
+                        )
+                    }
+                    #[cfg(feature = "compat")]
+                    JoinRuntimeFilterExecution::Compat { .. } => {
+                        BroadcastJoinProbeProcessorFactory::new_compat(
+                            Arc::clone(&ctx.arena),
+                            *join_type,
+                            probe_keys.clone(),
+                            *residual_predicate,
+                            probe_is_left,
+                            has_equi_keys,
+                            Arc::clone(left_chunk_schema),
+                            Arc::clone(right_chunk_schema),
+                            Arc::clone(join_scope_chunk_schema),
+                            Arc::clone(&join_state),
+                        )
+                    }
+                };
+                probe_build.pipeline.factories.push(Box::new(probe_factory));
 
                 let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-                build_build
-                    .pipeline
-                    .factories
-                    .push(Box::new(HashJoinBuildSinkFactory::new(
-                        Arc::clone(&ctx.arena),
-                        *join_type,
-                        residual_predicate.is_some(),
-                        probe_is_left,
-                        has_equi_keys,
-                        build_keys.clone(),
-                        eq_null_safe.clone(),
-                        runtime_filters.clone(),
-                        *distribution_mode,
-                        build_state,
-                        Arc::clone(&ctx.runtime_filter_hub),
-                        runtime_in_filter_merger,
-                    )));
+                let build_factory = match runtime_filter_execution {
+                    JoinRuntimeFilterExecution::Native { .. } => {
+                        HashJoinBuildSinkFactory::new_native(
+                            Arc::clone(&ctx.arena),
+                            *join_type,
+                            residual_predicate.is_some(),
+                            probe_is_left,
+                            has_equi_keys,
+                            build_keys.clone(),
+                            eq_null_safe.clone(),
+                            *distribution_mode,
+                            build_state,
+                        )
+                    }
+                    #[cfg(feature = "compat")]
+                    JoinRuntimeFilterExecution::Compat { .. } => {
+                        HashJoinBuildSinkFactory::new_compat(
+                            Arc::clone(&ctx.arena),
+                            *join_type,
+                            residual_predicate.is_some(),
+                            probe_is_left,
+                            has_equi_keys,
+                            build_keys.clone(),
+                            eq_null_safe.clone(),
+                            runtime_filters.clone(),
+                            *distribution_mode,
+                            build_state,
+                            Arc::clone(ctx.compat_runtime_filter_hub()?),
+                            runtime_in_filter_merger,
+                        )
+                    }
+                };
+                build_build.pipeline.factories.push(Box::new(build_factory));
                 build_build.pipeline.needs_sink = false;
 
                 let mut extra_pipelines = Vec::new();
@@ -1218,26 +1434,54 @@ fn build_pipeline_for_node(
                 *join_type == JoinType::NullAwareLeftAnti,
             ));
 
-            probe_build.pipeline.factories.push(Box::new(
-                PartitionedJoinProbeProcessorFactory::new(
-                    Arc::clone(&ctx.arena),
-                    *join_type,
-                    probe_keys.clone(),
-                    *residual_predicate,
-                    probe_is_left,
-                    has_equi_keys,
-                    Arc::clone(left_chunk_schema),
-                    Arc::clone(right_chunk_schema),
-                    Arc::clone(join_scope_chunk_schema),
-                    Arc::clone(&join_state),
-                ),
-            ));
+            let probe_factory = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { .. } => {
+                    PartitionedJoinProbeProcessorFactory::new_native(
+                        Arc::clone(&ctx.arena),
+                        *join_type,
+                        probe_keys.clone(),
+                        *residual_predicate,
+                        probe_is_left,
+                        has_equi_keys,
+                        Arc::clone(left_chunk_schema),
+                        Arc::clone(right_chunk_schema),
+                        Arc::clone(join_scope_chunk_schema),
+                        Arc::clone(&join_state),
+                    )
+                }
+                #[cfg(feature = "compat")]
+                JoinRuntimeFilterExecution::Compat { .. } => {
+                    PartitionedJoinProbeProcessorFactory::new_compat(
+                        Arc::clone(&ctx.arena),
+                        *join_type,
+                        probe_keys.clone(),
+                        *residual_predicate,
+                        probe_is_left,
+                        has_equi_keys,
+                        Arc::clone(left_chunk_schema),
+                        Arc::clone(right_chunk_schema),
+                        Arc::clone(join_scope_chunk_schema),
+                        Arc::clone(&join_state),
+                    )
+                }
+            };
+            probe_build.pipeline.factories.push(Box::new(probe_factory));
 
             let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-            build_build
-                .pipeline
-                .factories
-                .push(Box::new(HashJoinBuildSinkFactory::new(
+            let build_factory = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { .. } => HashJoinBuildSinkFactory::new_native(
+                    Arc::clone(&ctx.arena),
+                    *join_type,
+                    residual_predicate.is_some(),
+                    probe_is_left,
+                    has_equi_keys,
+                    build_keys.clone(),
+                    eq_null_safe.clone(),
+                    *distribution_mode,
+                    build_state,
+                ),
+                #[cfg(feature = "compat")]
+                JoinRuntimeFilterExecution::Compat { .. } => HashJoinBuildSinkFactory::new_compat(
                     Arc::clone(&ctx.arena),
                     *join_type,
                     residual_predicate.is_some(),
@@ -1248,9 +1492,11 @@ fn build_pipeline_for_node(
                     runtime_filters.clone(),
                     *distribution_mode,
                     build_state,
-                    Arc::clone(&ctx.runtime_filter_hub),
+                    Arc::clone(ctx.compat_runtime_filter_hub()?),
                     runtime_in_filter_merger,
-                )));
+                ),
+            };
+            build_build.pipeline.factories.push(Box::new(build_factory));
             build_build.pipeline.needs_sink = false;
 
             let mut extra_pipelines = Vec::new();
@@ -1412,11 +1658,20 @@ fn build_pipeline_for_node(
             })
         }
         ExecNodeKind::ExchangeSource(node) => {
-            let source: Box<dyn OperatorFactory> = Box::new(ExchangeSourceFactory::new(
-                node.clone(),
-                Arc::clone(&ctx.runtime_filter_hub),
-                Arc::clone(&ctx.arena),
-            )?);
+            let factory = match &ctx.runtime_filter_execution {
+                PipelineRuntimeFilterExecution::NativeDisabled => {
+                    ExchangeSourceFactory::new_native(node.clone(), Arc::clone(&ctx.arena))?
+                }
+                #[cfg(feature = "compat")]
+                PipelineRuntimeFilterExecution::Compat { hub } => {
+                    ExchangeSourceFactory::new_compat(
+                        node.clone(),
+                        Arc::clone(hub),
+                        Arc::clone(&ctx.arena),
+                    )?
+                }
+            };
+            let source: Box<dyn OperatorFactory> = Box::new(factory);
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -1435,11 +1690,18 @@ fn build_pipeline_for_node(
             })
         }
         ExecNodeKind::Scan(scan) => {
-            let source: Box<dyn OperatorFactory> = Box::new(ScanSourceFactory::new(
-                scan.clone(),
-                Arc::clone(&ctx.runtime_filter_hub),
-                Arc::clone(&ctx.arena),
-            ));
+            let factory = match &ctx.runtime_filter_execution {
+                PipelineRuntimeFilterExecution::NativeDisabled => {
+                    ScanSourceFactory::new_native(scan.clone(), Arc::clone(&ctx.arena))
+                }
+                #[cfg(feature = "compat")]
+                PipelineRuntimeFilterExecution::Compat { hub } => ScanSourceFactory::new_compat(
+                    scan.clone(),
+                    Arc::clone(hub),
+                    Arc::clone(&ctx.arena),
+                ),
+            };
+            let source: Box<dyn OperatorFactory> = Box::new(factory);
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -1491,27 +1753,38 @@ fn new_source_pipeline_with_dop(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
     use crate::exec::node::join::{
-        JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType,
+        CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
+        JoinType,
     };
     use crate::exec::node::lookup::LookUpNode;
+    use crate::exec::node::runtime_filter::{
+        NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
+        NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    };
+    use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::dependency::DependencyManager;
+    #[cfg(feature = "compat")]
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 
+    #[cfg(feature = "compat")]
+    use super::build_compat_pipeline_graph_for_exec_plan_with_dop;
     use super::{
-        build_pipeline_graph_for_exec_plan_with_dop,
-        build_pipeline_graph_for_exec_plan_with_root_sink_dop,
+        build_native_pipeline_graph_for_exec_plan_with_dop,
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
     };
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
@@ -1527,6 +1800,169 @@ mod tests {
                 output_chunk_schema,
             }),
         }
+    }
+
+    fn assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+        activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    ) {
+        let schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            &[SlotId::new(1)],
+        );
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let baseline = ExecPlan {
+            arena: arena.clone(),
+            root: lookup_node(1, Arc::clone(&schema)),
+        };
+        let build = |plan: &ExecPlan| {
+            build_native_pipeline_graph_for_exec_plan_with_dop(
+                plan,
+                false,
+                DependencyManager::new(),
+                None,
+                2,
+            )
+            .expect("graph")
+        };
+        let baseline = build(&baseline);
+        let wrapped = ExecPlan {
+            arena: arena.clone(),
+            root: ExecNode {
+                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                    input: Box::new(lookup_node(1, Arc::clone(&schema))),
+                    owner_node_id: 2,
+                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                        binding_id: 1,
+                        channel_id: 1,
+                        expr_id,
+                        activation,
+                        capabilities: BTreeSet::from([
+                            crate::runtime_filter::model::contract::ArtifactCapability::Membership,
+                            crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
+                        ]),
+                        contract: NativeRuntimeFilterContract::Membership {
+                            canonical_schema: Arc::from([]),
+                            schema_digest: [0; 32],
+                        },
+                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                    }],
+                }),
+            },
+        };
+        let wrapped = build(&wrapped);
+        assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
+        assert_eq!(
+            wrapped.pipelines[0].factories.len(),
+            baseline.pipelines[0].factories.len()
+        );
+        assert_eq!(
+            wrapped.pipelines[0].factories[0].name(),
+            baseline.pipelines[0].factories[0].name()
+        );
+    }
+
+    #[test]
+    fn dormant_blocking_consumer_has_no_dependency_or_wait() {
+        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
+        );
+    }
+
+    #[test]
+    fn dormant_live_consumer_has_no_snapshot_poll() {
+        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            },
+        );
+    }
+
+    #[test]
+    fn dormant_consumer_pipeline_is_chunk_exact_passthrough() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .expect("batch");
+        let chunk_schema = chunk_schema_of(&schema, &[SlotId::new(1)]);
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let baseline = ExecPlan {
+            arena: arena.clone(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: chunk.clone(),
+                    node_id: 1,
+                }),
+            },
+        };
+        let wrapped = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::NativeRuntimeFilterConsumer(
+                    NativeRuntimeFilterConsumerNode {
+                        input: Box::new(ExecNode {
+                            kind: ExecNodeKind::Values(ValuesNode {
+                                chunk: chunk.clone(),
+                                node_id: 1,
+                            }),
+                        }),
+                        owner_node_id: 2,
+                        bindings: vec![NativeRuntimeFilterConsumerSpec {
+                            binding_id: 1,
+                            channel_id: 1,
+                            expr_id,
+                            activation: crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+                            },
+                            capabilities: BTreeSet::from([
+                                crate::runtime_filter::model::contract::ArtifactCapability::Membership,
+                                crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
+                            ]),
+                            contract: NativeRuntimeFilterContract::Membership { canonical_schema: Arc::from([]), schema_digest: [0; 32] },
+                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                        }],
+                    },
+                ),
+            },
+        };
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &wrapped.root.kind else {
+            panic!("consumer")
+        };
+        let ExecNodeKind::Values(values) = &consumer.input.kind else {
+            panic!("values")
+        };
+        assert!(Arc::ptr_eq(
+            values.chunk.batch.column(0),
+            chunk.batch.column(0)
+        ));
+
+        let build = |plan: &ExecPlan| {
+            build_native_pipeline_graph_for_exec_plan_with_dop(
+                plan,
+                false,
+                DependencyManager::new(),
+                None,
+                2,
+            )
+            .expect("graph")
+        };
+        let baseline = build(&baseline);
+        let wrapped = build(&wrapped);
+        assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
+        assert_eq!(
+            wrapped.pipelines[0].factories.len(),
+            baseline.pipelines[0].factories.len()
+        );
+        assert_eq!(
+            wrapped.pipelines[0].factories[0].name(),
+            baseline.pipelines[0].factories[0].name()
+        );
     }
 
     #[test]
@@ -1610,13 +2046,12 @@ mod tests {
         };
 
         let plan = ExecPlan { arena, root };
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             2,
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 
@@ -1630,6 +2065,7 @@ mod tests {
         assert_eq!(local_exchange_sources, 1);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn right_semi_pipeline_uses_right_probe_and_left_build_for_runtime_filters() {
         let left_slot = SlotId::new(11);
@@ -1664,21 +2100,23 @@ mod tests {
                     build_keys: vec![left_key],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filters: vec![JoinRuntimeFilterSpec {
-                        filter_id: 7,
-                        expr_order: 0,
-                        probe_expr_id: right_key,
-                        build_expr_id: left_key,
-                        probe_slot_id: right_slot,
-                        build_data_type: DataType::Int32,
-                        merge_nodes: Vec::new(),
-                        has_remote_targets: false,
-                    }],
+                    runtime_filter_execution: JoinRuntimeFilterExecution::Compat {
+                        legacy_specs: vec![CompatJoinRuntimeFilterSpec {
+                            filter_id: 7,
+                            expr_order: 0,
+                            probe_expr_id: right_key,
+                            build_expr_id: left_key,
+                            probe_slot_id: right_slot,
+                            build_data_type: DataType::Int32,
+                            merge_nodes: Vec::new(),
+                            has_remote_targets: false,
+                        }],
+                    },
                 }),
             },
         };
 
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_compat_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
@@ -1775,13 +2213,12 @@ mod tests {
             },
         };
 
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             2,
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 
@@ -1835,13 +2272,12 @@ mod tests {
             },
         };
 
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             2,
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 
@@ -1871,14 +2307,13 @@ mod tests {
             },
         };
 
-        let graph = build_pipeline_graph_for_exec_plan_with_root_sink_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             4,
             Some(1),
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 
@@ -1966,13 +2401,12 @@ mod tests {
         };
 
         let plan = ExecPlan { arena, root };
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             2,
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 
@@ -2047,13 +2481,12 @@ mod tests {
         };
 
         let plan = ExecPlan { arena, root };
-        let graph = build_pipeline_graph_for_exec_plan_with_dop(
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
             &plan,
             false,
             DependencyManager::new(),
             None,
             2,
-            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
         )
         .expect("build pipeline graph");
 

@@ -54,14 +54,6 @@ mod tests {
     };
     use crate::types::native_proto::decode_type;
 
-    fn empty_runtime_filter_projection()
-    -> &'static crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection {
-        Box::leak(Box::new(
-            crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection::default(
-            ),
-        ))
-    }
-
     fn empty_scan_bindings() -> &'static ScanExecutionBindings {
         Box::leak(Box::new(ScanExecutionBindings::default()))
     }
@@ -711,12 +703,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let decoded =
             crate::proto::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
                 .expect("decode proto message");
@@ -849,12 +837,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -957,12 +941,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1074,12 +1054,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1161,12 +1137,8 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1234,12 +1206,8 @@ mod tests {
             runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
-        let encoded_plan = plan::encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode distributed plan");
+        let encoded_plan = plan::encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode distributed plan");
         let encoded = encoded_plan
             .fragments
             .iter()
@@ -1530,7 +1498,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: None,
             },
         )
         .expect("encode StarRocks native scan source");
@@ -1691,7 +1659,6 @@ mod tests {
                 .expect("placement endpoint"),
             scan_ranges,
             destinations: vec![destination],
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders,
         };
         let query_options = crate::runtime::query_options::QueryOptions {
@@ -1722,25 +1689,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let runtime_filter_prober_params = BTreeMap::from([(
-            9,
-            vec![
-                crate::runtime::endpoint::RuntimeFilterProberDestination::new(
-                    crate::common::types::UniqueId { hi: 30, lo: 40 },
-                    crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.30", 8060)
-                        .expect("prober endpoint"),
-                ),
-            ],
-        )]);
-        let runtime_filter_builder_number = BTreeMap::from([(9, 3)]);
-
         let encoded = instance::encode_instance_params(
             &crate::common::types::UniqueId { hi: 100, lo: 200 },
             &placement,
             Some(&query_options),
-            &runtime_filter_prober_params,
-            &runtime_filter_builder_number,
-            1 << 18,
             5,
             Some(
                 &crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
@@ -1791,15 +1743,7 @@ mod tests {
         assert_eq!(pruning.value_kind, 2);
         assert_eq!(pruning.min_int_value, Some(10));
         assert_eq!(pruning.max_int_value, Some(20));
-        let rf = encoded
-            .runtime_filter_params
-            .as_ref()
-            .expect("runtime filter params");
-        assert_eq!(rf.runtime_filter_builder_number.get(&9), Some(&3));
-        assert_eq!(
-            rf.id_to_prober_params[&9].params[0].endpoint,
-            "10.0.0.30:8060"
-        );
+        assert!(encoded.runtime_filter_params.is_none());
         let opts = encoded.query_options.as_ref().expect("query options");
         assert_eq!(opts.batch_size, 4096);
         assert_eq!(opts.query_timeout, 60);
@@ -1834,7 +1778,6 @@ mod tests {
                 ],
             )]),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
 
@@ -1842,9 +1785,6 @@ mod tests {
             &crate::common::types::UniqueId { hi: 100, lo: 200 },
             &placement,
             None,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            1024,
             0,
             None,
             false,

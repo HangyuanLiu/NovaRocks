@@ -41,7 +41,7 @@ use crate::common::ids::SlotId;
 use crate::common::largeint;
 use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
-use crate::exec::node::join::JoinRuntimeFilterSpec;
+use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 
 #[derive(Clone, Debug)]
 /// Typed IN runtime filter storing exact candidate values for one expression.
@@ -1102,7 +1102,7 @@ impl RuntimeInFilter {
 
 impl LocalRuntimeInFilterSet {
     pub(crate) fn new(
-        specs: &[JoinRuntimeFilterSpec],
+        specs: &[CompatJoinRuntimeFilterSpec],
         key_arrays: &[ArrayRef],
     ) -> Result<Self, String> {
         let mut filters = Vec::with_capacity(specs.len());

@@ -40,6 +40,19 @@ pub struct RuntimeProfile {
 
 pub type Profiler = RuntimeProfile;
 
+pub(crate) const NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE: &str = "NativeRuntimeFilterDormancy";
+pub(crate) const NATIVE_RUNTIME_FILTER_BINDING_COUNT: &str = "BindingCount";
+pub(crate) const NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP: &str = "ValidatedLookup";
+pub(crate) const NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED: &str = "DeploymentNotInstalled";
+pub(crate) const NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS: &[&str] = &[
+    "ArtifactBuild",
+    "ArtifactPublish",
+    "LegacyRegister",
+    "DependencyWait",
+    "SnapshotPoll",
+    "Apply",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProfileUnit {
     Unit,

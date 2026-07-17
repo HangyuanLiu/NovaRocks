@@ -19,7 +19,7 @@ use crate::types::ConnectionConfig;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
-#[path = "../../../src/common/engine_error_codes.rs"]
+#[path = "../../../novarocks/core/src/common/engine_error_codes.rs"]
 mod engine_error_codes;
 use engine_error_codes::EngineErrorCode;
 

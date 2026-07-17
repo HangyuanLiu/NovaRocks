@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-#[path = "../../../src/common/engine_error_codes.rs"]
+#[path = "../../../novarocks/core/src/common/engine_error_codes.rs"]
 mod engine_error_codes;
 use engine_error_codes::EngineErrorCode;
 

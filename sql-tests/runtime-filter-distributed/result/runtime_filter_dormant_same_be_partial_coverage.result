@@ -1,0 +1,7 @@
+-- query 11
+mode	row_count	id_sum
+rf_off	20	54400
+
+-- query 13
+mode	row_count	id_sum
+rf_on	20	54400

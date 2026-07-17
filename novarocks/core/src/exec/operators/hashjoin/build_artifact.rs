@@ -46,18 +46,35 @@ pub(crate) struct JoinBuildArtifact {
     pub(crate) build_row_count: usize,
     pub(crate) build_has_null_key: bool,
     pub(crate) build_null_key_rows: Option<Arc<Vec<u32>>>,
-    pub(crate) runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
+    runtime_filter_execution: JoinBuildArtifactRuntimeFilterExecution,
+}
+
+#[derive(Clone)]
+enum JoinBuildArtifactRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        local_filters: Option<Arc<LocalRuntimeFilterSet>>,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) enum JoinBuildRuntimeFilterView {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        local_filters: Option<Arc<LocalRuntimeFilterSet>>,
+    },
 }
 
 impl JoinBuildArtifact {
-    pub(crate) fn new(
+    pub(crate) fn new_native(
         provided: BuildComponentRequirements,
         build_store: Option<BuildStore>,
         build_table: Option<JoinHashMap>,
         build_row_count: usize,
         build_has_null_key: bool,
         build_null_key_rows: Option<Arc<Vec<u32>>>,
-        runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
     ) -> Self {
         Self {
             provided,
@@ -66,8 +83,32 @@ impl JoinBuildArtifact {
             build_row_count,
             build_has_null_key,
             build_null_key_rows,
-            runtime_filters,
+            runtime_filter_execution: JoinBuildArtifactRuntimeFilterExecution::Native,
         }
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn new_compat(
+        provided: BuildComponentRequirements,
+        build_store: Option<BuildStore>,
+        build_table: Option<JoinHashMap>,
+        build_row_count: usize,
+        build_has_null_key: bool,
+        build_null_key_rows: Option<Arc<Vec<u32>>>,
+        runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
+    ) -> Self {
+        let mut artifact = Self::new_native(
+            provided,
+            build_store,
+            build_table,
+            build_row_count,
+            build_has_null_key,
+            build_null_key_rows,
+        );
+        artifact.runtime_filter_execution = JoinBuildArtifactRuntimeFilterExecution::Compat {
+            local_filters: runtime_filters,
+        };
+        artifact
     }
 
     pub(crate) fn validate_components(
@@ -159,8 +200,16 @@ impl BuildView {
         self.artifact.build_null_key_rows.clone()
     }
 
-    pub(crate) fn runtime_filters(&self) -> Option<Arc<LocalRuntimeFilterSet>> {
-        self.artifact.runtime_filters.clone()
+    pub(crate) fn runtime_filter_view(&self) -> JoinBuildRuntimeFilterView {
+        match &self.artifact.runtime_filter_execution {
+            JoinBuildArtifactRuntimeFilterExecution::Native => JoinBuildRuntimeFilterView::Native,
+            #[cfg(feature = "compat")]
+            JoinBuildArtifactRuntimeFilterExecution::Compat { local_filters } => {
+                JoinBuildRuntimeFilterView::Compat {
+                    local_filters: local_filters.clone(),
+                }
+            }
+        }
     }
 }
 
@@ -216,13 +265,12 @@ mod tests {
 
     #[test]
     fn membership_only_artifact_allows_missing_row_payload_when_lookup_table_present() {
-        let artifact = JoinBuildArtifact::new(
+        let artifact = JoinBuildArtifact::new_native(
             membership_only_requirements(),
             None,
             Some(lookup_table()),
             3,
             false,
-            None,
             None,
         );
         assert!(
@@ -234,13 +282,12 @@ mod tests {
 
     #[test]
     fn membership_lookup_rejects_missing_table_when_nonempty() {
-        let artifact = JoinBuildArtifact::new(
+        let artifact = JoinBuildArtifact::new_native(
             membership_only_requirements(),
             None,
             None,
             3,
             false,
-            None,
             None,
         );
         let err = artifact
@@ -252,7 +299,7 @@ mod tests {
     #[test]
     fn row_payload_requirement_rejects_missing_build_store() {
         let artifact =
-            JoinBuildArtifact::new(row_payload_requirements(), None, None, 3, false, None, None);
+            JoinBuildArtifact::new_native(row_payload_requirements(), None, None, 3, false, None);
         let err = artifact
             .validate_components(row_payload_requirements())
             .expect_err("missing row payload must fail");
@@ -262,7 +309,7 @@ mod tests {
     #[test]
     fn row_payload_requirement_allows_empty_build_without_store() {
         let artifact =
-            JoinBuildArtifact::new(row_payload_requirements(), None, None, 0, false, None, None);
+            JoinBuildArtifact::new_native(row_payload_requirements(), None, None, 0, false, None);
         assert!(
             artifact
                 .validate_components(row_payload_requirements())
@@ -273,7 +320,7 @@ mod tests {
     #[test]
     fn no_lookup_requirement_allows_missing_table() {
         let artifact =
-            JoinBuildArtifact::new(no_lookup_requirements(), None, None, 3, false, None, None);
+            JoinBuildArtifact::new_native(no_lookup_requirements(), None, None, 3, false, None);
         assert!(
             artifact
                 .validate_components(no_lookup_requirements())
@@ -283,13 +330,12 @@ mod tests {
 
     #[test]
     fn provided_contract_mismatch_reports_component_contract_mismatch() {
-        let artifact = JoinBuildArtifact::new(
+        let artifact = JoinBuildArtifact::new_native(
             membership_only_requirements(),
             None,
             Some(lookup_table()),
             3,
             false,
-            None,
             None,
         );
         let err = artifact
@@ -300,15 +346,8 @@ mod tests {
 
     #[test]
     fn missing_null_key_rows_for_nonempty_build_reports_required_rows() {
-        let artifact = JoinBuildArtifact::new(
-            null_key_rows_requirements(),
-            None,
-            None,
-            3,
-            false,
-            None,
-            None,
-        );
+        let artifact =
+            JoinBuildArtifact::new_native(null_key_rows_requirements(), None, None, 3, false, None);
         let err = artifact
             .validate_components(null_key_rows_requirements())
             .expect_err("nonempty build must carry required null-key rows");
@@ -317,13 +356,12 @@ mod tests {
 
     #[test]
     fn build_view_build_chunk_reports_missing_payload_context() {
-        let artifact = Arc::new(JoinBuildArtifact::new(
+        let artifact = Arc::new(JoinBuildArtifact::new_native(
             no_lookup_requirements(),
             None,
             None,
             3,
             false,
-            None,
             None,
         ));
         let view = BuildView::new(artifact, no_lookup_requirements()).expect("build view");

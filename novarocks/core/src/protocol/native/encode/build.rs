@@ -1072,7 +1072,6 @@ mod tests {
             .schedule(
                 prepared.scheduling_view(),
                 crate::common::types::UniqueId { hi: 1, lo: 7 },
-                None,
             )
             .expect("schedule broadcast plan");
         assert_eq!(

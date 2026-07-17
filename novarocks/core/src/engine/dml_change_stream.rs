@@ -271,7 +271,6 @@ pub(crate) fn execute_dml_change_stream_write(
     let crate::engine::PlannedIcebergChangeStreamWrite {
         prepared,
         native_bundle,
-        runtime_filters,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -283,7 +282,6 @@ pub(crate) fn execute_dml_change_stream_write(
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         prepared,
         native_bundle,
-        runtime_filters,
         query_opts.cloned(),
     )?;
     dml_change_stream_write_execution(result, commit_plan)
@@ -636,6 +634,7 @@ mod tests {
                 }),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
+                runtime_filter_dormancy_proof: None,
             },
             commit_plan:
                 crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
@@ -660,6 +659,7 @@ mod tests {
             write_commit: Some(empty_writer_commit_for_test()),
             write_abort: None,
             fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
         }
     }
 

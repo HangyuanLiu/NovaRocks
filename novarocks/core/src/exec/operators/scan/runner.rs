@@ -2117,7 +2117,7 @@ mod tests {
     }
 
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::JoinRuntimeFilterSpec {
+        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
             filter_id,
             expr_order: 0,
             probe_expr_id: crate::exec::expr::ExprId(0),
@@ -2137,7 +2137,7 @@ mod tests {
     }
 
     fn string_in_filter(filter_id: i32, values: Vec<&str>) -> Vec<RuntimeInFilter> {
-        let spec = crate::exec::node::join::JoinRuntimeFilterSpec {
+        let spec = crate::exec::node::join::CompatJoinRuntimeFilterSpec {
             filter_id,
             expr_order: 0,
             probe_expr_id: crate::exec::expr::ExprId(0),

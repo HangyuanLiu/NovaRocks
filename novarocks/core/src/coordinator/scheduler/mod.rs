@@ -54,24 +54,16 @@
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
 
-mod runtime_filter;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::cluster::{LiveBackend, LiveBackendSnapshot};
 use crate::coordinator::prepare::{FragmentSchedulingView, PreparedFragment};
-use crate::runtime::endpoint::{
-    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
-};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::planner::distributed::{
     FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
-};
-
-pub(crate) use runtime_filter::{
-    PlannedRuntimeFilter, RuntimeFilterPlanResult, plan_runtime_filters,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -102,14 +94,12 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
     /// Destinations this instance should push its output to.
     pub(crate) destinations: Vec<FragmentDestination>,
-    /// Runtime filter prober destinations, keyed by filter_id.
-    pub(crate) runtime_filter_prober_params: BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
     /// Number of upstream senders per exchange node id.
     pub(crate) per_exch_num_senders: BTreeMap<i32, i32>,
 }
 
 /// The result of scheduling a multi-fragment plan.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SchedulingPlan {
     /// Fragment chosen as the execution anchor for fetch/write coordination.
     pub(crate) root_fragment_id: FragmentId,
@@ -177,7 +167,6 @@ impl FragmentScheduler {
         &self,
         view: FragmentSchedulingView<'_>,
         query_id: UniqueId,
-        rf_plan: Option<&RuntimeFilterPlanResult>,
     ) -> Result<SchedulingPlan, String> {
         let live = self.live_backend_snapshot.entries();
         let n = live.len();
@@ -347,7 +336,6 @@ impl FragmentScheduler {
                             endpoint: RuntimeEndpoint::from_socket_addr(addr),
                             scan_ranges: BTreeMap::new(),
                             destinations: Vec::new(),
-                            runtime_filter_prober_params: BTreeMap::new(),
                             per_exch_num_senders: BTreeMap::new(),
                         })
                     },
@@ -393,9 +381,6 @@ impl FragmentScheduler {
             root_backend_idx,
         };
         populate_destinations(&mut plan, view.edges(), live)?;
-        if let Some(rf_plan) = rf_plan {
-            populate_runtime_filter_params(&mut plan, rf_plan, live)?;
-        }
         populate_per_exch_num_senders(&mut plan, view.edges());
         Ok(plan)
     }
@@ -440,52 +425,6 @@ fn populate_destinations(
         if let Some(source_instances) = plan.by_fragment.get_mut(&edge.source_fragment_id) {
             for instance in source_instances {
                 instance.destinations.extend(destinations.iter().cloned());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn populate_runtime_filter_params(
-    plan: &mut SchedulingPlan,
-    rf_plan: &RuntimeFilterPlanResult,
-    live: &[LiveBackend],
-) -> Result<(), String> {
-    let mut probe_instances_by_filter: BTreeMap<i32, Vec<(UniqueId, usize)>> = BTreeMap::new();
-    for (fragment_id, probes) in &rf_plan.probe_side_filters {
-        if let Some(instances) = plan.by_fragment.get(fragment_id) {
-            let placements = instances
-                .iter()
-                .map(|instance| (instance.finst_id, instance.backend_idx))
-                .collect::<Vec<_>>();
-            for (filter_id, _scan_node_id) in probes {
-                probe_instances_by_filter
-                    .entry(*filter_id)
-                    .or_default()
-                    .extend(placements.iter().copied());
-            }
-        }
-    }
-    for (build_fragment_id, filter_ids) in &rf_plan.build_side_filters {
-        if let Some(build_instances) = plan.by_fragment.get_mut(build_fragment_id) {
-            for filter_id in filter_ids {
-                if let Some(probe_list) = probe_instances_by_filter.get(filter_id) {
-                    let probers = probe_list
-                        .iter()
-                        .map(|(finst_id, backend_idx)| {
-                            let addr = live_backend_addr(live, *backend_idx)?;
-                            Ok(RuntimeFilterProberDestination::new(
-                                *finst_id,
-                                RuntimeEndpoint::from_socket_addr(addr),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    for instance in build_instances.iter_mut() {
-                        instance
-                            .runtime_filter_prober_params
-                            .insert(*filter_id, probers.clone());
-                    }
-                }
             }
         }
     }
@@ -559,7 +498,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
-    use super::RuntimeFilterPlanResult;
     use crate::coordinator::prepare::{
         PreparedFragmentRole, PreparedFragmentSet, prepared_fragment_set_for_test,
     };
@@ -700,7 +638,7 @@ mod tests {
             query_id: UniqueId,
         ) -> Result<SchedulingPlan, String> {
             let topology = sealed_topology_for_test(fragments, edges);
-            self.schedule_fixture(fragments, edges, &topology, query_id, None)
+            self.schedule_fixture(fragments, edges, &topology, query_id)
         }
 
         fn schedule_fixture(
@@ -709,10 +647,9 @@ mod tests {
             edges: &[FragmentEdge],
             topology: &TestTopology,
             query_id: UniqueId,
-            rf_plan: Option<&RuntimeFilterPlanResult>,
         ) -> Result<SchedulingPlan, String> {
             let prepared = prepared_from_fixture(fragments, edges, topology);
-            self.schedule(prepared.scheduling_view(), query_id, rf_plan)
+            self.schedule(prepared.scheduling_view(), query_id)
         }
     }
 
@@ -815,7 +752,6 @@ mod tests {
             endpoint: RuntimeEndpoint::from_socket_addr(be("10.0.0.1:9010")),
             scan_ranges,
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -963,7 +899,7 @@ mod tests {
             // An empty live snapshot is rejected before the sealed topology is
             // ever inspected, so an empty projection is a legal placeholder here.
             let prepared = prepared_fragment_set_for_test(Vec::new(), Vec::new(), 0, Vec::new());
-            let result = scheduler.schedule(prepared.scheduling_view(), dummy_query_id(), None);
+            let result = scheduler.schedule(prepared.scheduling_view(), dummy_query_id());
             assert!(result.is_err());
             assert!(
                 result.unwrap_err().contains("no live backend available"),
@@ -983,7 +919,7 @@ mod tests {
             let topology = sealed_topology_for_test(&fragments, &edges);
 
             let plan = scheduler
-                .schedule_fixture(&fragments, &edges, &topology, make_query_id(7, 1), None)
+                .schedule_fixture(&fragments, &edges, &topology, make_query_id(7, 1))
                 .expect("schedule");
 
             let placements = &plan.by_fragment[&0];
@@ -1026,7 +962,7 @@ mod tests {
             ]);
 
             let plan = scheduler
-                .schedule_fixture(&fragments, &edges, &topology, make_query_id(7, 0), None)
+                .schedule_fixture(&fragments, &edges, &topology, make_query_id(7, 0))
                 .expect("schedule all range coverage cases from one snapshot");
             let backend_ids = |fragment_id| {
                 plan.by_fragment[&fragment_id]
@@ -1646,67 +1582,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_runtime_filter_params_build_gets_all_probe_instances() {
-        // 2 probe instances -> 2 probers with the right addresses.
-        let backends = two_backends();
-        let scheduler = FragmentScheduler::new(backends.clone());
-        // F0=scan (2 inst), F1=root (1 inst); F0 is probe, F1 is build (artificial scenario).
-        let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
-        let edges = vec![fake_edge(0, 1, TestPartitionType::Unpartitioned, 10)];
-        let rf_plan = RuntimeFilterPlanResult {
-            all_filters: Default::default(),
-            build_side_filters: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(1u32, vec![42i32]); // fragment 1 builds filter 42
-                m
-            },
-            probe_side_filters: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(0u32, vec![(42i32, 1i32)]); // fragment 0 probes filter 42 on scan node 1
-                m
-            },
-        };
-        let topology = sealed_topology_for_test(&fragments, &edges);
-        let plan = scheduler
-            .schedule_fixture(
-                &fragments,
-                &edges,
-                &topology,
-                make_query_id(1, 0),
-                Some(&rf_plan),
-            )
-            .expect("schedule with runtime filters");
-
-        // F1 (build fragment) single instance should have 2 prober entries for filter 42.
-        let build_inst = &plan.by_fragment[&1][0];
-        let probers = build_inst
-            .runtime_filter_prober_params
-            .get(&42)
-            .expect("filter 42 prober params");
-        assert_eq!(probers.len(), 2, "2 probe instances -> 2 prober entries");
-
-        // Verify addresses correspond to the 2 probe instances (F0: backends 0 and 1).
-        let addrs: Vec<String> = probers
-            .iter()
-            .map(|p| p.endpoint().host().to_string())
-            .collect();
-        let ports: Vec<i32> = probers.iter().map(|p| p.endpoint().port()).collect();
-        assert!(
-            addrs.contains(&"10.0.0.1".to_string()),
-            "probe instance 0 on backend 0"
-        );
-        assert!(
-            addrs.contains(&"10.0.0.2".to_string()),
-            "probe instance 1 on backend 1"
-        );
-        assert_eq!(
-            ports,
-            vec![9010, 9010],
-            "both probe endpoints use port 9010"
-        );
-    }
-
-    #[test]
     fn fill_per_exch_num_senders_accumulates_upstream_count() {
         // F0 (scan, 3 inst) -> exchange node 10 -> F2 (root)
         // F1 (scan, 3 inst) -> exchange node 20 -> F2 (root)
@@ -1775,7 +1650,7 @@ mod tests {
         let topology = TestTopology::new(vec![0, 1], 0);
 
         let plan = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect("assign honors the sealed anchor");
 
         assert_eq!(
@@ -1801,7 +1676,7 @@ mod tests {
         let topology = TestTopology::new(vec![0, 1, 2], 2);
 
         let plan = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect("assign consumes the sealed order");
 
         assert_eq!(
@@ -1841,7 +1716,7 @@ mod tests {
         let topology = TestTopology::new(vec![0, 10, 11], 10);
 
         let plan = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(5, 5), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(5, 5))
             .expect("assign schedules the sealed write DAG");
 
         assert_eq!(plan.root_fragment_id, 10, "sealed write anchor");
@@ -1871,7 +1746,7 @@ mod tests {
         let topology = TestTopology::new(vec![0, 1], 1);
 
         let plan = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect("assign schedules the sealed router shape");
 
         assert_eq!(plan.root_fragment_id, 1);
@@ -1896,7 +1771,7 @@ mod tests {
         let topology = TestTopology::new(vec![0, 1], 1);
 
         let plan = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect("assign schedules the sealed CTE shape");
 
         assert_eq!(plan.root_fragment_id, 1);
@@ -1928,7 +1803,7 @@ mod tests {
         ];
         let scheduler3 = FragmentScheduler::new_with_backend_ids(live3);
         let plan3 = scheduler3
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(9, 0), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(9, 0))
             .expect("schedule against a 3-BE registry");
         assert_eq!(plan3.root_fragment_id, 1);
         let f0_dense: Vec<usize> = plan3.by_fragment[&0]
@@ -1947,7 +1822,7 @@ mod tests {
         let live_sparse = vec![(3usize, be("10.0.0.4:9010")), (7usize, be("10.0.0.8:9010"))];
         let scheduler_sparse = FragmentScheduler::new_with_backend_ids(live_sparse);
         let plan_sparse = scheduler_sparse
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(9, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(9, 1))
             .expect("schedule against a sparse registry");
         assert_eq!(
             plan_sparse.root_fragment_id, 1,
@@ -1974,7 +1849,7 @@ mod tests {
         let topology = TestTopology::new(vec![0], 1);
 
         let err = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect_err("order/fragment desync must be rejected");
         assert!(err.contains("not a permutation"), "got: {err}");
     }
@@ -1987,7 +1862,7 @@ mod tests {
         let topology = TestTopology::new(vec![0], 5);
 
         let err = scheduler
-            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1), None)
+            .schedule_fixture(&fragments, &edges, &topology, make_query_id(1, 1))
             .expect_err("an anchor absent from the fragment set must be rejected");
         assert!(
             err.contains("is not among scheduled fragments"),

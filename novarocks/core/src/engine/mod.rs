@@ -2570,8 +2570,6 @@ fn explain_analyze_query(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let planning_elapsed = planning_start.elapsed();
 
     let query_opts = query_options_for_explain_analyze(query_opts);
@@ -2580,12 +2578,11 @@ fn explain_analyze_query(
     let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         Some(query_opts),
     )
-    .execute_with_profile_outcome()?;
+    .execute_with_profile_outcome(&distributed_plan)?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
         return Err(abort.reason.clone());
@@ -2614,6 +2611,9 @@ fn explain_analyze_query(
         outcome.query_result.row_count()
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
+    if let Some(proof) = outcome.runtime_filter_dormancy_proof.as_ref() {
+        lines.push(format_runtime_filter_dormancy_proof(proof));
+    }
     if let Some(counters) =
         crate::coordinator::profile::correlate::format_counter_sums_from_profile_trees(
             &outcome.fragment_profiles,
@@ -2665,6 +2665,18 @@ fn format_distributed_profile_summary(
         format_explain_analyze_duration_ns(summary.exchange_process_time_ns),
         format_explain_analyze_duration_ns(summary.network_time_ns),
         format_explain_analyze_duration_ns(summary.scan_io_time_ns)
+    )
+}
+
+fn format_runtime_filter_dormancy_proof(
+    proof: &crate::coordinator::profile::correlate::RuntimeFilterDormancyProof,
+) -> String {
+    format!(
+        "RuntimeFilterDormancy: lookups_observed={} all_deployment_not_installed={} zero_side_effects={} same_backend_partial_completion={}",
+        proof.lookups_observed,
+        proof.all_deployment_not_installed,
+        proof.zero_side_effects,
+        proof.same_backend_partial_completion,
     )
 }
 
@@ -2957,13 +2969,10 @@ pub(crate) fn execute_query_as_iceberg_write(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3074,6 +3083,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
             write_commit: None,
             write_abort: None,
             fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
         })
     } else {
         None
@@ -3083,7 +3093,6 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::coordinator::prepare::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    pub(crate) runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3127,8 +3136,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
@@ -3136,7 +3143,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     Ok(PlannedIcebergChangeStreamWrite {
         prepared,
         native_bundle,
-        runtime_filters,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -3146,14 +3152,12 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::coordinator::prepare::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3184,12 +3188,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
-    execute_planned_iceberg_change_stream_write(
-        planned.prepared,
-        planned.native_bundle,
-        planned.runtime_filters,
-        query_opts,
-    )
+    execute_planned_iceberg_change_stream_write(planned.prepared, planned.native_bundle, query_opts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3530,13 +3529,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3594,13 +3590,10 @@ pub(crate) fn execute_logical_plan_with_options(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -4382,6 +4375,21 @@ mod tests {
         assert_eq!(
             super::query_options_for_explain_analyze(Some(options)),
             expected
+        );
+    }
+
+    #[test]
+    fn runtime_filter_dormancy_summary_is_stable() {
+        let proof = crate::coordinator::profile::correlate::RuntimeFilterDormancyProof {
+            lookups_observed: true,
+            all_deployment_not_installed: true,
+            zero_side_effects: true,
+            same_backend_partial_completion: false,
+        };
+
+        assert_eq!(
+            super::format_runtime_filter_dormancy_proof(&proof),
+            "RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false"
         );
     }
 
@@ -5331,7 +5339,6 @@ mysql_port = 47892
     ) -> (
         crate::coordinator::prepare::PreparedFragmentSet,
         crate::protocol::native::encode::NativeFragmentBundle,
-        Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     ) {
         use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
@@ -5442,11 +5449,7 @@ mysql_port = 47892
             &prepared,
         )
         .expect("encode fragments");
-        let runtime_filters = crate::coordinator::scheduler::plan_runtime_filters(
-            prepared.runtime_filter_projection(),
-        )
-        .expect("plan runtime filters");
-        (prepared, native_bundle, runtime_filters)
+        (prepared, native_bundle)
     }
 
     /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
@@ -6263,6 +6266,12 @@ mysql_port = 47892
         assert!(text.contains("source_wait="), "{text}");
         assert!(text.contains("sink_wait="), "{text}");
         assert!(text.contains("exchange_wait="), "{text}");
+        assert!(
+            text.contains(
+                "RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false"
+            ),
+            "{text}"
+        );
         assert!(text.contains("PLAN FRAGMENT 0"), "{text}");
         assert!(text.contains("stats={rows="), "{text}");
         assert!(text.contains("act={rows="), "{text}");
@@ -6275,64 +6284,40 @@ mysql_port = 47892
         assert!(text.contains("Profile: active="), "{text}");
     }
 
-    /// OQ-5 Task 6: preparation must project the query-global runtime-filter
-    /// Graph for native descriptors on the join node and the scheduler-facing
-    /// `RuntimeFilterPlanResult`. Exercises the full
+    /// RFD-5B: preparation must materialize the query-global runtime-filter
+    /// Graph into fragment-local tables and sealed node binding IDs. Exercises the full
     /// standalone pipeline (analyze -> plan -> optimize -> planner RF Graph ->
     /// preparation -> encode/schedule) over the test catalog's fact-like
     /// `tbl(id int, name varchar)` joined to the small `date_dim` fixture on `id`.
     #[test]
     #[cfg(feature = "compat")]
-    fn preparation_projects_graph_runtime_filters_into_native_and_scheduler_artifacts() {
-        let (_prepared, native_bundle, runtime_filters) =
+    fn preparation_materializes_graph_runtime_filters_into_native_binding_tables() {
+        let (_prepared, native_bundle) =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
-        fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {
-            !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_filter)
+        fn has_binding_attachment(node: &crate::proto::plan::DistributedNode) -> bool {
+            !node.runtime_filter_binding_ids.is_empty()
+                || node.children.iter().any(has_binding_attachment)
         }
-        let has_rf = native_bundle
+        let has_attachment = native_bundle
             .fragments_in_id_order()
             .map(|(_, fragment)| fragment)
-            .any(|fragment| fragment.root.as_ref().is_some_and(has_build_filter));
+            .any(|fragment| fragment.root.as_ref().is_some_and(has_binding_attachment));
         assert!(
-            has_rf,
-            "expected a native hash join node with build_runtime_filters"
+            has_attachment,
+            "expected a native node with sealed runtime-filter binding IDs"
         );
-        // The coordinator-facing RF plan must be assembled with native
-        // descriptor metadata plus build/probe placement maps.
-        let rf_plan = runtime_filters
-            .as_ref()
-            .expect("rf_plan should be Some when a join emits filters");
-        assert!(
-            !rf_plan.all_filters.is_empty(),
-            "all_filters must carry the native descriptor"
-        );
-        let descriptor = rf_plan
-            .all_filters
-            .values()
-            .next()
-            .expect("expected one native runtime filter descriptor");
-        assert!(
-            descriptor.build_plan_node_id >= 0,
-            "native descriptor must record the build plan node"
-        );
-        assert!(
-            !descriptor.probe_target_node_ids.is_empty(),
-            "native descriptor must record probe target plan nodes"
-        );
-        assert!(
-            rf_plan.build_side_filters.values().any(|v| !v.is_empty()),
-            "build_side_filters must record the join fragment"
-        );
-        assert!(
-            rf_plan.probe_side_filters.values().any(|v| !v.is_empty()),
-            "probe_side_filters must record the probe target"
-        );
+        assert!(native_bundle.fragments_in_id_order().any(|(_, fragment)| {
+            fragment
+                .runtime_filter_bindings
+                .as_ref()
+                .is_some_and(|table| !table.bindings.is_empty())
+        }));
     }
 
     #[test]
     #[cfg(feature = "compat")]
     fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
-        let (prepared, _native_bundle, _runtime_filters) = build_fragments_for_query(
+        let (prepared, _native_bundle) = build_fragments_for_query(
             "SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1",
         );
 
@@ -6352,7 +6337,7 @@ mysql_port = 47892
     #[test]
     #[cfg(feature = "compat")]
     fn builder_preserves_cte_coordinator_shape_for_nested_cte_query() {
-        let (prepared, _native_bundle, _runtime_filters) = build_fragments_for_query(
+        let (prepared, _native_bundle) = build_fragments_for_query(
             "WITH outer_cte AS ( \
                 WITH inner_cte AS (SELECT id FROM tbl) \
                 SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \

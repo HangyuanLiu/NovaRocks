@@ -87,11 +87,12 @@ pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_deadline: Instant,
     pub(crate) exchange_senders: HashMap<i32, usize>,
-    pub(crate) runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
-    pub(crate) runtime_filter_params: Option<RuntimeFilterParams>,
-    pub(crate) runtime_filter_worker_params: Option<RuntimeFilterWorkerParams>,
-    pub(crate) runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
-    pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
+    legacy_runtime_filter_execution: LegacyRuntimeFilterExecutionClaim,
+    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    runtime_filter_params: Option<RuntimeFilterParams>,
+    runtime_filter_worker_params: Option<RuntimeFilterWorkerParams>,
+    runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
+    pending_runtime_filters: Vec<PendingRuntimeFilter>,
     runtime_filter_service: Arc<RuntimeFilterService>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
@@ -99,6 +100,15 @@ pub(crate) struct QueryContext {
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LegacyRuntimeFilterExecutionClaim {
+    #[default]
+    Unclaimed,
+    NativeDisabled,
+    #[cfg(feature = "compat")]
+    Compat,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +157,7 @@ impl QueryContext {
             query_expire,
             query_deadline: now + query_expire,
             exchange_senders: HashMap::new(),
+            legacy_runtime_filter_execution: LegacyRuntimeFilterExecutionClaim::Unclaimed,
             runtime_filter_hub: None,
             runtime_filter_params: None,
             runtime_filter_worker_params: None,
@@ -197,7 +208,6 @@ impl QueryContext {
         Instant::now() >= self.delivery_deadline
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_query_expired(&self) -> bool {
         Instant::now() >= self.query_deadline
     }
@@ -219,35 +229,115 @@ impl QueryContext {
         self.exchange_senders.get(&node_id).copied()
     }
 
-    pub(crate) fn set_runtime_filter_hub(&mut self, hub: Arc<RuntimeFilterHub>) {
+    fn claim_legacy_runtime_filter_execution(
+        &mut self,
+        claim: LegacyRuntimeFilterExecutionClaim,
+    ) -> Result<(), String> {
+        match (self.legacy_runtime_filter_execution, claim) {
+            (_, LegacyRuntimeFilterExecutionClaim::Unclaimed) => Ok(()),
+            (current, requested) if current == requested => Ok(()),
+            (
+                LegacyRuntimeFilterExecutionClaim::Unclaimed,
+                LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+            ) => {
+                if self.runtime_filter_params.is_some()
+                    || self.runtime_filter_worker_params.is_some()
+                    || self.runtime_filter_hub.is_some()
+                    || self.runtime_filter_worker.is_some()
+                    || !self.pending_runtime_filters.is_empty()
+                {
+                    return Err(
+                        "cannot claim NativeDisabled with unexpected legacy runtime-filter state"
+                            .to_string(),
+                    );
+                }
+                self.legacy_runtime_filter_execution = claim;
+                Ok(())
+            }
+            #[cfg(feature = "compat")]
+            (
+                LegacyRuntimeFilterExecutionClaim::Unclaimed,
+                LegacyRuntimeFilterExecutionClaim::Compat,
+            ) => {
+                self.legacy_runtime_filter_execution = claim;
+                Ok(())
+            }
+            (current, requested) => Err(format!(
+                "legacy runtime-filter execution claim conflict: current={current:?} requested={requested:?}"
+            )),
+        }
+    }
+
+    fn ensure_legacy_runtime_filter_enabled(&self) -> Result<(), String> {
+        match self.legacy_runtime_filter_execution {
+            LegacyRuntimeFilterExecutionClaim::NativeDisabled => Err(
+                "legacy runtime-filter state is unavailable for NativeDisabled query".to_string(),
+            ),
+            LegacyRuntimeFilterExecutionClaim::Unclaimed => {
+                Err("legacy runtime-filter execution mode is unclaimed".to_string())
+            }
+            #[cfg(feature = "compat")]
+            LegacyRuntimeFilterExecutionClaim::Compat => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_runtime_filter_execution_claim(
+        &self,
+    ) -> LegacyRuntimeFilterExecutionClaim {
+        self.legacy_runtime_filter_execution
+    }
+
+    pub(crate) fn set_runtime_filter_hub(
+        &mut self,
+        hub: Arc<RuntimeFilterHub>,
+    ) -> Result<(), String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
         self.runtime_filter_hub = Some(hub);
+        Ok(())
     }
 
-    pub(crate) fn runtime_filter_hub(&self) -> Option<Arc<RuntimeFilterHub>> {
-        self.runtime_filter_hub.clone()
+    pub(crate) fn runtime_filter_hub(&self) -> Result<Option<Arc<RuntimeFilterHub>>, String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
+        Ok(self.runtime_filter_hub.clone())
     }
 
-    pub(crate) fn set_runtime_filter_params(&mut self, params: RuntimeFilterParams) {
+    pub(crate) fn set_runtime_filter_params(
+        &mut self,
+        params: RuntimeFilterParams,
+    ) -> Result<(), String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
         if self.runtime_filter_params.is_none() {
             self.runtime_filter_worker_params = Some(params.to_worker_params());
             self.runtime_filter_params = Some(params);
         }
+        Ok(())
     }
 
-    pub(crate) fn runtime_filter_params(&self) -> Option<RuntimeFilterParams> {
-        self.runtime_filter_params.clone()
+    pub(crate) fn runtime_filter_params(&self) -> Result<Option<RuntimeFilterParams>, String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
+        Ok(self.runtime_filter_params.clone())
     }
 
-    pub(crate) fn runtime_filter_worker_params(&self) -> Option<RuntimeFilterWorkerParams> {
-        self.runtime_filter_worker_params.clone()
+    pub(crate) fn runtime_filter_worker_params(
+        &self,
+    ) -> Result<Option<RuntimeFilterWorkerParams>, String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
+        Ok(self.runtime_filter_worker_params.clone())
     }
 
-    pub(crate) fn set_runtime_filter_worker(&mut self, worker: Arc<RuntimeFilterWorker>) {
+    pub(crate) fn set_runtime_filter_worker(
+        &mut self,
+        worker: Arc<RuntimeFilterWorker>,
+    ) -> Result<(), String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
         self.runtime_filter_worker = Some(worker);
+        Ok(())
     }
 
-    pub(crate) fn runtime_filter_worker(&self) -> Option<Arc<RuntimeFilterWorker>> {
-        self.runtime_filter_worker.clone()
+    pub(crate) fn runtime_filter_worker(&self) -> Result<Option<Arc<RuntimeFilterWorker>>, String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
+        Ok(self.runtime_filter_worker.clone())
     }
 
     pub(crate) fn runtime_filter_service(&self) -> Arc<RuntimeFilterService> {
@@ -307,17 +397,22 @@ impl QueryContext {
         build_be_number: i32,
         data: Vec<u8>,
         build_data_type: Option<DataType>,
-    ) {
+    ) -> Result<(), String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
         self.pending_runtime_filters.push(PendingRuntimeFilter {
             filter_id,
             build_be_number,
             data,
             build_data_type,
         });
+        Ok(())
     }
 
-    pub(crate) fn drain_pending_runtime_filters(&mut self) -> Vec<PendingRuntimeFilter> {
-        std::mem::take(&mut self.pending_runtime_filters)
+    pub(crate) fn drain_pending_runtime_filters(
+        &mut self,
+    ) -> Result<Vec<PendingRuntimeFilter>, String> {
+        self.ensure_legacy_runtime_filter_enabled()?;
+        Ok(std::mem::take(&mut self.pending_runtime_filters))
     }
 
     pub(crate) fn mem_tracker(&self) -> Arc<MemTracker> {
@@ -544,23 +639,47 @@ impl QueryContextManager {
     fn clean_expired(&self) {
         let expired = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let to_remove = guard
+            let expired_second_chance = guard
                 .second_chance
                 .iter()
                 .filter_map(|(qid, ctx)| {
                     (ctx.has_no_active_instances() && ctx.is_delivery_expired()).then_some(*qid)
                 })
                 .collect::<Vec<_>>();
-            to_remove
-                .into_iter()
-                .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx)))
-                .collect::<Vec<_>>()
+            let expired_active = guard
+                .active
+                .iter()
+                .filter_map(|(qid, ctx)| {
+                    (ctx.has_no_active_instances() && ctx.is_query_expired()).then_some(*qid)
+                })
+                .collect::<Vec<_>>();
+            let mut expired = Vec::with_capacity(
+                expired_second_chance
+                    .len()
+                    .saturating_add(expired_active.len()),
+            );
+            expired.extend(
+                expired_second_chance
+                    .into_iter()
+                    .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx))),
+            );
+            expired.extend(
+                expired_active
+                    .into_iter()
+                    .filter_map(|qid| guard.active.remove(&qid).map(|ctx| (qid, ctx))),
+            );
+            expired
         };
         for (qid, ctx) in expired {
             ctx.runtime_filter_service().shutdown();
             drop(ctx);
             self.remove_runtime_filter_lifecycle_if_context_absent(qid);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clean_expired_for_test(&self) {
+        self.clean_expired();
     }
 
     fn remove_runtime_filter_lifecycle_if_context_absent(&self, query_id: QueryId) {
@@ -570,7 +689,7 @@ impl QueryContextManager {
         }
     }
 
-    pub(crate) fn get_or_register(
+    fn get_or_register(
         &self,
         query_id: QueryId,
         return_error_if_not_exist: bool,
@@ -586,7 +705,77 @@ impl QueryContextManager {
         )
     }
 
-    pub(crate) fn ensure_context(
+    pub(crate) fn get_or_register_native(
+        &self,
+        query_id: QueryId,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        self.get_or_register_internal_with_claim(
+            query_id,
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            true,
+            LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+        )
+    }
+
+    pub(crate) fn ensure_native_context(
+        &self,
+        query_id: QueryId,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        self.get_or_register_internal_with_claim(
+            query_id,
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            false,
+            LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn get_or_register_compat(
+        &self,
+        query_id: QueryId,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        self.get_or_register_internal_with_claim(
+            query_id,
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            true,
+            LegacyRuntimeFilterExecutionClaim::Compat,
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn ensure_compat_context(
+        &self,
+        query_id: QueryId,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        self.get_or_register_internal_with_claim(
+            query_id,
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            false,
+            LegacyRuntimeFilterExecutionClaim::Compat,
+        )
+    }
+
+    fn ensure_context(
         &self,
         query_id: QueryId,
         return_error_if_not_exist: bool,
@@ -610,14 +799,44 @@ impl QueryContextManager {
         query_expire: Duration,
         increment: bool,
     ) -> Result<(), String> {
+        self.get_or_register_internal_with_claim(
+            query_id,
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            increment,
+            LegacyRuntimeFilterExecutionClaim::Unclaimed,
+        )
+    }
+
+    fn get_or_register_internal_with_claim(
+        &self,
+        query_id: QueryId,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        increment: bool,
+        claim: LegacyRuntimeFilterExecutionClaim,
+    ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if let Some(ctx) = guard.active.get_mut(&query_id) {
+            if claim != LegacyRuntimeFilterExecutionClaim::Unclaimed {
+                ctx.claim_legacy_runtime_filter_execution(claim)?;
+            }
             if increment {
                 ctx.increment_num_fragments();
             }
             return Ok(());
         }
-        if let Some(mut ctx) = guard.second_chance.remove(&query_id) {
+        if guard.second_chance.contains_key(&query_id) {
+            if claim != LegacyRuntimeFilterExecutionClaim::Unclaimed {
+                guard
+                    .second_chance
+                    .get_mut(&query_id)
+                    .expect("checked")
+                    .claim_legacy_runtime_filter_execution(claim)?;
+            }
+            let mut ctx = guard.second_chance.remove(&query_id).expect("checked");
             if increment {
                 ctx.increment_num_fragments();
             }
@@ -628,6 +847,9 @@ impl QueryContextManager {
             return Err("Query terminates prematurely (missing QueryContext)".to_string());
         }
         let mut ctx = QueryContext::new(query_id, delivery_expire, query_expire);
+        if claim != LegacyRuntimeFilterExecutionClaim::Unclaimed {
+            ctx.claim_legacy_runtime_filter_execution(claim)?;
+        }
         if increment {
             ctx.increment_num_fragments();
         }
@@ -841,11 +1063,11 @@ impl QueryContextManager {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if let Some(ctx) = guard.active.get_mut(&query_id) {
-            ctx.set_runtime_filter_hub(hub);
+            ctx.set_runtime_filter_hub(hub)?;
             return Ok(());
         }
         if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-            ctx.set_runtime_filter_hub(hub);
+            ctx.set_runtime_filter_hub(hub)?;
             return Ok(());
         }
         Err("QueryContext not found".to_string())
@@ -854,13 +1076,16 @@ impl QueryContextManager {
     pub(crate) fn get_runtime_filter_hub(
         &self,
         query_id: QueryId,
-    ) -> Option<Arc<RuntimeFilterHub>> {
+    ) -> Result<Option<Arc<RuntimeFilterHub>>, String> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
+        let Some(ctx) = guard
             .active
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.runtime_filter_hub())
+        else {
+            return Ok(None);
+        };
+        ctx.runtime_filter_hub()
     }
 
     pub(crate) fn set_runtime_filter_params(
@@ -869,10 +1094,10 @@ impl QueryContextManager {
         params: RuntimeFilterParams,
     ) -> Result<(), String> {
         let pending = self.with_context_mut(query_id, |ctx| {
-            ctx.set_runtime_filter_params(params);
-            Ok(ctx.drain_pending_runtime_filters())
+            ctx.set_runtime_filter_params(params)?;
+            ctx.drain_pending_runtime_filters()
         })?;
-        if let Some(worker) = self.get_or_create_runtime_filter_worker(query_id) {
+        if let Some(worker) = self.get_or_create_runtime_filter_worker(query_id)? {
             for item in pending {
                 let _ = worker.receive_partial(
                     item.filter_id,
@@ -889,13 +1114,16 @@ impl QueryContextManager {
     pub(crate) fn get_runtime_filter_params(
         &self,
         query_id: QueryId,
-    ) -> Option<RuntimeFilterParams> {
+    ) -> Result<Option<RuntimeFilterParams>, String> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
+        let Some(ctx) = guard
             .active
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.runtime_filter_params())
+        else {
+            return Ok(None);
+        };
+        ctx.runtime_filter_params()
     }
 
     #[allow(dead_code)]
@@ -906,11 +1134,11 @@ impl QueryContextManager {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if let Some(ctx) = guard.active.get_mut(&query_id) {
-            ctx.set_runtime_filter_worker(worker);
+            ctx.set_runtime_filter_worker(worker)?;
             return Ok(());
         }
         if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-            ctx.set_runtime_filter_worker(worker);
+            ctx.set_runtime_filter_worker(worker)?;
             return Ok(());
         }
         Err("QueryContext not found".to_string())
@@ -920,44 +1148,50 @@ impl QueryContextManager {
     pub(crate) fn get_runtime_filter_worker(
         &self,
         query_id: QueryId,
-    ) -> Option<Arc<RuntimeFilterWorker>> {
+    ) -> Result<Option<Arc<RuntimeFilterWorker>>, String> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
+        let Some(ctx) = guard
             .active
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.runtime_filter_worker())
+        else {
+            return Ok(None);
+        };
+        ctx.runtime_filter_worker()
     }
 
     pub(crate) fn get_or_create_runtime_filter_worker(
         &self,
         query_id: QueryId,
-    ) -> Option<Arc<RuntimeFilterWorker>> {
+    ) -> Result<Option<Arc<RuntimeFilterWorker>>, String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         let ctx = if let Some(ctx) = guard.active.get_mut(&query_id) {
             ctx
         } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
             ctx
         } else {
-            return None;
+            return Ok(None);
         };
-        if let Some(worker) = ctx.runtime_filter_worker() {
-            return Some(worker);
+        let existing_worker = ctx.runtime_filter_worker()?;
+        if let Some(worker) = existing_worker {
+            return Ok(Some(worker));
         }
-        let params = ctx.runtime_filter_worker_params()?;
-        let hub = if let Some(hub) = ctx.runtime_filter_hub() {
+        let Some(params) = ctx.runtime_filter_worker_params()? else {
+            return Ok(None);
+        };
+        let hub = if let Some(hub) = ctx.runtime_filter_hub()? {
             hub
         } else {
             let hub = Arc::new(RuntimeFilterHub::new_for_query(
                 DependencyManager::new(),
                 query_id,
             ));
-            ctx.set_runtime_filter_hub(Arc::clone(&hub));
+            ctx.set_runtime_filter_hub(Arc::clone(&hub))?;
             hub
         };
         let worker = Arc::new(RuntimeFilterWorker::new(query_id, params, hub));
-        ctx.set_runtime_filter_worker(Arc::clone(&worker));
-        Some(worker)
+        ctx.set_runtime_filter_worker(Arc::clone(&worker))?;
+        Ok(Some(worker))
     }
 
     pub(crate) fn enqueue_pending_runtime_filter(
@@ -969,8 +1203,7 @@ impl QueryContextManager {
         build_data_type: Option<DataType>,
     ) -> Result<(), String> {
         self.with_context_mut(query_id, |ctx| {
-            ctx.push_pending_runtime_filter(filter_id, build_be_number, data, build_data_type);
-            Ok(())
+            ctx.push_pending_runtime_filter(filter_id, build_be_number, data, build_data_type)
         })
     }
 
@@ -1263,6 +1496,292 @@ pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
     QUERY_CONTEXT_MANAGER
         .get_or_init(QueryContextManager::new)
         .clone()
+}
+
+#[cfg(test)]
+mod legacy_runtime_filter_execution_claim_tests {
+    use std::collections::BTreeMap;
+    #[cfg(feature = "compat")]
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::{
+        LegacyRuntimeFilterExecutionClaim, QueryContextManager, QueryContextManagerInner, QueryId,
+    };
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+
+    fn test_manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn disabled_query_context_rejects_legacy_params_without_partial_state() {
+        let mgr = test_manager();
+        let query_id = QueryId { hi: 501, lo: 502 };
+        mgr.get_or_register_native(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("native claim");
+
+        let error = mgr
+            .set_runtime_filter_params(
+                query_id,
+                RuntimeFilterParams::new(BTreeMap::new(), BTreeMap::new(), None),
+            )
+            .expect_err("disabled context must reject legacy params");
+        assert!(error.contains("NativeDisabled"), "{error}");
+        let guard = mgr.inner.lock().expect("query ctx manager lock");
+        let context = guard.active.get(&query_id).expect("query context");
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+        assert!(context.runtime_filter_params.is_none());
+        assert_eq!(context.num_fragments, 1);
+    }
+
+    #[test]
+    fn disabled_query_context_rejects_all_legacy_state_access() {
+        let mgr = test_manager();
+        let query_id = QueryId { hi: 505, lo: 506 };
+        mgr.get_or_register_native(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("native claim");
+
+        let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
+        assert!(mgr.set_runtime_filter_hub(query_id, hub).is_err());
+        assert!(mgr.get_runtime_filter_hub(query_id).is_err());
+        assert!(mgr.get_runtime_filter_worker(query_id).is_err());
+        assert!(mgr.get_or_create_runtime_filter_worker(query_id).is_err());
+        assert!(
+            mgr.enqueue_pending_runtime_filter(query_id, 7, 0, vec![1], None)
+                .is_err()
+        );
+        assert!(
+            mgr.with_context_mut(query_id, |ctx| ctx.drain_pending_runtime_filters())
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn query_mode_claim_conflicts_fail_fast_without_incrementing_fragments() {
+        let mgr = test_manager();
+        let query_id = QueryId { hi: 503, lo: 504 };
+        mgr.get_or_register_native(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("native claim");
+
+        let error = mgr
+            .get_or_register_compat(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect_err("cross-mode claim must fail");
+        assert!(error.contains("NativeDisabled"), "{error}");
+        let guard = mgr.inner.lock().expect("query ctx manager lock");
+        let context = guard.active.get(&query_id).expect("query context");
+        assert_eq!(context.num_fragments, 1);
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    fn race_native_and_compat_claims(
+        mgr: Arc<QueryContextManager>,
+        query_id: QueryId,
+    ) -> (Result<(), String>, Result<(), String>) {
+        let barrier = Arc::new(Barrier::new(3));
+        let native = {
+            let mgr = Arc::clone(&mgr);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                mgr.get_or_register_native(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+            })
+        };
+        let compat = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                mgr.get_or_register_compat(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+            })
+        };
+        barrier.wait();
+        (
+            native.join().expect("native claim thread"),
+            compat.join().expect("compat claim thread"),
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    fn assert_single_claim_winner(
+        mgr: &QueryContextManager,
+        query_id: QueryId,
+        results: &(Result<(), String>, Result<(), String>),
+        expected_fragments: usize,
+    ) {
+        assert_ne!(results.0.is_ok(), results.1.is_ok(), "results={results:?}");
+        let guard = mgr.inner.lock().expect("query ctx manager lock");
+        assert!(!guard.second_chance.contains_key(&query_id));
+        let context = guard.active.get(&query_id).expect("active query context");
+        assert_eq!(context.num_fragments, expected_fragments);
+        assert_ne!(
+            context.legacy_runtime_filter_execution_claim(),
+            LegacyRuntimeFilterExecutionClaim::Unclaimed
+        );
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn concurrent_cross_mode_claim_on_missing_context_has_one_winner() {
+        let mgr = Arc::new(test_manager());
+        let query_id = QueryId { hi: 507, lo: 508 };
+
+        let results = race_native_and_compat_claims(Arc::clone(&mgr), query_id);
+
+        assert_single_claim_winner(&mgr, query_id, &results, 1);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn concurrent_cross_mode_claim_on_active_context_has_one_winner() {
+        let mgr = Arc::new(test_manager());
+        let query_id = QueryId { hi: 509, lo: 510 };
+        mgr.ensure_context(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("unclaimed active context");
+
+        let results = race_native_and_compat_claims(Arc::clone(&mgr), query_id);
+
+        assert_single_claim_winner(&mgr, query_id, &results, 1);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn concurrent_cross_mode_claim_on_second_chance_preserves_context() {
+        let mgr = Arc::new(test_manager());
+        let query_id = QueryId { hi: 511, lo: 512 };
+        mgr.get_or_register(
+            query_id,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("unclaimed context");
+        let service_before = {
+            let guard = mgr.inner.lock().expect("query ctx manager lock");
+            guard
+                .active
+                .get(&query_id)
+                .expect("active context")
+                .runtime_filter_service()
+        };
+        mgr.finish_fragment(query_id);
+        assert!(
+            mgr.inner
+                .lock()
+                .expect("query ctx manager lock")
+                .second_chance
+                .contains_key(&query_id)
+        );
+
+        let results = race_native_and_compat_claims(Arc::clone(&mgr), query_id);
+
+        assert_single_claim_winner(&mgr, query_id, &results, 2);
+        let guard = mgr.inner.lock().expect("query ctx manager lock");
+        let service_after = guard
+            .active
+            .get(&query_id)
+            .expect("promoted context")
+            .runtime_filter_service();
+        assert!(Arc::ptr_eq(&service_before, &service_after));
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn same_mode_rpc_and_fragment_claim_order_is_idempotent() {
+        for (query_id, rpc_first) in [
+            (QueryId { hi: 513, lo: 514 }, true),
+            (QueryId { hi: 515, lo: 516 }, false),
+        ] {
+            let mgr = test_manager();
+            if rpc_first {
+                mgr.ensure_compat_context(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("rpc claim");
+                mgr.get_or_register_compat(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("fragment claim");
+            } else {
+                mgr.get_or_register_compat(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("fragment claim");
+                mgr.ensure_compat_context(
+                    query_id,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(5),
+                )
+                .expect("rpc claim");
+            }
+            let guard = mgr.inner.lock().expect("query ctx manager lock");
+            let context = guard.active.get(&query_id).expect("active context");
+            assert_eq!(context.num_fragments, 1);
+            assert_eq!(
+                context.legacy_runtime_filter_execution_claim(),
+                LegacyRuntimeFilterExecutionClaim::Compat
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1839,6 +2358,177 @@ mod runtime_filter_service_lifecycle_tests {
                 .second_chance
                 .contains_key(&query_id)
         );
+    }
+
+    #[test]
+    fn clean_expired_shuts_down_expired_claim_only_active_context_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(72);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("runtime-filter RPC claim-only context");
+        let (service, receiver) = install_probed_service(&manager, query_id);
+        manager
+            .inner
+            .lock()
+            .expect("query manager")
+            .active
+            .get_mut(&query_id)
+            .expect("claim-only active query")
+            .query_deadline = Instant::now() - Duration::from_millis(1);
+
+        manager.clean_expired();
+
+        assert_terminal_probe(receiver);
+        assert!(
+            !manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .active
+                .contains_key(&query_id)
+        );
+        assert!(registry.snapshot(query_key).is_none());
+        let error = service
+            .install(participant_install())
+            .expect_err("expired claim-only service must remain closed");
+        assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
+    }
+
+    #[test]
+    fn clean_expired_preserves_unexpired_claim_only_active_context() {
+        let manager = test_manager();
+        let query_id = query_id(73);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("runtime-filter RPC claim-only context");
+        let before = service(&manager, query_id);
+
+        manager.clean_expired();
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("claim remains active");
+        assert_eq!(context.num_active_fragments, 0);
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+        assert!(Arc::ptr_eq(&before, &context.runtime_filter_service()));
+    }
+
+    #[test]
+    fn clean_expired_preserves_active_fragment_past_query_deadline() {
+        let manager = test_manager();
+        let query_id = query_id(74);
+        manager
+            .get_or_register_native(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("active Native fragment");
+        manager
+            .inner
+            .lock()
+            .expect("query manager")
+            .active
+            .get_mut(&query_id)
+            .expect("active query")
+            .query_deadline = Instant::now() - Duration::from_millis(1);
+
+        manager.clean_expired();
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard
+            .active
+            .get(&query_id)
+            .expect("active fragment retained");
+        assert_eq!(context.num_active_fragments, 1);
+    }
+
+    #[test]
+    fn concurrent_native_fragment_recreates_context_while_expired_claim_shuts_down() {
+        let manager = test_manager();
+        let query_id = query_id(75);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("claim-only Native context");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink = Arc::new(BlockingShutdownSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let old_service = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("claim-only query");
+            context.query_deadline = Instant::now() - Duration::from_millis(1);
+            let service = Arc::new(RuntimeFilterService::new_for_query(
+                uid(query_id.lo),
+                sink,
+                &context.mem_tracker,
+            ));
+            context.runtime_filter_service = Arc::clone(&service);
+            service
+        };
+        assert_eq!(
+            old_service
+                .install(participant_install())
+                .expect("valid install"),
+            InstallOutcome::Installed
+        );
+
+        let cleaner = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.clean_expired())
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expired claim shutdown must start");
+
+        manager
+            .get_or_register_native(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("legal concurrent Native fragment");
+        release_tx.send(()).expect("release old shutdown");
+        cleaner.join().expect("cleaner");
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("replacement context");
+        assert_eq!(context.num_active_fragments, 1);
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+        assert!(registry.snapshot(query_key).is_some());
+        registry.remove_query(query_key);
     }
 
     #[test]

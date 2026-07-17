@@ -50,6 +50,7 @@ pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
         ExecNodeKind::UnionAll(_) => "UnionAll",
         ExecNodeKind::SetOp(_) => "SetOp",
         ExecNodeKind::Values(_) => "Values",
+        ExecNodeKind::NativeRuntimeFilterConsumer(_) => "NativeRuntimeFilterConsumer",
         ExecNodeKind::TableFunction(_) => "TableFunction",
         ExecNodeKind::Repeat(_) => "Repeat",
         ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",

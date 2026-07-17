@@ -49,6 +49,7 @@ message PlanFragment {
   repeated novarocks.common.OutputColumn output_columns = 7; // fragment output schema.
   optional uint32 cte_id = 8;                            // CTE id when this fragment is CTE-owned.
   repeated CteExchangeBinding cte_exchange_nodes = 9;    // CTE exchange bindings inside this fragment.
+  RuntimeFilterBindingTable runtime_filter_bindings = 10; // fragment-local static runtime-filter bindings.
 }
 
 // Binding between one CTE and its exchange receiver nodes.
@@ -69,9 +70,10 @@ message DistributedNode {
   repeated int32 tuple_ids = 3;                         // legacy tuple ids needed during NIDL-4 prepare.
   repeated int32 nullable_tuple_ids = 4;                // nullable tuple ids for outer-join semantics.
   int64 limit = 5;                                      // node limit; -1 means no limit.
-  repeated RuntimeFilterBuild build_runtime_filters = 6; // runtime filters built by this node.
-  repeated RuntimeFilterProbe probe_runtime_filters = 7; // runtime filters probed by this node.
+  reserved 6, 7;
+  reserved "build_runtime_filters", "probe_runtime_filters";
   repeated DistributedNode children = 8;                // child plan nodes.
+  repeated uint32 runtime_filter_binding_ids = 9;        // sealed binding ids attached to this node.
   oneof payload {
     PlanNode physical = 10;       // physical operator payload.
     ExchangeReceiver exchange = 11; // exchange receiver payload.
@@ -148,9 +150,8 @@ enum PartitionKind {
   PARTITION_KIND_HASH = 3;
 }
 
-// Runtime filter build wiring after fragment assignment.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
+// Published schema tombstone. No active field, production writer, or production
+// reader may reference this legacy runtime-filter message.
 message RuntimeFilterBuild {
   int32 filter_id = 1;                         // runtime filter id.
   novarocks.expr.Expr build_expr = 2;          // build-side expression.
@@ -161,13 +162,137 @@ message RuntimeFilterBuild {
   repeated uint32 target_fragment_ids = 7;     // probe-side target fragment ids.
 }
 
-// Runtime filter probe wiring after fragment assignment.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
+// Published schema tombstone. No active field, production writer, or production
+// reader may reference this legacy runtime-filter message.
 message RuntimeFilterProbe {
   int32 filter_id = 1;                // runtime filter id.
   novarocks.expr.Expr probe_expr = 2; // local probe expression.
   uint32 source_fragment_id = 3;      // build-side source fragment id.
+}
+
+// Fragment-local static runtime-filter binding table. Dynamic deployment,
+// routing, coverage, participants, and epochs are intentionally off-wire here.
+message RuntimeFilterBindingTable {
+  uint32 fragment_id = 1;
+  repeated RuntimeFilterBinding bindings = 2;
+}
+
+// One exact planner binding materialized by coordinator preparation.
+message RuntimeFilterBinding {
+  uint32 binding_id = 1;
+  uint32 channel_id = 2;
+  int32 node_id = 3;
+  RuntimeFilterApplyPoint apply_point = 4;
+  novarocks.expr.Expr expression = 5;
+  RuntimeFilterContract contract = 6;
+  RuntimeFilterReductionContract reduction = 7;
+  oneof role {
+    RuntimeFilterProducerRole producer = 8;
+    RuntimeFilterConsumerRole consumer = 9;
+  }
+}
+
+enum RuntimeFilterApplyPoint {
+  RUNTIME_FILTER_APPLY_POINT_UNSPECIFIED = 0;
+  RUNTIME_FILTER_APPLY_POINT_NODE_INPUT = 1;
+  RUNTIME_FILTER_APPLY_POINT_NODE_OUTPUT = 2;
+}
+
+message RuntimeFilterContract {
+  oneof kind {
+    RuntimeFilterMembershipContract membership = 1;
+    RuntimeFilterOrderedContract ordered = 2;
+  }
+}
+
+message RuntimeFilterMembershipContract {
+  bytes canonical_schema = 1;
+  bytes schema_digest = 2;
+}
+
+message RuntimeFilterOrderedContract {
+  repeated RuntimeFilterOrderKey keys = 1;
+  bytes comparator_digest = 2;
+  bytes order_contract_digest = 3;
+}
+
+message RuntimeFilterOrderKey {
+  novarocks.common.TypeDesc type = 1;
+  RuntimeFilterSortDirection direction = 2;
+  RuntimeFilterNullOrder null_order = 3;
+}
+
+enum RuntimeFilterSortDirection {
+  RUNTIME_FILTER_SORT_DIRECTION_UNSPECIFIED = 0;
+  RUNTIME_FILTER_SORT_DIRECTION_ASCENDING = 1;
+  RUNTIME_FILTER_SORT_DIRECTION_DESCENDING = 2;
+}
+
+enum RuntimeFilterNullOrder {
+  RUNTIME_FILTER_NULL_ORDER_UNSPECIFIED = 0;
+  RUNTIME_FILTER_NULL_ORDER_FIRST = 1;
+  RUNTIME_FILTER_NULL_ORDER_LAST = 2;
+}
+
+message RuntimeFilterReductionContract {
+  oneof kind {
+    bool set_union = 1;
+    bool tighten_ordered_bound = 2;
+    RuntimeFilterTopKReduction merge_topk_summary = 3;
+  }
+}
+
+message RuntimeFilterTopKReduction {
+  uint32 k = 1;
+  bytes contract_digest = 2;
+}
+
+message RuntimeFilterProducerRole {
+  repeated RuntimeFilterContributionKind contribution_kinds = 1;
+  RuntimeFilterCompletionRequirement completion_requirement = 2;
+}
+
+message RuntimeFilterConsumerRole {
+  repeated RuntimeFilterArtifactCapability capabilities = 1;
+  RuntimeFilterConsumerActivation activation = 2;
+}
+
+enum RuntimeFilterContributionKind {
+  RUNTIME_FILTER_CONTRIBUTION_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_VALUE_DOMAIN_DELTA = 1;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_FINAL_DOMAIN_SHARD = 2;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_ORDERED_BOUND_UPDATE = 3;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_TOPK_SUMMARY = 4;
+  RUNTIME_FILTER_CONTRIBUTION_KIND_PRODUCER_CLOSED = 5;
+}
+
+enum RuntimeFilterCompletionRequirement {
+  RUNTIME_FILTER_COMPLETION_REQUIREMENT_UNSPECIFIED = 0;
+  RUNTIME_FILTER_COMPLETION_REQUIREMENT_PRODUCER_CLOSED = 1;
+  RUNTIME_FILTER_COMPLETION_REQUIREMENT_FENCED_COMMITTED_DOMAIN_FROZEN = 2;
+}
+
+enum RuntimeFilterArtifactCapability {
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_UNSPECIFIED = 0;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_MEMBERSHIP = 1;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_ORDERED_RANGE = 2;
+  RUNTIME_FILTER_ARTIFACT_CAPABILITY_EMPTY_DOMAIN = 3;
+}
+
+message RuntimeFilterConsumerActivation {
+  oneof kind {
+    bool blocking_snapshot = 1;
+    RuntimeFilterLateApplyGranularity non_blocking_live = 2;
+  }
+}
+
+enum RuntimeFilterLateApplyGranularity {
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_UNSPECIFIED = 0;
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW = 1;
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_BATCH = 2;
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW_GROUP = 3;
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_SPLIT = 4;
+  RUNTIME_FILTER_LATE_APPLY_GRANULARITY_FILE = 5;
 }
 
 // Directed data-flow edge between two fragments.
@@ -696,7 +821,8 @@ message HashJoinNode {
   novarocks.expr.Expr other_condition = 3;             // optional non-equality join predicate.
   JoinDistribution distribution = 4;                   // physical join distribution.
   optional JoinExecutionMode execution_mode = 5;       // optional runtime-filter execution mode.
-  repeated RuntimeFilterBuildIntent build_runtime_filters = 6; // planned runtime filter builds.
+  reserved 6;
+  reserved "build_runtime_filters";
 }
 
 // Hash join equality condition.
@@ -708,9 +834,8 @@ message HashJoinEqCondition {
   bool null_safe = 3;            // true for null-safe equality.
 }
 
-// Runtime filter build intent before fragment assignment.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
+// Published schema tombstone. No active field, production writer, or production
+// reader may reference this legacy runtime-filter message.
 message RuntimeFilterBuildIntent {
   int32 filter_id = 1;                   // runtime filter id.
   novarocks.expr.Expr build_expr = 2;    // build-side expression.

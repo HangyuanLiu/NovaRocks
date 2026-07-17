@@ -25,20 +25,28 @@ use std::time::Duration;
 use sink_factory::{prepare_result_buffer_for_native_sink, sink_factory_from_native};
 
 use super::expr::lower_proto_expr;
-use super::node::{NodeLoweringContext, lower_proto_node};
+use super::node::{NodeLoweringContext, lower_proto_node_with_bindings};
+use super::runtime_filter_binding::{
+    DecodedApplyPoint, NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole,
+    RuntimeFilterBindingLookupLedger,
+};
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+use crate::exec::node::ExecPlan;
 use crate::exec::operators::DataStreamSinkFactoryInput;
-use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::native_fragment_wire as native_wire;
-use crate::runtime::profile::Profiler;
+use crate::runtime::profile::{
+    NATIVE_RUNTIME_FILTER_BINDING_COUNT, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED,
+    NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP,
+    NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS, Profiler,
+};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::{connector, proto};
@@ -52,6 +60,10 @@ pub(crate) fn execute_fragment_native(
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
 ) -> Result<FragmentOutput, String> {
+    let mut runtime_filter_bindings = RuntimeFilterBindingLookupLedger::decode(
+        fragment.fragment_id,
+        fragment.runtime_filter_bindings.as_ref(),
+    )?;
     let query_options = instance_params
         .query_options
         .as_ref()
@@ -68,17 +80,17 @@ pub(crate) fn execute_fragment_native(
         .as_ref()
         .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
         .map(unique_id_from_native)?;
-    let runtime_filter_params = instance_params
-        .runtime_filter_params
-        .as_ref()
-        .map(native_wire::runtime_filter_params_from_native)
-        .transpose()?;
+    if instance_params.runtime_filter_params.is_some() {
+        return Err(
+            "native InstanceParams must not carry legacy runtime-filter params".to_string(),
+        );
+    }
     let result_buffer_tracker = mem_tracker.clone();
     let runtime_state = build_runtime_state(
         RuntimeStateInputs {
             query_options: query_options.clone(),
             query_id: Some(query_id),
-            runtime_filter_params,
+            runtime_filter_params: None,
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(instance_params.backend_num),
             mem_tracker,
@@ -112,16 +124,21 @@ pub(crate) fn execute_fragment_native(
         hi: query_id.hi,
         lo: query_id.lo,
     });
-    let lowered = {
+    let (lowered, dormancy_facts) = {
         let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
-        lower_proto_node(root, &mut arena, &ctx)?
+        let lowered =
+            lower_proto_node_with_bindings(root, &mut arena, &ctx, &mut runtime_filter_bindings)?;
+        let dormancy_facts = runtime_filter_bindings.finish()?;
+        (lowered, dormancy_facts)
     };
+    if let Some(profiler) = profiler.as_ref() {
+        record_native_runtime_filter_dormancy(profiler, &dormancy_facts);
+    }
 
-    let mut exec_plan = ExecPlan {
+    let exec_plan = ExecPlan {
         arena,
         root: lowered.node,
     };
-    push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     prepare_result_buffer_for_native_sink(
         sink,
@@ -140,7 +157,7 @@ pub(crate) fn execute_fragment_native(
     let _exec_timer = profiler
         .as_ref()
         .map(|p| p.scoped_timer("PipelineExecuteTime"));
-    execute_plan_with_pipeline(
+    execute_native_plan_with_pipeline(
         exec_plan,
         debug_exec_node_output(),
         Duration::from_millis(50),
@@ -155,6 +172,42 @@ pub(crate) fn execute_fragment_native(
     )?;
 
     Ok(FragmentOutput { profile_json: None })
+}
+
+fn record_native_runtime_filter_dormancy(
+    profiler: &Profiler,
+    facts: &[NativeRuntimeFilterDormancyFact],
+) {
+    let dormancy = profiler.child(NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE);
+    dormancy.counter_set_unit(
+        NATIVE_RUNTIME_FILTER_BINDING_COUNT,
+        i64::try_from(facts.len()).expect("runtime-filter binding count fits i64"),
+    );
+    for fact in facts {
+        let binding = dormancy.child(format!("Binding{}", fact.binding_id));
+        binding.add_info_string("BindingId", fact.binding_id.to_string());
+        binding.add_info_string("ChannelId", fact.channel_id.to_string());
+        binding.add_info_string("NodeId", fact.node_id.to_string());
+        binding.add_info_string(
+            "ApplyPoint",
+            match fact.apply_point {
+                DecodedApplyPoint::NodeInput => "NodeInput",
+                DecodedApplyPoint::NodeOutput => "NodeOutput",
+            },
+        );
+        binding.add_info_string(
+            "Role",
+            match fact.role {
+                NativeRuntimeFilterDormancyRole::Producer => "Producer",
+                NativeRuntimeFilterDormancyRole::Consumer => "Consumer",
+            },
+        );
+        binding.counter_set_unit(NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP, 1);
+        binding.counter_set_unit(NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED, 1);
+        for counter in NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS {
+            binding.counter_set_unit(counter, 0);
+        }
+    }
 }
 
 fn unique_id_from_native(src: &proto::common::UniqueId) -> UniqueId {
@@ -323,6 +376,10 @@ mod tests {
                 kind: Some(plan::data_sink::Kind::Noop(true)),
             }),
             output_columns: columns,
+            runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                fragment_id: 1,
+                bindings: Vec::new(),
+            }),
             ..Default::default()
         }
     }
@@ -599,5 +656,88 @@ mod tests {
 
         execute_fragment_native(&fragment, &params, None, 1, None, None, None)
             .expect("native noop fragment executes");
+    }
+
+    #[test]
+    fn native_fragment_emits_zero_binding_dormancy_profile() {
+        let fragment = noop_values_fragment();
+        let params = instance_params();
+        let profiler = Profiler::new("native fragment");
+
+        execute_fragment_native(
+            &fragment,
+            &params,
+            None,
+            1,
+            None,
+            Some(profiler.clone()),
+            None,
+        )
+        .expect("native noop fragment executes");
+
+        let dormancy = profiler
+            .get_child("NativeRuntimeFilterDormancy")
+            .expect("zero-binding fragment still emits structured dormancy profile");
+        assert_eq!(dormancy.counter_value("BindingCount"), Some(0));
+        assert!(dormancy.children().is_empty());
+    }
+
+    #[test]
+    fn dormancy_profile_records_every_binding_and_explicit_zero_side_effects() {
+        use super::super::runtime_filter_binding::{
+            DecodedApplyPoint, NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole,
+        };
+
+        let profiler = Profiler::new("native fragment");
+        record_native_runtime_filter_dormancy(
+            &profiler,
+            &[
+                NativeRuntimeFilterDormancyFact {
+                    binding_id: 1,
+                    channel_id: 9,
+                    node_id: 11,
+                    apply_point: DecodedApplyPoint::NodeInput,
+                    role: NativeRuntimeFilterDormancyRole::Consumer,
+                },
+                NativeRuntimeFilterDormancyFact {
+                    binding_id: 2,
+                    channel_id: 9,
+                    node_id: 12,
+                    apply_point: DecodedApplyPoint::NodeOutput,
+                    role: NativeRuntimeFilterDormancyRole::Producer,
+                },
+            ],
+        );
+
+        let dormancy = profiler
+            .get_child("NativeRuntimeFilterDormancy")
+            .expect("dormancy profile");
+        assert_eq!(dormancy.counter_value("BindingCount"), Some(2));
+        for (binding_id, role) in [(1, "Consumer"), (2, "Producer")] {
+            let binding = dormancy
+                .get_child(&format!("Binding{binding_id}"))
+                .expect("binding profile");
+            assert_eq!(
+                binding.get_info_string("BindingId"),
+                Some(binding_id.to_string())
+            );
+            assert_eq!(binding.get_info_string("Role").as_deref(), Some(role));
+            assert_eq!(binding.counter_value("ValidatedLookup"), Some(1));
+            assert_eq!(binding.counter_value("DeploymentNotInstalled"), Some(1));
+            for counter in [
+                "ArtifactBuild",
+                "ArtifactPublish",
+                "LegacyRegister",
+                "DependencyWait",
+                "SnapshotPoll",
+                "Apply",
+            ] {
+                assert_eq!(
+                    binding.counter_value(counter),
+                    Some(0),
+                    "{counter} must be explicit zero for binding {binding_id}"
+                );
+            }
+        }
     }
 }

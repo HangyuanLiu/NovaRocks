@@ -20,7 +20,6 @@ pub(crate) mod build;
 mod fragment;
 mod node;
 pub(crate) mod output;
-pub(crate) mod runtime_filter;
 mod seal;
 pub(crate) mod topology;
 mod validation;

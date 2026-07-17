@@ -23,7 +23,7 @@ use thrift::OrderedFloat;
 
 use crate::common::thrift::thrift_compact_serialize;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, push_down_local_runtime_filters};
+use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::novarocks_connectors::ConnectorRegistry;
 
@@ -39,7 +39,7 @@ use crate::exec::operators::{
     ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::executor::{
-    execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
+    execute_compat_plan_with_pipeline, execute_compat_plan_with_pipeline_with_root_sink_dop,
 };
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -148,6 +148,9 @@ fn collect_glm_metadata(
             for input in &node.inputs {
                 collect_glm_metadata(input, row_pos_descs)?;
             }
+        }
+        ExecNodeKind::NativeRuntimeFilterConsumer(node) => {
+            collect_glm_metadata(&node.input, row_pos_descs)?;
         }
         ExecNodeKind::Values(_) => {}
         ExecNodeKind::IcebergDeltaScan(_) => {}
@@ -970,7 +973,10 @@ pub(crate) fn execute_fragment(
                 query_context_manager().register_row_pos_descs(query_id, row_pos_descs)?;
             }
         }
-        push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
+        super::runtime_filter_pushdown::push_down_local_runtime_filters(
+            &mut exec_plan.root,
+            &exec_plan.arena,
+        );
         let root_plan_node_id = plan.nodes.first().map(|n| n.node_id).unwrap_or(-1);
 
         match sink.type_ {
@@ -1005,7 +1011,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1051,7 +1057,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1110,7 +1116,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1155,7 +1161,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1192,7 +1198,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1217,7 +1223,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1244,7 +1250,7 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                execute_compat_plan_with_pipeline(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1292,7 +1298,7 @@ pub(crate) fn execute_fragment(
                 let root_sink_dop = (sink_mode
                     == crate::connector::iceberg::IcebergSinkMode::DeletionVectors)
                     .then_some(1);
-                execute_plan_with_pipeline_with_root_sink_dop(
+                execute_compat_plan_with_pipeline_with_root_sink_dop(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -1327,7 +1333,7 @@ pub(crate) fn execute_fragment(
                     let _exec_timer = profiler
                         .as_ref()
                         .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                    execute_plan_with_pipeline(
+                    execute_compat_plan_with_pipeline(
                         exec_plan,
                         debug_exec_node_output(),
                         Duration::from_millis(50),

@@ -82,13 +82,20 @@ pub(crate) fn standalone_query_profile_count(query_id: &UniqueId) -> usize {
         .unwrap_or(0)
 }
 
-pub(crate) fn take_standalone_query_profiles(query_id: &UniqueId) -> Vec<RuntimeProfileTree> {
+pub(crate) fn take_standalone_query_profiles(
+    query_id: &UniqueId,
+) -> BTreeMap<UniqueId, RuntimeProfileTree> {
     standalone_query_profiles()
         .lock()
         .expect("standalone query profile registry lock")
         .profiles
         .remove(&query_profile_key(query_id))
-        .map(|profiles| profiles.into_values().collect())
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .map(|((hi, lo), profile)| (UniqueId { hi, lo }, profile))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -222,7 +229,14 @@ mod tests {
         assert_eq!(standalone_query_profile_count(&query_id), 1);
         let profiles = take_standalone_query_profiles(&query_id);
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].root.node_id, 9);
+        assert_eq!(
+            profiles
+                .get(&finst_id)
+                .expect("canonical final profile remains keyed by finst_id")
+                .root
+                .node_id,
+            9
+        );
     }
 
     #[test]

@@ -20,13 +20,15 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use super::super::expr::lower_proto_expr;
-use super::super::layout::{Layout, chunk_schema_from_output_columns};
+use super::super::layout::chunk_schema_from_output_columns;
 use super::LoweredNode;
 use super::common::{check_exact_arity, concat_layouts, proto_join_type};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
+use crate::exec::node::join::{
+    JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::types::wider_type;
@@ -81,8 +83,6 @@ pub(super) fn lower_hash_join_node(
         }
         eq_null_safe.push(cond.null_safe);
     }
-    let raw_probe_keys = probe_keys.clone();
-    let raw_build_keys = build_keys.clone();
     coerce_join_key_types(&mut probe_keys, &mut build_keys, arena)?;
     for key in probe_keys.iter().chain(build_keys.iter()) {
         if let Some(dt) = arena.data_type(*key)
@@ -98,28 +98,6 @@ pub(super) fn lower_hash_join_node(
         .map(|expr| lower_proto_expr(expr, arena, &join_layout))
         .transpose()
         .map_err(|err| format!("HashJoinNode other_condition: {err}"))?;
-    let runtime_filters = lower_join_runtime_filters(
-        join,
-        RuntimeFilterLoweringInput {
-            join_type,
-            probe_layout: if right_semi_physical_right_probe {
-                &right.layout
-            } else {
-                &left.layout
-            },
-            build_layout: if right_semi_physical_right_probe {
-                &left.layout
-            } else {
-                &right.layout
-            },
-            raw_probe_keys: &raw_probe_keys,
-            raw_build_keys: &raw_build_keys,
-            probe_keys: &probe_keys,
-            build_keys: &build_keys,
-            arena,
-        },
-    )?;
-
     Ok(LoweredNode {
         node: ExecNode {
             kind: ExecNodeKind::Join(JoinNode {
@@ -135,7 +113,9 @@ pub(super) fn lower_hash_join_node(
                 build_keys,
                 eq_null_safe,
                 residual_predicate,
-                runtime_filters,
+                runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                    producers: Vec::new(),
+                },
             }),
         },
         layout: join_layout,
@@ -189,131 +169,7 @@ fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistribu
     }
 }
 
-struct RuntimeFilterLoweringInput<'a> {
-    join_type: JoinType,
-    probe_layout: &'a Layout,
-    build_layout: &'a Layout,
-    raw_probe_keys: &'a [ExprId],
-    raw_build_keys: &'a [ExprId],
-    probe_keys: &'a [ExprId],
-    build_keys: &'a [ExprId],
-    arena: &'a mut ExprArena,
-}
-
-fn lower_join_runtime_filters(
-    join: &plan::HashJoinNode,
-    input: RuntimeFilterLoweringInput<'_>,
-) -> Result<Vec<JoinRuntimeFilterSpec>, String> {
-    if !is_runtime_filter_safe_join_type(input.join_type) {
-        return Ok(Vec::new());
-    }
-    let mut runtime_filters = Vec::new();
-    for rf in &join.build_runtime_filters {
-        let expr_order = rf.expr_order as usize;
-        if expr_order >= input.probe_keys.len() || expr_order >= input.build_keys.len() {
-            return Err(format!(
-                "HashJoinNode runtime filter {} expr_order {} out of range",
-                rf.filter_id, expr_order
-            ));
-        }
-        validate_runtime_filter_intent(
-            rf,
-            expr_order,
-            input.probe_layout,
-            input.build_layout,
-            input.raw_probe_keys[expr_order],
-            input.raw_build_keys[expr_order],
-            input.arena,
-        )?;
-        if join
-            .eq_conditions
-            .get(expr_order)
-            .map(|cond| cond.null_safe)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let build_data_type = input
-            .arena
-            .data_type(input.build_keys[expr_order])
-            .ok_or_else(|| format!("runtime filter {} build key type missing", rf.filter_id))?
-            .clone();
-        let Some(ExprNode::SlotId(probe_slot_id)) = input.arena.node(input.probe_keys[expr_order])
-        else {
-            continue;
-        };
-        runtime_filters.push(JoinRuntimeFilterSpec {
-            filter_id: rf.filter_id,
-            expr_order,
-            probe_expr_id: input.probe_keys[expr_order],
-            build_expr_id: input.build_keys[expr_order],
-            probe_slot_id: *probe_slot_id,
-            build_data_type,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        });
-    }
-    Ok(runtime_filters)
-}
-
-fn is_runtime_filter_safe_join_type(join_type: JoinType) -> bool {
-    matches!(
-        join_type,
-        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-    )
-}
-
-fn validate_runtime_filter_intent(
-    rf: &plan::RuntimeFilterBuildIntent,
-    expr_order: usize,
-    probe_layout: &Layout,
-    build_layout: &Layout,
-    expected_probe_key: ExprId,
-    expected_build_key: ExprId,
-    arena: &mut ExprArena,
-) -> Result<(), String> {
-    let probe_expr = rf.probe_expr.as_ref().ok_or_else(|| {
-        format!(
-            "HashJoinNode runtime filter {} probe_expr missing",
-            rf.filter_id
-        )
-    })?;
-    let probe_expr_id = lower_proto_expr(probe_expr, arena, probe_layout).map_err(|err| {
-        format!(
-            "HashJoinNode runtime filter {} probe_expr: {err}",
-            rf.filter_id
-        )
-    })?;
-    if !exprs_equivalent(arena, probe_expr_id, expected_probe_key) {
-        return Err(format!(
-            "HashJoinNode runtime filter {} probe_expr does not match join key at expr_order {}",
-            rf.filter_id, expr_order
-        ));
-    }
-
-    let build_expr = rf.build_expr.as_ref().ok_or_else(|| {
-        format!(
-            "HashJoinNode runtime filter {} build_expr missing",
-            rf.filter_id
-        )
-    })?;
-    let build_expr_id = lower_proto_expr(build_expr, arena, build_layout).map_err(|err| {
-        format!(
-            "HashJoinNode runtime filter {} build_expr: {err}",
-            rf.filter_id
-        )
-    })?;
-    if !exprs_equivalent(arena, build_expr_id, expected_build_key) {
-        return Err(format!(
-            "HashJoinNode runtime filter {} build_expr does not match join key at expr_order {}",
-            rf.filter_id, expr_order
-        ));
-    }
-
-    Ok(())
-}
-
-fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
+pub(super) fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
     if arena.data_type(left) != arena.data_type(right) {
         return false;
     }
@@ -523,11 +379,9 @@ mod tests {
 
     use super::super::tests::{
         column_ref, lower, one_col_values_node_with, one_col_values_node_with_nullable,
-        output_column_with_nullable, physical_node, two_col_values_node,
+        output_column_with_nullable, physical_node,
     };
-    use super::super::{NodeLoweringContext, lower_proto_node};
     use crate::common::ids::SlotId;
-    use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::proto::plan;
 
@@ -549,7 +403,6 @@ mod tests {
                 other_condition: None,
                 distribution: plan::JoinDistribution::Broadcast as i32,
                 execution_mode: None,
-                build_runtime_filters: Vec::new(),
             }),
             output_columns,
             vec![
@@ -586,7 +439,6 @@ mod tests {
                 other_condition: None,
                 distribution: plan::JoinDistribution::Broadcast as i32,
                 execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
-                build_runtime_filters: Vec::new(),
             }),
             Vec::new(),
             vec![
@@ -621,77 +473,5 @@ mod tests {
             join_node.distribution_mode,
             crate::exec::node::join::JoinDistributionMode::Broadcast
         );
-    }
-
-    #[test]
-    fn hash_join_runtime_filter_skips_unsafe_join_type_and_rejects_mismatched_exprs() {
-        let outer_with_rf = physical_node(
-            30,
-            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
-                join_type: plan::JoinKind::LeftOuter as i32,
-                eq_conditions: vec![plan::HashJoinEqCondition {
-                    left: Some(column_ref(1, DataType::Int64)),
-                    right: Some(column_ref(3, DataType::Int64)),
-                    null_safe: false,
-                }],
-                other_condition: None,
-                distribution: plan::JoinDistribution::Broadcast as i32,
-                execution_mode: None,
-                build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
-                    filter_id: 1,
-                    build_expr: Some(column_ref(3, DataType::Int64)),
-                    probe_expr: Some(column_ref(1, DataType::Int64)),
-                    expr_order: 0,
-                    execution_mode: plan::JoinExecutionMode::Broadcast as i32,
-                }],
-            }),
-            Vec::new(),
-            vec![
-                two_col_values_node(10),
-                one_col_values_node_with(11, 3, "rhs", 10),
-            ],
-        );
-        let mut arena = ExprArena::default();
-        let lowered = lower_proto_node(&outer_with_rf, &mut arena, &NodeLoweringContext::default())
-            .expect("outer join runtime filters should be skipped");
-        let ExecNodeKind::Join(join) = lowered.node.kind else {
-            panic!("expected Join");
-        };
-        assert!(join.runtime_filters.is_empty());
-
-        let mismatched_probe = physical_node(
-            31,
-            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
-                join_type: plan::JoinKind::Inner as i32,
-                eq_conditions: vec![plan::HashJoinEqCondition {
-                    left: Some(column_ref(1, DataType::Int64)),
-                    right: Some(column_ref(3, DataType::Int64)),
-                    null_safe: false,
-                }],
-                other_condition: None,
-                distribution: plan::JoinDistribution::Broadcast as i32,
-                execution_mode: None,
-                build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
-                    filter_id: 2,
-                    build_expr: Some(column_ref(3, DataType::Int64)),
-                    probe_expr: Some(column_ref(2, DataType::Int64)),
-                    expr_order: 0,
-                    execution_mode: plan::JoinExecutionMode::Broadcast as i32,
-                }],
-            }),
-            Vec::new(),
-            vec![
-                two_col_values_node(10),
-                one_col_values_node_with(11, 3, "rhs", 10),
-            ],
-        );
-        let mut arena = ExprArena::default();
-        let err = lower_proto_node(
-            &mismatched_probe,
-            &mut arena,
-            &NodeLoweringContext::default(),
-        )
-        .unwrap_err();
-        assert!(err.contains("probe_expr does not match"));
     }
 }

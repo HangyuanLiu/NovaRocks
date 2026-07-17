@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::RuntimeFilterProbeSpec;
+use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
 use crate::runtime::exchange::ExchangeKey;
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,7 @@ pub struct ExchangeSourceNode {
     pub runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     pub expected_chunk_schema: ChunkSchemaRef,
     pub local_rf_waiting_set: Vec<i32>,
+    pub(crate) native_runtime_filter_specs: Vec<NativeRuntimeFilterConsumerSpec>,
 }
 
 impl ExchangeSourceNode {
@@ -44,6 +46,7 @@ impl ExchangeSourceNode {
             runtime_filter_specs: Vec::new(),
             expected_chunk_schema,
             local_rf_waiting_set: Vec::new(),
+            native_runtime_filter_specs: Vec::new(),
         }
     }
 
@@ -53,6 +56,10 @@ impl ExchangeSourceNode {
 
     pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
         &self.runtime_filter_specs
+    }
+
+    pub(crate) fn native_runtime_filter_specs(&self) -> &[NativeRuntimeFilterConsumerSpec] {
+        &self.native_runtime_filter_specs
     }
 
     pub fn expected_chunk_schema(&self) -> ChunkSchemaRef {
@@ -92,5 +99,12 @@ impl ExchangeSourceNode {
             self.runtime_filter_specs.push(spec.clone());
             seen.insert(spec.filter_id, spec.clone());
         }
+    }
+
+    pub(crate) fn set_native_runtime_filter_specs(
+        &mut self,
+        specs: Vec<NativeRuntimeFilterConsumerSpec>,
+    ) {
+        self.native_runtime_filter_specs = specs;
     }
 }

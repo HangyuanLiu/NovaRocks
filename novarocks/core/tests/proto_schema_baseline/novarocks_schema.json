@@ -2247,6 +2247,13 @@
               "label": "repeated",
               "oneof": null
             },
+            "9": {
+              "number": 9,
+              "name": "runtime_filter_binding_ids",
+              "type_name": "uint32",
+              "label": "repeated",
+              "oneof": null
+            },
             "10": {
               "number": 10,
               "name": "physical",
@@ -2262,8 +2269,14 @@
               "oneof": "payload"
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            6,
+            7
+          ],
+          "reserved_names": [
+            "build_runtime_filters",
+            "probe_runtime_filters"
+          ]
         },
         "DistributedPlan": {
           "fields": {
@@ -2650,8 +2663,12 @@
               "oneof": null
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            6
+          ],
+          "reserved_names": [
+            "build_runtime_filters"
+          ]
         },
         "IcebergChangeStreamBranchRoute": {
           "fields": {
@@ -4327,6 +4344,13 @@
               "type_name": "CteExchangeBinding",
               "label": "repeated",
               "oneof": null
+            },
+            "10": {
+              "number": 10,
+              "name": "runtime_filter_bindings",
+              "type_name": "RuntimeFilterBindingTable",
+              "label": "singular",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -4812,6 +4836,95 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterBinding": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "channel_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "node_id",
+              "type_name": "int32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "apply_point",
+              "type_name": "RuntimeFilterApplyPoint",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "expression",
+              "type_name": "novarocks.expr.Expr",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "contract",
+              "type_name": "RuntimeFilterContract",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "reduction",
+              "type_name": "RuntimeFilterReductionContract",
+              "label": "singular",
+              "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "producer",
+              "type_name": "RuntimeFilterProducerRole",
+              "label": "singular",
+              "oneof": "role"
+            },
+            "9": {
+              "number": 9,
+              "name": "consumer",
+              "type_name": "RuntimeFilterConsumerRole",
+              "label": "singular",
+              "oneof": "role"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterBindingTable": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "fragment_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "bindings",
+              "type_name": "RuntimeFilterBinding",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterBuild": {
           "fields": {
             "1": {
@@ -4908,6 +5021,140 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterConsumerActivation": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "blocking_snapshot",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "2": {
+              "number": 2,
+              "name": "non_blocking_live",
+              "type_name": "RuntimeFilterLateApplyGranularity",
+              "label": "singular",
+              "oneof": "kind"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterConsumerRole": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "capabilities",
+              "type_name": "RuntimeFilterArtifactCapability",
+              "label": "repeated",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "activation",
+              "type_name": "RuntimeFilterConsumerActivation",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterContract": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "membership",
+              "type_name": "RuntimeFilterMembershipContract",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "2": {
+              "number": 2,
+              "name": "ordered",
+              "type_name": "RuntimeFilterOrderedContract",
+              "label": "singular",
+              "oneof": "kind"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterMembershipContract": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "canonical_schema",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "schema_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOrderKey": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "type",
+              "type_name": "novarocks.common.TypeDesc",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "direction",
+              "type_name": "RuntimeFilterSortDirection",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "null_order",
+              "type_name": "RuntimeFilterNullOrder",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOrderedContract": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "keys",
+              "type_name": "RuntimeFilterOrderKey",
+              "label": "repeated",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "comparator_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "order_contract_digest",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterProbe": {
           "fields": {
             "1": {
@@ -4928,6 +5175,73 @@
               "number": 3,
               "name": "source_fragment_id",
               "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterProducerRole": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "contribution_kinds",
+              "type_name": "RuntimeFilterContributionKind",
+              "label": "repeated",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "completion_requirement",
+              "type_name": "RuntimeFilterCompletionRequirement",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterReductionContract": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "set_union",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "2": {
+              "number": 2,
+              "name": "tighten_ordered_bound",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "3": {
+              "number": 3,
+              "name": "merge_topk_summary",
+              "type_name": "RuntimeFilterTopKReduction",
+              "label": "singular",
+              "oneof": "kind"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterTopKReduction": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "k",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "contract_digest",
+              "type_name": "bytes",
               "label": "singular",
               "oneof": null
             }
@@ -6314,6 +6628,160 @@
             {
               "number": 6,
               "name": "ROW_COUNT_ASSERTION_GE"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterApplyPoint": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_APPLY_POINT_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_APPLY_POINT_NODE_INPUT"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_APPLY_POINT_NODE_OUTPUT"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterArtifactCapability": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_ARTIFACT_CAPABILITY_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_ARTIFACT_CAPABILITY_MEMBERSHIP"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_ARTIFACT_CAPABILITY_ORDERED_RANGE"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_ARTIFACT_CAPABILITY_EMPTY_DOMAIN"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterCompletionRequirement": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_COMPLETION_REQUIREMENT_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_COMPLETION_REQUIREMENT_PRODUCER_CLOSED"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_COMPLETION_REQUIREMENT_FENCED_COMMITTED_DOMAIN_FROZEN"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterContributionKind": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_VALUE_DOMAIN_DELTA"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_FINAL_DOMAIN_SHARD"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_ORDERED_BOUND_UPDATE"
+            },
+            {
+              "number": 4,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_TOPK_SUMMARY"
+            },
+            {
+              "number": 5,
+              "name": "RUNTIME_FILTER_CONTRIBUTION_KIND_PRODUCER_CLOSED"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterLateApplyGranularity": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_BATCH"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_ROW_GROUP"
+            },
+            {
+              "number": 4,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_SPLIT"
+            },
+            {
+              "number": 5,
+              "name": "RUNTIME_FILTER_LATE_APPLY_GRANULARITY_FILE"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterNullOrder": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_NULL_ORDER_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_NULL_ORDER_FIRST"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_NULL_ORDER_LAST"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterSortDirection": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_SORT_DIRECTION_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_SORT_DIRECTION_ASCENDING"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_SORT_DIRECTION_DESCENDING"
             }
           ],
           "reserved_numbers": [],

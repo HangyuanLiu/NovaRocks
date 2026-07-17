@@ -674,25 +674,10 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
         }
         has_binding(&fragment.root, consumer.binding_id)
     }));
-
-    let projection =
-        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(&distributed)
-            .expect("project Graph-derived runtime filters");
-    let builds = projection.builds_for(
-        producer.location.fragment_id.get(),
-        producer.location.node_id.get(),
-    );
-    let probes = projection.probes_for(
-        consumer.location.fragment_id.get(),
-        consumer.location.node_id.get(),
-    );
-    assert_eq!((builds.len(), probes.len()), (1, 1));
-    assert_eq!(builds[0].channel_id, producer.channel_id);
-    assert_eq!(probes[0].channel_id, consumer.channel_id);
 }
 
 #[test]
-fn rfd_5a_graph_projection_disambiguates_duplicate_build_expressions_by_channel_order() {
+fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
     let probe_expr_1 = column_ref_expr(1, "probe_1", DataType::Int64, false);
     let probe_expr_2 = column_ref_expr(2, "probe_2", DataType::Int64, false);
     let build_expr = column_ref_expr(3, "build", DataType::Int64, false);
@@ -781,17 +766,21 @@ fn rfd_5a_graph_projection_disambiguates_duplicate_build_expressions_by_channel_
     };
 
     let distributed = build_distributed_plan(&join).expect("build duplicate-key RF graph");
-    let projection =
-        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(&distributed)
-            .expect("project duplicate-key runtime filters");
+    let graph = distributed.runtime_filter_graph();
     let join_node = &distributed.fragments()[0].root;
-    let builds = projection.builds_for(join_node.fragment_id, join_node.node_id);
+    let producers = graph
+        .bindings()
+        .filter(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
+        .collect::<Vec<_>>();
+    let consumers = graph
+        .bindings()
+        .filter(|binding| matches!(binding.role, RuntimeFilterBindingRole::Consumer(_)))
+        .collect::<Vec<_>>();
 
-    assert_eq!(builds.len(), 2);
-    assert_eq!(builds[0].expr_order, 0);
-    assert_eq!(builds[1].expr_order, 1);
-    assert_column_ref(&builds[0].probe_expr, 1, "probe_1");
-    assert_column_ref(&builds[1].probe_expr, 2, "probe_2");
+    assert_eq!((producers.len(), consumers.len()), (2, 2));
+    assert_eq!(join_node.runtime_filter_binding_ids.len(), 2);
+    assert_column_ref(&consumers[0].expression, 1, "probe_1");
+    assert_column_ref(&consumers[1].expression, 2, "probe_2");
 }
 
 #[test]

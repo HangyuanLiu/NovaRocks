@@ -108,6 +108,7 @@ pub(super) fn lower_iceberg_delta_table_scan(
                 delete_side,
             }),
             node_id: node.node_id,
+            native_runtime_filter_specs: Vec::new(),
         }),
     };
     if let Some(predicate) = lower_scan_predicate(scan, arena, &layout)? {

@@ -30,7 +30,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::hash_join_probe_core::{HashJoinProbeCore, join_type_str};
+use super::hash_join_probe_core::{
+    HashJoinProbeCore, JoinProbeRuntimeFilterExecution, join_type_str,
+};
 use super::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::common::config::operator_buffer_chunks;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -56,10 +58,12 @@ pub struct PartitionedJoinProbeProcessorFactory {
     right_chunk_schema: ChunkSchemaRef,
     join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<PartitionedJoinSharedState>,
+    runtime_filter_execution: JoinProbeRuntimeFilterExecution,
 }
 
 impl PartitionedJoinProbeProcessorFactory {
-    pub(crate) fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_native(
         arena: Arc<ExprArena>,
         join_type: JoinType,
         probe_keys: Vec<ExprId>,
@@ -70,6 +74,64 @@ impl PartitionedJoinProbeProcessorFactory {
         right_chunk_schema: ChunkSchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<PartitionedJoinSharedState>,
+    ) -> Self {
+        Self::new_in_mode(
+            arena,
+            join_type,
+            probe_keys,
+            residual_predicate,
+            probe_is_left,
+            has_equi_keys,
+            left_chunk_schema,
+            right_chunk_schema,
+            join_scope_chunk_schema,
+            state,
+            JoinProbeRuntimeFilterExecution::Native,
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_compat(
+        arena: Arc<ExprArena>,
+        join_type: JoinType,
+        probe_keys: Vec<ExprId>,
+        residual_predicate: Option<ExprId>,
+        probe_is_left: bool,
+        has_equi_keys: bool,
+        left_chunk_schema: ChunkSchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
+        state: Arc<PartitionedJoinSharedState>,
+    ) -> Self {
+        Self::new_in_mode(
+            arena,
+            join_type,
+            probe_keys,
+            residual_predicate,
+            probe_is_left,
+            has_equi_keys,
+            left_chunk_schema,
+            right_chunk_schema,
+            join_scope_chunk_schema,
+            state,
+            JoinProbeRuntimeFilterExecution::Compat,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_in_mode(
+        arena: Arc<ExprArena>,
+        join_type: JoinType,
+        probe_keys: Vec<ExprId>,
+        residual_predicate: Option<ExprId>,
+        probe_is_left: bool,
+        has_equi_keys: bool,
+        left_chunk_schema: ChunkSchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
+        state: Arc<PartitionedJoinSharedState>,
+        runtime_filter_execution: JoinProbeRuntimeFilterExecution,
     ) -> Self {
         let node_id = parse_join_node_id_from_dep_key(state.dep_name(0));
         Self {
@@ -85,6 +147,7 @@ impl PartitionedJoinProbeProcessorFactory {
             right_chunk_schema,
             join_scope_chunk_schema,
             state,
+            runtime_filter_execution,
         }
     }
 }
@@ -117,17 +180,31 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
             finishing: false,
             finishing_done: false,
             finished: false,
-            core: HashJoinProbeCore::new(
-                Arc::clone(&self.arena),
-                self.join_type,
-                self.probe_keys.clone(),
-                self.residual_predicate,
-                self.probe_is_left,
-                self.has_equi_keys,
-                Arc::clone(&self.left_chunk_schema),
-                Arc::clone(&self.right_chunk_schema),
-                Arc::clone(&self.join_scope_chunk_schema),
-            ),
+            core: match self.runtime_filter_execution {
+                JoinProbeRuntimeFilterExecution::Native => HashJoinProbeCore::new_native(
+                    Arc::clone(&self.arena),
+                    self.join_type,
+                    self.probe_keys.clone(),
+                    self.residual_predicate,
+                    self.probe_is_left,
+                    self.has_equi_keys,
+                    Arc::clone(&self.left_chunk_schema),
+                    Arc::clone(&self.right_chunk_schema),
+                    Arc::clone(&self.join_scope_chunk_schema),
+                ),
+                #[cfg(feature = "compat")]
+                JoinProbeRuntimeFilterExecution::Compat => HashJoinProbeCore::new_compat(
+                    Arc::clone(&self.arena),
+                    self.join_type,
+                    self.probe_keys.clone(),
+                    self.residual_predicate,
+                    self.probe_is_left,
+                    self.has_equi_keys,
+                    Arc::clone(&self.left_chunk_schema),
+                    Arc::clone(&self.right_chunk_schema),
+                    Arc::clone(&self.join_scope_chunk_schema),
+                ),
+            },
             buffered_rows: 0,
             input_rows: 0,
             input_chunks: 0,
@@ -446,7 +523,6 @@ mod tests {
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
     use crate::runtime::runtime_state::RuntimeState;
 
     use super::PartitionedJoinProbeProcessorFactory;
@@ -711,7 +787,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             1,
@@ -724,7 +799,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             false,
@@ -732,13 +807,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -802,7 +874,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             1,
@@ -815,7 +886,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             false,
@@ -823,13 +894,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -913,7 +981,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -926,7 +993,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             false,
@@ -934,13 +1001,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -1061,7 +1125,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1074,7 +1137,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             true,
@@ -1082,13 +1145,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -1175,7 +1235,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1189,7 +1248,7 @@ mod tests {
 
         // Left semi: probe is left, build is right.
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             false,
@@ -1197,13 +1256,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -1296,7 +1352,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1310,7 +1365,7 @@ mod tests {
 
         // Left anti: probe is left, build is right.
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             false,
@@ -1318,13 +1373,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -1411,7 +1463,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1425,7 +1476,7 @@ mod tests {
 
         // Right semi: probe is right, build is left.
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             false,
@@ -1433,13 +1484,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             vec![probe_key],
@@ -1520,7 +1568,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1533,7 +1580,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             false,
@@ -1541,13 +1588,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             vec![probe_key],
@@ -1630,7 +1674,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1644,7 +1687,7 @@ mod tests {
 
         // Keep probe on left to match real pipeline topology.
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             true,
@@ -1652,13 +1695,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             vec![probe_key],
@@ -1756,7 +1796,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1769,7 +1808,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             true,
@@ -1777,13 +1816,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -1869,7 +1905,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1882,7 +1917,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             true,
@@ -1890,13 +1925,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -1983,7 +2015,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -1997,7 +2028,7 @@ mod tests {
 
         // Right anti: probe is right, build is left.
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightAnti,
             false,
@@ -2005,13 +2036,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::RightAnti,
             vec![probe_key],
@@ -2092,7 +2120,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -2105,7 +2132,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             false,
@@ -2113,13 +2140,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2212,7 +2236,6 @@ mod tests {
         let arena = Arc::new(arena);
 
         let dep_manager = DependencyManager::new();
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
         let join_state = Arc::new(PartitionedJoinSharedState::new(
             1,
             2,
@@ -2225,7 +2248,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
-        let build_factory = HashJoinBuildSinkFactory::new(
+        let build_factory = HashJoinBuildSinkFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             true,
@@ -2233,13 +2256,10 @@ mod tests {
             true,
             vec![build_key],
             vec![false],
-            Vec::new(),
             JoinDistributionMode::Partitioned,
             build_state,
-            Arc::clone(&runtime_filter_hub),
-            None,
         );
-        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],

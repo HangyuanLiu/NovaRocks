@@ -60,20 +60,62 @@ pub struct ScanSourceFactory {
     name: String,
     scan: ScanNode,
     state: SharedScanState,
-    #[allow(dead_code)]
-    runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
-    runtime_filter_exprs: HashMap<i32, ExprId>,
-    runtime_filters_expected: usize,
-    local_rf_waiting_set: Vec<i32>,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
+    runtime_filter_execution: ScanSourceRuntimeFilterExecution,
     arena: Arc<ExprArena>,
 }
 
+enum ScanSourceRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
+        runtime_filter_exprs: HashMap<i32, ExprId>,
+        runtime_filters_expected: usize,
+        local_rf_waiting_set: Vec<i32>,
+        runtime_filter_hub: Arc<RuntimeFilterHub>,
+    },
+}
+
 impl ScanSourceFactory {
-    pub(crate) fn new(
+    pub(crate) fn new_native(scan: ScanNode, arena: Arc<ExprArena>) -> Self {
+        Self::new_in_mode(scan, arena, ScanSourceRuntimeFilterExecution::Native)
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn new_compat(
         scan: ScanNode,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         arena: Arc<ExprArena>,
+    ) -> Self {
+        let runtime_filter_specs = scan.runtime_filter_specs().to_vec();
+        let runtime_filter_exprs = runtime_filter_specs
+            .iter()
+            .map(|spec| (spec.filter_id, spec.expr_id))
+            .collect();
+        let runtime_filters_expected = runtime_filter_specs.len();
+        if runtime_filters_expected > 0
+            && let Some(node_id) = scan.node_id()
+        {
+            runtime_filter_hub.register_probe_specs(node_id, &runtime_filter_specs);
+        }
+        let local_rf_waiting_set = scan.local_rf_waiting_set().to_vec();
+        Self::new_in_mode(
+            scan,
+            arena,
+            ScanSourceRuntimeFilterExecution::Compat {
+                runtime_filter_specs,
+                runtime_filter_exprs,
+                runtime_filters_expected,
+                local_rf_waiting_set,
+                runtime_filter_hub,
+            },
+        )
+    }
+
+    fn new_in_mode(
+        scan: ScanNode,
+        arena: Arc<ExprArena>,
+        runtime_filter_execution: ScanSourceRuntimeFilterExecution,
     ) -> Self {
         let mut name = scan
             .profile_name()
@@ -92,45 +134,33 @@ impl ScanSourceFactory {
                 name = format!("{name} (plan_node_id=-1)");
             }
         }
-        let runtime_filter_specs = scan.runtime_filter_specs().to_vec();
-        let runtime_filter_exprs = runtime_filter_specs
-            .iter()
-            .map(|spec| (spec.filter_id, spec.expr_id))
-            .collect();
-        let runtime_filters_expected = runtime_filter_specs.len();
-        if runtime_filters_expected > 0 {
-            if let Some(node_id) = scan.node_id() {
-                runtime_filter_hub.register_probe_specs(node_id, &runtime_filter_specs);
-            } else {
-                warn!(
-                    "scan runtime filter specs present but scan node_id is missing: name={}",
-                    name
-                );
-            }
-        }
-        let local_rf_waiting_set = scan.local_rf_waiting_set().to_vec();
         Self {
             name,
             scan,
             state: SharedScanState::new(),
-            runtime_filter_specs,
-            runtime_filter_exprs,
-            runtime_filters_expected,
-            local_rf_waiting_set,
-            runtime_filter_hub,
+            runtime_filter_execution,
             arena,
         }
     }
 
+    #[cfg(feature = "compat")]
     fn local_rf_deps(&self) -> Vec<DependencyHandle> {
-        if self.local_rf_waiting_set.is_empty() {
+        let ScanSourceRuntimeFilterExecution::Compat {
+            local_rf_waiting_set,
+            runtime_filter_hub,
+            ..
+        } = &self.runtime_filter_execution
+        else {
+            return Vec::new();
+        };
+        if local_rf_waiting_set.is_empty() {
             return Vec::new();
         }
         let mut deps = Vec::new();
         let mut seen = HashSet::new();
-        for node_id in &self.local_rf_waiting_set {
+        for node_id in local_rf_waiting_set {
             if seen.insert(*node_id) {
-                if let Some(dep) = self.runtime_filter_hub.local_dependency_if_exists(*node_id) {
+                if let Some(dep) = runtime_filter_hub.local_dependency_if_exists(*node_id) {
                     deps.push(dep);
                 } else {
                     debug!(
@@ -151,21 +181,40 @@ impl OperatorFactory for ScanSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let runtime_filter_probe = if self.runtime_filters_expected > 0 {
-            self.scan.node_id().map(|node_id| {
-                ScanRuntimeFilterProbe::new(self.runtime_filter_hub.register_probe(node_id))
-            })
-        } else {
-            None
-        };
-        if !self.local_rf_waiting_set.is_empty() {
-            debug!(
-                "ScanSource local RF wait: node_id={:?} driver_id={} waiting_set={:?}",
-                self.scan.node_id(),
-                driver_id,
-                self.local_rf_waiting_set
-            );
-        }
+        let (runtime_filter_probe, local_rf_deps, runtime_filter_exprs, runtime_filters_expected) =
+            match &self.runtime_filter_execution {
+                ScanSourceRuntimeFilterExecution::Native => (None, Vec::new(), HashMap::new(), 0),
+                #[cfg(feature = "compat")]
+                ScanSourceRuntimeFilterExecution::Compat {
+                    runtime_filter_exprs,
+                    runtime_filters_expected,
+                    local_rf_waiting_set,
+                    runtime_filter_hub,
+                    ..
+                } => {
+                    let probe = if *runtime_filters_expected > 0 {
+                        self.scan.node_id().map(|node_id| {
+                            ScanRuntimeFilterProbe::new(runtime_filter_hub.register_probe(node_id))
+                        })
+                    } else {
+                        None
+                    };
+                    if !local_rf_waiting_set.is_empty() {
+                        debug!(
+                            "ScanSource local RF wait: node_id={:?} driver_id={} waiting_set={:?}",
+                            self.scan.node_id(),
+                            driver_id,
+                            local_rf_waiting_set
+                        );
+                    }
+                    (
+                        probe,
+                        self.local_rf_deps(),
+                        runtime_filter_exprs.clone(),
+                        *runtime_filters_expected,
+                    )
+                }
+            };
         let node_id = self.scan.node_id().unwrap_or(-1);
         let label = format!("scan_async_queue node={} driver={}", node_id, driver_id);
         Box::new(ScanSourceOperator {
@@ -175,9 +224,9 @@ impl OperatorFactory for ScanSourceFactory {
             driver_id,
             dispatch: None,
             runtime_filter_probe,
-            local_rf_deps: self.local_rf_deps(),
-            runtime_filter_exprs: self.runtime_filter_exprs.clone(),
-            runtime_filters_expected: self.runtime_filters_expected,
+            local_rf_deps,
+            runtime_filter_exprs,
+            runtime_filters_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             arena: Arc::clone(&self.arena),
             profiles: None,
@@ -1088,6 +1137,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn dispatch_materialization_uses_runtime_filter_decision_once() {
         let op = Arc::new(RecordingScanOp::new());
@@ -1098,7 +1148,7 @@ mod tests {
         let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         runtime_filter_hub.set_wait_timeouts(None, None);
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_compat(scan, runtime_filter_hub, arena);
         let rt = RuntimeState::default();
 
         let mut source_a = factory.create(2, 0);
@@ -1128,6 +1178,7 @@ mod tests {
         assert_eq!(op.decisions(), vec!["unavailable:NoWaitConfigured"]);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn runtime_filter_materialized_scan_prepare_does_not_wait_or_build() {
         let op = Arc::new(RecordingScanOp::new());
@@ -1141,7 +1192,7 @@ mod tests {
             Some(Duration::from_millis(20)),
         );
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_compat(scan, runtime_filter_hub, arena);
 
         let mut source = factory.create(1, 0);
         let start = Instant::now();
@@ -1156,6 +1207,7 @@ mod tests {
         assert!(op.decisions().is_empty());
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn runtime_filter_materialized_scan_builds_after_runtime_filter_complete() {
         let op = Arc::new(RecordingScanOp::new());
@@ -1169,7 +1221,7 @@ mod tests {
             Some(Duration::from_millis(200)),
         );
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, Arc::clone(&runtime_filter_hub), arena);
+        let factory = ScanSourceFactory::new_compat(scan, Arc::clone(&runtime_filter_hub), arena);
 
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare source");
@@ -1193,9 +1245,8 @@ mod tests {
         let scan = ScanNode::new(op.clone())
             .with_node_id(11)
             .with_connector_io_tasks_per_scan_operator(Some(1));
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena);
 
         let mut source = factory.create(1, 0);
         source.prepare().expect("prepare source");
@@ -1210,9 +1261,8 @@ mod tests {
             morsels: vec![vec![1, 2], vec![3], vec![4, 5, 6], vec![7]],
         };
         let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena);
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1296,9 +1346,8 @@ mod tests {
             morsels: vec![vec![1, 2, 3]],
         };
         let scan = ScanNode::new(Arc::new(op)).with_connector_io_tasks_per_scan_operator(Some(1));
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena);
 
         let mut driver = factory.create(2, 0);
         driver.prepare().expect("prepare scan source");
@@ -1344,9 +1393,8 @@ mod tests {
             .with_connector_io_tasks_per_scan_operator(Some(1))
             .with_limit(Some(25));
 
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena);
 
         let dop = 4;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)
@@ -1410,9 +1458,8 @@ mod tests {
             .with_connector_io_tasks_per_scan_operator(Some(1))
             .with_limit(Some(25));
 
-        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         let arena = Arc::new(ExprArena::default());
-        let factory = ScanSourceFactory::new(scan, runtime_filter_hub, arena);
+        let factory = ScanSourceFactory::new_native(scan, arena);
 
         let dop = 2;
         let mut drivers: Vec<Box<dyn crate::exec::pipeline::operator::Operator>> = (0..dop)

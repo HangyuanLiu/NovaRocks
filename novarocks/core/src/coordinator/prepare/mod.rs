@@ -17,6 +17,7 @@
 
 mod iceberg_delta;
 mod projection;
+pub(crate) mod runtime_filter_binding;
 pub(crate) mod scan;
 mod scan_preparation;
 
@@ -101,8 +102,11 @@ pub(crate) fn prepare_fragments(
         plan.boundaries().contracts(),
         &sealed_ids,
     )?;
-    let runtime_filter_projection =
-        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?;
+    let mut runtime_filter_binding_tables =
+        runtime_filter_binding::materialize_runtime_filter_binding_tables(
+            plan.runtime_filter_graph(),
+            plan.fragments(),
+        )?;
     let scan_bindings = prepare_scan_bindings(plan, connectors, resolver)?;
 
     let mut by_fragment = BTreeMap::new();
@@ -194,6 +198,9 @@ pub(crate) fn prepare_fragments(
             .unwrap_or_default();
         let prepared = projection::prepared_fragment(
             fragment.fragment_id,
+            runtime_filter_binding_tables
+                .remove(&fragment.fragment_id)
+                .expect("binding materialization creates one table per fragment"),
             scan_node_ids,
             execution_role,
             output_columns,
@@ -208,6 +215,7 @@ pub(crate) fn prepare_fragments(
             ));
         }
     }
+    debug_assert!(runtime_filter_binding_tables.is_empty());
 
     validate_binding_keys(
         "scan ranges",
@@ -228,9 +236,58 @@ pub(crate) fn prepare_fragments(
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan_bindings,
-        runtime_filter_projection,
         topological_fragment_order,
         execution_anchor_fragment_id,
+        plan.edges().to_vec(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_fragment_set_for_native_encode_test(
+    plan: &crate::sql::planner::distributed::DistributedPlan,
+) -> Result<PreparedFragmentSet, String> {
+    let mut binding_tables = runtime_filter_binding::materialize_runtime_filter_binding_tables(
+        plan.runtime_filter_graph(),
+        plan.fragments(),
+    )?;
+    let result_fragment_id = plan.topology().result_fragment_id();
+    let terminal_write_fragment_ids = plan
+        .topology()
+        .terminal_write_fragment_ids()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut by_fragment = BTreeMap::new();
+    for fragment in plan.fragments() {
+        let role = if result_fragment_id == Some(fragment.fragment_id) {
+            PreparedFragmentRole::Result
+        } else if terminal_write_fragment_ids.contains(&fragment.fragment_id) {
+            PreparedFragmentRole::TerminalWrite
+        } else {
+            PreparedFragmentRole::NonTerminal
+        };
+        by_fragment.insert(
+            fragment.fragment_id,
+            projection::prepared_fragment(
+                fragment.fragment_id,
+                binding_tables
+                    .remove(&fragment.fragment_id)
+                    .expect("binding materialization creates one table per fragment"),
+                Vec::new(),
+                role,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+    }
+    debug_assert!(binding_tables.is_empty());
+    Ok(PreparedFragmentSet::new(
+        by_fragment,
+        scan::ScanExecutionBindings::default(),
+        plan.topology().topological_fragment_order().to_vec(),
+        plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),
     ))
 }

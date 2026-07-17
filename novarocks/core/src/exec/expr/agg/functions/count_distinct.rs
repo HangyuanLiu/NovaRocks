@@ -684,7 +684,7 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-    use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+    use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
     use crate::runtime::runtime_state::RuntimeState;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
@@ -828,7 +828,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),

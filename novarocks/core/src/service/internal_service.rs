@@ -495,7 +495,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let (delivery_expire, query_expire) =
             query_expire_durations(Some(&common_query_opts_native));
         let require_existing = common_desc_tbl.map(desc_tbl_is_cached).unwrap_or(false);
-        mgr.ensure_context(query_id, require_existing, delivery_expire, query_expire)?;
+        mgr.ensure_compat_context(query_id, require_existing, delivery_expire, query_expire)?;
         if let Some(desc_tbl) = common_desc_tbl
             && !desc_tbl_is_cached(desc_tbl)
             && !is_desc_tbl_effectively_empty(desc_tbl)
@@ -580,7 +580,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             .as_ref()
             .map(desc_tbl_is_cached)
             .unwrap_or(false);
-        mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
+        mgr.get_or_register_compat(query_id, require_existing, delivery_expire, query_expire)?;
         let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
         mgr.set_cache_options(query_id, cache_options)?;
         if !sender_counts_applied && !sender_counts.is_empty() {
@@ -673,7 +673,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         validate_internal_addresses(&exec_params, Some(&fragment))?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
             let params = RuntimeFilterParams::from_thrift(&params)?;
-            let _ = mgr.set_runtime_filter_params(query_id, params);
+            mgr.set_runtime_filter_params(query_id, params)?;
         }
         spawn_exec_fragment(
             fragment,
@@ -763,7 +763,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         .as_ref()
         .map(desc_tbl_is_cached)
         .unwrap_or(false);
-    mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
+    mgr.get_or_register_compat(query_id, require_existing, delivery_expire, query_expire)?;
     let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
     mgr.set_cache_options(query_id, cache_options)?;
     mgr.with_context_mut(query_id, |ctx| {
@@ -844,7 +844,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
         let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
-        let _ = mgr.set_runtime_filter_params(query_id, rf_params);
+        mgr.set_runtime_filter_params(query_id, rf_params)?;
     }
     spawn_exec_fragment(
         fragment,
@@ -904,7 +904,7 @@ pub(crate) fn execute_plan_fragment_sync(
         .as_ref()
         .map(desc_tbl_is_cached)
         .unwrap_or(false);
-    mgr.get_or_register(query_id, require_existing, delivery_expire, query_expire)?;
+    mgr.get_or_register_compat(query_id, require_existing, delivery_expire, query_expire)?;
     let cache_options = CacheOptions::from_query_options(Some(&query_opts_native))?;
     mgr.set_cache_options(query_id, cache_options)?;
     mgr.with_context_mut(query_id, |ctx| {
@@ -931,7 +931,7 @@ pub(crate) fn execute_plan_fragment_sync(
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
         let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
-        let _ = mgr.set_runtime_filter_params(query_id, rf_params);
+        mgr.set_runtime_filter_params(query_id, rf_params)?;
     }
 
     let exec_result = execute_fragment(

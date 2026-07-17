@@ -17,25 +17,19 @@
 
 //! Deterministic instance sidecar-to-protobuf mapping for the native boundary.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::scheduler::FragmentInstancePlacement;
 use crate::proto::{common, novarocks};
-use crate::runtime::endpoint::{
-    FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
-};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range;
 
 pub(crate) fn encode_instance_params(
     query_id: &UniqueId,
     placement: &FragmentInstancePlacement,
     query_options: Option<&QueryOptions>,
-    runtime_filter_prober_params: &BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
-    runtime_filter_builder_number: &BTreeMap<i32, i32>,
-    runtime_filter_max_size: i64,
     backend_num: i32,
     report_endpoint: Option<&RuntimeEndpoint>,
     typed_result_sink: bool,
@@ -69,11 +63,7 @@ pub(crate) fn encode_instance_params(
             .iter()
             .map(encode_destination)
             .collect::<Result<Vec<_>, _>>()?,
-        runtime_filter_params: encode_runtime_filter_params(
-            runtime_filter_prober_params,
-            runtime_filter_builder_number,
-            runtime_filter_max_size,
-        )?,
+        runtime_filter_params: None,
         query_options: query_options.map(encode_query_options),
         report_endpoint: report_endpoint.map(RuntimeEndpoint::as_host_port),
         typed_result_sink,
@@ -215,22 +205,6 @@ fn encode_destination(src: &FragmentDestination) -> Result<novarocks::Destinatio
         finst_id: Some(encode_unique_id(src.finst_id())),
         endpoint: src.endpoint().as_host_port(),
     })
-}
-
-fn encode_runtime_filter_params(
-    prober_params: &BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
-    runtime_filter_builder_number: &BTreeMap<i32, i32>,
-    runtime_filter_max_size: i64,
-) -> Result<Option<novarocks::RuntimeFilterParams>, String> {
-    let params = RuntimeFilterParams::new(
-        prober_params.clone(),
-        runtime_filter_builder_number.clone(),
-        (runtime_filter_max_size > 0).then_some(runtime_filter_max_size),
-    );
-    if params.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(params.to_native()))
 }
 
 fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOptions {

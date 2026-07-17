@@ -2986,3 +2986,122 @@ fn proto_schema_comparator_returns_stable_sorted_deduped_violations() {
         "expected sorted output, got: {violations:?}"
     );
 }
+
+#[test]
+fn rfd5b_proto_additive_binding_fields_are_exact() {
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let plan = &schema.files["idl/novarocks/plan.proto"];
+
+    let fragment_field = &plan.messages["PlanFragment"].fields[&10];
+    assert_eq!(fragment_field.name, "runtime_filter_bindings");
+    assert_eq!(fragment_field.type_name, "RuntimeFilterBindingTable");
+    assert_eq!(fragment_field.label, "singular");
+
+    let node_field = &plan.messages["DistributedNode"].fields[&9];
+    assert_eq!(node_field.name, "runtime_filter_binding_ids");
+    assert_eq!(node_field.type_name, "uint32");
+    assert_eq!(node_field.label, "repeated");
+
+    let distributed_node = &plan.messages["DistributedNode"];
+    assert!(distributed_node.reserved_numbers.contains(&6));
+    assert!(distributed_node.reserved_numbers.contains(&7));
+    assert!(
+        distributed_node
+            .reserved_names
+            .contains("build_runtime_filters")
+    );
+    assert!(
+        distributed_node
+            .reserved_names
+            .contains("probe_runtime_filters")
+    );
+    let hash_join = &plan.messages["HashJoinNode"];
+    assert!(hash_join.reserved_numbers.contains(&6));
+    assert!(hash_join.reserved_names.contains("build_runtime_filters"));
+
+    let table = &plan.messages["RuntimeFilterBindingTable"];
+    assert_eq!(table.fields[&1].name, "fragment_id");
+    assert_eq!(table.fields[&2].name, "bindings");
+    assert_eq!(table.fields[&2].label, "repeated");
+    assert_eq!(
+        plan.messages["RuntimeFilterOrderedContract"].fields[&1].type_name,
+        "RuntimeFilterOrderKey"
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterOrderedContract"].fields[&1].label,
+        "repeated"
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterConsumerActivation"].fields[&1]
+            .oneof
+            .as_deref(),
+        Some("kind")
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterConsumerActivation"].fields[&2]
+            .oneof
+            .as_deref(),
+        Some("kind")
+    );
+}
+
+#[test]
+fn rfd5b_distributed_node_reserves_old_fields_by_number_and_name() {
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let node = &schema.files["idl/novarocks/plan.proto"].messages["DistributedNode"];
+    assert!(!node.fields.contains_key(&6));
+    assert!(!node.fields.contains_key(&7));
+    assert!(node.reserved_numbers.contains(&6));
+    assert!(node.reserved_numbers.contains(&7));
+    assert!(node.reserved_names.contains("build_runtime_filters"));
+    assert!(node.reserved_names.contains("probe_runtime_filters"));
+}
+
+#[test]
+fn rfd5b_hash_join_reserves_old_intent_field_by_number_and_name() {
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let join = &schema.files["idl/novarocks/plan.proto"].messages["HashJoinNode"];
+    assert!(!join.fields.contains_key(&6));
+    assert!(join.reserved_numbers.contains(&6));
+    assert!(join.reserved_names.contains("build_runtime_filters"));
+}
+
+#[test]
+fn rfd5b_old_runtime_filter_messages_are_unreachable_tombstones() {
+    const OLD_PROTO_TOMBSTONES: &[&str] = &[
+        "RuntimeFilterBuild",
+        "RuntimeFilterProbe",
+        "RuntimeFilterBuildIntent",
+    ];
+
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let plan = &schema.files["idl/novarocks/plan.proto"];
+    for tombstone in OLD_PROTO_TOMBSTONES {
+        assert!(
+            plan.messages.contains_key(*tombstone),
+            "published message {tombstone} must remain as a schema tombstone"
+        );
+    }
+    let reachable = plan
+        .messages
+        .iter()
+        .flat_map(|(owner, message)| {
+            message.fields.values().filter_map(move |field| {
+                OLD_PROTO_TOMBSTONES
+                    .contains(&field.type_name.as_str())
+                    .then(|| format!("{owner}.{} -> {}", field.name, field.type_name))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        reachable.is_empty(),
+        "old runtime-filter messages remain reachable from active fields: {reachable:?}"
+    );
+
+    let proto = fs::read_to_string(Path::new(manifest_dir()).join("idl/novarocks/plan.proto"))
+        .expect("read native plan schema");
+    assert!(
+        proto.contains("schema tombstone"),
+        "old runtime-filter declarations must document their tombstone status"
+    );
+}

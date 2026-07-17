@@ -44,18 +44,21 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
 use crate::coordinator::ports::{CoordinatorExecutionPorts, CoordinatorObserver};
+use crate::coordinator::prepare::runtime_filter_binding::PreparedRuntimeFilterBindingRole;
 use crate::coordinator::prepare::{
     PreparedFragment, PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
+};
+use crate::coordinator::profile::correlate::{
+    RuntimeFilterDormancyApplyPoint, RuntimeFilterDormancyBindingExpectation,
+    RuntimeFilterDormancyBindingRole, RuntimeFilterDormancyExpectations,
+    RuntimeFilterDormancyProof, prove_runtime_filter_dormancy,
 };
 use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
-#[cfg(test)]
 use crate::coordinator::scheduler::SchedulingPlan;
-use crate::coordinator::scheduler::{
-    FragmentInstancePlacement, FragmentScheduler, RuntimeFilterPlanResult,
-};
+use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -64,9 +67,15 @@ use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
+use crate::runtime_filter::model::contract::CompletionRequirement;
+use crate::runtime_filter::model::graph::{ApplyPoint, RuntimeFilterBindingRole};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
+use crate::sql::planner::distributed::{
+    DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge, FragmentEdgeKind,
+    FragmentId, FragmentStreamKind, PartitionKind,
+};
+use crate::sql::planner::physical::{JoinDistribution, JoinExecutionMode};
 
 #[cfg(test)]
 use crate::coordinator::profile::record_native_standalone_query_profile_report;
@@ -84,6 +93,245 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
     pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
+    pub(crate) runtime_filter_dormancy_proof: Option<RuntimeFilterDormancyProof>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScheduledRuntimeFilterBindingRole {
+    Producer {
+        completion_requirement: CompletionRequirement,
+    },
+    Consumer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScheduledRuntimeFilterBindingFact {
+    fragment_id: FragmentId,
+    binding_id: u32,
+    channel_id: u32,
+    node_id: i32,
+    apply_point: RuntimeFilterDormancyApplyPoint,
+    role: ScheduledRuntimeFilterBindingRole,
+    partitioned_build_edge: Option<RuntimeFilterDormancyBuildEdge>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeFilterDormancyBuildEdge {
+    source_fragment_id: FragmentId,
+    target_exchange_node_id: i32,
+}
+
+#[derive(Default)]
+struct RuntimeFilterDormancyTopologyFacts {
+    partitioned_build_edges: BTreeMap<u32, RuntimeFilterDormancyBuildEdge>,
+}
+
+fn build_runtime_filter_dormancy_topology_facts(
+    plan: &DistributedPlan,
+) -> RuntimeFilterDormancyTopologyFacts {
+    fn nearest_input_exchange(node: &DistributedNode) -> Option<&DistributedNode> {
+        if matches!(node.payload, DistributedNodeKind::Exchange(_)) {
+            return Some(node);
+        }
+        match node.children.as_slice() {
+            [child] => nearest_input_exchange(child),
+            _ => None,
+        }
+    }
+
+    fn visit(
+        plan: &DistributedPlan,
+        node: &DistributedNode,
+        facts: &mut RuntimeFilterDormancyTopologyFacts,
+    ) {
+        if let DistributedNodeKind::HashJoin(join) = &node.payload
+            && join.execution_mode == Some(JoinExecutionMode::Partitioned)
+            && join.distribution == JoinDistribution::Shuffle
+            && let [_, build] = node.children.as_slice()
+            && let Some(exchange_node) = nearest_input_exchange(build)
+            && let DistributedNodeKind::Exchange(exchange) = &exchange_node.payload
+            && let Some(edge) = plan.edges().iter().find(|edge| {
+                edge.source_fragment_id == exchange.source_fragment_id
+                    && edge.target_fragment_id == node.fragment_id
+                    && edge.target_exchange_node_id == exchange_node.node_id
+                    && matches!(edge.output_partition.kind, PartitionKind::Hash)
+                    && edge.stream_kind == FragmentStreamKind::Partitioned
+            })
+        {
+            let build_edge = RuntimeFilterDormancyBuildEdge {
+                source_fragment_id: edge.source_fragment_id,
+                target_exchange_node_id: edge.target_exchange_node_id,
+            };
+            for binding_id in &node.runtime_filter_binding_ids {
+                if plan
+                    .runtime_filter_graph()
+                    .binding(*binding_id)
+                    .is_some_and(|binding| {
+                        matches!(binding.role, RuntimeFilterBindingRole::Producer(_))
+                    })
+                {
+                    facts
+                        .partitioned_build_edges
+                        .insert(binding_id.get(), build_edge);
+                }
+            }
+        }
+        for child in &node.children {
+            visit(plan, child, facts);
+        }
+    }
+
+    let mut facts = RuntimeFilterDormancyTopologyFacts::default();
+    for fragment in plan.fragments() {
+        visit(plan, &fragment.root, &mut facts);
+    }
+    facts
+}
+
+fn build_runtime_filter_dormancy_expectations(
+    prepared: &PreparedFragmentSet,
+    plan: &SchedulingPlan,
+    topology: &RuntimeFilterDormancyTopologyFacts,
+) -> Result<(RuntimeFilterDormancyExpectations, bool), String> {
+    let mut facts_by_fragment =
+        BTreeMap::<FragmentId, Vec<ScheduledRuntimeFilterBindingFact>>::new();
+    for fragment in prepared.scheduling_view().fragments() {
+        let facts = fragment
+            .runtime_filter_bindings()
+            .bindings()
+            .map(|binding| ScheduledRuntimeFilterBindingFact {
+                fragment_id: fragment.fragment_id(),
+                binding_id: binding.binding_id().get(),
+                channel_id: binding.channel_id().get(),
+                node_id: binding.node_id().get(),
+                apply_point: match binding.apply_point() {
+                    ApplyPoint::NodeInput => RuntimeFilterDormancyApplyPoint::NodeInput,
+                    ApplyPoint::NodeOutput => RuntimeFilterDormancyApplyPoint::NodeOutput,
+                },
+                role: match binding.role() {
+                    PreparedRuntimeFilterBindingRole::Producer {
+                        completion_requirement,
+                        ..
+                    } => ScheduledRuntimeFilterBindingRole::Producer {
+                        completion_requirement: *completion_requirement,
+                    },
+                    PreparedRuntimeFilterBindingRole::Consumer { .. } => {
+                        ScheduledRuntimeFilterBindingRole::Consumer
+                    }
+                },
+                partitioned_build_edge: topology
+                    .partitioned_build_edges
+                    .get(&binding.binding_id().get())
+                    .copied(),
+            })
+            .collect::<Vec<_>>();
+        facts_by_fragment.insert(fragment.fragment_id(), facts);
+    }
+
+    let all_facts = facts_by_fragment
+        .values()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let same_backend_partial_completion = same_backend_partial_completion_witness(
+        &all_facts,
+        prepared.scheduling_view().edges(),
+        plan,
+    );
+
+    let mut expectations = RuntimeFilterDormancyExpectations::new();
+    for (fragment_id, placements) in &plan.by_fragment {
+        let facts = facts_by_fragment.get(fragment_id).ok_or_else(|| {
+            format!(
+                "runtime-filter dormancy expectation missing prepared fragment_id={fragment_id}"
+            )
+        })?;
+        for placement in placements {
+            let expected_bindings = facts
+                .iter()
+                .map(|fact| {
+                    (
+                        fact.binding_id,
+                        RuntimeFilterDormancyBindingExpectation {
+                            fragment_id: fact.fragment_id,
+                            binding_id: fact.binding_id,
+                            channel_id: fact.channel_id,
+                            node_id: fact.node_id,
+                            apply_point: fact.apply_point,
+                            role: match fact.role {
+                                ScheduledRuntimeFilterBindingRole::Producer { .. } => {
+                                    RuntimeFilterDormancyBindingRole::Producer
+                                }
+                                ScheduledRuntimeFilterBindingRole::Consumer => {
+                                    RuntimeFilterDormancyBindingRole::Consumer
+                                }
+                            },
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if expectations
+                .insert(placement.finst_id, expected_bindings)
+                .is_some()
+            {
+                return Err(format!(
+                    "runtime-filter dormancy expectation has duplicate finst_id={}",
+                    placement.finst_id
+                ));
+            }
+        }
+    }
+    Ok((expectations, same_backend_partial_completion))
+}
+
+fn same_backend_partial_completion_witness(
+    facts: &[ScheduledRuntimeFilterBindingFact],
+    edges: &[FragmentEdge],
+    plan: &SchedulingPlan,
+) -> bool {
+    facts.iter().any(|producer| {
+        let ScheduledRuntimeFilterBindingRole::Producer {
+            completion_requirement: CompletionRequirement::ProducerClosed,
+        } = producer.role
+        else {
+            return false;
+        };
+        let Some(producer_placements) = plan.by_fragment.get(&producer.fragment_id) else {
+            return false;
+        };
+        if producer_placements.len() <= 1 {
+            return false;
+        }
+        let Some(partitioned_build_edge) = producer.partitioned_build_edge else {
+            return false;
+        };
+        let receives_partitioned_build_input = edges.iter().any(|edge| {
+            edge.source_fragment_id == partitioned_build_edge.source_fragment_id
+                && edge.target_fragment_id == producer.fragment_id
+                && edge.target_exchange_node_id == partitioned_build_edge.target_exchange_node_id
+                && matches!(edge.output_partition.kind, PartitionKind::Hash)
+                && edge.stream_kind == FragmentStreamKind::Partitioned
+        });
+        if !receives_partitioned_build_input {
+            return false;
+        }
+
+        facts.iter().any(|consumer| {
+            consumer.channel_id == producer.channel_id
+                && consumer.fragment_id != producer.fragment_id
+                && matches!(consumer.role, ScheduledRuntimeFilterBindingRole::Consumer)
+                && plan
+                    .by_fragment
+                    .get(&consumer.fragment_id)
+                    .is_some_and(|consumer_placements| {
+                        producer_placements.iter().any(|producer_placement| {
+                            consumer_placements.iter().any(|consumer_placement| {
+                                producer_placement.backend_idx == consumer_placement.backend_idx
+                            })
+                        })
+                    })
+        })
+    })
 }
 
 /// Coordinates multi-fragment query execution across one or more backends.
@@ -94,7 +342,6 @@ pub(crate) struct CoordinatedQueryResult {
 pub(crate) struct ExecutionCoordinator {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
-    runtime_filters: Option<RuntimeFilterPlanResult>,
     execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
@@ -113,7 +360,6 @@ impl ExecutionCoordinator {
     pub(crate) fn new(
         prepared: PreparedFragmentSet,
         native_bundle: NativeFragmentBundle,
-        runtime_filters: Option<RuntimeFilterPlanResult>,
         execution_ports: CoordinatorExecutionPorts,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
@@ -121,7 +367,6 @@ impl ExecutionCoordinator {
         Self {
             prepared,
             native_bundle,
-            runtime_filters,
             execution_ports,
             scheduler,
             query_options,
@@ -131,20 +376,24 @@ impl ExecutionCoordinator {
     }
 
     pub(crate) fn execute_with_write_outcome(self) -> Result<CoordinatedQueryResult, String> {
-        self.execute_with_profile_collection(false)
+        self.execute_with_profile_collection(false, None)
     }
 
-    pub(crate) fn execute_with_profile_outcome(self) -> Result<CoordinatedQueryResult, String> {
-        self.execute_with_profile_collection(true)
+    pub(crate) fn execute_with_profile_outcome(
+        self,
+        distributed_plan: &DistributedPlan,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let topology = build_runtime_filter_dormancy_topology_facts(distributed_plan);
+        self.execute_with_profile_collection(true, Some(topology))
     }
 
     fn execute_with_profile_collection(
         self,
         collect_profiles: bool,
+        runtime_filter_dormancy_topology: Option<RuntimeFilterDormancyTopologyFacts>,
     ) -> Result<CoordinatedQueryResult, String> {
         let prepared = self.prepared;
         let native_bundle = self.native_bundle;
-        let runtime_filters = self.runtime_filters;
         let query_options = self.query_options;
         #[cfg(test)]
         let scheduled_plan_test_drift = self.scheduled_plan_test_drift;
@@ -194,11 +443,7 @@ impl ExecutionCoordinator {
         }
 
         validate_prepared_native_payloads(&prepared, &native_bundle)?;
-        let plan = scheduler.schedule(
-            prepared.scheduling_view(),
-            query_id.clone(),
-            runtime_filters.as_ref(),
-        )?;
+        let plan = scheduler.schedule(prepared.scheduling_view(), query_id.clone())?;
         #[cfg(test)]
         let plan = apply_scheduled_plan_test_drift(plan, scheduled_plan_test_drift);
         validate_artifact_fragment_sets(&prepared, &native_bundle, &plan)?;
@@ -308,15 +553,6 @@ impl ExecutionCoordinator {
             })
             .collect();
 
-        // Build a fragment-id -> instance count map from the scheduling plan.
-        // Builder numbers must equal the number of build-side instances, not a
-        // hardcoded 1.
-        let instance_counts: BTreeMap<FragmentId, usize> = plan
-            .by_fragment
-            .iter()
-            .map(|(&fid, insts)| (fid, insts.len()))
-            .collect();
-
         let mut tracker = InFlightTracker::default();
         // Collect submissions by fragment, then submit consumers before
         // producers. This ensures downstream exchange receivers/result buffers
@@ -411,23 +647,11 @@ impl ExecutionCoordinator {
                     }
                 }
                 let typed_result_sink = is_root && needs_fragment_status_report;
-                let native_rf_builder_number = runtime_filter_builder_number_for_instance(
-                    runtime_filters.as_ref(),
-                    &instance_counts,
-                );
-                let native_rf_max_size = if runtime_filters.is_some() {
-                    16_i64 * 1024 * 1024
-                } else {
-                    0
-                };
                 let native_instance_params =
                     crate::protocol::native::encode::encode_instance_params(
                         &query_id,
                         placement,
                         query_options.as_ref(),
-                        &placement.runtime_filter_prober_params,
-                        &native_rf_builder_number,
-                        native_rf_max_size,
                         placement.instance_index as i32,
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,
@@ -510,6 +734,20 @@ impl ExecutionCoordinator {
             collect_profiles,
             observer.as_ref(),
         )?;
+        let runtime_filter_dormancy_proof = if collect_profiles {
+            let topology = runtime_filter_dormancy_topology.as_ref().ok_or_else(|| {
+                "runtime-filter dormancy proof missing distributed topology facts".to_string()
+            })?;
+            let (expectations, same_backend_partial_completion) =
+                build_runtime_filter_dormancy_expectations(&prepared, &plan, topology)?;
+            prove_runtime_filter_dormancy(
+                &expectations,
+                &fetch_result.fragment_profiles,
+                same_backend_partial_completion,
+            )?
+        } else {
+            None
+        };
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(
                 target: "novarocks::write_coordinator",
@@ -542,7 +780,8 @@ impl ExecutionCoordinator {
             query_result,
             write_commit: fetch_result.write_commit,
             write_abort: fetch_result.write_abort,
-            fragment_profiles: fetch_result.fragment_profiles,
+            fragment_profiles: fetch_result.fragment_profiles.into_values().collect(),
+            runtime_filter_dormancy_proof,
         })
     }
 
@@ -1285,25 +1524,6 @@ fn native_cte_multicast_contract_slot_map(
     map
 }
 
-fn runtime_filter_builder_number_for_instance(
-    rf_plan: Option<&RuntimeFilterPlanResult>,
-    instance_counts: &BTreeMap<FragmentId, usize>,
-) -> BTreeMap<i32, i32> {
-    let mut builder_number = BTreeMap::new();
-    if let Some(rf_plan) = rf_plan {
-        for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
-            let n_builders = instance_counts
-                .get(build_frag_id)
-                .map(|&n| n as i32)
-                .unwrap_or(1);
-            for filter_id in filter_ids {
-                builder_number.insert(*filter_id, n_builders);
-            }
-        }
-    }
-    builder_number
-}
-
 // ---------------------------------------------------------------------------
 // In-flight instance tracking (per-backend cancellation)
 // ---------------------------------------------------------------------------
@@ -1360,7 +1580,7 @@ pub(crate) struct SubmitAndFetchResult {
     pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
-    pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
+    pub(crate) fragment_profiles: BTreeMap<UniqueId, RuntimeProfileTree>,
 }
 
 struct QueryStateRegistrationGuard {
@@ -1535,7 +1755,7 @@ pub(crate) fn submit_and_fetch_loop(
                     chunks,
                     write_commit: None,
                     write_abort: Some(abort),
-                    fragment_profiles: Vec::new(),
+                    fragment_profiles: BTreeMap::new(),
                 });
             }
             if let Some(err) = take_standalone_query_failure(query_id) {
@@ -1625,7 +1845,7 @@ pub(crate) fn submit_and_fetch_loop(
             runtime_query_id,
         )?
     } else {
-        Vec::new()
+        BTreeMap::new()
     };
 
     Ok(SubmitAndFetchResult {
@@ -1644,11 +1864,11 @@ fn wait_for_profile_reports(
     deadline: std::time::Instant,
     timeout_ms: i64,
     runtime_query_id: crate::runtime::query_context::QueryId,
-) -> Result<Vec<RuntimeProfileTree>, String> {
+) -> Result<BTreeMap<UniqueId, RuntimeProfileTree>, String> {
     const PROFILE_REPORT_POLL_INTERVAL_MS: i64 = 10;
 
     if expected_reports == 0 {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
 
     loop {
@@ -1907,7 +2127,6 @@ mod native_contract_tests {
         ExecutionCoordinator {
             prepared,
             native_bundle,
-            runtime_filters: None,
             execution_ports: CoordinatorExecutionPorts::new(
                 dispatcher,
                 crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
@@ -1944,7 +2163,6 @@ mod native_contract_tests {
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -2433,6 +2651,103 @@ mod native_contract_tests {
         assert!(err.contains("map key 7"), "{err}");
         assert!(err.contains("fragment_id 8"), "{err}");
         assert_eq!(side_effects, 0);
+    }
+
+    #[test]
+    fn same_backend_partial_completion_witness_requires_all_structural_facts() {
+        let facts = vec![
+            ScheduledRuntimeFilterBindingFact {
+                fragment_id: 2,
+                binding_id: 1,
+                channel_id: 9,
+                node_id: 20,
+                apply_point: RuntimeFilterDormancyApplyPoint::NodeOutput,
+                role: ScheduledRuntimeFilterBindingRole::Producer {
+                    completion_requirement: crate::runtime_filter::model::contract::CompletionRequirement::ProducerClosed,
+                },
+                partitioned_build_edge: Some(RuntimeFilterDormancyBuildEdge {
+                    source_fragment_id: 1,
+                    target_exchange_node_id: 20,
+                }),
+            },
+            ScheduledRuntimeFilterBindingFact {
+                fragment_id: 3,
+                binding_id: 2,
+                channel_id: 9,
+                node_id: 30,
+                apply_point: RuntimeFilterDormancyApplyPoint::NodeInput,
+                role: ScheduledRuntimeFilterBindingRole::Consumer,
+                partitioned_build_edge: None,
+            },
+        ];
+        let mut producer_a = placement(2, 1);
+        producer_a.backend_idx = 0;
+        producer_a.instance_index = 0;
+        let mut producer_b = placement(2, 2);
+        producer_b.backend_idx = 1;
+        producer_b.instance_index = 1;
+        let mut consumer = placement(3, 3);
+        consumer.backend_idx = 0;
+        let plan = SchedulingPlan {
+            root_fragment_id: 3,
+            by_fragment: BTreeMap::from([
+                (1, vec![placement(1, 0)]),
+                (2, vec![producer_a, producer_b]),
+                (3, vec![consumer]),
+            ]),
+            root_finst_id: UniqueId { hi: 92_000, lo: 3 },
+            root_backend_idx: 0,
+        };
+        let hash_edge = FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 2,
+            target_exchange_node_id: 20,
+            output_partition: DataPartition::hash(Vec::new()),
+            stream_kind: crate::sql::planner::distributed::FragmentStreamKind::Partitioned,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        };
+
+        assert!(same_backend_partial_completion_witness(
+            &facts,
+            &[hash_edge.clone()],
+            &plan,
+        ));
+
+        let unrelated_hash_edge = FragmentEdge {
+            target_exchange_node_id: 21,
+            ..hash_edge.clone()
+        };
+        assert!(!same_backend_partial_completion_witness(
+            &facts,
+            &[unrelated_hash_edge],
+            &plan,
+        ));
+
+        let mut one_participant = plan.clone();
+        one_participant.by_fragment.get_mut(&2).unwrap().pop();
+        assert!(!same_backend_partial_completion_witness(
+            &facts,
+            &[hash_edge.clone()],
+            &one_participant,
+        ));
+
+        let mut gather_edge = hash_edge.clone();
+        gather_edge.output_partition = DataPartition::unpartitioned();
+        gather_edge.stream_kind = crate::sql::planner::distributed::FragmentStreamKind::Gather;
+        assert!(!same_backend_partial_completion_witness(
+            &facts,
+            &[gather_edge],
+            &plan,
+        ));
+
+        let mut disjoint = plan;
+        disjoint.by_fragment.get_mut(&3).unwrap()[0].backend_idx = 2;
+        assert!(!same_backend_partial_completion_witness(
+            &facts,
+            &[hash_edge],
+            &disjoint,
+        ));
     }
 
     #[test]
@@ -3125,7 +3440,15 @@ mod native_contract_tests {
         )
         .expect("native profiles collected");
         assert_eq!(result.fragment_profiles.len(), 1);
-        assert_eq!(result.fragment_profiles[0].root.node_id, 7);
+        assert_eq!(
+            result
+                .fragment_profiles
+                .get(&finst_id)
+                .expect("profile remains keyed by finst_id")
+                .root
+                .node_id,
+            7
+        );
     }
 
     #[test]
@@ -3214,8 +3537,7 @@ mod native_contract_tests {
                 tuple_ids: Vec::new(),
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 payload: Some(native_plan::distributed_node::Payload::Physical(
                     native_plan::PlanNode {
@@ -3354,7 +3676,6 @@ mod native_contract_tests {
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
 
@@ -3522,17 +3843,5 @@ mod native_contract_tests {
             ],
             "target fragment 4 has no placements",
         );
-    }
-
-    #[test]
-    fn runtime_filter_builder_number_uses_native_instance_counts() {
-        let rf = RuntimeFilterPlanResult {
-            all_filters: Default::default(),
-            build_side_filters: std::collections::HashMap::from([(3, vec![11, 12])]),
-            probe_side_filters: Default::default(),
-        };
-        let numbers =
-            runtime_filter_builder_number_for_instance(Some(&rf), &BTreeMap::from([(3, 4_usize)]));
-        assert_eq!(numbers, BTreeMap::from([(11, 4), (12, 4)]));
     }
 }

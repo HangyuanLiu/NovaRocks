@@ -323,7 +323,6 @@ mod tests {
             endpoint: RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap()),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }

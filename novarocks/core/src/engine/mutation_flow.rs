@@ -1080,7 +1080,6 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
-            runtime_filters,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1096,7 +1095,6 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
             prepared,
             native_bundle,
-            runtime_filters,
             None,
         )?;
         if let Some(commit) = result.write_commit.as_ref()
@@ -1157,7 +1155,6 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
-            runtime_filters,
             commit_plan,
             #[cfg(test)]
             topology,
@@ -1173,7 +1170,6 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         let result = crate::engine::execute_planned_iceberg_change_stream_write(
             prepared,
             native_bundle,
-            runtime_filters,
             None,
         )?;
         if let Some(commit) = result.write_commit.as_ref()
@@ -1250,6 +1246,7 @@ fn merge_all_write_commits(
         write_commit: merged_commit,
         write_abort,
         fragment_profiles: Vec::new(),
+        runtime_filter_dormancy_proof: None,
     })
 }
 
@@ -1389,6 +1386,7 @@ fn no_mutation_write_result() -> CoordinatedQueryResult {
         write_commit: None,
         write_abort: None,
         fragment_profiles: Vec::new(),
+        runtime_filter_dormancy_proof: None,
     }
 }
 
@@ -1801,6 +1799,7 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             write_commit: Some(write_commit),
             write_abort: None,
             fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
         })
     }
 
@@ -3520,6 +3519,7 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     write_commit: Some(rewrite.write_commit),
                     write_abort: None,
                     fragment_profiles: Vec::new(),
+                    runtime_filter_dormancy_proof: None,
                 });
                 *self
                     .cow_update_rewrite
