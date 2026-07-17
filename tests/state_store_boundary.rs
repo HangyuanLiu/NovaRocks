@@ -2402,29 +2402,78 @@ fn state_store_foundationdb_dependency_boundary_matches_provider_contract() {
 #[test]
 fn state_store_foundationdb_provider_variant_is_feature_independent() {
     let config = src_dir().join("state_store/config.rs");
-    let syntax = syn::parse_file(&fs::read_to_string(&config).expect("read state store config"))
-        .expect("parse state store config");
-    let provider = syntax
-        .items
+    let source = fs::read_to_string(&config).expect("read state store config");
+    let tokens = rust_source_tokens(&source);
+    let provider_body_open = tokens
         .iter()
-        .find_map(|item| match item {
-            syn::Item::Enum(item) if item.ident == "StateStoreProviderConfig" => Some(item),
-            _ => None,
+        .enumerate()
+        .find_map(|(index, token)| {
+            (token.text == "enum"
+                && tokens
+                    .get(index + 1)
+                    .is_some_and(|name| name.text == "StateStoreProviderConfig"))
+            .then_some(index + 2)
+        })
+        .and_then(|after_name| {
+            tokens[after_name..]
+                .iter()
+                .position(|token| token.text == "{")
+                .map(|offset| after_name + offset)
         })
         .expect("StateStoreProviderConfig must exist in production config");
-    let foundationdb = provider
-        .variants
-        .iter()
-        .find(|variant| variant.ident == "Foundationdb")
-        .expect("Foundationdb provider variant must exist when the feature is off");
+    let provider_body_close = rust_matching_token(&tokens, provider_body_open, "{", "}")
+        .expect("StateStoreProviderConfig body must be balanced");
 
-    assert!(
-        foundationdb
-            .attrs
-            .iter()
-            .all(|attribute| !attribute.path().is_ident("cfg")),
-        "Foundationdb config variant must not be feature-gated"
-    );
+    let mut cursor = provider_body_open + 1;
+    while cursor < provider_body_close {
+        while tokens.get(cursor).is_some_and(|token| token.text == ",") {
+            cursor += 1;
+        }
+
+        let mut has_cfg_attribute = false;
+        while tokens.get(cursor).is_some_and(|token| token.text == "#")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text == "[")
+        {
+            let attribute_end = rust_matching_token(&tokens, cursor + 1, "[", "]")
+                .expect("StateStoreProviderConfig attribute must be balanced");
+            has_cfg_attribute |= tokens
+                .get(cursor + 2)
+                .is_some_and(|attribute| attribute.text == "cfg");
+            cursor = attribute_end + 1;
+        }
+
+        let variant = tokens
+            .get(cursor)
+            .expect("StateStoreProviderConfig variant must be present");
+        if variant.text == "Foundationdb" {
+            assert!(
+                !has_cfg_attribute,
+                "Foundationdb config variant must not be feature-gated"
+            );
+            return;
+        }
+
+        cursor += 1;
+        while cursor < provider_body_close && tokens[cursor].text != "," {
+            if matches!(tokens[cursor].text.as_str(), "{" | "(" | "[") {
+                let closing = match tokens[cursor].text.as_str() {
+                    "{" => "}",
+                    "(" => ")",
+                    "[" => "]",
+                    _ => unreachable!(),
+                };
+                cursor = rust_matching_token(&tokens, cursor, &tokens[cursor].text, closing)
+                    .expect("StateStoreProviderConfig variant must be balanced")
+                    + 1;
+            } else {
+                cursor += 1;
+            }
+        }
+    }
+
+    panic!("Foundationdb provider variant must exist when the feature is off");
 }
 
 #[test]
