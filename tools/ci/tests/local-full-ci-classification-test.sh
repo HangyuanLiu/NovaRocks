@@ -89,6 +89,29 @@ if printf '%s\n' "${SUITES[@]}" | grep -qx "starrocks-compat"; then
   exit 1
 fi
 
+resolve_root="$tmpdir/resolve-malformed"
+mkdir -p \
+  "$resolve_root/sql-tests/a-valid/sql" \
+  "$resolve_root/sql-tests/z-malformed/sql"
+printf '%s\n' 'explicit_only = false' \
+  >"$resolve_root/sql-tests/a-valid/suite.toml"
+printf '%s\n' 'explicit_only = "false"' \
+  >"$resolve_root/sql-tests/z-malformed/suite.toml"
+resolve_status=0
+(
+  REPO_ROOT="$resolve_root"
+  RUN_MODE="all-discovered"
+  resolve_suites
+) 2>"$resolve_root/resolve.err" || resolve_status=$?
+if [ "$resolve_status" -eq 0 ]; then
+  echo "all-discovered resolution must propagate malformed metadata failure" >&2
+  exit 1
+fi
+if [ "$resolve_status" -ne 2 ]; then
+  echo "all-discovered resolution returned $resolve_status instead of discovery status 2" >&2
+  exit 1
+fi
+
 RUN_MODE="explicit"
 REQUESTED_SUITES=("starrocks-compat")
 resolve_suites

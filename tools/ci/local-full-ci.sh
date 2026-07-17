@@ -474,10 +474,11 @@ resolve_suites() {
   fi
 
   if [ "$RUN_MODE" = "all-discovered" ]; then
+    suites_output="$(ci_discover_sql_suites "$REPO_ROOT")" || return $?
     while IFS= read -r suite; do
       [ -n "$suite" ] || continue
       SUITES+=("$suite")
-    done < <(ci_discover_sql_suites "$REPO_ROOT")
+    done <<<"$suites_output"
     return 0
   fi
 

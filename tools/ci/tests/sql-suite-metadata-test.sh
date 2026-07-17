@@ -80,4 +80,29 @@ missing_manifest_root="$tmpdir/missing-manifest"
 mkdir -p "$missing_manifest_root/sql-tests/starrocks-compat/sql"
 assert_metadata_error "$missing_manifest_root" starrocks-compat
 
+mixed_root="$tmpdir/mixed"
+mkdir -p \
+  "$mixed_root/sql-tests/a-valid/sql" \
+  "$mixed_root/sql-tests/z-malformed/sql"
+printf '%s\n' 'explicit_only = false' \
+  >"$mixed_root/sql-tests/a-valid/suite.toml"
+printf '%s\n' 'explicit_only = "false"' \
+  >"$mixed_root/sql-tests/z-malformed/suite.toml"
+mixed_stdout="$mixed_root/discovery.out"
+if ci_discover_sql_suites "$mixed_root" >"$mixed_stdout" 2>"$mixed_root/discovery.err"; then
+  echo "shell discovery accepted a malformed suite after a valid suite" >&2
+  exit 1
+else
+  mixed_status=$?
+fi
+if [ "$mixed_status" -eq 0 ]; then
+  echo "mixed shell discovery must return a nonzero status" >&2
+  exit 1
+fi
+if [ -s "$mixed_stdout" ]; then
+  echo "mixed shell discovery leaked a partial suite list" >&2
+  cat "$mixed_stdout" >&2
+  exit 1
+fi
+
 echo "sql-suite-metadata-test: PASS"
