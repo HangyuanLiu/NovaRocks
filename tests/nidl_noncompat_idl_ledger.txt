@@ -1,5 +1,0 @@
-# NIDL-E non-compat StarRocks-IDL ledger.
-# E10 final state: this file is intentionally empty.
-# Non-compat production code must not reference crate::thrift,
-# crate::proto::starrocks, or crate::proto::staros.
-# build.rs / lib.rs generated-IDL gates are enforced by architecture_guard.

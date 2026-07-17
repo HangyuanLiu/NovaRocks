@@ -22,7 +22,7 @@ use crate::catalog::table::CatalogTable;
 use crate::connector::ConnectorRegistry;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
-    ResolvedAnalyzerTable,
+    ResolvedAnalyzerTable, TableLookupMode,
 };
 use crate::sql::planner::table::TableDef;
 
@@ -30,6 +30,7 @@ pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
     service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
     connectors: &'a ConnectorRegistry,
+    lookup_mode: TableLookupMode,
 }
 
 impl<'a> CatalogServiceProvider<'a> {
@@ -37,11 +38,13 @@ impl<'a> CatalogServiceProvider<'a> {
         current_catalog: Option<&'a str>,
         service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
         connectors: &'a ConnectorRegistry,
+        lookup_mode: TableLookupMode,
     ) -> Self {
         Self {
             current_catalog,
             service,
             connectors,
+            lookup_mode,
         }
     }
 
@@ -69,19 +72,32 @@ impl<'a> CatalogServiceProvider<'a> {
                     planner,
                 ))
             }
-            Some(catalog) => {
-                let metadata = self
-                    .service
-                    .registry()
-                    .read()
-                    .expect("catalog service registry read lock")
-                    .resolve(catalog, database, table)?;
-                let planner = metadata.to_table_def();
-                Ok(ResolvedAnalyzerTable {
-                    catalog: metadata.table,
-                    planner,
-                })
-            }
+            Some(catalog) => match self.lookup_mode {
+                TableLookupMode::SchemaOnly => {
+                    let metadata = self
+                        .service
+                        .registry()
+                        .read()
+                        .expect("catalog service registry read lock")
+                        .resolve(catalog, database, table)?;
+                    let planner = metadata.to_table_def();
+                    Ok(ResolvedAnalyzerTable {
+                        catalog: metadata.table,
+                        planner,
+                    })
+                }
+                TableLookupMode::ExplainStats => {
+                    let backend = self.connectors.catalog_backend("iceberg")?;
+                    let source = self.connectors.table_source("iceberg")?;
+                    let resolved = backend.load_table_for_read(catalog, database, table)?;
+                    let planner = source.build_schema_table_def(&resolved)?;
+                    Ok(ResolvedAnalyzerTable::from_planner(
+                        Some(catalog),
+                        database,
+                        planner,
+                    ))
+                }
+            },
         }
     }
 
@@ -209,7 +225,7 @@ mod tests {
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::catalog::{
-        CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
+        CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider, TableLookupMode,
     };
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
     use crate::sql::planner::table::{ScanSource, TableDef};
@@ -290,7 +306,12 @@ mod tests {
         let resolutions = Arc::new(AtomicUsize::new(0));
         let service = service(Arc::clone(&resolutions));
         let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
+        let provider = CatalogServiceProvider::new(
+            Some("ice"),
+            &service,
+            &connectors,
+            TableLookupMode::SchemaOnly,
+        );
 
         let resolved =
             PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
@@ -322,7 +343,12 @@ mod tests {
         let resolutions = Arc::new(AtomicUsize::new(0));
         let service = service(Arc::clone(&resolutions));
         let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
+        let provider = CatalogServiceProvider::new(
+            Some("ice"),
+            &service,
+            &connectors,
+            TableLookupMode::SchemaOnly,
+        );
 
         let table =
             CatalogProvider::get_table(&provider, "db", "orders").expect("resolve neutral table");
@@ -514,7 +540,12 @@ mod tests {
             let service = service(Arc::clone(&resolutions));
             let (connectors, loads, full_calls, schema_calls, metadata_row_calls) =
                 tracking_connectors();
-            let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
+            let provider = CatalogServiceProvider::new(
+                Some("ice"),
+                &service,
+                &connectors,
+                TableLookupMode::SchemaOnly,
+            );
 
             let table = IcebergMetadataTableProvider::get_iceberg_metadata_table(
                 &provider,
@@ -547,5 +578,36 @@ mod tests {
                 Some("http://minio:9000")
             );
         }
+    }
+
+    #[test]
+    fn explain_stats_external_lookup_uses_schema_metadata_builder() {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let service = service(Arc::clone(&resolutions));
+        let (connectors, loads, full_calls, schema_calls, metadata_row_calls) =
+            tracking_connectors();
+        let provider = CatalogServiceProvider::new(
+            Some("ice"),
+            &service,
+            &connectors,
+            TableLookupMode::ExplainStats,
+        );
+
+        let resolved =
+            PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
+                .expect("resolve table for EXPLAIN stats");
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata_row_calls.load(Ordering::SeqCst), 0);
+        let ScanSource::IcebergDataFiles { table, .. } = resolved.planner.source else {
+            panic!("expected iceberg source");
+        };
+        assert_eq!(
+            table.serialized_metadata.as_deref(),
+            Some("schema-metadata")
+        );
     }
 }

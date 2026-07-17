@@ -56,8 +56,8 @@ use crate::meta::repository::job::{
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
-use crate::sql::catalog::StandaloneCatalogService;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
+use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_ops;
@@ -308,11 +308,13 @@ pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
     catalog_service: &'a StandaloneCatalogService,
     connectors: &'a crate::connector::ConnectorRegistry,
+    lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
     crate::sql::catalog::provider::CatalogServiceProvider::new(
         current_catalog,
         catalog_service,
         connectors,
+        lookup_mode,
     )
 }
 
@@ -1020,6 +1022,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    TableLookupMode::ExplainStats,
                 );
                 let result = if force_logical_explain {
                     explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
@@ -1061,6 +1064,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    TableLookupMode::ExplainStats,
                 );
                 let result = explain_analyze_query(
                     &prepared,
@@ -1141,6 +1145,7 @@ impl StandaloneSession {
                     current_catalog,
                     &catalog_service_snapshot,
                     &connectors_snapshot,
+                    TableLookupMode::SchemaOnly,
                 );
                 self::statistics::observe_query(&self.inner, &prepared, current_database)?;
                 let result = execute_query_with_catalog_provider(
@@ -2915,6 +2920,7 @@ pub(crate) fn execute_query_with_catalog_service(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        TableLookupMode::SchemaOnly,
     );
     execute_query_with_catalog_provider(
         query,
@@ -3021,6 +3027,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         current_catalog,
         &catalog_service_snapshot,
         &connectors_snapshot,
+        TableLookupMode::SchemaOnly,
     );
 
     let (resolved, cte_registry, mut factory) =

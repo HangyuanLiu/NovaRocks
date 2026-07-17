@@ -37,6 +37,12 @@ use metadata::CatalogRuntimeMetadata;
 
 pub(crate) type StandaloneCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TableLookupMode {
+    SchemaOnly,
+    ExplainStats,
+}
+
 pub(crate) fn build_internal_catalog(
     name: &str,
     local: Arc<RwLock<local::PlannerMemoryCatalog>>,
