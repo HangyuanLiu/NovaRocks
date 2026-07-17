@@ -92,6 +92,21 @@ The production acceptance fixture is the pinned MySQL 8.4.10 container under
 `docker/mysql-state-store/`. The Homebrew server is auxiliary developer evidence
 only and does not replace the pinned fixture.
 
+On Linux x86_64, run the same production gate as CI from a fresh fixture:
+
+```bash
+trap 'docker/mysql-state-store/down.sh --docker' EXIT
+docker/mysql-state-store/up.sh
+source docker/mysql-state-store/runtime/current/env.sh
+tools/ci/mysql-state-store-provider.sh
+```
+
+The gate deliberately runs both `probes/contract.sh` and the public provider
+3072/3073-byte exact test; neither is a substitute for the other. FoundationDB
+coverage in this gate is feature-off and non-live, so it does not require
+`libfdb_c`. The final 1FE+3BE baseline also leaves the MySQL provider disabled
+and proves only additive/no-fallback behavior, not a two-FE failover.
+
 `state_store_mysql` runs the provider scenarios and, through `mysql_suite`, all
 13 shared conformance cases without changing
 `tests/common/state_store_conformance.rs`. Each conformance factory invocation
