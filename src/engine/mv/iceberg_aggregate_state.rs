@@ -429,11 +429,11 @@ mod tests {
 
     use crate::catalog::schema::SqlType;
     use crate::engine::mv::agg_state::mv_agg_state::{
-        AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
+        AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
     use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
     use crate::engine::mv::agg_state::state_codec::encode_count_state;
+    use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {
         record_batch_to_chunk(batch).expect("chunk")

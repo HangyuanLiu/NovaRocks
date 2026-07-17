@@ -686,7 +686,7 @@ fn merged_state_expr(
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
 ) -> Result<TypedExpr, String> {
-    use crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole;
+    use crate::mv::model::AggregateStateRole;
 
     let delta = find_output_column_by_name(delta_outputs, &state_column.name)?;
     let delta = find_output_column_by_id(join_outputs, delta.column_id)?;
@@ -1098,7 +1098,7 @@ fn single_state_column_for_visible(
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
     visible_index: usize,
 ) -> Result<&crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn, String> {
-    use crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole;
+    use crate::mv::model::AggregateStateRole;
 
     layout
         .state_columns
@@ -1117,8 +1117,8 @@ fn single_state_column_for_visible(
 fn retraction_count_state_column(
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<&crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn, String> {
-    use crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole;
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::mv::model::AggregateFunctionKind;
+    use crate::mv::model::AggregateStateRole;
 
     layout
         .state_columns
@@ -1138,9 +1138,9 @@ fn retraction_count_state_column(
 }
 
 fn state_union_function(
-    function: crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind,
+    function: crate::mv::model::AggregateFunctionKind,
 ) -> Result<&'static str, String> {
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::mv::model::AggregateFunctionKind;
 
     match function {
         AggregateFunctionKind::Count => Ok("count_state_union"),
@@ -1157,9 +1157,9 @@ fn state_union_function(
 }
 
 fn visible_state_function(
-    function: crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind,
+    function: crate::mv::model::AggregateFunctionKind,
 ) -> Result<&'static str, String> {
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::mv::model::AggregateFunctionKind;
 
     match function {
         AggregateFunctionKind::Count => Ok("count_state_visible"),
@@ -1180,7 +1180,7 @@ fn visible_state_args(
     merged_state: TypedExpr,
     layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<TypedExpr>, String> {
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
+    use crate::mv::model::AggregateFunctionKind;
 
     let visible = layout
         .visible_columns
@@ -1381,10 +1381,7 @@ fn aggregate_state_names(
     let single_state_count = layout
         .state_columns
         .iter()
-        .filter(|column| {
-            column.state_role
-                == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single
-        })
+        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::Single)
         .count();
     if single_state_count != aggregate_node.aggregates.len() {
         return Err(format!(
@@ -1409,10 +1406,10 @@ fn aggregate_state_names(
             ));
         }
         let expected_role = match layout_column.state_role {
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => {
+            crate::mv::model::AggregateStateRole::Single => {
                 crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
             }
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
+            crate::mv::model::AggregateStateRole::RetractionCount => {
                 crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
             }
         };
@@ -1423,7 +1420,7 @@ fn aggregate_state_names(
             ));
         }
         match layout_column.state_role {
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => {
+            crate::mv::model::AggregateStateRole::Single => {
                 if !contract_column
                     .type_signature
                     .eq_ignore_ascii_case("binary")
@@ -1446,7 +1443,7 @@ fn aggregate_state_names(
                     })?;
                 signed_state_function(&call.name)?;
             }
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
+            crate::mv::model::AggregateStateRole::RetractionCount => {
                 if !contract_column.type_signature.eq_ignore_ascii_case("long")
                     && !contract_column
                         .type_signature
@@ -1625,10 +1622,10 @@ fn signed_aggregate(
             signed_aggregate_call(&call, action_column)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let hidden_retraction_call = layout.state_columns.iter().any(|column| {
-        column.state_role
-            == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount
-    });
+    let hidden_retraction_call = layout
+        .state_columns
+        .iter()
+        .any(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount);
     if hidden_retraction_call {
         signed_calls.push(retraction_count_aggregate_call(action_column));
     }
@@ -1962,7 +1959,7 @@ fn signed_aggregate_project_items(
     aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::ProjectItem>, String> {
-    use crate::engine::mv::agg_state::mv_shape::VisibleAggregateOutput;
+    use crate::mv::model::VisibleAggregateOutput;
 
     let mut items = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
     for output in &shape.visible_outputs {
@@ -2019,7 +2016,7 @@ fn signed_aggregate_project_items(
                     .iter()
                     .find(|column| {
                         column.state_role
-                            == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single
+                            == crate::mv::model::AggregateStateRole::Single
                             && column.aggregate_index == *aggregate_index
                     })
                     .ok_or_else(|| {
@@ -2056,10 +2053,11 @@ fn signed_aggregate_project_items(
             }
         }
     }
-    for state_column in layout.state_columns.iter().filter(|column| {
-        column.state_role
-            == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount
-    }) {
+    for state_column in layout
+        .state_columns
+        .iter()
+        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount)
+    {
         let call = signed_calls.last().ok_or_else(|| {
             format!(
                 "Iceberg IMV aggregate rewrite missing hidden retraction state call for {}",
@@ -2108,10 +2106,8 @@ fn state_shaped_state_data_type(
     state_column: &crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn,
 ) -> DataType {
     match state_column.state_role {
-        crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => DataType::Binary,
-        crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
-            state_column.data_type.clone()
-        }
+        crate::mv::model::AggregateStateRole::Single => DataType::Binary,
+        crate::mv::model::AggregateStateRole::RetractionCount => state_column.data_type.clone(),
     }
 }
 
@@ -2531,10 +2527,7 @@ mod tests {
         let state_column = layout
             .state_columns
             .iter()
-            .find(|column| {
-                column.state_role
-                    == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single
-            })
+            .find(|column| column.state_role == crate::mv::model::AggregateStateRole::Single)
             .expect("single AVG state column");
         let merged_state = TypedExpr {
             kind: ExprKind::ColumnRef {

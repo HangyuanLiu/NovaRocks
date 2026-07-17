@@ -22,9 +22,10 @@
 /// intentionally ignored — this extractor does not classify or reject based on
 /// the table structure.
 use super::mv_shape::{
-    AggregateCallShape, AggregateMvShape, GroupKeyShape, VisibleAggregateOutput,
-    classify_aggregate_select_outputs, table_factor_name_and_alias,
+    AggregateCallShape, AggregateMvShape, GroupKeyShape, classify_aggregate_select_outputs,
+    table_factor_name_and_alias,
 };
+use crate::mv::model::VisibleAggregateOutput;
 
 /// The focused aggregate-call surface extracted from a stored MV SELECT.
 ///
@@ -217,9 +218,8 @@ pub(crate) fn extract_aggregate_sql_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::agg_state::mv_shape::{
-        AggregateFunctionKind, AggregateInput, VisibleAggregateOutput,
-    };
+    use crate::engine::mv::agg_state::mv_shape::AggregateInput;
+    use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =

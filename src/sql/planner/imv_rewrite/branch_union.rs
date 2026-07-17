@@ -253,12 +253,8 @@ fn branch_union_aggregate_change_stream_output_columns(
     }
     for column in &layout.state_columns {
         let data_type = match column.state_role {
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => {
-                DataType::Binary
-            }
-            crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
-                column.data_type.clone()
-            }
+            crate::mv::model::AggregateStateRole::Single => DataType::Binary,
+            crate::mv::model::AggregateStateRole::RetractionCount => column.data_type.clone(),
         };
         columns.push(allocate_imv_output_column(
             ctx,

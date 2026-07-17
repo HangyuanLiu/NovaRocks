@@ -33,9 +33,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog::schema::SqlType;
 use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
-use crate::engine::mv::agg_state::mv_shape::{
-    AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
-};
+use crate::engine::mv::agg_state::mv_shape::{AggregateInput, AggregateMvShape};
 use crate::engine::mv::agg_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
@@ -54,6 +52,7 @@ use crate::exec::expr::function::mv_state::{
     count_state_visible, max_state_union, max_state_visible_key_value, min_state_union,
     min_state_visible_key_value, sum_state_union,
 };
+use crate::mv::model::{AggregateFunctionKind, AggregateStateRole, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
 
@@ -143,17 +142,6 @@ pub(crate) struct AggregateStateColumn {
     pub(crate) function: AggregateFunctionKind,
     pub(crate) state_role: AggregateStateRole,
     pub(crate) count_star: bool,
-}
-
-/// Identifies a state column's role within its logical aggregate.
-///
-/// Cardinality contract: one opaque `Single` state per aggregate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateStateRole {
-    /// Single opaque VARBINARY state column.
-    Single,
-    /// Hidden row-count state used only to decide whether a group has been fully retracted.
-    RetractionCount,
 }
 
 #[derive(Clone, Debug)]
@@ -2893,8 +2881,8 @@ mod tests {
     fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
         use crate::engine::mv::agg_state::mv_shape::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
-            VisibleAggregateOutput,
         };
+        use crate::mv::model::VisibleAggregateOutput;
         use sqlparser::ast::ObjectName;
 
         let shape = AggregateMvShape {

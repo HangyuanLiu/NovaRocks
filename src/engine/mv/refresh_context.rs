@@ -421,7 +421,8 @@ fn aggregate_input_types_from_schema_contract(
     calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::engine::mv::agg_state::mv_shape::{AggregateInput, VisibleAggregateOutput};
+    use crate::engine::mv::agg_state::mv_shape::AggregateInput;
+    use crate::mv::model::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {

@@ -4748,8 +4748,9 @@ enable_path_style_access = true
     #[test]
     fn build_aggregate_mv_layout_succeeds_with_analyzer_sourced_visible_types() {
         use crate::engine::mv::agg_state::mv_agg_state::{
-            AGG_RETRACTION_COUNT_STATE_COLUMN, AggregateStateRole, build_aggregate_mv_layout,
+            AGG_RETRACTION_COUNT_STATE_COLUMN, build_aggregate_mv_layout,
         };
+        use crate::mv::model::AggregateStateRole;
 
         let state = state_with_orders_table();
 

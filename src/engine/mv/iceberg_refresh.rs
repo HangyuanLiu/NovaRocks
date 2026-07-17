@@ -2497,13 +2497,13 @@ fn aggregate_contract(
 }
 
 fn aggregate_state_role_contract(
-    role: crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole,
+    role: crate::mv::model::AggregateStateRole,
 ) -> crate::meta::repository::mv_contract::AggregateStateRoleContract {
     match role {
-        crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single => {
+        crate::mv::model::AggregateStateRole::Single => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
         }
-        crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount => {
+        crate::mv::model::AggregateStateRole::RetractionCount => {
             crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
         }
     }
@@ -9116,9 +9116,7 @@ fn aggregate_state_result_column_names(
     let mut names = Vec::with_capacity(calls.visible_outputs.len() + layout.state_columns.len());
     for output in &calls.visible_outputs {
         match output {
-            crate::engine::mv::agg_state::mv_shape::VisibleAggregateOutput::GroupKey(
-                group_key_index,
-            ) => {
+            crate::mv::model::VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = layout
                     .group_key_source_indexes
                     .get(*group_key_index)
@@ -9137,15 +9135,13 @@ fn aggregate_state_result_column_names(
                     })?;
                 names.push(visible.name.clone());
             }
-            crate::engine::mv::agg_state::mv_shape::VisibleAggregateOutput::Aggregate(
-                aggregate_index,
-            ) => {
+            crate::mv::model::VisibleAggregateOutput::Aggregate(aggregate_index) => {
                 let state_column = layout
                     .state_columns
                     .iter()
                     .find(|column| {
                         column.state_role
-                            == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::Single
+                            == crate::mv::model::AggregateStateRole::Single
                             && column.aggregate_index == *aggregate_index
                     })
                     .ok_or_else(|| {
@@ -9157,10 +9153,11 @@ fn aggregate_state_result_column_names(
             }
         }
     }
-    for state_column in layout.state_columns.iter().filter(|column| {
-        column.state_role
-            == crate::engine::mv::agg_state::mv_agg_state::AggregateStateRole::RetractionCount
-    }) {
+    for state_column in layout
+        .state_columns
+        .iter()
+        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount)
+    {
         names.push(state_column.name.clone());
     }
     Ok(names)
@@ -9216,9 +9213,7 @@ fn alias_aggregate_refresh_group_key_projection(
     };
     for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
         match output {
-            crate::engine::mv::agg_state::mv_shape::VisibleAggregateOutput::GroupKey(
-                group_key_index,
-            ) => {
+            crate::mv::model::VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = layout
                     .group_key_source_indexes
                     .get(*group_key_index)
@@ -9252,7 +9247,7 @@ fn alias_aggregate_refresh_group_key_projection(
                     ));
                 }
             }
-            crate::engine::mv::agg_state::mv_shape::VisibleAggregateOutput::Aggregate(_) => {}
+            crate::mv::model::VisibleAggregateOutput::Aggregate(_) => {}
         }
     }
     Ok(())
@@ -25795,10 +25790,10 @@ mod tests {
     mod aggregate_apply_test_helpers {
         use crate::catalog::schema::SqlType;
         use crate::engine::mv::agg_state::mv_agg_state::{
-            AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
+            AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
         };
-        use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
         use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
+        use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
         use arrow::datatypes::DataType;
 
         pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {

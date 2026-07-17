@@ -808,11 +808,11 @@ mod tests {
 
     use crate::catalog::schema::SqlType;
     use crate::engine::mv::agg_state::mv_agg_state::{
-        AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
+        AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
-    use crate::engine::mv::agg_state::mv_shape::AggregateFunctionKind;
     use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
     use crate::exec::chunk::Chunk;
+    use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArcFixture;

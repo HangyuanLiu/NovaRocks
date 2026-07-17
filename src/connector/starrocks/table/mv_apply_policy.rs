@@ -64,9 +64,10 @@ pub(crate) fn apply_policy_for_change(
 mod tests {
     use super::*;
     use crate::engine::mv::agg_state::mv_shape::{
-        AggregateCallShape, AggregateFunctionKind, AggregateInput, AggregateMvShape,
-        IncrementalMvShape, JoinProjectionFilterMvShape, ProjectionFilterMvShape,
+        AggregateCallShape, AggregateInput, AggregateMvShape, IncrementalMvShape,
+        JoinProjectionFilterMvShape, ProjectionFilterMvShape,
     };
+    use crate::mv::model::AggregateFunctionKind;
 
     fn object_name() -> sqlparser::ast::ObjectName {
         sqlparser::ast::ObjectName(vec![
