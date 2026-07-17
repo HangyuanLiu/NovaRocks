@@ -303,7 +303,8 @@ int32_t invoke_internal_brpc_client(
                 google::protobuf::Closure*),
         const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr,
         const uint8_t* attachment_ptr = nullptr,
-        size_t attachment_len = 0) {
+        size_t attachment_len = 0,
+        int max_retry = -1) {
     init_compat_buf(out_resp);
     init_compat_buf(out_err);
 
@@ -364,6 +365,9 @@ int32_t invoke_internal_brpc_client(
     starrocks::PInternalService_Stub stub(channel.get());
     brpc::Controller cntl;
     cntl.set_timeout_ms(600000);
+    if (max_retry >= 0) {
+        cntl.set_max_retry(max_retry);
+    }
     if (attachment_len > 0 &&
         cntl.request_attachment().append(attachment_ptr, attachment_len) != 0) {
         write_compat_buf(std::string(rpc_name) + " attachment allocation failed", out_err);
@@ -2498,7 +2502,8 @@ int32_t novarocks_compat_exec_plan_fragment(const char* host,
             &starrocks::PInternalService_Stub::exec_plan_fragment,
             nullptr,
             attachment_ptr,
-            attachment_len);
+            attachment_len,
+            0);
 }
 
 int32_t novarocks_compat_exec_batch_plan_fragments(const char* host,
@@ -2521,7 +2526,8 @@ int32_t novarocks_compat_exec_batch_plan_fragments(const char* host,
             &starrocks::PInternalService_Stub::exec_batch_plan_fragments,
             nullptr,
             attachment_ptr,
-            attachment_len);
+            attachment_len,
+            0);
 }
 
 int32_t novarocks_compat_fetch_data(const char* host,
@@ -2543,7 +2549,8 @@ int32_t novarocks_compat_fetch_data(const char* host,
             &starrocks::PInternalService_Stub::fetch_data,
             nullptr,
             attachment_ptr,
-            attachment_len);
+            attachment_len,
+            0);
 }
 
 int32_t novarocks_compat_cancel_plan_fragment(const char* host,
@@ -2566,7 +2573,8 @@ int32_t novarocks_compat_cancel_plan_fragment(const char* host,
             &starrocks::PInternalService_Stub::cancel_plan_fragment,
             nullptr,
             attachment_ptr,
-            attachment_len);
+            attachment_len,
+            0);
 }
 
 int32_t novarocks_compat_transmit_chunk(const char* host,

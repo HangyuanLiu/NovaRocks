@@ -2725,6 +2725,15 @@ fn run() -> Result<i32> {
 
         for case in &cases {
             for step in &case.steps {
+                if let Err(error) =
+                    compat_directive::validate_execution_mode(&step.meta, cli.mode)
+                {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
                 if let Err(error) = compat_directive::validate_mode(&step.meta, selected_cluster_mode)
                 {
                     println!(

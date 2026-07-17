@@ -594,7 +594,14 @@ impl ManagedProcess {
         let started = Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
         let mut process = Self::spawn_impl(
-            label, command, marker, timeout, log_path, None, false, true,
+            label,
+            command,
+            marker,
+            timeout,
+            log_path,
+            None,
+            false,
+            Some(deadline),
         )?;
         process.wait_for_successful_exit(deadline, timeout)
     }
@@ -607,7 +614,7 @@ impl ManagedProcess {
         log_path: PathBuf,
     ) -> Result<Self> {
         Self::spawn_impl(
-            label, command, marker, timeout, log_path, None, false, false,
+            label, command, marker, timeout, log_path, None, false, None,
         )
     }
 
@@ -628,7 +635,7 @@ impl ManagedProcess {
             log_path,
             Some(log_writer),
             false,
-            false,
+            None,
         )
     }
 
@@ -640,7 +647,7 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None, true, false)
+        Self::spawn_impl(label, command, marker, timeout, log_path, None, true, None)
     }
 
     fn spawn_impl(
@@ -651,10 +658,12 @@ impl ManagedProcess {
         log_path: PathBuf,
         log_writer: Option<Box<dyn Write + Send>>,
         poison_stdout_tail: bool,
-        one_shot: bool,
+        one_shot_deadline: Option<Instant>,
     ) -> Result<Self> {
         let started = Instant::now();
-        let deadline = started.checked_add(timeout).unwrap_or(started);
+        let deadline = one_shot_deadline
+            .unwrap_or_else(|| started.checked_add(timeout).unwrap_or(started));
+        let one_shot = one_shot_deadline.is_some();
         let readiness_baseline = ReadinessBaseline::capture(&marker)?;
         let log_file: Box<dyn Write + Send> = match log_writer {
             Some(log_writer) => log_writer,
@@ -942,10 +951,32 @@ impl ManagedProcess {
 
     fn wait_for_successful_exit(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
         loop {
+            let now = Instant::now();
+            if now >= deadline {
+                let message = format!(
+                    "{} timed out waiting for successful completion after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+                self.kill_now()
+                    .with_context(|| format!("{message}; also failed to kill timed out process"))?;
+                bail!("{message}");
+            }
             #[cfg(unix)]
             if self.leader_exit_observed()? {
-                let status = self.reap_natural_exit(short_output_join_deadline())?;
+                let status = self.reap_natural_exit(deadline)?;
                 self.ensure_output_io_ok("complete one-shot process")?;
+                if Instant::now() >= deadline {
+                    bail!(
+                        "{} timed out waiting for successful completion after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                        self.label,
+                        self.stdout_tail(),
+                        self.stderr_tail(),
+                        self.log_path.display()
+                    );
+                }
                 if status.success() {
                     return Ok(());
                 }
@@ -960,8 +991,17 @@ impl ManagedProcess {
             #[cfg(not(unix))]
             if let Some(status) = self.child.try_wait()? {
                 self.stopped = true;
-                self.join_output_threads_until(short_output_join_deadline());
+                self.join_output_threads_until(deadline);
                 self.ensure_output_io_ok("complete one-shot process")?;
+                if Instant::now() >= deadline {
+                    bail!(
+                        "{} timed out waiting for successful completion after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                        self.label,
+                        self.stdout_tail(),
+                        self.stderr_tail(),
+                        self.log_path.display()
+                    );
+                }
                 if status.success() {
                     return Ok(());
                 }
@@ -974,19 +1014,6 @@ impl ManagedProcess {
                 );
             }
 
-            let now = Instant::now();
-            if now >= deadline {
-                let message = format!(
-                    "{} timed out waiting for successful completion after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
-                    self.label,
-                    self.stdout_tail(),
-                    self.stderr_tail(),
-                    self.log_path.display()
-                );
-                self.kill_now()
-                    .with_context(|| format!("{message}; also failed to kill timed out process"))?;
-                bail!("{message}");
-            }
             thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
         }
     }
@@ -1046,6 +1073,16 @@ impl ManagedProcess {
         one_shot: bool,
     ) -> Result<()> {
         loop {
+            let now = Instant::now();
+            if now >= deadline {
+                bail!(
+                    "{} timed out waiting for readiness marker after {timeout:?}; stdout_tail={:?}; stderr_tail={}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
             if matches!(marker, ReadyMarker::StdoutContains(_))
                 && matches!(ready_rx.try_recv(), Ok(()))
             {
@@ -1055,11 +1092,21 @@ impl ManagedProcess {
             #[cfg(unix)]
             if self.leader_exit_observed()? {
                 if one_shot {
-                    self.join_output_threads_until(short_output_join_deadline());
+                    self.join_output_threads_until(deadline);
+                    self.ensure_output_io_ok("confirm one-shot readiness")?;
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "{} timed out waiting for readiness marker after {timeout:?}; stdout_tail={:?}; stderr_tail={}; log={}",
+                            self.label,
+                            self.stdout_tail(),
+                            self.stderr_tail(),
+                            self.log_path.display()
+                        );
+                    }
                     if self.readiness_marker_observed(marker, readiness_baseline)? {
                         return Ok(());
                     }
-                    let status = self.reap_natural_exit(short_output_join_deadline())?;
+                    let status = self.reap_natural_exit(deadline)?;
                     bail!(
                         "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
                         self.label,
@@ -1168,16 +1215,6 @@ impl ManagedProcess {
                 }
             }
 
-            let now = Instant::now();
-            if now >= deadline {
-                bail!(
-                    "{} timed out waiting for readiness marker after {timeout:?}; stdout_tail={:?}; stderr_tail={}; log={}",
-                    self.label,
-                    self.stdout_tail(),
-                    self.stderr_tail(),
-                    self.log_path.display()
-                );
-            }
             thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
         }
     }
@@ -3100,5 +3137,108 @@ mod tests {
             .expect("parse timed out one-shot pid");
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+    }
+
+    #[test]
+    fn managed_process_one_shot_rejects_marker_observed_after_deadline() {
+        let temp = TempDir::new("one-shot-late-marker");
+        let marker = ReadyMarker::StdoutContains("PASS_MARKER".to_string());
+        let baseline = ReadinessBaseline::capture(&marker).expect("capture readiness baseline");
+        let mut process = ManagedProcess::spawn(
+            "late marker one-shot fixture".to_string(),
+            shell("printf 'READY\\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn fixture");
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        ready_tx.send(()).expect("publish marker observation");
+
+        let error = process
+            .wait_for_ready(
+                &marker,
+                &baseline,
+                &ready_rx,
+                Instant::now() - Duration::from_millis(1),
+                Duration::from_millis(10),
+                true,
+            )
+            .expect_err("a marker observed after the absolute deadline must be rejected");
+        process.kill_now().expect("clean up late marker fixture");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+
+    #[test]
+    fn managed_process_one_shot_rejects_natural_exit_after_deadline() {
+        let temp = TempDir::new("one-shot-late-exit");
+        let mut process = ManagedProcess::spawn(
+            "late exit one-shot fixture".to_string(),
+            shell("printf 'READY\\n'; sleep 0.05; exit 0"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn fixture");
+        let child_pid = process.pid();
+        assert!(wait_until(Duration::from_secs(1), || process
+            .leader_exit_observed()
+            .expect("observe leader exit")));
+
+        let error = process
+            .wait_for_successful_exit(
+                Instant::now() - Duration::from_millis(1),
+                Duration::from_millis(10),
+            )
+            .expect_err("a natural exit observed after the absolute deadline must be rejected");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+    }
+
+    #[test]
+    fn managed_process_one_shot_reader_join_uses_original_deadline() {
+        let temp = TempDir::new("one-shot-reader-deadline");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_after_delay = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            let (lock, wake) = &*release_after_delay;
+            *lock.lock().expect("lock writer release") = true;
+            wake.notify_all();
+        });
+        let timeout = Duration::from_millis(120);
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut process = ManagedProcess::spawn_impl(
+            "reader deadline one-shot fixture".to_string(),
+            shell("printf 'PASS_MARKER\\n'; sleep 0.03; printf 'late\\n' >&2; exit 0"),
+            ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
+            timeout,
+            temp.path().join("fixture.log"),
+            Some(Box::new(BlockAfterFirstWrite {
+                writes: 0,
+                release: Arc::clone(&release),
+                file: fs::File::create(temp.path().join("fixture.log"))
+                    .expect("create fixture log"),
+            })),
+            false,
+            Some(deadline),
+        )
+        .expect("marker must arrive within the deadline");
+
+        let error = process
+            .wait_for_successful_exit(deadline, timeout)
+            .expect_err("reader drain past the original deadline must fail");
+        let elapsed = started.elapsed();
+        releaser.join().expect("join writer releaser");
+
+        assert!(
+            elapsed < Duration::from_millis(220),
+            "reader join created a fresh cleanup budget: elapsed={elapsed:?}; {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for stderr reader thread"),
+            "{error:#}"
+        );
     }
 }

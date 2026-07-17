@@ -17,6 +17,7 @@
 
 use crate::cluster::{ClusterMode, ServerHandle};
 use crate::types::{QueryMeta, SqlStep};
+use crate::Mode;
 use anyhow::{Context, Result, bail};
 use std::fmt::Write;
 
@@ -41,6 +42,13 @@ pub(crate) fn validate_mode(meta: &QueryMeta, mode: ClusterMode) -> Result<()> {
         if !COMPAT_PROBES.contains(&probe.as_str()) {
             bail!("unknown compatibility probe: {probe}");
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_execution_mode(meta: &QueryMeta, mode: Mode) -> Result<()> {
+    if has_directives(meta) && mode != Mode::Verify {
+        bail!("compatibility directives require verify mode (got {mode:?})");
     }
     Ok(())
 }
@@ -189,6 +197,27 @@ mod tests {
         }
         validate_mode(&meta, ClusterMode::StarRocksCompat)
             .expect("starrocks-compat mode must allow probes");
+    }
+
+    #[test]
+    fn compat_directive_rejects_record_and_diff_modes() {
+        let meta = QueryMeta {
+            be_log_contains: vec!["compat_ingress".to_string()],
+            ..QueryMeta::default()
+        };
+
+        for mode in [Mode::Record, Mode::Diff] {
+            let error = validate_execution_mode(&meta, mode)
+                .expect_err("non-verify modes must not silently skip compatibility directives");
+            assert!(
+                error
+                    .to_string()
+                    .contains("compatibility directives require verify mode"),
+                "unexpected error for {mode:?}: {error:#}"
+            );
+        }
+        validate_execution_mode(&meta, Mode::Verify)
+            .expect("verify mode must execute compatibility directives");
     }
 
     #[test]

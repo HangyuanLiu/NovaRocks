@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Cargo auto-discovers directories under tests/ as integration targets. The
-// production probe is the explicit test=false binary declared in Cargo.toml.
-#![cfg(not(test))]
-
 use anyhow::{Context, Result, bail};
 use novarocks::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
@@ -415,6 +411,7 @@ fn run_probe(args: &Args) -> Result<()> {
     }
 }
 
+#[cfg(not(test))]
 fn main() {
     let result = (|| -> Result<()> {
         let args = parse_args()?;
@@ -428,5 +425,84 @@ fn main() {
     if let Err(error) = result {
         eprintln!("starrocks-compat-probe failed: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    enum LocalResponse {
+        Close,
+        Invalid,
+    }
+
+    fn invoke_exec_plan_against_local_endpoint(response: LocalResponse) -> (i32, Vec<u8>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local probe endpoint");
+        let port = listener.local_addr().expect("read local endpoint").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept C ABI connection");
+            if matches!(response, LocalResponse::Invalid) {
+                stream
+                    .write_all(b"invalid local brpc response")
+                    .expect("write invalid local response");
+            }
+        });
+
+        let host = CString::new("127.0.0.1").expect("valid local host");
+        let request = PExecPlanFragmentRequest {
+            attachment_protocol: Some("binary".to_string()),
+        }
+        .encode_to_vec();
+        let attachment = [0xff, 0x00, 0x01];
+        let mut response = NovaRocksRustBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let mut error = NovaRocksRustBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let started = Instant::now();
+        // SAFETY: The listener is local, all input slices outlive the synchronous call,
+        // and both output buffers are initialized and freed with the matching C ABI.
+        let rc = unsafe {
+            novarocks_compat_exec_plan_fragment(
+                host.as_ptr(),
+                port,
+                request.as_ptr(),
+                request.len(),
+                attachment.as_ptr(),
+                attachment.len(),
+                &mut response,
+                &mut error,
+            )
+        };
+        let _ = take_buf(&mut response);
+        let error = take_buf(&mut error);
+        server.join().expect("join local endpoint");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "local network C ABI failure was not bounded"
+        );
+        (rc, error)
+    }
+
+    #[test]
+    fn network_c_abi_returns_error_when_local_endpoint_closes() {
+        let (rc, error) = invoke_exec_plan_against_local_endpoint(LocalResponse::Close);
+        assert_ne!(rc, 0, "a closed local endpoint must fail");
+        assert!(!error.is_empty(), "transport failure must include an error");
+    }
+
+    #[test]
+    fn network_c_abi_returns_error_for_invalid_local_response() {
+        let (rc, error) = invoke_exec_plan_against_local_endpoint(LocalResponse::Invalid);
+        assert_ne!(rc, 0, "an invalid local response must fail");
+        assert!(!error.is_empty(), "protocol failure must include an error");
     }
 }

@@ -133,6 +133,24 @@ impl CompatArtifact {
         let probe_binary = probe_path
             .canonicalize()
             .with_context(|| format!("canonicalize compat probe {}", probe_path.display()))?;
+        let required_probe = binary
+            .parent()
+            .context("canonical compat artifact binary has no parent directory")?
+            .join("starrocks-compat-probe")
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "canonicalize required compat probe path next to {}",
+                    binary.display()
+                )
+            })?;
+        if probe_binary != required_probe {
+            bail!(
+                "compat canonical probe path mismatch: manifest={} required={}",
+                probe_binary.display(),
+                required_probe.display()
+            );
+        }
         if !probe_binary.is_file() {
             bail!("compat probe is not a file: {}", probe_binary.display());
         }
@@ -490,6 +508,26 @@ mod tests {
             probe.canonicalize().expect("canonical probe binary")
         );
         assert_eq!(artifact.probe_sha256, sha256(probe_bytes));
+
+        let alternate_probe_dir = root.join("alternate-probe");
+        fs::create_dir_all(&alternate_probe_dir).expect("create alternate probe directory");
+        let alternate_probe = alternate_probe_dir.join("starrocks-compat-probe");
+        write_executable(&alternate_probe, probe_bytes);
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(&alternate_probe, &sha256(probe_bytes), &head),
+        )
+        .expect("point probe manifest at a separately proven binary");
+        let error = resolve_error(&repo_root);
+        assert!(
+            error.contains("canonical probe path"),
+            "a self-consistent manifest must not select a non-sibling probe: {error}"
+        );
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(&probe, &sha256(probe_bytes), &head),
+        )
+        .expect("restore sibling probe manifest");
 
         fs::write(&probe, b"tampered probe\n").expect("tamper probe binary");
         assert!(resolve_error(&repo_root).contains("probe SHA-256 mismatch"));
