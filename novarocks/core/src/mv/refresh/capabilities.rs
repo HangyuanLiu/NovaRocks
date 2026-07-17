@@ -119,6 +119,50 @@ fn apply_key_source_to_refresh_identity(source: ApplyKeySource) -> RefreshIdenti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::persistence::schema::{
+        AggregateStateContract, BaseContract, BaseSchemaSnapshot, BranchIdColumnContract,
+        BranchUnionContract, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind,
+        OutputContract, TargetContract,
+    };
+
+    fn schema_contract(source: ApplyKeySource) -> MvSchemaContract {
+        MvSchemaContract {
+            contract_version: 2,
+            base: BaseContract {
+                table_fqn: "ice.db.base".to_string(),
+                table_uuid: "base-uuid".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 1,
+                schema_at_create: BaseSchemaSnapshot { fields: vec![] },
+            },
+            bases: vec![],
+            output: OutputContract {
+                columns: vec![],
+                filter: None,
+            },
+            join: None,
+            aggregate: None,
+            branch: None,
+            target: TargetContract {
+                table_fqn: "ice.db.mv".to_string(),
+                table_uuid: "mv-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: vec![],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: match source {
+                        ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+                        ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                    }
+                    .to_string(),
+                    target_field_id: 1,
+                    source,
+                },
+                partition: None,
+            },
+        }
+    }
 
     #[test]
     fn apply_key_sources_map_to_runtime_identities() {
@@ -133,6 +177,97 @@ mod tests {
         assert_eq!(
             apply_key_source_to_refresh_identity(ApplyKeySource::GroupRowId),
             RefreshIdentity::GroupRowId
+        );
+    }
+
+    #[test]
+    fn schema_shapes_reconstruct_refresh_capabilities() {
+        let projection = schema_contract(ApplyKeySource::BaseRowId);
+
+        let mut join = schema_contract(ApplyKeySource::JoinRowKey);
+        join.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![],
+        });
+
+        let mut branch_aggregate = schema_contract(ApplyKeySource::GroupRowId);
+        branch_aggregate.aggregate = Some(AggregateStateContract {
+            state_layout_version: 1,
+            row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+            state_columns: vec![],
+        });
+        branch_aggregate.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: "__nova_branch_id".to_string(),
+                target_field_id: 2,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::GroupRowId,
+        });
+
+        let cases = [
+            (
+                "projection",
+                projection,
+                BaseSnapshotPolicy::SingleBase,
+                false,
+                RefreshIdentity::BaseRowId,
+                ApplyKeyValueType::Int64,
+            ),
+            (
+                "join",
+                join,
+                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                false,
+                RefreshIdentity::JoinRowKey,
+                ApplyKeyValueType::Utf8,
+            ),
+            (
+                "branch aggregate",
+                branch_aggregate,
+                BaseSnapshotPolicy::AllBasesRequired,
+                true,
+                RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
+                ApplyKeyValueType::BranchUtf8,
+            ),
+        ];
+
+        for (label, contract, snapshot_policy, has_agg_state, identity, value_type) in cases {
+            let capabilities = RefreshCapabilities::from_schema_contract(&contract)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(capabilities.snapshot_policy, snapshot_policy, "{label}");
+            assert_eq!(capabilities.has_agg_state, has_agg_state, "{label}");
+            assert_eq!(capabilities.identity, identity, "{label}");
+            assert_eq!(capabilities.apply_key_value_type, value_type, "{label}");
+            assert_eq!(
+                capabilities.partition_pruning,
+                PartitionPruningPolicy::BestEffort,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_join_branch_shape_fails_fast() {
+        let mut contract = schema_contract(ApplyKeySource::BaseRowId);
+        contract.join = Some(JoinContract {
+            kind: JoinContractKind::InnerEquiJoin,
+            predicates: vec![],
+        });
+        contract.branch = Some(BranchUnionContract {
+            branch_id_column: BranchIdColumnContract {
+                column_name: "__nova_branch_id".to_string(),
+                target_field_id: 2,
+            },
+            branch_count: 2,
+            inner_apply_key_source: ApplyKeySource::BaseRowId,
+        });
+
+        let error = RefreshCapabilities::from_schema_contract(&contract)
+            .expect_err("join + branch without aggregate must be rejected");
+        assert_eq!(
+            error,
+            "unsupported schema contract shape (join=true, agg=false, branch=true)"
         );
     }
 }
