@@ -155,14 +155,12 @@ pub(crate) enum FragmentSinkKind {
 pub(crate) enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups,
-    SenderIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FragmentSinkAssignmentRequirement {
     None,
     Required(FragmentSinkAssignmentKind),
-    Optional(FragmentSinkAssignmentKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,8 +171,8 @@ pub(crate) struct FragmentSinkSpec {
 
 impl FragmentSinkSpec {
     pub(crate) const fn for_kind(kind: FragmentSinkKind) -> Self {
-        use FragmentSinkAssignmentKind::{DestinationGroups, SenderIdentity, StreamDestinations};
-        use FragmentSinkAssignmentRequirement::{None, Optional, Required};
+        use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
+        use FragmentSinkAssignmentRequirement::{None, Required};
 
         let assignment_requirement = match kind {
             FragmentSinkKind::Result | FragmentSinkKind::Noop | FragmentSinkKind::SchemaTable => {
@@ -184,9 +182,7 @@ impl FragmentSinkSpec {
             FragmentSinkKind::MultiCastDataStream
             | FragmentSinkKind::SplitDataStream
             | FragmentSinkKind::IcebergChangeStreamRouter => Required(DestinationGroups),
-            FragmentSinkKind::IcebergTable | FragmentSinkKind::OlapTable => {
-                Optional(SenderIdentity)
-            }
+            FragmentSinkKind::IcebergTable | FragmentSinkKind::OlapTable => None,
         };
         Self {
             kind,
@@ -299,8 +295,8 @@ mod tests {
 
     #[test]
     fn sink_assignment_requirement_is_derived_from_kind() {
-        use FragmentSinkAssignmentKind::{DestinationGroups, SenderIdentity, StreamDestinations};
-        use FragmentSinkAssignmentRequirement::{None, Optional, Required};
+        use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
+        use FragmentSinkAssignmentRequirement::{None, Required};
         use FragmentSinkKind::{
             DataStream, IcebergChangeStreamRouter, IcebergTable, MultiCastDataStream, Noop,
             OlapTable, Result, SchemaTable, SplitDataStream,
@@ -329,7 +325,7 @@ mod tests {
         for kind in [IcebergTable, OlapTable] {
             assert_eq!(
                 FragmentSinkSpec::for_kind(kind).assignment_requirement(),
-                Optional(SenderIdentity)
+                None
             );
         }
     }
