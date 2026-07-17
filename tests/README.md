@@ -129,7 +129,7 @@ Focused contract checks:
 ```bash
 cargo test --test state_store_contract mysql_
 cargo test --lib state_store::limits::tests::mysql_
-cargo test --test architecture_guard state_store_mysql
+cargo test --test state_store_boundary state_store_mysql
 cargo test --features mysql-state-store-provider,state-store-test-hooks \
   --test state_store_mysql mysql_suite -- --exact --test-threads=1
 cargo test --features mysql-state-store-provider,state-store-test-hooks \

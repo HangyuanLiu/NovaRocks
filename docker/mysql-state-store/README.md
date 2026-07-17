@@ -43,8 +43,9 @@ runtime so the container cannot lose its generated secrets or configuration.
 profile-only root cleaner against only the `/var/lib/mysql` bind mount, removes
 any Compose resources created by that cleanup run, and only then removes the
 host runtime. The cleaner has no network, ports, secrets, or access to the rest
-of the runtime. Every Docker phase is bounded; any inspect, stop, cleaner, or
-final cleanup failure retains the current link and runtime for a safe retry.
+of the runtime. Every cleanup phase is bounded; any inspect, stop, cleaner,
+final Compose cleanup, or host runtime cleanup failure retains the current link
+and runtime for a safe retry.
 Both forms derive the project identity and are safe before prepare or after a
 partial startup. The cleaner is skipped when no data directory exists, so
 cleanup before prepare cannot create a bind-mount source as root. Default

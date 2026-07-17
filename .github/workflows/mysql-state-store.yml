@@ -27,7 +27,7 @@ on:
       - "novarocks.toml.example"
       - "src/common/app_config.rs"
       - "src/state_store/**"
-      - "tests/architecture_guard/state_store_boundary.rs"
+      - "tests/state_store_boundary.rs"
       - "tests/cluster_mvp.rs"
       - "tests/common/state_store_conformance.rs"
       - "tests/state_store_contract.rs"

@@ -41,6 +41,27 @@ run_with_timeout() {
   wait "$child"
 }
 
+file_mode() {
+  local path="$1"
+  local mode
+  if stat --version >/dev/null 2>&1; then
+    if ! mode="$(stat -c '%a' "$path")"; then
+      echo "failed to read MySQL runtime file mode with GNU stat" >&2
+      return 1
+    fi
+  else
+    if ! mode="$(stat -f '%Lp' "$path")"; then
+      echo "failed to read MySQL runtime file mode with BSD stat" >&2
+      return 1
+    fi
+  fi
+  if [[ ! "$mode" =~ ^[0-7]{3}$ ]]; then
+    echo "MySQL runtime file mode is not a canonical three-digit octal value" >&2
+    return 1
+  fi
+  printf '%s\n' "$mode"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exports_file="$SCRIPT_DIR/runtime/current/env.sh"
 self_check=false
@@ -65,7 +86,11 @@ test -n "$NOVA_MYSQL_COMPOSE_PROJECT"
 test -n "$NOVAROCKS_MYSQL_DATABASE"
 test -n "$NOVAROCKS_MYSQL_USERNAME"
 test "$NOVAROCKS_MYSQL_PASSWORD_ENV" = "NOVAROCKS_MYSQL_PASSWORD"
-test "$(stat -f '%Lp' "$exports_file" 2>/dev/null || stat -c '%a' "$exports_file")" = "600"
+exports_mode="$(file_mode "$exports_file")"
+if [[ "$exports_mode" != "600" ]]; then
+  echo "MySQL runtime environment must have mode 600" >&2
+  exit 1
+fi
 
 readiness="$(run_with_timeout 15 docker compose \
   --env-file "$NOVA_MYSQL_COMPOSE_ENV" \

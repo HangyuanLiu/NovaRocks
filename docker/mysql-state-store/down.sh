@@ -163,8 +163,11 @@ else
   echo "MySQL Docker project is not running; removing stale runtime"
 fi
 
-rm -f "$current_link"
 if [[ -d "$runtime_dir" ]]; then
-  run_with_timeout 30 rm -rf "$runtime_dir"
+  if ! run_with_timeout 30 rm -rf "$runtime_dir"; then
+    echo "failed to remove MySQL host runtime; current link and runtime are retained" >&2
+    exit 1
+  fi
 fi
+rm -f "$current_link"
 echo "Removed MySQL state-store runtime: $runtime_dir"

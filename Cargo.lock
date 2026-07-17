@@ -3217,7 +3217,6 @@ dependencies = [
  "mysql",
  "mysql_async",
  "mysql_common 0.32.4",
- "novarocks-codegen-audit",
  "num-traits",
  "num_cpus",
  "once_cell",
