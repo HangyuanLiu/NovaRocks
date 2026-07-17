@@ -876,9 +876,36 @@ fn main() {
             );
             println!("Press Ctrl-C to stop...");
 
-            // Keep process alive until Ctrl-C or signal
+            // Keep process alive until Ctrl-C, signal, or a supervised service failure.
+            #[cfg(feature = "compat")]
+            let mut compat_service_failure = None;
             while running.load(Ordering::SeqCst) {
+                #[cfg(feature = "compat")]
+                match novarocks::service::grpc_server::poll_grpc_server_failure() {
+                    Ok(Some(failure)) => {
+                        compat_service_failure = Some(failure);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        compat_service_failure =
+                            Some(format!("poll compat grpc supervisor failed: {error}"));
+                        break;
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            #[cfg(feature = "compat")]
+            if compat_service_failure.is_none() {
+                match novarocks::service::grpc_server::poll_grpc_server_failure() {
+                    Ok(Some(failure)) => compat_service_failure = Some(failure),
+                    Ok(None) => {}
+                    Err(error) => {
+                        compat_service_failure =
+                            Some(format!("poll compat grpc supervisor failed: {error}"));
+                    }
+                }
             }
 
             #[cfg(feature = "compat")]
@@ -887,11 +914,23 @@ fn main() {
             novarocks::service::backend_service::stop_backend_service();
             #[cfg(feature = "compat")]
             novarocks::service::heartbeat_service::stop_heartbeat_server();
-            novarocks::service::grpc_server::stop_grpc_server();
+            let grpc_stop_result = novarocks::service::grpc_server::stop_grpc_server();
             novarocks::service::report_worker::stop();
 
             // Cleanup: remove pid file
             let _ = fs::remove_file(pid_file);
+            #[cfg(feature = "compat")]
+            {
+                let mut failures = compat_service_failure.into_iter().collect::<Vec<_>>();
+                if let Err(error) = grpc_stop_result {
+                    failures.push(format!("stop grpc server failed: {error}"));
+                }
+                if !failures.is_empty() {
+                    panic!("compatibility BE service failure: {}", failures.join("; "));
+                }
+            }
+            #[cfg(not(feature = "compat"))]
+            grpc_stop_result.expect("stop grpc server");
             println!("novarocksd stopped");
         }
         "stop" => match read_pid_file(pid_file) {

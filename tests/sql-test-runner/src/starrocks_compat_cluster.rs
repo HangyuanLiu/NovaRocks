@@ -24,6 +24,8 @@ use mysql::{Conn as MysqlConn, OptsBuilder};
 use std::fs;
 use std::net::TcpListener;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -504,10 +506,13 @@ fn wait_for_fe_mysql(
                 )
                 .map(|_| ())
         },
-        |io_timeout| {
-            let mut connection =
-                MysqlConn::new(mysql_options(user, password, query_port, io_timeout))
-                    .context("connect and authenticate StarRocks FE MySQL")?;
+        |connect_timeout| {
+            MysqlConn::new(mysql_options(user, password, query_port, connect_timeout))
+                .context("connect and authenticate StarRocks FE MySQL")
+        },
+        |connection, select_timeout| {
+            set_mysql_connection_io_timeout(connection, select_timeout)
+                .context("apply remaining deadline to StarRocks FE MySQL SELECT 1")?;
             connection
                 .query_drop("SELECT 1")
                 .context("execute StarRocks FE MySQL health check SELECT 1")
@@ -517,29 +522,120 @@ fn wait_for_fe_mysql(
     .with_context(|| format!("StarRocks FE MySQL did not become ready at 127.0.0.1:{query_port}"))
 }
 
-fn wait_for_fe_mysql_with<H, Q, S>(
+#[cfg(unix)]
+fn set_mysql_connection_io_timeout(connection: &MysqlConn, timeout: Duration) -> Result<()> {
+    let seconds = timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t;
+    let mut microseconds = timeout.subsec_micros() as libc::suseconds_t;
+    if seconds == 0 && microseconds == 0 {
+        microseconds = 1;
+    }
+    let value = libc::timeval {
+        tv_sec: seconds,
+        tv_usec: microseconds,
+    };
+    let value_ptr = std::ptr::from_ref(&value).cast::<libc::c_void>();
+    let value_len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `connection` owns a live TCP socket for the duration of this call, and
+        // `value_ptr` references a correctly sized `timeval`.
+        let result = unsafe {
+            libc::setsockopt(
+                connection.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                value_ptr,
+                value_len,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("set MySQL socket I/O timeout");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mysql_connection_io_timeout(_connection: &MysqlConn, _timeout: Duration) -> Result<()> {
+    bail!("StarRocks compatibility MySQL deadline enforcement requires a Unix TCP socket")
+}
+
+fn wait_for_fe_mysql_with<C, H, N, Q, S>(
     timeout: Duration,
-    mut process_health: H,
-    mut connect_and_select: Q,
-    mut sleep: S,
+    process_health: H,
+    connect: N,
+    select: Q,
+    sleep: S,
 ) -> Result<()>
 where
     H: FnMut() -> Result<()>,
-    Q: FnMut(Duration) -> Result<()>,
+    N: FnMut(Duration) -> Result<C>,
+    Q: FnMut(&mut C, Duration) -> Result<()>,
     S: FnMut(Duration),
 {
-    let deadline = Instant::now() + timeout;
+    wait_for_fe_mysql_with_clock(
+        Instant::now() + timeout,
+        process_health,
+        connect,
+        select,
+        sleep,
+        Instant::now,
+    )
+}
+
+fn wait_for_fe_mysql_with_clock<C, H, N, Q, S, T>(
+    deadline: Instant,
+    mut process_health: H,
+    mut connect: N,
+    mut select: Q,
+    mut sleep: S,
+    mut now: T,
+) -> Result<()>
+where
+    H: FnMut() -> Result<()>,
+    N: FnMut(Duration) -> Result<C>,
+    Q: FnMut(&mut C, Duration) -> Result<()>,
+    S: FnMut(Duration),
+    T: FnMut() -> Instant,
+{
     loop {
+        if now() >= deadline {
+            bail!("timed out waiting for MySQL connect plus SELECT 1 before starting I/O")
+        }
         process_health()?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let io_timeout = remaining
-            .min(Duration::from_secs(2))
-            .max(Duration::from_millis(1));
-        match connect_and_select(io_timeout) {
+        let before_connect = now();
+        if before_connect >= deadline {
+            bail!("timed out waiting for MySQL connect plus SELECT 1 before connect")
+        }
+        let connect_budget = deadline
+            .duration_since(before_connect)
+            .min(Duration::from_secs(2));
+        let attempt = match connect(connect_budget) {
+            Ok(mut connection) => {
+                let before_select = now();
+                if before_select >= deadline {
+                    Err(anyhow::anyhow!(
+                        "MySQL connect completed at the absolute deadline before SELECT 1"
+                    ))
+                } else {
+                    let select_budget = deadline
+                        .duration_since(before_select)
+                        .min(Duration::from_secs(2));
+                    select(&mut connection, select_budget)
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match attempt {
             Ok(()) => return Ok(()),
-            Err(_) if Instant::now() < deadline => sleep(POLL_INTERVAL.min(remaining)),
             Err(error) => {
-                bail!("timed out waiting for MySQL connect plus SELECT 1: {error:#}")
+                let before_sleep = now();
+                if before_sleep >= deadline {
+                    bail!("timed out waiting for MySQL connect plus SELECT 1: {error:#}")
+                }
+                let sleep_budget = POLL_INTERVAL.min(deadline.duration_since(before_sleep));
+                if !sleep_budget.is_zero() {
+                    sleep(sleep_budget);
+                }
             }
         }
     }
@@ -949,6 +1045,7 @@ impl Drop for StarRocksCompatServerHandle {
 mod tests {
     use super::*;
     use crate::managed_process::ReadyMarker;
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1356,7 +1453,8 @@ query_port = 9030
                 health_checks += 1;
                 Ok(())
             },
-            |_| {
+            |_| Ok(()),
+            |_, _| {
                 mysql_attempts += 1;
                 if mysql_attempts == 1 {
                     bail!("transient SELECT 1 failure");
@@ -1368,5 +1466,34 @@ query_port = 9030
         .expect("transient MySQL health failure must be retried");
         assert_eq!(mysql_attempts, 2);
         assert_eq!(health_checks, 2);
+    }
+
+    #[test]
+    fn fe_mysql_connect_and_select_share_one_absolute_deadline() {
+        let base = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let select_budget = Cell::new(None);
+
+        let error = wait_for_fe_mysql_with_clock(
+            base + Duration::from_millis(100),
+            || Ok(()),
+            |connect_budget| {
+                assert_eq!(connect_budget, Duration::from_millis(100));
+                elapsed.set(elapsed.get() + Duration::from_millis(70));
+                Ok(())
+            },
+            |_, budget| {
+                select_budget.set(Some(budget));
+                elapsed.set(elapsed.get() + budget);
+                bail!("SELECT 1 remained blocked until its I/O budget expired")
+            },
+            |_| panic!("an expired absolute deadline must not sleep before returning"),
+            || base + elapsed.get(),
+        )
+        .expect_err("SELECT 1 must fail at the shared absolute deadline");
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert_eq!(select_budget.get(), Some(Duration::from_millis(30)));
+        assert_eq!(elapsed.get(), Duration::from_millis(100));
     }
 }
