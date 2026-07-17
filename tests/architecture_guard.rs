@@ -46443,14 +46443,6 @@ fn pbf_1a_visibility_is_pub_crate(visibility: &syn::Visibility) -> bool {
     )
 }
 
-fn pbf_1a_visibility_is_private(visibility: &syn::Visibility) -> bool {
-    matches!(visibility, syn::Visibility::Inherited)
-        || matches!(
-            visibility,
-            syn::Visibility::Restricted(restricted) if restricted.path.is_ident("self")
-        )
-}
-
 fn pbf_1a_expected_vocabulary_owner(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "ProtocolFamily"
@@ -46480,6 +46472,82 @@ fn pbf_1a_path_starts_with(path: &[String], expected: &[&str]) -> bool {
             .iter()
             .zip(expected)
             .all(|(actual, expected)| actual == expected)
+}
+
+#[derive(Debug)]
+struct Pbf1aUseBinding {
+    target: Vec<String>,
+    local: Option<String>,
+    glob: bool,
+}
+
+fn pbf_1a_collect_use_bindings(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    bindings: &mut Vec<Pbf1aUseBinding>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            pbf_1a_collect_use_bindings(&path.tree, prefix, bindings);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let mut target = prefix.clone();
+            target.push(name.ident.to_string());
+            bindings.push(Pbf1aUseBinding {
+                local: Some(name.ident.to_string()),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut target = prefix.clone();
+            target.push(rename.ident.to_string());
+            bindings.push(Pbf1aUseBinding {
+                local: Some(rename.rename.to_string()),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Glob(_) => {
+            let mut target = prefix.clone();
+            target.push("*".to_string());
+            bindings.push(Pbf1aUseBinding {
+                local: None,
+                target,
+                glob: true,
+            });
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                pbf_1a_collect_use_bindings(tree, prefix, bindings);
+            }
+        }
+    }
+}
+
+fn pbf_1a_path_is_expected_owner_glob(path: &[String]) -> bool {
+    path.last().is_some_and(|segment| segment == "*")
+        && [
+            &["crate", "protocol", "common", "error"][..],
+            &["crate", "exec", "fragment", "error"][..],
+            &["crate", "runtime", "fragment", "error"][..],
+        ]
+        .iter()
+        .any(|owner| {
+            path.len() == owner.len() + 1
+                && path
+                    .iter()
+                    .zip(owner.iter())
+                    .all(|(actual, expected)| actual == expected)
+        })
+}
+
+fn pbf_1a_path_is_expected_vocabulary(path: &[String], local: &str) -> bool {
+    pbf_1a_expected_vocabulary_owner(local).is_some_and(|owner| {
+        pbf_1a_path_starts_with(path, owner) && path.last().is_some_and(|target| target == local)
+    })
 }
 
 fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &str) -> Vec<String> {
@@ -46528,12 +46596,28 @@ fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &s
             ));
         }
     }
+    let mut bindings = Vec::new();
     for item in &file.items {
-        if let syn::Item::Use(import) = item
-            && !pbf_1a_visibility_is_private(&import.vis)
+        if let syn::Item::Use(import) = item {
+            pbf_1a_collect_use_bindings(&import.tree, &mut Vec::new(), &mut bindings);
+        }
+    }
+    for binding in bindings {
+        let target = rust_canonical_use_segments(&binding.target.join("::"), source_rel)
+            .unwrap_or(binding.target);
+        if binding.glob && !pbf_1a_path_is_expected_owner_glob(&target) {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` imports a fail-closed legacy glob `{}`",
+                target.join("::")
+            ));
+        }
+        if let Some(local) = binding.local
+            && pbf_1a_expected_vocabulary_owner(&local).is_some()
+            && !pbf_1a_path_is_expected_vocabulary(&target, &local)
         {
             violations.push(format!(
-                "PBF-1A module owner `{source_rel}` must not contain an outward re-export"
+                "PBF-1A module owner `{source_rel}` binds protected vocabulary `{local}` from wrong owner `{}`",
+                target.join("::")
             ));
         }
     }
@@ -46793,14 +46877,14 @@ fn pbf_1a_module_owner_detector_requires_external_top_level_pub_crate_modules() 
 
     let child_reexport = pbf_1a_module_contract_violations(
         "src/protocol/common/mod.rs",
-        "pub(crate) mod error; pub(crate) use legacy::error;",
+        "pub(crate) mod error; pub(crate) use crate::common::error::ProtocolError;",
         "error",
     );
     assert!(
         child_reexport
             .iter()
-            .any(|violation| violation.contains("re-export")),
-        "protected child re-export must be diagnosed: {child_reexport:?}"
+            .any(|violation| violation.contains("wrong owner")),
+        "protected child vocabulary from a legacy owner must be diagnosed: {child_reexport:?}"
     );
 }
 
@@ -46809,6 +46893,7 @@ fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports(
     for allowed in [
         "pub(crate) mod common; use std::fmt;",
         "pub(crate) mod common; pub(self) use std::error::Error;",
+        "pub(crate) mod common; pub(crate) use std::fmt::Debug;",
     ] {
         let violations =
             pbf_1a_module_contract_violations("src/protocol/mod.rs", allowed, "common");
@@ -46844,14 +46929,38 @@ fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports(
 
     let legacy_reexport = pbf_1a_module_contract_violations(
         "src/protocol/mod.rs",
-        "pub(crate) mod common; pub(crate) use crate::common::error::LegacyProtocolError;",
+        "pub(crate) mod common; pub(crate) use crate::common::error::ProtocolError;",
         "common",
     );
     assert!(
         legacy_reexport
             .iter()
-            .any(|violation| violation.contains("outward re-export")),
+            .any(|violation| violation.contains("legacy owner")),
         "outward legacy-owner re-exports must fail: {legacy_reexport:?}"
+    );
+
+    let renamed_vocabulary = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::Legacy as ProtocolError;",
+        "common",
+    );
+    assert!(
+        renamed_vocabulary
+            .iter()
+            .any(|violation| violation.contains("binds protected vocabulary `ProtocolError`")),
+        "renaming a legacy target as protected vocabulary must fail: {renamed_vocabulary:?}"
+    );
+
+    let legacy_glob = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::*;",
+        "common",
+    );
+    assert!(
+        legacy_glob
+            .iter()
+            .any(|violation| violation.contains("legacy glob")),
+        "a private legacy-owner glob must fail closed: {legacy_glob:?}"
     );
 }
 
