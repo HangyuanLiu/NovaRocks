@@ -39,9 +39,17 @@ through the sole database owner, removes any prior readiness database owned by
 the same worktree, and verifies real SQL readiness. `status.sh` repeats the SQL
 checks. While the Compose project is running, `down.sh` retains its backing
 runtime so the container cannot lose its generated secrets or configuration.
-`down.sh --docker` stops the derived worktree Compose project and then removes
-the runtime; both forms derive the project identity and are safe before prepare
-or after a partial startup.
+`down.sh --docker` stops the derived worktree Compose project, runs the
+profile-only root cleaner against only the `/var/lib/mysql` bind mount, removes
+any Compose resources created by that cleanup run, and only then removes the
+host runtime. The cleaner has no network, ports, secrets, or access to the rest
+of the runtime. Every Docker phase is bounded; any inspect, stop, cleaner, or
+final cleanup failure retains the current link and runtime for a safe retry.
+Both forms derive the project identity and are safe before prepare or after a
+partial startup. The cleaner is skipped when no data directory exists, so
+cleanup before prepare cannot create a bind-mount source as root. Default
+`down.sh` never removes a runtime containing MySQL data, even after the project
+has stopped; use `down.sh --docker` for that ownership-aware cleanup.
 
 Tests that mutate schema or coordinate multiple processes must request a unique
 database:

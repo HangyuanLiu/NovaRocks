@@ -125,13 +125,39 @@ if ! running_ids="$(project_running)"; then
 fi
 
 if [[ "$stop_docker" == true ]]; then
-  run_with_timeout 90 docker compose \
+  if ! run_with_timeout 90 docker compose \
     --env-file "$compose_env" \
     -p "$compose_project" \
     -f "$compose_file" \
-    down --remove-orphans
+    down --remove-orphans; then
+    echo "failed to stop MySQL Compose project; runtime is retained" >&2
+    exit 1
+  fi
+  if [[ -d "$runtime_dir/data" ]]; then
+    if ! run_with_timeout 90 docker compose \
+      --profile cleanup \
+      --env-file "$compose_env" \
+      -p "$compose_project" \
+      -f "$compose_file" \
+      run --rm --no-deps runtime-cleaner; then
+      echo "failed to clean MySQL container-owned runtime data; runtime is retained" >&2
+      exit 1
+    fi
+    if ! run_with_timeout 90 docker compose \
+      --profile cleanup \
+      --env-file "$compose_env" \
+      -p "$compose_project" \
+      -f "$compose_file" \
+      down --remove-orphans; then
+      echo "failed to remove MySQL cleanup project resources; runtime is retained" >&2
+      exit 1
+    fi
+  fi
 elif [[ -n "$running_ids" ]]; then
   echo "MySQL Docker project is running; backing runtime is retained: $compose_project"
+  exit 0
+elif [[ -d "$runtime_dir/data" ]]; then
+  echo "MySQL runtime data requires --docker cleanup; backing runtime is retained: $runtime_dir"
   exit 0
 else
   echo "MySQL Docker project is not running; removing stale runtime"
