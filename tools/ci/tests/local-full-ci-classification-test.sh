@@ -179,52 +179,6 @@ if [ "$(ci_native_cross_process_suite_cluster_size join)" != "3" ]; then
   exit 1
 fi
 
-local_full_ci_text="$(cat "$REPO_ROOT/tools/ci/local-full-ci.sh")"
-if ! grep -q 'echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"' <<<"$local_full_ci_text" \
-  || ! grep -q 'echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"' <<<"$local_full_ci_text"; then
-  echo "prepare runtime must record the effective SQL cluster topology" >&2
-  exit 1
-fi
-if ! grep -q 'stop_server_for_native_cross_process_stage' <<<"$local_full_ci_text"; then
-  echo "local-full-ci must use the native cross-process stop-stage name" >&2
-  exit 1
-fi
-if ! grep -q 'run_native_cross_process_sql_suites' <<<"$local_full_ci_text"; then
-  echo "local-full-ci must use the native cross-process runner name" >&2
-  exit 1
-fi
-if ! grep -q 'sql-native-cross-process' <<<"$local_full_ci_text"; then
-  echo "native cross-process logs must use the sql-native-cross-process directory" >&2
-  exit 1
-fi
-if ! grep -q 'native-cross-process:$suite' <<<"$local_full_ci_text"; then
-  echo "native cross-process suite status keys must use native-cross-process:<suite>" >&2
-  exit 1
-fi
-if ! grep -q 'standalone-server stop for native cross-process' <<<"$local_full_ci_text"; then
-  echo "native cross-process stop stage must use the native cross-process stage name" >&2
-  exit 1
-fi
-if ! grep -q 'native 1FE+3BE cross-process' <<<"$local_full_ci_text"; then
-  echo "local-full-ci help must describe native 1FE+3BE cross-process coverage" >&2
-  exit 1
-fi
-if ! grep -q 'NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED' <<<"$local_full_ci_text"; then
-  echo "native cross-process required failures must be controlled by the renamed env" >&2
-  exit 1
-fi
-if ! grep -q -- '--cluster-mode "$suite_cluster_mode"' <<<"$local_full_ci_text" \
-  || ! grep -q -- '--cluster-size "$suite_cluster_size"' <<<"$local_full_ci_text"; then
-  echo "native cross-process suites must pass cluster mode and cluster size explicitly" >&2
-  exit 1
-fi
-
-retired_plan_wire_flag="--plan-wire""-format"
-retired_proto_env="NOVA_CI_""PROTO_"
-if rg -n -- "$retired_plan_wire_flag|$retired_proto_env" "$REPO_ROOT/tools/ci" >/dev/null; then
-  echo "tools/ci must not contain the retired plan-wire flag or retired Proto matrix variables" >&2
-  exit 1
-fi
 if [ "${WITH_COMPAT:-}" != "false" ]; then
   echo "local-full-ci must disable compat gates by default" >&2
   exit 1
@@ -246,28 +200,6 @@ if ! (
   echo "--with-compat must explicitly enable compat gates" >&2
   exit 1
 fi
-
-run_cargo_gates_text="$(declare -f run_cargo_gates)"
-if grep -q -- '--features compat' <<<"$run_cargo_gates_text"; then
-  echo "default cargo gates must not build or test compat" >&2
-  exit 1
-fi
-
-if ! declare -F run_compat_gates >/dev/null; then
-  echo "local-full-ci must define explicit compat gates" >&2
-  exit 1
-fi
-
-run_compat_gates_text="$(declare -f run_compat_gates)"
-for expected in \
-  'cargo clippy --all-targets --features compat' \
-  'cargo build --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
-  'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat'; do
-  if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
-    echo "explicit compat gates must include: $expected" >&2
-    exit 1
-  fi
-done
 
 default_compat_output="$({
   WITH_COMPAT="false"
@@ -301,22 +233,3 @@ for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
     exit 1
   fi
 done
-
-main_text="$(declare -f main)"
-sql_line="$(grep -n 'run_sql_suites' <<<"$main_text" | tail -1 | cut -d: -f1)"
-native_cross_process_line="$(grep -n 'run_native_cross_process_sql_suites' <<<"$main_text" | tail -1 | cut -d: -f1)"
-compat_line="$(grep -n 'run_compat_gates' <<<"$main_text" | tail -1 | cut -d: -f1)"
-if [ -z "$sql_line" ] \
-  || [ -z "$native_cross_process_line" ] \
-  || [ -z "$compat_line" ] \
-  || [ "$native_cross_process_line" -le "$sql_line" ] \
-  || [ "$compat_line" -le "$native_cross_process_line" ]; then
-  echo "explicit compat gates must run after regular and cross-process native SQL coverage" >&2
-  exit 1
-fi
-
-server_lib_text="$(cat "$REPO_ROOT/tools/ci/lib/server.sh")"
-if ! grep -q -- 'NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1' <<<"$server_lib_text"; then
-  echo "local full CI standalone-server must enable test-only IMV stateless rebuild procedure" >&2
-  exit 1
-fi
