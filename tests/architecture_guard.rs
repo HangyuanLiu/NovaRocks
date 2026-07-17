@@ -46481,6 +46481,12 @@ struct Pbf1aUseBinding {
     glob: bool,
 }
 
+fn pbf_1a_ident_text(ident: &syn::Ident) -> String {
+    use syn::ext::IdentExt;
+
+    ident.unraw().to_string()
+}
+
 fn pbf_1a_collect_use_bindings(
     tree: &syn::UseTree,
     prefix: &mut Vec<String>,
@@ -46488,24 +46494,25 @@ fn pbf_1a_collect_use_bindings(
 ) {
     match tree {
         syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(pbf_1a_ident_text(&path.ident));
             pbf_1a_collect_use_bindings(&path.tree, prefix, bindings);
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
             let mut target = prefix.clone();
-            target.push(name.ident.to_string());
+            let ident = pbf_1a_ident_text(&name.ident);
+            target.push(ident.clone());
             bindings.push(Pbf1aUseBinding {
-                local: Some(name.ident.to_string()),
+                local: Some(ident),
                 target,
                 glob: false,
             });
         }
         syn::UseTree::Rename(rename) => {
             let mut target = prefix.clone();
-            target.push(rename.ident.to_string());
+            target.push(pbf_1a_ident_text(&rename.ident));
             bindings.push(Pbf1aUseBinding {
-                local: Some(rename.rename.to_string()),
+                local: Some(pbf_1a_ident_text(&rename.rename)),
                 target,
                 glob: false,
             });
@@ -46949,6 +46956,18 @@ fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports(
             .iter()
             .any(|violation| violation.contains("binds protected vocabulary `ProtocolError`")),
         "renaming a legacy target as protected vocabulary must fail: {renamed_vocabulary:?}"
+    );
+
+    let raw_renamed_vocabulary = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::Legacy as r#ProtocolError;",
+        "common",
+    );
+    assert!(
+        raw_renamed_vocabulary
+            .iter()
+            .any(|violation| violation.contains("binds protected vocabulary `ProtocolError`")),
+        "raw identifiers must not bypass protected vocabulary bindings: {raw_renamed_vocabulary:?}"
     );
 
     let legacy_glob = pbf_1a_module_contract_violations(
