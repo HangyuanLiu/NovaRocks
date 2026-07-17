@@ -46435,6 +46435,162 @@ fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static 
     }
 }
 
+fn pbf_1a_visibility_is_pub_crate(visibility: &syn::Visibility) -> bool {
+    matches!(
+        visibility,
+        syn::Visibility::Restricted(restricted)
+            if restricted.in_token.is_none() && restricted.path.is_ident("crate")
+    )
+}
+
+fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &str) -> Vec<String> {
+    let mut file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A module owner `{source_rel}` must parse: {error}"
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A module owner `{source_rel}` has cfg-dependent ownership that cannot be proven"
+        )];
+    }
+    let mut violations = Vec::new();
+    let declarations = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) if module.ident == protected => Some(module),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if declarations.len() != 1 {
+        violations.push(format!(
+            "PBF-1A module owner `{source_rel}` must declare exactly one top-level `{protected}` module; found {}",
+            declarations.len()
+        ));
+    }
+    for declaration in declarations {
+        if declaration.content.is_some() {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must declare `{protected}` as an external module"
+            ));
+        }
+        if !pbf_1a_visibility_is_pub_crate(&declaration.vis) {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must declare `{protected}` with exact pub(crate) visibility"
+            ));
+        }
+        if !declaration.attrs.is_empty() {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must not decorate `{protected}` with attributes"
+            ));
+        }
+    }
+    for item in &file.items {
+        if let syn::Item::Use(import) = item
+            && !matches!(import.vis, syn::Visibility::Inherited)
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must not contain production re-exports"
+            ));
+        }
+    }
+    violations
+}
+
+fn pbf_1a_meta_contains_path(meta: &syn::Meta) -> Result<bool, syn::Error> {
+    match meta {
+        syn::Meta::Path(path) => Ok(path.is_ident("path")),
+        syn::Meta::NameValue(name_value) => Ok(name_value.path.is_ident("path")),
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            use syn::parse::Parser;
+
+            let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())?;
+            for meta in nested.iter().skip(1) {
+                if pbf_1a_meta_contains_path(meta)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        syn::Meta::List(_) => Ok(false),
+    }
+}
+
+fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct IndirectionAudit {
+        findings: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for IndirectionAudit {
+        fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+            match pbf_1a_meta_contains_path(&attribute.meta) {
+                Ok(true) => self.findings.push("path attribute".to_string()),
+                Ok(false) => {}
+                Err(error) => self
+                    .findings
+                    .push(format!("unparseable attribute metadata: {error}")),
+            }
+            syn::visit::visit_attribute(self, attribute);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.is_ident("include") {
+                self.findings.push("include! macro".to_string());
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    let mut file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A owner `{source_rel}` must parse before source-indirection audit: {error}"
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A owner `{source_rel}` has cfg-dependent source ownership that cannot be proven"
+        )];
+    }
+    let mut audit = IndirectionAudit::default();
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit
+        .findings
+        .into_iter()
+        .map(|finding| format!("PBF-1A owner `{source_rel}` has forbidden {finding}"))
+        .collect()
+}
+
+fn pbf_1a_read_source_inventory(
+    repo: &Path,
+    paths: &[PathBuf],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut sources = Vec::new();
+    let mut violations = Vec::new();
+    for path in paths {
+        let source_rel = path
+            .strip_prefix(repo)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        match fs::read_to_string(path) {
+            Ok(source) => sources.push((source_rel, source)),
+            Err(error) => violations.push(format!(
+                "PBF-1A production inventory source `{source_rel}` is unreadable: {error}"
+            )),
+        }
+    }
+    (sources, violations)
+}
+
 fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
     let mut violations = Vec::new();
     let mut owner_sources = Vec::new();
@@ -46457,11 +46613,7 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
         if let Err(error) = syn::parse_file(&owner) {
             violations.push(format!("PBF-1A owner `{owner_rel}` must parse: {error}"));
         }
-        if rfd4_m2a_has_forbidden_source_indirection(&production) {
-            violations.push(format!(
-                "PBF-1A owner `{owner_rel}` must not use #[path] or include! source indirection"
-            ));
-        }
+        violations.extend(pbf_1a_source_indirection_violations(owner_rel, &owner));
         violations.extend(
             production_crate_self_alias_violations(owner_rel, &owner)
                 .into_iter()
@@ -46484,18 +46636,12 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
         let parent_path = repo.join(parent_rel);
         match fs::read_to_string(&parent_path) {
             Ok(parent) => {
-                if !rust_module_item_declarations(&parent).contains(module) {
-                    violations.push(format!(
-                        "PBF-1A module `{module}` is missing from `{parent_rel}`"
-                    ));
-                }
-                if rfd4_m2a_has_forbidden_source_indirection(&rust_sanitized_production_text(
-                    &parent,
-                )) {
-                    violations.push(format!(
-                        "PBF-1A parent `{parent_rel}` must not use #[path] or include! source indirection"
-                    ));
-                }
+                violations.extend(pbf_1a_module_contract_violations(
+                    parent_rel,
+                    parent.as_str(),
+                    module,
+                ));
+                violations.extend(pbf_1a_source_indirection_violations(parent_rel, &parent));
             }
             Err(error) => violations.push(format!(
                 "PBF-1A parent module `{parent_rel}` is unreadable: {error}"
@@ -46508,20 +46654,11 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
             .join("mod.rs");
         match fs::read_to_string(&child_rel) {
             Ok(child) => {
-                if !rust_module_item_declarations(&child).contains("error") {
-                    violations.push(format!(
-                        "PBF-1A module `error` is missing from `{}`",
-                        child_rel.strip_prefix(repo).unwrap().display()
-                    ));
-                }
-                if rfd4_m2a_has_forbidden_source_indirection(&rust_sanitized_production_text(
-                    &child,
-                )) {
-                    violations.push(format!(
-                        "PBF-1A child module `{}` must not use #[path] or include! source indirection",
-                        child_rel.strip_prefix(repo).unwrap().display()
-                    ));
-                }
+                let child_rel = child_rel.strip_prefix(repo).unwrap().to_string_lossy();
+                violations.extend(pbf_1a_module_contract_violations(
+                    &child_rel, &child, "error",
+                ));
+                violations.extend(pbf_1a_source_indirection_violations(&child_rel, &child));
             }
             Err(error) => violations.push(format!(
                 "PBF-1A child module `{}` is unreadable: {error}",
@@ -46530,17 +46667,17 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
         }
     }
 
-    let production_sources = rs_files(&repo.join("src"))
-        .into_iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .collect::<Vec<_>>();
+    let production_paths = rs_files(&repo.join("src"));
+    let (production_sources, inventory_violations) =
+        pbf_1a_read_source_inventory(repo, &production_paths);
+    violations.extend(inventory_violations);
     if production_sources.is_empty() {
         violations.push("PBF-1A production source inventory is empty".to_string());
     }
     for name in PBF_1A_TOP_LEVEL_ERRORS {
         let count = production_sources
             .iter()
-            .map(|source| rust_named_type_declaration_count(source, name))
+            .map(|(_, source)| rust_named_type_declaration_count(source, name))
             .sum::<usize>();
         if count != 1 {
             violations.push(format!(
@@ -46563,6 +46700,96 @@ fn pbf_1a_fragment_error_vocabulary_has_layered_owners() {
         "PBF-1A fragment error vocabulary must keep layered, unique, fail-closed owners:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn pbf_1a_module_owner_detector_requires_external_top_level_pub_crate_modules() {
+    for invalid in [
+        "pub(crate) mod common {}",
+        "mod nested { pub(crate) mod common; }",
+        "pub mod common;",
+        "pub(in crate) mod common;",
+        "pub(crate) use legacy::common;",
+        "pub(crate) use legacy::*;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/mod.rs", invalid, "common");
+        assert!(
+            !violations.is_empty(),
+            "inline, nested, wrongly-visible, or re-exported module must fail: {invalid}"
+        );
+    }
+    assert!(
+        pbf_1a_module_contract_violations(
+            "src/protocol/mod.rs",
+            "pub(crate) mod common; pub(crate) mod native;",
+            "common",
+        )
+        .is_empty(),
+        "one top-level external pub(crate) declaration must pass"
+    );
+
+    let child_reexport = pbf_1a_module_contract_violations(
+        "src/protocol/common/mod.rs",
+        "pub(crate) mod error; pub(crate) use legacy::error;",
+        "error",
+    );
+    assert!(
+        child_reexport
+            .iter()
+            .any(|violation| violation.contains("re-export")),
+        "protected child re-export must be diagnosed: {child_reexport:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_inventory_reader_fails_closed_on_unreadable_source() {
+    let root = std::env::temp_dir().join(format!(
+        "pbf_1a_inventory_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let missing = root.join("src/missing.rs");
+    let (sources, violations) = pbf_1a_read_source_inventory(&root, &[missing]);
+    assert!(sources.is_empty());
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("src/missing.rs")
+                && violation.contains("unreadable")),
+        "an unreadable inventory entry must be a violation: {violations:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_source_indirection_detector_is_syn_aware() {
+    let safe = r#"
+fn render() {
+    let path = "safe.rs";
+    let include = "diagnostic text";
+    let _ = (path, include);
+}
+"#;
+    let safe_violations =
+        pbf_1a_source_indirection_violations("src/protocol/common/error.rs", safe);
+    assert!(
+        safe_violations.is_empty(),
+        "ordinary identifiers named path/include must remain valid: {safe_violations:?}"
+    );
+
+    for invalid in [
+        "#[path = \"legacy.rs\"] mod error;",
+        "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
+        "include!(\"legacy.rs\");",
+        "const _: () = { include![\"legacy.rs\"] };",
+    ] {
+        let violations =
+            pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
+        assert!(
+            !violations.is_empty(),
+            "real source indirection must fail: {invalid}"
+        );
+    }
 }
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]

@@ -237,6 +237,57 @@ mod tests {
             path.to_string(),
             "plan_fragment.root.children[2].assignments[\"scan\\\"owner\"]"
         );
+        assert_eq!(
+            path.segments(),
+            &[
+                FieldPathSegment::Field("plan_fragment"),
+                FieldPathSegment::Field("root"),
+                FieldPathSegment::Field("children"),
+                FieldPathSegment::Index(2),
+                FieldPathSegment::Field("assignments"),
+                FieldPathSegment::MapKey("scan\"owner".to_string()),
+            ]
+        );
+
+        let escaped = FieldPath::root("root").map_key("slash\\line\n\t\u{7}");
+        assert_eq!(escaped.to_string(), "root[\"slash\\\\line\\n\\t\\u{7}\"]");
+    }
+
+    #[test]
+    fn protocol_vocabulary_labels_are_stable() {
+        for (family, expected) in [
+            (ProtocolFamily::Native, "native"),
+            (ProtocolFamily::StarRocks, "starrocks"),
+        ] {
+            assert_eq!(family.to_string(), expected);
+        }
+        for (kind, expected) in [
+            (
+                TransportDecodeErrorKind::MalformedPayload,
+                "malformed payload",
+            ),
+            (
+                TransportDecodeErrorKind::TruncatedPayload,
+                "truncated payload",
+            ),
+            (
+                TransportDecodeErrorKind::UnsupportedEncoding,
+                "unsupported encoding",
+            ),
+        ] {
+            assert_eq!(kind.to_string(), expected);
+        }
+        for (kind, expected) in [
+            (ProtocolErrorKind::MissingField, "missing field"),
+            (ProtocolErrorKind::InvalidEnum, "invalid enum"),
+            (ProtocolErrorKind::InvalidValue, "invalid value"),
+            (ProtocolErrorKind::OutOfRange, "out of range"),
+            (ProtocolErrorKind::DuplicateField, "duplicate field"),
+            (ProtocolErrorKind::InconsistentFields, "inconsistent fields"),
+            (ProtocolErrorKind::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(kind.to_string(), expected);
+        }
     }
 
     #[test]
