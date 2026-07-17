@@ -26,7 +26,9 @@ use super::common::{check_exact_arity, concat_layouts, proto_join_type};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType};
+use crate::exec::node::join::{
+    JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::types::wider_type;
@@ -98,7 +100,7 @@ pub(super) fn lower_hash_join_node(
         .map(|expr| lower_proto_expr(expr, arena, &join_layout))
         .transpose()
         .map_err(|err| format!("HashJoinNode other_condition: {err}"))?;
-    let runtime_filters = lower_join_runtime_filters(
+    validate_join_runtime_filter_intents(
         join,
         RuntimeFilterLoweringInput {
             join_type,
@@ -135,7 +137,9 @@ pub(super) fn lower_hash_join_node(
                 build_keys,
                 eq_null_safe,
                 residual_predicate,
-                runtime_filters,
+                runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                    producers: Vec::new(),
+                },
             }),
         },
         layout: join_layout,
@@ -200,14 +204,13 @@ struct RuntimeFilterLoweringInput<'a> {
     arena: &'a mut ExprArena,
 }
 
-fn lower_join_runtime_filters(
+fn validate_join_runtime_filter_intents(
     join: &plan::HashJoinNode,
     input: RuntimeFilterLoweringInput<'_>,
-) -> Result<Vec<JoinRuntimeFilterSpec>, String> {
+) -> Result<(), String> {
     if !is_runtime_filter_safe_join_type(input.join_type) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut runtime_filters = Vec::new();
     for rf in &join.build_runtime_filters {
         let expr_order = rf.expr_order as usize;
         if expr_order >= input.probe_keys.len() || expr_order >= input.build_keys.len() {
@@ -225,35 +228,8 @@ fn lower_join_runtime_filters(
             input.raw_build_keys[expr_order],
             input.arena,
         )?;
-        if join
-            .eq_conditions
-            .get(expr_order)
-            .map(|cond| cond.null_safe)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let build_data_type = input
-            .arena
-            .data_type(input.build_keys[expr_order])
-            .ok_or_else(|| format!("runtime filter {} build key type missing", rf.filter_id))?
-            .clone();
-        let Some(ExprNode::SlotId(probe_slot_id)) = input.arena.node(input.probe_keys[expr_order])
-        else {
-            continue;
-        };
-        runtime_filters.push(JoinRuntimeFilterSpec {
-            filter_id: rf.filter_id,
-            expr_order,
-            probe_expr_id: input.probe_keys[expr_order],
-            build_expr_id: input.build_keys[expr_order],
-            probe_slot_id: *probe_slot_id,
-            build_data_type,
-            merge_nodes: Vec::new(),
-            has_remote_targets: false,
-        });
     }
-    Ok(runtime_filters)
+    Ok(())
 }
 
 fn is_runtime_filter_safe_join_type(join_type: JoinType) -> bool {
@@ -529,6 +505,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
+    use crate::exec::node::join::JoinRuntimeFilterExecution;
     use crate::proto::plan;
 
     #[test]
@@ -657,7 +634,10 @@ mod tests {
         let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("expected Join");
         };
-        assert!(join.runtime_filters.is_empty());
+        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
+            panic!("native runtime-filter execution")
+        };
+        assert!(producers.is_empty());
 
         let mismatched_probe = physical_node(
             31,

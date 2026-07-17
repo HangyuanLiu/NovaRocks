@@ -266,12 +266,21 @@ pub struct AggregateProcessorFactory {
     output_intermediate: bool,
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
-    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    runtime_filter_execution: AggregateRuntimeFilterExecution,
+}
+
+#[derive(Clone)]
+enum AggregateRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        topn_specs: Vec<TopNRuntimeFilterSpec>,
+        hub: Arc<RuntimeFilterHub>,
+    },
 }
 
 impl AggregateProcessorFactory {
-    pub(crate) fn new(
+    pub(crate) fn new_native(
         node_id: i32,
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
@@ -279,8 +288,6 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
-        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-        runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
@@ -295,9 +302,37 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
-            topn_rf_specs,
-            runtime_filter_hub,
+            runtime_filter_execution: AggregateRuntimeFilterExecution::Native,
         }
+    }
+
+    #[cfg(feature = "compat")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_compat(
+        node_id: i32,
+        arena: Arc<ExprArena>,
+        group_by: Vec<ExprId>,
+        functions: Vec<AggFunction>,
+        output_intermediate: bool,
+        direct_input: bool,
+        output_chunk_schema: ChunkSchemaRef,
+        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+        runtime_filter_hub: Arc<RuntimeFilterHub>,
+    ) -> Self {
+        let mut factory = Self::new_native(
+            node_id,
+            arena,
+            group_by,
+            functions,
+            output_intermediate,
+            direct_input,
+            output_chunk_schema,
+        );
+        factory.runtime_filter_execution = AggregateRuntimeFilterExecution::Compat {
+            topn_specs: topn_rf_specs,
+            hub: runtime_filter_hub,
+        };
+        factory
     }
 }
 
@@ -331,8 +366,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             profile_initialized: false,
             profiles: None,
             key_table_mem_tracker: None,
-            topn_rf_specs: self.topn_rf_specs.clone(),
-            runtime_filter_hub: self.runtime_filter_hub.clone(),
+            runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
         })
     }
@@ -362,8 +396,7 @@ struct AggregateProcessorOperator {
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
-    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
 }
 
@@ -445,15 +478,18 @@ impl AggregateProcessorOperator {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
     fn try_publish_topn_runtime_filter(&mut self) {
         const PUBLISH_THRESHOLD: usize = 4096;
 
-        if self.topn_rf_specs.is_empty() {
-            return;
-        }
-        let Some(hub) = &self.runtime_filter_hub else {
+        let AggregateRuntimeFilterExecution::Compat { topn_specs, hub } =
+            &self.runtime_filter_execution
+        else {
             return;
         };
+        if topn_specs.is_empty() {
+            return;
+        }
         let Some(key_table) = &self.key_table else {
             return;
         };
@@ -461,7 +497,7 @@ impl AggregateProcessorOperator {
             return;
         }
 
-        for spec in &self.topn_rf_specs {
+        for spec in topn_specs {
             if key_table.group_count() < spec.limit {
                 continue;
             }
@@ -1121,6 +1157,9 @@ impl AggregateProcessorOperator {
             Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
         }
     }
+
+    #[cfg(not(feature = "compat"))]
+    fn try_publish_topn_runtime_filter(&mut self) {}
 
     fn expected_group_types(&self) -> Result<Vec<DataType>, String> {
         let mut types = Vec::with_capacity(self.group_by.len());

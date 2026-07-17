@@ -36,7 +36,7 @@ use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use super::build_artifact::{BuildView, JoinBuildArtifact};
+use super::build_artifact::{BuildView, JoinBuildArtifact, JoinBuildRuntimeFilterView};
 #[cfg(test)]
 use super::build_requirements;
 use super::build_requirements::{BuildComponentRequirements, required_build_components};
@@ -49,7 +49,6 @@ use super::join_probe_utils::cross_join_batches;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
-use crate::exec::runtime_filter::LocalRuntimeFilterSet;
 use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
 fn concat_compatible_batches(
@@ -107,6 +106,31 @@ fn concat_schema_for_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Sch
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum JoinProbeRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat,
+}
+
+impl JoinProbeRuntimeFilterExecution {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            #[cfg(feature = "compat")]
+            Self::Compat => "compat",
+        }
+    }
+
+    fn matches(self, view: &JoinBuildRuntimeFilterView) -> bool {
+        match self {
+            Self::Native => matches!(view, JoinBuildRuntimeFilterView::Native),
+            #[cfg(feature = "compat")]
+            Self::Compat => matches!(view, JoinBuildRuntimeFilterView::Compat { .. }),
+        }
+    }
+}
+
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
 pub(crate) struct HashJoinProbeCore {
     arena: Arc<ExprArena>,
@@ -125,7 +149,8 @@ pub(crate) struct HashJoinProbeCore {
     build_chunk: Option<Arc<Chunk>>,
     build_null_key_rows: Option<Arc<Vec<u32>>>,
     build_table: Option<Arc<JoinHashMap>>,
-    runtime_filters: Option<Arc<LocalRuntimeFilterSet>>,
+    expected_runtime_filter_execution: JoinProbeRuntimeFilterExecution,
+    runtime_filter_execution: Option<JoinBuildRuntimeFilterView>,
     output_schema: Option<SchemaRef>,
     build_matched: Option<BuildMatchFlags>,
     global_build_row_count: usize,
@@ -147,7 +172,7 @@ pub(crate) struct HashJoinProbeCore {
 }
 
 impl HashJoinProbeCore {
-    pub(crate) fn new(
+    pub(crate) fn new_native(
         arena: Arc<ExprArena>,
         join_type: JoinType,
         probe_keys: Vec<ExprId>,
@@ -157,6 +182,59 @@ impl HashJoinProbeCore {
         left_chunk_schema: ChunkSchemaRef,
         right_chunk_schema: ChunkSchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self::new_in_mode(
+            arena,
+            join_type,
+            probe_keys,
+            residual_predicate,
+            probe_is_left,
+            has_equi_keys,
+            left_chunk_schema,
+            right_chunk_schema,
+            join_scope_chunk_schema,
+            JoinProbeRuntimeFilterExecution::Native,
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn new_compat(
+        arena: Arc<ExprArena>,
+        join_type: JoinType,
+        probe_keys: Vec<ExprId>,
+        residual_predicate: Option<ExprId>,
+        probe_is_left: bool,
+        has_equi_keys: bool,
+        left_chunk_schema: ChunkSchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self::new_in_mode(
+            arena,
+            join_type,
+            probe_keys,
+            residual_predicate,
+            probe_is_left,
+            has_equi_keys,
+            left_chunk_schema,
+            right_chunk_schema,
+            join_scope_chunk_schema,
+            JoinProbeRuntimeFilterExecution::Compat,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_in_mode(
+        arena: Arc<ExprArena>,
+        join_type: JoinType,
+        probe_keys: Vec<ExprId>,
+        residual_predicate: Option<ExprId>,
+        probe_is_left: bool,
+        has_equi_keys: bool,
+        left_chunk_schema: ChunkSchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
+        expected_runtime_filter_execution: JoinProbeRuntimeFilterExecution,
     ) -> Self {
         Self {
             arena,
@@ -175,7 +253,8 @@ impl HashJoinProbeCore {
             build_chunk: None,
             build_null_key_rows: None,
             build_table: None,
-            runtime_filters: None,
+            expected_runtime_filter_execution,
+            runtime_filter_execution: None,
             output_schema: None,
             build_matched: None,
             global_build_row_count: 0,
@@ -331,11 +410,26 @@ impl HashJoinProbeCore {
             self.has_equi_keys,
         );
         let view = BuildView::new(Arc::clone(&artifact), requirements)?;
+        let runtime_filter_execution = view.runtime_filter_view();
+        if !self
+            .expected_runtime_filter_execution
+            .matches(&runtime_filter_execution)
+        {
+            let expected = self.expected_runtime_filter_execution.name();
+            let actual = match &runtime_filter_execution {
+                JoinBuildRuntimeFilterView::Native => "native",
+                #[cfg(feature = "compat")]
+                JoinBuildRuntimeFilterView::Compat { .. } => "compat",
+            };
+            return Err(format!(
+                "hash join build artifact runtime-filter execution mode mismatch: expected={expected} actual={actual}"
+            ));
+        }
 
         self.build_chunk = view.optional_build_chunk();
         self.build_null_key_rows = view.build_null_key_rows();
         self.build_table = view.build_table();
-        self.runtime_filters = view.runtime_filters();
+        self.runtime_filter_execution = Some(runtime_filter_execution);
         self.build_partition_row_count = view.build_row_count();
         self.build_partition_has_null_key = view.build_has_null_key();
         self.global_build_row_count = global_build_row_count;
@@ -1690,12 +1784,21 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
     fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
         if !self.should_apply_runtime_filters() {
             return Ok(chunks);
         }
-        let Some(filters) = self.runtime_filters.as_ref() else {
-            return Ok(chunks);
+        let filters = match self.runtime_filter_execution.as_ref() {
+            None => return Err("hash join build artifact not loaded".to_string()),
+            Some(JoinBuildRuntimeFilterView::Native) => return Ok(chunks),
+            #[cfg(feature = "compat")]
+            Some(JoinBuildRuntimeFilterView::Compat { local_filters }) => {
+                let Some(filters) = local_filters.as_ref() else {
+                    return Ok(chunks);
+                };
+                filters
+            }
         };
         let mut out = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -1707,6 +1810,11 @@ impl HashJoinProbeCore {
             }
         }
         Ok(out)
+    }
+
+    #[cfg(not(feature = "compat"))]
+    fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
+        Ok(chunks)
     }
 
     fn should_apply_runtime_filters(&self) -> bool {
@@ -1843,14 +1951,13 @@ mod tests {
             build_table.method_kind(),
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectInt { .. }
         ));
-        JoinBuildArtifact::new(
+        JoinBuildArtifact::new_native(
             required_build_components(join_type, has_residual_predicate, true, true),
             Some(BuildStore::new(build)),
             Some(build_table),
             build_row_count,
             build_has_null_key,
             build_null_key_rows,
-            None,
         )
     }
 
@@ -1887,7 +1994,37 @@ mod tests {
             build_table.method_kind(),
             crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapMethodKind::DirectIntSet { .. }
         ));
-        JoinBuildArtifact::new(
+        JoinBuildArtifact::new_native(
+            required_build_components(JoinType::LeftSemi, false, true, true),
+            None,
+            Some(build_table),
+            build_row_count,
+            false,
+            None,
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    fn direct_compat_set_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
+        let key_arrays = vec![build.column_by_slot_id(RIGHT_K_SLOT_ID).expect("build key")];
+        let batch = crate::exec::operators::hashjoin::join_hash_map::method::BuildKeyBatch::new(
+            key_arrays,
+            build.len(),
+        )
+        .expect("key batch");
+        let build_row_count = build.len();
+        let build_table =
+            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMap::build_from_key_batches(
+                vec![DataType::Int32],
+                vec![false],
+                &[batch],
+                crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions {
+                    purpose: crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildPurpose::PresenceOnly,
+                    ..crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions::default()
+                },
+            )
+            .expect("direct set build table");
+        JoinBuildArtifact::new_compat(
             required_build_components(JoinType::LeftSemi, false, true, true),
             None,
             Some(build_table),
@@ -1896,6 +2033,125 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn left_semi_probe_core() -> HashJoinProbeCore {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        HashJoinProbeCore::new_native(
+            Arc::new(arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            None,
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        )
+    }
+
+    #[cfg(feature = "compat")]
+    fn left_semi_compat_probe_core() -> HashJoinProbeCore {
+        let left_schema = schema_kv("lk", "lv");
+        let right_schema = schema_kv("rk", "rw");
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+        let mut arena = ExprArena::default();
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        HashJoinProbeCore::new_compat(
+            Arc::new(arena),
+            JoinType::LeftSemi,
+            vec![probe_key],
+            None,
+            true,
+            true,
+            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
+            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    LEFT_K_SLOT_ID,
+                    LEFT_V_SLOT_ID,
+                    RIGHT_K_SLOT_ID,
+                    RIGHT_W_SLOT_ID,
+                ],
+            ),
+        )
+    }
+
+    fn assert_probe_core_unloaded(core: &HashJoinProbeCore) {
+        assert!(!core.is_build_loaded());
+        assert!(core.build_requirements.is_none());
+        assert!(core.build_view.is_none());
+        assert!(core.build_chunk.is_none());
+        assert!(core.build_null_key_rows.is_none());
+        assert!(core.build_table.is_none());
+        assert!(core.build_matched.is_none());
+        assert_eq!(core.global_build_row_count, 0);
+        assert!(!core.global_build_has_null_key);
+        assert_eq!(core.build_partition_row_count, 0);
+        assert!(!core.build_partition_has_null_key);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn native_probe_rejects_compat_artifact_before_loading_any_state() {
+        let right_schema = schema_kv("rk", "rw");
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100],
+            &[10],
+        );
+        let artifact = Arc::new(direct_compat_set_build_artifact_from_build_chunk(
+            build_chunk,
+        ));
+        let mut core = left_semi_probe_core();
+
+        let err = core
+            .set_build_artifact(artifact, 1, false)
+            .expect_err("native probe must reject compat build artifact");
+
+        assert!(
+            err.contains("runtime-filter execution mode mismatch"),
+            "err={err}"
+        );
+        assert_probe_core_unloaded(&core);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn compat_probe_rejects_native_artifact_before_loading_any_state() {
+        let right_schema = schema_kv("rk", "rw");
+        let build_chunk = chunk_of_two(
+            Arc::clone(&right_schema),
+            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
+            &[100],
+            &[10],
+        );
+        let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
+        let mut core = left_semi_compat_probe_core();
+
+        let err = core
+            .set_build_artifact(artifact, 1, false)
+            .expect_err("compat probe must reject native build artifact");
+
+        assert!(
+            err.contains("runtime-filter execution mode mismatch"),
+            "err={err}"
+        );
+        assert_probe_core_unloaded(&core);
     }
 
     #[test]
@@ -1916,7 +2172,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -1971,17 +2227,16 @@ mod tests {
             .expect("add rows");
         table.finalize().expect("finalize table");
 
-        let artifact = Arc::new(JoinBuildArtifact::new(
+        let artifact = Arc::new(JoinBuildArtifact::new_native(
             required_build_components(JoinType::LeftSemi, true, true, true),
             None,
             Some(table),
             build_chunk.len(),
             false,
             None,
-            None,
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2019,17 +2274,16 @@ mod tests {
             &[10, 20],
             &[100, 200],
         );
-        let artifact = Arc::new(JoinBuildArtifact::new(
+        let artifact = Arc::new(JoinBuildArtifact::new_native(
             required_build_components(JoinType::Inner, false, true, false),
             Some(BuildStore::new(build_chunk.clone())),
             None,
             build_chunk.len(),
             false,
             None,
-            None,
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             Vec::new(),
@@ -2104,7 +2358,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -2166,7 +2420,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftOuter,
             vec![probe_key],
@@ -2233,7 +2487,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::FullOuter,
             vec![probe_key],
@@ -2312,7 +2566,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2370,7 +2624,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -2431,7 +2685,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2491,7 +2745,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -2626,17 +2880,16 @@ mod tests {
             .add_build_rows(&build_key_arrays, build_chunk.len())
             .expect("add build rows");
         build_table.finalize().expect("finalize build table");
-        let artifact = Arc::new(JoinBuildArtifact::new(
+        let artifact = Arc::new(JoinBuildArtifact::new_native(
             required_build_components(JoinType::RightSemi, true, true, true),
             Some(BuildStore::new(build_chunk.clone())),
             Some(build_table),
             1,
             false,
             None,
-            None,
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             vec![probe_key],
@@ -2703,7 +2956,7 @@ mod tests {
             Some(Arc::new(Vec::new())),
         ));
 
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::NullAwareLeftAnti,
             vec![probe_key],
@@ -2754,16 +3007,15 @@ mod tests {
         let residual = arena.push_typed(ExprNode::Lt(left_v, right_w), DataType::Boolean);
         let arena = Arc::new(arena);
 
-        let artifact = Arc::new(JoinBuildArtifact::new(
+        let artifact = Arc::new(JoinBuildArtifact::new_native(
             required_build_components(JoinType::NullAwareLeftAnti, true, true, true),
             None,
             None,
             0,
             false,
             Some(Arc::new(Vec::new())),
-            None,
         ));
-        let mut core = HashJoinProbeCore::new(
+        let mut core = HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::NullAwareLeftAnti,
             vec![probe_key],

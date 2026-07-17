@@ -21,7 +21,8 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::join::{
-    JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType, RuntimeFilterMergeNode,
+    CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution,
+    JoinType, RuntimeFilterMergeNode,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
@@ -525,7 +526,7 @@ pub(crate) fn lower_hash_join_node(
             let merge_nodes =
                 lower_runtime_filter_merge_nodes(desc.runtime_filter_merge_nodes.as_deref());
             let has_remote_targets = desc.has_remote_targets.unwrap_or(false);
-            runtime_filters.push(JoinRuntimeFilterSpec {
+            runtime_filters.push(CompatJoinRuntimeFilterSpec {
                 filter_id,
                 expr_order,
                 probe_expr_id: *probe_key,
@@ -607,7 +608,9 @@ pub(crate) fn lower_hash_join_node(
                 build_keys,
                 eq_null_safe,
                 residual_predicate,
-                runtime_filters,
+                runtime_filter_execution: JoinRuntimeFilterExecution::Compat {
+                    legacy_specs: runtime_filters,
+                },
             }),
         },
         layout: output_layout,
@@ -838,7 +841,11 @@ mod tests {
             panic!("expected join node");
         };
 
-        assert_eq!(join.runtime_filters.len(), 1);
+        let JoinRuntimeFilterExecution::Compat { legacy_specs } = &join.runtime_filter_execution
+        else {
+            panic!("compat lowering must produce compat runtime-filter execution");
+        };
+        assert_eq!(legacy_specs.len(), 1);
         assert!(matches!(
             arena.node(join.build_keys[0]),
             Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(11)
@@ -847,7 +854,7 @@ mod tests {
             arena.node(join.probe_keys[0]),
             Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(22)
         ));
-        assert_eq!(join.runtime_filters[0].probe_slot_id, SlotId::new(22));
+        assert_eq!(legacy_specs[0].probe_slot_id, SlotId::new(22));
     }
 
     fn type_desc() -> types::TTypeDesc {

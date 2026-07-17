@@ -53,7 +53,9 @@ use crate::exec::node::exchange_source::ExchangeSourceNode;
 #[cfg(feature = "compat")]
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::filter::FilterNode;
-use crate::exec::node::join::{JoinNode, JoinType};
+use crate::exec::node::join::{
+    CompatJoinRuntimeFilterSpec, JoinNode, JoinRuntimeFilterExecution, JoinType,
+};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::lookup::LookUpNode;
 use crate::exec::node::nljoin::NestedLoopJoinNode;
@@ -102,7 +104,6 @@ pub enum ExecNodeKind {
     Analytic(AnalyticNode),
     SetOp(SetOpNode),
     NativeRuntimeFilterConsumer(runtime_filter::NativeRuntimeFilterConsumerNode),
-    InterimDormantNativeRuntimeFilterProducer(runtime_filter::InterimDormantNativeProducerNode),
 }
 
 #[derive(Clone, Debug)]
@@ -288,9 +289,6 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
         ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
             output_slots_for_node(&consumer.input)
         }
-        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
-            output_slots_for_node(&producer.input)
-        }
         ExecNodeKind::Repeat(RepeatNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::ChangeEventExpand(node) => {
             Some(node.output_slot_ids.iter().copied().collect())
@@ -359,9 +357,6 @@ fn push_down_local_runtime_filters_inner(
         ExecNodeKind::Values(_) => {}
         ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
             push_down_local_runtime_filters_inner(&mut consumer.input, arena, inherited);
-        }
-        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
-            push_down_local_runtime_filters_inner(&mut producer.input, arena, inherited);
         }
         ExecNodeKind::Project(project) => {
             let mut rewritten = Vec::new();
@@ -508,7 +503,7 @@ fn push_down_local_runtime_filters_inner(
             join_type,
             probe_keys,
             build_keys: _build_keys,
-            runtime_filters,
+            runtime_filter_execution,
             ..
         }) => {
             let right_semi_physical_right_probe = *join_type == JoinType::RightSemi;
@@ -518,6 +513,11 @@ fn push_down_local_runtime_filters_inner(
                 (left.as_mut(), right.as_mut())
             };
 
+            let runtime_filters: &[CompatJoinRuntimeFilterSpec] = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { .. } => &[][..],
+                #[cfg(feature = "compat")]
+                JoinRuntimeFilterExecution::Compat { legacy_specs } => legacy_specs.as_slice(),
+            };
             let mut probe_filters = inherited.to_vec();
             if matches!(
                 *join_type,
@@ -570,7 +570,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::join::{JoinDistributionMode, JoinRuntimeFilterSpec};
+    use crate::exec::node::join::JoinDistributionMode;
+    #[cfg(feature = "compat")]
+    use crate::exec::node::join::{CompatJoinRuntimeFilterSpec, JoinRuntimeFilterExecution};
     use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
     use crate::runtime::profile::RuntimeProfile;
 
@@ -618,6 +620,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn right_semi_local_runtime_filter_pushes_to_preserved_right_child() {
         let left_slot = SlotId::new(11);
@@ -650,16 +653,18 @@ mod tests {
                 build_keys: vec![left_key],
                 eq_null_safe: vec![false],
                 residual_predicate: None,
-                runtime_filters: vec![JoinRuntimeFilterSpec {
-                    filter_id: 7,
-                    expr_order: 0,
-                    probe_expr_id: right_key,
-                    build_expr_id: left_key,
-                    probe_slot_id: right_slot,
-                    build_data_type: DataType::Int32,
-                    merge_nodes: Vec::new(),
-                    has_remote_targets: false,
-                }],
+                runtime_filter_execution: JoinRuntimeFilterExecution::Compat {
+                    legacy_specs: vec![CompatJoinRuntimeFilterSpec {
+                        filter_id: 7,
+                        expr_order: 0,
+                        probe_expr_id: right_key,
+                        build_expr_id: left_key,
+                        probe_slot_id: right_slot,
+                        build_data_type: DataType::Int32,
+                        merge_nodes: Vec::new(),
+                        has_remote_targets: false,
+                    }],
+                },
             }),
         };
 
@@ -714,6 +719,7 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn runtime_filter_pushdown_traverses_project_to_join() {
         let mut arena = ExprArena::default();
@@ -743,16 +749,18 @@ mod tests {
                 build_keys: vec![build_expr],
                 eq_null_safe: vec![false],
                 residual_predicate: None,
-                runtime_filters: vec![JoinRuntimeFilterSpec {
-                    filter_id: 7,
-                    expr_order: 0,
-                    probe_expr_id: probe_expr,
-                    build_expr_id: build_expr,
-                    probe_slot_id: SlotId::new(3),
-                    build_data_type: DataType::Int32,
-                    merge_nodes: Vec::new(),
-                    has_remote_targets: false,
-                }],
+                runtime_filter_execution: JoinRuntimeFilterExecution::Compat {
+                    legacy_specs: vec![CompatJoinRuntimeFilterSpec {
+                        filter_id: 7,
+                        expr_order: 0,
+                        probe_expr_id: probe_expr,
+                        build_expr_id: build_expr,
+                        probe_slot_id: SlotId::new(3),
+                        build_data_type: DataType::Int32,
+                        merge_nodes: Vec::new(),
+                        has_remote_targets: false,
+                    }],
+                },
             }),
         };
         let mut root = ExecNode {

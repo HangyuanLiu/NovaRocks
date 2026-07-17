@@ -51,9 +51,6 @@ pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
         ExecNodeKind::SetOp(_) => "SetOp",
         ExecNodeKind::Values(_) => "Values",
         ExecNodeKind::NativeRuntimeFilterConsumer(_) => "NativeRuntimeFilterConsumer",
-        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(_) => {
-            "InterimDormantNativeRuntimeFilterProducer"
-        }
         ExecNodeKind::TableFunction(_) => "TableFunction",
         ExecNodeKind::Repeat(_) => "Repeat",
         ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",

@@ -393,9 +393,7 @@ impl FragmentScheduler {
             root_backend_idx,
         };
         populate_destinations(&mut plan, view.edges(), live)?;
-        if let Some(rf_plan) = rf_plan {
-            populate_runtime_filter_params(&mut plan, rf_plan, live)?;
-        }
+        let _ = (rf_plan, live);
         populate_per_exch_num_senders(&mut plan, view.edges());
         Ok(plan)
     }

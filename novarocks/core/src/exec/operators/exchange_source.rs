@@ -76,17 +76,43 @@ const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
 pub struct ExchangeSourceFactory {
     name: String,
     node: ExchangeSourceNode,
-    #[allow(dead_code)]
-    runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
-    runtime_filter_exprs: HashMap<i32, ExprId>,
-    runtime_filters_expected: usize,
-    local_rf_waiting_set: Vec<i32>,
-    runtime_filter_hub: Arc<RuntimeFilterHub>,
+    runtime_filter_execution: ExchangeSourceRuntimeFilterExecution,
     arena: Arc<ExprArena>,
 }
 
+enum ExchangeSourceRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        runtime_filter_specs: Vec<crate::exec::node::RuntimeFilterProbeSpec>,
+        runtime_filter_exprs: HashMap<i32, ExprId>,
+        runtime_filters_expected: usize,
+        local_rf_waiting_set: Vec<i32>,
+        runtime_filter_hub: Arc<RuntimeFilterHub>,
+    },
+}
+
 impl ExchangeSourceFactory {
-    pub(crate) fn new(
+    pub(crate) fn new_native(
+        node: ExchangeSourceNode,
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
+        let name = node.profile_name();
+        exchange::register_expected_chunk_schema(
+            node.key,
+            node.expected_senders,
+            node.expected_chunk_schema(),
+        )?;
+        Ok(Self {
+            name,
+            node,
+            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native,
+            arena,
+        })
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn new_compat(
         node: ExchangeSourceNode,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         arena: Arc<ExprArena>,
@@ -110,24 +136,35 @@ impl ExchangeSourceFactory {
         Ok(Self {
             name,
             node,
-            runtime_filter_specs,
-            runtime_filter_exprs,
-            runtime_filters_expected,
-            local_rf_waiting_set,
-            runtime_filter_hub,
+            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Compat {
+                runtime_filter_specs,
+                runtime_filter_exprs,
+                runtime_filters_expected,
+                local_rf_waiting_set,
+                runtime_filter_hub,
+            },
             arena,
         })
     }
 
+    #[cfg(feature = "compat")]
     fn local_rf_deps(&self) -> Vec<crate::exec::pipeline::dependency::DependencyHandle> {
-        if self.local_rf_waiting_set.is_empty() {
+        let ExchangeSourceRuntimeFilterExecution::Compat {
+            local_rf_waiting_set,
+            runtime_filter_hub,
+            ..
+        } = &self.runtime_filter_execution
+        else {
+            return Vec::new();
+        };
+        if local_rf_waiting_set.is_empty() {
             return Vec::new();
         }
         let mut deps = Vec::new();
         let mut seen = HashSet::new();
-        for node_id in &self.local_rf_waiting_set {
+        for node_id in local_rf_waiting_set {
             if seen.insert(*node_id) {
-                if let Some(dep) = self.runtime_filter_hub.local_dependency_if_exists(*node_id) {
+                if let Some(dep) = runtime_filter_hub.local_dependency_if_exists(*node_id) {
                     deps.push(dep);
                 } else {
                     debug!(
@@ -147,15 +184,40 @@ impl OperatorFactory for ExchangeSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        if !self.local_rf_waiting_set.is_empty() {
-            debug!(
-                "ExchangeSource local RF wait: finst={} node_id={} driver_id={} waiting_set={:?}",
-                self.node.key.finst_uuid(),
-                self.node.key.node_id,
-                driver_id,
-                self.local_rf_waiting_set
-            );
-        }
+        let (runtime_filter_probe, local_rf_deps, runtime_filter_exprs, runtime_filters_expected) =
+            match &self.runtime_filter_execution {
+                ExchangeSourceRuntimeFilterExecution::Native => {
+                    (None, Vec::new(), HashMap::new(), 0)
+                }
+                #[cfg(feature = "compat")]
+                ExchangeSourceRuntimeFilterExecution::Compat {
+                    runtime_filter_exprs,
+                    runtime_filters_expected,
+                    local_rf_waiting_set,
+                    runtime_filter_hub,
+                    ..
+                } => {
+                    if !local_rf_waiting_set.is_empty() {
+                        debug!(
+                            "ExchangeSource local RF wait: finst={} node_id={} driver_id={} waiting_set={:?}",
+                            self.node.key.finst_uuid(),
+                            self.node.key.node_id,
+                            driver_id,
+                            local_rf_waiting_set
+                        );
+                    }
+                    let probe =
+                        (*runtime_filters_expected > 0).then(|| ExchangeRuntimeFilterProbe {
+                            probe: runtime_filter_hub.register_probe(self.node.key.node_id),
+                        });
+                    (
+                        probe,
+                        self.local_rf_deps(),
+                        runtime_filter_exprs.clone(),
+                        *runtime_filters_expected,
+                    )
+                }
+            };
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
@@ -165,18 +227,10 @@ impl OperatorFactory for ExchangeSourceFactory {
             finished: false,
             logged_first_pull: false,
             logged_first_none: false,
-            runtime_filter_probe: if self.runtime_filters_expected > 0 {
-                Some(ExchangeRuntimeFilterProbe {
-                    probe: self
-                        .runtime_filter_hub
-                        .register_probe(self.node.key.node_id),
-                })
-            } else {
-                None
-            },
-            local_rf_deps: self.local_rf_deps(),
-            runtime_filter_exprs: self.runtime_filter_exprs.clone(),
-            runtime_filters_expected: self.runtime_filters_expected,
+            runtime_filter_probe,
+            local_rf_deps,
+            runtime_filter_exprs,
+            runtime_filters_expected,
             runtime_filter_lifecycle_handles: HashMap::new(),
             acquired: None,
             runtime_filters_loaded: false,
@@ -775,7 +829,7 @@ mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::RuntimeFilterProbeSpec;
-    use crate::exec::node::join::JoinRuntimeFilterSpec;
+    use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
     use crate::exec::runtime_filter::{
         LocalRuntimeInFilterSet, RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter,
         RuntimeEmptyFilter, RuntimeFilterType, RuntimeMembershipFilter, RuntimeMinMaxFilter,
@@ -807,7 +861,7 @@ mod tests {
     }
 
     fn in_filter(filter_id: i32, values: Vec<i32>) -> Vec<RuntimeInFilter> {
-        let spec = JoinRuntimeFilterSpec {
+        let spec = CompatJoinRuntimeFilterSpec {
             filter_id,
             expr_order: 0,
             probe_expr_id: crate::exec::expr::ExprId(0),

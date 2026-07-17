@@ -73,26 +73,6 @@ pub struct NativeRuntimeFilterConsumerNode {
     pub(crate) bindings: Vec<NativeRuntimeFilterConsumerSpec>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct InterimDormantNativeProducerBinding {
-    pub(crate) binding_id: u32,
-    pub(crate) channel_id: u32,
-    pub(crate) build_expr_id: ExprId,
-    pub(crate) build_key_index: usize,
-    pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
-    pub(crate) completion_requirement: CompletionRequirement,
-    pub(crate) contract: NativeRuntimeFilterContract,
-    pub(crate) reduction: NativeRuntimeFilterReduction,
-    pub(crate) availability: NativeRuntimeFilterAvailability,
-}
-
-#[derive(Clone, Debug)]
-pub struct InterimDormantNativeProducerNode {
-    pub(crate) input: Box<ExecNode>,
-    pub(crate) owner_node_id: i32,
-    pub(crate) bindings: Vec<InterimDormantNativeProducerBinding>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -129,7 +109,7 @@ mod tests {
             NativeRuntimeFilterAvailability::DeploymentNotInstalled
         );
 
-        let producer = InterimDormantNativeProducerBinding {
+        let producer = crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec {
             binding_id: 3,
             channel_id: 4,
             build_expr_id: expr_id,

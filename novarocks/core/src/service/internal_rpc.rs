@@ -251,6 +251,63 @@ pub(crate) fn handle_transmit_runtime_filter(
         lo: query_id.lo,
     };
 
+    let (delivery_expire, query_expire) = query_expire_durations(None);
+    if let Err(err) = query_context_manager().ensure_native_context(
+        query_id,
+        false,
+        delivery_expire,
+        query_expire,
+    ) {
+        response.status = Some(error_common_status(err));
+        return response;
+    }
+    response.status = Some(error_common_status(format!(
+        "legacy runtime-filter RPC is disabled for native query_id={query_id} filter_id={filter_id}"
+    )));
+    response
+}
+
+#[cfg(feature = "compat")]
+fn record_pending_runtime_filter_enqueue_result(
+    response: &mut proto::filter::TransmitRuntimeFilterResponse,
+    result: Result<(), String>,
+) {
+    if let Err(err) = result {
+        response.status = Some(error_common_status(err));
+    }
+}
+
+#[cfg(feature = "compat")]
+fn handle_transmit_runtime_filter_compat_common(
+    params: proto::filter::TransmitRuntimeFilterRequest,
+) -> proto::filter::TransmitRuntimeFilterResponse {
+    let filter_id = params.filter_id;
+    let mut response = proto::filter::TransmitRuntimeFilterResponse {
+        status: Some(ok_common_status()),
+        filter_id,
+    };
+    let Some(query_id) = params.query_id.as_ref() else {
+        response.status = Some(error_common_status(
+            "missing query_id for transmit_runtime_filter",
+        ));
+        return response;
+    };
+    let query_id = QueryId {
+        hi: query_id.hi,
+        lo: query_id.lo,
+    };
+
+    let (delivery_expire, query_expire) = query_expire_durations(None);
+    if let Err(err) = query_context_manager().ensure_compat_context(
+        query_id,
+        false,
+        delivery_expire,
+        query_expire,
+    ) {
+        response.status = Some(error_common_status(err));
+        return response;
+    }
+
     let payload = params.data.as_slice();
     if payload.is_empty() {
         response.status = Some(error_common_status(format!(
@@ -266,21 +323,23 @@ pub(crate) fn handle_transmit_runtime_filter(
         .and_then(arrow_type_from_common_type_desc);
 
     if params.is_partial {
-        let Some(worker) = query_context_manager().get_or_create_runtime_filter_worker(query_id)
-        else {
-            let (delivery_expire, query_expire) = query_expire_durations(None);
-            let _ = query_context_manager().ensure_context(
-                query_id,
-                false,
-                delivery_expire,
-                query_expire,
-            );
-            let _ = query_context_manager().enqueue_pending_runtime_filter(
-                query_id,
-                filter_id,
-                params.build_be_number,
-                params.data,
-                build_data_type,
+        let worker = match query_context_manager().get_or_create_runtime_filter_worker(query_id) {
+            Ok(worker) => worker,
+            Err(err) => {
+                response.status = Some(error_common_status(err));
+                return response;
+            }
+        };
+        let Some(worker) = worker else {
+            record_pending_runtime_filter_enqueue_result(
+                &mut response,
+                query_context_manager().enqueue_pending_runtime_filter(
+                    query_id,
+                    filter_id,
+                    params.build_be_number,
+                    params.data,
+                    build_data_type,
+                ),
             );
             return response;
         };
@@ -339,7 +398,7 @@ pub(crate) fn handle_transmit_runtime_filter_compat(
         build_be_number: params.build_be_number.unwrap_or_default(),
         column_type,
     };
-    let response = handle_transmit_runtime_filter(native);
+    let response = handle_transmit_runtime_filter_compat_common(native);
     let status = response.status.map(|status| proto::starrocks::StatusPb {
         status_code: status.code,
         error_msgs: if status.message.is_empty() {
@@ -368,7 +427,7 @@ fn receive_total_runtime_filter(
                 .to_string(),
         );
     }
-    let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id) else {
+    let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id)? else {
         return Err(format!("runtime filter hub not found: query_id={query_id}"));
     };
     hub.receive_remote_filter(filter_id, payload)
@@ -511,6 +570,124 @@ pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResp
     }
 }
 
+#[cfg(test)]
+mod native_runtime_filter_mode_tests {
+    use super::*;
+
+    fn submit_native_fragment_with_legacy_runtime_filter(query_id: QueryId) -> Result<(), String> {
+        crate::service::native_fragment_service::submit_exec_plan_fragment_native(
+            crate::proto::plan::PlanFragment::default(),
+            crate::proto::novarocks::InstanceParams {
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi + 1,
+                    lo: query_id.lo + 1,
+                }),
+                runtime_filter_params: Some(crate::proto::novarocks::RuntimeFilterParams {
+                    runtime_filter_builder_number: HashMap::from([(9, 1)]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn native_rf_rpc_before_fragment_claims_disabled_and_queues_nothing() {
+        let query_id = QueryId {
+            hi: 71_001,
+            lo: 71_002,
+        };
+        let response =
+            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: true,
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                filter_id: 9,
+                data: vec![1, 2, 3],
+                build_be_number: 0,
+                column_type: None,
+            });
+
+        let status = response.status.expect("status");
+        assert_ne!(status.code, 0);
+        assert!(status.message.contains("disabled"), "{}", status.message);
+        let manager = query_context_manager();
+        assert!(manager.get_runtime_filter_hub(query_id).is_err());
+        assert!(
+            manager
+                .enqueue_pending_runtime_filter(query_id, 9, 0, vec![1], None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_fragment_before_rf_rpc_claims_disabled_and_queues_nothing() {
+        let query_id = QueryId {
+            hi: 71_003,
+            lo: 71_004,
+        };
+        let fragment_error = submit_native_fragment_with_legacy_runtime_filter(query_id)
+            .expect_err("native fragment must reject legacy runtime-filter params");
+        assert!(
+            fragment_error.contains("contains legacy runtime-filter params"),
+            "{fragment_error}"
+        );
+
+        let response =
+            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: true,
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                filter_id: 9,
+                data: vec![1, 2, 3],
+                build_be_number: 0,
+                column_type: None,
+            });
+
+        let status = response.status.expect("status");
+        assert_ne!(status.code, 0);
+        assert!(status.message.contains("disabled"), "{}", status.message);
+        let manager = query_context_manager();
+        assert!(manager.get_runtime_filter_hub(query_id).is_err());
+        assert!(manager.get_runtime_filter_worker(query_id).is_err());
+        assert!(
+            manager
+                .enqueue_pending_runtime_filter(query_id, 9, 0, vec![1], None)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod pending_runtime_filter_enqueue_error_tests {
+    use super::*;
+
+    #[test]
+    fn pending_enqueue_error_is_returned_in_rpc_status() {
+        let mut response = proto::filter::TransmitRuntimeFilterResponse {
+            status: Some(ok_common_status()),
+            filter_id: 17,
+        };
+
+        record_pending_runtime_filter_enqueue_result(
+            &mut response,
+            Err("injected pending enqueue failure".to_string()),
+        );
+
+        let status = response.status.expect("status");
+        assert_ne!(status.code, 0);
+        assert!(status.message.contains("injected pending enqueue failure"));
+    }
+}
+
 #[cfg(all(test, feature = "compat"))]
 mod tests {
     #[cfg(feature = "compat")]
@@ -559,6 +736,10 @@ mod tests {
     use crate::service::internal_rpc_client;
     use crate::thrift::descriptors;
     use crate::thrift::types;
+    #[cfg(feature = "compat")]
+    use crate::thrift::{
+        internal_service as thrift_internal_service, partitions, planner, runtime_filter,
+    };
 
     fn unique_id(hi: i64, lo: i64) -> proto::starrocks::PUniqueId {
         proto::starrocks::PUniqueId { hi, lo }
@@ -573,6 +754,95 @@ mod tests {
         params: crate::thrift::runtime_filter::TRuntimeFilterParams,
     ) -> RuntimeFilterParams {
         RuntimeFilterParams::from_thrift(&params).expect("runtime filter params")
+    }
+
+    #[cfg(feature = "compat")]
+    fn submit_compat_fragment_with_runtime_filter_params(
+        query_id: QueryId,
+        runtime_filter_params: runtime_filter::TRuntimeFilterParams,
+    ) -> Result<(), String> {
+        let fragment = planner::TPlanFragment {
+            plan: None,
+            output_exprs: None,
+            output_sink: None,
+            partition: partitions::TDataPartition::new(
+                partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::thrift::exprs::TExpr>>,
+                None::<Vec<partitions::TRangePartition>>,
+                None::<Vec<partitions::TBucketProperty>>,
+            ),
+            min_reservation_bytes: None,
+            initial_reservation_total_claims: None,
+            query_global_dicts: None,
+            load_global_dicts: None,
+            cache_param: None,
+            query_global_dict_exprs: None,
+            group_execution_param: None,
+        };
+        let exec_params = thrift_internal_service::TPlanFragmentExecParams {
+            query_id: types::TUniqueId::new(query_id.hi, query_id.lo),
+            fragment_instance_id: types::TUniqueId::new(query_id.hi + 1, query_id.lo + 1),
+            per_node_scan_ranges: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+            destinations: None,
+            sender_id: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            use_vectorized: None,
+            runtime_filter_params: Some(runtime_filter_params),
+            instances_number: None,
+            enable_exchange_pass_through: None,
+            node_to_per_driver_seq_scan_ranges: None,
+            enable_exchange_perf: None,
+            pipeline_sink_dop: None,
+            report_when_finish: None,
+            exec_debug_options: None,
+        };
+        let request = thrift_internal_service::TExecPlanFragmentParams {
+            protocol_version: thrift_internal_service::InternalServiceVersion::V1,
+            fragment: Some(fragment),
+            desc_tbl: None,
+            params: Some(exec_params),
+            coord: None,
+            backend_num: None,
+            query_globals: None,
+            query_options: None,
+            enable_profile: None,
+            resource_info: None,
+            import_label: None,
+            db_name: None,
+            load_job_id: None,
+            load_error_hub_info: None,
+            is_pipeline: None,
+            pipeline_dop: None,
+            per_scan_node_dop: None,
+            workgroup: None,
+            enable_resource_group: None,
+            func_version: None,
+            enable_shared_scan: None,
+            is_stream_pipeline: None,
+            adaptive_dop_param: None,
+            group_execution_scan_dop: None,
+            pred_tree_params: None,
+            exec_stats_node_ids: None,
+            arrow_flight_sql_version: None,
+            novarocks_report_addr: None,
+            novarocks_typed_result_sink: None,
+        };
+        let bytes = crate::common::thrift::thrift_binary_serialize(&request)?;
+        crate::service::internal_service::submit_exec_plan_fragment(&bytes)
+    }
+
+    #[cfg(feature = "compat")]
+    fn submit_native_fragment(query_id: QueryId) -> Result<(), String> {
+        crate::service::native_fragment_service::submit_exec_plan_fragment_native(
+            crate::proto::plan::PlanFragment::default(),
+            crate::proto::novarocks::InstanceParams {
+                query_id: Some(common_unique_id(query_id.hi, query_id.lo)),
+                fragment_instance_id: Some(common_unique_id(query_id.hi + 1, query_id.lo + 1)),
+                ..Default::default()
+            },
+        )
     }
 
     fn ok_status(status: Option<&proto::starrocks::StatusPb>) -> bool {
@@ -826,15 +1096,15 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_partial_merge_broadcasts_on_completion() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
         let _transport_guard =
             crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
             );
-        let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
         let query_id = QueryId { hi: 100, lo: 200 };
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),
@@ -908,15 +1178,15 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_decimal_partial_uses_build_column_type() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
         let _transport_guard =
             crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
             );
-        let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
         let query_id = QueryId { hi: 101, lo: 201 };
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),
@@ -1006,10 +1276,10 @@ mod tests {
     #[test]
     #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_pending_decimal_partial_preserves_build_column_type() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
         let _transport_guard =
             crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
             );
-        let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();
 
         let query_id = QueryId { hi: 102, lo: 202 };
@@ -1048,28 +1318,25 @@ mod tests {
             "pending first partial must not broadcast before params are installed"
         );
 
-        query_context_manager()
-            .set_runtime_filter_params(
-                query_id,
-                runtime_filter_params_from_thrift_fixture(
-                    crate::thrift::runtime_filter::TRuntimeFilterParams {
-                        id_to_prober_params: Some(BTreeMap::from([(
-                            10,
-                            vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
-                                fragment_instance_id: Some(types::TUniqueId::new(1000, 1001)),
-                                fragment_instance_address: Some(types::TNetworkAddress::new(
-                                    "probe-host".to_string(),
-                                    9010,
-                                )),
-                            }],
-                        )])),
-                        runtime_filter_builder_number: Some(BTreeMap::from([(10, 2)])),
-                        runtime_filter_max_size: None,
-                        skew_join_runtime_filters: None,
-                    },
-                ),
-            )
-            .expect("set runtime filter params");
+        submit_compat_fragment_with_runtime_filter_params(
+            query_id,
+            crate::thrift::runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: Some(BTreeMap::from([(
+                    10,
+                    vec![crate::thrift::runtime_filter::TRuntimeFilterProberParams {
+                        fragment_instance_id: Some(types::TUniqueId::new(1000, 1001)),
+                        fragment_instance_address: Some(types::TNetworkAddress::new(
+                            "probe-host".to_string(),
+                            9010,
+                        )),
+                    }],
+                )])),
+                runtime_filter_builder_number: Some(BTreeMap::from([(10, 2)])),
+                runtime_filter_max_size: None,
+                skew_join_runtime_filters: None,
+            },
+        )
+        .expect("submit compat fragment with runtime-filter params");
         assert!(
             sent.lock().expect("sent lock").is_empty(),
             "single replayed partial must not broadcast before all builders arrive"
@@ -1103,13 +1370,159 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
+    fn compat_fragment_before_rf_rpc_delivers_without_pending_queue() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
+        let _transport_guard =
+            crate::service::internal_rpc_transport::use_brpc_compat_internal_rpc_transport_for_test(
+            );
+        internal_rpc_client::clear_test_hooks();
+
+        let query_id = QueryId {
+            hi: 72_001,
+            lo: 72_002,
+        };
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_capture = Arc::clone(&sent);
+        internal_rpc_client::set_transmit_runtime_filter_hook(move |host, port, params| {
+            sent_capture
+                .lock()
+                .expect("sent lock")
+                .push((host.to_string(), port, params));
+            Ok(())
+        });
+
+        submit_compat_fragment_with_runtime_filter_params(
+            query_id,
+            runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: Some(BTreeMap::from([(
+                    11,
+                    vec![runtime_filter::TRuntimeFilterProberParams {
+                        fragment_instance_id: Some(types::TUniqueId::new(1100, 1101)),
+                        fragment_instance_address: Some(types::TNetworkAddress::new(
+                            "probe-host".to_string(),
+                            9011,
+                        )),
+                    }],
+                )])),
+                runtime_filter_builder_number: Some(BTreeMap::from([(11, 1)])),
+                runtime_filter_max_size: None,
+                skew_join_runtime_filters: None,
+            },
+        )
+        .expect("submit compat fragment");
+        assert!(
+            query_context_manager()
+                .get_runtime_filter_worker(query_id)
+                .expect("compat worker lookup")
+                .is_some()
+        );
+
+        let filter = RuntimeInFilter::empty(11, SlotId::new(11), &DataType::Int32)
+            .expect("empty runtime filter");
+        let response = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(true),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(11),
+            build_be_number: Some(1),
+            data: Some(encode_starrocks_in_filter(&filter).expect("encode runtime filter")),
+            ..Default::default()
+        });
+        assert!(
+            ok_status(response.status.as_ref()),
+            "response status: {:?}",
+            response.status
+        );
+        let sent = sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "probe-host");
+        assert_eq!(sent[0].1, 9011);
+        assert!(!sent[0].2.is_partial);
+        internal_rpc_client::clear_test_hooks();
+    }
+
+    #[test]
+    #[cfg(feature = "compat")]
+    fn native_rf_rpc_then_compat_fragment_rejects_cross_mode_without_partial_state() {
+        let query_id = QueryId {
+            hi: 72_003,
+            lo: 72_004,
+        };
+        let native_response =
+            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: true,
+                query_id: Some(common_unique_id(query_id.hi, query_id.lo)),
+                filter_id: 12,
+                data: vec![1, 2, 3],
+                build_be_number: 1,
+                column_type: None,
+            });
+        assert!(!ok_common_status(native_response.status.as_ref()));
+
+        let error = submit_compat_fragment_with_runtime_filter_params(
+            query_id,
+            runtime_filter::TRuntimeFilterParams::default(),
+        )
+        .expect_err("compat fragment must reject native-claimed query");
+        assert!(error.contains("NativeDisabled"), "{error}");
+        let manager = query_context_manager();
+        assert!(manager.get_runtime_filter_hub(query_id).is_err());
+        assert!(manager.get_runtime_filter_worker(query_id).is_err());
+        assert!(manager.get_runtime_filter_params(query_id).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "compat")]
+    fn compat_rf_rpc_then_native_fragment_rejects_cross_mode_without_native_partial_state() {
+        let query_id = QueryId {
+            hi: 72_005,
+            lo: 72_006,
+        };
+        let filter = RuntimeInFilter::empty(13, SlotId::new(11), &DataType::Int32)
+            .expect("empty runtime filter");
+        let compat_response =
+            handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+                is_partial: Some(true),
+                query_id: Some(unique_id(query_id.hi, query_id.lo)),
+                filter_id: Some(13),
+                build_be_number: Some(1),
+                data: Some(encode_starrocks_in_filter(&filter).expect("encode runtime filter")),
+                ..Default::default()
+            });
+        assert!(ok_status(compat_response.status.as_ref()));
+
+        let error = submit_native_fragment(query_id)
+            .expect_err("native fragment must reject compat-claimed query");
+        assert!(error.contains("Compat"), "{error}");
+        let manager = query_context_manager();
+        assert!(
+            manager
+                .get_runtime_filter_params(query_id)
+                .expect("compat params lookup")
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_runtime_filter_worker(query_id)
+                .expect("compat worker lookup")
+                .is_none()
+        );
+        assert!(
+            manager
+                .get_runtime_filter_hub(query_id)
+                .expect("compat hub lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_handle_transmit_runtime_filter_final_delivery_updates_probe() {
         let query_id = QueryId { hi: 300, lo: 400 };
         let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
         let registry = RuntimeFilterLifecycleRegistry::global();
         registry.remove_query(query_key);
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),
@@ -1134,7 +1547,7 @@ mod tests {
         let probe = hub.register_probe(88);
         query_context_manager()
             .with_context_mut(query_id, |ctx| {
-                ctx.set_runtime_filter_hub(Arc::clone(&hub));
+                ctx.set_runtime_filter_hub(Arc::clone(&hub))?;
                 Ok(())
             })
             .expect("install runtime filter hub");
@@ -1142,17 +1555,16 @@ mod tests {
         let filter =
             RuntimeInFilter::empty(0, SlotId::new(11), &DataType::Int32).expect("empty in filter");
         let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
-        let response =
-            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
-                is_partial: false,
-                query_id: Some(common_unique_id(query_id.hi, query_id.lo)),
-                filter_id: 0,
-                data: payload,
-                build_be_number: 0,
-                column_type: None,
-            });
+        let response = handle_transmit_runtime_filter_compat(CompatTransmitRuntimeFilterRequest {
+            is_partial: Some(false),
+            query_id: Some(unique_id(query_id.hi, query_id.lo)),
+            filter_id: Some(0),
+            data: Some(payload),
+            build_be_number: Some(0),
+            ..Default::default()
+        });
 
-        assert!(ok_common_status(response.status.as_ref()));
+        assert!(ok_status(response.status.as_ref()));
         let snapshot = probe.snapshot();
         assert_eq!(snapshot.in_filters().len(), 1);
         assert_eq!(snapshot.in_filters()[0].filter_id(), 0);
@@ -1168,7 +1580,7 @@ mod tests {
     fn prober_install_path_rejects_partial_filter() {
         let query_id = QueryId { hi: 301, lo: 401 };
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),
@@ -1190,7 +1602,7 @@ mod tests {
         let probe = hub.register_probe(88);
         query_context_manager()
             .with_context_mut(query_id, |ctx| {
-                ctx.set_runtime_filter_hub(Arc::clone(&hub));
+                ctx.set_runtime_filter_hub(Arc::clone(&hub))?;
                 Ok(())
             })
             .expect("install runtime filter hub");
@@ -1216,7 +1628,7 @@ mod tests {
         let query_id = QueryId { hi: 500, lo: 600 };
         let tuple_id = 1;
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),
@@ -1336,7 +1748,7 @@ mod tests {
         let query_id = QueryId { hi: 510, lo: 610 };
         let tuple_id = 1;
         query_context_manager()
-            .ensure_context(
+            .ensure_compat_context(
                 query_id,
                 false,
                 Duration::from_secs(60),

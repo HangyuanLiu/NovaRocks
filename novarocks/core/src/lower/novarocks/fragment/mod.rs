@@ -32,7 +32,7 @@ use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::DataStreamSinkFactoryInput;
-use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
@@ -148,7 +148,7 @@ pub(crate) fn execute_fragment_native(
     let _exec_timer = profiler
         .as_ref()
         .map(|p| p.scoped_timer("PipelineExecuteTime"));
-    execute_plan_with_pipeline(
+    execute_native_plan_with_pipeline(
         exec_plan,
         debug_exec_node_output(),
         Duration::from_millis(50),

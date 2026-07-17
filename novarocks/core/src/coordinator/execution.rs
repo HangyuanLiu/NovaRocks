@@ -411,23 +411,16 @@ impl ExecutionCoordinator {
                     }
                 }
                 let typed_result_sink = is_root && needs_fragment_status_report;
-                let native_rf_builder_number = runtime_filter_builder_number_for_instance(
-                    runtime_filters.as_ref(),
-                    &instance_counts,
-                );
-                let native_rf_max_size = if runtime_filters.is_some() {
-                    16_i64 * 1024 * 1024
-                } else {
-                    0
-                };
+                let native_rf_prober_params = std::collections::BTreeMap::new();
+                let native_rf_builder_number = std::collections::BTreeMap::new();
                 let native_instance_params =
                     crate::protocol::native::encode::encode_instance_params(
                         &query_id,
                         placement,
                         query_options.as_ref(),
-                        &placement.runtime_filter_prober_params,
+                        &native_rf_prober_params,
                         &native_rf_builder_number,
-                        native_rf_max_size,
+                        0,
                         placement.instance_index as i32,
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,

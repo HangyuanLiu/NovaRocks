@@ -1093,6 +1093,7 @@ mod tests {
             .with_accept_empty_scan_ranges(true)
     }
 
+    #[cfg(feature = "compat")]
     fn hdfs_scan_source_for_runtime_pruning_test(
         scan: ScanNode,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
@@ -1100,19 +1101,21 @@ mod tests {
         profile: RuntimeProfile,
     ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
         let factory =
-            ScanSourceFactory::new(scan, runtime_filter_hub, Arc::new(ExprArena::default()));
+            ScanSourceFactory::new_compat(scan, runtime_filter_hub, Arc::new(ExprArena::default()));
         let mut source = factory.create(1, driver_id);
         source.set_profiles(OperatorProfiles::new(profile));
         source.prepare().expect("prepare scan source");
         source
     }
 
+    #[cfg(feature = "compat")]
     fn runtime_filter_hub_for_test() -> Arc<RuntimeFilterHub> {
         let hub = Arc::new(RuntimeFilterHub::new(DependencyManager::new()));
         hub.set_wait_timeouts(Some(std::time::Duration::from_secs(5)), None);
         hub
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn iceberg_runtime_file_pruning_removes_all_splits_for_pruned_file() {
         let cfg = hdfs_cfg_with_two_iceberg_files_for_test();
@@ -1140,6 +1143,7 @@ mod tests {
         assert_eq!(counters.unavailable, 0);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn all_pruned_runtime_file_pruning_flushes_profile_without_morsels() {
         let op = Arc::new(HdfsScanOp::new(
@@ -1194,6 +1198,7 @@ mod tests {
         assert_eq!(counters.files_pruned, 2);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn selected_file_runtime_file_pruning_flushes_profile_from_source() {
         let op = Arc::new(HdfsScanOp::new(hdfs_cfg_with_two_iceberg_files_for_test()));
@@ -1232,6 +1237,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn missing_metadata_runtime_file_pruning_flushes_profile_from_source() {
         let op = Arc::new(HdfsScanOp::new(
@@ -1288,6 +1294,7 @@ mod tests {
         assert_eq!(counters.files_pruned, 0);
     }
 
+    #[cfg(feature = "compat")]
     #[test]
     fn runtime_file_pruning_profile_flush_is_not_duplicated_across_drivers() {
         let op = Arc::new(HdfsScanOp::new(
@@ -1300,7 +1307,7 @@ mod tests {
         let filter = runtime_membership_filter_for_test(1, SlotId::new(3), &[100_i32]);
         let hub = runtime_filter_hub_for_test();
         let factory =
-            ScanSourceFactory::new(scan, Arc::clone(&hub), Arc::new(ExprArena::default()));
+            ScanSourceFactory::new_compat(scan, Arc::clone(&hub), Arc::new(ExprArena::default()));
         let profile_a = RuntimeProfile::new("hdfs-scan-a");
         let profile_b = RuntimeProfile::new("hdfs-scan-b");
         let mut source_a = factory.create(2, 0);

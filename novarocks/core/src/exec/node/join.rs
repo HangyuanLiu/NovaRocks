@@ -18,6 +18,11 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
+use crate::exec::node::runtime_filter::{
+    NativeRuntimeFilterAvailability, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+};
+use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
+use std::collections::BTreeSet;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -45,7 +50,7 @@ pub struct RuntimeFilterMergeNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct JoinRuntimeFilterSpec {
+pub struct CompatJoinRuntimeFilterSpec {
     pub filter_id: i32,
     pub expr_order: usize,
     pub probe_expr_id: ExprId,
@@ -54,6 +59,30 @@ pub struct JoinRuntimeFilterSpec {
     pub build_data_type: arrow::datatypes::DataType,
     pub merge_nodes: Vec<RuntimeFilterMergeNode>,
     pub has_remote_targets: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
+    pub(crate) binding_id: u32,
+    pub(crate) channel_id: u32,
+    pub(crate) build_expr_id: ExprId,
+    pub(crate) build_key_index: usize,
+    pub(crate) contribution_kinds: BTreeSet<ContributionKind>,
+    pub(crate) completion_requirement: CompletionRequirement,
+    pub(crate) contract: NativeRuntimeFilterContract,
+    pub(crate) reduction: NativeRuntimeFilterReduction,
+    pub(crate) availability: NativeRuntimeFilterAvailability,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum JoinRuntimeFilterExecution {
+    Native {
+        producers: Vec<NativeJoinRuntimeFilterProducerSpec>,
+    },
+    #[cfg(feature = "compat")]
+    Compat {
+        legacy_specs: Vec<CompatJoinRuntimeFilterSpec>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +101,7 @@ pub struct JoinNode {
     /// `true` means this key uses null-safe equality (`<=>` / EQ_FOR_NULL).
     pub eq_null_safe: Vec<bool>,
     pub residual_predicate: Option<ExprId>,
-    pub runtime_filters: Vec<JoinRuntimeFilterSpec>,
+    pub(crate) runtime_filter_execution: JoinRuntimeFilterExecution,
 }
 
 impl JoinNode {

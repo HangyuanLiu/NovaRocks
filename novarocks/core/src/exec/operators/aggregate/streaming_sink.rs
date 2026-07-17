@@ -65,21 +65,28 @@ pub struct AggregateStreamingSinkFactory {
     functions: Vec<AggFunction>,
     output_intermediate: bool,
     output_chunk_schema: ChunkSchemaRef,
-    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
     streaming_state: AggregateStreamingState,
 }
 
+#[derive(Clone)]
+enum StreamingAggregateRuntimeFilterExecution {
+    Native,
+    #[cfg(feature = "compat")]
+    Compat {
+        topn_specs: Vec<TopNRuntimeFilterSpec>,
+        hub: Arc<RuntimeFilterHub>,
+    },
+}
+
 impl AggregateStreamingSinkFactory {
-    pub(crate) fn new(
+    pub(crate) fn new_native(
         node_id: i32,
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
         functions: Vec<AggFunction>,
         output_intermediate: bool,
         output_chunk_schema: ChunkSchemaRef,
-        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-        runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
         state: AggregateStreamingState,
     ) -> Self {
         let name = if node_id >= 0 {
@@ -94,10 +101,38 @@ impl AggregateStreamingSinkFactory {
             functions,
             output_intermediate,
             output_chunk_schema,
-            topn_rf_specs,
-            runtime_filter_hub,
+            runtime_filter_execution: StreamingAggregateRuntimeFilterExecution::Native,
             streaming_state: state,
         }
+    }
+
+    #[cfg(feature = "compat")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_compat(
+        node_id: i32,
+        arena: Arc<ExprArena>,
+        group_by: Vec<ExprId>,
+        functions: Vec<AggFunction>,
+        output_intermediate: bool,
+        output_chunk_schema: ChunkSchemaRef,
+        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+        runtime_filter_hub: Arc<RuntimeFilterHub>,
+        state: AggregateStreamingState,
+    ) -> Self {
+        let mut factory = Self::new_native(
+            node_id,
+            arena,
+            group_by,
+            functions,
+            output_intermediate,
+            output_chunk_schema,
+            state,
+        );
+        factory.runtime_filter_execution = StreamingAggregateRuntimeFilterExecution::Compat {
+            topn_specs: topn_rf_specs,
+            hub: runtime_filter_hub,
+        };
+        factory
     }
 }
 
@@ -126,8 +161,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
             key_table_mem_tracker: None,
-            topn_rf_specs: self.topn_rf_specs.clone(),
-            runtime_filter_hub: self.runtime_filter_hub.clone(),
+            runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
             streaming_state: self.streaming_state.clone(),
         })
@@ -157,8 +191,7 @@ struct AggregateStreamingSinkOperator {
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
-    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
-    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     streaming_state: AggregateStreamingState,
 }
@@ -217,15 +250,18 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
     fn try_publish_topn_runtime_filter(&mut self) {
         const PUBLISH_THRESHOLD: usize = 4096;
 
-        if self.topn_rf_specs.is_empty() {
-            return;
-        }
-        let Some(hub) = &self.runtime_filter_hub else {
+        let StreamingAggregateRuntimeFilterExecution::Compat { topn_specs, hub } =
+            &self.runtime_filter_execution
+        else {
             return;
         };
+        if topn_specs.is_empty() {
+            return;
+        }
         let Some(key_table) = &self.key_table else {
             return;
         };
@@ -233,7 +269,7 @@ impl AggregateStreamingSinkOperator {
             return;
         }
 
-        for spec in &self.topn_rf_specs {
+        for spec in topn_specs {
             if key_table.group_count() < spec.limit {
                 continue;
             }
@@ -751,6 +787,9 @@ impl AggregateStreamingSinkOperator {
             Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
         }
     }
+
+    #[cfg(not(feature = "compat"))]
+    fn try_publish_topn_runtime_filter(&mut self) {}
 
     fn expected_group_types(&self) -> Result<Vec<DataType>, String> {
         let mut types = Vec::with_capacity(self.group_by.len());

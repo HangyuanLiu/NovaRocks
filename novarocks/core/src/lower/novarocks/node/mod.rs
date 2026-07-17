@@ -50,9 +50,9 @@ use super::runtime_filter_binding::{
 use crate::common::types::UniqueId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
+use crate::exec::node::join::{JoinRuntimeFilterExecution, NativeJoinRuntimeFilterProducerSpec};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
-    InterimDormantNativeProducerBinding, InterimDormantNativeProducerNode,
     NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
     NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
 };
@@ -490,7 +490,7 @@ fn attach_hash_join_producers(
         }
         let build_key_index = matches[0];
         let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
-        producers.push(InterimDormantNativeProducerBinding {
+        producers.push(NativeJoinRuntimeFilterProducerSpec {
             binding_id: binding.binding_id,
             channel_id: binding.channel_id,
             build_expr_id,
@@ -502,16 +502,7 @@ fn attach_hash_join_producers(
             availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
         });
     }
-    let input = lowered.node.clone();
-    lowered.node = ExecNode {
-        kind: ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(
-            InterimDormantNativeProducerNode {
-                input: Box::new(input),
-                owner_node_id: wire_node.node_id,
-                bindings: producers,
-            },
-        ),
-    };
+    join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
     Ok(())
 }
 
@@ -1264,12 +1255,13 @@ mod tests {
         )
         .expect("producer seam");
         ledger.finish().expect("producer binding consumed");
-        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
-        else {
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
-        assert_eq!(producer.bindings.len(), 1);
-        assert!(matches!(producer.input.kind, ExecNodeKind::Join(_)));
+        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
+            panic!("native producer execution")
+        };
+        assert_eq!(producers.len(), 1);
 
         let mut nullable_mismatch = column_ref(2, DataType::Int64);
         nullable_mismatch.nullable = false;
@@ -1341,11 +1333,13 @@ mod tests {
         )
         .expect("coerced producer seam");
         ledger.finish().expect("producer binding consumed");
-        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
-        else {
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
-        let build_expr_id = producer.bindings[0].build_expr_id;
+        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
+            panic!("native producer execution")
+        };
+        let build_expr_id = producers[0].build_expr_id;
         assert_eq!(arena.data_type(build_expr_id), Some(&DataType::Int32));
         assert!(matches!(
             arena.node(build_expr_id),
@@ -1392,13 +1386,14 @@ mod tests {
         )
         .expect("two channels may bind the same unique raw key");
         ledger.finish().expect("both producer bindings consumed");
-        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
-        else {
+        let ExecNodeKind::Join(join) = lowered.node.kind else {
             panic!("producer seam")
         };
+        let JoinRuntimeFilterExecution::Native { producers } = join.runtime_filter_execution else {
+            panic!("native producer execution")
+        };
         assert_eq!(
-            producer
-                .bindings
+            producers
                 .iter()
                 .map(|binding| binding.binding_id)
                 .collect::<Vec<_>>(),

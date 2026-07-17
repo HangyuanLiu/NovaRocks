@@ -21,7 +21,7 @@
 //! - Bridges fragment context, driver executor, and terminal sink orchestration.
 //!
 //! Key exported interfaces:
-//! - Functions: `execute_plan_with_pipeline`.
+//! - Functions: fixed native and compat pipeline execution entrypoints.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -36,7 +36,9 @@ use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::builder::build_pipeline_graph_for_exec_plan_with_root_sink_dop;
+#[cfg(feature = "compat")]
+use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
+use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::dependency::DependencyManager;
 use super::fragment_context::{FragmentContext, FragmentFeAddress};
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
@@ -46,7 +48,7 @@ use super::pipeline::Pipeline;
 use crate::runtime::profile::Profiler;
 
 /// Execute one plan fragment through pipeline runtime and return the terminal sink outcome.
-pub(crate) fn execute_plan_with_pipeline(
+pub(crate) fn execute_native_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -59,7 +61,7 @@ pub(crate) fn execute_plan_with_pipeline(
     fe_addr: Option<FragmentFeAddress>,
     backend_num: Option<i32>,
 ) -> Result<(), String> {
-    execute_plan_with_pipeline_with_root_sink_dop(
+    execute_native_plan_with_pipeline_with_root_sink_dop(
         plan,
         debug,
         time_slice,
@@ -75,7 +77,7 @@ pub(crate) fn execute_plan_with_pipeline(
     )
 }
 
-pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
+pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     plan: ExecPlan,
     debug: bool,
     time_slice: Duration,
@@ -89,12 +91,115 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
+    execute_plan_with_pipeline_in_mode(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        PipelineExecutionMode::NativeDisabled,
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn execute_compat_plan_with_pipeline(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+) -> Result<(), String> {
+    execute_compat_plan_with_pipeline_with_root_sink_dop(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        None,
+    )
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+) -> Result<(), String> {
+    execute_plan_with_pipeline_in_mode(
+        plan,
+        debug,
+        time_slice,
+        sink,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        query_id,
+        fe_addr,
+        backend_num,
+        root_sink_dop,
+        PipelineExecutionMode::Compat,
+    )
+}
+
+enum PipelineExecutionMode {
+    NativeDisabled,
+    #[cfg(feature = "compat")]
+    Compat,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_plan_with_pipeline_in_mode(
+    plan: ExecPlan,
+    debug: bool,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    query_id: Option<crate::runtime::query_context::QueryId>,
+    fe_addr: Option<FragmentFeAddress>,
+    backend_num: Option<i32>,
+    root_sink_dop: Option<i32>,
+    mode: PipelineExecutionMode,
+) -> Result<(), String> {
     let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
-    let runtime_filter_hub = match query_id {
-        Some(qid) => {
-            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid) {
-                hub
+    #[cfg(feature = "compat")]
+    let runtime_filter_hub = match (&mode, query_id) {
+        (PipelineExecutionMode::NativeDisabled, _) => None,
+        (PipelineExecutionMode::Compat, Some(qid)) => {
+            if let Some(hub) = query_context_manager().get_runtime_filter_hub(qid)? {
+                Some(hub)
             } else {
                 let hub = Arc::new(
                     crate::runtime::runtime_filter_hub::RuntimeFilterHub::new_for_query(
@@ -102,36 +207,54 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
                         qid,
                     ),
                 );
-                let _ = query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub));
-                hub
+                query_context_manager().set_runtime_filter_hub(qid, Arc::clone(&hub))?;
+                Some(hub)
             }
         }
-        None => Arc::new(crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(
-            DependencyManager::new(),
+        (PipelineExecutionMode::Compat, None) => Some(Arc::new(
+            crate::runtime::runtime_filter_hub::RuntimeFilterHub::new(DependencyManager::new()),
         )),
     };
-    runtime_filter_hub.set_wait_timeouts(
-        runtime_state.runtime_filter_scan_wait_timeout(),
-        runtime_state.runtime_filter_wait_timeout(),
-    );
-    if let Some(qid) = query_id {
-        if let Some(params) = runtime_state.runtime_filter_params().cloned() {
-            let _ = query_context_manager().set_runtime_filter_params(qid, params);
+    #[cfg(feature = "compat")]
+    if let Some(runtime_filter_hub) = runtime_filter_hub.as_ref() {
+        runtime_filter_hub.set_wait_timeouts(
+            runtime_state.runtime_filter_scan_wait_timeout(),
+            runtime_state.runtime_filter_wait_timeout(),
+        );
+        if let Some(qid) = query_id {
+            if let Some(params) = runtime_state.runtime_filter_params().cloned() {
+                query_context_manager().set_runtime_filter_params(qid, params)?;
+            }
+            query_context_manager().get_or_create_runtime_filter_worker(qid)?;
         }
-        let _ = query_context_manager().get_or_create_runtime_filter_worker(qid);
     }
 
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
-    let graph = build_pipeline_graph_for_exec_plan_with_root_sink_dop(
-        &plan,
-        debug,
-        dep_manager.clone(),
-        exchange_finst_id,
-        pipeline_dop,
-        root_sink_dop,
-        Arc::clone(&runtime_filter_hub),
-    )?;
+    let graph = match mode {
+        PipelineExecutionMode::NativeDisabled => {
+            build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
+                &plan,
+                debug,
+                dep_manager.clone(),
+                exchange_finst_id,
+                pipeline_dop,
+                root_sink_dop,
+            )?
+        }
+        #[cfg(feature = "compat")]
+        PipelineExecutionMode::Compat => {
+            build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop(
+                &plan,
+                debug,
+                dep_manager.clone(),
+                exchange_finst_id,
+                pipeline_dop,
+                root_sink_dop,
+                runtime_filter_hub.expect("compat runtime-filter hub"),
+            )?
+        }
+    };
 
     let finst_id = runtime_state.fragment_instance_id();
     let ctx = Arc::new(FragmentContext::new(
@@ -258,7 +381,7 @@ mod tests {
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
     use crate::runtime::runtime_state::RuntimeState;
 
-    use super::execute_plan_with_pipeline;
+    use super::execute_native_plan_with_pipeline;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
@@ -325,7 +448,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -445,7 +568,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -561,7 +684,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -683,7 +806,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -825,14 +948,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: Some(residual),
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -998,14 +1124,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1155,14 +1284,17 @@ mod tests {
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
                     residual_predicate: None,
-                    runtime_filters: Vec::new(),
+                    runtime_filter_execution:
+                        crate::exec::node::join::JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                 }),
             },
         };
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1312,7 +1444,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),
@@ -1438,7 +1570,7 @@ mod tests {
 
         let handle = ResultSinkHandle::new();
         let runtime_state = Arc::new(RuntimeState::default());
-        execute_plan_with_pipeline(
+        execute_native_plan_with_pipeline(
             plan,
             false,
             Duration::from_millis(10),

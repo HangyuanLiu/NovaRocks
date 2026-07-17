@@ -3294,7 +3294,7 @@ mod tests {
         });
         cfg.variant_path_predicates
             .push(variant_path_predicate(Some(10)));
-        let specs = [crate::exec::node::join::JoinRuntimeFilterSpec {
+        let specs = [crate::exec::node::join::CompatJoinRuntimeFilterSpec {
             filter_id: 1,
             expr_order: 0,
             probe_expr_id: crate::exec::expr::ExprId(0),
@@ -3356,7 +3356,7 @@ mod tests {
             query_global_dicts: Default::default(),
         };
         let specs = [
-            crate::exec::node::join::JoinRuntimeFilterSpec {
+            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
                 filter_id: 1,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),
@@ -3366,7 +3366,7 @@ mod tests {
                 merge_nodes: Vec::new(),
                 has_remote_targets: false,
             },
-            crate::exec::node::join::JoinRuntimeFilterSpec {
+            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
                 filter_id: 2,
                 expr_order: 1,
                 probe_expr_id: crate::exec::expr::ExprId(1),
@@ -3483,7 +3483,7 @@ mod tests {
         };
 
         let specs = [
-            crate::exec::node::join::JoinRuntimeFilterSpec {
+            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
                 filter_id: 1,
                 expr_order: 0,
                 probe_expr_id: crate::exec::expr::ExprId(0),
@@ -3493,7 +3493,7 @@ mod tests {
                 merge_nodes: Vec::new(),
                 has_remote_targets: false,
             },
-            crate::exec::node::join::JoinRuntimeFilterSpec {
+            crate::exec::node::join::CompatJoinRuntimeFilterSpec {
                 filter_id: 2,
                 expr_order: 1,
                 probe_expr_id: crate::exec::expr::ExprId(1),
@@ -4636,7 +4636,7 @@ mod tests {
     fn runtime_filter_ctx_for_keys(
         key_values: Vec<i32>,
     ) -> crate::exec::node::scan::RuntimeFilterContext {
-        let specs = [crate::exec::node::join::JoinRuntimeFilterSpec {
+        let specs = [crate::exec::node::join::CompatJoinRuntimeFilterSpec {
             filter_id: 1,
             expr_order: 0,
             probe_expr_id: crate::exec::expr::ExprId(0),

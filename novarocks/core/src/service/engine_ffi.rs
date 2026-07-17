@@ -1122,13 +1122,22 @@ mod tests {
         let query_id = QueryId { hi: 3001, lo: 4002 };
         let finst_id = UniqueId { hi: 5003, lo: 6004 };
         let mgr = query_context_manager();
-        mgr.ensure_context(
+        #[cfg(feature = "compat")]
+        mgr.ensure_compat_context(
             query_id,
             false,
             Duration::from_secs(5),
             Duration::from_secs(9),
         )
-        .expect("ensure query context");
+        .expect("ensure compat query context");
+        #[cfg(not(feature = "compat"))]
+        mgr.ensure_native_context(
+            query_id,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(9),
+        )
+        .expect("ensure native query context");
         mgr.register_finst(finst_id, query_id);
 
         assert_eq!(

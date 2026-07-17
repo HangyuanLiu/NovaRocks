@@ -38,7 +38,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_group_key_hashes, build_group_key_views,
 };
-use crate::exec::node::join::JoinRuntimeFilterSpec;
+use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
 
 #[derive(Clone, Debug)]
 /// Local registry containing runtime membership filters keyed by expression id.
@@ -85,7 +85,7 @@ pub(in crate::exec::runtime_filter) fn row_has_null(
 }
 
 impl LocalRuntimeFilterSet {
-    pub(crate) fn new(specs: &[JoinRuntimeFilterSpec], hash_seed: u64) -> Self {
+    pub(crate) fn new(specs: &[CompatJoinRuntimeFilterSpec], hash_seed: u64) -> Self {
         let mut filters = Vec::with_capacity(specs.len());
         for spec in specs {
             filters.push(LocalRuntimeFilter {
