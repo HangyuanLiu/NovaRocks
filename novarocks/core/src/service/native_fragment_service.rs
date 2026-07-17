@@ -244,11 +244,6 @@ pub fn submit_exec_plan_fragment_native(
         .as_ref()
         .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
         .map(unique_id_from_native)?;
-    if instance_params.runtime_filter_params.is_some() {
-        return Err(format!(
-            "native fragment query_id={query_id} contains legacy runtime-filter params"
-        ));
-    }
     let query_opts = instance_params
         .query_options
         .as_ref()
@@ -256,6 +251,12 @@ pub fn submit_exec_plan_fragment_native(
         .transpose()?;
     let (delivery_expire, query_expire) = query_expire_durations(query_opts.as_ref());
     let mgr = query_context_manager();
+    mgr.ensure_native_context(query_id, false, delivery_expire, query_expire)?;
+    if instance_params.runtime_filter_params.is_some() {
+        return Err(format!(
+            "native fragment query_id={query_id} contains legacy runtime-filter params"
+        ));
+    }
     mgr.get_or_register_native(query_id, false, delivery_expire, query_expire)?;
     let cache_options = CacheOptions::from_query_options(query_opts.as_ref())?;
     mgr.set_cache_options(query_id, cache_options)?;
@@ -327,17 +328,24 @@ pub fn submit_exec_plan_fragment_native(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::runtime::query_context::LegacyRuntimeFilterExecutionClaim;
     use crate::runtime::query_options::QueryOptions;
+    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
+    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
     fn context_submission_state(
         query_id: QueryId,
         exchange_node_id: i32,
-    ) -> Option<(usize, Option<CacheOptions>, Option<usize>)> {
+    ) -> Option<(usize, usize, Option<CacheOptions>, Option<usize>)> {
         query_context_manager()
             .with_context_mut(query_id, |ctx| {
                 Ok((
                     ctx.num_fragments,
+                    ctx.num_active_fragments,
                     ctx.cache_options(),
                     ctx.exchange_sender_count(exchange_node_id),
                 ))
@@ -379,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_filter_rejection_does_not_mutate_context_before_legal_retry() {
+    fn legacy_runtime_filter_rejection_claims_native_without_fragment_side_effects() {
         let query_id = QueryId {
             hi: 73_001,
             lo: 73_002,
@@ -401,27 +409,100 @@ mod tests {
             error.contains("contains legacy runtime-filter params"),
             "{error}"
         );
-        assert_eq!(context_submission_state(query_id, exchange_node_id), None);
-
-        let mut retry = native_instance_params(
-            query_id,
-            crate::proto::novarocks::RuntimeFilterParams::default(),
-        );
-        retry.runtime_filter_params = None;
-        retry.query_options = Some(crate::proto::novarocks::QueryOptions {
-            datacache_evict_probability: Some(101),
-            ..Default::default()
-        });
-        let retry_error =
-            submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), retry)
-                .expect_err("retry fixture must fail after context registration");
-        assert!(
-            retry_error.contains("datacache_evict_probability"),
-            "{retry_error}"
-        );
         assert_eq!(
             context_submission_state(query_id, exchange_node_id),
-            Some((1, None, None))
+            Some((0, 0, None, None))
+        );
+
+        let manager = query_context_manager();
+        manager
+            .with_context_mut(query_id, |ctx| {
+                assert_eq!(
+                    ctx.legacy_runtime_filter_execution_claim(),
+                    LegacyRuntimeFilterExecutionClaim::NativeDisabled
+                );
+                Ok(())
+            })
+            .expect("inspect retained NativeDisabled claim");
+        let params_set_error = manager
+            .set_runtime_filter_params(
+                query_id,
+                RuntimeFilterParams::new(BTreeMap::new(), BTreeMap::new(), None),
+            )
+            .expect_err("NativeDisabled claim must reject legacy params creation");
+        assert!(
+            params_set_error.contains("NativeDisabled"),
+            "{params_set_error}"
+        );
+        let params_error = manager
+            .get_runtime_filter_params(query_id)
+            .expect_err("NativeDisabled claim must reject legacy params access");
+        assert!(params_error.contains("NativeDisabled"), "{params_error}");
+        let pending_error = manager
+            .enqueue_pending_runtime_filter(query_id, 7, 0, vec![1], None)
+            .expect_err("NativeDisabled claim must reject pending payload creation");
+        assert!(pending_error.contains("NativeDisabled"), "{pending_error}");
+        let pending_access_error = manager
+            .with_context_mut(query_id, |ctx| ctx.drain_pending_runtime_filters())
+            .expect_err("NativeDisabled claim must reject pending payload access");
+        assert!(
+            pending_access_error.contains("NativeDisabled"),
+            "{pending_access_error}"
+        );
+        let hub_set_error = manager
+            .set_runtime_filter_hub(
+                query_id,
+                Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            )
+            .expect_err("NativeDisabled claim must reject legacy hub creation");
+        assert!(hub_set_error.contains("NativeDisabled"), "{hub_set_error}");
+        let hub_error = match manager.get_runtime_filter_hub(query_id) {
+            Ok(_) => panic!("NativeDisabled claim must reject legacy hub access"),
+            Err(error) => error,
+        };
+        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
+        let worker_error = match manager.get_or_create_runtime_filter_worker(query_id) {
+            Ok(_) => panic!("NativeDisabled claim must reject legacy worker creation"),
+            Err(error) => error,
+        };
+        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
+        let worker_access_error = match manager.get_runtime_filter_worker(query_id) {
+            Ok(_) => panic!("NativeDisabled claim must reject legacy worker access"),
+            Err(error) => error,
+        };
+        assert!(
+            worker_access_error.contains("NativeDisabled"),
+            "{worker_access_error}"
+        );
+
+        #[cfg(feature = "compat")]
+        {
+            let compat_error = manager
+                .get_or_register_compat(
+                    query_id,
+                    false,
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(60),
+                )
+                .expect_err("Compat fragment must conflict with the retained NativeDisabled claim");
+            assert!(compat_error.contains("NativeDisabled"), "{compat_error}");
+            assert_eq!(
+                context_submission_state(query_id, exchange_node_id),
+                Some((0, 0, None, None))
+            );
+        }
+
+        manager
+            .get_or_register_native(
+                query_id,
+                false,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .expect("legal Native fragment retry must register successfully");
+        assert_eq!(
+            context_submission_state(query_id, exchange_node_id),
+            Some((1, 1, None, None))
         );
     }
 

@@ -283,7 +283,9 @@ impl QueryContext {
     }
 
     #[cfg(test)]
-    fn legacy_runtime_filter_execution_claim(&self) -> LegacyRuntimeFilterExecutionClaim {
+    pub(crate) fn legacy_runtime_filter_execution_claim(
+        &self,
+    ) -> LegacyRuntimeFilterExecutionClaim {
         self.legacy_runtime_filter_execution
     }
 
