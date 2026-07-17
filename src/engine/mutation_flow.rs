@@ -306,21 +306,15 @@ fn build_update_mor_change_stream_write_plan(
         )?;
     }
 
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
+    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
-    let analyzer_provider = crate::engine::build_analyzer_provider(
+    let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
-        &catalog_snapshot,
-        &catalog_mgr_snapshot,
+        &catalog_service_snapshot,
         &connectors_snapshot,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -2081,7 +2075,7 @@ fn execute_update_match_query(
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal UPDATE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_mgr(
+    let result = crate::engine::execute_query_with_catalog_service(
         state,
         current_catalog,
         current_database,
@@ -3129,21 +3123,15 @@ fn build_merge_mor_change_stream_write_plan(
         )?;
     }
 
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
+    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
-    let analyzer_provider = crate::engine::build_analyzer_provider(
+    let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
-        &catalog_snapshot,
-        &catalog_mgr_snapshot,
+        &catalog_service_snapshot,
         &connectors_snapshot,
     );
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
@@ -3198,7 +3186,7 @@ fn execute_merge_match_query(
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal MERGE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_mgr(
+    let result = crate::engine::execute_query_with_catalog_service(
         state,
         current_catalog,
         current_database,

@@ -27,13 +27,13 @@ use crate::connector::iceberg::changes::{
     previous_snapshot_data_file_lineage_index, scan_deleted_data_file_rows,
     scan_equality_delete_rows_for_table_at,
 };
-use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::iceberg_delta_scan::BaseDataFileLineage;
 use crate::runtime::query_result::QueryResult;
+use crate::sql::catalog::local::PlannerMemoryCatalog;
 
 pub(crate) struct IvmDeltaSourceFiles {
     pub previous_snapshot_id: i64,
@@ -238,7 +238,7 @@ pub(crate) fn execute_delta_source_query(
         source_files.files,
     )?;
 
-    let mut delta_catalog = InMemoryCatalog::default();
+    let mut delta_catalog = PlannerMemoryCatalog::default();
     delta_catalog.create_database(&namespace)?;
     delta_catalog
         .register(&namespace, table_def)

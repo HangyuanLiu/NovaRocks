@@ -979,10 +979,8 @@ pub(crate) fn execute_drop_catalog_statement(
             let normalized_catalog = normalize_identifier(catalog_name)?;
             delete_iceberg_catalog_if_needed(state, &normalized_catalog)?;
             state
-                .catalog_mgr
-                .write()
-                .expect("catalog mgr write lock")
-                .unregister(&normalized_catalog);
+                .catalog_service
+                .unregister_catalog(&normalized_catalog);
             Ok(StatementResult::Ok)
         }
         Err(err) if if_exists && err.contains("unknown catalog") => Ok(StatementResult::Ok),
@@ -1103,8 +1101,7 @@ pub(crate) fn execute_drop_table_statement(
                     &target.namespace,
                     &target.table,
                 )?;
-                crate::engine::query_prep::invalidate_catalog_mgr_table(
-                    state,
+                state.catalog_service.invalidate_table(
                     &target.catalog,
                     &target.namespace,
                     &target.table,
@@ -1152,12 +1149,9 @@ fn cleanup_iceberg_drop_table_registration_if_exists(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
 ) -> Result<(), String> {
-    crate::engine::query_prep::invalidate_catalog_mgr_table(
-        state,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
+    state
+        .catalog_service
+        .invalidate_table(&target.catalog, &target.namespace, &target.table)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
         &target.namespace,
@@ -1173,7 +1167,8 @@ fn drop_local_catalog_table(
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name.parts.as_slice(), current_database)?;
     let mut guard = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     match guard.drop_table(&resolved.database, &resolved.table) {

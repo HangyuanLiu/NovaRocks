@@ -15,37 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Analyzer-facing adapter over CatalogMgr plus the local InMemoryCatalog.
-
 use crate::catalog::partition::LegacyRangePartition;
 use crate::catalog::provider::CatalogProvider;
+use crate::catalog::service::CatalogService;
 use crate::catalog::table::CatalogTable;
 use crate::connector::ConnectorRegistry;
-use crate::engine::catalog::InMemoryCatalog;
-use crate::engine::catalog_mgr::CatalogMgr;
 use crate::sql::catalog::{
-    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
+    CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
+    ResolvedAnalyzerTable,
 };
 use crate::sql::planner::table::TableDef;
 
-pub(crate) struct CatalogMgrProvider<'a> {
+pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
-    local: &'a InMemoryCatalog,
-    catalog_mgr: &'a CatalogMgr,
+    service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
     connectors: &'a ConnectorRegistry,
 }
 
-impl<'a> CatalogMgrProvider<'a> {
+impl<'a> CatalogServiceProvider<'a> {
     pub(crate) fn new(
         current_catalog: Option<&'a str>,
-        local: &'a InMemoryCatalog,
-        catalog_mgr: &'a CatalogMgr,
+        service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
         connectors: &'a ConnectorRegistry,
     ) -> Self {
         Self {
             current_catalog,
-            local,
-            catalog_mgr,
+            service,
             connectors,
         }
     }
@@ -62,7 +57,12 @@ impl<'a> CatalogMgrProvider<'a> {
     ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                let planner = self.local.get(database, table)?;
+                let planner = self
+                    .service
+                    .local()
+                    .read()
+                    .expect("catalog service local read lock")
+                    .get(database, table)?;
                 Ok(ResolvedAnalyzerTable::from_planner(
                     Some("default_catalog"),
                     database,
@@ -70,10 +70,16 @@ impl<'a> CatalogMgrProvider<'a> {
                 ))
             }
             Some(catalog) => {
-                let metadata = self.catalog_mgr.resolve(catalog, database, table)?;
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
                 Ok(ResolvedAnalyzerTable {
-                    catalog: metadata.to_catalog_table(),
-                    planner: metadata.to_table_def(),
+                    catalog: metadata.table,
+                    planner,
                 })
             }
         }
@@ -87,7 +93,12 @@ impl<'a> CatalogMgrProvider<'a> {
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     ) -> Result<TableDef, String> {
         match self.effective_catalog(catalog) {
-            Some("default_catalog") | None => self.local.get(database, table),
+            Some("default_catalog") | None => self
+                .service
+                .local()
+                .read()
+                .expect("catalog service local read lock")
+                .get(database, table),
             Some(catalog)
                 if metadata_table_type
                     == crate::connector::iceberg::IcebergMetadataTableType::Partitions =>
@@ -99,11 +110,11 @@ impl<'a> CatalogMgrProvider<'a> {
             }
             Some(catalog)
                 if matches!(
-                metadata_table_type,
-                crate::connector::iceberg::IcebergMetadataTableType::Files
-                    | crate::connector::iceberg::IcebergMetadataTableType::Manifests
-                    | crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
-            ) =>
+                    metadata_table_type,
+                    crate::connector::iceberg::IcebergMetadataTableType::Files
+                        | crate::connector::iceberg::IcebergMetadataTableType::Manifests
+                        | crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
+                ) =>
             {
                 let backend = self.connectors.catalog_backend("iceberg")?;
                 let source = self.connectors.table_source("iceberg")?;
@@ -120,7 +131,7 @@ impl<'a> CatalogMgrProvider<'a> {
     }
 }
 
-impl CatalogProvider for CatalogMgrProvider<'_> {
+impl CatalogProvider for CatalogServiceProvider<'_> {
     fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String> {
         self.resolve_table_for_analysis_once(None, database, table)
             .map(|resolved| resolved.catalog)
@@ -142,12 +153,15 @@ impl CatalogProvider for CatalogMgrProvider<'_> {
         table: &str,
         partition: &str,
     ) -> Result<Option<LegacyRangePartition>, String> {
-        self.local
+        self.service
+            .local()
+            .read()
+            .expect("catalog service local read lock")
             .get_legacy_range_partition(database, table, partition)
     }
 }
 
-impl PlannerTableProvider for CatalogMgrProvider<'_> {
+impl PlannerTableProvider for CatalogServiceProvider<'_> {
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,
@@ -162,7 +176,7 @@ impl PlannerTableProvider for CatalogMgrProvider<'_> {
     }
 }
 
-impl IcebergMetadataTableProvider for CatalogMgrProvider<'_> {
+impl IcebergMetadataTableProvider for CatalogServiceProvider<'_> {
     fn get_iceberg_metadata_table(
         &self,
         catalog: Option<&str>,
@@ -176,57 +190,37 @@ impl IcebergMetadataTableProvider for CatalogMgrProvider<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, RwLock};
+
+    use arrow::datatypes::DataType;
+
+    use super::CatalogServiceProvider;
     use crate::catalog::identifier::TableIdentity;
+    use crate::catalog::memory::MemoryCatalog;
+    use crate::catalog::provider::CatalogProvider;
+    use crate::catalog::registry::{Catalog, CatalogRegistry};
     use crate::catalog::schema::ColumnDef;
+    use crate::catalog::service::CatalogService;
     use crate::connector::backend::{
         CatalogBackend, CreateTableRequest, ResolvedTable, TableSource,
     };
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::catalog::InMemoryCatalog;
-    use crate::engine::catalog_mgr::catalog::Catalog;
-    use crate::engine::catalog_mgr::iceberg::IcebergCatalog;
-    use crate::engine::catalog_mgr::metadata::{TableBinding, TableMetadata};
+    use crate::sql::catalog::{
+        CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
+    };
     use crate::sql::parser::ast::AlterIcebergPartitionSpecStmt;
-    use crate::sql::planner::table::ScanSource;
-    use arrow::datatypes::DataType;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::sql::planner::table::{ScanSource, TableDef};
 
-    struct FixedIceCatalog;
-    impl Catalog for FixedIceCatalog {
-        fn name(&self) -> &str {
-            "ice"
-        }
-
-        fn get_table_metadata(
-            &self,
-            namespace: &str,
-            table: &str,
-        ) -> Result<TableMetadata, String> {
-            Ok(TableMetadata {
-                identity: TableIdentity::new("ice", namespace, table),
-                columns: vec![ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                }],
-                iceberg_row_lineage_columns: vec![ColumnDef {
-                    name: "_row_id".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                }],
-                binding: TableBinding::Iceberg {
-                    info: iceberg_info(),
-                    cloud_properties: Default::default(),
-                },
-            })
+    fn column(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
         }
     }
 
@@ -245,18 +239,106 @@ mod tests {
         }
     }
 
+    fn runtime_metadata() -> CatalogRuntimeMetadata {
+        CatalogRuntimeMetadata::from_table_def(
+            TableIdentity::new("ice", "db", "orders"),
+            &TableDef {
+                name: "orders".to_string(),
+                columns: vec![column("id")],
+                iceberg_row_lineage_metadata_columns: vec![column("_row_id")],
+                source: ScanSource::IcebergDataFiles {
+                    table: iceberg_info(),
+                    files: vec![],
+                    cloud_properties: Default::default(),
+                    binding:
+                        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                },
+            },
+        )
+        .expect("runtime metadata")
+    }
+
+    struct TrackingCatalog {
+        resolutions: Arc<AtomicUsize>,
+    }
+
+    impl Catalog<CatalogRuntimeMetadata> for TrackingCatalog {
+        fn name(&self) -> &str {
+            "ice"
+        }
+
+        fn get_table_metadata(
+            &self,
+            namespace: &str,
+            table: &str,
+        ) -> Result<CatalogRuntimeMetadata, String> {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(namespace, "db");
+            assert_eq!(table, "orders");
+            Ok(runtime_metadata())
+        }
+    }
+
+    fn service(resolutions: Arc<AtomicUsize>) -> CatalogService<TableDef, CatalogRuntimeMetadata> {
+        let mut registry = CatalogRegistry::new();
+        registry.register(Arc::new(TrackingCatalog { resolutions }));
+        CatalogService::new(Arc::new(RwLock::new(MemoryCatalog::default())), registry)
+    }
+
+    #[test]
+    fn ordinary_external_lookup_resolves_registry_exactly_once() {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let service = service(Arc::clone(&resolutions));
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
+
+        let resolved =
+            PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
+                .expect("resolve table");
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolved.catalog.identity,
+            TableIdentity::new("ice", "db", "orders")
+        );
+        assert_eq!(resolved.catalog.hidden_columns[0].name, "_row_id");
+        assert_eq!(resolved.planner.name, "orders");
+        assert!(matches!(
+            resolved.planner.source,
+            ScanSource::IcebergDataFiles { .. }
+        ));
+        assert!(
+            service
+                .local()
+                .read()
+                .expect("local read lock")
+                .get("db", "orders")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn neutral_external_lookup_uses_the_same_authoritative_resolution() {
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let service = service(Arc::clone(&resolutions));
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
+
+        let table =
+            CatalogProvider::get_table(&provider, "db", "orders").expect("resolve neutral table");
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(table.identity, TableIdentity::new("ice", "db", "orders"));
+        assert_eq!(table.columns[0].name, "id");
+        assert_eq!(table.hidden_columns[0].name, "_row_id");
+    }
+
     fn resolved_table(catalog: &str, namespace: &str, table: &str) -> ResolvedTable {
         ResolvedTable {
             catalog: catalog.to_string(),
             namespace: namespace.to_string(),
             table: table.to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
+            columns: vec![column("id")],
         }
     }
 
@@ -368,21 +450,20 @@ mod tests {
         }
     }
 
-    fn provider_with_tracking_connectors<'a>(
-        local: &'a InMemoryCatalog,
-        mgr: &'a CatalogMgr,
-        connectors: &'a mut crate::connector::ConnectorRegistry,
-    ) -> (
-        CatalogMgrProvider<'a>,
+    fn tracking_connectors() -> (
+        crate::connector::ConnectorRegistry,
+        Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
+        let loads = Arc::new(AtomicUsize::new(0));
         let full_calls = Arc::new(AtomicUsize::new(0));
         let schema_calls = Arc::new(AtomicUsize::new(0));
         let metadata_row_calls = Arc::new(AtomicUsize::new(0));
+        let mut connectors = crate::connector::ConnectorRegistry::default();
         connectors.register_catalog_backend(Arc::new(TrackingBackend {
-            loads: Arc::new(AtomicUsize::new(0)),
+            loads: Arc::clone(&loads),
         }));
         connectors.register_table_source(Arc::new(TrackingSource {
             full_calls: Arc::clone(&full_calls),
@@ -390,7 +471,8 @@ mod tests {
             metadata_row_calls: Arc::clone(&metadata_row_calls),
         }));
         (
-            CatalogMgrProvider::new(Some("ice"), local, mgr, connectors),
+            connectors,
+            loads,
             full_calls,
             schema_calls,
             metadata_row_calls,
@@ -398,105 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_resolves_current_catalog_without_mutating_local_catalog() {
-        let local = InMemoryCatalog::default();
-        let mut mgr = CatalogMgr::new();
-        mgr.register(Arc::new(FixedIceCatalog));
-        let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
-
-        let table =
-            PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
-                .expect("resolve")
-                .planner;
-
-        assert_eq!(table.name, "orders");
-        assert!(matches!(table.source, ScanSource::IcebergDataFiles { .. }));
-        assert!(local.get("db", "orders").is_err());
-    }
-
-    #[test]
-    fn neutral_provider_preserves_external_identity_and_schema() {
-        let local = InMemoryCatalog::default();
-        let mut mgr = CatalogMgr::new();
-        mgr.register(Arc::new(FixedIceCatalog));
-        let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
-
-        let table =
-            CatalogProvider::get_table(&provider, "db", "orders").expect("resolve neutral table");
-
-        assert_eq!(table.identity, TableIdentity::new("ice", "db", "orders"));
-        assert_eq!(table.columns[0].name, "id");
-        assert_eq!(table.hidden_columns[0].name, "_row_id");
-    }
-
-    #[test]
-    fn ordinary_lookup_cannot_be_switched_to_full_scan_binding_mode() {
-        let local = InMemoryCatalog::default();
-        let mut mgr = CatalogMgr::new();
-        mgr.register(Arc::new(FixedIceCatalog));
-        let mut connectors = crate::connector::ConnectorRegistry::default();
-        let full_calls = Arc::new(AtomicUsize::new(0));
-        connectors.register_catalog_backend(Arc::new(TrackingBackend {
-            loads: Arc::new(AtomicUsize::new(0)),
-        }));
-        connectors.register_table_source(Arc::new(TrackingSource {
-            full_calls: Arc::clone(&full_calls),
-            schema_calls: Arc::new(AtomicUsize::new(0)),
-            metadata_row_calls: Arc::new(AtomicUsize::new(0)),
-        }));
-        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
-
-        let _ = PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
-            .expect("ordinary lookup");
-
-        assert_eq!(
-            full_calls.load(Ordering::SeqCst),
-            0,
-            "ordinary catalog lookup must never build a full scan binding"
-        );
-    }
-
-    #[test]
-    fn ordinary_lookup_populates_schema_cache_without_full_scan_binding() {
-        let local = InMemoryCatalog::default();
-        let loads = Arc::new(AtomicUsize::new(0));
-        let full_calls = Arc::new(AtomicUsize::new(0));
-        let schema_calls = Arc::new(AtomicUsize::new(0));
-        let mut mgr = CatalogMgr::new();
-        mgr.register(Arc::new(IcebergCatalog::new(
-            "ice",
-            Arc::new(TrackingBackend {
-                loads: Arc::clone(&loads),
-            }),
-            Arc::new(TrackingSource {
-                full_calls: Arc::clone(&full_calls),
-                schema_calls: Arc::clone(&schema_calls),
-                metadata_row_calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        )));
-        let connectors = crate::connector::ConnectorRegistry::default();
-        let provider = CatalogMgrProvider::new(Some("ice"), &local, &mgr, &connectors);
-
-        let first =
-            PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
-                .expect("schema cache miss")
-                .planner;
-        let second =
-            PlannerTableProvider::resolve_table_for_analysis(&provider, None, "db", "orders")
-                .expect("schema cache hit")
-                .planner;
-
-        assert_eq!(first.name, second.name);
-        assert_eq!(loads.load(Ordering::SeqCst), 1);
-        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn provider_preserves_metadata_builder_lanes() {
+    fn metadata_lookup_preserves_explicit_connector_builder_lanes() {
         for (metadata_type, expected_metadata, expected_calls) in [
+            (
+                IcebergMetadataTableType::Partitions,
+                "full-metadata",
+                (1, 0, 0),
+            ),
             (IcebergMetadataTableType::Files, "metadata-rows", (0, 0, 1)),
             (
                 IcebergMetadataTableType::Manifests,
@@ -520,12 +510,11 @@ mod tests {
             ),
             (IcebergMetadataTableType::Refs, "schema-metadata", (0, 1, 0)),
         ] {
-            let local = InMemoryCatalog::default();
-            let mut mgr = CatalogMgr::new();
-            mgr.register(Arc::new(FixedIceCatalog));
-            let mut connectors = crate::connector::ConnectorRegistry::default();
-            let (provider, full_calls, schema_calls, metadata_row_calls) =
-                provider_with_tracking_connectors(&local, &mgr, &mut connectors);
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let service = service(Arc::clone(&resolutions));
+            let (connectors, loads, full_calls, schema_calls, metadata_row_calls) =
+                tracking_connectors();
+            let provider = CatalogServiceProvider::new(Some("ice"), &service, &connectors);
 
             let table = IcebergMetadataTableProvider::get_iceberg_metadata_table(
                 &provider,
@@ -536,6 +525,8 @@ mod tests {
             )
             .expect("resolve metadata table");
 
+            assert_eq!(resolutions.load(Ordering::SeqCst), 0);
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
             assert_eq!(full_calls.load(Ordering::SeqCst), expected_calls.0);
             assert_eq!(schema_calls.load(Ordering::SeqCst), expected_calls.1);
             assert_eq!(metadata_row_calls.load(Ordering::SeqCst), expected_calls.2);
@@ -556,32 +547,5 @@ mod tests {
                 Some("http://minio:9000")
             );
         }
-    }
-
-    #[test]
-    fn provider_uses_full_table_def_for_partitions_metadata_lookup() {
-        let local = InMemoryCatalog::default();
-        let mut mgr = CatalogMgr::new();
-        mgr.register(Arc::new(FixedIceCatalog));
-        let mut connectors = crate::connector::ConnectorRegistry::default();
-        let (provider, full_calls, schema_calls, metadata_row_calls) =
-            provider_with_tracking_connectors(&local, &mgr, &mut connectors);
-
-        let table = IcebergMetadataTableProvider::get_iceberg_metadata_table(
-            &provider,
-            None,
-            "db",
-            "orders",
-            IcebergMetadataTableType::Partitions,
-        )
-        .expect("resolve partitions metadata table");
-
-        assert_eq!(full_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(schema_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(metadata_row_calls.load(Ordering::SeqCst), 0);
-        let ScanSource::IcebergDataFiles { table, .. } = table.source else {
-            panic!("expected iceberg source");
-        };
-        assert_eq!(table.serialized_metadata.as_deref(), Some("full-metadata"));
     }
 }

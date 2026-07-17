@@ -499,7 +499,11 @@ impl VirtualTableProvider for SchemataProvider {
         // that CREATE DATABASE registers via the StarRocks connector backend,
         // so a single enumeration covers both the synthetic info_schema
         // entry and every user-created namespace).
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         let mut databases: Vec<String> = catalog.database_names().map(str::to_string).collect();
         drop(catalog);
         databases.sort();

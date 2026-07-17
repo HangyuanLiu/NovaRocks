@@ -1339,7 +1339,8 @@ fn commit_catalog_visible_version(
         .ok_or_else(|| format!("StarRocks runtime missing for table_id={table_id}"))?;
 
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     register_starrocks_table_in_catalog(&mut catalog, &runtime)?;
@@ -1369,7 +1370,11 @@ fn insert_from_query_into_starrocks_table(
     // references in the SELECT pick up the right schema; matches the INSERT
     // target namespace established by `resolve_starrocks_name`.
     let query_result = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         let connectors_snapshot = state
             .connectors
             .read()
@@ -1708,7 +1713,6 @@ mod mv_target_tests {
     use crate::connector::starrocks::table::{
         StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
     };
-    use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::mv::agg_state::state_codec::{encode_count_state, encode_sum_int64};
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
@@ -1722,6 +1726,7 @@ mod mv_target_tests {
     };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
     use arrow::array::{Array, BinaryBuilder, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
@@ -2686,7 +2691,7 @@ mod mv_target_tests {
 
         let starrocks = StarRocksTableCatalog::rebuild(Some(config.clone()), snapshot)
             .expect("rebuild StarRocks");
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         catalog.create_database("analytics").expect("database");
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks).expect("register catalog");
         let mut state = StandaloneState {
@@ -2695,9 +2700,12 @@ mod mv_target_tests {
             metadata_provider: Some(Arc::new(metadata_provider)),
             ..Default::default()
         };
-        state.catalog = Arc::new(std::sync::RwLock::new(catalog));
+        *state
+            .catalog_service
+            .local()
+            .write()
+            .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_mgr_entries(&state);
 
         MvTestFixture {
             state,
@@ -3167,7 +3175,7 @@ mod mv_target_tests {
 
         let starrocks = StarRocksTableCatalog::rebuild(Some(config.clone()), snapshot)
             .map_err(|e| format!("rebuild StarRocks failed: {e}"))?;
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         catalog
             .create_database("analytics")
             .map_err(|e| format!("create analytics failed: {e}"))?;
@@ -3179,9 +3187,12 @@ mod mv_target_tests {
             metadata_provider: Some(Arc::new(metadata_provider)),
             ..Default::default()
         };
-        state.catalog = Arc::new(std::sync::RwLock::new(catalog));
+        *state
+            .catalog_service
+            .local()
+            .write()
+            .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_mgr_entries(&state);
 
         Ok(MvTestFixture {
             state,

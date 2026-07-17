@@ -953,7 +953,8 @@ fn try_register_scoped_framework_locator_table(
 ) -> Result<Option<ScopedFrameworkLocatorTable>, String> {
     let table_name = table_def.name.clone();
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .map_err(|e| format!("standalone catalog write lock: {e}"))?;
     catalog
@@ -1031,7 +1032,8 @@ impl ScopedFrameworkLocatorTable {
 
         let mut catalog = self
             .state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .map_err(|e| format!("standalone catalog write lock: {e}"))?;
         let current_table = match catalog.get(&self.namespace, &self.table) {
@@ -2961,7 +2963,11 @@ mod tests {
                 .any(|column| column.name == "_pos")
         );
         {
-            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            let mut catalog_guard = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("standalone catalog");
             catalog_guard.create_database("db").expect("create db");
             catalog_guard
                 .register("db", table_def)
@@ -3075,7 +3081,11 @@ mod tests {
             .expect("build standard target table def");
         assert_standard_mv_target_table_def_hides_physical_apply_key(&standard_table_def);
         {
-            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            let mut catalog_guard = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("standalone catalog");
             catalog_guard.create_database("db").expect("create db");
             catalog_guard
                 .register("db", standard_table_def)
@@ -3123,7 +3133,8 @@ mod tests {
 
         assert_position_delete_groups_eq(direct_groups, framework_groups);
         let target_def_after_framework = state
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog")
             .get("db", "mv_target")
@@ -3470,7 +3481,11 @@ mod tests {
             .map(|nonce| format!("{prefix}_{nonce}"))
             .collect::<Vec<_>>();
         {
-            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            let mut catalog_guard = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("standalone catalog");
             catalog_guard.create_database("db").expect("create db");
             for name in &colliding_names {
                 catalog_guard
@@ -3506,7 +3521,11 @@ mod tests {
         .expect("framework apply-key locator");
         assert_eq!(located.delete_groups.len(), 1);
 
-        let catalog_guard = state.catalog.read().expect("standalone catalog");
+        let catalog_guard = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog");
         for name in &colliding_names {
             let table_def = catalog_guard.get("db", name).unwrap_or_else(|err| {
                 panic!("pre-existing collision table {name} was dropped: {err}")
@@ -3535,7 +3554,11 @@ mod tests {
         let overwritten_table_def =
             sentinel_framework_locator_table_def(synthetic_name, "overwritten_owner", 9201, 9202);
         {
-            let mut catalog_guard = state.catalog.write().expect("standalone catalog");
+            let mut catalog_guard = state
+                .catalog_service
+                .local()
+                .write()
+                .expect("standalone catalog");
             catalog_guard
                 .register("db", overwritten_table_def.clone())
                 .expect("overwrite synthetic table name");
@@ -3546,7 +3569,8 @@ mod tests {
             .expect("cleanup overwritten locator table");
 
         let current_table_def = state
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog")
             .get("db", synthetic_name)

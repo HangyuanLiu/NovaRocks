@@ -720,19 +720,14 @@ pub(crate) fn analyze_visible_query(
         );
     };
 
-    let catalog = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
+    let catalog_service = crate::engine::catalog_service_snapshot(state);
     let connectors = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr = crate::engine::catalog_mgr_snapshot(state);
     let provider =
-        crate::engine::build_analyzer_provider(None, &catalog, &catalog_mgr, &connectors);
+        crate::engine::build_catalog_service_provider(None, &catalog_service, &connectors);
     let (resolved, _cte_registry, _factory) =
         crate::sql::analyzer::analyze(&query, &provider, current_database)
             .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
@@ -769,7 +764,7 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
         )?;
     }
 
-    crate::engine::execute_query_with_catalog_mgr(
+    crate::engine::execute_query_with_catalog_service(
         state,
         current_catalog,
         current_database,

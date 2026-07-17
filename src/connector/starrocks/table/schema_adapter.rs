@@ -499,6 +499,7 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::memory::DEFAULT_DATABASE;
     use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
     use crate::connector::starrocks::table::ddl::{
@@ -507,7 +508,6 @@ mod tests {
     use crate::connector::starrocks::table::model::{
         StarRocksTableKind, StarRocksTableState, StoredStarRocksColumn, StoredStarRocksTable,
     };
-    use crate::engine::catalog::DEFAULT_DATABASE;
     use crate::sql::parser::ast::{ColumnAggregation, TableColumnDef, TableKeyDesc, TableKeyKind};
 
     use super::{

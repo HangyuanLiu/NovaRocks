@@ -60,14 +60,19 @@ impl CatalogBackend for StarRocksTableBackend {
 
     fn namespace_exists(&self, _catalog: &str, database: &str) -> Result<bool, String> {
         let state = self.state()?;
-        let logical = state.catalog.read().expect("standalone catalog read lock");
+        let logical = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         logical.database_exists(database)
     }
 
     fn create_namespace(&self, _catalog: &str, database: &str) -> Result<(), String> {
         let state = self.state()?;
         let mut logical = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .expect("standalone catalog write lock");
         logical.create_database(database)
@@ -90,7 +95,8 @@ impl CatalogBackend for StarRocksTableBackend {
             }
         }
         let mut logical = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .expect("standalone catalog write lock");
         logical.drop_database(database)
@@ -118,7 +124,11 @@ impl CatalogBackend for StarRocksTableBackend {
 
     fn table_exists(&self, _catalog: &str, database: &str, table: &str) -> Result<bool, String> {
         let state = self.state()?;
-        let logical = state.catalog.read().expect("standalone catalog read lock");
+        let logical = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         Ok(logical.get(database, table).is_ok())
     }
 
@@ -140,7 +150,11 @@ impl CatalogBackend for StarRocksTableBackend {
         table: &str,
     ) -> Result<ResolvedTable, String> {
         let state = self.state()?;
-        let logical = state.catalog.read().expect("standalone catalog read lock");
+        let logical = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         let table_def = logical.get(database, table)?;
         Ok(ResolvedTable {
             catalog: String::new(),

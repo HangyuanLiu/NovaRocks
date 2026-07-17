@@ -64,46 +64,6 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
         migration_task: "EBD-5B",
     },
     EngineFileOwner {
-        path: "src/engine/catalog.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-4",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/catalog.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/iceberg.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/internal.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/metadata.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/mod.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/provider.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
-        path: "src/engine/catalog_mgr/schema_cache.rs",
-        target_owner: "catalog",
-        migration_task: "EBD-5A",
-    },
-    EngineFileOwner {
         path: "src/engine/delete_flow.rs",
         target_owner: "dml",
         migration_task: "EBD-11",
@@ -471,17 +431,9 @@ const ENGINE_FILE_OWNERS: &[EngineFileOwner] = &[
 ];
 
 const ENGINE_MODULE_DECLARATIONS: &[&str] = &[
-    "src/engine/catalog_mgr/mod.rs||external|path=default|catalog",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|iceberg",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|internal",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|metadata",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|provider",
-    "src/engine/catalog_mgr/mod.rs||external|path=default|schema_cache",
     "src/engine/mod.rs||external|path=default|aggregate",
     "src/engine/mod.rs||external|path=default|backend_ops",
     "src/engine/mod.rs||external|path=default|backend_resolver",
-    "src/engine/mod.rs||external|path=default|catalog",
-    "src/engine/mod.rs||external|path=default|catalog_mgr",
     "src/engine/mod.rs||external|path=default|delete_flow",
     "src/engine/mod.rs||external|path=default|delete_predicate_translate",
     "src/engine/mod.rs||external|path=default|dml_change_stream",
@@ -575,7 +527,7 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         &[
             "crate::engine::StandaloneState",
             "crate::engine::backend_resolver::resolve_table_target",
-            "crate::engine::execute_query_with_catalog_mgr",
+            "crate::engine::execute_query_with_catalog_service",
             "crate::engine::iceberg_writer::invalidate_iceberg_caches",
         ],
     ),
@@ -617,9 +569,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "src/connector/mod.rs",
         &[
             "crate::engine::StandaloneState",
-            "crate::engine::catalog::InMemoryCatalog",
-            "crate::engine::catalog_mgr::iceberg::IcebergCatalog::new",
-            "crate::engine::catalog_mgr::internal::InternalCatalog::new",
             "crate::engine::mv::iceberg_backend::IcebergMvBackend::new",
         ],
     ),
@@ -661,10 +610,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "src/connector/starrocks/table/catalog.rs",
-        &["crate::engine::catalog::InMemoryCatalog"],
-    ),
-    (
         "src/connector/starrocks/table/ddl.rs",
         &[
             "crate::engine::StandaloneState",
@@ -700,7 +645,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
         "src/connector/starrocks/table/ivm_delta_source.rs",
         &[
             "crate::engine::StandaloneState",
-            "crate::engine::catalog::InMemoryCatalog",
             "crate::engine::execute_query",
             "crate::engine::mv::agg_state::mv_shape::query_has_aggregate_surface",
             "crate::engine::mv::table_ref::IcebergTableRef",
@@ -902,7 +846,6 @@ const EXTERNAL_ENGINE_DEPENDENCIES: &[(&str, &[&str])] = &[
             "crate::engine::StandaloneNovaRocks",
             "crate::engine::StandaloneOptions",
             "crate::engine::StatementResult",
-            "crate::engine::catalog::DEFAULT_DATABASE",
             "crate::engine::mv_maintenance::MaintenanceCoordinatorConfig",
             "crate::engine::mv_maintenance::start_maintenance_coordinator_for_server",
             "crate::engine::mv_scheduler::RefreshCoordinatorConfig",
@@ -2427,7 +2370,7 @@ fn baseline_arrays_are_canonical() -> bool {
 fn ebd_1_engine_migration_firewall_matches_source_tree() {
     let actual = current_source_tree_snapshot();
     assert!(
-        actual.engine_files.len() >= 80,
+        actual.engine_files.len() >= 76,
         "EBD-1 must scan the full engine tree, found only {} files",
         actual.engine_files.len()
     );
@@ -6918,7 +6861,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7820,7 +7763,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8742,7 +8685,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8756,7 +8699,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
     );
 }
 
-const EBD_4B3B_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+const EBD_4B3B_PROVIDER: &str = "src/sql/catalog/provider.rs";
 const EBD_4B3B_ENGINE: &str = "src/engine/mod.rs";
 const EBD_4B3B_SQL_CATALOG: &str = "src/sql/catalog.rs";
 
@@ -8900,6 +8843,270 @@ fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
 }
 
 fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
+    fn unwrap_expr(expr: &syn::Expr) -> &syn::Expr {
+        match expr {
+            syn::Expr::Group(group) => unwrap_expr(&group.expr),
+            syn::Expr::Paren(paren) => unwrap_expr(&paren.expr),
+            syn::Expr::Try(try_expr) => unwrap_expr(&try_expr.expr),
+            _ => expr,
+        }
+    }
+
+    fn binding_name(local: &syn::Local) -> Option<String> {
+        let syn::Pat::Ident(pattern) = &local.pat else {
+            return None;
+        };
+        Some(pattern.ident.to_string())
+    }
+
+    fn method_call<'a>(expr: &'a syn::Expr, method: &str) -> Option<&'a syn::ExprMethodCall> {
+        let syn::Expr::MethodCall(call) = unwrap_expr(expr) else {
+            return None;
+        };
+        (call.method == method).then_some(call)
+    }
+
+    fn path_ident(expr: &syn::Expr) -> Option<String> {
+        let syn::Expr::Path(path) = unwrap_expr(expr) else {
+            return None;
+        };
+        (path.qself.is_none() && path.path.segments.len() == 1)
+            .then(|| path.path.segments[0].ident.to_string())
+    }
+
+    fn method_count(expr: &syn::Expr, method: &str) -> usize {
+        struct MethodVisitor<'a> {
+            method: &'a str,
+            count: usize,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for MethodVisitor<'_> {
+            fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+                if item.method == self.method {
+                    self.count += 1;
+                }
+                syn::visit::visit_expr_method_call(self, item);
+            }
+        }
+
+        let mut visitor = MethodVisitor { method, count: 0 };
+        syn::visit::Visit::visit_expr(&mut visitor, expr);
+        visitor.count
+    }
+
+    fn field_is_from_binding(expr: &syn::Expr, binding: &str, field: &str) -> bool {
+        let syn::Expr::Field(field_expr) = unwrap_expr(expr) else {
+            return false;
+        };
+        matches!(&field_expr.member, syn::Member::Named(member) if member == field)
+            && path_ident(&field_expr.base).as_deref() == Some(binding)
+    }
+
+    fn result_uses_resolved_metadata(
+        expr: &syn::Expr,
+        metadata_binding: &str,
+        planner_binding: &str,
+    ) -> bool {
+        let syn::Expr::Call(ok_call) = unwrap_expr(expr) else {
+            return false;
+        };
+        if !matches!(
+            ok_call.func.as_ref(),
+            syn::Expr::Path(path)
+                if path.qself.is_none()
+                    && ebd_4b3b_path_ends_with(&path.path, "Ok")
+                    && ok_call.args.len() == 1
+        ) {
+            return false;
+        }
+        let Some(argument) = ok_call.args.first() else {
+            return false;
+        };
+        let syn::Expr::Struct(result) = unwrap_expr(argument) else {
+            return false;
+        };
+        if !ebd_4b3b_path_ends_with(&result.path, "ResolvedAnalyzerTable")
+            || result.rest.is_some()
+            || result.fields.len() != 2
+        {
+            return false;
+        }
+
+        let mut catalog_from_metadata = false;
+        let mut planner_from_metadata = false;
+        for field in &result.fields {
+            match &field.member {
+                syn::Member::Named(member) if member == "catalog" => {
+                    catalog_from_metadata =
+                        field_is_from_binding(&field.expr, metadata_binding, "table");
+                }
+                syn::Member::Named(member) if member == "planner" => {
+                    planner_from_metadata =
+                        path_ident(&field.expr).as_deref() == Some(planner_binding);
+                }
+                _ => return false,
+            }
+        }
+        catalog_from_metadata && planner_from_metadata
+    }
+
+    fn resolution_branch_is_exact(block: &syn::Block, external_catalog: &str) -> bool {
+        let [
+            syn::Stmt::Local(metadata_local),
+            syn::Stmt::Local(planner_local),
+            syn::Stmt::Expr(result, None),
+        ] = block.stmts.as_slice()
+        else {
+            return false;
+        };
+        let Some(metadata_binding) = binding_name(metadata_local) else {
+            return false;
+        };
+        let Some(metadata_init) = &metadata_local.init else {
+            return false;
+        };
+        let Some(resolve) = method_call(&metadata_init.expr, "resolve") else {
+            return false;
+        };
+        if method_count(&resolve.receiver, "registry") != 1
+            || resolve.args.len() != 3
+            || resolve.args.first().and_then(path_ident).as_deref() != Some(external_catalog)
+            || resolve.args.iter().nth(1).and_then(path_ident).as_deref() != Some("database")
+            || resolve.args.iter().nth(2).and_then(path_ident).as_deref() != Some("table")
+        {
+            return false;
+        }
+
+        let Some(planner_binding) = binding_name(planner_local) else {
+            return false;
+        };
+        let Some(planner_init) = &planner_local.init else {
+            return false;
+        };
+        let Some(to_table_def) = method_call(&planner_init.expr, "to_table_def") else {
+            return false;
+        };
+        if path_ident(&to_table_def.receiver).as_deref() != Some(&metadata_binding) {
+            return false;
+        }
+
+        result_uses_resolved_metadata(result, &metadata_binding, &planner_binding)
+    }
+
+    fn external_catalog_binding(pattern: &syn::Pat) -> Option<String> {
+        let syn::Pat::TupleStruct(pattern) = pattern else {
+            return None;
+        };
+        if !ebd_4b3b_path_ends_with(&pattern.path, "Some") || pattern.elems.len() != 1 {
+            return None;
+        }
+        let Some(syn::Pat::Ident(binding)) = pattern.elems.first() else {
+            return None;
+        };
+        if binding.by_ref.is_some()
+            || binding.mutability.is_some()
+            || binding.subpat.is_some()
+            || matches!(
+                binding.ident.to_string().as_str(),
+                "self" | "database" | "table"
+            )
+        {
+            return None;
+        }
+        Some(binding.ident.to_string())
+    }
+
+    fn is_default_catalog_some_pattern(pattern: &syn::Pat) -> bool {
+        let syn::Pat::TupleStruct(pattern) = pattern else {
+            return false;
+        };
+        ebd_4b3b_path_ends_with(&pattern.path, "Some")
+            && pattern.elems.len() == 1
+            && matches!(
+                pattern.elems.first(),
+                Some(syn::Pat::Lit(literal))
+                    if matches!(
+                        &literal.lit,
+                        syn::Lit::Str(value) if value.value() == "default_catalog"
+                    )
+            )
+    }
+
+    fn is_none_pattern(pattern: &syn::Pat) -> bool {
+        matches!(
+            pattern,
+            syn::Pat::Ident(none)
+                if none.ident == "None"
+                    && none.by_ref.is_none()
+                    && none.mutability.is_none()
+                    && none.subpat.is_none()
+        ) || matches!(
+            pattern,
+            syn::Pat::Path(path) if ebd_4b3b_path_ends_with(&path.path, "None")
+        )
+    }
+
+    fn is_default_catalog_pattern(pattern: &syn::Pat) -> bool {
+        let syn::Pat::Or(pattern) = pattern else {
+            return false;
+        };
+        if pattern.cases.len() != 2 {
+            return false;
+        }
+        let mut default_some = 0;
+        let mut none = 0;
+        for case in &pattern.cases {
+            if is_default_catalog_some_pattern(case) {
+                default_some += 1;
+            } else if is_none_pattern(case) {
+                none += 1;
+            } else {
+                return false;
+            }
+        }
+        default_some == 1 && none == 1
+    }
+
+    fn external_resolution_tail_is_exact(block: &syn::Block) -> bool {
+        let [syn::Stmt::Expr(tail, None)] = block.stmts.as_slice() else {
+            return false;
+        };
+        let syn::Expr::Match(match_expr) = unwrap_expr(tail) else {
+            return false;
+        };
+        let Some(effective_catalog) = method_call(&match_expr.expr, "effective_catalog") else {
+            return false;
+        };
+        if path_ident(&effective_catalog.receiver).as_deref() != Some("self")
+            || effective_catalog.args.len() != 1
+            || effective_catalog
+                .args
+                .first()
+                .and_then(path_ident)
+                .as_deref()
+                != Some("catalog")
+        {
+            return false;
+        }
+
+        let [default_arm, external_arm] = match_expr.arms.as_slice() else {
+            return false;
+        };
+        if default_arm.guard.is_some()
+            || external_arm.guard.is_some()
+            || !is_default_catalog_pattern(&default_arm.pat)
+        {
+            return false;
+        }
+        let Some(external_catalog) = external_catalog_binding(&external_arm.pat) else {
+            return false;
+        };
+        let syn::Expr::Block(external_body) = unwrap_expr(&external_arm.body) else {
+            return false;
+        };
+        resolution_branch_is_exact(&external_body.block, &external_catalog)
+    }
+
     #[derive(Default)]
     struct ResolutionVisitor {
         resolve_calls: usize,
@@ -8929,9 +9136,10 @@ fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
     let mut visitor = ResolutionVisitor::default();
     syn::visit::Visit::visit_block(&mut visitor, block);
     visitor.resolve_calls == 1
-        && visitor.catalog_table_calls == 1
         && visitor.planner_table_calls == 1
+        && visitor.catalog_table_calls == 0
         && visitor.forbidden_calls == 0
+        && external_resolution_tail_is_exact(block)
 }
 
 fn ebd_4b3b_schema_only_helper_is_metadata_only(block: &syn::Block) -> bool {
@@ -9046,7 +9254,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
         impl<'ast> syn::visit::Visit<'ast> for BoundaryVisitor<'_> {
             fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
                 if self.path == EBD_4B3B_PROVIDER
-                    && item.ident == "CatalogMgrProvider"
+                    && item.ident == "CatalogServiceProvider"
                     && let syn::Fields::Named(fields) = &item.fields
                 {
                     for field in &fields.named {
@@ -9073,7 +9281,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
                         item.self_ty.as_ref(),
                         syn::Type::Path(path)
                             if path.path.segments.last().is_some_and(|segment| {
-                                segment.ident == "CatalogMgrProvider"
+                                segment.ident == "CatalogServiceProvider"
                             })
                     )
                     && item
@@ -9204,8 +9412,8 @@ fn ebd_4b3b_detector_rejects_statistics_lookup_rewiring() {
         GuardSource::new(
             EBD_4B3B_PROVIDER,
             r#"
-struct CatalogMgrProvider { default_mode: TableLookupMode }
-impl PlannerTableProvider for CatalogMgrProvider {
+struct CatalogServiceProvider { default_mode: TableLookupMode }
+impl PlannerTableProvider for CatalogServiceProvider {
     fn new(default_mode: TableLookupMode) -> Self { todo!() }
     fn iceberg_table_def(&self, mode: &TableLookupMode) {
         match mode {
@@ -9278,6 +9486,244 @@ fn execute() {
         violations
             .iter()
             .any(|item| item.contains("explain-full-payload-read"))
+    );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_catalog_table_not_derived_from_resolved_metadata() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        let metadata = self
+            .service
+            .registry()
+            .read()
+            .expect("catalog service registry read lock")
+            .resolve(catalog.unwrap(), database, table)?;
+        let planner = metadata.to_table_def();
+        Ok(ResolvedAnalyzerTable {
+            catalog: CatalogTable::default(),
+            planner,
+        })
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "a fake CatalogTable must not satisfy one-resolution metadata provenance: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_unreachable_metadata_provenance_decoy() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        if false {
+            let _ = {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog.unwrap(), database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            };
+        }
+        Ok(ResolvedAnalyzerTable {
+            catalog: CatalogTable::default(),
+            planner: TableDef::default(),
+        })
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "unreachable metadata provenance must not validate a fake tail result: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_shadowed_or_misbound_external_catalog_arms() {
+    for (case, match_arms) in [
+        (
+            "preceding Some wildcard",
+            r#"
+            Some(_) => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+"#,
+        ),
+        (
+            "preceding catch all",
+            r#"
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            _ => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+"#,
+        ),
+        (
+            "misbound resolve catalog",
+            r#"
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(other_catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+"#,
+        ),
+    ] {
+        let source = format!(
+            r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {{
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {{
+        match self.effective_catalog(catalog) {{
+{match_arms}
+        }}
+    }}
+}}
+"#
+        );
+        let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&[GuardSource::new(
+            EBD_4B3B_PROVIDER,
+            &source,
+        )]);
+        assert!(
+            violations
+                .iter()
+                .any(|item| item.contains("neutral-resolution-helper-shape")),
+            "{case} must not satisfy the external catalog resolution partition: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_4b3b_detector_rejects_external_catalog_arm_before_default_arm() {
+    let sources = vec![GuardSource::new(
+        EBD_4B3B_PROVIDER,
+        r#"
+struct CatalogServiceProvider;
+impl CatalogServiceProvider {
+    fn resolve_table_for_analysis_once(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        match self.effective_catalog(catalog) {
+            Some(catalog) => {
+                let metadata = self
+                    .service
+                    .registry()
+                    .read()
+                    .expect("catalog service registry read lock")
+                    .resolve(catalog, database, table)?;
+                let planner = metadata.to_table_def();
+                Ok(ResolvedAnalyzerTable {
+                    catalog: metadata.table,
+                    planner,
+                })
+            }
+            Some("default_catalog") | None => Ok(ResolvedAnalyzerTable {
+                catalog: CatalogTable::default(),
+                planner: TableDef::default(),
+            }),
+        }
+    }
+}
+"#,
+    )];
+
+    let violations = ebd_4b3b_audit_statistics_lookup_decoupling(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.contains("neutral-resolution-helper-shape")),
+        "external catalog arm before default arm must not satisfy the resolution partition: {violations:?}"
     );
 }
 
@@ -9876,7 +10322,12 @@ fn ebd_4b3c_audit_paths_definitions_and_forwarding(sources: &[GuardSource]) -> B
 
         fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
             self.record_definition("type", &item.ident.to_string());
-            if ebd_4b3c_type_contains_model_path(
+            if !ebd_5a1_is_allowed_sql_specialization_alias(
+                &self.source.path,
+                &self.inline_modules,
+                self.aliases,
+                item,
+            ) && ebd_4b3c_type_contains_model_path(
                 &item.ty,
                 self.source,
                 self.aliases,
@@ -12889,7 +13340,7 @@ const EBD_4B3D_PROVIDER_OWNER: &str = "src/catalog/provider.rs";
 const EBD_4B3D_PARTITION_OWNER: &str = "src/catalog/partition.rs";
 const EBD_4B3D_PLANNER_EXTENSION_OWNER: &str = "src/sql/catalog.rs";
 const EBD_4B3D_ANALYZER_ENTRY: &str = "src/sql/analyzer/resolve_from.rs";
-const EBD_4B3D_ENGINE_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+const EBD_4B3D_PLANNER_PROVIDER_OWNER: &str = "src/sql/catalog/provider.rs";
 
 fn ebd_4b3d_named_item_count(source: &str, kind: &str, name: &str) -> usize {
     let Ok(file) = syn::parse_file(source) else {
@@ -13377,7 +13828,7 @@ fn ebd_4b3d_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     }
 
     let engine_provider = sources
-        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .get(EBD_4B3D_PLANNER_PROVIDER_OWNER)
         .map(|source| rust_sanitized_production_text(&source.text))
         .unwrap_or_default();
     for required in [
@@ -13387,17 +13838,17 @@ fn ebd_4b3d_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
     ] {
         if !engine_provider.contains(required) {
             violations.insert(format!(
-                "neutral-table-engine-provider-port-missing: {EBD_4B3D_ENGINE_PROVIDER}|{required}"
+                "neutral-table-planner-provider-port-missing: {EBD_4B3D_PLANNER_PROVIDER_OWNER}|{required}"
             ));
         }
     }
     for call in sources
-        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .get(EBD_4B3D_PLANNER_PROVIDER_OWNER)
         .map(|source| ebd_4b3d_neutral_provider_connector_calls(&source.text))
         .unwrap_or_default()
     {
         violations.insert(format!(
-            "neutral-table-ordinary-provider-connector-call: {EBD_4B3D_ENGINE_PROVIDER}|{call}"
+            "neutral-table-ordinary-provider-connector-call: {EBD_4B3D_PLANNER_PROVIDER_OWNER}|{call}"
         ));
     }
 
@@ -13462,12 +13913,12 @@ trait IcebergMetadataTableProvider {
             "fn resolve() { provider.resolve_table_for_analysis(); metadata.get_iceberg_metadata_table(); }",
         ),
         GuardSource::new(
-            EBD_4B3D_ENGINE_PROVIDER,
+            EBD_4B3D_PLANNER_PROVIDER_OWNER,
             r#"
 use crate::catalog::provider::CatalogProvider;
 use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
-struct CatalogMgrProvider;
-impl CatalogProvider for CatalogMgrProvider {
+struct CatalogServiceProvider;
+impl CatalogProvider for CatalogServiceProvider {
     fn get_table(&self) { self.resolve_table_for_analysis_once(); }
 }
 "#,
@@ -13512,18 +13963,18 @@ fn get_table_with_mode() {}
 "#,
     ));
     invalid[5] = GuardSource::new(
-        EBD_4B3D_ENGINE_PROVIDER,
+        EBD_4B3D_PLANNER_PROVIDER_OWNER,
         r#"
 use crate::catalog::provider::CatalogProvider;
 use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
-struct CatalogMgrProvider;
-impl CatalogProvider for CatalogMgrProvider {
+struct CatalogServiceProvider;
+impl CatalogProvider for CatalogServiceProvider {
     fn get_table(&self) {
         self.lookup_neutral();
         nested::nested_lookup(self);
     }
 }
-impl CatalogMgrProvider {
+impl CatalogServiceProvider {
     fn lookup_neutral(&self) {
         self.catalog_backend();
         self.load_table_for_read();
@@ -13535,7 +13986,7 @@ impl DuplicateMethodOwner {
     fn lookup_neutral(&self) {}
 }
 mod nested {
-    fn nested_lookup(provider: &super::CatalogMgrProvider) {
+    fn nested_lookup(provider: &super::CatalogServiceProvider) {
         provider.table_source();
         provider.build_schema_table_def();
     }
@@ -13575,11 +14026,11 @@ mod nested {
         "neutral-table-public-reexport: src/sql/provider_reexport.rs|CatalogProvider",
         "neutral-table-retired-surface: src/sql/legacy_provider.rs|TableLookupMode",
         "neutral-table-retired-surface: src/sql/legacy_provider.rs|get_table_with_mode",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|catalog_backend",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|load_table_for_read",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_table_def",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|table_source",
-        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_schema_table_def",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|catalog_backend",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|load_table_for_read",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|build_table_def",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|table_source",
+        "neutral-table-ordinary-provider-connector-call: src/sql/catalog/provider.rs|build_schema_table_def",
         "neutral-table-engine-forwarding-provider: src/engine/catalog.rs",
     ] {
         assert!(
@@ -13587,6 +14038,2232 @@ mod nested {
                 .iter()
                 .any(|violation| violation.contains(expected)),
             "EBD-4B3D detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+const EBD_5A1_MEMORY_OWNER: &str = "src/catalog/memory.rs";
+const EBD_5A1_REGISTRY_OWNER: &str = "src/catalog/registry.rs";
+const EBD_5A1_CACHE_OWNER: &str = "src/catalog/schema_cache.rs";
+const EBD_5A1_SERVICE_OWNER: &str = "src/catalog/service.rs";
+const EBD_5A1_SQL_PROVIDER_OWNER: &str = "src/sql/catalog/provider.rs";
+
+const EBD_5A1_REQUIRED_OWNERS: &[(&str, &str)] = &[
+    (EBD_5A1_MEMORY_OWNER, "MemoryCatalog"),
+    (EBD_5A1_REGISTRY_OWNER, "CatalogRegistry"),
+    (EBD_5A1_CACHE_OWNER, "SchemaCache"),
+    (EBD_5A1_SERVICE_OWNER, "CatalogService"),
+    (EBD_5A1_SQL_PROVIDER_OWNER, "CatalogServiceProvider"),
+];
+
+const EBD_5A1_RETIRED_OWNER_SYMBOLS: &[&str] =
+    &["InMemoryCatalog", "CatalogMgr", "CatalogMgrProvider"];
+const EBD_5A1_RETIRED_OWNER_PATHS: &[&str] = &[
+    "src/engine/catalog.rs",
+    "src/engine/catalog_mgr/catalog.rs",
+    "src/engine/catalog_mgr/iceberg.rs",
+    "src/engine/catalog_mgr/internal.rs",
+    "src/engine/catalog_mgr/metadata.rs",
+    "src/engine/catalog_mgr/mod.rs",
+    "src/engine/catalog_mgr/provider.rs",
+    "src/engine/catalog_mgr/schema_cache.rs",
+];
+
+fn ebd_5a1_attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attribute| {
+        if attribute.path().is_ident("test") {
+            return true;
+        }
+        let syn::Meta::List(list) = &attribute.meta else {
+            return false;
+        };
+        list.path.is_ident("cfg")
+            && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+    })
+}
+
+#[derive(Default)]
+struct Ebd5a1Definitions {
+    items: BTreeMap<(String, String), usize>,
+    macros: BTreeSet<String>,
+}
+
+fn ebd_5a1_definitions(source: &str) -> Ebd5a1Definitions {
+    struct Visitor {
+        definitions: Ebd5a1Definitions,
+    }
+
+    impl Visitor {
+        fn record(&mut self, kind: &str, name: &syn::Ident) {
+            *self
+                .definitions
+                .items
+                .entry((kind.to_string(), name.to_string()))
+                .or_default() += 1;
+        }
+
+        fn record_macro(&mut self, item: &syn::ItemMacro) {
+            let tokens = rust_source_tokens(&item.mac.tokens.to_string());
+            for window in tokens.windows(2) {
+                if matches!(
+                    window[0].text.as_str(),
+                    "struct" | "enum" | "trait" | "type"
+                ) && (EBD_5A1_REQUIRED_OWNERS
+                    .iter()
+                    .any(|(_, symbol)| window[1].text == *symbol)
+                    || EBD_5A1_RETIRED_OWNER_SYMBOLS.contains(&window[1].text.as_str()))
+                {
+                    self.definitions.macros.insert(window[1].text.clone());
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("struct", &item.ident);
+                syn::visit::visit_item_struct(self, item);
+            }
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("enum", &item.ident);
+                syn::visit::visit_item_enum(self, item);
+            }
+        }
+
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("trait", &item.ident);
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record("type", &item.ident);
+                syn::visit::visit_item_type(self, item);
+            }
+        }
+
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.record_macro(item);
+                syn::visit::visit_item_macro(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return Ebd5a1Definitions::default();
+    };
+    let mut visitor = Visitor {
+        definitions: Ebd5a1Definitions::default(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.definitions
+}
+
+fn ebd_5a1_public_forwarding_reexports(source: &GuardSource) -> BTreeSet<String> {
+    let forwarding_symbols = EBD_5A1_REQUIRED_OWNERS
+        .iter()
+        .map(|(_, symbol)| *symbol)
+        .chain(EBD_5A1_RETIRED_OWNER_SYMBOLS.iter().copied())
+        .collect::<BTreeSet<_>>();
+
+    rust_raw_production_use_statements(&source.text)
+        .into_iter()
+        .filter(|import| import.visibility != "private")
+        .filter_map(|import| {
+            let path = rust_canonical_path_segments_in_scope(
+                &import.path.segments,
+                &source.path,
+                &import.inline_modules,
+            )
+            .unwrap_or(import.path.segments);
+            let aliases_symbol = import
+                .path
+                .alias
+                .as_deref()
+                .is_some_and(|alias| forwarding_symbols.contains(alias));
+            let forwards_symbol = path
+                .iter()
+                .any(|segment| forwarding_symbols.contains(segment.as_str()));
+            let forwards_old_engine_module = path.starts_with(&[
+                "crate".to_string(),
+                "engine".to_string(),
+                "catalog".to_string(),
+            ]) || path.starts_with(&[
+                "crate".to_string(),
+                "engine".to_string(),
+                "catalog_mgr".to_string(),
+            ]);
+            let forwards_canonical_module = [
+                ["crate", "catalog", "memory"].as_slice(),
+                ["crate", "catalog", "registry"].as_slice(),
+                ["crate", "catalog", "schema_cache"].as_slice(),
+                ["crate", "catalog", "service"].as_slice(),
+                ["crate", "sql", "catalog", "provider"].as_slice(),
+            ]
+            .iter()
+            .any(|module| {
+                path.iter()
+                    .map(String::as_str)
+                    .take(module.len())
+                    .eq(module.iter().copied())
+            });
+            (aliases_symbol
+                || forwards_symbol
+                || forwards_old_engine_module
+                || forwards_canonical_module)
+                .then(|| path.join("::"))
+        })
+        .collect()
+}
+
+fn ebd_5a1_runtime_symbol(path: &[String]) -> Option<&'static str> {
+    const RUNTIME_PATHS: &[(&[&str], &str)] = &[
+        (
+            &["crate", "catalog", "memory", "MemoryCatalog"],
+            "MemoryCatalog",
+        ),
+        (
+            &["crate", "catalog", "registry", "CatalogRegistry"],
+            "CatalogRegistry",
+        ),
+        (
+            &["crate", "catalog", "schema_cache", "SchemaCache"],
+            "SchemaCache",
+        ),
+        (
+            &["crate", "catalog", "service", "CatalogService"],
+            "CatalogService",
+        ),
+        (
+            &[
+                "crate",
+                "sql",
+                "catalog",
+                "provider",
+                "CatalogServiceProvider",
+            ],
+            "CatalogServiceProvider",
+        ),
+    ];
+    RUNTIME_PATHS
+        .iter()
+        .find(|(candidate, _)| {
+            path.iter()
+                .map(String::as_str)
+                .eq(candidate.iter().copied())
+        })
+        .map(|(_, symbol)| *symbol)
+}
+
+fn ebd_5a1_runtime_types_in_type(
+    ty: &syn::Type,
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+) -> BTreeSet<String> {
+    struct Visitor<'a> {
+        source_path: &'a str,
+        inline_modules: &'a [String],
+        aliases: &'a RustScopedAliases,
+        found: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            let segments = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            let resolved = rust_resolve_scoped_paths(
+                &segments,
+                self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: segments.clone(),
+                    inline_modules: self.inline_modules.to_vec(),
+                }]
+            });
+            let alias_resolved = resolved.iter().any(|target| {
+                target.segments != segments || target.inline_modules != self.inline_modules
+            });
+            for resolved in resolved {
+                let canonical = rust_canonical_path_segments_in_scope(
+                    &resolved.segments,
+                    self.source_path,
+                    &resolved.inline_modules,
+                );
+                let direct_symbol = (!alias_resolved).then(|| {
+                    segments.last().and_then(|symbol| {
+                        EBD_5A1_REQUIRED_OWNERS
+                            .iter()
+                            .any(|(_, required)| symbol == required)
+                            .then_some(symbol.as_str())
+                    })
+                });
+                if let Some(symbol) = canonical
+                    .as_deref()
+                    .and_then(ebd_5a1_runtime_symbol)
+                    .or(direct_symbol.flatten())
+                {
+                    self.found.insert(symbol.to_string());
+                }
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut visitor = Visitor {
+        source_path,
+        inline_modules,
+        aliases,
+        found: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_type(&mut visitor, ty);
+    visitor.found
+}
+
+fn ebd_5a1_canonical_type_path(
+    ty: &syn::Type,
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    let segments = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    let resolved =
+        rust_resolve_scoped_paths(&segments, inline_modules, aliases, &mut BTreeSet::new(), 0)?;
+    if resolved.len() != 1 {
+        return None;
+    }
+    let target = resolved.into_iter().next().expect("single resolved path");
+    let canonical = rust_canonical_path_segments_in_scope(
+        &target.segments,
+        source_path,
+        &target.inline_modules,
+    )?;
+
+    let last = type_path.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(arguments) = &last.arguments else {
+        return Some((canonical, Vec::new()));
+    };
+    let mut generic_types = Vec::new();
+    for argument in &arguments.args {
+        let syn::GenericArgument::Type(argument) = argument else {
+            return None;
+        };
+        let (canonical, nested) =
+            ebd_5a1_canonical_type_path(argument, source_path, inline_modules, aliases)?;
+        if !nested.is_empty() {
+            return None;
+        }
+        generic_types.push(canonical);
+    }
+    Some((canonical, generic_types))
+}
+
+fn ebd_5a1_is_allowed_sql_specialization_alias(
+    source_path: &str,
+    inline_modules: &[String],
+    aliases: &RustScopedAliases,
+    item: &syn::ItemType,
+) -> bool {
+    if !inline_modules.is_empty()
+        || !ebd_4b1_is_pub_crate(&item.vis)
+        || !item.generics.params.is_empty()
+        || item.generics.where_clause.is_some()
+    {
+        return false;
+    }
+    let Some((target, arguments)) =
+        ebd_5a1_canonical_type_path(&item.ty, source_path, inline_modules, aliases)
+    else {
+        return false;
+    };
+    match (source_path, item.ident.to_string().as_str()) {
+        ("src/sql/catalog/local.rs", "PlannerMemoryCatalog") => {
+            target == ["crate", "catalog", "memory", "MemoryCatalog"]
+                && arguments == [["crate", "sql", "planner", "table", "TableDef"]]
+        }
+        ("src/sql/catalog.rs", "StandaloneCatalogService") => {
+            target == ["crate", "catalog", "service", "CatalogService"]
+                && arguments
+                    == [
+                        ["crate", "sql", "planner", "table", "TableDef"],
+                        [
+                            "crate",
+                            "sql",
+                            "catalog",
+                            "metadata",
+                            "CatalogRuntimeMetadata",
+                        ],
+                    ]
+        }
+        _ => false,
+    }
+}
+
+fn ebd_5a1_runtime_alias_and_wrapper_violations(source: &GuardSource) -> BTreeSet<String> {
+    struct Visitor<'a> {
+        path: &'a str,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if ebd_5a1_is_allowed_sql_specialization_alias(
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+                item,
+            ) {
+                return;
+            }
+            for symbol in ebd_5a1_runtime_types_in_type(
+                &item.ty,
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+            ) {
+                self.violations.insert(format!(
+                    "catalog-runtime-type-alias: {}|{}|{symbol}",
+                    self.path, item.ident
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let canonical_owner = EBD_5A1_REQUIRED_OWNERS
+                .iter()
+                .any(|(path, symbol)| self.path == *path && item.ident == *symbol);
+            if !canonical_owner && item.fields.len() == 1 {
+                let field = item.fields.iter().next().expect("single struct field");
+                for symbol in ebd_5a1_runtime_types_in_type(
+                    &field.ty,
+                    self.path,
+                    &self.inline_modules,
+                    self.aliases,
+                ) {
+                    self.violations.insert(format!(
+                        "catalog-runtime-wrapper: {}|{}|{symbol}",
+                        self.path, item.ident
+                    ));
+                }
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if let Some((_, items)) = &item.content {
+                self.inline_modules.push(item.ident.to_string());
+                for nested in items {
+                    syn::visit::Visit::visit_item(self, nested);
+                }
+                self.inline_modules.pop();
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(&source.text) else {
+        return BTreeSet::new();
+    };
+    let aliases = rust_production_scoped_aliases(&source.text);
+    let mut visitor = Visitor {
+        path: &source.path,
+        aliases: &aliases,
+        inline_modules: Vec::new(),
+        violations: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.violations
+}
+
+fn ebd_5a1_production_function_names(source: &str) -> BTreeSet<String> {
+    struct Visitor {
+        names: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.names.insert(item.sig.ident.to_string());
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.names.insert(item.sig.ident.to_string());
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::new();
+    };
+    let mut visitor = Visitor {
+        names: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.names
+}
+
+fn ebd_5a1_connector_state_registration_violations(
+    sources: &BTreeMap<&str, &GuardSource>,
+) -> BTreeSet<String> {
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct CallTarget {
+        path: String,
+        conservative_leaf: bool,
+    }
+
+    #[derive(Default)]
+    struct FunctionNode {
+        qualified_path: String,
+        source_path: String,
+        name: String,
+        accepts_state: bool,
+        touches_catalog_runtime: bool,
+        direct_registration: bool,
+        calls: BTreeSet<CallTarget>,
+    }
+
+    #[derive(Default)]
+    struct SignatureTypes {
+        state: bool,
+        catalog_params: BTreeSet<String>,
+    }
+
+    impl SignatureTypes {
+        fn inspect(
+            signature: &syn::Signature,
+            source_path: &str,
+            inline_modules: &[String],
+            aliases: &RustScopedAliases,
+        ) -> Self {
+            fn type_contains_leaf(ty: &syn::Type, names: &[&str]) -> bool {
+                struct Visitor<'a> {
+                    names: &'a [&'a str],
+                    found: bool,
+                }
+
+                impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+                    fn visit_path(&mut self, path: &'ast syn::Path) {
+                        self.found |= path.segments.iter().any(|segment| {
+                            self.names.contains(&segment.ident.to_string().as_str())
+                        });
+                        if !self.found {
+                            syn::visit::visit_path(self, path);
+                        }
+                    }
+                }
+
+                let mut visitor = Visitor {
+                    names,
+                    found: false,
+                };
+                syn::visit::Visit::visit_type(&mut visitor, ty);
+                visitor.found
+            }
+
+            let mut result = Self::default();
+            for input in &signature.inputs {
+                let syn::FnArg::Typed(input) = input else {
+                    continue;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    continue;
+                };
+                if type_contains_leaf(&input.ty, &["StandaloneState"]) {
+                    result.state = true;
+                }
+                let runtime_type =
+                    !ebd_5a1_runtime_types_in_type(&input.ty, source_path, inline_modules, aliases)
+                        .is_empty()
+                        || type_contains_leaf(
+                            &input.ty,
+                            &["CatalogMgr", "StandaloneCatalogService"],
+                        );
+                if runtime_type {
+                    result.catalog_params.insert(binding.ident.to_string());
+                }
+            }
+            result
+        }
+    }
+
+    struct FunctionBody {
+        legacy_registry: bool,
+        service: bool,
+        service_registration: bool,
+        calls: BTreeSet<(Vec<String>, bool)>,
+        tainted: BTreeSet<String>,
+    }
+
+    impl FunctionBody {
+        fn new(tainted: BTreeSet<String>) -> Self {
+            Self {
+                legacy_registry: false,
+                service: false,
+                service_registration: false,
+                calls: BTreeSet::new(),
+                tainted,
+            }
+        }
+
+        fn expr_is_tainted(&self, expr: &syn::Expr) -> bool {
+            match expr {
+                syn::Expr::Path(path) => path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| self.tainted.contains(&segment.ident.to_string())),
+                syn::Expr::Field(field) => {
+                    matches!(
+                        &field.member,
+                        syn::Member::Named(name)
+                            if matches!(name.to_string().as_str(), "catalog_mgr" | "catalog_service")
+                    ) || self.expr_is_tainted(&field.base)
+                }
+                syn::Expr::Reference(reference) => self.expr_is_tainted(&reference.expr),
+                syn::Expr::Paren(paren) => self.expr_is_tainted(&paren.expr),
+                syn::Expr::Group(group) => self.expr_is_tainted(&group.expr),
+                syn::Expr::Cast(cast) => self.expr_is_tainted(&cast.expr),
+                syn::Expr::Await(await_expr) => self.expr_is_tainted(&await_expr.base),
+                syn::Expr::Try(try_expr) => self.expr_is_tainted(&try_expr.expr),
+                syn::Expr::Unary(unary) => self.expr_is_tainted(&unary.expr),
+                _ => false,
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FunctionBody {
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            let tainted = local
+                .init
+                .as_ref()
+                .is_some_and(|init| self.expr_is_tainted(&init.expr));
+            syn::visit::visit_local(self, local);
+            if tainted && let syn::Pat::Ident(binding) = &local.pat {
+                self.tainted.insert(binding.ident.to_string());
+            }
+        }
+
+        fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+            if let syn::Member::Named(name) = &field.member {
+                match name.to_string().as_str() {
+                    "catalog_mgr" => self.legacy_registry = true,
+                    "catalog_service" => self.service = true,
+                    _ => {}
+                }
+            }
+            syn::visit::visit_expr_field(self, field);
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(name) = path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+            {
+                if matches!(
+                    name.as_str(),
+                    "register_default_catalog_mgr_entries" | "register_iceberg_catalog_mgr_entry"
+                ) {
+                    self.legacy_registry = true;
+                }
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let tainted = call.args.iter().any(|arg| self.expr_is_tainted(arg));
+            if tainted && let syn::Expr::Path(path) = call.func.as_ref() {
+                self.calls.insert((
+                    path.path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect(),
+                    false,
+                ));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let method = call.method.to_string();
+            let tainted = self.expr_is_tainted(&call.receiver)
+                || call.args.iter().any(|arg| self.expr_is_tainted(arg));
+            if tainted {
+                self.calls.insert((vec![method.clone()], true));
+            }
+            if matches!(method.as_str(), "register_catalog" | "unregister_catalog") {
+                self.service_registration |= self.expr_is_tainted(&call.receiver);
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    struct Visitor<'a> {
+        source_path: &'a str,
+        module: Vec<String>,
+        inline_modules: Vec<String>,
+        aliases: &'a RustScopedAliases,
+        impl_self_path: Option<Vec<String>>,
+        functions: Vec<FunctionNode>,
+    }
+
+    impl Visitor<'_> {
+        fn resolved_paths(&self, path: Vec<String>) -> BTreeSet<Vec<String>> {
+            if path.first().is_some_and(|segment| segment == "Self")
+                && let Some(self_path) = &self.impl_self_path
+            {
+                let mut target = self_path.clone();
+                target.extend_from_slice(&path[1..]);
+                return BTreeSet::from([target]);
+            }
+
+            rust_resolve_scoped_paths(
+                &path,
+                &self.inline_modules,
+                self.aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: path,
+                    inline_modules: self.inline_modules.clone(),
+                }]
+            })
+            .into_iter()
+            .filter_map(|target| {
+                rust_canonical_path_segments_in_scope(
+                    &target.segments,
+                    self.source_path,
+                    &target.inline_modules,
+                )
+            })
+            .collect()
+        }
+
+        fn nominal_self_path(&self, ty: &syn::Type) -> Option<Vec<String>> {
+            let syn::Type::Path(path) = ty else {
+                return None;
+            };
+            if path.qself.is_some() {
+                return None;
+            }
+            let segments = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            let paths = self.resolved_paths(segments);
+            (paths.len() == 1)
+                .then(|| paths.into_iter().next())
+                .flatten()
+        }
+
+        fn call_targets(&self, calls: BTreeSet<(Vec<String>, bool)>) -> BTreeSet<CallTarget> {
+            calls
+                .into_iter()
+                .flat_map(|(call, conservative_leaf)| {
+                    self.resolved_paths(call)
+                        .into_iter()
+                        .map(move |path| CallTarget {
+                            path: path.join("::"),
+                            conservative_leaf,
+                        })
+                })
+                .collect()
+        }
+
+        fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            let signature_types = SignatureTypes::inspect(
+                signature,
+                self.source_path,
+                &self.inline_modules,
+                self.aliases,
+            );
+            let mut body = FunctionBody::new(signature_types.catalog_params.clone());
+            syn::visit::Visit::visit_block(&mut body, block);
+            let name = signature.ident.to_string();
+            let mut function_path = self.impl_self_path.clone().unwrap_or_else(|| {
+                let mut path = self.module.clone();
+                path.extend(self.inline_modules.iter().cloned());
+                path
+            });
+            function_path.push(name.clone());
+            self.functions.push(FunctionNode {
+                qualified_path: function_path.join("::"),
+                source_path: self.source_path.to_string(),
+                name,
+                accepts_state: signature_types.state,
+                touches_catalog_runtime: body.legacy_registry
+                    || body.service
+                    || !signature_types.catalog_params.is_empty(),
+                direct_registration: body.legacy_registry || body.service_registration,
+                calls: self.call_targets(body.calls),
+            });
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let previous = self.impl_self_path.take();
+            self.impl_self_path = self.nominal_self_path(&item.self_ty);
+            for impl_item in &item.items {
+                syn::visit::Visit::visit_impl_item(self, impl_item);
+            }
+            self.impl_self_path = previous;
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if let Some((_, items)) = &item.content {
+                self.inline_modules.push(item.ident.to_string());
+                for nested in items {
+                    syn::visit::Visit::visit_item(self, nested);
+                }
+                self.inline_modules.pop();
+            }
+        }
+    }
+
+    let mut functions = Vec::new();
+    for source in sources
+        .values()
+        .filter(|source| source.path.starts_with("src/connector/"))
+    {
+        let Ok(file) = syn::parse_file(&source.text) else {
+            continue;
+        };
+        let Some(module) = rust_source_module_segments(&source.path) else {
+            continue;
+        };
+        let aliases = rust_production_scoped_aliases(&source.text);
+        let mut visitor = Visitor {
+            source_path: &source.path,
+            module,
+            inline_modules: Vec::new(),
+            aliases: &aliases,
+            impl_self_path: None,
+            functions: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+        functions.extend(visitor.functions);
+    }
+
+    let mut exact_candidates = BTreeMap::<String, Vec<usize>>::new();
+    let mut leaf_candidates = BTreeMap::<String, Vec<usize>>::new();
+    for (index, node) in functions.iter().enumerate() {
+        exact_candidates
+            .entry(node.qualified_path.clone())
+            .or_default()
+            .push(index);
+        leaf_candidates
+            .entry(node.name.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut reaches_registration = functions
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.direct_registration)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut changed = false;
+        for (index, node) in functions.iter().enumerate() {
+            if reaches_registration.contains(&index) {
+                continue;
+            }
+            let reaches = node.calls.iter().any(|call| {
+                let exact = exact_candidates
+                    .get(&call.path)
+                    .into_iter()
+                    .flatten()
+                    .copied();
+                let use_leaf = call.conservative_leaf
+                    || exact_candidates
+                        .get(&call.path)
+                        .is_none_or(|candidates| candidates.is_empty());
+                let leaf = call
+                    .path
+                    .rsplit("::")
+                    .next()
+                    .and_then(|name| leaf_candidates.get(name))
+                    .into_iter()
+                    .flatten()
+                    .copied();
+                exact
+                    .chain(use_leaf.then_some(leaf).into_iter().flatten())
+                    .any(|candidate| reaches_registration.contains(&candidate))
+            });
+            if reaches {
+                changed |= reaches_registration.insert(index);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    functions
+        .into_iter()
+        .enumerate()
+        .filter(|(index, node)| {
+            node.accepts_state
+                && node.touches_catalog_runtime
+                && reaches_registration.contains(index)
+        })
+        .map(|(_, node)| {
+            format!(
+                "catalog-runtime-connector-state-registration: {}|{}",
+                node.source_path, node.name
+            )
+        })
+        .collect()
+}
+
+fn ebd_5a1_engine_forwarding_facade_violations(
+    sources: &BTreeMap<&str, &GuardSource>,
+) -> BTreeSet<String> {
+    fn type_contains_leaf(ty: &syn::Type, names: &[&str]) -> bool {
+        struct Visitor<'a> {
+            names: &'a [&'a str],
+            found: bool,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                self.found |= path
+                    .segments
+                    .iter()
+                    .any(|segment| self.names.contains(&segment.ident.to_string().as_str()));
+                if !self.found {
+                    syn::visit::visit_path(self, path);
+                }
+            }
+        }
+
+        let mut visitor = Visitor {
+            names,
+            found: false,
+        };
+        syn::visit::Visit::visit_type(&mut visitor, ty);
+        visitor.found
+    }
+
+    fn runtime_binding_names(
+        signature: &syn::Signature,
+        source_path: &str,
+        inline_modules: &[String],
+        aliases: &RustScopedAliases,
+    ) -> BTreeSet<String> {
+        signature
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(input) = input else {
+                    return None;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    return None;
+                };
+                (!ebd_5a1_runtime_types_in_type(&input.ty, source_path, inline_modules, aliases)
+                    .is_empty()
+                    || type_contains_leaf(&input.ty, &["StandaloneCatalogService"]))
+                .then(|| binding.ident.to_string())
+            })
+            .collect()
+    }
+
+    fn state_binding_names(signature: &syn::Signature) -> BTreeSet<String> {
+        signature
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(input) = input else {
+                    return None;
+                };
+                let syn::Pat::Ident(binding) = input.pat.as_ref() else {
+                    return None;
+                };
+                type_contains_leaf(&input.ty, &["StandaloneState"])
+                    .then(|| binding.ident.to_string())
+            })
+            .collect()
+    }
+
+    fn expr_touches_runtime(expr: &syn::Expr, runtime_bindings: &BTreeSet<String>) -> bool {
+        match expr {
+            syn::Expr::Path(path) => path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| runtime_bindings.contains(&segment.ident.to_string())),
+            syn::Expr::Field(field) => {
+                matches!(
+                    &field.member,
+                    syn::Member::Named(name)
+                        if name == "catalog_service"
+                ) || expr_touches_runtime(&field.base, runtime_bindings)
+            }
+            syn::Expr::Call(call) => {
+                expr_touches_runtime(&call.func, runtime_bindings)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_touches_runtime(arg, runtime_bindings))
+            }
+            syn::Expr::MethodCall(call) => {
+                expr_touches_runtime(&call.receiver, runtime_bindings)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_touches_runtime(arg, runtime_bindings))
+            }
+            syn::Expr::Reference(reference) => {
+                expr_touches_runtime(&reference.expr, runtime_bindings)
+            }
+            syn::Expr::Return(return_expr) => return_expr
+                .expr
+                .as_deref()
+                .is_some_and(|expr| expr_touches_runtime(expr, runtime_bindings)),
+            syn::Expr::Paren(paren) => expr_touches_runtime(&paren.expr, runtime_bindings),
+            syn::Expr::Group(group) => expr_touches_runtime(&group.expr, runtime_bindings),
+            syn::Expr::Await(await_expr) => {
+                expr_touches_runtime(&await_expr.base, runtime_bindings)
+            }
+            syn::Expr::Try(try_expr) => expr_touches_runtime(&try_expr.expr, runtime_bindings),
+            _ => false,
+        }
+    }
+
+    fn is_thin_forwarder(
+        signature: &syn::Signature,
+        block: &syn::Block,
+        source_path: &str,
+        inline_modules: &[String],
+        aliases: &RustScopedAliases,
+    ) -> bool {
+        let runtime_bindings =
+            runtime_binding_names(signature, source_path, inline_modules, aliases);
+        let state_bindings = state_binding_names(signature);
+        let exposes_runtime = !runtime_bindings.is_empty()
+            || match &signature.output {
+                syn::ReturnType::Default => false,
+                syn::ReturnType::Type(_, ty) => {
+                    !ebd_5a1_runtime_types_in_type(ty, source_path, inline_modules, aliases)
+                        .is_empty()
+                        || type_contains_leaf(ty, &["StandaloneCatalogService"])
+                }
+            };
+        let Some(syn::Stmt::Expr(expr, _)) = block.stmts.first() else {
+            return false;
+        };
+        block.stmts.len() == 1
+            && (exposes_runtime || !state_bindings.is_empty())
+            && expr_touches_runtime(expr, &runtime_bindings)
+    }
+
+    struct Visitor<'a> {
+        path: &'a str,
+        aliases: &'a RustScopedAliases,
+        inline_modules: Vec<String>,
+        violations: BTreeSet<String>,
+    }
+
+    impl Visitor<'_> {
+        fn inspect(&mut self, signature: &syn::Signature, block: &syn::Block) {
+            if is_thin_forwarder(
+                signature,
+                block,
+                self.path,
+                &self.inline_modules,
+                self.aliases,
+            ) {
+                self.violations.insert(format!(
+                    "catalog-runtime-engine-forwarding-facade: {}|{}",
+                    self.path, signature.ident
+                ));
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor<'_> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                self.inspect(&item.sig, &item.block);
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if ebd_5a1_attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            if let Some((_, items)) = &item.content {
+                self.inline_modules.push(item.ident.to_string());
+                for nested in items {
+                    syn::visit::Visit::visit_item(self, nested);
+                }
+                self.inline_modules.pop();
+            }
+        }
+    }
+
+    let declared = sources
+        .get("src/engine/mod.rs")
+        .into_iter()
+        .flat_map(|source| rust_module_items(&rust_sanitized_production_text(&source.text)))
+        .filter(|item| item.is_external && item.inline_modules.is_empty())
+        .map(|item| item.name)
+        .collect::<BTreeSet<_>>();
+    let mut violations = BTreeSet::new();
+    for module in declared {
+        for path in [
+            format!("src/engine/{module}.rs"),
+            format!("src/engine/{module}/mod.rs"),
+        ] {
+            let Some(source) = sources.get(path.as_str()) else {
+                continue;
+            };
+            let Ok(file) = syn::parse_file(&source.text) else {
+                continue;
+            };
+            let aliases = rust_production_scoped_aliases(&source.text);
+            let mut visitor = Visitor {
+                path: &source.path,
+                aliases: &aliases,
+                inline_modules: Vec::new(),
+                violations: BTreeSet::new(),
+            };
+            syn::visit::Visit::visit_file(&mut visitor, &file);
+            violations.extend(visitor.violations);
+        }
+    }
+    violations
+}
+
+fn ebd_5a1_standalone_state_fields(source: &str) -> BTreeMap<String, usize> {
+    struct Visitor {
+        fields: BTreeMap<String, usize>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Visitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if item.ident == "StandaloneState" && !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                for field in &item.fields {
+                    if let Some(name) = &field.ident {
+                        *self.fields.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_struct(self, item);
+            }
+        }
+
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !ebd_5a1_attrs_are_test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeMap::new();
+    };
+    let mut visitor = Visitor {
+        fields: BTreeMap::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.fields
+}
+
+fn ebd_5a1_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
+    let sources = sources
+        .iter()
+        .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
+        .map(|source| (source.path.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let definitions = sources
+        .iter()
+        .map(|(path, source)| (*path, ebd_5a1_definitions(&source.text)))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = BTreeSet::new();
+
+    for path in EBD_5A1_RETIRED_OWNER_PATHS {
+        if sources.contains_key(path) {
+            violations.insert(format!("catalog-runtime-old-owner: {path}"));
+        }
+    }
+
+    if let Some(engine_mod) = sources.get("src/engine/mod.rs") {
+        for item in rust_module_items(&rust_sanitized_production_text(&engine_mod.text)) {
+            if matches!(item.name.as_str(), "catalog" | "catalog_mgr") {
+                violations.insert(format!(
+                    "catalog-runtime-old-module: src/engine/mod.rs|{}",
+                    item.name
+                ));
+            }
+        }
+    }
+
+    for (path, symbol) in EBD_5A1_REQUIRED_OWNERS {
+        let owner_count = definitions
+            .get(path)
+            .and_then(|items| {
+                items
+                    .items
+                    .get(&("struct".to_string(), (*symbol).to_string()))
+            })
+            .copied()
+            .unwrap_or_default();
+        if owner_count != 1 {
+            violations.insert(format!(
+                "catalog-runtime-owner-count: {path}|struct|{symbol}|expected=1 actual={owner_count}"
+            ));
+        }
+        for (source_path, items) in &definitions {
+            if source_path == path {
+                continue;
+            }
+            let count = items
+                .items
+                .iter()
+                .filter(|((_, name), _)| name == symbol)
+                .map(|(_, count)| count)
+                .sum::<usize>();
+            if count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-secondary-owner: {source_path}|{symbol}|count={count}"
+                ));
+            }
+        }
+    }
+
+    for (path, items) in &definitions {
+        for symbol in EBD_5A1_RETIRED_OWNER_SYMBOLS {
+            let alias_count = items
+                .items
+                .get(&("type".to_string(), (*symbol).to_string()))
+                .copied()
+                .unwrap_or_default();
+            if alias_count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-retired-alias: {path}|{symbol}|count={alias_count}"
+                ));
+            }
+            let owner_count = items
+                .items
+                .iter()
+                .filter(|((kind, name), _)| kind != "type" && name == symbol)
+                .map(|(_, count)| count)
+                .sum::<usize>();
+            if owner_count != 0 {
+                violations.insert(format!(
+                    "catalog-runtime-retired-owner: {path}|{symbol}|count={owner_count}"
+                ));
+            }
+        }
+        for symbol in &items.macros {
+            violations.insert(format!(
+                "catalog-runtime-macro-secondary-owner: {path}|{symbol}"
+            ));
+        }
+    }
+
+    for source in sources.values() {
+        violations.extend(ebd_5a1_runtime_alias_and_wrapper_violations(source));
+        for target in ebd_5a1_public_forwarding_reexports(source) {
+            violations.insert(format!(
+                "catalog-runtime-forwarding-reexport: {}|{target}",
+                source.path
+            ));
+        }
+        for function in ebd_5a1_production_function_names(&source.text) {
+            if function.contains("catalog_mgr")
+                || matches!(
+                    function.as_str(),
+                    "build_analyzer_provider" | "execute_query_with_catalog_mgr"
+                )
+            {
+                violations.insert(format!(
+                    "catalog-runtime-retired-helper: {}|{function}",
+                    source.path
+                ));
+            }
+        }
+    }
+    violations.extend(ebd_5a1_connector_state_registration_violations(&sources));
+    violations.extend(ebd_5a1_engine_forwarding_facade_violations(&sources));
+
+    for path in [
+        EBD_5A1_MEMORY_OWNER,
+        EBD_5A1_REGISTRY_OWNER,
+        EBD_5A1_CACHE_OWNER,
+        EBD_5A1_SERVICE_OWNER,
+    ] {
+        let Some(source) = sources.get(path) else {
+            continue;
+        };
+        for dependency in rust_production_canonical_paths(&source.text, path) {
+            if dependency.starts_with(&["crate".to_string(), "engine".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "sql".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "connector".to_string()])
+            {
+                violations.insert(format!(
+                    "catalog-runtime-neutral-owner-dependency: {path}|{}",
+                    dependency.join("::")
+                ));
+            }
+        }
+        let production = rust_sanitized_production_text(&source.text);
+        for forbidden in [
+            "CatalogRuntimeMetadata",
+            "ConnectorRegistry",
+            "ResolvedAnalyzerTable",
+            "StandaloneState",
+            "TableDef",
+        ] {
+            if rust_source_tokens(&production)
+                .iter()
+                .any(|token| token.text == forbidden)
+            {
+                violations.insert(format!(
+                    "catalog-runtime-neutral-owner-dependency: {path}|{forbidden}"
+                ));
+            }
+        }
+    }
+
+    let state_fields = sources
+        .get("src/engine/mod.rs")
+        .map(|source| ebd_5a1_standalone_state_fields(&source.text))
+        .unwrap_or_default();
+    let service_count = state_fields
+        .get("catalog_service")
+        .copied()
+        .unwrap_or_default();
+    if service_count != 1 {
+        violations.insert(format!(
+            "catalog-runtime-state-field-count: src/engine/mod.rs|catalog_service|expected=1 actual={service_count}"
+        ));
+    }
+    for forbidden in ["catalog", "catalog_mgr"] {
+        let count = state_fields.get(forbidden).copied().unwrap_or_default();
+        if count != 0 {
+            violations.insert(format!(
+                "catalog-runtime-state-retired-field: src/engine/mod.rs|{forbidden}|count={count}"
+            ));
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn ebd_5a1_catalog_runtime_owner_cutover_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-5A1 catalog runtime owner cutover failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_forwarding_alias_macro_and_state_registration() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            r#"
+pub(crate) struct MemoryCatalog<T> { local: Option<T> }
+#[cfg(test)]
+struct CatalogRegistry<T>(T);
+const COMMENT_NOISE: &str = "struct SchemaCache; state.catalog_mgr.write();";
+"#,
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/fixture.rs",
+            r#"
+struct LocalCatalogRegistry;
+struct LocalSchemaCache;
+#[cfg(test)]
+fn register_catalog(state: &StandaloneState) {
+    state.catalog_mgr.write().unwrap();
+}
+// pub use crate::catalog::service::CatalogService;
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "cfg(test), comments, strings, and unrelated local types must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/catalog.rs",
+        "pub use crate::catalog::service::CatalogService;",
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/catalog/legacy_alias.rs",
+        "type CatalogMgr<M> = CatalogRegistry<M>;",
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/catalog/cache_macro.rs",
+        "macro_rules! define_cache { () => { struct SchemaCache; } }",
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/catalog_registration.rs",
+        r#"
+fn register_catalog(state: &StandaloneState) {
+    state.catalog_mgr.write().unwrap();
+}
+"#,
+    ));
+
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-old-owner",
+        "catalog-runtime-forwarding-reexport",
+        "catalog-runtime-retired-alias",
+        "catalog-runtime-macro-secondary-owner",
+        "catalog-runtime-connector-state-registration",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "EBD-5A1 detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_arbitrarily_named_runtime_aliases_and_wrappers() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            r#"
+pub(crate) struct CatalogService<T, M> {
+    local: MemoryCatalog<T>,
+    registry: CatalogRegistry<M>,
+}
+"#,
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            r#"
+pub(crate) struct CatalogServiceProvider<'a, T, M> {
+    service: &'a CatalogService<T, M>,
+    current_catalog: Option<&'a str>,
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            r#"
+struct StandaloneState {
+    catalog_service: Arc<CatalogService<(), ()>>,
+    connectors: Arc<()>,
+}
+
+struct CatalogRuntime {
+    catalog_service: Arc<CatalogService<(), ()>>,
+    connectors: Arc<()>,
+}
+
+use crate::unrelated::{
+    registry::CatalogRegistry,
+    service::CatalogService as UnrelatedService,
+};
+type UnrelatedAlias<M> = CatalogRegistry<M>;
+struct UnrelatedHolder<M> {
+    inner: UnrelatedService<M>,
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "real service composition fields must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/legacy_registry.rs",
+        r#"
+use crate::catalog::registry::CatalogRegistry as Registry;
+use crate::catalog::{
+    memory::MemoryCatalog as Memory,
+    service::CatalogService as Service,
+};
+use crate::sql::catalog::provider::CatalogServiceProvider as Provider;
+
+type LegacyRegistry<M> = Registry<M>;
+type LegacyProvider<'a> = Provider<'a>;
+struct LegacyMemory<M> { inner: Memory<M> }
+struct LegacyService<M> {
+    inner: Service<(), M>,
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/catalog/legacy_cache.rs",
+        r#"
+use super::schema_cache::SchemaCache as Cache;
+struct LegacyCache<M>(Cache<M>);
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-type-alias: src/engine/legacy_registry.rs|LegacyRegistry|CatalogRegistry",
+        "catalog-runtime-type-alias: src/engine/legacy_registry.rs|LegacyProvider|CatalogServiceProvider",
+        "catalog-runtime-wrapper: src/engine/legacy_registry.rs|LegacyMemory|MemoryCatalog",
+        "catalog-runtime-wrapper: src/engine/legacy_registry.rs|LegacyService|CatalogService",
+        "catalog-runtime-wrapper: src/catalog/legacy_cache.rs|LegacyCache|SchemaCache",
+    ] {
+        assert!(
+            violations.contains(expected),
+            "EBD-5A1 detector missed arbitrary runtime alias/wrapper {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_allows_only_exact_sql_specialization_aliases() {
+    let canonical_sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+pub(crate) type PlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+        ),
+        GuardSource::new(
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub(crate) type StandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+    ];
+
+    let canonical_violations = ebd_5a1_completion_violations(&canonical_sources);
+    assert!(
+        canonical_violations.is_empty(),
+        "the two plan-mandated SQL specialization aliases must be accepted exactly: {canonical_violations:?}"
+    );
+
+    for (path, source, expected) in [
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+pub(crate) type RenamedPlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|RenamedPlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+use crate::sql::planner::table::TableDef;
+type PlannerMemoryCatalog = MemoryCatalog<TableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|PlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog/local.rs",
+            r#"
+use crate::catalog::memory::MemoryCatalog;
+struct OtherTableDef;
+pub(crate) type PlannerMemoryCatalog = MemoryCatalog<OtherTableDef>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog/local.rs|PlannerMemoryCatalog|MemoryCatalog",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub(crate) type RenamedStandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|RenamedStandaloneCatalogService|CatalogService",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+use metadata::CatalogRuntimeMetadata;
+pub type StandaloneCatalogService =
+    CatalogService<TableDef, CatalogRuntimeMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|StandaloneCatalogService|CatalogService",
+        ),
+        (
+            "src/sql/catalog.rs",
+            r#"
+use crate::catalog::service::CatalogService;
+use crate::sql::planner::table::TableDef;
+struct OtherMetadata;
+pub(crate) type StandaloneCatalogService = CatalogService<TableDef, OtherMetadata>;
+"#,
+            "catalog-runtime-type-alias: src/sql/catalog.rs|StandaloneCatalogService|CatalogService",
+        ),
+    ] {
+        let mut invalid = canonical_sources.clone();
+        let index = invalid
+            .iter()
+            .position(|candidate| candidate.path == path)
+            .expect("canonical alias fixture");
+        invalid[index] = GuardSource::new(path, source);
+        let violations = ebd_5a1_completion_violations(&invalid);
+        assert!(
+            violations.contains(expected),
+            "renamed aliases and non-exact interfaces must remain rejected: expected {expected}, got {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_cross_function_connector_registration_forwarding() {
+    let mut sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+    ];
+    sources.push(GuardSource::new(
+        "src/connector/catalog_forward.rs",
+        r#"
+fn install_catalog(service: &StandaloneCatalogService) {
+    service.register_catalog(build_catalog());
+}
+
+fn forward_catalog(state: &StandaloneState) {
+    install_catalog(&state.catalog_service);
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.contains(
+            "catalog-runtime-connector-state-registration: src/connector/catalog_forward.rs|forward_catalog"
+        ),
+        "EBD-5A1 detector missed cross-function connector registration forwarding: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_cross_file_connector_registration_forwarding() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/inspect.rs",
+            r#"
+use crate::unrelated::service::Service;
+
+fn inspect_unrelated(service: &Service) {
+    service.inspect();
+}
+
+fn inspect_catalog(service: &StandaloneCatalogService) {
+    service.catalog_names();
+}
+
+fn inspect_state(state: &StandaloneState) {
+    inspect_catalog(&state.catalog_service);
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "cross-file analysis must not report non-registration helpers: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/connector/mod.rs",
+        r#"
+mod iceberg;
+
+fn install_standalone_catalogs(state: &StandaloneState) {
+    iceberg::install_catalog(&state.catalog_service);
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/iceberg.rs",
+        r#"
+use crate::catalog::service::CatalogService as Service;
+
+pub(super) fn install_catalog(service: &Service<(), ()>) {
+    service.register_catalog(build_catalog());
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    assert!(
+        violations.contains(
+            "catalog-runtime-connector-state-registration: src/connector/mod.rs|install_standalone_catalogs"
+        ),
+        "EBD-5A1 detector missed cross-file connector registration forwarding: {violations:?}"
+    );
+    assert!(
+        !violations.contains(
+            "catalog-runtime-connector-state-registration: src/connector/inspect.rs|inspect_state"
+        ),
+        "EBD-5A1 detector misreported non-registration helper forwarding: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_resolves_associated_registration_and_same_name_impl_candidates() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/inspect.rs",
+            r#"
+struct CatalogInspector;
+impl CatalogInspector {
+    fn inspect(service: &StandaloneCatalogService) {
+        service.catalog_names();
+    }
+}
+
+fn inspect_state(state: &StandaloneState) {
+    CatalogInspector::inspect(&state.catalog_service);
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "non-registration associated functions must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/connector/mod.rs",
+        r#"
+mod iceberg;
+
+fn install_associated(state: &StandaloneState) {
+    iceberg::CatalogInstaller::install(&state.catalog_service);
+}
+
+fn install_selected(state: &StandaloneState, installer: &iceberg::MethodInstaller) {
+    installer.install(&state.catalog_service);
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/iceberg.rs",
+        r#"
+pub(super) struct CatalogInstaller;
+impl CatalogInstaller {
+    pub(super) fn install(service: &StandaloneCatalogService) {
+        service.register_catalog(build_catalog());
+    }
+}
+
+struct CatalogObserver;
+impl CatalogObserver {
+    fn install(service: &StandaloneCatalogService) {
+        service.catalog_names();
+    }
+}
+
+pub(super) struct MethodInstaller;
+impl MethodInstaller {
+    pub(super) fn install(&self, service: &StandaloneCatalogService) {
+        service.register_catalog(build_catalog());
+    }
+}
+
+struct MethodObserver;
+impl MethodObserver {
+    fn install(&self, service: &StandaloneCatalogService) {
+        service.catalog_names();
+    }
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-connector-state-registration: src/connector/mod.rs|install_associated",
+        "catalog-runtime-connector-state-registration: src/connector/mod.rs|install_selected",
+    ] {
+        assert!(
+            violations.contains(expected),
+            "EBD-5A1 detector missed associated or ambiguous impl registration {expected}: {violations:?}"
+        );
+    }
+    assert!(
+        !violations.contains(
+            "catalog-runtime-connector-state-registration: src/connector/inspect.rs|inspect_state"
+        ),
+        "EBD-5A1 detector misreported a non-registration associated function: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_rejects_renamed_engine_runtime_forwarding_facades() {
+    let mut valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            r#"
+mod query_flow;
+struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
+"#,
+        ),
+        GuardSource::new(
+            "src/engine/query_flow.rs",
+            r#"
+use crate::unrelated::service::Service;
+
+fn inspect_unrelated(service: &Service) {
+    service.inspect();
+}
+
+fn execute_query(state: &StandaloneState, request: QueryRequest) -> QueryResult {
+    let table = state.catalog_service.resolve_table(&request)?;
+    let plan = plan_query(table, request)?;
+    execute_plan(plan)
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "multi-step engine business flows must remain accepted: {valid_violations:?}"
+    );
+
+    valid[5] = GuardSource::new(
+        "src/engine/mod.rs",
+        r#"
+mod query_flow;
+mod catalog_facade;
+pub(crate) use catalog_facade::register_catalog;
+struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }
+"#,
+    );
+    valid.push(GuardSource::new(
+        "src/engine/catalog_facade.rs",
+        r#"
+use crate::catalog::service::CatalogService as Service;
+
+pub(crate) fn register_catalog(
+    service: &Service<(), ()>,
+    catalog: Arc<dyn Catalog>,
+) {
+    service.register_catalog(catalog);
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        violations.contains(
+            "catalog-runtime-engine-forwarding-facade: src/engine/catalog_facade.rs|register_catalog"
+        ),
+        "EBD-5A1 detector missed renamed engine catalog runtime forwarding facade: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_only_aggregates_tainted_ambiguous_method_calls() {
+    let sources = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/connector/observer.rs",
+            r#"
+struct Observer;
+impl Observer {
+    fn install(&self) {}
+}
+
+struct CatalogInstaller;
+impl CatalogInstaller {
+    fn install(service: &StandaloneCatalogService) {
+        service.register_catalog(build_catalog());
+    }
+}
+
+fn inspect_then_observe(state: &StandaloneState, observer: &Observer) {
+    state.catalog_service.catalog_names();
+    observer.install();
+}
+"#,
+        ),
+    ];
+    let violations = ebd_5a1_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "unrelated untainted method calls must not aggregate global registration candidates: {violations:?}"
+    );
+}
+
+#[test]
+fn ebd_5a1_detector_excludes_test_only_impls_but_rejects_production_impls() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_5A1_MEMORY_OWNER,
+            "pub(crate) struct MemoryCatalog<T> { local: Option<T> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_REGISTRY_OWNER,
+            "pub(crate) struct CatalogRegistry<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_CACHE_OWNER,
+            "pub(crate) struct SchemaCache<M> { marker: std::marker::PhantomData<M> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SERVICE_OWNER,
+            "pub(crate) struct CatalogService<T, M> { marker: std::marker::PhantomData<(T, M)> }",
+        ),
+        GuardSource::new(
+            EBD_5A1_SQL_PROVIDER_OWNER,
+            "pub(crate) struct CatalogServiceProvider<'a> { marker: std::marker::PhantomData<&'a ()> }",
+        ),
+        GuardSource::new(
+            "src/engine/mod.rs",
+            "struct StandaloneState { catalog_service: Arc<StandaloneCatalogService> }",
+        ),
+        GuardSource::new(
+            "src/engine/test_impl.rs",
+            r#"
+struct OwnerFixture;
+#[cfg(test)]
+impl OwnerFixture {
+    fn execute_query_with_catalog_mgr(&self) {}
+}
+"#,
+        ),
+        GuardSource::new(
+            "src/connector/test_impl.rs",
+            r#"
+struct ConnectorFixture;
+#[cfg(test)]
+impl ConnectorFixture {
+    fn install(&self, state: &StandaloneState) {
+        state.catalog_service.register_catalog(build_catalog());
+    }
+}
+"#,
+        ),
+    ];
+    let valid_violations = ebd_5a1_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "entire cfg(test) impl blocks must remain excluded: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid.push(GuardSource::new(
+        "src/engine/production_impl.rs",
+        r#"
+struct ProductionOwner;
+impl ProductionOwner {
+    fn execute_query_with_catalog_mgr(&self) {}
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/connector/production_impl.rs",
+        r#"
+struct ProductionConnector;
+impl ProductionConnector {
+    fn install(&self, state: &StandaloneState) {
+        state.catalog_service.register_catalog(build_catalog());
+    }
+}
+"#,
+    ));
+    let violations = ebd_5a1_completion_violations(&invalid);
+    for expected in [
+        "catalog-runtime-retired-helper: src/engine/production_impl.rs|execute_query_with_catalog_mgr",
+        "catalog-runtime-connector-state-registration: src/connector/production_impl.rs|install",
+    ] {
+        assert!(
+            violations.contains(expected),
+            "EBD-5A1 detector missed production impl violation {expected}: {violations:?}"
         );
     }
 }

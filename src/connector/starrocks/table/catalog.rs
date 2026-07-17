@@ -39,7 +39,7 @@ use super::model::{
 use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::schema::ColumnDef;
 use crate::connector::starrocks::table::config::StarRocksTableConfig;
-use crate::engine::catalog::InMemoryCatalog;
+use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::planner::table::{ScanSource, TableDef};
 
 #[derive(Clone, Debug, Default)]
@@ -586,7 +586,7 @@ pub(crate) fn runtime_registered(tablet_id: i64) -> bool {
 }
 
 pub(crate) fn register_starrocks_table_in_catalog(
-    catalog: &mut InMemoryCatalog,
+    catalog: &mut PlannerMemoryCatalog,
     runtime: &StarRocksTableRuntime,
 ) -> Result<(), String> {
     let table = starrocks_table_def(runtime)?;
@@ -594,7 +594,7 @@ pub(crate) fn register_starrocks_table_in_catalog(
 }
 
 pub(crate) fn register_starrocks_tables_in_catalog(
-    catalog: &mut InMemoryCatalog,
+    catalog: &mut PlannerMemoryCatalog,
     starrocks: &StarRocksTableCatalog,
 ) -> Result<(), String> {
     let mut keys = starrocks.tables_by_name.keys().cloned().collect::<Vec<_>>();
@@ -838,8 +838,8 @@ fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::catalog::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::memory::DEFAULT_DATABASE;
     use crate::connector::starrocks::table::model::{StarRocksTableKind, StoredStarRocksSchema};
-    use crate::engine::catalog::DEFAULT_DATABASE;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
 
@@ -1001,7 +1001,7 @@ mod tests {
                 runtime,
             )]),
         };
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
 
         register_starrocks_tables_in_catalog(&mut catalog, &starrocks)
             .expect("register StarRocks tables in catalog");

@@ -16,8 +16,8 @@
 // under the License.
 
 //! Synthetic/local query preparation for time-travel, delta scans, MV helpers,
-//! ANALYZE schema materialization, and CatalogMgr table invalidation. Ordinary
-//! SELECT external tables resolve through CatalogMgrProvider.
+//! ANALYZE schema materialization, and catalog-service table invalidation.
+//! Ordinary SELECT external tables resolve through CatalogServiceProvider.
 
 use std::sync::Arc;
 
@@ -121,22 +121,11 @@ pub(crate) fn add_files(
         &s3_path,
     )?;
     entry.invalidate_table_cache(&namespace, &table_name);
-    invalidate_catalog_mgr_table(state, &catalog_name, &namespace, &table_name)?;
+    state
+        .catalog_service
+        .invalidate_table(&catalog_name, &namespace, &table_name)?;
     let msg = format!("Added {count} file(s)");
     build_string_query_result("status", vec![msg]).map(StatementResult::Query)
-}
-
-pub(crate) fn invalidate_catalog_mgr_table(
-    state: &Arc<StandaloneState>,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<(), String> {
-    state
-        .catalog_mgr
-        .read()
-        .expect("catalog mgr read lock")
-        .invalidate_table(catalog, namespace, table)
 }
 
 // ---------------------------------------------------------------------------
@@ -194,11 +183,11 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 ///
 /// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
 /// 2. Build a synthetic `TableDef` for that snapshot and register it in the
-///    in-memory catalog under the name `<table>__at_<snapshot_id>`.
+///    local planner catalog under the name `<table>__at_<snapshot_id>`.
 /// 3. Rewrite the `TableFactor::Table`:
 ///    - Replace `name` with `default_catalog.<namespace>.<synthetic name>` so
-///      CatalogMgrProvider routes the local synthetic table through the
-///      InMemoryCatalog even when the session has an Iceberg current catalog.
+///      CatalogServiceProvider routes the synthetic table through the local
+///      planner catalog even when the session has an Iceberg current catalog.
 ///    - Clear `version` (set to `None`).
 ///    - Preserve any existing alias; if none, set `alias` = original table name
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
@@ -525,7 +514,11 @@ fn register_local_table_registration(
     namespace: &str,
     table_def: TableDef,
 ) -> Result<(), String> {
-    let mut guard = state.catalog.write().expect("catalog write lock");
+    let mut guard = state
+        .catalog_service
+        .local()
+        .write()
+        .expect("catalog service local write lock");
     guard.create_database(namespace).ok();
     guard
         .register(namespace, table_def)
@@ -552,7 +545,8 @@ pub(crate) fn drop_local_table_registration_if_exists(
     table: &str,
 ) -> Result<(), String> {
     let mut guard = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .map_err(|e| format!("standalone catalog write lock: {e}"))?;
     match guard.drop_table(namespace, table) {
@@ -562,7 +556,7 @@ pub(crate) fn drop_local_table_registration_if_exists(
     }
 }
 
-/// IVM-A1 helper: build an `InMemoryCatalog`-compatible `TableDef` for the
+/// IVM-A1 helper: build a local planner-catalog-compatible `TableDef` for the
 /// base table of an MV refresh without registering any data files.
 /// Advertises Iceberg v3 row-lineage virtual columns (`_row_id`, etc.) so
 /// the analyzer can resolve apply-key references; the actual per-snapshot
@@ -776,51 +770,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalidate_catalog_mgr_table_delegates_to_registered_catalog() {
-        struct TrackingCatalog {
-            invalidated: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-        }
-
-        impl crate::engine::catalog_mgr::catalog::Catalog for TrackingCatalog {
-            fn name(&self) -> &str {
-                "ice"
-            }
-
-            fn get_table_metadata(
-                &self,
-                _namespace: &str,
-                _table: &str,
-            ) -> Result<crate::engine::catalog_mgr::metadata::TableMetadata, String> {
-                Err("unused".to_string())
-            }
-
-            fn invalidate_table(&self, namespace: &str, table: &str) {
-                self.invalidated
-                    .lock()
-                    .expect("invalidated lock")
-                    .push((namespace.to_string(), table.to_string()));
-            }
-        }
-
-        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
-        let invalidated = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        state
-            .catalog_mgr
-            .write()
-            .expect("catalog mgr write lock")
-            .register(std::sync::Arc::new(TrackingCatalog {
-                invalidated: std::sync::Arc::clone(&invalidated),
-            }));
-
-        super::invalidate_catalog_mgr_table(&state, "ice", "db", "t").expect("invalidate table");
-
-        assert_eq!(
-            *invalidated.lock().expect("invalidated lock"),
-            vec![("db".to_string(), "t".to_string())]
-        );
-    }
-
     struct PerTableBindingBackend;
 
     impl crate::connector::backend::CatalogBackend for PerTableBindingBackend {
@@ -937,7 +886,8 @@ mod tests {
             .expect("register synthetic table");
 
         let registered = state
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("catalog read lock")
             .get("scratch", "rewrite_piece")
@@ -948,7 +898,8 @@ mod tests {
             .expect("drop synthetic table");
         assert!(
             state
-                .catalog
+                .catalog_service
+                .local()
                 .read()
                 .expect("catalog read lock")
                 .get("scratch", "rewrite_piece")
@@ -986,26 +937,24 @@ mod tests {
     }
 
     #[test]
-    fn catalog_mgr_provider_analyzes_iceberg_query_without_global_registration() {
+    fn catalog_service_provider_analyzes_iceberg_query_without_global_registration() {
         let state = state_with_per_table_binding_source();
         {
-            let mut mgr = state.catalog_mgr.write().expect("catalog mgr");
             let connectors = state.connectors.read().expect("connectors");
-            mgr.register(std::sync::Arc::new(
-                crate::engine::catalog_mgr::iceberg::IcebergCatalog::new(
+            state
+                .catalog_service
+                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     "ice",
                     connectors.catalog_backend("iceberg").expect("backend"),
                     connectors.table_source("iceberg").expect("source"),
-                ),
-            ));
+                ));
         }
-        let local = state.catalog.read().expect("catalog").clone();
+        let catalog_service = crate::engine::catalog_service_snapshot(&state);
+        let local = catalog_service.local_snapshot();
         let connectors = state.connectors.read().expect("connectors").clone();
-        let mgr = state.catalog_mgr.read().expect("catalog mgr").clone();
-        let provider = crate::engine::catalog_mgr::provider::CatalogMgrProvider::new(
+        let provider = crate::engine::build_catalog_service_provider(
             Some("ice"),
-            &local,
-            &mgr,
+            &catalog_service,
             &connectors,
         );
         let query = parse_query_for_table_names("SELECT * FROM parted");

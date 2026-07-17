@@ -119,7 +119,11 @@ pub(crate) fn create_mv(
         .unwrap_or("starrocks");
     let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
     {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         let database_exists = catalog.database_exists(&db_name)?;
         if !database_exists && storage_engine != StarRocksMvStorageEngine::Iceberg {
             return Err(format!("unknown database: {db_name}"));
@@ -457,7 +461,8 @@ pub(crate) fn create_mv(
     drop(starrocks);
 
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     register_starrocks_table_in_catalog(&mut catalog, &runtime)?;
@@ -986,7 +991,8 @@ pub(crate) fn drop_mv(
             return Ok(StatementResult::Ok);
         }
         if state
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog read lock")
             .get(&db_name, &mv_name)
@@ -1255,7 +1261,11 @@ pub(crate) fn analyze_mv_select(
     if has_three_part_refs(&resolved_refs) {
         crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
     }
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let catalog = state
+        .catalog_service
+        .local()
+        .read()
+        .expect("standalone catalog read lock");
     let (resolved, _, _factory) =
         crate::sql::analyzer::analyze(&analyzed_query, &*catalog, current_database)?;
     drop(catalog);
@@ -1619,7 +1629,8 @@ fn register_iceberg_tables_for_mv_analysis(
         let mut table_def = table_source.build_table_def(&resolved)?;
         table_def.name = table.clone();
         let mut local_catalog = state
-            .catalog
+            .catalog_service
+            .local()
             .write()
             .map_err(|e| format!("standalone catalog write lock: {e}"))?;
         local_catalog.create_database(namespace)?;
@@ -2158,9 +2169,9 @@ mod tests {
     use super::*;
     use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::StarRocksTableRuntime;
-    use crate::engine::catalog::InMemoryCatalog;
     use crate::meta::MetaStoreProvider;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
     use arrow::array::Array;
     use std::sync::RwLock;
     use tempfile::TempDir;
@@ -3437,7 +3448,7 @@ GROUP BY k1",
             .expect("count state column");
         assert_eq!(state_column.visible, Some(false));
 
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         catalog
             .create_database("analytics")
             .expect("create database");

@@ -216,7 +216,7 @@ pub(crate) fn execute_insert_from_query_on_pipeline(
     query: &sqlparser::ast::Query,
     query_opts: Option<&QueryOptions>,
 ) -> Result<RecordBatch, String> {
-    let query_result = crate::engine::execute_query_with_catalog_mgr(
+    let query_result = crate::engine::execute_query_with_catalog_service(
         state,
         current_catalog,
         &target.namespace,

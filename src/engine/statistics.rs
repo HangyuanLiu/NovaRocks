@@ -1034,13 +1034,17 @@ fn estimate_insert_source_stats(
     insert_columns: &[String],
     source: &InsertSource,
 ) -> Result<Option<Vec<ColumnStatRow>>, String> {
-    // Stats estimation is only meaningful for tables present in the in-memory
-    // local catalog (local/StarRocks tables, or external tables explicitly
+    // Stats estimation is only meaningful for tables present in the local
+    // planner catalog (local/StarRocks tables, or external tables explicitly
     // materialized by statistics paths such as ANALYZE). Ordinary Iceberg
-    // SELECT resolves through CatalogMgrProvider and may not create local
+    // SELECT resolves through CatalogServiceProvider and may not create local
     // entries, so skip stats estimation when no local entry exists.
     let table = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         match catalog.get(&key.db, &key.table) {
             Ok(table) => table,
             Err(_) => return Ok(None),
@@ -1102,7 +1106,8 @@ fn collect_column_stats_by_query(
             return Err("statistics aggregate did not parse as query".to_string());
         };
         let catalog_snapshot = state
-            .catalog
+            .catalog_service
+            .local()
             .read()
             .expect("standalone catalog read lock")
             .clone();
@@ -1302,7 +1307,11 @@ fn ensure_normal_usage(state: &Arc<StandaloneState>, key: &TableKey) -> Result<(
     // SELECTs against iceberg tables, the local catalog may have no entry.
     // Silently skip column-usage tracking in that case.
     let table = {
-        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("standalone catalog read lock");
         match catalog.get(&key.db, &key.table) {
             Ok(table) => table,
             Err(_) => return Ok(()),
@@ -1550,7 +1559,11 @@ fn object_name_parts(name: &sqlast::ObjectName) -> Vec<String> {
 }
 
 fn table_columns(state: &Arc<StandaloneState>, key: &TableKey) -> Result<Vec<String>, String> {
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let catalog = state
+        .catalog_service
+        .local()
+        .read()
+        .expect("standalone catalog read lock");
     let table = catalog.get(&key.db, &key.table)?;
     table
         .columns

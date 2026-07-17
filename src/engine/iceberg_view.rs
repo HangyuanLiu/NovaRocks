@@ -202,21 +202,15 @@ fn analyze_view_query(
     namespace: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<Vec<OutputColumn>, String> {
-    let catalog_snapshot = state
-        .catalog
-        .read()
-        .expect("standalone catalog read lock")
-        .clone();
+    let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let connectors_snapshot = state
         .connectors
         .read()
         .expect("standalone connector registry read lock")
         .clone();
-    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
-    let provider = crate::engine::build_analyzer_provider(
+    let provider = crate::engine::build_catalog_service_provider(
         Some(catalog),
-        &catalog_snapshot,
-        &catalog_mgr_snapshot,
+        &catalog_service_snapshot,
         &connectors_snapshot,
     );
     let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, namespace)

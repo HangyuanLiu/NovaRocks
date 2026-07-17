@@ -116,7 +116,11 @@ pub(crate) fn create_starrocks_table(
     bucket_count: Option<u32>,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_starrocks_table_name(name, current_database)?;
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let catalog = state
+        .catalog_service
+        .local()
+        .read()
+        .expect("standalone catalog read lock");
     if !catalog.database_exists(&resolved.database)? {
         return Err(format!("unknown database: {}", resolved.database));
     }
@@ -340,7 +344,8 @@ pub(crate) fn create_starrocks_table(
     drop(guard);
 
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     register_starrocks_table_in_catalog(&mut catalog, &runtime)?;
@@ -556,7 +561,8 @@ where
     )?;
     *starrocks = rebuilt;
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     let _ = catalog.drop_table(database_name, table_name);
@@ -780,7 +786,8 @@ where
     let updated_runtime = rebuilt.table(database_name, table_name)?.clone();
     *starrocks = rebuilt;
     let mut catalog = state
-        .catalog
+        .catalog_service
+        .local()
         .write()
         .expect("standalone catalog write lock");
     register_starrocks_table_in_catalog(&mut catalog, &updated_runtime)?;
@@ -1060,6 +1067,7 @@ mod tests {
 
     use prost::Message;
 
+    use crate::catalog::memory::DEFAULT_DATABASE;
     use crate::catalog::schema::SqlType;
     use crate::connector::starrocks::table::catalog::{
         register_starrocks_table_in_catalog, starrocks_scan_tablets,
@@ -1073,13 +1081,13 @@ mod tests {
     use crate::connector::starrocks::table::schema_adapter::build_tablet_schema;
     use crate::connector::starrocks::table::{StarRocksTableCatalog, StarRocksTableConfig};
     use crate::engine::StandaloneState;
-    use crate::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::meta::repository::{id_scopes, test_avro_seed::encode_seed_payload};
     use crate::meta::{
         ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
         SqliteMetaStoreProvider,
     };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::catalog::local::PlannerMemoryCatalog;
     use crate::sql::parser::ast::{TableColumnDef, TableKeyDesc, TableKeyKind};
 
     use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
@@ -1526,7 +1534,7 @@ mod tests {
             .expect("StarRocks runtime")
             .clone();
 
-        let mut catalog = InMemoryCatalog::default();
+        let mut catalog = PlannerMemoryCatalog::default();
         register_starrocks_table_in_catalog(&mut catalog, &runtime)
             .expect("register StarRocks table");
         let mut state = StandaloneState {
@@ -1535,9 +1543,12 @@ mod tests {
             metadata_provider: Some(Arc::new(metadata_provider)),
             ..StandaloneState::default()
         };
-        state.catalog = Arc::new(RwLock::new(catalog));
+        *state
+            .catalog_service
+            .local()
+            .write()
+            .expect("catalog service local write lock") = catalog;
         let state = Arc::new(state);
-        crate::connector::register_default_catalog_mgr_entries(&state);
         (dir, state)
     }
 
@@ -1551,7 +1562,11 @@ mod tests {
 
         drop_starrocks_table(&state, DEFAULT_DATABASE, "orders").expect("drop StarRocks table");
 
-        let catalog = state.catalog.read().expect("catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("catalog read lock");
         let lookup = catalog.get(DEFAULT_DATABASE, "orders");
         assert!(
             lookup.is_err(),
@@ -1609,7 +1624,11 @@ mod tests {
         let _runtime_guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
         let (_dir, state) = seeded_state();
         let logical_columns_before = {
-            let catalog = state.catalog.read().expect("catalog read lock");
+            let catalog = state
+                .catalog_service
+                .local()
+                .read()
+                .expect("catalog read lock");
             let table = catalog
                 .get(DEFAULT_DATABASE, "orders")
                 .expect("logical table before truncate");
@@ -1655,7 +1674,11 @@ mod tests {
         );
         drop(starrocks);
 
-        let catalog = state.catalog.read().expect("catalog read lock");
+        let catalog = state
+            .catalog_service
+            .local()
+            .read()
+            .expect("catalog read lock");
         let logical_after = catalog
             .get(DEFAULT_DATABASE, "orders")
             .expect("logical table after truncate");
