@@ -37,6 +37,7 @@ use crate::runtime::query_result::{
     QueryResult, QueryResultColumn, build_string_query_result, record_batch_to_chunk,
 };
 
+use crate::catalog::attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
 use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::memory::DEFAULT_DATABASE;
 use crate::connector::{
@@ -46,9 +47,7 @@ use crate::connector::{
 #[cfg(feature = "compat")]
 use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
 use crate::meta::repository::backend::BackendMetaRepository;
-use crate::meta::repository::iceberg_catalog::{
-    IcebergCatalogMetaRepository, IcebergCatalogProperties,
-};
+use crate::meta::repository::iceberg_catalog::IcebergCatalogMetaRepository;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::{
     IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
@@ -356,6 +355,7 @@ pub(crate) struct StandaloneState {
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     pub(crate) mv_repo: MvMetaRepository,
+    pub(crate) catalog_attachment_repo: CatalogAttachmentRepository,
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
@@ -395,6 +395,7 @@ impl Default for StandaloneState {
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
+            catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
@@ -546,6 +547,7 @@ impl StandaloneNovaRocks {
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
+            catalog_attachment_repo: CatalogAttachmentRepository,
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             job_repo: JobMetaRepository,
             exchange_port,
@@ -1776,7 +1778,7 @@ impl StandaloneSession {
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                 &stmt.name, backend, source,
             ));
-        persist_iceberg_catalog_if_needed(
+        persist_catalog_attachment_if_needed(
             &self.inner,
             &normalize_identifier(&stmt.name)?,
             &persisted_properties,
@@ -2327,9 +2329,9 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .begin_read()
         .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
     let catalogs = state
-        .iceberg_catalog_repo
-        .list_catalogs(read.as_ref())
-        .map_err(|e| format!("load iceberg catalog metadata failed: {e}"))?;
+        .catalog_attachment_repo
+        .list(read.as_ref())
+        .map_err(|e| format!("load catalog attachment metadata failed: {e}"))?;
     let namespaces = state
         .iceberg_catalog_repo
         .list_namespaces(read.as_ref())
@@ -2383,7 +2385,7 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     Ok(())
 }
 
-pub(crate) fn persist_iceberg_catalog_if_needed(
+pub(crate) fn persist_catalog_attachment_if_needed(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
     properties: &[(String, String)],
@@ -2392,20 +2394,20 @@ pub(crate) fn persist_iceberg_catalog_if_needed(
         return Ok(());
     };
     let mut txn = provider
-        .begin_write("persist iceberg catalog")
+        .begin_write("persist catalog attachment")
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
-        .iceberg_catalog_repo
-        .upsert_catalog(
+        .catalog_attachment_repo
+        .upsert(
             txn.as_mut(),
             catalog_name,
-            IcebergCatalogProperties {
+            CatalogAttachmentProperties {
                 properties: properties.to_vec(),
             },
         )
-        .map_err(|e| format!("persist iceberg catalog metadata failed: {e}"))?;
+        .map_err(|e| format!("persist catalog attachment metadata failed: {e}"))?;
     txn.commit()
-        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
+        .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -2506,7 +2508,7 @@ pub(crate) fn delete_iceberg_namespace_if_needed(
     Ok(())
 }
 
-pub(crate) fn delete_iceberg_catalog_if_needed(
+pub(crate) fn delete_catalog_attachment_if_needed(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
 ) -> Result<(), String> {
@@ -2514,14 +2516,14 @@ pub(crate) fn delete_iceberg_catalog_if_needed(
         return Ok(());
     };
     let mut txn = provider
-        .begin_write("delete iceberg catalog")
+        .begin_write("delete catalog attachment")
         .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
     state
-        .iceberg_catalog_repo
-        .delete_catalog_and_mv_relationships(txn.as_mut(), &state.mv_repo, catalog_name)
-        .map_err(|e| format!("delete iceberg catalog metadata failed: {e}"))?;
+        .catalog_attachment_repo
+        .delete(txn.as_mut(), catalog_name)
+        .map_err(|e| format!("delete catalog attachment metadata failed: {e}"))?;
     txn.commit()
-        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
+        .map_err(|e| format!("commit catalog attachment metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -6785,7 +6787,7 @@ mysql_port = 47892
     }
 
     #[test]
-    fn embedded_session_restores_iceberg_metadata_from_sqlite() {
+    fn embedded_session_restores_catalog_attachment_and_reads_external_table() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
         let metadata_dir = TempDir::new().expect("create metadata dir");
         let config_path = write_test_metadata_config(&metadata_dir, "standalone.sqlite");

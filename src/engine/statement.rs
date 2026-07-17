@@ -29,7 +29,7 @@ use crate::catalog::identifier::resolve_local_table_name;
 use crate::catalog::partition::LegacyRangePartition;
 use crate::catalog::schema::SqlType;
 use crate::engine::{
-    StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
+    StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
@@ -977,7 +977,7 @@ pub(crate) fn execute_drop_catalog_statement(
         Ok(()) => {
             drop(guard);
             let normalized_catalog = normalize_identifier(catalog_name)?;
-            delete_iceberg_catalog_if_needed(state, &normalized_catalog)?;
+            delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
             state
                 .catalog_service
                 .unregister_catalog(&normalized_catalog);
