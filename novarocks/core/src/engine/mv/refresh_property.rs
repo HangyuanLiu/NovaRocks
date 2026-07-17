@@ -22,8 +22,8 @@
 //! over an analyzed MV query, then lowers it into the executable
 //! [`ImvRefreshContract`] via [`RefreshFragmentProperty::into_refresh_contract`].
 //! This is now the single source of contract derivation: the old flat
-//! classifier in [`crate::engine::mv::refresh_contract`] has been removed and
-//! `derive_imv_refresh_contract` delegates here.
+//! classifier has been removed and `derive_imv_refresh_contract` now lives in
+//! this analysis adapter.
 //!
 //! The synthesis MIRRORS the structural acceptance/rejection of the former flat
 //! classifier (unsupported join kinds, non-equi inner joins, non-UNION-ALL set
@@ -52,18 +52,21 @@
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
 use crate::catalog::identifier::TableIdentity;
-use crate::engine::mv::apply_key::ApplyKeyValueType;
-use crate::engine::mv::refresh_contract::{
-    AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
-    JoinRefreshContract,
+use crate::mv::refresh::apply_key::ApplyKeyContract;
+use crate::mv::refresh::contract::{
+    AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
 };
-use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
-use crate::mv::persistence::schema::{ApplyKeySource, MvSchemaContract};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
     SetOpKind, SortItem, TypedExpr,
 };
 use crate::sql::planner::table::ScanSource;
+
+pub(crate) fn derive_imv_refresh_contract(
+    analysis: &crate::engine::mv::analysis::MvAnalysis,
+) -> Result<ImvRefreshContract, String> {
+    derive_fragment_property(&analysis.resolved_query)?.into_refresh_contract()
+}
 
 /// The row-identity contract synthesized for a refresh fragment. This describes
 /// *what a single output row is identified by* so the apply path can compute a
@@ -105,185 +108,6 @@ impl TargetIdentity {
             TargetIdentity::GroupRowId(_) => "GroupRowId",
             TargetIdentity::BranchScoped(_) => "BranchScoped",
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RefreshCapabilities — derived from the persisted MvSchemaContract
-// ---------------------------------------------------------------------------
-
-/// What a NotDerivable partition derivation outcome means for the refresh
-/// (umbrella spec §4.3). v1 (D5): every shape is BestEffort — matching the
-/// pre-existing warn + unpruned-scan behavior. `Required` is defined for
-/// P2/P3, where partitioned aggregates may be tightened to fail fast.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PartitionPruningPolicy {
-    Required,
-    BestEffort,
-}
-
-/// A compact row-identity discriminant used at refresh time. Unlike
-/// `TargetIdentity`, which carries full query-analysis payload (group-key
-/// names, nested join children), this enum only retains the top-level
-/// constructor the driver needs to choose the apply-key path. It is
-/// reconstructed from the persisted `MvSchemaContract` by
-/// `from_schema_contract`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshIdentity {
-    /// A single base-table row (projection / filter over a single scan, or a
-    /// single-scan aggregate).
-    BaseRowId,
-    /// A joined row (two-table inner equi-join, with or without aggregation).
-    JoinRowKey,
-    /// An aggregated group row (aggregate over a single scan or a fan-in
-    /// union). Group-key names are not needed at refresh; the apply key is
-    /// derived from the persisted column name.
-    GroupRowId,
-    /// A branch-scoped composite identity (UNION ALL). The inner identity is
-    /// the per-branch discriminant, reconstructed from
-    /// `BranchUnionContract::inner_apply_key_source`.
-    BranchScoped(Box<RefreshIdentity>),
-}
-
-/// Refresh-time capabilities derived directly from a persisted
-/// `MvSchemaContract`. This replaces the legacy `RefreshStrategy` enum for
-/// the purposes of driver dispatch (Phase 3 / B2+): all driver code that
-/// currently matches on `RefreshStrategy` can be rewritten to match on
-/// `RefreshCapabilities` fields instead.
-///
-/// Constructed by `from_schema_contract`; the parity test in this module
-/// asserts that every field is consistent with the legacy `RefreshStrategy`
-/// the driver currently derives from the same contract.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RefreshCapabilities {
-    /// How the driver treats the set of base-table snapshots.
-    pub(crate) snapshot_policy: BaseSnapshotPolicy,
-    /// Whether the MV carries incremental aggregate state columns.
-    pub(crate) has_agg_state: bool,
-    /// The row-identity discriminant reconstructed from the persisted contract.
-    pub(crate) identity: RefreshIdentity,
-    /// The name of the hidden apply-key column in the target Iceberg table.
-    pub(crate) apply_key_column: String,
-    /// The value type of the apply-key column, used to drive the merge-sink
-    /// apply-key reader.
-    pub(crate) apply_key_value_type: ApplyKeyValueType,
-    /// Policy applied when partition derivation reports NotDerivable.
-    pub(crate) partition_pruning: PartitionPruningPolicy,
-}
-
-impl RefreshCapabilities {
-    /// Derive `RefreshCapabilities` from a persisted `MvSchemaContract`.
-    ///
-    /// Thin associated-function alias for the module-level
-    /// [`from_schema_contract`]; this is the entry point the refresh driver
-    /// dispatches on (Phase 3 / B2+).
-    pub(crate) fn from_schema_contract(
-        c: &MvSchemaContract,
-    ) -> Result<RefreshCapabilities, String> {
-        from_schema_contract(c)
-    }
-}
-
-/// Derive `RefreshCapabilities` from a persisted `MvSchemaContract`.
-///
-/// Returns `Err(String)` for contract shapes that do not correspond to any
-/// supported strategy. A composed branch-union of aggregate-over-join persists
-/// a join + aggregate + branch contract (join+agg+branch) and is supported here.
-pub(crate) fn from_schema_contract(c: &MvSchemaContract) -> Result<RefreshCapabilities, String> {
-    let has_join = c.join.is_some();
-    let has_agg = c.aggregate.is_some();
-    let has_branch = c.branch.is_some();
-    let has_extra_bases = !c.bases.is_empty();
-
-    // Snapshot policy: mirrors stored_refresh_strategy_for_plan + the
-    // per-strategy base-snapshot-policy chosen by the driver wrappers.
-    //   branch (incl. composed over join) -> AllBasesRequired
-    //   join (no branch)                  -> JoinPairPartialInitialSkip
-    //   multiple bases (no branch/join)   -> AllBasesRequired
-    //   single base                       -> SingleBase
-    // Branch takes precedence over join: a composed branch-union of
-    // aggregate-over-join persists both a join and a branch section, and the
-    // branch-scoped refresh driver requires every base snapshot (AllBasesRequired).
-    let snapshot_policy = if has_branch {
-        BaseSnapshotPolicy::AllBasesRequired
-    } else if has_join {
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip
-    } else if has_extra_bases {
-        BaseSnapshotPolicy::AllBasesRequired
-    } else {
-        BaseSnapshotPolicy::SingleBase
-    };
-
-    // Row identity at refresh time.
-    let identity = if has_branch {
-        let branch = c.branch.as_ref().unwrap();
-        let inner = apply_key_source_to_refresh_identity(branch.inner_apply_key_source);
-        RefreshIdentity::BranchScoped(Box::new(inner))
-    } else {
-        apply_key_source_to_refresh_identity(c.target.hidden_apply_key.source)
-    };
-
-    // Apply key column name from the persisted target contract.
-    let apply_key_column = c.target.hidden_apply_key.column_name.clone();
-
-    // Apply key value type: derived from (source, branch).
-    //   BaseRowId  + no branch -> Int64
-    //   BaseRowId  + branch    -> BranchInt64
-    //   JoinRowKey + no branch -> Utf8   (composite row-key string)
-    //   GroupRowId + no branch -> Utf8   (group-key hash string)
-    //   GroupRowId + branch    -> BranchUtf8
-    //
-    // Cross-checked against ApplyKeyContract::{projection_filter,
-    // union_projection_filter, join_projection_filter, aggregate_group_row,
-    // join_aggregate_group_row, branch_union_aggregate_group_row}.
-    let apply_key_value_type = match (c.target.hidden_apply_key.source, has_branch) {
-        (ApplyKeySource::BaseRowId, false) => ApplyKeyValueType::Int64,
-        (ApplyKeySource::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
-        (ApplyKeySource::JoinRowKey, _) => ApplyKeyValueType::Utf8,
-        (ApplyKeySource::GroupRowId, false) => ApplyKeyValueType::Utf8,
-        (ApplyKeySource::GroupRowId, true) => ApplyKeyValueType::BranchUtf8,
-    };
-
-    // Validate the contract shape is one the driver supports (mirrors the
-    // catch-all error in stored_refresh_strategy_for_plan). The tuple
-    // mirrors stored_refresh_strategy_for_plan's (join, agg, branch) match:
-    // join contracts legitimately have non-empty `bases` (the two join sides),
-    // so `extra_bases` is not part of the gating predicate here — it is only
-    // needed to disambiguate FanIn (bases non-empty) vs Single (bases empty)
-    // within the (false, true, false) aggregate-without-join arm.
-    match (has_join, has_agg, has_branch) {
-        (false, false, false) // ProjectionFilter
-        | (true,  false, false) // JoinProjectionFilter
-        | (false, false, true)  // UnionProjectionFilter
-        | (false, true,  false) // SingleAggregate or FanInAggregate
-        | (true,  true,  false) // JoinAggregate
-        | (false, true,  true)  // BranchUnionAggregate (simple branches)
-        | (true,  true,  true)  // BranchUnionAggregate over join (composed)
-        => {}
-        _ => {
-            return Err(format!(
-                "unsupported schema contract shape \
-                 (join={has_join}, agg={has_agg}, branch={has_branch})"
-            ));
-        }
-    }
-
-    Ok(RefreshCapabilities {
-        snapshot_policy,
-        has_agg_state: has_agg,
-        identity,
-        apply_key_column,
-        apply_key_value_type,
-        partition_pruning: PartitionPruningPolicy::BestEffort,
-    })
-}
-
-/// Convert an `ApplyKeySource` discriminant to a `RefreshIdentity` leaf.
-fn apply_key_source_to_refresh_identity(source: ApplyKeySource) -> RefreshIdentity {
-    match source {
-        ApplyKeySource::BaseRowId => RefreshIdentity::BaseRowId,
-        ApplyKeySource::JoinRowKey => RefreshIdentity::JoinRowKey,
-        ApplyKeySource::GroupRowId => RefreshIdentity::GroupRowId,
     }
 }
 
@@ -2560,8 +2384,6 @@ mod tests {
     // Minimal contract builders used only in the parity tests below.
     // ------------------------------------------------------------------
 
-    use crate::engine::mv::apply_key::ApplyKeyValueType;
-    use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
     use crate::mv::persistence::schema::{
         AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, ExpressionKind, ExpressionLineage,
@@ -2570,6 +2392,15 @@ mod tests {
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
+    use crate::mv::refresh::apply_key::ApplyKeyValueType;
+    use crate::mv::refresh::capabilities::{
+        PartitionPruningPolicy, RefreshCapabilities, RefreshIdentity,
+    };
+    use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
+
+    fn from_schema_contract(contract: &MvSchemaContract) -> Result<RefreshCapabilities, String> {
+        RefreshCapabilities::from_schema_contract(contract)
+    }
 
     /// Minimal base contract (single-column Iceberg table).
     fn parity_base(fqn: &str, uuid: &str) -> BaseContract {

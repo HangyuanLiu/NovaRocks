@@ -15,200 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::catalog::identifier::TableIdentity;
-use crate::engine::mv::apply_key::ApplyKeyValueType;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RewriteEvidence {
-    None,
-    Aggregate,
-    JoinAggregate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ApplyKeyContract {
-    pub(crate) column_name: &'static str,
-    pub(crate) value_type: ApplyKeyValueType,
-    pub(crate) rewrite_evidence: RewriteEvidence,
-    pub(crate) allow_full_rebuild_on_policy_full_refresh: bool,
-    pub(crate) preload_locator_for_change_stream_deletes: bool,
-}
-
-impl ApplyKeyContract {
-    pub(crate) fn projection_filter() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::Int64,
-            rewrite_evidence: RewriteEvidence::None,
-            allow_full_rebuild_on_policy_full_refresh: true,
-            preload_locator_for_change_stream_deletes: false,
-        }
-    }
-
-    pub(crate) fn union_projection_filter() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::BranchInt64,
-            rewrite_evidence: RewriteEvidence::None,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            preload_locator_for_change_stream_deletes: false,
-        }
-    }
-
-    pub(crate) fn join_projection_filter() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::Utf8,
-            rewrite_evidence: RewriteEvidence::None,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            preload_locator_for_change_stream_deletes: false,
-        }
-    }
-
-    pub(crate) fn aggregate_group_row() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::Utf8,
-            rewrite_evidence: RewriteEvidence::Aggregate,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            preload_locator_for_change_stream_deletes: true,
-        }
-    }
-
-    pub(crate) fn join_aggregate_group_row() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::Utf8,
-            rewrite_evidence: RewriteEvidence::JoinAggregate,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            preload_locator_for_change_stream_deletes: true,
-        }
-    }
-
-    pub(crate) fn branch_union_aggregate_group_row() -> Self {
-        Self {
-            column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-            value_type: ApplyKeyValueType::BranchUtf8,
-            rewrite_evidence: RewriteEvidence::Aggregate,
-            allow_full_rebuild_on_policy_full_refresh: false,
-            preload_locator_for_change_stream_deletes: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ImvRefreshContract {
-    pub(crate) base_refs: Vec<TableIdentity>,
-    pub(crate) apply_key: ApplyKeyContract,
-    pub(crate) aggregate: Option<AggregateRefreshContract>,
-    pub(crate) join: Option<JoinRefreshContract>,
-    pub(crate) branch: Option<BranchRefreshContract>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AggregateRefreshContract {
-    pub(crate) group_key_count: usize,
-    pub(crate) aggregate_count: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct JoinRefreshContract {
-    pub(crate) join_key_count: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BranchRefreshContract {
-    pub(crate) branch_count: usize,
-}
-
-pub(crate) fn derive_imv_refresh_contract(
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
-) -> Result<ImvRefreshContract, String> {
-    crate::engine::mv::refresh_property::derive_fragment_property(&analysis.resolved_query)?
-        .into_refresh_contract()
-}
-
-#[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::catalog::identifier::TableIdentity;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
     use crate::engine::mv::analysis::{MvAnalysis, ResolvedTableRef};
+    use crate::engine::mv::refresh_property::derive_imv_refresh_contract;
+    use crate::mv::refresh::apply_key::{ApplyKeyContract, ApplyKeyValueType, RewriteEvidence};
+    use crate::mv::refresh::contract::{
+        AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
+    };
     use crate::sql::analysis::{
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use arrow::datatypes::DataType;
-
-    #[test]
-    fn apply_key_contract_constructor_matrix_is_stable() {
-        use crate::mv::persistence::schema::{
-            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-            JOIN_APPLY_KEY_COLUMN_NAME,
-        };
-
-        let cases = [
-            (
-                ApplyKeyContract::projection_filter(),
-                HIDDEN_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::Int64,
-                RewriteEvidence::None,
-                true,
-                false,
-            ),
-            (
-                ApplyKeyContract::union_projection_filter(),
-                HIDDEN_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::BranchInt64,
-                RewriteEvidence::None,
-                false,
-                false,
-            ),
-            (
-                ApplyKeyContract::join_projection_filter(),
-                JOIN_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::Utf8,
-                RewriteEvidence::None,
-                false,
-                false,
-            ),
-            (
-                ApplyKeyContract::aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::Utf8,
-                RewriteEvidence::Aggregate,
-                false,
-                true,
-            ),
-            (
-                ApplyKeyContract::join_aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::Utf8,
-                RewriteEvidence::JoinAggregate,
-                false,
-                true,
-            ),
-            (
-                ApplyKeyContract::branch_union_aggregate_group_row(),
-                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                ApplyKeyValueType::BranchUtf8,
-                RewriteEvidence::Aggregate,
-                false,
-                true,
-            ),
-        ];
-
-        for (actual, column_name, value_type, rewrite_evidence, rebuild, preload) in cases {
-            assert_eq!(actual.column_name, column_name);
-            assert_eq!(actual.value_type, value_type);
-            assert_eq!(actual.rewrite_evidence, rewrite_evidence);
-            assert_eq!(actual.allow_full_rebuild_on_policy_full_refresh, rebuild);
-            assert_eq!(actual.preload_locator_for_change_stream_deletes, preload);
-        }
-    }
 
     struct TestIcebergCatalog;
 
