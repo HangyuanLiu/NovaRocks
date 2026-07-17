@@ -3122,7 +3122,6 @@ dependencies = [
  "moka",
  "mysql",
  "mysql_common",
- "novarocks-codegen-audit",
  "num-traits",
  "num_cpus",
  "once_cell",
@@ -3162,17 +3161,6 @@ dependencies = [
  "url",
  "uuid",
  "which",
-]
-
-[[package]]
-name = "novarocks-codegen-audit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "tempfile",
 ]
 
 [[package]]
