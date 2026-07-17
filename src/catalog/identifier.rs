@@ -47,6 +47,10 @@ impl TableIdentity {
             table: table.to_string(),
         }
     }
+
+    pub(crate) fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
+    }
 }
 
 pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
@@ -461,5 +465,11 @@ mod tests {
         assert_eq!(identity.catalog, "MiXeD");
         assert_eq!(identity.namespace, "Ns");
         assert_eq!(identity.table, "T");
+    }
+
+    #[test]
+    fn table_identity_formats_fully_qualified_name() {
+        let identity = TableIdentity::new("ice", "sales", "orders");
+        assert_eq!(identity.fqn(), "ice.sales.orders");
     }
 }
