@@ -46783,31 +46783,87 @@ fn pbf_1a_path_is_std_include(path: &[String]) -> bool {
     path == ["std", "include"]
 }
 
+fn pbf_1a_resolve_namespace_aliases(
+    path: &[String],
+    aliases: &BTreeMap<String, Vec<String>>,
+    ambiguous: &BTreeSet<String>,
+) -> Result<Vec<String>, ()> {
+    let mut resolved = path.to_vec();
+    let mut visited = BTreeSet::new();
+    loop {
+        let Some(first) = resolved.first().cloned() else {
+            return Ok(resolved);
+        };
+        if ambiguous.contains(&first) || !visited.insert(first.clone()) {
+            return Err(());
+        }
+        let Some(target) = aliases.get(&first) else {
+            return Ok(resolved);
+        };
+        let mut canonical = target.clone();
+        canonical.extend_from_slice(&resolved[1..]);
+        resolved = canonical;
+    }
+}
+
 fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<String> {
     #[derive(Default)]
-    struct IncludeAliasAudit {
-        aliases: BTreeSet<String>,
+    struct NamespaceAliasAudit {
+        aliases: BTreeMap<String, Vec<String>>,
+        ambiguous: BTreeSet<String>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for IncludeAliasAudit {
+    impl NamespaceAliasAudit {
+        fn record(&mut self, local: String, target: Vec<String>) {
+            if target.as_slice() == [local.as_str()] {
+                return;
+            }
+            if self.ambiguous.contains(&local) {
+                return;
+            }
+            match self.aliases.get(&local) {
+                Some(existing) if existing != &target => {
+                    self.aliases.remove(&local);
+                    self.ambiguous.insert(local);
+                }
+                Some(_) => {}
+                None => {
+                    self.aliases.insert(local, target);
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for NamespaceAliasAudit {
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
             let mut bindings = Vec::new();
             pbf_1a_collect_use_bindings(&item.tree, &mut Vec::new(), &mut bindings);
             for binding in bindings {
                 if !binding.glob
-                    && pbf_1a_path_is_std_include(&binding.target)
                     && let Some(local) = binding.local
                 {
-                    self.aliases.insert(local);
+                    self.record(local, binding.target);
                 }
             }
             syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            let target = vec![pbf_1a_ident_text(&item.ident)];
+            let local = item
+                .rename
+                .as_ref()
+                .map(|(_, rename)| pbf_1a_ident_text(rename))
+                .unwrap_or_else(|| target[0].clone());
+            self.record(local, target);
+            syn::visit::visit_item_extern_crate(self, item);
         }
     }
 
     struct IndirectionAudit {
         findings: Vec<String>,
-        include_aliases: BTreeSet<String>,
+        namespace_aliases: BTreeMap<String, Vec<String>>,
+        ambiguous_aliases: BTreeSet<String>,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for IndirectionAudit {
@@ -46830,9 +46886,17 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
                 .map(|segment| pbf_1a_ident_text(&segment.ident))
                 .collect::<Vec<_>>();
             let is_bare_include = path.as_slice() == ["include"];
-            let is_qualified_std_include = pbf_1a_path_is_std_include(&path);
-            let is_import_alias = path.len() == 1 && self.include_aliases.contains(&path[0]);
-            if is_bare_include || is_qualified_std_include || is_import_alias {
+            let canonical = pbf_1a_resolve_namespace_aliases(
+                &path,
+                &self.namespace_aliases,
+                &self.ambiguous_aliases,
+            );
+            let is_std_include = canonical
+                .as_ref()
+                .is_ok_and(|path| pbf_1a_path_is_std_include(path));
+            let is_unproven_include_alias =
+                canonical.is_err() && path.last().is_some_and(|segment| segment == "include");
+            if is_bare_include || is_std_include || is_unproven_include_alias {
                 self.findings.push("include! macro".to_string());
             }
             syn::visit::visit_macro(self, mac);
@@ -46852,11 +46916,12 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
             "PBF-1A owner `{source_rel}` has cfg-dependent source ownership that cannot be proven"
         )];
     }
-    let mut aliases = IncludeAliasAudit::default();
+    let mut aliases = NamespaceAliasAudit::default();
     syn::visit::Visit::visit_file(&mut aliases, &file);
     let mut audit = IndirectionAudit {
         findings: Vec::new(),
-        include_aliases: aliases.aliases,
+        namespace_aliases: aliases.aliases,
+        ambiguous_aliases: aliases.ambiguous,
     };
     syn::visit::Visit::visit_file(&mut audit, &file);
     audit
@@ -46893,6 +46958,27 @@ fn pbf_1a_declaration_contract_violations(
     source: &str,
     expected: Pbf1aVocabularyEntry,
 ) -> Vec<String> {
+    fn item_declaration(
+        item: &syn::Item,
+        expected_name: &str,
+    ) -> Option<(Pbf1aDeclarationKind, bool)> {
+        match item {
+            syn::Item::Struct(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::Struct,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            syn::Item::Enum(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::Enum,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            syn::Item::Type(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::TypeAlias,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            _ => None,
+        }
+    }
+
     struct DeclarationAudit<'a> {
         expected_name: &'a str,
         declarations: Vec<(Pbf1aDeclarationKind, bool)>,
@@ -46951,9 +47037,30 @@ fn pbf_1a_declaration_contract_violations(
         declarations: Vec::new(),
     };
     syn::visit::Visit::visit_file(&mut audit, &file);
+    let top_level = file
+        .items
+        .iter()
+        .filter_map(|item| item_declaration(item, expected.name))
+        .collect::<Vec<_>>();
+    let nested_count = audit.declarations.len().saturating_sub(top_level.len());
 
     let mut violations = Vec::new();
-    for (kind, exact_pub_crate) in audit.declarations {
+    if nested_count > 0 {
+        violations.push(format!(
+            "PBF-1A vocabulary `{}` in `{source_rel}` must have one top-level `{}` declaration; found {nested_count} nested declaration(s)",
+            expected.name,
+            expected.kind.label()
+        ));
+    }
+    if top_level.len() != 1 {
+        violations.push(format!(
+            "PBF-1A vocabulary `{}` in `{source_rel}` must have exactly one top-level `{}` declaration; found {}",
+            expected.name,
+            expected.kind.label(),
+            top_level.len()
+        ));
+    }
+    for (kind, exact_pub_crate) in top_level {
         if kind != expected.kind {
             violations.push(format!(
                 "PBF-1A vocabulary `{}` in `{source_rel}` must be declared as `{}`; found `{}`",
@@ -47355,6 +47462,29 @@ fn pbf_1a_unique_vocabulary_detector_rejects_wrong_declaration_kind_and_visibili
 }
 
 #[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_nested_owner_declarations() {
+    for declaration in [
+        "mod hidden { pub(crate) struct FragmentLaunchError; }",
+        "fn hidden() { pub(crate) struct FragmentLaunchError; }",
+        "const _: () = { pub(crate) struct FragmentLaunchError; };",
+    ] {
+        let inventory = vec![(
+            "src/runtime/fragment/error.rs".to_string(),
+            declaration.to_string(),
+        )];
+        let violations = pbf_1a_unique_vocabulary_violations(&inventory);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("`FragmentLaunchError`")
+                    && violation.contains("top-level `struct`")
+                    && violation.contains("nested declaration")
+            }),
+            "a nested declaration must not satisfy the expected owner ledger: `{declaration}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
 fn pbf_1a_inventory_reader_fails_closed_on_unreadable_source() {
     let root = std::env::temp_dir().join(format!(
         "pbf_1a_inventory_{}_{}",
@@ -47389,6 +47519,19 @@ fn render() {
         "ordinary identifiers named path/include must remain valid: {safe_violations:?}"
     );
 
+    let unrelated_namespace_alias = r#"
+use crate::diagnostics as owner;
+owner::include!("diagnostic-only");
+"#;
+    let unrelated_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        unrelated_namespace_alias,
+    );
+    assert!(
+        unrelated_violations.is_empty(),
+        "an unrelated namespace alias with an include-named macro must not be mistaken for std::include!: {unrelated_violations:?}"
+    );
+
     for invalid in [
         "#[path = \"legacy.rs\"] mod error;",
         "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
@@ -47397,6 +47540,10 @@ fn render() {
         "std::include!(\"legacy.rs\");",
         "::std::include!(\"legacy.rs\");",
         "use std::include as load_owner; load_owner!(\"legacy.rs\");",
+        "use std as owner; owner::include!(\"legacy.rs\");",
+        "extern crate std as owner; owner::include!(\"legacy.rs\");",
+        "use r#std as r#owner; r#owner::r#include!(\"legacy.rs\");",
+        "use std as owner; use owner as chained; chained::include!(\"legacy.rs\");",
     ] {
         let violations =
             pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
