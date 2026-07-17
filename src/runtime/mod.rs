@@ -27,7 +27,6 @@ pub mod execution_services;
 pub(crate) mod fragment_exec_params;
 pub(crate) mod fragment_output;
 pub mod global_async_runtime;
-pub mod heartbeat_mgr;
 pub mod io;
 pub mod load_tracking;
 pub mod lookup;
@@ -39,7 +38,6 @@ pub mod query_context;
 pub(crate) mod query_options;
 pub mod query_result;
 pub(crate) mod query_state;
-pub(crate) mod registry_cleanup;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
 pub mod result_buffer;

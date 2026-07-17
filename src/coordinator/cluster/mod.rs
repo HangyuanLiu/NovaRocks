@@ -19,6 +19,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod lifecycle;
+mod query_cleanup;
+
+#[cfg(not(test))]
+pub(crate) use lifecycle::spawn_heartbeat_manager;
+pub(crate) use lifecycle::{RegistryEventSink, run_heartbeat_round};
+pub(crate) use query_cleanup::QueryCleanupSink;
+
 static GLOBAL_REGISTRY: OnceLock<Mutex<Option<Arc<BackendRegistry>>>> = OnceLock::new();
 
 pub(crate) type BeId = u32;
