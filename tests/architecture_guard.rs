@@ -46882,6 +46882,9 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.is_ident("macro_rules") {
+                self.findings.push("declarative macro".to_string());
+            }
             let path = mac
                 .path
                 .segments
@@ -47552,14 +47555,31 @@ owner::include!("diagnostic-only");
     );
 
     let unrelated_macro_name = r#"
-macro_rules! load { ($value:literal) => { $value }; }
-const _: &str = load!("diagnostic-only");
+load!("diagnostic-only");
 "#;
     let unrelated_macro_violations =
         pbf_1a_source_indirection_violations("src/protocol/common/error.rs", unrelated_macro_name);
     assert!(
         unrelated_macro_violations.is_empty(),
         "an ordinary macro name without ambiguous alias provenance must remain legal: {unrelated_macro_violations:?}"
+    );
+
+    let test_only_declarative_macro = r#"
+#[cfg(test)]
+macro_rules! hide_source {
+    () => {
+        include!("legacy.rs");
+        #[path = "legacy.rs"] mod hidden;
+    };
+}
+"#;
+    let test_only_macro_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        test_only_declarative_macro,
+    );
+    assert!(
+        test_only_macro_violations.is_empty(),
+        "a cfg(test)-only declarative macro must stay outside the production audit: {test_only_macro_violations:?}"
     );
 
     for invalid in [
@@ -47578,6 +47598,8 @@ const _: &str = load!("diagnostic-only");
         "use r#std::{self as r#owner}; r#owner::r#include!(\"legacy.rs\");",
         "use std::{self as owner}; use owner::{self as chained}; chained::include!(\"legacy.rs\");",
         "mod left { use std::include as load; load!(\"legacy.rs\"); } mod right { use std::format as load; }",
+        "macro_rules! hide_source { () => { include!(\"legacy.rs\"); }; }",
+        "macro_rules! hide_source { () => { #[path = \"legacy.rs\"] mod hidden; }; }",
     ] {
         let violations =
             pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
