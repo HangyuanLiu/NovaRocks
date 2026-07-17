@@ -90,7 +90,7 @@ impl<'a> CatalogServiceProvider<'a> {
                     let backend = self.connectors.catalog_backend("iceberg")?;
                     let source = self.connectors.table_source("iceberg")?;
                     let resolved = backend.load_table_for_read(catalog, database, table)?;
-                    let planner = source.build_table_def(&resolved)?;
+                    let planner = source.build_schema_table_def(&resolved)?;
                     Ok(ResolvedAnalyzerTable::from_planner(
                         Some(catalog),
                         database,
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn explain_stats_external_lookup_uses_full_metadata_builder() {
+    fn explain_stats_external_lookup_uses_schema_metadata_builder() {
         let resolutions = Arc::new(AtomicUsize::new(0));
         let service = service(Arc::clone(&resolutions));
         let (connectors, loads, full_calls, schema_calls, metadata_row_calls) =
@@ -599,12 +599,15 @@ mod tests {
 
         assert_eq!(resolutions.load(Ordering::SeqCst), 0);
         assert_eq!(loads.load(Ordering::SeqCst), 1);
-        assert_eq!(full_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(schema_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(schema_calls.load(Ordering::SeqCst), 1);
         assert_eq!(metadata_row_calls.load(Ordering::SeqCst), 0);
         let ScanSource::IcebergDataFiles { table, .. } = resolved.planner.source else {
             panic!("expected iceberg source");
         };
-        assert_eq!(table.serialized_metadata.as_deref(), Some("full-metadata"));
+        assert_eq!(
+            table.serialized_metadata.as_deref(),
+            Some("schema-metadata")
+        );
     }
 }
