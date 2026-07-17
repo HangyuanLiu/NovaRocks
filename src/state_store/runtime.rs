@@ -524,7 +524,7 @@ impl fmt::Debug for StateStoreRuntime {
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
-struct MysqlRuntime {
+pub(in crate::state_store) struct MysqlRuntime {
     shared: Arc<MysqlRuntimeShared>,
     lifecycle: Mutex<MysqlRuntimeLifecycle>,
 }
@@ -555,7 +555,7 @@ enum MysqlRuntimeLifecycle {
 
 #[cfg(feature = "mysql-state-store-provider")]
 impl MysqlRuntime {
-    fn boot(config: MySqlClientConfig) -> Result<Self, StateStoreError> {
+    pub(in crate::state_store) fn boot(config: MySqlClientConfig) -> Result<Self, StateStoreError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             StateStoreError::new(
                 StateStoreErrorKind::InvalidConfiguration,
@@ -612,7 +612,7 @@ impl MysqlRuntime {
         Ok(())
     }
 
-    async fn open_store(
+    pub(in crate::state_store) async fn open_store(
         &self,
         config: &StateStoreConfig,
         _deployment: FeDeploymentView,
@@ -1001,7 +1001,10 @@ impl MysqlRuntime {
         super::mysql::client::run_sleep_until_deadline(pool, deadline).await
     }
 
-    async fn shutdown(&mut self, timeout: Duration) -> Result<(), StateStoreError> {
+    pub(in crate::state_store) async fn shutdown(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), StateStoreError> {
         self.shutdown_with_drain_hook(timeout, || {}).await
     }
 

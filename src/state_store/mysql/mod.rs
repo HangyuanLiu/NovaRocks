@@ -21,6 +21,9 @@ pub(crate) mod client;
 pub(crate) mod codec;
 pub(crate) mod commit;
 pub(crate) mod error;
+#[cfg(feature = "state-store-test-hooks")]
+#[doc(hidden)]
+pub mod helper_protocol;
 pub(crate) mod identity;
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) mod open_test_hooks;

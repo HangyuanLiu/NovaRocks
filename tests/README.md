@@ -80,7 +80,7 @@ goldens. Finish tests by dropping transaction and store handles, then call
 `StateStoreRuntime::shutdown()`, and only after successful runtime shutdown run
 `docker/foundationdb/down.sh --docker`.
 
-## MySQL State Store Boundary
+## MySQL State Store
 
 `mysql-state-store-provider` pins the optional Tokio-native client to
 `mysql_async 0.37.0` with the minimal Rustls feature set. Default and
@@ -88,11 +88,26 @@ feature-off builds retain the MySQL configuration vocabulary but do not include
 the async driver; selecting MySQL in those builds returns a typed
 `InvalidConfiguration` error and never falls back to SQLite.
 
-Task 1 covers only the dependency, nested `[state_store.mysql_client]`
-configuration, non-secret static validation, 3072-byte provider-effective key
-limit, and architecture ownership guard. Password values are not read during
-configuration loading, and no MySQL schema, transaction, or runtime provider is
-implemented in this task.
+The production acceptance fixture is the pinned MySQL 8.4.10 container under
+`docker/mysql-state-store/`. The Homebrew server is auxiliary developer evidence
+only and does not replace the pinned fixture.
+
+`state_store_mysql` runs the provider scenarios and, through `mysql_suite`, all
+13 shared conformance cases without changing
+`tests/common/state_store_conformance.rs`. Each conformance factory invocation
+uses a separately provisioned database while sharing one explicit MySQL runtime.
+`state_store_mysql_cross_process` starts two independent exec helper clients
+against an ordinary-provider credential and shared schema. The parent test is
+the only database provisioner; helper environments contain no provisioner
+credential or compose runtime material. These helpers are MySQL clients, not
+FEs, so this test is not a real two-FE deployment.
+
+The helper uses a strict, ordered JSONL protocol containing only
+`Open`, `Begin`, `Get`, `Range`, `Put`, `Delete`, `Commit`, `Resolve`, `Poll`,
+and `Shutdown`. Protocol errors are flushed before a deterministic nonzero
+exit. Normal `Shutdown` aborts active transactions and waits for explicit
+runtime disconnect. Diagnostics must never contain credentials, a DSN, a raw
+database or cluster identifier, or logical keys and values.
 
 Focused contract checks:
 
@@ -100,6 +115,11 @@ Focused contract checks:
 cargo test --test state_store_contract mysql_
 cargo test --lib state_store::limits::tests::mysql_
 cargo test --test architecture_guard state_store_mysql
+cargo test --features mysql-state-store-provider,state-store-test-hooks \
+  --test state_store_mysql mysql_suite -- --exact --test-threads=1
+cargo test --features mysql-state-store-provider,state-store-test-hooks \
+  --test state_store_mysql_cross_process mysql_cross_process_suite \
+  -- --exact --test-threads=1
 ```
 
 ## About Rust Target Discovery

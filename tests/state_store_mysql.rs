@@ -17,6 +17,7 @@
 
 #![cfg(feature = "mysql-state-store-provider")]
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::Command;
@@ -255,6 +256,67 @@ fn shared_post_dispatch_factory(store: Arc<dyn StateStore>) -> StateStoreFactory
     Rc::new(move || {
         let store = Arc::clone(&store);
         Box::pin(async move {
+            Ok(StateStoreConformanceFixture::new(
+                store,
+                Arc::new(MysqlPostDispatchController),
+            ))
+        })
+    })
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn mysql_conformance_limits() -> StateStoreLimitOverrides {
+    const CONFORMANCE_MAX_VALUE_BYTES: usize = 1_899;
+    let mutation_bytes = MysqlWriteTestApi::put_accounted_bytes(
+        &[11, 0xfe, 1],
+        &vec![0; CONFORMANCE_MAX_VALUE_BYTES],
+        &Precondition::Any,
+    )
+    .expect("account MySQL conformance mutation");
+    let four_mutation_bytes = MysqlWriteTestApi::transaction_envelope_bytes()
+        .checked_add(
+            mutation_bytes
+                .checked_mul(4)
+                .expect("four MySQL conformance mutations fit usize"),
+        )
+        .expect("MySQL conformance budget fits usize");
+    StateStoreLimitOverrides {
+        max_key_bytes: Some(64),
+        max_value_bytes: Some(CONFORMANCE_MAX_VALUE_BYTES),
+        max_page_size: Some(10),
+        max_transaction_operations: Some(8),
+        max_transaction_bytes: Some(four_mutation_bytes),
+        transaction_deadline_ms: Some(4_000),
+        runner_max_attempts: Some(3),
+    }
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+fn mysql_conformance_factory(
+    runtime: Rc<StateStoreRuntime>,
+    databases: Rc<RefCell<Vec<TestDatabase>>>,
+) -> StateStoreFactory {
+    Rc::new(move || {
+        let database = TestDatabase::provision("mysql_suite", "conformance");
+        let database_name = database.name.clone();
+        databases.borrow_mut().push(database);
+        let runtime = Rc::clone(&runtime);
+        Box::pin(async move {
+            let store = open_state_store(
+                runtime.as_ref(),
+                StateStoreConfig {
+                    cluster_id: "mysql-conformance-cluster".to_owned(),
+                    limits: mysql_conformance_limits(),
+                    provider: StateStoreProviderConfig::Mysql {
+                        database: database_name,
+                    },
+                },
+                FeDeploymentView {
+                    active_fe_count: NonZeroUsize::new(2).expect("two is non-zero"),
+                    topology_revision: Bytes::from_static(b"mysql-conformance-topology"),
+                },
+            )
+            .await?;
             Ok(StateStoreConformanceFixture::new(
                 store,
                 Arc::new(MysqlPostDispatchController),
@@ -3099,6 +3161,24 @@ async fn mysql_shared_post_dispatch_cancel_waiter_reconciles() {
     drop(factory);
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_suite() {
+    let runtime = Rc::new(
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime"),
+    );
+    let databases = Rc::new(RefCell::new(Vec::new()));
+    let factory = mysql_conformance_factory(Rc::clone(&runtime), Rc::clone(&databases));
+    common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+    drop(factory);
+    let mut runtime = Rc::try_unwrap(runtime).expect("all MySQL conformance handles drained");
+    runtime
+        .shutdown()
+        .await
+        .expect("shutdown MySQL conformance runtime");
+    drop(databases);
 }
 
 macro_rules! task6_change_test {

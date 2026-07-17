@@ -31,6 +31,13 @@ required-features = ["foundationdb-provider", "state-store-test-hooks"]
 test = false
 bench = false
 
+[[bin]]
+name = "state-store-mysql-helper"
+path = "tests/support/state_store_mysql_helper.rs"
+required-features = ["mysql-state-store-provider", "state-store-test-hooks"]
+test = false
+bench = false
+
 [dependencies]
 # logging/config
 tracing = "0.1"

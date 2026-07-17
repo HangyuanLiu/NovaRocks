@@ -1,0 +1,789 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#![cfg(all(
+    feature = "mysql-state-store-provider",
+    feature = "state-store-test-hooks"
+))]
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use serde_json::{Value as JsonValue, json};
+use uuid::Uuid;
+
+const HELPER: &str = env!("CARGO_BIN_EXE_state-store-mysql-helper");
+
+fn run_helper(input: &[u8], configure: impl FnOnce(&mut Command)) -> Output {
+    let mut command = Command::new(HELPER);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure(&mut command);
+    let mut child = command.spawn().expect("spawn MySQL state store helper");
+    child
+        .stdin
+        .take()
+        .expect("take helper stdin")
+        .write_all(input)
+        .expect("write helper input");
+    child.wait_with_output().expect("wait for helper output")
+}
+
+fn response_lines(output: &Output) -> Vec<JsonValue> {
+    String::from_utf8(output.stdout.clone())
+        .expect("helper stdout is UTF-8 JSONL")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("decode helper JSON response"))
+        .collect()
+}
+
+fn assert_terminal_protocol_error(input: &[u8], expected_code: &str) {
+    let output = run_helper(input, |_| {});
+    assert!(
+        !output.status.success(),
+        "invalid protocol input must terminate the helper"
+    );
+    let responses = response_lines(&output);
+    assert_eq!(
+        responses.len(),
+        1,
+        "the protocol error must be flushed once"
+    );
+    assert_eq!(responses[0]["ok"], false);
+    assert_eq!(responses[0]["event"], "Error");
+    assert_eq!(responses[0]["code"], expected_code);
+    assert_eq!(responses[0]["id"], 1);
+    assert!(responses[0]["pid"].as_u64().is_some_and(|pid| pid > 0));
+}
+
+#[test]
+fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
+    let output = run_helper(b"{\"id\":1,\"command\":\"Shutdown\"}\n", |_| {});
+    assert!(output.status.success(), "Shutdown must exit successfully");
+    let responses = response_lines(&output);
+    assert_eq!(responses.len(), 1, "Shutdown must emit one response");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["ok"], true);
+    assert_eq!(responses[0]["event"], "Shutdown");
+    assert!(responses[0]["pid"].as_u64().is_some_and(|pid| pid > 0));
+
+    for command in [
+        json!({"id": 1, "command": "Begin", "transaction_id": Uuid::nil(), "description": "protocol"}),
+        json!({"id": 1, "command": "Get", "transaction_id": Uuid::nil(), "key": "00ff"}),
+        json!({"id": 1, "command": "Range", "transaction_id": Uuid::nil(), "start": "00", "end": "ff", "direction": "Forward", "page_size": 1}),
+        json!({"id": 1, "command": "Put", "transaction_id": Uuid::nil(), "key": "00", "value": "ff", "precondition": "Any"}),
+        json!({"id": 1, "command": "Delete", "transaction_id": Uuid::nil(), "key": "00", "precondition": "Any"}),
+        json!({"id": 1, "command": "Commit", "transaction_id": Uuid::nil(), "lose_response": false}),
+        json!({"id": 1, "command": "Resolve", "transaction_id": Uuid::nil()}),
+        json!({"id": 1, "command": "Poll", "after": null, "page_size": 1}),
+    ] {
+        let mut encoded = serde_json::to_vec(&command).expect("encode frozen command");
+        encoded.push(b'\n');
+        assert_terminal_protocol_error(&encoded, "InvalidOrder");
+    }
+
+    for forbidden in ["Release", "Pause", "Barrier", "Sleep", "Inject", "Crash"] {
+        let input = format!("{{\"id\":1,\"command\":\"{forbidden}\"}}\n");
+        assert_terminal_protocol_error(input.as_bytes(), "InvalidJson");
+    }
+    assert_terminal_protocol_error(
+        b"{\"id\":1,\"command\":\"Put\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"not-hex\",\"value\":\"00\",\"precondition\":\"Any\"}\n",
+        "InvalidHex",
+    );
+    assert_terminal_protocol_error(
+        b"{\"id\":1,\"command\":\"Get\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"unexpected\":true}\n",
+        "InvalidJson",
+    );
+    assert_terminal_protocol_error(
+        b"{\"id\":1,\"command\":\"Delete\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"precondition\":{\"version\":\"00\",\"unexpected\":true}}\n",
+        "InvalidJson",
+    );
+    assert_terminal_protocol_error(
+        b"{\"id\":1,\"id\":1,\"command\":\"Shutdown\"}\n",
+        "InvalidJson",
+    );
+    let oversized = format!(
+        "{{\"id\":1,\"command\":\"Put\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"value\":\"{}\",\"precondition\":\"Any\"}}\n",
+        "00".repeat(90_000)
+    );
+    assert_terminal_protocol_error(oversized.as_bytes(), "LineTooLong");
+    let oversized_key = format!(
+        "{{\"id\":1,\"command\":\"Get\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"{}\"}}\n",
+        "00".repeat(3_073)
+    );
+    assert_terminal_protocol_error(oversized_key.as_bytes(), "HexTooLong");
+
+    let canaries = [
+        "ordinary-password-canary",
+        "provisioner-password-canary",
+        "mysql://credential-canary@database-canary",
+        "database-canary",
+        "logical-key-canary",
+        "logical-value-canary",
+    ];
+    let output = run_helper(b"{\"id\":1,\"command\":\"Crash\"}\n", |command| {
+        command
+            .env("NOVAROCKS_MYSQL_PASSWORD", canaries[0])
+            .env("NOVA_MYSQL_PROVISIONER_PASSWORD", canaries[1])
+            .env("NOVAROCKS_MYSQL_DSN", canaries[2])
+            .env("NOVAROCKS_MYSQL_DATABASE", canaries[3])
+            .env("NOVAROCKS_LOGICAL_KEY", canaries[4])
+            .env("NOVAROCKS_LOGICAL_VALUE", canaries[5]);
+    });
+    let diagnostics = [output.stdout, output.stderr].concat();
+    for canary in canaries {
+        assert!(
+            !diagnostics
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes()),
+            "helper diagnostics exposed sensitive protocol material"
+        );
+    }
+}
+
+#[test]
+fn mysql_helper_open_failure_shuts_down_runtime_and_exits_deterministically() {
+    let output = run_helper(
+        b"{\"id\":1,\"command\":\"Open\",\"cluster_id\":\"cross-process-open-failure\"}\n",
+        |command| {
+            command.env("NOVAROCKS_MYSQL_DATABASE", "missing_cross_process_database");
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "a store-open failure must retire the helper"
+    );
+    let responses = response_lines(&output);
+    assert_eq!(responses.len(), 1, "the open error must be flushed once");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["ok"], false);
+    assert_eq!(responses[0]["event"], "Error");
+    assert_eq!(responses[0]["code"], "OpenFailed");
+    let error = responses[0]["error"]
+        .as_str()
+        .expect("open failure includes the public state-store error");
+    let kind = responses[0]["error_kind"]
+        .as_str()
+        .expect("open failure includes the public error kind");
+    assert!(
+        error.starts_with(kind),
+        "the helper must preserve the original public open error"
+    );
+    assert!(!error.contains("missing_cross_process_database"));
+}
+
+#[test]
+fn mysql_cross_process_suite() {
+    run_mysql_cross_process_suite();
+}
+
+struct TestDatabase {
+    name: String,
+}
+
+impl TestDatabase {
+    fn provision(case_id: &str) -> Self {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docker/mysql-state-store/provision-test-database.sh");
+        let output = Command::new(script)
+            .args(["create", case_id])
+            .output()
+            .expect("run MySQL test database provisioner");
+        assert!(
+            output.status.success(),
+            "MySQL test database provisioner create failed"
+        );
+        let name = String::from_utf8(output.stdout)
+            .expect("database name is UTF-8")
+            .trim()
+            .to_owned();
+        assert!(name.starts_with("novarocks_ss3_"));
+        Self { name }
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docker/mysql-state-store/provision-test-database.sh");
+        let status = Command::new(script).args(["drop", &self.name]).status();
+        if !status.is_ok_and(|status| status.success()) && !std::thread::panicking() {
+            panic!("MySQL test database provisioner drop failed");
+        }
+    }
+}
+
+struct HelperProcess {
+    child: Child,
+    stdin: ChildStdin,
+    responses: mpsc::Receiver<String>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    next_id: u64,
+}
+
+impl HelperProcess {
+    fn spawn(database: &str) -> Self {
+        let password_env = required_process_env("NOVAROCKS_MYSQL_PASSWORD_ENV");
+        let password = required_process_env(&password_env);
+        let mut command = Command::new(HELPER);
+        command
+            .env_clear()
+            .env(
+                "NOVAROCKS_MYSQL_HOST",
+                required_process_env("NOVAROCKS_MYSQL_HOST"),
+            )
+            .env(
+                "NOVAROCKS_MYSQL_PORT",
+                required_process_env("NOVAROCKS_MYSQL_PORT"),
+            )
+            .env(
+                "NOVAROCKS_MYSQL_USERNAME",
+                required_process_env("NOVAROCKS_MYSQL_USERNAME"),
+            )
+            .env("NOVAROCKS_MYSQL_PASSWORD_ENV", &password_env)
+            .env(&password_env, password)
+            .env("NOVAROCKS_MYSQL_DATABASE", database)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn MySQL state store helper");
+        let stdin = child.stdin.take().expect("take helper stdin");
+        let stdout = child.stdout.take().expect("take helper stdout");
+        let child_stderr = child.stderr.take().expect("take helper stderr");
+        let (sender, responses) = mpsc::channel();
+        let stdout_reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_sink = Arc::clone(&stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(child_stderr);
+            std::io::copy(
+                &mut reader,
+                &mut *stderr_sink.lock().expect("lock helper stderr"),
+            )
+            .expect("capture helper stderr");
+        });
+        Self {
+            child,
+            stdin,
+            responses,
+            stdout_reader: Some(stdout_reader),
+            stderr,
+            stderr_reader: Some(stderr_reader),
+            next_id: 0,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn request(&mut self, mut command: JsonValue) -> JsonValue {
+        self.next_id += 1;
+        command["id"] = json!(self.next_id);
+        self.send(&command);
+        let response = self.receive();
+        assert_eq!(response["id"], self.next_id);
+        assert_eq!(response["ok"], true, "helper request failed");
+        response
+    }
+
+    fn send(&mut self, command: &JsonValue) {
+        serde_json::to_writer(&mut self.stdin, &command).expect("encode helper request");
+        self.stdin.write_all(b"\n").expect("write JSONL delimiter");
+        self.stdin.flush().expect("flush helper request");
+    }
+
+    fn receive(&self) -> JsonValue {
+        let line = self
+            .responses
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|_| panic!("helper response timed out: {}", self.safe_stderr()));
+        serde_json::from_str(&line).expect("decode helper response")
+    }
+
+    fn request_unchecked(&mut self, mut command: JsonValue) -> JsonValue {
+        self.next_id += 1;
+        command["id"] = json!(self.next_id);
+        self.send(&command);
+        let response = self.receive();
+        assert_eq!(response["id"], self.next_id);
+        response
+    }
+
+    fn send_with_id(&mut self, id: u64, mut command: JsonValue) -> JsonValue {
+        command["id"] = json!(id);
+        self.send(&command);
+        self.receive()
+    }
+
+    fn open(&mut self, cluster_id: &str) -> JsonValue {
+        self.request(json!({"command": "Open", "cluster_id": cluster_id}))
+    }
+
+    fn shutdown(mut self) {
+        let response = self.request(json!({"command": "Shutdown"}));
+        assert_eq!(response["event"], "Shutdown");
+        let status = self.child.wait().expect("wait for helper shutdown");
+        assert!(status.success(), "helper shutdown failed");
+        self.join_readers();
+        assert!(self.safe_stderr().is_empty(), "unexpected helper stderr");
+    }
+
+    fn wait_for_failure(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll helper exit") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper must exit after a terminal protocol error"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success(), "terminal helper error must be nonzero");
+        self.join_readers();
+    }
+
+    fn safe_stderr(&self) -> String {
+        let stderr = self.stderr.lock().expect("lock helper stderr");
+        let raw = String::from_utf8_lossy(&stderr);
+        redact_test_material(&raw)
+    }
+
+    fn join_readers(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.join().expect("join helper stdout reader");
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("join helper stderr reader");
+        }
+    }
+}
+
+fn required_process_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("required MySQL fixture variable is missing"))
+}
+
+impl Drop for HelperProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.join_readers();
+    }
+}
+
+fn redact_test_material(raw: &str) -> String {
+    let mut redacted = raw.to_owned();
+    for name in [
+        "NOVAROCKS_MYSQL_PASSWORD",
+        "NOVA_MYSQL_PROVISIONER_PASSWORD",
+        "NOVAROCKS_MYSQL_DATABASE",
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            redacted = redacted.replace(&value, "<redacted>");
+        }
+    }
+    redacted
+}
+
+fn run_mysql_cross_process_suite() {
+    same_key_cas_case();
+    write_skew_case();
+    range_phantom_case();
+    response_loss_resolution_case();
+    transaction_tombstone_reuse_case();
+    change_order_case();
+    cluster_and_database_mismatch_case();
+    request_identifier_case();
+}
+
+fn open_pair(case_id: &str) -> (TestDatabase, HelperProcess, HelperProcess) {
+    let database = TestDatabase::provision(case_id);
+    let mut left = HelperProcess::spawn(&database.name);
+    let mut right = HelperProcess::spawn(&database.name);
+    assert_no_provisioner_environment(left.id());
+    assert_no_provisioner_environment(right.id());
+    let left_open = left.open("mysql-cross-process-cluster");
+    let right_open = right.open("mysql-cross-process-cluster");
+    assert_eq!(left_open["event"], "Opened");
+    assert_eq!(right_open["event"], "Opened");
+    assert_eq!(left_open["pid"], left.id());
+    assert_eq!(right_open["pid"], right.id());
+    assert_ne!(
+        left.id(),
+        right.id(),
+        "helpers must be distinct exec processes"
+    );
+    (database, left, right)
+}
+
+fn assert_no_provisioner_environment(pid: u32) {
+    #[cfg(target_os = "linux")]
+    let environment =
+        std::fs::read(format!("/proc/{pid}/environ")).expect("read helper process environment");
+    #[cfg(not(target_os = "linux"))]
+    let environment = Command::new("ps")
+        .args(["eww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .expect("inspect helper process environment")
+        .stdout;
+    for forbidden in [
+        b"NOVA_MYSQL_PROVISIONER_USERNAME".as_slice(),
+        b"NOVA_MYSQL_PROVISIONER_PASSWORD".as_slice(),
+        b"NOVA_MYSQL_COMPOSE_ENV".as_slice(),
+    ] {
+        assert!(
+            !environment
+                .windows(forbidden.len())
+                .any(|window| window == forbidden),
+            "helper inherited provisioner environment"
+        );
+    }
+}
+
+fn begin(helper: &mut HelperProcess, transaction_id: Uuid, description: &str) {
+    let response = helper.request(json!({
+        "command": "Begin",
+        "transaction_id": transaction_id,
+        "description": description,
+    }));
+    assert_eq!(response["event"], "Begun");
+}
+
+fn get(helper: &mut HelperProcess, transaction_id: Uuid, key: &[u8]) -> JsonValue {
+    let response = helper.request(json!({
+        "command": "Get",
+        "transaction_id": transaction_id,
+        "key": hex::encode(key),
+    }));
+    assert_eq!(response["event"], "Get");
+    response["record"].clone()
+}
+
+fn range(helper: &mut HelperProcess, transaction_id: Uuid, start: &[u8], end: &[u8]) -> JsonValue {
+    let response = helper.request(json!({
+        "command": "Range",
+        "transaction_id": transaction_id,
+        "start": hex::encode(start),
+        "end": hex::encode(end),
+        "direction": "Forward",
+        "page_size": 32,
+    }));
+    assert_eq!(response["event"], "Range");
+    response
+}
+
+fn put(
+    helper: &mut HelperProcess,
+    transaction_id: Uuid,
+    key: &[u8],
+    value: &[u8],
+    precondition: JsonValue,
+) {
+    let response = helper.request(json!({
+        "command": "Put",
+        "transaction_id": transaction_id,
+        "key": hex::encode(key),
+        "value": hex::encode(value),
+        "precondition": precondition,
+    }));
+    assert_eq!(response["event"], "Staged");
+}
+
+fn commit(helper: &mut HelperProcess, transaction_id: Uuid, lose_response: bool) -> JsonValue {
+    let response = helper.request(json!({
+        "command": "Commit",
+        "transaction_id": transaction_id,
+        "lose_response": lose_response,
+    }));
+    assert_eq!(response["event"], "Commit");
+    response
+}
+
+fn resolve(helper: &mut HelperProcess, transaction_id: Uuid) -> JsonValue {
+    let response = helper.request(json!({
+        "command": "Resolve",
+        "transaction_id": transaction_id,
+    }));
+    assert_eq!(response["event"], "Resolve");
+    response
+}
+
+fn seed(helper: &mut HelperProcess, rows: &[(&[u8], &[u8])]) {
+    let transaction_id = Uuid::now_v7();
+    begin(helper, transaction_id, "cross-process seed");
+    for (key, value) in rows {
+        put(helper, transaction_id, key, value, json!("Any"));
+    }
+    assert_eq!(
+        commit(helper, transaction_id, false)["outcome"],
+        "Committed"
+    );
+}
+
+fn same_key_cas_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-cas");
+    seed(&mut left, &[(b"cas/key", b"seed")]);
+    let left_id = Uuid::now_v7();
+    let right_id = Uuid::now_v7();
+    begin(&mut left, left_id, "same-key CAS left");
+    begin(&mut right, right_id, "same-key CAS right");
+    let left_record = get(&mut left, left_id, b"cas/key");
+    let right_record = get(&mut right, right_id, b"cas/key");
+    assert_eq!(left_record["value"], hex::encode(b"seed"));
+    assert_eq!(right_record["version"], left_record["version"]);
+    put(
+        &mut left,
+        left_id,
+        b"cas/key",
+        b"left",
+        json!({"version": left_record["version"]}),
+    );
+    put(
+        &mut right,
+        right_id,
+        b"cas/key",
+        b"right",
+        json!({"version": right_record["version"]}),
+    );
+    assert_eq!(commit(&mut left, left_id, false)["outcome"], "Committed");
+    assert_eq!(commit(&mut right, right_id, false)["outcome"], "Conflict");
+    left.shutdown();
+    right.shutdown();
+}
+
+fn write_skew_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-skew");
+    seed(&mut left, &[(b"skew/left", b"on"), (b"skew/right", b"on")]);
+    let left_id = Uuid::now_v7();
+    let right_id = Uuid::now_v7();
+    begin(&mut left, left_id, "write-skew left");
+    begin(&mut right, right_id, "write-skew right");
+    assert_eq!(
+        get(&mut left, left_id, b"skew/right")["value"],
+        hex::encode(b"on")
+    );
+    assert_eq!(
+        get(&mut right, right_id, b"skew/left")["value"],
+        hex::encode(b"on")
+    );
+    put(&mut left, left_id, b"skew/left", b"off", json!("Present"));
+    put(
+        &mut right,
+        right_id,
+        b"skew/right",
+        b"off",
+        json!("Present"),
+    );
+    assert_eq!(commit(&mut left, left_id, false)["outcome"], "Committed");
+    assert_eq!(commit(&mut right, right_id, false)["outcome"], "Conflict");
+    left.shutdown();
+    right.shutdown();
+}
+
+fn range_phantom_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-phantom");
+    let reader = Uuid::now_v7();
+    begin(&mut left, reader, "range phantom reader");
+    assert_eq!(
+        range(&mut left, reader, b"phantom/", b"phantom0")["records"],
+        json!([])
+    );
+    let writer = Uuid::now_v7();
+    begin(&mut right, writer, "range phantom writer");
+    put(
+        &mut right,
+        writer,
+        b"phantom/key",
+        b"inserted",
+        json!("Any"),
+    );
+    assert_eq!(commit(&mut right, writer, false)["outcome"], "Committed");
+    put(
+        &mut left,
+        reader,
+        b"phantom/result",
+        b"must-not-publish",
+        json!("Any"),
+    );
+    assert_eq!(commit(&mut left, reader, false)["outcome"], "Conflict");
+    left.shutdown();
+    right.shutdown();
+}
+
+fn response_loss_resolution_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-unknown");
+    let transaction_id = Uuid::now_v7();
+    begin(&mut left, transaction_id, "response-loss commit");
+    put(
+        &mut left,
+        transaction_id,
+        b"unknown/key",
+        b"committed",
+        json!("Any"),
+    );
+    assert_eq!(
+        commit(&mut left, transaction_id, true)["outcome"],
+        "CommitUnknown"
+    );
+    let resolution = resolve(&mut right, transaction_id);
+    assert_eq!(resolution["resolution"], "Committed");
+    assert!(
+        resolution["revision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    left.shutdown();
+    right.shutdown();
+}
+
+fn transaction_tombstone_reuse_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-tombstone");
+    let transaction_id = Uuid::now_v7();
+    assert_eq!(
+        resolve(&mut right, transaction_id)["resolution"],
+        "NotCommitted"
+    );
+    begin(&mut left, transaction_id, "tombstoned transaction reuse");
+    put(
+        &mut left,
+        transaction_id,
+        b"tombstone/key",
+        b"must-not-publish",
+        json!("Any"),
+    );
+    assert_ne!(
+        commit(&mut left, transaction_id, false)["outcome"],
+        "Committed"
+    );
+    assert_eq!(
+        resolve(&mut right, transaction_id)["resolution"],
+        "NotCommitted"
+    );
+    left.shutdown();
+    right.shutdown();
+}
+
+fn change_order_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-changes");
+    let transaction_id = Uuid::now_v7();
+    begin(&mut left, transaction_id, "ordered change hints");
+    for (key, value) in [
+        (b"changes/z".as_slice(), b"z".as_slice()),
+        (b"changes/a".as_slice(), b"a".as_slice()),
+        (b"changes/m".as_slice(), b"m".as_slice()),
+    ] {
+        put(&mut left, transaction_id, key, value, json!("Any"));
+    }
+    assert_eq!(
+        commit(&mut left, transaction_id, false)["outcome"],
+        "Committed"
+    );
+    let page = right.request(json!({"command": "Poll", "after": null, "page_size": 10}));
+    assert_eq!(page["event"], "Poll");
+    let keys = page["hints"]
+        .as_array()
+        .expect("change hints array")
+        .iter()
+        .map(|hint| hint["key"].as_str().expect("hex change key"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [b"changes/a", b"changes/m", b"changes/z"]
+            .map(hex::encode)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let revisions = page["hints"]
+        .as_array()
+        .expect("change hints array")
+        .iter()
+        .map(|hint| hint["revision"].as_str().expect("change revision"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(revisions.len(), 1, "one commit must produce one revision");
+    left.shutdown();
+    right.shutdown();
+}
+
+fn cluster_and_database_mismatch_case() {
+    let database = TestDatabase::provision("cross-process-mismatch");
+    let mut owner = HelperProcess::spawn(&database.name);
+    owner.open("mysql-cross-process-cluster");
+
+    let mut wrong_cluster = HelperProcess::spawn(&database.name);
+    let response = wrong_cluster.request_unchecked(json!({
+        "command": "Open",
+        "cluster_id": "wrong-cross-process-cluster",
+    }));
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "OpenFailed");
+    wrong_cluster.wait_for_failure();
+    assert!(wrong_cluster.safe_stderr().is_empty());
+
+    let mut missing_database = HelperProcess::spawn("novarocks_ss3_missing_cross_process");
+    let response = missing_database.request_unchecked(json!({
+        "command": "Open",
+        "cluster_id": "mysql-cross-process-cluster",
+    }));
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "OpenFailed");
+    missing_database.wait_for_failure();
+    assert!(missing_database.safe_stderr().is_empty());
+    owner.shutdown();
+}
+
+fn request_identifier_case() {
+    let database = TestDatabase::provision("cross-process-ids");
+    let mut duplicate = HelperProcess::spawn(&database.name);
+    duplicate.open("mysql-cross-process-cluster");
+    let response =
+        duplicate.send_with_id(1, json!({"command": "Poll", "after": null, "page_size": 1}));
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "DuplicateId");
+    duplicate.wait_for_failure();
+    assert!(duplicate.safe_stderr().is_empty());
+
+    let mut out_of_order = HelperProcess::spawn(&database.name);
+    out_of_order.open("mysql-cross-process-cluster");
+    let response =
+        out_of_order.send_with_id(3, json!({"command": "Poll", "after": null, "page_size": 1}));
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "OutOfOrderId");
+    out_of_order.wait_for_failure();
+    assert!(out_of_order.safe_stderr().is_empty());
+}
