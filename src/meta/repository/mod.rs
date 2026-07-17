@@ -20,7 +20,6 @@ use std::fmt;
 use crate::meta::{MetaError, MetaErrorKind};
 
 pub mod backend;
-pub mod dictionary;
 pub mod iceberg_catalog;
 pub mod iceberg_operation;
 pub mod id_scopes;

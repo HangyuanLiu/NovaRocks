@@ -204,7 +204,6 @@ pub(crate) fn run_insert(
         source,
         overwrite_mode,
     )?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, &target)?;
     Ok(StatementResult::Ok)
 }
 

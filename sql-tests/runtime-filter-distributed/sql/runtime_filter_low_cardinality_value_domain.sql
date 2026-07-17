@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- @tags=runtime_filter,cross_process,distributed,low-cardinality,dictionary
 -- C5: 1FE+3BE cross-fragment RF over a low-cardinality string probe column
--- must stay value-domain correct without standalone native dictionary rewrites.
+-- must stay value-domain correct with runtime dictionary carriers.
 
 CREATE TABLE ${case_db}.rf_dist_lc_probe (
   status STRING,
@@ -46,8 +46,6 @@ INSERT INTO ${case_db}.rf_dist_lc_build VALUES
   ('CLOSED', 'Y'),
   ('NEW', 'N'),
   (NULL, 'Y');
-
-ANALYZE FULL TABLE ${case_db}.rf_dist_lc_probe;
 
 SET global_runtime_filter_build_max_size = 10737418240;
 SET global_runtime_filter_probe_min_selectivity = 0.0;

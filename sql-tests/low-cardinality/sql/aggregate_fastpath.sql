@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=low-cardinality,dictionary,aggregate
--- Verify aggregate results over low-cardinality metadata match flat Utf8
+-- Verify aggregate results over runtime dictionary carriers match flat Utf8
 -- semantics, including NULL group handling.
 CREATE TABLE ${case_db}.dict_agg_fastpath_t (
   k INT,
@@ -31,7 +31,6 @@ INSERT INTO ${case_db}.dict_agg_fastpath_t VALUES
   (4, NULL, 'east', 40),
   (5, 'CANCELLED', 'east', 50),
   (6, NULL, 'west', 60);
-ANALYZE FULL TABLE ${case_db}.dict_agg_fastpath_t;
 
 SELECT status, COUNT(*) AS c, SUM(v) AS total
 FROM ${case_db}.dict_agg_fastpath_t

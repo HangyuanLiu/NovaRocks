@@ -62,7 +62,6 @@ pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
-pub(crate) mod dictionary;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
@@ -363,7 +362,6 @@ pub(crate) struct StandaloneState {
     pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
     pub(crate) iceberg_operation_repo: IcebergOperationRepository,
     pub(crate) job_repo: JobMetaRepository,
-    pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
     /// Wake-up channel for the iceberg maintenance coordinator; injected by
     /// the server after the coordinator thread starts, None otherwise.
@@ -410,7 +408,6 @@ impl Default for StandaloneState {
             iceberg_catalog_repo: IcebergCatalogMetaRepository,
             iceberg_operation_repo: IcebergOperationRepository,
             job_repo: JobMetaRepository,
-            dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,
             maintenance_signal_tx: std::sync::Mutex::new(None),
             views: RwLock::new(std::collections::HashMap::new()),
@@ -744,19 +741,7 @@ impl StandaloneSession {
         current_database: &str,
         query_opts: Option<QueryOptions>,
     ) -> Result<StatementResult, String> {
-        // Install the per-statement dictionary provider so optimizer
-        // calls reached through nested engine entry points (insert,
-        // delete, MV refresh, statistics, etc.) can resolve active
-        // dictionary snapshots without each entry point having to
-        // thread the provider through its signature.
-        let provider: std::sync::Arc<
-            dyn crate::sql::optimizer::rewrite::context::QueryDictionaryProvider,
-        > = std::sync::Arc::new(crate::engine::dictionary::DictionaryQueryProvider::new(
-            self.inner.clone(),
-        ));
-        crate::sql::optimizer::rewrite::context::with_dictionary_provider(provider, || {
-            self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
-        })
+        self.execute_in_context_inner(sql, current_catalog, current_database, query_opts)
     }
 
     fn execute_in_context_inner(
@@ -2683,7 +2668,6 @@ fn explain_analyze_query(
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         mv_candidates,
     )?;
 
@@ -2862,14 +2846,12 @@ fn explain_query(
         ),
         None => Vec::new(),
     };
-    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         mv_candidates,
     )?;
 
@@ -3069,7 +3051,6 @@ pub(crate) fn execute_query_as_iceberg_write(
             scalar_arena,
             &query_stats.snapshot,
             factory,
-            None,
             Vec::new(),
         )?,
     };
@@ -3519,7 +3500,6 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         Vec::new(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
@@ -3552,7 +3532,6 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         Vec::new(),
     )?;
     let output_columns = optimized_tree.output_columns.clone();
@@ -3638,14 +3617,12 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         }
         _ => Vec::new(),
     };
-    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     snapshot_effective_backend_count_into_session();
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         mv_candidates,
     )?;
 
@@ -3711,7 +3688,6 @@ pub(crate) fn execute_logical_plan_with_options(
         scalar_arena,
         &query_stats.snapshot,
         factory,
-        None,
         Vec::new(),
     )?;
     ensure_mainline_distributed_execution(
@@ -5553,7 +5529,6 @@ mysql_port = 47892
             scalar_arena,
             &query_stats.snapshot,
             factory,
-            None,
             Vec::new(),
         )
         .expect("optimize");

@@ -16,8 +16,7 @@
 -- under the License.
 
 -- @tags=low-cardinality,dictionary,observability
--- Verify EXPLAIN ANALYZE exposes dictionary carrier runtime counters without
--- restoring legacy native rewrite plan shapes.
+-- Verify EXPLAIN ANALYZE exposes dictionary carrier runtime counters.
 
 CREATE TABLE ${case_db}.dict_observability_orders (
   order_id BIGINT,
@@ -33,8 +32,6 @@ INSERT INTO ${case_db}.dict_observability_orders VALUES
   (5, 'SHIPPED', 50),
   (6, NULL, 60);
 
-ANALYZE FULL TABLE ${case_db}.dict_observability_orders;
-
 -- @normalize_explain_timing=true
 -- @result_contains=dict={in_rows=
 -- @result_contains=kept_rows=
@@ -43,8 +40,6 @@ ANALYZE FULL TABLE ${case_db}.dict_observability_orders;
 -- @result_contains=kept_cols=
 -- @result_contains=hydrated_cols=
 -- @result_contains=unsupported_cols=
--- @result_not_contains=dict=[
--- @result_not_contains=DECODE
 EXPLAIN ANALYZE
 SELECT status, count(*) AS cnt
 FROM ${case_db}.dict_observability_orders

@@ -145,11 +145,10 @@ impl IcebergMvTargetLocatorScan {
 pub enum ScanSource {
     /// StarRocks table: data lives in object storage (s3:// or
     /// file://) and metadata lives in a `MetaStoreProvider` (currently
-    /// SQLite). The `(db_id, table_id)` identity carried here lets plan-time consumers
-    /// (e.g. `DictionaryQueryProvider::owner_for`) resolve the StarRocks
-    /// dictionary owner without taking `state.starrocks_table.read()` on
-    /// every Scan column. The connector scan planner validates this planned
-    /// identity against the live runtime before producing splits.
+    /// SQLite). The `(db_id, table_id)` identity carried here lets plan-time
+    /// consumers resolve the StarRocks table without relying on mutable names.
+    /// The connector scan planner validates this planned identity against the
+    /// live runtime before producing splits.
     StarRocks { db_id: i64, table_id: i64 },
     IcebergDataFiles {
         table: IcebergTableInfo,

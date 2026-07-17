@@ -133,7 +133,6 @@ pub(crate) fn execute_iceberg_truncate_table(
     // 6. Invalidate the iceberg entry's table cache so subsequent SELECTs
     //    see the new (zero-row) snapshot.
     invalidate_iceberg_caches(state, target)?;
-    crate::engine::dictionary::maintenance::mark_target_stale(state, target)?;
 
     Ok(StatementResult::Ok)
 }

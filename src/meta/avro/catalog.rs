@@ -190,16 +190,6 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/cluster.backend/0001.avsc"),
         },
         SchemaSource {
-            subject: "dictionary.snapshot",
-            id: 1,
-            raw_schema: include_str!("schemas/dictionary.snapshot/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "dictionary.lookup",
-            id: 1,
-            raw_schema: include_str!("schemas/dictionary.lookup/0001.avsc"),
-        },
-        SchemaSource {
             subject: "iceberg.catalog",
             id: 1,
             raw_schema: include_str!("schemas/iceberg.catalog/0001.avsc"),

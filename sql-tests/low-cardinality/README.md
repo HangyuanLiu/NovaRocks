@@ -19,32 +19,30 @@ under the License.
 
 # low-cardinality
 
-End-to-end coverage for low-cardinality dictionary metadata and carrier
-compatibility after R0. Cases here exercise:
+End-to-end coverage for the runtime low-cardinality carrier. Cases here
+exercise:
 
-- `ANALYZE FULL TABLE` populates `dictionary.snapshot` metadata for
-  string-typed columns, while standalone SQL results continue to follow plain
-  string semantics;
-- write paths (INSERT / UPDATE / MERGE / TRUNCATE / DELETE) advance table
-  snapshots so stale dictionary metadata does not affect query correctness;
-- DROP TABLE / DROP DATABASE remove dictionary metadata;
+- Parquet dictionary pages flow into execution as self-describing Arrow
+  `DictionaryArray` values without table-level dictionary metadata;
+- filter, aggregate, NULL and runtime-filter semantics match flat string
+  execution;
 - runtime filters stay value-domain correct over low-cardinality string data;
 - runtime observability reports dictionary carrier input, kept, and hydrated
-  counters without restoring legacy native rewrite plan shapes.
+  counters.
 
-R0 retired the standalone native low-cardinality rewrite path. Standalone SQL
-plans should not contain FE-compatible `DECODE` nodes or scan dictionary hints;
-cases that need plan-shape protection use `@explain_not_contains` on the query
-under test. `EXPLAIN COSTS` is **not** suitable in standalone mode —
+Standalone SQL does not build or consume table-level global dictionary
+snapshots. The FE-compatible `query_global_dicts` / `DECODE_NODE` path is a
+separate protocol path driven by StarRocks FE plans. `EXPLAIN COSTS` is
+**not** suitable in standalone mode —
 `try_explain_costs` short-circuits to an ESTIMATE / cardinality summary and
 never renders the physical plan tree.
 
 ## Storage (Iceberg v3)
 
 All cases here run on **Iceberg v3** via `init.sql`'s
-`lowcard_cat_${suite_uuid0}` external catalog. `ANALYZE FULL` builds Iceberg
-dictionary metadata; a subsequent write advances the table snapshot so stale
-metadata must not change the rows returned by standalone SQL (see `stale`).
+`lowcard_cat_${suite_uuid0}` external catalog. Low-cardinality execution uses
+file- or batch-local dictionary carriers and does not require statistics
+collection.
 
 The legacy compressed-key cases now live with the aggregate correctness cases
 in **`aggregate`**. Focused 128-bit `LARGEINT` statistics coverage lives in

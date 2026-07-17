@@ -451,7 +451,6 @@ mod tests {
             scalar_arena,
             &HashMap::new(),
             factory,
-            None,
             Vec::new(),
         )
         .expect("physical optimization")

@@ -16,8 +16,8 @@
 -- under the License.
 
 -- @tags=low-cardinality,dictionary,filter
--- Verify simple string filters over low-cardinality metadata preserve selected
--- and passthrough string columns.
+-- Verify simple string filters over runtime dictionary carriers preserve
+-- selected and passthrough string columns.
 CREATE TABLE ${case_db}.dict_filter_fastpath_c1_t (
   id INT,
   status STRING,
@@ -30,7 +30,6 @@ INSERT INTO ${case_db}.dict_filter_fastpath_c1_t VALUES
   (4, NULL, 'retail'),
   (5, 'PAID', 'ops'),
   (6, NULL, 'web');
-ANALYZE FULL TABLE ${case_db}.dict_filter_fastpath_c1_t;
 SELECT id, status, channel
 FROM ${case_db}.dict_filter_fastpath_c1_t
 WHERE status = 'PAID'
