@@ -17,22 +17,22 @@
 
 use std::sync::Arc;
 
+use crate::catalog::identifier::TableIdentity;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
 use crate::engine::mv::analysis::ResolvedTableRef;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine, StoredMvDefinition,
 };
 
 pub(crate) struct ResolvedCreateMvDependencies {
-    pub(crate) base_refs: Vec<IcebergTableRef>,
+    pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
 }
 
-pub(crate) fn iceberg_table_dependency_ref(base: &IcebergTableRef) -> MvDependencyObjectRef {
+pub(crate) fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: Some(base.catalog.clone()),
         database_or_namespace: base.namespace.clone(),
@@ -157,7 +157,7 @@ pub(crate) fn resolve_create_mv_dependencies(
                     .find_by_target(read.as_ref(), catalog, namespace, table)
                     .map_err(|e| format!("load MV target dependency failed: {e}"))?
                     .is_some();
-                let base = IcebergTableRef {
+                let base = TableIdentity {
                     catalog: catalog.clone(),
                     namespace: namespace.clone(),
                     table: table.clone(),
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn dependency_ref_display_distinguishes_table_and_mv() {
-        let table = iceberg_table_dependency_ref(&IcebergTableRef {
+        let table = iceberg_table_dependency_ref(&TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "orders".to_string(),

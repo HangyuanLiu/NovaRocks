@@ -31,6 +31,7 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::ApplyTransactionAction;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
@@ -64,8 +65,8 @@ use crate::engine::mv::iceberg_target_apply::{
     iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::engine::mv::lifecycle::{
-    BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvBaseRef, MvStorageEngine,
-    MvTarget, RefreshError, RefreshMode, RefreshPlan,
+    BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, MvStorageEngine, MvTarget,
+    RefreshError, RefreshMode, RefreshPlan,
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
@@ -82,7 +83,6 @@ use crate::engine::mv::refresh_property::{
     RefreshCapabilities, RefreshFragmentProperty, RefreshIdentity, TargetIdentity,
     derive_fragment_property,
 };
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
@@ -439,7 +439,7 @@ pub(crate) fn create_iceberg_mv(
                 txn.as_mut(),
                 CreateMvDefinitionRequest {
                     select_sql: canonical_select_query.to_string(),
-                    base_table_refs: base_refs.iter().map(IcebergTableRef::fqn).collect(),
+                    base_table_refs: base_refs.iter().map(TableIdentity::fqn).collect(),
                     primary_key_columns: primary_key_columns.clone(),
                     storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
                     target_catalog: Some(target.catalog.clone()),
@@ -563,7 +563,7 @@ fn iceberg_mv_target_exists(
 /// refs must be distinct (a duplicate fan-in base is not supported in this
 /// build). Each resolved base is further checked against the persisted schema
 /// contract by `validate_aggregate_schema_contract_for_base`.
-fn validate_aggregate_fan_in_base_refs(base_refs: &[IcebergTableRef]) -> Result<(), String> {
+fn validate_aggregate_fan_in_base_refs(base_refs: &[TableIdentity]) -> Result<(), String> {
     let mut resolved_refs = BTreeSet::new();
     for base in base_refs {
         let fqn = base.fqn().to_ascii_lowercase();
@@ -615,7 +615,7 @@ fn branch_union_refresh_first_branch_calls(
 /// invariant to enforce here is that the resolved base refs are distinct: the
 /// branch base set is a set, so a duplicate resolved ref would mean the resolved
 /// refs and the branch base set cannot be in 1:1 correspondence.
-fn validate_branch_union_aggregate_base_refs(base_refs: &[IcebergTableRef]) -> Result<(), String> {
+fn validate_branch_union_aggregate_base_refs(base_refs: &[TableIdentity]) -> Result<(), String> {
     let mut resolved_refs = BTreeSet::new();
     for base_ref in base_refs {
         let fqn = base_ref.fqn().to_ascii_lowercase();
@@ -630,7 +630,7 @@ fn validate_branch_union_aggregate_base_refs(base_refs: &[IcebergTableRef]) -> R
 
 fn validate_aggregate_schema_contract_for_base(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -774,7 +774,7 @@ fn validate_branch_union_contract(
 /// identical: a mismatch between the resolved refs and the contract base set is
 /// an error; a match is accepted.
 fn validate_union_projection_base_refs(
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<(), String> {
     let contract_fqns = schema_contract
@@ -805,7 +805,7 @@ fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     branch_count: usize,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -1069,10 +1069,10 @@ fn first_union_branch_ast_query(
 
 fn load_all_bases_with_row_lineage(
     state: &Arc<StandaloneState>,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<
     Vec<(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )>,
     String,
@@ -1085,10 +1085,10 @@ fn load_all_bases_with_row_lineage(
 
 fn load_base_with_row_lineage(
     state: &Arc<StandaloneState>,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
 ) -> Result<
     (
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     ),
     String,
@@ -1316,7 +1316,7 @@ fn create_apply_key_table_column(
 }
 
 fn base_snapshot_status_for_refresh(
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     previous_snapshot_id: Option<i64>,
     current_snapshot_id_before_pin: Option<i64>,
 ) -> BaseSnapshotStatus {
@@ -1421,7 +1421,7 @@ fn build_iceberg_mv_schema_contract(
     canonical_query: &sqlparser::ast::Query,
     analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target: &IcebergMvTarget,
@@ -1491,7 +1491,7 @@ fn build_non_branch_schema_contract(
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1537,7 +1537,7 @@ fn build_non_branch_contract_core(
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1751,7 +1751,7 @@ fn build_aggregate_contract_core(
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1906,7 +1906,7 @@ fn build_join_base_contracts_and_lineage(
     join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
 ) -> Result<
@@ -1975,7 +1975,7 @@ fn build_branch_union_schema_contract(
     canonical_query: &sqlparser::ast::Query,
     analysis: &crate::engine::mv::analysis::MvAnalysis,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -2222,12 +2222,12 @@ fn wrap_set_expr_as_query(
 fn first_branch_loaded_bases(
     branch_query: &sqlparser::ast::Query,
     loaded_bases: &[(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
 ) -> Result<
     Vec<(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )>,
     String,
@@ -2266,13 +2266,13 @@ fn overlay_narrowed_bases(
 
 fn loaded_base_for_table_fqn<'a>(
     loaded_bases: &'a [(
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
     table_fqn: &str,
 ) -> Result<
     &'a (
-        IcebergTableRef,
+        TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     ),
     String,
@@ -2284,7 +2284,7 @@ fn loaded_base_for_table_fqn<'a>(
 }
 
 fn base_contract(
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     loaded_base: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     alias_at_create: Option<String>,
     fields: Vec<crate::meta::repository::mv_contract::BaseFieldRecord>,
@@ -2743,7 +2743,7 @@ fn rewrite_full_refresh_select_with_pin_for_scope(
 fn rewrite_full_refresh_select_with_pin(
     select_sql: &str,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
 ) -> Result<String, String> {
     rewrite_full_refresh_select_with_pin_for_scope(
         select_sql,
@@ -3784,7 +3784,7 @@ fn refresh_iceberg_union_projection_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     canonical_select_query: &sqlparser::ast::Query,
     branch_count: usize,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
@@ -4082,7 +4082,7 @@ fn refresh_iceberg_aggregate_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     all_bases_is_fan_in: bool,
@@ -4202,7 +4202,7 @@ fn refresh_single_aggregate_iceberg_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
@@ -4490,7 +4490,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     refresh: AllBasesAggregateRefresh<'_>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
@@ -4805,7 +4805,7 @@ fn refresh_join_aggregate_iceberg_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
@@ -5035,7 +5035,7 @@ fn plan_refresh_mode_from_decision(decision: RefreshDecision) -> Result<RefreshM
 }
 
 fn base_snapshot_statuses_for_plan(
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
     current_snapshots: &BTreeMap<String, Option<i64>>,
 ) -> Vec<BaseSnapshotStatus> {
@@ -5107,10 +5107,10 @@ fn merge_affected_partition_results(
 fn plan_multi_base_affected_partitions<'a>(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     mode: RefreshMode,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
     current_snapshots: &BTreeMap<String, Option<i64>>,
-    mut table_for_base: impl FnMut(&IcebergTableRef) -> Option<&'a iceberg::table::Table>,
+    mut table_for_base: impl FnMut(&TableIdentity) -> Option<&'a iceberg::table::Table>,
     context: &str,
 ) -> crate::engine::mv::partition::AffectedTargetPartitions {
     match mode {
@@ -5475,7 +5475,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             mode,
             base_refs: base_refs
                 .iter()
-                .map(|base_ref| MvBaseRef {
+                .map(|base_ref| TableIdentity {
                     catalog: base_ref.catalog.clone(),
                     namespace: base_ref.namespace.clone(),
                     table: base_ref.table.clone(),
@@ -5545,7 +5545,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 target,
                 storage_engine: MvStorageEngine::Iceberg,
                 mode: RefreshMode::Noop,
-                base_refs: vec![MvBaseRef {
+                base_refs: vec![TableIdentity {
                     catalog: base_ref.catalog.clone(),
                     namespace: base_ref.namespace.clone(),
                     table: base_ref.table.clone(),
@@ -5655,7 +5655,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
         target,
         storage_engine: MvStorageEngine::Iceberg,
         mode,
-        base_refs: vec![MvBaseRef {
+        base_refs: vec![TableIdentity {
             catalog: base_ref.catalog.clone(),
             namespace: base_ref.namespace.clone(),
             table: base_ref.table.clone(),
@@ -5681,7 +5681,7 @@ fn plan_iceberg_union_projection_mv_refresh(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     branch_count: usize,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<RefreshPlan, RefreshError> {
@@ -5819,7 +5819,7 @@ fn plan_iceberg_union_projection_mv_refresh(
         mode,
         base_refs: base_refs
             .iter()
-            .map(|base_ref| MvBaseRef {
+            .map(|base_ref| TableIdentity {
                 catalog: base_ref.catalog.clone(),
                 namespace: base_ref.namespace.clone(),
                 table: base_ref.table.clone(),
@@ -5855,7 +5855,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &sqlparser::ast::Query,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
@@ -5994,7 +5994,7 @@ fn plan_iceberg_aggregate_mv_refresh(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &sqlparser::ast::Query,
 ) -> Result<RefreshPlan, RefreshError> {
@@ -6236,7 +6236,7 @@ fn build_iceberg_refresh_plan(
     stmt: &RefreshMaterializedViewStmt,
     current_catalog: Option<&str>,
     current_database: &str,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     snapshot_pins: BTreeMap<String, Option<i64>>,
     mode: RefreshMode,
     affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
@@ -6248,7 +6248,7 @@ fn build_iceberg_refresh_plan(
         mode,
         base_refs: base_refs
             .iter()
-            .map(|base_ref| MvBaseRef {
+            .map(|base_ref| TableIdentity {
                 catalog: base_ref.catalog.clone(),
                 namespace: base_ref.namespace.clone(),
                 table: base_ref.table.clone(),
@@ -8316,7 +8316,7 @@ fn first_refresh_iceberg_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_snapshot_id: i64,
     current_table_uuid: &str,
     pinned_full_select_sql: &str,
@@ -9615,7 +9615,7 @@ fn rebuild_iceberg_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     pinned_full_select_sql: &str,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
     partition_contract: Option<&crate::meta::repository::mv_contract::MvPartitionContract>,
@@ -10041,7 +10041,7 @@ fn derive_refresh_contract_for_strategy_dispatch(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
     target_table: &iceberg::table::Table,
 ) -> Result<
@@ -10100,7 +10100,7 @@ fn derive_refresh_contract_from_query(
 fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
     state: &Arc<StandaloneState>,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
     target_table: &iceberg::table::Table,
 ) -> Result<Option<String>, String> {
@@ -10205,7 +10205,7 @@ fn ensure_schema_contract_compatible_for_refresh(
 fn validate_repartition_schema_contract(
     state: &Arc<StandaloneState>,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
     if schema_contract.join.is_some() {
@@ -10280,7 +10280,7 @@ fn validate_repartition_schema_contract(
 
 fn validate_aggregate_repartition_schema_contract_for_base(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -10304,7 +10304,7 @@ fn validate_aggregate_repartition_schema_contract_for_base(
 
 fn validate_repartition_base_schema_contract(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
@@ -10346,7 +10346,7 @@ fn refresh_iceberg_join_mv(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
@@ -10546,7 +10546,7 @@ fn refresh_iceberg_join_mv(
 
 fn validate_join_aliases_base_refs(
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     for name in [
         aliases.left_table.to_ascii_lowercase(),
@@ -10569,8 +10569,8 @@ fn validate_join_aliases_base_refs(
 /// against `base.fqn()`.
 fn join_base_refs_for_aliases<'a>(
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
-    base_refs: &'a [IcebergTableRef],
-) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
+    base_refs: &'a [TableIdentity],
+) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
     let left_name = aliases.left_table.as_str();
     let right_name = aliases.right_table.as_str();
     let left = base_refs
@@ -10586,8 +10586,8 @@ fn join_base_refs_for_aliases<'a>(
 
 fn join_base_refs_for_schema_contract<'a>(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    base_refs: &'a [IcebergTableRef],
-) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
+    base_refs: &'a [TableIdentity],
+) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
     let join = schema_contract
         .join
         .as_ref()
@@ -10617,7 +10617,7 @@ fn join_base_refs_for_schema_contract<'a>(
 fn validate_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     validate_refresh_pin_table_uuids_for_operation(
         mv_definition,
@@ -10630,7 +10630,7 @@ fn validate_refresh_pin_table_uuids(
 fn validate_repartition_refresh_pin_table_uuids(
     mv_definition: &StoredMvDefinition,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     validate_refresh_pin_table_uuids_for_operation(
         mv_definition,
@@ -10643,7 +10643,7 @@ fn validate_repartition_refresh_pin_table_uuids(
 fn validate_refresh_pin_table_uuids_for_operation(
     mv_definition: &StoredMvDefinition,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     unsafe_message: &str,
 ) -> Result<(), String> {
     for base_ref in base_refs {
@@ -10737,7 +10737,7 @@ fn validate_join_base_schema_contract_for_rebind(
 
 fn validate_join_schema_contract(
     contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    bases: &[(&IcebergTableRef, &iceberg::table::Table); 2],
+    bases: &[(&TableIdentity, &iceberg::table::Table); 2],
     target_table: &iceberg::table::Table,
 ) -> Result<JoinSchemaContractDecision, String> {
     contract
@@ -10861,10 +10861,10 @@ fn build_join_projection_repartition_context(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
-) -> Result<(IcebergMvRefreshContext, IcebergTableRef, IcebergTableRef), String> {
+) -> Result<(IcebergMvRefreshContext, TableIdentity, TableIdentity), String> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV repartition requires exactly two base tables".to_string());
     }
@@ -10934,8 +10934,8 @@ fn repartition_iceberg_join_mv_overwrite(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
     partition_contract: &crate::meta::repository::mv_contract::MvPartitionContract,
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -11174,8 +11174,8 @@ fn first_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
@@ -11375,9 +11375,9 @@ fn join_full_refresh_uses_logical_plan() -> bool {
 
 fn rewrite_join_full_refresh_query(
     query: &mut sqlparser::ast::Query,
-    left_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
     left_snapshot: i64,
-    right_ref: &IcebergTableRef,
+    right_ref: &TableIdentity,
     right_snapshot: i64,
     left_alias: &str,
     right_alias: &str,
@@ -11458,7 +11458,7 @@ fn join_row_id_select_item(alias: &str, output: &str) -> sqlparser::ast::SelectI
 
 fn rewrite_snapshot_table_factor(
     factor: &mut sqlparser::ast::TableFactor,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     snapshot_id: i64,
     default_alias: Option<&str>,
 ) -> Result<(), String> {
@@ -11507,7 +11507,7 @@ fn rewrite_snapshot_table_factor(
 
 fn object_name_matches_base(
     name: &sqlparser::ast::ObjectName,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
 ) -> Result<bool, String> {
     let parts = object_name_identifier_parts(name);
     Ok(match parts.as_slice() {
@@ -11535,12 +11535,12 @@ fn object_name_identifier_parts(name: &sqlparser::ast::ObjectName) -> Vec<String
         .collect()
 }
 
-fn synthetic_snapshot_table_name(base: &IcebergTableRef, snapshot_id: i64) -> String {
+fn synthetic_snapshot_table_name(base: &TableIdentity, snapshot_id: i64) -> String {
     format!("{}__at_{}", base.table, snapshot_id)
 }
 
 fn synthetic_snapshot_object_name(
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     snapshot_id: i64,
 ) -> sqlparser::ast::ObjectName {
     sqlparser::ast::ObjectName(vec![
@@ -11553,7 +11553,7 @@ fn synthetic_snapshot_object_name(
 
 fn build_join_snapshot_catalog(
     state: &Arc<StandaloneState>,
-    snapshots: &[(&IcebergTableRef, i64); 2],
+    snapshots: &[(&TableIdentity, i64); 2],
 ) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
     let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
     for (base, snapshot_id) in snapshots {
@@ -11623,7 +11623,7 @@ fn build_iceberg_mv_planning_catalog(
 fn register_join_snapshot_side(
     catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     snapshot_id: i64,
 ) -> Result<(), String> {
     catalog.create_database(&base.namespace)?;
@@ -11893,8 +11893,8 @@ mod partition_planning_tests {
         )
     }
 
-    fn base_ref(table: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    fn base_ref(table: &str) -> TableIdentity {
+        TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: table.to_string(),
@@ -12449,8 +12449,8 @@ mod join_delta_append_only_fast_path_tests {
         );
     }
 
-    fn base(name: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    fn base(name: &str) -> TableIdentity {
+        TableIdentity {
             catalog: "ice".to_string(),
             namespace: "ns".to_string(),
             table: name.to_string(),
@@ -12533,7 +12533,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
 
 fn build_iceberg_table_def_for_snapshot_scan(
     state: &Arc<StandaloneState>,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     snapshot_id: i64,
 ) -> Result<crate::sql::planner::table::TableDef, String> {
     let entry = {
@@ -12580,7 +12580,7 @@ fn build_iceberg_table_def_for_snapshot_scan(
 fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.rewrite.target;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -12721,8 +12721,8 @@ fn select_join_full_refresh_route() -> JoinFullRefreshRoute {
 fn build_join_full_refresh_logical_plan(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
 ) -> Result<JoinRefreshLogicalPlan, String> {
     let (plan, mut factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
     let input = build_join_full_refresh_apply_input(
@@ -12817,8 +12817,8 @@ struct JoinFullRefreshApplyInput {
 fn build_join_full_refresh_apply_input(
     plan: crate::sql::planner::logical::LogicalPlanNode,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
 ) -> Result<JoinFullRefreshApplyInput, String> {
     let crate::sql::planner::logical::LogicalPlanNode {
         kind,
@@ -12912,7 +12912,7 @@ struct JoinFullRefreshBaseScan {
 
 fn find_join_full_refresh_base_scan(
     plan: &crate::sql::planner::logical::LogicalPlanNode,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     role: &str,
 ) -> Result<JoinFullRefreshBaseScan, String> {
     let mut scans = Vec::new();
@@ -12932,7 +12932,7 @@ fn find_join_full_refresh_base_scan(
 
 fn collect_join_full_refresh_base_scans(
     plan: &crate::sql::planner::logical::LogicalPlanNode,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     scans: &mut Vec<JoinFullRefreshBaseScan>,
 ) {
     if let crate::sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
@@ -12991,8 +12991,8 @@ fn join_full_refresh_row_id_column(
 
 fn build_join_full_refresh_key_pairs(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
     left_scan: &JoinFullRefreshBaseScan,
     right_scan: &JoinFullRefreshBaseScan,
 ) -> Result<
@@ -13147,8 +13147,8 @@ fn find_unique_scan_output_column(
 #[allow(clippy::too_many_arguments)]
 fn build_join_full_refresh_descriptor(
     ctx: &IcebergMvRefreshContext,
-    left_ref: &IcebergTableRef,
-    right_ref: &IcebergTableRef,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
     payload_columns: Vec<OutputColumn>,
     left_row_id_column: OutputColumn,
     right_row_id_column: OutputColumn,
@@ -14387,7 +14387,7 @@ fn execute_join_delta_branches(
 /// `InjectActionColumnRule`) reference by name.
 fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
-    base_refs: &[&IcebergTableRef],
+    base_refs: &[&TableIdentity],
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
     let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
@@ -14475,7 +14475,7 @@ fn build_join_delta_target_locator_table_def(
     target_table: &iceberg::table::Table,
     target_snapshot_id: Option<i64>,
 ) -> Result<crate::sql::planner::table::TableDef, String> {
-    let base = IcebergTableRef {
+    let base = TableIdentity {
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
         table: target.table.clone(),
@@ -14521,7 +14521,7 @@ fn build_empty_join_delta_target_locator_table_def(
 fn register_join_delta_coalesce_side(
     catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     side: crate::engine::mv::iceberg_join_branch::BranchSide,
     registered_delta_tables: &mut BTreeSet<String>,
     registered_snapshot_tables: &mut BTreeSet<String>,
@@ -14570,7 +14570,7 @@ fn join_catalog_registration_key(
 fn register_join_branch_side(
     catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
-    base: &IcebergTableRef,
+    base: &TableIdentity,
     side: crate::engine::mv::iceberg_join_branch::BranchSide,
 ) -> Result<(), String> {
     catalog.create_database(&base.namespace)?;
@@ -15285,7 +15285,7 @@ fn build_imv_change_stream_branches_for_test(
 }
 
 struct RewriteMergeBaseChange<'a> {
-    base_ref: &'a IcebergTableRef,
+    base_ref: &'a TableIdentity,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     base_table: &'a iceberg::table::Table,
@@ -15312,7 +15312,7 @@ fn rewrite_refresh_table_uuid_map(
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     base_table: &iceberg::table::Table,
@@ -16490,12 +16490,12 @@ mod tests {
 
     #[test]
     fn join_base_refs_for_schema_contract_uses_join_lineage_order() {
-        let left = IcebergTableRef {
+        let left = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "fact".to_string(),
         };
-        let right = IcebergTableRef {
+        let right = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "dim".to_string(),
@@ -16811,7 +16811,7 @@ mod tests {
 
     #[test]
     fn refresh_status_uses_base_ref_fqn() {
-        let base_ref = IcebergTableRef {
+        let base_ref = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "orders".to_string(),
@@ -18255,8 +18255,8 @@ mod tests {
         stmt
     }
 
-    fn iceberg_ref(catalog: &str, namespace: &str, table: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    fn iceberg_ref(catalog: &str, namespace: &str, table: &str) -> TableIdentity {
+        TableIdentity {
             catalog: catalog.to_string(),
             namespace: namespace.to_string(),
             table: table.to_string(),
@@ -22802,12 +22802,12 @@ mod tests {
             "SELECT l.id FROM ice.db.left_orders AS l \
              JOIN ice.db.right_orders AS r ON l.rid = r.rid",
         );
-        let left_ref = IcebergTableRef {
+        let left_ref = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "left_orders".to_string(),
         };
-        let right_ref = IcebergTableRef {
+        let right_ref = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "right_orders".to_string(),

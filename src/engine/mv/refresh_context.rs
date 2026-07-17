@@ -32,13 +32,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::planner::table::{
@@ -67,7 +67,7 @@ pub(crate) struct IcebergMvRewriteContext {
     pub canonical_select_query: Arc<sqlparser::ast::Query>,
 
     // ---- Base table inputs ----
-    pub base_refs: Arc<[IcebergTableRef]>,
+    pub base_refs: Arc<[TableIdentity]>,
     pub pin: Arc<RefreshSnapshotPin>,
     pub previous_snapshot_ids: BTreeMap<String, i64>,
     pub previous_table_uuids: BTreeMap<String, String>,
@@ -163,7 +163,7 @@ impl IcebergMvRewriteContext {
         current_database: String,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
@@ -629,7 +629,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -661,7 +661,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -697,7 +697,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -731,7 +731,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -1348,7 +1348,7 @@ fn target_contract_transform_text(
 
 fn collect_base_catalog_entries(
     iceberg_catalogs: &IcebergCatalogRegistry,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
     let mut entries = BTreeMap::new();
     for base_ref in base_refs {
@@ -1487,8 +1487,8 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
+    use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -1502,8 +1502,8 @@ pub(crate) mod tests_support {
 
     use super::*;
 
-    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> TableIdentity {
+        TableIdentity {
             catalog: c.to_string(),
             namespace: n.to_string(),
             table: t.to_string(),
@@ -1667,7 +1667,7 @@ pub(crate) mod tests_support {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -1801,7 +1801,7 @@ pub(crate) mod tests_support {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         Arc::new(
@@ -2000,8 +2000,8 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
+    use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
@@ -2015,7 +2015,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2061,7 +2061,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
 
@@ -2091,7 +2091,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(Vec::<IcebergTableRef>::new());
+        let base_refs: Arc<[TableIdentity]> = Arc::from(Vec::<TableIdentity>::new());
         let pin = Arc::new(RefreshSnapshotPin::default());
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2119,7 +2119,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> =
+        let base_refs: Arc<[TableIdentity]> =
             Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
@@ -2148,7 +2148,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         // Pin has the right count but the entry is for a different fqn.
         let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
         let schema = make_target_schema();
@@ -2183,7 +2183,7 @@ mod tests {
             .insert("ice.db.b".to_string(), "uuid-OLD".to_string());
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2214,7 +2214,7 @@ mod tests {
         def.last_refresh_table_uuids.clear();
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2243,7 +2243,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let mut contract = make_schema_contract();
@@ -2276,7 +2276,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         // Contract has two columns (matching schema count) but one has a wrong
@@ -2310,7 +2310,7 @@ mod tests {
     fn summary_orders_by_base_refs_declared_order() {
         let target = make_target();
         let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![
             make_ref("ice", "db", "b"),
             make_ref("ice", "db", "a"),
             make_ref("ice", "db", "c"),
@@ -2390,7 +2390,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let mut contract = make_schema_contract();
@@ -2420,7 +2420,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         // Three-field target schema: 100=k (visible), 101=v (visible),
@@ -2478,7 +2478,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         let schema = Arc::new(
@@ -2545,7 +2545,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         // Aggregate target schema: visible columns 100=k and 101=v, hidden

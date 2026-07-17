@@ -48,6 +48,7 @@ use crate::exec::chunk::Chunk;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, StarRocksTableRuntime, register_starrocks_tables_in_catalog,
 };
@@ -65,7 +66,6 @@ use crate::connector::starrocks::table::txn::{
     write_chunks_into_starrocks_partition_for_aggregate_mv_upsert,
     write_chunks_into_starrocks_partition_for_mv_refresh_with_row_delta,
 };
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::job::CreateEraseJobRequest;
 use crate::meta::repository::mv::{StoredMvDefinition, UpdateStarRocksMvRefreshSummaryRequest};
 use crate::meta::repository::starrocks_table::{
@@ -615,7 +615,7 @@ fn execute_aggregate_mv_full_refresh(
 fn rewrite_full_refresh_select_with_pin(
     select_sql: &str,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
 ) -> Result<String, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|e| format!("full refresh pin SELECT normalize error: {e}"))?;
@@ -657,7 +657,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     mv_name: &'a str,
     table_id: i64,
     select_sql: &'a str,
-    base_ref: &'a IcebergTableRef,
+    base_ref: &'a TableIdentity,
     shape: &'a crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
     change_batch: crate::connector::iceberg::changes::IcebergChangeBatch,
     previous_refresh_rows: i64,
@@ -1428,7 +1428,7 @@ fn validate_incremental_mv_select(
 
 fn validate_incremental_mv_base_ref(
     base_table: &sqlparser::ast::ObjectName,
-    base_ref: &IcebergTableRef,
+    base_ref: &TableIdentity,
 ) -> Result<(), String> {
     let actual = normalize_three_part_base_table(base_table)?;
     let expected = (
@@ -1480,7 +1480,7 @@ fn normalize_three_part_base_table(
 
 pub(crate) fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
 ) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let entry = {
         let registry = state
@@ -1494,7 +1494,7 @@ pub(crate) fn load_current_iceberg_base_table(
 }
 
 pub(crate) fn single_snapshot_map(
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
     snapshot_id: i64,
 ) -> BTreeMap<String, i64> {
     let mut snapshots = BTreeMap::new();
@@ -1503,7 +1503,7 @@ pub(crate) fn single_snapshot_map(
 }
 
 pub(crate) fn single_table_uuid_map(
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
     table_uuid: &str,
 ) -> BTreeMap<String, String> {
     let mut uuids = BTreeMap::new();
@@ -1519,7 +1519,7 @@ struct CurrentBaseMetadata {
 
 fn collect_current_base_metadata(
     state: &Arc<StandaloneState>,
-    refs: &[IcebergTableRef],
+    refs: &[TableIdentity],
 ) -> Result<CurrentBaseMetadata, String> {
     let registry = state
         .iceberg_catalogs
@@ -1545,7 +1545,7 @@ fn collect_current_base_metadata_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
     table_id: i64,
     staged: &StagedStarRocksMvRefresh,
-    refs: &[IcebergTableRef],
+    refs: &[TableIdentity],
 ) -> Result<CurrentBaseMetadata, String> {
     match collect_current_base_metadata(state, refs) {
         Ok(metadata) => Ok(metadata),
@@ -1781,7 +1781,7 @@ fn activate_starrocks_mv_refresh_partition(
     Ok(())
 }
 
-pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTableRef>, String> {
+pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
     refs.iter()
         .map(|fqn| {
             let parts = fqn.split('.').collect::<Vec<_>>();
@@ -1790,7 +1790,7 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTab
                     "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
                 ));
             };
-            Ok(IcebergTableRef {
+            Ok(TableIdentity {
                 catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
                 namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
                 table: crate::catalog::identifier::normalize_identifier(table)?,
@@ -1969,7 +1969,7 @@ mod tests {
     #[test]
     fn advance_empty_change_stream_updates_metadata_without_writing() {
         let (_dir, state, table_id) = seed_mv_refresh_state();
-        let base_ref = IcebergTableRef {
+        let base_ref = TableIdentity {
             catalog: "missing_catalog".to_string(),
             namespace: "ns".to_string(),
             table: "orders".to_string(),
@@ -3909,7 +3909,7 @@ enable_path_style_access = true
             &test_starrocks_table_config().warehouse_uri,
         )
         .expect("stage");
-        let refs = vec![IcebergTableRef {
+        let refs = vec![TableIdentity {
             catalog: "missing_catalog".to_string(),
             namespace: "ns".to_string(),
             table: "orders".to_string(),

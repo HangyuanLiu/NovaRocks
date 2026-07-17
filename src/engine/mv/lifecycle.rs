@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
@@ -77,19 +78,6 @@ impl MvTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvBaseRef {
-    pub catalog: String,
-    pub namespace: String,
-    pub table: String,
-}
-
-impl MvBaseRef {
-    pub(crate) fn fqn(&self) -> String {
-        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshMode {
     Noop,
@@ -132,7 +120,7 @@ pub(crate) struct RefreshPlan {
     pub target: MvTarget,
     pub storage_engine: MvStorageEngine,
     pub mode: RefreshMode,
-    pub base_refs: Vec<MvBaseRef>,
+    pub base_refs: Vec<TableIdentity>,
     pub snapshot_pins: BTreeMap<String, Option<i64>>,
     pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
     pub backend_plan: BackendRefreshPlan,

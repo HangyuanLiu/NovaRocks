@@ -16,7 +16,7 @@
 // under the License.
 
 #[cfg(test)]
-use crate::engine::mv::table_ref::IcebergTableRef;
+use crate::catalog::identifier::TableIdentity;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StarRocksTableSnapshot {
@@ -85,7 +85,7 @@ pub(crate) struct StoredMaterializedView {
     pub mv_id: i64,
     pub select_sql: String,
     pub refresh_mode: StarRocksMvRefreshMode,
-    pub base_table_refs: Vec<IcebergTableRef>,
+    pub base_table_refs: Vec<TableIdentity>,
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,

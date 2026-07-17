@@ -51,13 +51,13 @@
 //! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
+use crate::catalog::identifier::TableIdentity;
 use crate::engine::mv::apply_key::ApplyKeyValueType;
 use crate::engine::mv::refresh_contract::{
     AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
     JoinRefreshContract,
 };
 use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv_contract::{ApplyKeySource, MvSchemaContract};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
@@ -359,7 +359,7 @@ enum AggregateInputShape {
 pub(crate) struct RefreshFragmentProperty {
     pub(crate) identity: TargetIdentity,
     pub(crate) state: StateContract,
-    pub(crate) base_refs: Vec<IcebergTableRef>,
+    pub(crate) base_refs: Vec<TableIdentity>,
     /// `Some(n)` iff the identity top is `BranchScoped`, where `n` is the
     /// number of UNION ALL branches; `None` otherwise.
     pub(crate) branch_count: Option<usize>,
@@ -738,10 +738,10 @@ impl RefreshFragmentProperty {
 /// self-joins (`T JOIN T` → 1 distinct base for a 2-side structure) and
 /// duplicate-base fan-ins are rejected.
 fn validate_distinct_base_ref_arity(
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
     expected: usize,
 ) -> Result<(), String> {
-    let mut distinct: Vec<&IcebergTableRef> = Vec::new();
+    let mut distinct: Vec<&TableIdentity> = Vec::new();
     for base_ref in base_refs {
         if !distinct.contains(&base_ref) {
             distinct.push(base_ref);
@@ -1124,7 +1124,7 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
 
 /// The set of distinct base table refs (order-independent) referenced by a
 /// branch, used to compare composed-branch structure for A3 homogeneity.
-fn distinct_base_ref_set(base_refs: &[IcebergTableRef]) -> std::collections::BTreeSet<String> {
+fn distinct_base_ref_set(base_refs: &[TableIdentity]) -> std::collections::BTreeSet<String> {
     base_refs
         .iter()
         .map(|base_ref| base_ref.fqn().to_ascii_lowercase())
@@ -1172,9 +1172,9 @@ fn collect_union_all_query<'a>(
 /// off the scan's `ScanSource` (the relation tree, not the MV-declared refs).
 fn iceberg_ref_from_scan(
     scan: &crate::sql::analysis::ScanRelation,
-) -> Result<IcebergTableRef, String> {
+) -> Result<TableIdentity, String> {
     match &scan.table.source {
-        ScanSource::IcebergDataFiles { table, .. } => Ok(IcebergTableRef {
+        ScanSource::IcebergDataFiles { table, .. } => Ok(TableIdentity {
             catalog: table.catalog.clone(),
             namespace: table.namespace.clone(),
             table: table.table.clone(),
@@ -1934,11 +1934,7 @@ mod tests {
     }
 
     fn base_ref_fqns(property: &RefreshFragmentProperty) -> Vec<String> {
-        property
-            .base_refs
-            .iter()
-            .map(IcebergTableRef::fqn)
-            .collect()
+        property.base_refs.iter().map(TableIdentity::fqn).collect()
     }
 
     // --- Acceptance: per-operator synthesis -------------------------------
@@ -2047,7 +2043,7 @@ mod tests {
             contract
                 .base_refs
                 .iter()
-                .map(IcebergTableRef::fqn)
+                .map(TableIdentity::fqn)
                 .collect::<Vec<_>>(),
             vec!["ice.sales.fact_a", "ice.sales.fact_b", "ice.sales.fact_c"]
         );

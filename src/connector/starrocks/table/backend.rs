@@ -23,14 +23,15 @@ use std::sync::{Arc, Weak};
 
 use arrow::record_batch::RecordBatch;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, MvBackend, ResolvedTable, TableSink, TableSource,
 };
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::{
     BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-    MvBaseRef, MvListRow, MvStorageEngine, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome,
-    RefreshPlan, RefreshRequest, StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
+    MvListRow, MvStorageEngine, RefreshCtx, RefreshError, RefreshMode, RefreshOutcome, RefreshPlan,
+    RefreshRequest, StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::sql::planner::table::TableDef;
@@ -289,7 +290,7 @@ impl MvBackend for StarRocksTableMvBackend {
             target: req.target,
             storage_engine: MvStorageEngine::StarRocks,
             mode: RefreshMode::Incremental,
-            base_refs: vec![MvBaseRef {
+            base_refs: vec![TableIdentity {
                 catalog: "starrocks".to_string(),
                 namespace: req.current_database.clone(),
                 table: req.statement.name.parts.join("."),

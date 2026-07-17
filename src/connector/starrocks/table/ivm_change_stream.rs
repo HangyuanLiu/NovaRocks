@@ -18,11 +18,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::changes::{ChangeError, IcebergChangeBatch, plan_changes};
 use crate::connector::starrocks::table::mv_refresh::load_current_iceberg_base_table;
 use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::engine::StandaloneState;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::runtime::query_result::QueryResult;
 
 // Compatibility wrapper for the older two-branch materialized change stream.
@@ -94,8 +94,8 @@ pub(crate) fn plan_change_batches_for_pin(
     state: &Arc<StandaloneState>,
     pin: &RefreshSnapshotPin,
     last_refresh: &BTreeMap<String, i64>,
-    pk_columns_by_base: &HashMap<IcebergTableRef, Vec<String>>,
-) -> Result<Vec<(IcebergTableRef, IcebergChangeBatch)>, String> {
+    pk_columns_by_base: &HashMap<TableIdentity, Vec<String>>,
+) -> Result<Vec<(TableIdentity, IcebergChangeBatch)>, String> {
     let mut out = Vec::with_capacity(pin.len());
     for (fqn, pinned_snap) in pin.iter() {
         let base_ref = parse_fqn_to_iceberg_ref(fqn)?;
@@ -117,14 +117,14 @@ pub(crate) fn plan_change_batches_for_pin(
 }
 
 #[allow(dead_code)]
-fn parse_fqn_to_iceberg_ref(fqn: &str) -> Result<IcebergTableRef, String> {
+fn parse_fqn_to_iceberg_ref(fqn: &str) -> Result<TableIdentity, String> {
     let parts: Vec<&str> = fqn.split('.').collect();
     if parts.len() != 3 {
         return Err(format!(
             "expected 3-part fqn '<catalog>.<namespace>.<table>', got '{fqn}'"
         ));
     }
-    Ok(IcebergTableRef {
+    Ok(TableIdentity {
         catalog: parts[0].to_string(),
         namespace: parts[1].to_string(),
         table: parts[2].to_string(),
