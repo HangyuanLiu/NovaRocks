@@ -21,6 +21,7 @@ mod compat_artifact;
 mod config;
 mod fault_injection;
 mod imv_stateless;
+mod managed_process;
 mod parser;
 mod results;
 mod runner;
