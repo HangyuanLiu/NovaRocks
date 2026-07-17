@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod cluster;
 pub(crate) mod dispatch;
 pub(crate) mod execution;
 pub(crate) mod ports;

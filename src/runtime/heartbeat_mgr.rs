@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::runtime::backend_registry::{BackendRegistry, BeId, HeartbeatOutcome, RegistryEvent};
+use crate::coordinator::cluster::{BackendRegistry, BeId, HeartbeatOutcome, RegistryEvent};
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
 
 pub trait RegistryEventSink: Send + Sync + 'static {
@@ -118,7 +118,7 @@ impl RegistryEventSink for NoopEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::backend_registry::{
+    use crate::coordinator::cluster::{
         BackendRegistry, BackendState, HeartbeatOutcome, RegistryEvent,
     };
     use crate::service::grpc_client::proto;

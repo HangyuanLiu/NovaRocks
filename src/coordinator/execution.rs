@@ -1491,9 +1491,8 @@ pub(crate) fn submit_and_fetch_loop(
             return Err(e);
         }
         observer.fragment_scheduled();
-        if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
-            registry
-                .record_scheduled_fragment(backend_idx as crate::runtime::backend_registry::BeId);
+        if let Some(registry) = crate::coordinator::cluster::backend_registry() {
+            registry.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
         }
         tracker.record_submitted(backend_idx, finst_id.clone());
         crate::runtime::query_state::in_flight_table().register(

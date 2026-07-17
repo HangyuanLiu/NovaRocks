@@ -24,10 +24,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::ClusterRole;
+use crate::coordinator::cluster::{BackendRegistry, BackendState, BeId, HeartbeatOutcome};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
-use crate::runtime::backend_registry::{BackendRegistry, BackendState, BeId, HeartbeatOutcome};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::query_state::in_flight_table;
 use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
@@ -35,7 +35,7 @@ use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
 pub(crate) fn ensure_backend_registry(
     state: &Arc<StandaloneState>,
 ) -> Result<Arc<BackendRegistry>, String> {
-    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
         return Ok(registry);
     }
 
@@ -69,8 +69,7 @@ pub(crate) fn ensure_backend_registry(
         .collect::<Result<Vec<_>, _>>()?;
     registry.seed_from_config(&seed_endpoints);
 
-    let installed =
-        crate::runtime::backend_registry::install_backend_registry(Arc::clone(&registry));
+    let installed = crate::coordinator::cluster::install_backend_registry(Arc::clone(&registry));
     #[cfg(not(test))]
     if installed {
         crate::runtime::heartbeat_mgr::spawn(
@@ -82,7 +81,7 @@ pub(crate) fn ensure_backend_registry(
     #[cfg(test)]
     let _ = installed;
 
-    Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
+    Ok(crate::coordinator::cluster::backend_registry().unwrap_or(registry))
 }
 
 pub(crate) fn wait_for_configured_backends_live(
@@ -95,7 +94,7 @@ pub(crate) fn wait_for_configured_backends_live(
         .iter()
         .map(|addr| parse_backend_addr(addr))
         .collect::<Result<Vec<_>, _>>()?;
-    let Some(registry) = crate::runtime::backend_registry::backend_registry() else {
+    let Some(registry) = crate::coordinator::cluster::backend_registry() else {
         return Err("role=fe backend registry is not initialized".to_string());
     };
 
@@ -167,7 +166,7 @@ pub(crate) fn install_all_in_one_backend_registry(
     endpoint: SocketAddr,
     heartbeat_timeout_retries: u32,
 ) -> Result<Arc<BackendRegistry>, String> {
-    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
         validate_all_in_one_loopback_registry(registry.as_ref(), endpoint)?;
         return Ok(registry);
     }
@@ -191,8 +190,8 @@ pub(crate) fn install_all_in_one_backend_registry(
         },
     );
 
-    crate::runtime::backend_registry::install_backend_registry(Arc::clone(&registry));
-    Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
+    crate::coordinator::cluster::install_backend_registry(Arc::clone(&registry));
+    Ok(crate::coordinator::cluster::backend_registry().unwrap_or(registry))
 }
 
 fn validate_all_in_one_loopback_registry(
@@ -233,7 +232,7 @@ fn current_time_millis() -> i64 {
 }
 
 pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
-    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+    if let Some(registry) = crate::coordinator::cluster::backend_registry() {
         let live = registry.live_endpoints();
         if live.is_empty() {
             return Err("no live backend available".to_string());
@@ -308,7 +307,7 @@ pub(crate) fn execute_show_backends(
             )?))
         }
         ClusterRole::AllInOne => {
-            let registry = crate::runtime::backend_registry::backend_registry()
+            let registry = crate::coordinator::cluster::backend_registry()
                 .ok_or_else(|| "all-in-one backend registry is not initialized".to_string())?;
             Ok(StatementResult::Query(show_backends_result(
                 registry.snapshot(),
@@ -319,7 +318,7 @@ pub(crate) fn execute_show_backends(
 }
 
 fn show_backends_result(
-    mut entries: Vec<crate::runtime::backend_registry::BackendEntry>,
+    mut entries: Vec<crate::coordinator::cluster::BackendEntry>,
 ) -> Result<QueryResult, String> {
     entries.sort_by_key(|entry| entry.be_id);
     let column_names = [
@@ -524,7 +523,7 @@ fn backend_state_from_str(state: &str) -> Result<BackendState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
+    use crate::coordinator::cluster::BackendRegistryTestGuard as BackendRegistryReset;
 
     #[test]
     fn all_in_one_loopback_registry_installs_live_backend_zero() {
@@ -559,7 +558,7 @@ mod tests {
         let requested_endpoint: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();
         let registry = Arc::new(BackendRegistry::new(3));
         registry.add_backend_with_state(existing_endpoint, BackendState::Live);
-        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+        crate::coordinator::cluster::replace_backend_registry_for_test(Some(registry));
 
         let err = match install_all_in_one_backend_registry(requested_endpoint, 3) {
             Ok(_) => panic!("mismatched existing registry must fail"),

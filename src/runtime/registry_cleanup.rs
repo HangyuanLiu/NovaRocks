@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::backend_registry::{BeId, RegistryEvent};
+use crate::coordinator::cluster::{BeId, RegistryEvent};
 use crate::runtime::heartbeat_mgr::RegistryEventSink;
 use crate::runtime::query_state::in_flight_table;
 
@@ -58,7 +58,7 @@ impl RegistryEventSink for QueryCleanupSink {
 mod tests {
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::runtime::backend_registry::RegistryEvent;
+    use crate::coordinator::cluster::RegistryEvent;
     use crate::runtime::exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state};
     use crate::runtime::heartbeat_mgr::RegistryEventSink;
     use crate::runtime::query_context::{QueryId, query_context_manager};
