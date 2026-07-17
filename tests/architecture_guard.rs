@@ -46402,6 +46402,1227 @@ mod ebd_5b1_cluster_membership_owner;
 #[path = "architecture_guard/ebd_5b2_cluster_heartbeat_lifecycle.rs"]
 mod ebd_5b2_cluster_heartbeat_lifecycle;
 
+const PBF_1A_ERROR_OWNERS: [(&str, &str, &str); 3] = [
+    (
+        "src/protocol/common/error.rs",
+        "src/protocol/mod.rs",
+        "common",
+    ),
+    ("src/exec/fragment/error.rs", "src/exec/mod.rs", "fragment"),
+    (
+        "src/runtime/fragment/error.rs",
+        "src/runtime/mod.rs",
+        "fragment",
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pbf1aDeclarationKind {
+    Struct,
+    Enum,
+    TypeAlias,
+}
+
+impl Pbf1aDeclarationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::TypeAlias => "type alias",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Pbf1aVocabularyEntry {
+    name: &'static str,
+    kind: Pbf1aDeclarationKind,
+    owner_rel: &'static str,
+    owner_path: &'static [&'static str],
+}
+
+const PBF_1A_VOCABULARY_LEDGER: [Pbf1aVocabularyEntry; 17] = [
+    Pbf1aVocabularyEntry {
+        name: "ProtocolFamily",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FieldPath",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FieldPathSegment",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "TransportDecodeError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "TransportDecodeErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ProtocolError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ProtocolErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ExecPlanBuildError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ExecPlanInvariant",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingTarget",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchStage",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentExecutionError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentExecutionErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+];
+
+fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static str] {
+    if source_rel == "src/protocol/mod.rs" || source_rel.starts_with("src/protocol/common/") {
+        &[
+            "exec",
+            "runtime",
+            "connector",
+            "service",
+            "coordinator",
+            "sql",
+            "proto",
+            "protobuf",
+            "prost",
+            "thrift",
+        ]
+    } else if source_rel == "src/exec/mod.rs" || source_rel.starts_with("src/exec/fragment/") {
+        &[
+            "protocol", "runtime", "proto", "protobuf", "prost", "thrift",
+        ]
+    } else {
+        &["protocol", "proto", "protobuf", "prost", "thrift"]
+    }
+}
+
+fn pbf_1a_visibility_is_pub_crate(visibility: &syn::Visibility) -> bool {
+    matches!(
+        visibility,
+        syn::Visibility::Restricted(restricted)
+            if restricted.in_token.is_none() && restricted.path.is_ident("crate")
+    )
+}
+
+fn pbf_1a_expected_vocabulary_owner(name: &str) -> Option<&'static [&'static str]> {
+    PBF_1A_VOCABULARY_LEDGER
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.owner_path)
+}
+
+fn pbf_1a_path_starts_with(path: &[String], expected: &[&str]) -> bool {
+    path.len() == expected.len() + 1
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
+}
+
+#[derive(Debug)]
+struct Pbf1aUseBinding {
+    target: Vec<String>,
+    local: Option<String>,
+    glob: bool,
+}
+
+fn pbf_1a_ident_text(ident: &syn::Ident) -> String {
+    use syn::ext::IdentExt;
+
+    ident.unraw().to_string()
+}
+
+fn pbf_1a_collect_use_bindings(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    bindings: &mut Vec<Pbf1aUseBinding>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(pbf_1a_ident_text(&path.ident));
+            pbf_1a_collect_use_bindings(&path.tree, prefix, bindings);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let mut target = prefix.clone();
+            let ident = pbf_1a_ident_text(&name.ident);
+            target.push(ident.clone());
+            bindings.push(Pbf1aUseBinding {
+                local: Some(ident),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut target = prefix.clone();
+            target.push(pbf_1a_ident_text(&rename.ident));
+            bindings.push(Pbf1aUseBinding {
+                local: Some(pbf_1a_ident_text(&rename.rename)),
+                target,
+                glob: false,
+            });
+        }
+        syn::UseTree::Glob(_) => {
+            let mut target = prefix.clone();
+            target.push("*".to_string());
+            bindings.push(Pbf1aUseBinding {
+                local: None,
+                target,
+                glob: true,
+            });
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                pbf_1a_collect_use_bindings(tree, prefix, bindings);
+            }
+        }
+    }
+}
+
+fn pbf_1a_path_is_expected_owner_glob(path: &[String]) -> bool {
+    path.last().is_some_and(|segment| segment == "*")
+        && [
+            &["crate", "protocol", "common", "error"][..],
+            &["crate", "exec", "fragment", "error"][..],
+            &["crate", "runtime", "fragment", "error"][..],
+        ]
+        .iter()
+        .any(|owner| {
+            path.len() == owner.len() + 1
+                && path
+                    .iter()
+                    .zip(owner.iter())
+                    .all(|(actual, expected)| actual == expected)
+        })
+}
+
+fn pbf_1a_path_is_expected_vocabulary(path: &[String], local: &str) -> bool {
+    pbf_1a_expected_vocabulary_owner(local).is_some_and(|owner| {
+        pbf_1a_path_starts_with(path, owner) && path.last().is_some_and(|target| target == local)
+    })
+}
+
+fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &str) -> Vec<String> {
+    let mut file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A module owner `{source_rel}` must parse: {error}"
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A module owner `{source_rel}` has cfg-dependent ownership that cannot be proven"
+        )];
+    }
+    let mut violations = Vec::new();
+    let declarations = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) if module.ident == protected => Some(module),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if declarations.len() != 1 {
+        violations.push(format!(
+            "PBF-1A module owner `{source_rel}` must declare exactly one top-level `{protected}` module; found {}",
+            declarations.len()
+        ));
+    }
+    for declaration in declarations {
+        if declaration.content.is_some() {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must declare `{protected}` as an external module"
+            ));
+        }
+        if !pbf_1a_visibility_is_pub_crate(&declaration.vis) {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must declare `{protected}` with exact pub(crate) visibility"
+            ));
+        }
+        if !declaration.attrs.is_empty() {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` must not decorate `{protected}` with attributes"
+            ));
+        }
+    }
+    let mut bindings = Vec::new();
+    for item in &file.items {
+        if let syn::Item::Use(import) = item {
+            pbf_1a_collect_use_bindings(&import.tree, &mut Vec::new(), &mut bindings);
+        }
+    }
+    for binding in bindings {
+        let target = rust_canonical_use_segments(&binding.target.join("::"), source_rel)
+            .unwrap_or(binding.target);
+        if binding.glob && !pbf_1a_path_is_expected_owner_glob(&target) {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` imports a fail-closed legacy glob `{}`",
+                target.join("::")
+            ));
+        }
+        if let Some(local) = binding.local
+            && pbf_1a_expected_vocabulary_owner(&local).is_some()
+            && !pbf_1a_path_is_expected_vocabulary(&target, &local)
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` binds protected vocabulary `{local}` from wrong owner `{}`",
+                target.join("::")
+            ));
+        }
+    }
+    let forbidden = pbf_1a_forbidden_dependency_segments(source_rel);
+    for path in rust_production_canonical_paths(text, source_rel) {
+        if let Some(segment) = path
+            .iter()
+            .find(|segment| forbidden.contains(&segment.as_str()))
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` has forbidden `{segment}` dependency `{}`",
+                path.join("::")
+            ));
+        }
+        if let Some(name) = path.last()
+            && let Some(expected_owner) = pbf_1a_expected_vocabulary_owner(name)
+            && !pbf_1a_path_starts_with(&path, expected_owner)
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` imports vocabulary `{name}` from legacy owner `{}`",
+                path.join("::")
+            ));
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn pbf_1a_meta_contains_path(meta: &syn::Meta) -> Result<bool, syn::Error> {
+    match meta {
+        syn::Meta::Path(path) => Ok(path.is_ident("path")),
+        syn::Meta::NameValue(name_value) => Ok(name_value.path.is_ident("path")),
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            use syn::parse::Parser;
+
+            let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())?;
+            for meta in nested.iter().skip(1) {
+                if pbf_1a_meta_contains_path(meta)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        syn::Meta::List(_) => Ok(false),
+    }
+}
+
+fn pbf_1a_path_is_std_include(path: &[String]) -> bool {
+    path == ["std", "include"]
+}
+
+fn pbf_1a_resolve_namespace_aliases(
+    path: &[String],
+    aliases: &BTreeMap<String, Vec<String>>,
+    ambiguous: &BTreeSet<String>,
+) -> Result<Vec<String>, ()> {
+    let mut resolved = path.to_vec();
+    let mut visited = BTreeSet::new();
+    loop {
+        let Some(first) = resolved.first().cloned() else {
+            return Ok(resolved);
+        };
+        if ambiguous.contains(&first) || !visited.insert(first.clone()) {
+            return Err(());
+        }
+        let Some(target) = aliases.get(&first) else {
+            return Ok(resolved);
+        };
+        let mut canonical = target.clone();
+        canonical.extend_from_slice(&resolved[1..]);
+        resolved = canonical;
+    }
+}
+
+fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct NamespaceAliasAudit {
+        aliases: BTreeMap<String, Vec<String>>,
+        ambiguous: BTreeSet<String>,
+    }
+
+    impl NamespaceAliasAudit {
+        fn record(&mut self, local: String, mut target: Vec<String>) {
+            if target.len() > 1 && target.last().is_some_and(|segment| segment == "self") {
+                target.pop();
+            }
+            if target.as_slice() == [local.as_str()] {
+                return;
+            }
+            if self.ambiguous.contains(&local) {
+                return;
+            }
+            match self.aliases.get(&local) {
+                Some(existing) if existing != &target => {
+                    self.aliases.remove(&local);
+                    self.ambiguous.insert(local);
+                }
+                Some(_) => {}
+                None => {
+                    self.aliases.insert(local, target);
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for NamespaceAliasAudit {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let mut bindings = Vec::new();
+            pbf_1a_collect_use_bindings(&item.tree, &mut Vec::new(), &mut bindings);
+            for binding in bindings {
+                if !binding.glob
+                    && let Some(local) = binding.local
+                {
+                    self.record(local, binding.target);
+                }
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+            let target = vec![pbf_1a_ident_text(&item.ident)];
+            let local = item
+                .rename
+                .as_ref()
+                .map(|(_, rename)| pbf_1a_ident_text(rename))
+                .unwrap_or_else(|| target[0].clone());
+            self.record(local, target);
+            syn::visit::visit_item_extern_crate(self, item);
+        }
+    }
+
+    struct IndirectionAudit {
+        findings: Vec<String>,
+        namespace_aliases: BTreeMap<String, Vec<String>>,
+        ambiguous_aliases: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for IndirectionAudit {
+        fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+            match pbf_1a_meta_contains_path(&attribute.meta) {
+                Ok(true) => self.findings.push("path attribute".to_string()),
+                Ok(false) => {}
+                Err(error) => self
+                    .findings
+                    .push(format!("unparseable attribute metadata: {error}")),
+            }
+            syn::visit::visit_attribute(self, attribute);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.is_ident("macro_rules") {
+                self.findings.push("declarative macro".to_string());
+            }
+            let path = mac
+                .path
+                .segments
+                .iter()
+                .map(|segment| pbf_1a_ident_text(&segment.ident))
+                .collect::<Vec<_>>();
+            let is_bare_include = path.as_slice() == ["include"];
+            let canonical = pbf_1a_resolve_namespace_aliases(
+                &path,
+                &self.namespace_aliases,
+                &self.ambiguous_aliases,
+            );
+            let is_std_include = canonical
+                .as_ref()
+                .is_ok_and(|path| pbf_1a_path_is_std_include(path));
+            let is_unproven_include_alias = canonical.is_err()
+                && (path.last().is_some_and(|segment| segment == "include")
+                    || path
+                        .first()
+                        .is_some_and(|segment| self.ambiguous_aliases.contains(segment)));
+            if is_bare_include || is_std_include || is_unproven_include_alias {
+                self.findings.push("include! macro".to_string());
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    let mut file = match syn::parse_file(text) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A owner `{source_rel}` must parse before source-indirection audit: {error}"
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A owner `{source_rel}` has cfg-dependent source ownership that cannot be proven"
+        )];
+    }
+    let mut aliases = NamespaceAliasAudit::default();
+    syn::visit::Visit::visit_file(&mut aliases, &file);
+    let mut audit = IndirectionAudit {
+        findings: Vec::new(),
+        namespace_aliases: aliases.aliases,
+        ambiguous_aliases: aliases.ambiguous,
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    audit
+        .findings
+        .into_iter()
+        .map(|finding| format!("PBF-1A owner `{source_rel}` has forbidden {finding}"))
+        .collect()
+}
+
+fn pbf_1a_read_source_inventory(
+    repo: &Path,
+    paths: &[PathBuf],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut sources = Vec::new();
+    let mut violations = Vec::new();
+    for path in paths {
+        let source_rel = path
+            .strip_prefix(repo)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        match fs::read_to_string(path) {
+            Ok(source) => sources.push((source_rel, source)),
+            Err(error) => violations.push(format!(
+                "PBF-1A production inventory source `{source_rel}` is unreadable: {error}"
+            )),
+        }
+    }
+    (sources, violations)
+}
+
+fn pbf_1a_declaration_contract_violations(
+    source_rel: &str,
+    source: &str,
+    expected: Pbf1aVocabularyEntry,
+) -> Vec<String> {
+    fn item_declaration(
+        item: &syn::Item,
+        expected_name: &str,
+    ) -> Option<(Pbf1aDeclarationKind, bool)> {
+        match item {
+            syn::Item::Struct(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::Struct,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            syn::Item::Enum(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::Enum,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            syn::Item::Type(item) if pbf_1a_ident_text(&item.ident) == expected_name => Some((
+                Pbf1aDeclarationKind::TypeAlias,
+                pbf_1a_visibility_is_pub_crate(&item.vis),
+            )),
+            _ => None,
+        }
+    }
+
+    struct DeclarationAudit<'a> {
+        expected_name: &'a str,
+        declarations: Vec<(Pbf1aDeclarationKind, bool)>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for DeclarationAudit<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::Struct,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::Enum,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::TypeAlias,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    let mut file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A vocabulary `{}` source `{source_rel}` must parse for declaration audit: {error}",
+                expected.name
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A vocabulary `{}` source `{source_rel}` has cfg-dependent declarations that cannot be proven",
+            expected.name
+        )];
+    }
+
+    let mut audit = DeclarationAudit {
+        expected_name: expected.name,
+        declarations: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+    let top_level = file
+        .items
+        .iter()
+        .filter_map(|item| item_declaration(item, expected.name))
+        .collect::<Vec<_>>();
+    let nested_count = audit.declarations.len().saturating_sub(top_level.len());
+
+    let mut violations = Vec::new();
+    if nested_count > 0 {
+        violations.push(format!(
+            "PBF-1A vocabulary `{}` in `{source_rel}` must have one top-level `{}` declaration; found {nested_count} nested declaration(s)",
+            expected.name,
+            expected.kind.label()
+        ));
+    }
+    if top_level.len() != 1 {
+        violations.push(format!(
+            "PBF-1A vocabulary `{}` in `{source_rel}` must have exactly one top-level `{}` declaration; found {}",
+            expected.name,
+            expected.kind.label(),
+            top_level.len()
+        ));
+    }
+    for (kind, exact_pub_crate) in top_level {
+        if kind != expected.kind {
+            violations.push(format!(
+                "PBF-1A vocabulary `{}` in `{source_rel}` must be declared as `{}`; found `{}`",
+                expected.name,
+                expected.kind.label(),
+                kind.label()
+            ));
+        }
+        if !exact_pub_crate {
+            violations.push(format!(
+                "PBF-1A vocabulary `{}` in `{source_rel}` must have exact `pub(crate)` visibility",
+                expected.name
+            ));
+        }
+    }
+    violations
+}
+
+fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    if production_sources.is_empty() {
+        violations.push("PBF-1A production source inventory is empty".to_string());
+    }
+    for expected in PBF_1A_VOCABULARY_LEDGER {
+        let name = expected.name;
+        let declaration_counts = production_sources
+            .iter()
+            .map(|(source_rel, source)| {
+                (
+                    source_rel.as_str(),
+                    rust_named_type_declaration_count(source, name),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total_count = declaration_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        if total_count != 1 {
+            violations.push(format!(
+                "PBF-1A vocabulary `{name}` must have exactly one production declaration; found {total_count}"
+            ));
+        }
+
+        for (source_rel, source) in production_sources {
+            if rust_named_type_declaration_count(source, name) > 0 {
+                violations.extend(pbf_1a_declaration_contract_violations(
+                    source_rel, source, expected,
+                ));
+            }
+        }
+
+        let expected_owner = expected.owner_rel;
+        let expected_count = declaration_counts
+            .iter()
+            .find_map(|(source_rel, count)| (*source_rel == expected_owner).then_some(*count))
+            .unwrap_or(0);
+        let actual_owners = declaration_counts
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(source_rel, count)| format!("{source_rel} ({count})"))
+            .collect::<Vec<_>>();
+        if expected_count != 1
+            || declaration_counts
+                .iter()
+                .any(|(source_rel, count)| *source_rel != expected_owner && *count > 0)
+        {
+            violations.push(format!(
+                "PBF-1A vocabulary `{name}` must be declared exactly once in `{expected_owner}` and nowhere else; found expected-owner count {expected_count}, actual owners [{}]",
+                actual_owners.join(", ")
+            ));
+        }
+    }
+    violations
+}
+
+fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut owner_sources = Vec::new();
+
+    for (owner_rel, parent_rel, module) in PBF_1A_ERROR_OWNERS {
+        let owner_path = repo.join(owner_rel);
+        let owner = match fs::read_to_string(&owner_path) {
+            Ok(owner) => owner,
+            Err(error) => {
+                violations.push(format!("missing PBF-1A owner `{owner_rel}`: {error}"));
+                continue;
+            }
+        };
+        let production = rust_sanitized_production_text(&owner);
+        if production.trim().is_empty() {
+            violations.push(format!(
+                "PBF-1A owner `{owner_rel}` has an empty production source inventory"
+            ));
+        }
+        if let Err(error) = syn::parse_file(&owner) {
+            violations.push(format!("PBF-1A owner `{owner_rel}` must parse: {error}"));
+        }
+        violations.extend(pbf_1a_source_indirection_violations(owner_rel, &owner));
+        violations.extend(
+            production_crate_self_alias_violations(owner_rel, &owner)
+                .into_iter()
+                .map(|violation| format!("PBF-1A owner `{owner_rel}`: {violation}")),
+        );
+        let forbidden = pbf_1a_forbidden_dependency_segments(owner_rel);
+        for path in rust_production_canonical_paths(&owner, owner_rel) {
+            if let Some(segment) = path
+                .iter()
+                .find(|segment| forbidden.contains(&segment.as_str()))
+            {
+                violations.push(format!(
+                    "PBF-1A owner `{owner_rel}` has forbidden `{segment}` dependency `{}`",
+                    path.join("::")
+                ));
+            }
+        }
+        owner_sources.push((owner_rel, owner));
+
+        let parent_path = repo.join(parent_rel);
+        match fs::read_to_string(&parent_path) {
+            Ok(parent) => {
+                violations.extend(pbf_1a_module_contract_violations(
+                    parent_rel,
+                    parent.as_str(),
+                    module,
+                ));
+                violations.extend(pbf_1a_source_indirection_violations(parent_rel, &parent));
+            }
+            Err(error) => violations.push(format!(
+                "PBF-1A parent module `{parent_rel}` is unreadable: {error}"
+            )),
+        }
+
+        let child_rel = owner_path
+            .parent()
+            .expect("PBF-1A owner has a parent")
+            .join("mod.rs");
+        match fs::read_to_string(&child_rel) {
+            Ok(child) => {
+                let child_rel = child_rel.strip_prefix(repo).unwrap().to_string_lossy();
+                violations.extend(pbf_1a_module_contract_violations(
+                    &child_rel, &child, "error",
+                ));
+                violations.extend(pbf_1a_source_indirection_violations(&child_rel, &child));
+            }
+            Err(error) => violations.push(format!(
+                "PBF-1A child module `{}` is unreadable: {error}",
+                child_rel.strip_prefix(repo).unwrap().display()
+            )),
+        }
+    }
+
+    let production_paths = rs_files(&repo.join("src"));
+    let (production_sources, inventory_violations) =
+        pbf_1a_read_source_inventory(repo, &production_paths);
+    violations.extend(inventory_violations);
+    violations.extend(pbf_1a_unique_vocabulary_violations(&production_sources));
+
+    if owner_sources.is_empty() {
+        violations.push("PBF-1A guarded owner inventory is empty".to_string());
+    }
+    violations
+}
+
+#[test]
+fn pbf_1a_fragment_error_vocabulary_has_layered_owners() {
+    let violations = pbf_1a_error_vocabulary_violations(Path::new(manifest_dir()));
+    assert!(
+        violations.is_empty(),
+        "PBF-1A fragment error vocabulary must keep layered, unique, fail-closed owners:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn pbf_1a_module_owner_detector_requires_external_top_level_pub_crate_modules() {
+    for invalid in [
+        "pub(crate) mod common {}",
+        "mod nested { pub(crate) mod common; }",
+        "pub mod common;",
+        "pub(in crate) mod common;",
+        "pub(crate) use legacy::common;",
+        "pub(crate) use legacy::*;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/mod.rs", invalid, "common");
+        assert!(
+            !violations.is_empty(),
+            "inline, nested, wrongly-visible, or re-exported module must fail: {invalid}"
+        );
+    }
+    assert!(
+        pbf_1a_module_contract_violations(
+            "src/protocol/mod.rs",
+            "pub(crate) mod common; pub(crate) mod native;",
+            "common",
+        )
+        .is_empty(),
+        "one top-level external pub(crate) declaration must pass"
+    );
+
+    let child_reexport = pbf_1a_module_contract_violations(
+        "src/protocol/common/mod.rs",
+        "pub(crate) mod error; pub(crate) use crate::common::error::ProtocolError;",
+        "error",
+    );
+    assert!(
+        child_reexport
+            .iter()
+            .any(|violation| violation.contains("wrong owner")),
+        "protected child vocabulary from a legacy owner must be diagnosed: {child_reexport:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports() {
+    for allowed in [
+        "pub(crate) mod common; use std::fmt;",
+        "pub(crate) mod common; pub(self) use std::error::Error;",
+        "pub(crate) mod common; pub(crate) use std::fmt::Debug;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/mod.rs", allowed, "common");
+        assert!(
+            violations.is_empty(),
+            "unrelated private imports must remain allowed: {allowed}: {violations:?}"
+        );
+    }
+
+    let forbidden = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::runtime::query_context::QueryContext;",
+        "common",
+    );
+    assert!(
+        forbidden
+            .iter()
+            .any(|violation| violation.contains("forbidden `runtime` dependency")),
+        "private imports must not bypass the protocol layer: {forbidden:?}"
+    );
+
+    let legacy_private = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::ProtocolError;",
+        "common",
+    );
+    assert!(
+        legacy_private
+            .iter()
+            .any(|violation| violation.contains("legacy owner")),
+        "private vocabulary imports must not revive a legacy owner: {legacy_private:?}"
+    );
+
+    let legacy_reexport = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; pub(crate) use crate::common::error::ProtocolError;",
+        "common",
+    );
+    assert!(
+        legacy_reexport
+            .iter()
+            .any(|violation| violation.contains("legacy owner")),
+        "outward legacy-owner re-exports must fail: {legacy_reexport:?}"
+    );
+
+    let renamed_vocabulary = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::Legacy as ProtocolError;",
+        "common",
+    );
+    assert!(
+        renamed_vocabulary
+            .iter()
+            .any(|violation| violation.contains("binds protected vocabulary `ProtocolError`")),
+        "renaming a legacy target as protected vocabulary must fail: {renamed_vocabulary:?}"
+    );
+
+    let raw_renamed_vocabulary = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::Legacy as r#ProtocolError;",
+        "common",
+    );
+    assert!(
+        raw_renamed_vocabulary
+            .iter()
+            .any(|violation| violation.contains("binds protected vocabulary `ProtocolError`")),
+        "raw identifiers must not bypass protected vocabulary bindings: {raw_renamed_vocabulary:?}"
+    );
+
+    let legacy_glob = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::*;",
+        "common",
+    );
+    assert!(
+        legacy_glob
+            .iter()
+            .any(|violation| violation.contains("legacy glob")),
+        "a private legacy-owner glob must fail closed: {legacy_glob:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_dependency_detector_rejects_alias_grouped_imports_and_reexports() {
+    for invalid in [
+        "pub(crate) mod error; use crate::runtime as lifecycle;",
+        "pub(crate) mod error; use crate::{runtime::query_context::QueryContext, std::fmt};",
+        "pub(crate) mod error; pub(crate) use crate::runtime::RuntimeState;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/common/mod.rs", invalid, "error");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("forbidden `runtime` dependency")),
+            "alias, grouped import, and re-export must not bypass dependency ownership: {invalid}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_duplicate_and_empty_inventories() {
+    let duplicate = vec![
+        (
+            "src/first.rs".to_string(),
+            "pub(crate) struct FragmentLaunchError;".to_string(),
+        ),
+        (
+            "src/second.rs".to_string(),
+            "pub(crate) struct FragmentLaunchError;".to_string(),
+        ),
+    ];
+    let duplicate_violations = pbf_1a_unique_vocabulary_violations(&duplicate);
+    assert!(
+        duplicate_violations.iter().any(|violation| {
+            violation.contains("`FragmentLaunchError`") && violation.contains("found 2")
+        }),
+        "a duplicate vocabulary owner must fail: {duplicate_violations:?}"
+    );
+
+    let empty_violations = pbf_1a_unique_vocabulary_violations(&[]);
+    assert!(
+        empty_violations
+            .iter()
+            .any(|violation| violation.contains("production source inventory is empty")),
+        "an empty production inventory must fail closed: {empty_violations:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_a_declaration_moved_to_the_wrong_owner() {
+    let moved = vec![
+        ("src/protocol/common/error.rs".to_string(), String::new()),
+        (
+            "src/runtime/fragment/error.rs".to_string(),
+            "pub(crate) struct ProtocolError;".to_string(),
+        ),
+    ];
+    let violations = pbf_1a_unique_vocabulary_violations(&moved);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("`ProtocolError`")
+                && violation.contains("src/protocol/common/error.rs")
+                && violation.contains("src/runtime/fragment/error.rs")
+        }),
+        "a declaration moved to a different layer must identify both expected and actual owners: {violations:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_wrong_declaration_kind_and_visibility() {
+    for (declaration, expected_diagnostic) in [
+        (
+            "pub(crate) type FragmentLaunchError = String;",
+            "must be declared as `struct`",
+        ),
+        (
+            "pub(crate) enum FragmentLaunchError { Invalid }",
+            "must be declared as `struct`",
+        ),
+        (
+            "pub struct FragmentLaunchError;",
+            "exact `pub(crate)` visibility",
+        ),
+    ] {
+        let inventory = vec![(
+            "src/runtime/fragment/error.rs".to_string(),
+            declaration.to_string(),
+        )];
+        let violations = pbf_1a_unique_vocabulary_violations(&inventory);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("`FragmentLaunchError`")
+                    && violation.contains(expected_diagnostic)
+            }),
+            "the expected owner must not satisfy its ledger with `{declaration}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_nested_owner_declarations() {
+    for declaration in [
+        "mod hidden { pub(crate) struct FragmentLaunchError; }",
+        "fn hidden() { pub(crate) struct FragmentLaunchError; }",
+        "const _: () = { pub(crate) struct FragmentLaunchError; };",
+    ] {
+        let inventory = vec![(
+            "src/runtime/fragment/error.rs".to_string(),
+            declaration.to_string(),
+        )];
+        let violations = pbf_1a_unique_vocabulary_violations(&inventory);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("`FragmentLaunchError`")
+                    && violation.contains("top-level `struct`")
+                    && violation.contains("nested declaration")
+            }),
+            "a nested declaration must not satisfy the expected owner ledger: `{declaration}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn pbf_1a_inventory_reader_fails_closed_on_unreadable_source() {
+    let root = std::env::temp_dir().join(format!(
+        "pbf_1a_inventory_{}_{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let missing = root.join("src/missing.rs");
+    let (sources, violations) = pbf_1a_read_source_inventory(&root, &[missing]);
+    assert!(sources.is_empty());
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("src/missing.rs")
+                && violation.contains("unreadable")),
+        "an unreadable inventory entry must be a violation: {violations:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_source_indirection_detector_is_syn_aware() {
+    let safe = r#"
+fn render() {
+    let path = "safe.rs";
+    let include = "diagnostic text";
+    let _ = (path, include);
+}
+"#;
+    let safe_violations =
+        pbf_1a_source_indirection_violations("src/protocol/common/error.rs", safe);
+    assert!(
+        safe_violations.is_empty(),
+        "ordinary identifiers named path/include must remain valid: {safe_violations:?}"
+    );
+
+    let unrelated_namespace_alias = r#"
+use crate::diagnostics as owner;
+owner::include!("diagnostic-only");
+"#;
+    let unrelated_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        unrelated_namespace_alias,
+    );
+    assert!(
+        unrelated_violations.is_empty(),
+        "an unrelated namespace alias with an include-named macro must not be mistaken for std::include!: {unrelated_violations:?}"
+    );
+
+    let unrelated_grouped_self_alias = r#"
+use crate::diagnostics::{self as owner};
+owner::include!("diagnostic-only");
+"#;
+    let unrelated_grouped_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        unrelated_grouped_self_alias,
+    );
+    assert!(
+        unrelated_grouped_violations.is_empty(),
+        "an unrelated grouped self alias must remain outside std::include! provenance: {unrelated_grouped_violations:?}"
+    );
+
+    let unrelated_macro_name = r#"
+load!("diagnostic-only");
+"#;
+    let unrelated_macro_violations =
+        pbf_1a_source_indirection_violations("src/protocol/common/error.rs", unrelated_macro_name);
+    assert!(
+        unrelated_macro_violations.is_empty(),
+        "an ordinary macro name without ambiguous alias provenance must remain legal: {unrelated_macro_violations:?}"
+    );
+
+    let test_only_declarative_macro = r#"
+#[cfg(test)]
+macro_rules! hide_source {
+    () => {
+        include!("legacy.rs");
+        #[path = "legacy.rs"] mod hidden;
+    };
+}
+"#;
+    let test_only_macro_violations = pbf_1a_source_indirection_violations(
+        "src/protocol/common/error.rs",
+        test_only_declarative_macro,
+    );
+    assert!(
+        test_only_macro_violations.is_empty(),
+        "a cfg(test)-only declarative macro must stay outside the production audit: {test_only_macro_violations:?}"
+    );
+
+    for invalid in [
+        "#[path = \"legacy.rs\"] mod error;",
+        "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
+        "include!(\"legacy.rs\");",
+        "const _: () = { include![\"legacy.rs\"] };",
+        "std::include!(\"legacy.rs\");",
+        "::std::include!(\"legacy.rs\");",
+        "use std::include as load_owner; load_owner!(\"legacy.rs\");",
+        "use std as owner; owner::include!(\"legacy.rs\");",
+        "extern crate std as owner; owner::include!(\"legacy.rs\");",
+        "use r#std as r#owner; r#owner::r#include!(\"legacy.rs\");",
+        "use std as owner; use owner as chained; chained::include!(\"legacy.rs\");",
+        "use std::{self as owner}; owner::include!(\"legacy.rs\");",
+        "use r#std::{self as r#owner}; r#owner::r#include!(\"legacy.rs\");",
+        "use std::{self as owner}; use owner::{self as chained}; chained::include!(\"legacy.rs\");",
+        "mod left { use std::include as load; load!(\"legacy.rs\"); } mod right { use std::format as load; }",
+        "macro_rules! hide_source { () => { include!(\"legacy.rs\"); }; }",
+        "macro_rules! hide_source { () => { #[path = \"legacy.rs\"] mod hidden; }; }",
+    ] {
+        let violations =
+            pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
+        assert!(
+            !violations.is_empty(),
+            "real source indirection must fail: {invalid}"
+        );
+    }
+}
+
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
 mod ebd_1_engine_boundary;
 
