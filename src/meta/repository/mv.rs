@@ -20,7 +20,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::meta::keys::{NS_MV, normalize_lookup_name};
-use crate::meta::repository::mv_contract::{MvPartitionContract, MvSchemaContract};
 use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_payload_for_kind, encode_record_payload, id_scopes,
 };
@@ -28,6 +27,7 @@ use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
     MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
+use crate::mv::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
 const MV_DEFINITION_KIND: &str = "mv.definition";
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";

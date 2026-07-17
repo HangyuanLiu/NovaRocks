@@ -30,7 +30,7 @@ use crate::catalog::schema::ColumnDef;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
 };
-use crate::meta::repository::mv_contract::ApplyKeySource;
+use crate::mv::persistence::schema::ApplyKeySource;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };

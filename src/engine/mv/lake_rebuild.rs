@@ -37,8 +37,8 @@ use crate::meta::repository::mv::{
     CreateMvDefinitionRequest, CreateMvDependencyRequest, MvDependencyObjectRef,
     MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use crate::meta::repository::mv_descriptor::DescriptorDependency;
 use crate::mv::model::MvStorageEngine;
+use crate::mv::persistence::descriptor::DescriptorDependency;
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the definition-create
 /// request `create_iceberg_mv` would have issued, plus the refresh watermark
@@ -300,13 +300,13 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 mod tests {
     use super::*;
     use crate::connector::iceberg::commit::mv_provenance::{ProvenanceBase, RefreshTechnique};
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::descriptor::{DescriptorDependency, MvDescriptorV1};
+    use crate::mv::persistence::schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
-    use crate::meta::repository::mv_descriptor::{DescriptorDependency, MvDescriptorV1};
 
     fn sample_contract() -> MvSchemaContract {
         MvSchemaContract {

@@ -33,7 +33,7 @@ pub mod formats;
 pub mod fs;
 pub mod lower;
 pub mod meta;
-pub(crate) mod mv;
+pub mod mv;
 pub(crate) mod protocol;
 pub mod runtime;
 pub(crate) mod runtime_filter;

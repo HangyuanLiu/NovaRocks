@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, list_tables, load_table};
 use crate::engine::StandaloneState;
-use crate::meta::repository::mv_descriptor::{MV_DESCRIPTOR_PACKAGE_ID_PROP, MvDescriptorV1};
+use crate::mv::persistence::descriptor::{MV_DESCRIPTOR_PACKAGE_ID_PROP, MvDescriptorV1};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DiscoveredIcebergMv {

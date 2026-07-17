@@ -21,7 +21,7 @@
 //! base table's current Iceberg schema, produce the field-id-based
 //! lineage that A11's contract persists.
 
-use crate::meta::repository::mv_contract::{
+use crate::mv::persistence::schema::{
     BaseFieldRecord, ExpressionKind, ExpressionLineage, FilterLineage, JoinContract,
     JoinContractKind, JoinPredicateLineage, OutputColumnLineage, QualifiedFieldLineage,
 };

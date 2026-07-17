@@ -1299,7 +1299,7 @@ fn find_output_column_by_name<'a>(
 }
 
 fn is_unpartitioned_target_contract(
-    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+    schema_contract: &crate::mv::persistence::schema::MvSchemaContract,
 ) -> bool {
     schema_contract
         .target
@@ -1407,10 +1407,10 @@ fn aggregate_state_names(
         }
         let expected_role = match layout_column.state_role {
             crate::mv::model::AggregateStateRole::Single => {
-                crate::meta::repository::mv_contract::AggregateStateRoleContract::Single
+                crate::mv::persistence::schema::AggregateStateRoleContract::Single
             }
             crate::mv::model::AggregateStateRole::RetractionCount => {
-                crate::meta::repository::mv_contract::AggregateStateRoleContract::RetractionCount
+                crate::mv::persistence::schema::AggregateStateRoleContract::RetractionCount
             }
         };
         if contract_column.role != expected_role {
@@ -2224,7 +2224,7 @@ mod tests {
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };

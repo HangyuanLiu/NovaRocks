@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::connector::iceberg::changes::{ChangePartitionFieldValue, ChangePartitionValue};
-use crate::meta::repository::mv_contract::{
+use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+use crate::mv::persistence::schema::{
     ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
 };
-use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
 pub(crate) fn map_file_partition_to_mv_key(
     contract: &MvSchemaContract,
@@ -170,7 +170,7 @@ fn partition_transform_name(transform: &MvPartitionTransformContract) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,

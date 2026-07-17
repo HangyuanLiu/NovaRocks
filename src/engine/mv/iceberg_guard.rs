@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
-use crate::meta::repository::mv_descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
+use crate::mv::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergMvUserMutation {

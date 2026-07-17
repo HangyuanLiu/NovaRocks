@@ -338,7 +338,7 @@ mod tests {
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
         BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,

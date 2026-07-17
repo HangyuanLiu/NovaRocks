@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! IVM-A11 MV schema / field-id contract.
+//! Persisted MV schema / field-id contract.
 //!
 //! Persisted inside `StoredMvDefinition.schema_contract`. Captures base
 //! referenced fields + output lineage + target schema mapping at CREATE
@@ -914,6 +914,8 @@ mod tests {
         let decoded: MvSchemaContract = serde_json::from_str(json).expect("deserialize v1");
         assert!(decoded.bases.is_empty());
         assert!(decoded.join.is_none());
+        assert!(decoded.aggregate.is_none());
+        assert!(decoded.branch.is_none());
         assert!(decoded.target.partition.is_none());
         assert_eq!(decoded.base.alias_at_create, None);
         assert!(
@@ -923,6 +925,21 @@ mod tests {
                 .is_empty()
         );
         decoded.ensure_self_consistent().expect("self check");
+
+        let reencoded = serde_json::to_value(&decoded).expect("re-encode v1 contract");
+        assert_eq!(reencoded["bases"], serde_json::json!([]));
+        assert_eq!(reencoded["join"], serde_json::Value::Null);
+        assert_eq!(reencoded["aggregate"], serde_json::Value::Null);
+        assert_eq!(reencoded["branch"], serde_json::Value::Null);
+        assert_eq!(
+            reencoded["base"]["alias_at_create"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            reencoded["output"]["columns"][0]["expression"]["referenced_base_fields"],
+            serde_json::json!([])
+        );
+        assert_eq!(reencoded["target"]["partition"], serde_json::Value::Null);
     }
 
     #[test]

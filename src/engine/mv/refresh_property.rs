@@ -58,7 +58,7 @@ use crate::engine::mv::refresh_contract::{
     JoinRefreshContract,
 };
 use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
-use crate::meta::repository::mv_contract::{ApplyKeySource, MvSchemaContract};
+use crate::mv::persistence::schema::{ApplyKeySource, MvSchemaContract};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
     SetOpKind, SortItem, TypedExpr,
@@ -2562,7 +2562,7 @@ mod tests {
 
     use crate::engine::mv::apply_key::ApplyKeyValueType;
     use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, ExpressionKind, ExpressionLineage,
         GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,

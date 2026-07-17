@@ -26,7 +26,7 @@
 //! contracts result in fail-fast errors that propagate to the user.
 
 use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
-use crate::meta::repository::mv_contract::{
+use crate::mv::persistence::schema::{
     ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
     JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
 };
@@ -713,7 +713,7 @@ pub(crate) fn ensure_summary_watermark_matches_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv_contract::{
+    use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
