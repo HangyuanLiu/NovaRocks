@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field};
+
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -187,18 +189,93 @@ fn schema_summary(schema: &ChunkSchemaRef) -> String {
             let unique_id = slot
                 .unique_id()
                 .map_or_else(|| "none".to_string(), |id| id.to_string());
+            let metadata = metadata_suffix(slot.field().metadata());
             format!(
-                "slot={},name={},type={:?},nullable={},unique_id={}",
+                "slot={},name={},type={},nullable={},unique_id={}{}",
                 slot.slot_id(),
                 slot.name(),
-                slot.data_type(),
+                data_type_summary(slot.data_type()),
                 slot.nullable(),
-                unique_id
+                unique_id,
+                metadata,
             )
         })
         .collect::<Vec<_>>()
         .join(";");
-    format!("[{slots}]")
+    let schema_metadata = schema.arrow_schema_ref();
+    let schema_metadata = metadata_suffix(schema_metadata.metadata());
+    format!("[{slots}]{schema_metadata}")
+}
+
+fn data_type_summary(data_type: &DataType) -> String {
+    match data_type {
+        DataType::List(field) => format!("List({})", field_summary(field)),
+        DataType::LargeList(field) => format!("LargeList({})", field_summary(field)),
+        DataType::ListView(field) => format!("ListView({})", field_summary(field)),
+        DataType::LargeListView(field) => format!("LargeListView({})", field_summary(field)),
+        DataType::FixedSizeList(field, size) => {
+            format!("FixedSizeList(size={size},{})", field_summary(field))
+        }
+        DataType::Struct(fields) => format!(
+            "Struct([{}])",
+            fields
+                .iter()
+                .map(|field| field_summary(field))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        DataType::Union(fields, mode) => format!(
+            "Union(mode={mode:?},[{}])",
+            fields
+                .iter()
+                .map(|(type_id, field)| format!("type_id={type_id},{}", field_summary(field)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        DataType::Dictionary(key, value) => format!(
+            "Dictionary(key={},value={})",
+            data_type_summary(key),
+            data_type_summary(value)
+        ),
+        DataType::Map(field, sorted) => {
+            format!("Map(sorted={sorted},{})", field_summary(field))
+        }
+        DataType::RunEndEncoded(run_ends, values) => format!(
+            "RunEndEncoded(run_ends={},values={})",
+            field_summary(run_ends),
+            field_summary(values)
+        ),
+        _ => data_type.to_string(),
+    }
+}
+
+fn field_summary(field: &Field) -> String {
+    format!(
+        "field(name={:?},type={},nullable={}{})",
+        field.name(),
+        data_type_summary(field.data_type()),
+        field.is_nullable(),
+        metadata_suffix(field.metadata()),
+    )
+}
+
+fn metadata_suffix(metadata: &std::collections::HashMap<String, String>) -> String {
+    if metadata.is_empty() {
+        String::new()
+    } else {
+        format!(",metadata={}", sorted_metadata(metadata))
+    }
+}
+
+fn sorted_metadata(metadata: &std::collections::HashMap<String, String>) -> String {
+    let entries = metadata
+        .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(key, value)| format!("{key:?}:{value:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{entries}}}")
 }
 
 fn validate_exchange_contracts(
@@ -430,16 +507,14 @@ fn validate_runtime_filter_params(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "compat")]
-    use std::collections::HashMap;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
 
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::error::{
         FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -453,12 +528,17 @@ mod tests {
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
+    use crate::exec::node::filter::FilterNode;
+    use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
     use crate::exec::node::scan::{
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
+    use crate::exec::node::set_op::{SetOpKind, SetOpNode};
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::lower::novarocks::{NodeLoweringContext, lower_proto_node};
+    use crate::proto::{common, plan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::endpoint::RuntimeFilterProberDestination;
     use crate::runtime::exchange::ExchangeKey;
@@ -470,7 +550,8 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::types::native_proto::encode_type;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
 
     use super::*;
 
@@ -535,6 +616,19 @@ mod tests {
             .expect("chunk schema")
     }
 
+    fn schema_with_metadata(
+        slot_id: u32,
+        field: Field,
+        schema_metadata: HashMap<String, String>,
+    ) -> ChunkSchemaRef {
+        let slot = ChunkSlotSchema::from_field(SlotId::new(slot_id), &field, None)
+            .expect("chunk slot schema");
+        Arc::new(
+            ChunkSchema::try_new_with_schema_metadata(vec![slot], schema_metadata)
+                .expect("chunk schema with metadata"),
+        )
+    }
+
     fn exchange_node(node_id: i32, expected_schema: ChunkSchemaRef, finst: UniqueId) -> ExecNode {
         ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
@@ -567,6 +661,101 @@ mod tests {
             uid(3, 4),
             RuntimeEndpoint::new("be-1", 9060).expect("runtime endpoint"),
         )
+    }
+
+    fn native_type(data_type: &DataType) -> common::TypeDesc {
+        encode_type(data_type).expect("native type")
+    }
+
+    fn native_delta_scan_plan(node_id: i32) -> ExecPlan {
+        let output = common::OutputColumn {
+            column_id: 1,
+            name: "id".to_string(),
+            r#type: Some(native_type(&DataType::Int64)),
+            nullable: true,
+            is_internal: false,
+        };
+        let table = plan::IcebergTableInfo {
+            catalog: "rest".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_uuid: None,
+            current_snapshot_id: Some(2),
+            schema_id: 7,
+            location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
+            schema: Some(plan::IcebergSchemaDef {
+                fields: vec![plan::IcebergSchemaFieldDef {
+                    field_id: 10,
+                    name: "id".to_string(),
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                }],
+            }),
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        let node = plan::DistributedNode {
+            node_id,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: vec![output.clone()],
+                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
+                    database: "db".to_string(),
+                    table: Some(plan::TableDef {
+                        name: "t".to_string(),
+                        columns: vec![plan::ColumnDef {
+                            name: "id".to_string(),
+                            data_type: Some(native_type(&DataType::Int64)),
+                            nullable: true,
+                            write_default_json: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: Some(plan::ScanSource {
+                            kind: Some(plan::scan_source::Kind::IcebergDeltaTable(
+                                plan::IcebergDeltaTable {
+                                    table: Some(table),
+                                    from_snapshot_id: 1,
+                                    to_snapshot_id: 2,
+                                    delta_plan: Some(plan::IcebergDeltaScanPlan {
+                                        table_location: "file:///tmp/novarocks-pbf1c-delta"
+                                            .to_string(),
+                                        data_columns: vec![plan::IcebergDeltaDataColumn {
+                                            name: "id".to_string(),
+                                            field_id: 10,
+                                        }],
+                                        cloud_properties: HashMap::new(),
+                                        change_files: Vec::new(),
+                                        delete_side: None,
+                                    }),
+                                },
+                            )),
+                        }),
+                    }),
+                    alias: None,
+                    columns: vec![output],
+                    predicates: Vec::new(),
+                    required_columns: Vec::new(),
+                    dict_columns: Vec::new(),
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                })),
+            })),
+        };
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node(&node, &mut arena, &NodeLoweringContext::default())
+            .expect("lower native Iceberg delta scan");
+        ExecPlan {
+            arena,
+            root: lowered.node,
+        }
     }
 
     fn result_sink() -> FragmentSinkSpec {
@@ -1031,6 +1220,156 @@ mod tests {
         assert_eq!(
             error.detail(),
             "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none], got [slot=1,name=v,type=Int32,nullable=true,unique_id=none]"
+        );
+    }
+
+    #[test]
+    fn reports_field_metadata_only_exchange_schema_mismatch() {
+        let id = FragmentNodeId::new(20);
+        let expected = schema_with_metadata(
+            1,
+            Field::new("v", DataType::Int32, false).with_metadata(HashMap::from([(
+                "contract".to_string(),
+                "expected".to_string(),
+            )])),
+            HashMap::new(),
+        );
+        let actual = schema_with_metadata(
+            1,
+            Field::new("v", DataType::Int32, false).with_metadata(HashMap::from([(
+                "contract".to_string(),
+                "actual".to_string(),
+            )])),
+            HashMap::new(),
+        );
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: exchange_node(20, actual, uid(5, 8)),
+            },
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::from([(id, expected)]),
+            BTreeSet::new(),
+        );
+        let error = assert_error(
+            FragmentSubmission::try_new(
+                program,
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 341),
+                    BTreeMap::new(),
+                    BTreeMap::from([(id, 1)]),
+                    FragmentSinkAssignment::None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::ExchangeNode(20),
+            FragmentBindingErrorKind::SchemaMismatch,
+        );
+        assert_eq!(
+            error.detail(),
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,metadata={\"contract\":\"expected\"}], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,metadata={\"contract\":\"actual\"}]"
+        );
+    }
+
+    #[test]
+    fn reports_nested_type_metadata_in_sorted_exact_detail() {
+        let id = FragmentNodeId::new(20);
+        let nested = |last: &str| {
+            schema_with_metadata(
+                1,
+                Field::new(
+                    "v",
+                    DataType::Struct(Fields::from(vec![Arc::new(
+                        Field::new("item", DataType::Int64, true).with_metadata(HashMap::from([
+                            ("zeta".to_string(), last.to_string()),
+                            ("alpha".to_string(), "first".to_string()),
+                        ])),
+                    )])),
+                    false,
+                ),
+                HashMap::new(),
+            )
+        };
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: exchange_node(20, nested("actual"), uid(5, 8)),
+            },
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::from([(id, nested("expected"))]),
+            BTreeSet::new(),
+        );
+        let error = assert_error(
+            FragmentSubmission::try_new(
+                program,
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 342),
+                    BTreeMap::new(),
+                    BTreeMap::from([(id, 1)]),
+                    FragmentSinkAssignment::None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::ExchangeNode(20),
+            FragmentBindingErrorKind::SchemaMismatch,
+        );
+        assert_eq!(
+            error.detail(),
+            "exchange node 20 expected schema [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"expected\"})]),nullable=false,unique_id=none], got [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"actual\"})]),nullable=false,unique_id=none]"
+        );
+    }
+
+    #[test]
+    fn reports_schema_metadata_only_exchange_schema_mismatch() {
+        let id = FragmentNodeId::new(20);
+        let expected = schema_with_metadata(
+            1,
+            Field::new("v", DataType::Int32, false),
+            HashMap::from([("owner".to_string(), "expected".to_string())]),
+        );
+        let actual = schema_with_metadata(
+            1,
+            Field::new("v", DataType::Int32, false),
+            HashMap::from([("owner".to_string(), "actual".to_string())]),
+        );
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: exchange_node(20, actual, uid(5, 8)),
+            },
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::from([(id, expected)]),
+            BTreeSet::new(),
+        );
+        let error = assert_error(
+            FragmentSubmission::try_new(
+                program,
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 343),
+                    BTreeMap::new(),
+                    BTreeMap::from([(id, 1)]),
+                    FragmentSinkAssignment::None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::ExchangeNode(20),
+            FragmentBindingErrorKind::SchemaMismatch,
+        );
+        assert_eq!(
+            error.detail(),
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none],metadata={\"owner\":\"expected\"}, got [slot=1,name=v,type=Int32,nullable=false,unique_id=none],metadata={\"owner\":\"actual\"}"
         );
     }
 
@@ -1524,6 +1863,137 @@ mod tests {
             FragmentBindingTarget::ScanNode(10),
             FragmentBindingErrorKind::MissingAssignment,
         );
+    }
+
+    #[test]
+    fn regular_unary_wrapper_is_traversed() {
+        let id = FragmentNodeId::new(10);
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Filter(FilterNode {
+                        input: Box::new(scan_node(Some(10))),
+                        node_id: 30,
+                        predicate: crate::exec::expr::ExprId(0),
+                    }),
+                },
+            },
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 63),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        FragmentSubmission::try_new(program, instance).expect("filter child scan");
+    }
+
+    #[test]
+    fn binary_right_child_is_traversed() {
+        let id = FragmentNodeId::new(10);
+        let empty_schema = Arc::new(ChunkSchema::empty());
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Join(JoinNode {
+                        left: Box::new(values_plan(7).root),
+                        right: Box::new(scan_node(Some(10))),
+                        node_id: 30,
+                        join_type: JoinType::Inner,
+                        distribution_mode: JoinDistributionMode::Partitioned,
+                        left_chunk_schema: Arc::clone(&empty_schema),
+                        right_chunk_schema: Arc::clone(&empty_schema),
+                        join_scope_chunk_schema: empty_schema,
+                        probe_keys: Vec::new(),
+                        build_keys: Vec::new(),
+                        eq_null_safe: Vec::new(),
+                        residual_predicate: None,
+                        runtime_filters: Vec::new(),
+                    }),
+                },
+            },
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 64),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        FragmentSubmission::try_new(program, instance).expect("join right child scan");
+    }
+
+    #[test]
+    fn set_op_children_are_traversed() {
+        let id = FragmentNodeId::new(10);
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::SetOp(SetOpNode {
+                        kind: SetOpKind::Intersect,
+                        inputs: vec![values_plan(7).root, scan_node(Some(10))],
+                        node_id: 30,
+                        output_chunk_schema: Arc::new(ChunkSchema::empty()),
+                    }),
+                },
+            },
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 65),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        FragmentSubmission::try_new(program, instance).expect("set op child scan");
+    }
+
+    #[test]
+    fn iceberg_delta_scan_required_identity_is_collected() {
+        let id = FragmentNodeId::new(44);
+        let program = program_with(
+            native_delta_scan_plan(44),
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 66),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        FragmentSubmission::try_new(program, instance).expect("Iceberg delta scan identity");
     }
 
     #[cfg(feature = "compat")]
