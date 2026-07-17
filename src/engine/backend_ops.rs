@@ -24,7 +24,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::app_config::ClusterRole;
-use crate::coordinator::cluster::{BackendRegistry, BackendState, BeId, HeartbeatOutcome};
+use crate::coordinator::cluster::{
+    BackendRegistry, BackendState, BeId, HeartbeatOutcome, run_heartbeat_round,
+};
+#[cfg(not(test))]
+use crate::coordinator::cluster::{QueryCleanupSink, spawn_heartbeat_manager};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
@@ -72,10 +76,11 @@ pub(crate) fn ensure_backend_registry(
     let installed = crate::coordinator::cluster::install_backend_registry(Arc::clone(&registry));
     #[cfg(not(test))]
     if installed {
-        crate::runtime::heartbeat_mgr::spawn(
+        spawn_heartbeat_manager(
             Arc::clone(&registry),
             Duration::from_millis(cfg.cluster.heartbeat_interval_ms),
-            Arc::new(crate::runtime::registry_cleanup::QueryCleanupSink::new()),
+            crate::service::cluster_heartbeat::grpc_heartbeat,
+            Arc::new(QueryCleanupSink::new()),
         );
     }
     #[cfg(test)]
@@ -103,7 +108,7 @@ pub(crate) fn wait_for_configured_backends_live(
         &configured,
         Duration::from_secs(5),
         Duration::from_millis(cfg.cluster.heartbeat_interval_ms.max(10).min(200)),
-        crate::runtime::heartbeat_mgr::grpc_heartbeat,
+        crate::service::cluster_heartbeat::grpc_heartbeat,
     )
 }
 
@@ -123,7 +128,7 @@ where
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        crate::runtime::heartbeat_mgr::run_one_round(registry, &send);
+        run_heartbeat_round(registry, &send);
         if configured_backend_live(registry, configured) {
             return Ok(());
         }

@@ -28988,9 +28988,11 @@ fn coor_2_final_control_plane_ownership_is_non_vacuous() {
                 assert!(
                     matches!(
                         relative.as_str(),
-                        "src/coordinator/execution.rs" | "src/coordinator/report.rs"
+                        "src/coordinator/execution.rs"
+                            | "src/coordinator/report.rs"
+                            | "src/coordinator/cluster/query_cleanup.rs"
                     ),
-                    "{relative} references the sibling write owner outside execution/report"
+                    "{relative} references the sibling write owner outside execution/report/backend cleanup"
                 );
             }
         }
@@ -46396,6 +46398,9 @@ fn rfd4_m2b2_live_runtime_filter_root_freezes_owner_child_declarations() {
 }
 #[path = "architecture_guard/ebd_5b1_cluster_membership_owner.rs"]
 mod ebd_5b1_cluster_membership_owner;
+
+#[path = "architecture_guard/ebd_5b2_cluster_heartbeat_lifecycle.rs"]
+mod ebd_5b2_cluster_heartbeat_lifecycle;
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
 mod ebd_1_engine_boundary;

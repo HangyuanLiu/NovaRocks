@@ -1485,6 +1485,19 @@ pub(crate) fn submit_and_fetch_loop(
         root_finst_id,
     )?;
 
+    // Register every validated placement before the first remote submission.
+    // Otherwise a backend-loss event between submit success and registration
+    // can miss the query permanently because the registry emits only the state
+    // transition event. QueryStateRegistrationGuard removes these provisional
+    // mappings on every return path, including partial submit failure.
+    for ((backend_idx, _), finst_id) in submissions.iter().zip(&validated_finst_ids) {
+        crate::runtime::query_state::in_flight_table().register(
+            runtime_query_id,
+            finst_id.clone(),
+            *backend_idx,
+        );
+    }
+
     for ((backend_idx, submission), finst_id) in submissions.into_iter().zip(validated_finst_ids) {
         if let Err(e) = dispatcher.submit_fragment(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
@@ -1495,14 +1508,15 @@ pub(crate) fn submit_and_fetch_loop(
             registry.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
         }
         tracker.record_submitted(backend_idx, finst_id.clone());
-        crate::runtime::query_state::in_flight_table().register(
-            crate::runtime::query_context::QueryId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            },
-            finst_id,
-            backend_idx,
-        );
+        if crate::runtime::query_state::in_flight_table().state(runtime_query_id)
+            == Some(QueryState::Failed)
+        {
+            let reason = crate::runtime::query_state::in_flight_table()
+                .failure_reason(runtime_query_id)
+                .unwrap_or_else(|| format!("query {} failed", runtime_query_id));
+            tracker.cancel_all(dispatcher.as_ref());
+            return Err(reason);
+        }
     }
 
     let mut chunks = Vec::new();
@@ -2080,6 +2094,7 @@ mod native_contract_tests {
         submissions: Mutex<Vec<(usize, FragmentId, UniqueId)>>,
         submit_count: AtomicUsize,
         fail_on_submit: Option<usize>,
+        backend_loss_on_submit: Option<(usize, crate::coordinator::cluster::BeId)>,
         cancellations: Mutex<Vec<(usize, Vec<UniqueId>)>>,
         fetch_behavior: TestFetchBehavior,
         fetch_count: AtomicUsize,
@@ -2099,6 +2114,22 @@ mod native_contract_tests {
             Self::with_fetch(fail_on_submit, TestFetchBehavior::Eof)
         }
 
+        fn with_backend_loss_on_submit(
+            call: usize,
+            be_id: crate::coordinator::cluster::BeId,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                submissions: Mutex::new(Vec::new()),
+                submit_count: AtomicUsize::new(0),
+                fail_on_submit: None,
+                backend_loss_on_submit: Some((call, be_id)),
+                cancellations: Mutex::new(Vec::new()),
+                fetch_behavior: TestFetchBehavior::Eof,
+                fetch_count: AtomicUsize::new(0),
+                first_fetch: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+
         fn with_fetch(
             fail_on_submit: Option<usize>,
             fetch_behavior: TestFetchBehavior,
@@ -2107,6 +2138,7 @@ mod native_contract_tests {
                 submissions: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
                 fail_on_submit,
+                backend_loss_on_submit: None,
                 cancellations: Mutex::new(Vec::new()),
                 fetch_behavior,
                 fetch_count: AtomicUsize::new(0),
@@ -2124,6 +2156,14 @@ mod native_contract_tests {
             let call = self.submit_count.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_on_submit == Some(call) {
                 return Err(format!("native submit failed on call {call}"));
+            }
+            if let Some((failure_call, be_id)) = self.backend_loss_on_submit
+                && failure_call == call
+            {
+                crate::coordinator::cluster::RegistryEventSink::on_event(
+                    &crate::coordinator::cluster::QueryCleanupSink::new(),
+                    crate::coordinator::cluster::RegistryEvent::BackendLost { be_id },
+                );
             }
             let finst_id = submission.fragment_instance_id()?;
             self.submissions.lock().unwrap().push((
@@ -2475,6 +2515,56 @@ mod native_contract_tests {
             vec![(1, vec![UniqueId { hi: 92_000, lo: 1 }])]
         );
         assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn backend_loss_during_submit_observes_preregistered_query_mapping() {
+        let inner = CapturingDispatcher::with_backend_loss_on_submit(1, 1);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = UniqueId {
+            hi: 93_000,
+            lo: 93_001,
+        };
+        let first_finst_id = UniqueId { hi: 93_000, lo: 1 };
+        let root_finst_id = UniqueId { hi: 93_000, lo: 2 };
+        let runtime_query_id = crate::runtime::query_context::QueryId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        };
+        let mut tracker = InFlightTracker::default();
+
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            vec![
+                (1, submission(3, query_id, first_finst_id.clone())),
+                (0, submission(7, query_id, root_finst_id)),
+            ],
+            7,
+            0,
+            UniqueId { hi: 93_000, lo: 2 },
+            &query_id,
+            true,
+            1_000,
+            None,
+            None,
+            false,
+            &CountingCoordinatorObserver::default(),
+        )
+        .expect_err("backend loss during submit must fail the mapped query");
+
+        assert_eq!(err, "backend 1 lost");
+        assert_eq!(inner.submit_count.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.fetch_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *inner.cancellations.lock().unwrap(),
+            vec![(1, vec![first_finst_id])]
+        );
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(runtime_query_id),
+            None,
+            "query registration guard must remove provisional mappings"
+        );
     }
 
     #[test]
