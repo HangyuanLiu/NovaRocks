@@ -1705,6 +1705,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "sha2",
  "toml",
 ]
 

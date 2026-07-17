@@ -17,6 +17,7 @@
 
 mod benchmark_bootstrap;
 mod cluster;
+mod compat_artifact;
 mod config;
 mod fault_injection;
 mod imv_stateless;
