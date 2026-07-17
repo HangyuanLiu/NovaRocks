@@ -5289,33 +5289,36 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 mod tests {
     use super::super::analyze;
     use crate::sql::analysis::QueryBody;
-    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::catalog::PlannerTableProvider;
     use arrow::datatypes::DataType;
 
     struct EmptyCatalog;
 
-    impl CatalogProvider for EmptyCatalog {
-        fn get_table(
+    impl PlannerTableProvider for EmptyCatalog {
+        fn resolve_table_for_analysis(
             &self,
+            catalog: Option<&str>,
             _database: &str,
             table: &str,
-        ) -> Result<crate::sql::planner::table::TableDef, String> {
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let _ = catalog;
             Err(format!("table not found: {table}"))
         }
     }
 
     struct BigintOffsetCatalog;
 
-    impl CatalogProvider for BigintOffsetCatalog {
-        fn get_table(
+    impl PlannerTableProvider for BigintOffsetCatalog {
+        fn resolve_table_for_analysis(
             &self,
-            _database: &str,
+            catalog: Option<&str>,
+            database: &str,
             table: &str,
-        ) -> Result<crate::sql::planner::table::TableDef, String> {
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
             if table != "offsets" {
                 return Err(format!("table not found: {table}"));
             }
-            Ok(crate::sql::planner::table::TableDef {
+            let planner = crate::sql::planner::table::TableDef {
                 name: table.to_string(),
                 columns: vec![crate::catalog::schema::ColumnDef {
                     name: "offset".to_string(),
@@ -5329,7 +5332,10 @@ mod tests {
                     db_id: 0,
                     table_id: 0,
                 },
-            })
+            };
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 

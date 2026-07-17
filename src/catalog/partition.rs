@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod identifier;
-pub(crate) mod partition;
-pub(crate) mod provider;
-pub(crate) mod schema;
-pub(crate) mod table;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyRangePartition {
+    pub(crate) name: String,
+    pub(crate) column: String,
+    pub(crate) lower_sql: String,
+    pub(crate) upper_sql: String,
+}

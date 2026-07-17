@@ -1257,7 +1257,6 @@ const STANDALONE_STATE_DEPENDENCIES: &[(&str, &[&str])] = &[
 ];
 
 const FORWARDING_REEXPORTS: &[&str] = &[
-    "src/engine/catalog.rs|crate::engine::catalog|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryOwner|crate::sql::common::dictionary::DictionaryOwner",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionarySnapshot|crate::sql::common::dictionary::DictionarySnapshot",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryState|crate::sql::common::dictionary::DictionaryState",
@@ -1265,7 +1264,6 @@ const FORWARDING_REEXPORTS: &[&str] = &[
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|DictionaryWatermark|crate::sql::common::dictionary::DictionaryWatermark",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|QueryDictionarySelection|crate::sql::common::dictionary::QueryDictionarySelection",
     "src/engine/dictionary/model.rs|crate::engine::dictionary::model|pub(crate)|StarRocksTabletWatermark|crate::sql::common::dictionary::StarRocksTabletWatermark",
-    "src/engine/mod.rs|crate::engine|pub|CatalogProvider|crate::sql::catalog::CatalogProvider",
 ];
 
 const CURRENT_ENGINE_BOUNDARY_BASELINE: EngineBoundaryBaseline = EngineBoundaryBaseline {
@@ -6970,7 +6968,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 9];
+    let expected_counts = [88, 86, 217, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7872,7 +7870,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 9];
+    let expected_counts = [88, 86, 217, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8794,7 +8792,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [88, 86, 217, 58, 9];
+    let expected_counts = [88, 86, 217, 58, 7];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8897,6 +8895,7 @@ fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
     #[derive(Default)]
     struct OrdinaryLookupVisitor {
         schema_only_dispatches: usize,
+        neutral_resolution_dispatches: usize,
         other_dispatches: usize,
         full_load_calls: usize,
     }
@@ -8933,6 +8932,9 @@ fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
                         self.other_dispatches += 1;
                     }
                 }
+                "resolve_table_for_analysis_once" => {
+                    self.neutral_resolution_dispatches += 1;
+                }
                 _ => {}
             }
             syn::visit::visit_expr_method_call(self, item);
@@ -8941,9 +8943,45 @@ fn ebd_4b3b_ordinary_lookup_is_schema_only(block: &syn::Block) -> bool {
 
     let mut visitor = OrdinaryLookupVisitor::default();
     syn::visit::Visit::visit_block(&mut visitor, block);
-    visitor.schema_only_dispatches == 1
+    (visitor.schema_only_dispatches == 1 && visitor.neutral_resolution_dispatches == 0
+        || visitor.schema_only_dispatches == 0 && visitor.neutral_resolution_dispatches == 1)
         && visitor.other_dispatches == 0
         && visitor.full_load_calls == 0
+}
+
+fn ebd_4b3b_resolution_helper_is_metadata_only(block: &syn::Block) -> bool {
+    #[derive(Default)]
+    struct ResolutionVisitor {
+        resolve_calls: usize,
+        catalog_table_calls: usize,
+        planner_table_calls: usize,
+        forbidden_calls: usize,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ResolutionVisitor {
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            match item.method.to_string().as_str() {
+                "resolve" => self.resolve_calls += 1,
+                "to_catalog_table" => self.catalog_table_calls += 1,
+                "to_table_def" => self.planner_table_calls += 1,
+                "load_table_for_read"
+                | "build_table_def"
+                | "build_schema_table_def"
+                | "build_metadata_rows_table_def"
+                | "catalog_backend"
+                | "table_source" => self.forbidden_calls += 1,
+                _ => {}
+            }
+            syn::visit::visit_expr_method_call(self, item);
+        }
+    }
+
+    let mut visitor = ResolutionVisitor::default();
+    syn::visit::Visit::visit_block(&mut visitor, block);
+    visitor.resolve_calls == 1
+        && visitor.catalog_table_calls == 1
+        && visitor.planner_table_calls == 1
+        && visitor.forbidden_calls == 0
 }
 
 fn ebd_4b3b_schema_only_helper_is_metadata_only(block: &syn::Block) -> bool {
@@ -9051,7 +9089,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
 
         struct BoundaryVisitor<'a> {
             path: &'a str,
-            in_provider_impl: bool,
+            in_planner_provider_impl: bool,
             violations: &'a mut BTreeSet<String>,
         }
 
@@ -9079,17 +9117,22 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
             }
 
             fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-                let was_in_provider_impl = self.in_provider_impl;
-                self.in_provider_impl = self.path == EBD_4B3B_PROVIDER
+                let was_in_planner_provider_impl = self.in_planner_provider_impl;
+                self.in_planner_provider_impl = self.path == EBD_4B3B_PROVIDER
                     && matches!(
                         item.self_ty.as_ref(),
                         syn::Type::Path(path)
                             if path.path.segments.last().is_some_and(|segment| {
                                 segment.ident == "CatalogMgrProvider"
                             })
-                    );
+                    )
+                    && item
+                        .trait_
+                        .as_ref()
+                        .and_then(|(_, path, _)| path.segments.last())
+                        .is_some_and(|segment| segment.ident == "PlannerTableProvider");
                 syn::visit::visit_item_impl(self, item);
-                self.in_provider_impl = was_in_provider_impl;
+                self.in_planner_provider_impl = was_in_planner_provider_impl;
             }
 
             fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
@@ -9108,7 +9151,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
                         self.path
                     ));
                 }
-                if self.in_provider_impl
+                if self.in_planner_provider_impl
                     && matches!(
                         item.sig.ident.to_string().as_str(),
                         "get_table" | "get_table_in_catalog"
@@ -9120,12 +9163,21 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
                         self.path, item.sig.ident
                     ));
                 }
-                if self.in_provider_impl
+                if self.path == EBD_4B3B_PROVIDER
                     && item.sig.ident == "iceberg_table_def"
                     && !ebd_4b3b_schema_only_helper_is_metadata_only(&item.block)
                 {
                     self.violations.insert(format!(
                         "catalog-statistics-schema-only-helper-shape: {}|{}",
+                        self.path, item.sig.ident
+                    ));
+                }
+                if self.path == EBD_4B3B_PROVIDER
+                    && item.sig.ident == "resolve_table_for_analysis_once"
+                    && !ebd_4b3b_resolution_helper_is_metadata_only(&item.block)
+                {
+                    self.violations.insert(format!(
+                        "catalog-statistics-neutral-resolution-helper-shape: {}|{}",
                         self.path, item.sig.ident
                     ));
                 }
@@ -9184,7 +9236,7 @@ fn ebd_4b3b_audit_statistics_lookup_decoupling(sources: &[GuardSource]) -> BTree
 
         let mut visitor = BoundaryVisitor {
             path: &source.path,
-            in_provider_impl: false,
+            in_planner_provider_impl: false,
             violations: &mut violations,
         };
         syn::visit::Visit::visit_file(&mut visitor, &file);
@@ -9203,7 +9255,7 @@ fn ebd_4b3b_detector_rejects_statistics_lookup_rewiring() {
             EBD_4B3B_PROVIDER,
             r#"
 struct CatalogMgrProvider { default_mode: TableLookupMode }
-impl CatalogMgrProvider {
+impl PlannerTableProvider for CatalogMgrProvider {
     fn new(default_mode: TableLookupMode) -> Self { todo!() }
     fn iceberg_table_def(&self, mode: &TableLookupMode) {
         match mode {
@@ -12880,6 +12932,713 @@ fn ebd_4b3f_starrocks_scan_adapter_owner_is_complete() {
         "EBD-4B3F StarRocks scan adapter owner cutover failed:\n{}",
         violations.into_iter().collect::<Vec<_>>().join("\n")
     );
+}
+
+const EBD_4B3D_TABLE_OWNER: &str = "src/catalog/table.rs";
+const EBD_4B3D_PROVIDER_OWNER: &str = "src/catalog/provider.rs";
+const EBD_4B3D_PARTITION_OWNER: &str = "src/catalog/partition.rs";
+const EBD_4B3D_PLANNER_EXTENSION_OWNER: &str = "src/sql/catalog.rs";
+const EBD_4B3D_ANALYZER_ENTRY: &str = "src/sql/analyzer/resolve_from.rs";
+const EBD_4B3D_ENGINE_PROVIDER: &str = "src/engine/catalog_mgr/provider.rs";
+
+fn ebd_4b3d_named_item_count(source: &str, kind: &str, name: &str) -> usize {
+    let Ok(file) = syn::parse_file(source) else {
+        return 0;
+    };
+
+    struct Visitor<'a> {
+        kind: &'a str,
+        name: &'a str,
+        count: usize,
+    }
+
+    impl syn::visit::Visit<'_> for Visitor<'_> {
+        fn visit_item_struct(&mut self, item: &syn::ItemStruct) {
+            if self.kind == "struct" && item.ident == self.name {
+                self.count += 1;
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_trait(&mut self, item: &syn::ItemTrait) {
+            if self.kind == "trait" && item.ident == self.name {
+                self.count += 1;
+            }
+            syn::visit::visit_item_trait(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &syn::ItemType) {
+            if self.kind == "type" && item.ident == self.name {
+                self.count += 1;
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    let mut visitor = Visitor {
+        kind,
+        name,
+        count: 0,
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.count
+}
+
+fn ebd_4b3d_neutral_provider_connector_calls(source: &str) -> BTreeSet<String> {
+    fn attrs_are_test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attribute| {
+            if attribute.path().is_ident("test") {
+                return true;
+            }
+            let syn::Meta::List(list) = &attribute.meta else {
+                return false;
+            };
+            list.path.is_ident("cfg")
+                && cfg_attribute_requires_test(&format!("#[cfg({})]", list.tokens))
+        })
+    }
+
+    #[derive(Default)]
+    struct FunctionCalls {
+        local: BTreeSet<String>,
+        forbidden: BTreeSet<String>,
+    }
+
+    struct CallVisitor {
+        calls: FunctionCalls,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CallVisitor {
+        fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = item.func.as_ref()
+                && let Some(segment) = path.path.segments.last()
+            {
+                self.calls.local.insert(segment.ident.to_string());
+            }
+            syn::visit::visit_expr_call(self, item);
+        }
+
+        fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
+            let method = item.method.to_string();
+            if matches!(
+                method.as_str(),
+                "catalog_backend"
+                    | "table_source"
+                    | "load_table"
+                    | "load_table_for_read"
+                    | "build_table_def"
+                    | "build_schema_table_def"
+                    | "build_metadata_rows_table_def"
+            ) {
+                self.calls.forbidden.insert(method.clone());
+            }
+            if matches!(item.receiver.as_ref(), syn::Expr::Path(path) if path.path.is_ident("self"))
+            {
+                self.calls.local.insert(method);
+            }
+            syn::visit::visit_expr_method_call(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::from(["<parse-failed>".to_string()]);
+    };
+
+    struct FunctionCollector {
+        functions: BTreeMap<String, Vec<FunctionCalls>>,
+        roots: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FunctionCollector {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let mut visitor = CallVisitor {
+                calls: FunctionCalls::default(),
+            };
+            syn::visit::Visit::visit_block(&mut visitor, &item.block);
+            self.functions
+                .entry(item.sig.ident.to_string())
+                .or_default()
+                .push(visitor.calls);
+            syn::visit::visit_item_fn(self, item);
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if attrs_are_test_only(&item.attrs) {
+                return;
+            }
+            let catalog_provider_impl = item
+                .trait_
+                .as_ref()
+                .and_then(|(_, path, _)| path.segments.last())
+                .is_some_and(|segment| segment.ident == "CatalogProvider");
+            for impl_item in &item.items {
+                let syn::ImplItem::Fn(function) = impl_item else {
+                    continue;
+                };
+                if attrs_are_test_only(&function.attrs) {
+                    continue;
+                }
+                let name = function.sig.ident.to_string();
+                let mut visitor = CallVisitor {
+                    calls: FunctionCalls::default(),
+                };
+                syn::visit::Visit::visit_block(&mut visitor, &function.block);
+                self.functions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(visitor.calls);
+                if catalog_provider_impl {
+                    self.roots.insert(name);
+                }
+            }
+            syn::visit::visit_item_impl(self, item);
+        }
+    }
+
+    let mut collector = FunctionCollector {
+        functions: BTreeMap::new(),
+        roots: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut collector, &file);
+
+    let mut reachable = collector.roots.clone();
+    let mut pending = collector.roots.into_iter().collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        let Some(nodes) = collector.functions.get(&function) else {
+            continue;
+        };
+        for calls in nodes {
+            for callee in &calls.local {
+                if collector.functions.contains_key(callee) && reachable.insert(callee.clone()) {
+                    pending.push(callee.clone());
+                }
+            }
+        }
+    }
+
+    reachable
+        .into_iter()
+        .filter_map(|function| collector.functions.get(&function))
+        .flatten()
+        .flat_map(|calls| calls.forbidden.iter().cloned())
+        .collect()
+}
+
+fn ebd_4b3d_public_reexports(source: &str) -> BTreeSet<String> {
+    fn visit_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, reexports: &mut BTreeSet<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                visit_tree(&path.tree, prefix, reexports);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let symbol = name.ident.to_string();
+                if matches!(
+                    symbol.as_str(),
+                    "CatalogTable" | "CatalogProvider" | "LegacyRangePartition"
+                ) {
+                    reexports.insert(symbol);
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                for symbol in [rename.ident.to_string(), rename.rename.to_string()] {
+                    if matches!(
+                        symbol.as_str(),
+                        "CatalogTable" | "CatalogProvider" | "LegacyRangePartition"
+                    ) {
+                        reexports.insert(symbol);
+                    }
+                }
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    visit_tree(item, prefix, reexports);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                let path = prefix.join("::");
+                if path.ends_with("catalog::table") {
+                    reexports.insert("CatalogTable".to_string());
+                } else if path.ends_with("catalog::provider") {
+                    reexports.insert("CatalogProvider".to_string());
+                } else if path.ends_with("catalog::partition") {
+                    reexports.insert("LegacyRangePartition".to_string());
+                }
+            }
+        }
+    }
+
+    struct Visitor {
+        reexports: BTreeSet<String>,
+    }
+
+    impl syn::visit::Visit<'_> for Visitor {
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            if !matches!(item.vis, syn::Visibility::Inherited) {
+                visit_tree(&item.tree, &mut Vec::new(), &mut self.reexports);
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::from(["<parse-failed>".to_string()]);
+    };
+    let mut visitor = Visitor {
+        reexports: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.reexports
+}
+
+fn ebd_4b3d_macro_secondary_owners(source: &str) -> BTreeSet<String> {
+    struct Visitor {
+        owners: BTreeSet<String>,
+    }
+
+    impl syn::visit::Visit<'_> for Visitor {
+        fn visit_item_macro(&mut self, item: &syn::ItemMacro) {
+            let tokens = item.mac.tokens.to_string();
+            for (kind, symbol) in [
+                ("struct", "CatalogTable"),
+                ("type", "CatalogTable"),
+                ("trait", "CatalogProvider"),
+                ("type", "CatalogProvider"),
+                ("struct", "LegacyRangePartition"),
+                ("type", "LegacyRangePartition"),
+            ] {
+                if tokens.contains(&format!("{kind} {symbol}")) {
+                    self.owners.insert(symbol.to_string());
+                }
+            }
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    let Ok(file) = syn::parse_file(source) else {
+        return BTreeSet::from(["<parse-failed>".to_string()]);
+    };
+    let mut visitor = Visitor {
+        owners: BTreeSet::new(),
+    };
+    syn::visit::Visit::visit_file(&mut visitor, &file);
+    visitor.owners
+}
+
+fn ebd_4b3d_completion_violations(sources: &[GuardSource]) -> BTreeSet<String> {
+    let sources = sources
+        .iter()
+        .filter(|source| source.path != "tests/architecture_guard/ebd_1_engine_boundary.rs")
+        .map(|source| (source.path.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let mut violations = BTreeSet::new();
+
+    for (path, kind, symbol) in [
+        (EBD_4B3D_TABLE_OWNER, "struct", "CatalogTable"),
+        (EBD_4B3D_PROVIDER_OWNER, "trait", "CatalogProvider"),
+        (EBD_4B3D_PARTITION_OWNER, "struct", "LegacyRangePartition"),
+        (
+            EBD_4B3D_PLANNER_EXTENSION_OWNER,
+            "struct",
+            "ResolvedAnalyzerTable",
+        ),
+        (
+            EBD_4B3D_PLANNER_EXTENSION_OWNER,
+            "trait",
+            "PlannerTableProvider",
+        ),
+        (
+            EBD_4B3D_PLANNER_EXTENSION_OWNER,
+            "trait",
+            "IcebergMetadataTableProvider",
+        ),
+    ] {
+        let count = sources
+            .get(path)
+            .map(|source| ebd_4b3d_named_item_count(&source.text, kind, symbol))
+            .unwrap_or_default();
+        if count != 1 {
+            violations.insert(format!(
+                "neutral-table-owner-count: {path}|{kind}|{symbol}|expected=1 actual={count}"
+            ));
+        }
+    }
+
+    for path in [EBD_4B3D_TABLE_OWNER, EBD_4B3D_PROVIDER_OWNER] {
+        let Some(source) = sources.get(path) else {
+            continue;
+        };
+        let production = rust_sanitized_production_text(&source.text);
+        for forbidden in ["TableDef", "ScanSource", "Iceberg"] {
+            if production.contains(forbidden) {
+                violations.insert(format!(
+                    "neutral-table-owner-dependency: {path}|{forbidden}"
+                ));
+            }
+        }
+        for dependency in rust_production_canonical_paths(&source.text, path) {
+            if dependency.starts_with(&["crate".to_string(), "sql".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "engine".to_string()])
+                || dependency.starts_with(&["crate".to_string(), "connector".to_string()])
+            {
+                violations.insert(format!(
+                    "neutral-table-owner-dependency: {path}|{}",
+                    dependency.join("::")
+                ));
+            }
+        }
+    }
+
+    for source in sources.values() {
+        let production = rust_sanitized_production_text(&source.text);
+        for retired in ["TableLookupMode", "get_table_with_mode"] {
+            if production.contains(retired) {
+                violations.insert(format!(
+                    "neutral-table-retired-surface: {}|{retired}",
+                    source.path
+                ));
+            }
+        }
+        let legacy_count =
+            ebd_4b3d_named_item_count(&source.text, "struct", "LegacyRangePartition");
+        let legacy_alias_count =
+            ebd_4b3d_named_item_count(&source.text, "type", "LegacyRangePartition");
+        if source.path != EBD_4B3D_PARTITION_OWNER && (legacy_count != 0 || legacy_alias_count != 0)
+        {
+            violations.insert(format!(
+                "neutral-table-partition-secondary-owner: {}|count={}",
+                source.path,
+                legacy_count + legacy_alias_count
+            ));
+        }
+        let catalog_provider_count =
+            ebd_4b3d_named_item_count(&source.text, "trait", "CatalogProvider");
+        let catalog_provider_alias_count =
+            ebd_4b3d_named_item_count(&source.text, "type", "CatalogProvider");
+        if source.path != EBD_4B3D_PROVIDER_OWNER
+            && (catalog_provider_count != 0 || catalog_provider_alias_count != 0)
+        {
+            violations.insert(format!(
+                "neutral-table-provider-secondary-owner: {}|count={}",
+                source.path,
+                catalog_provider_count + catalog_provider_alias_count
+            ));
+        }
+        let catalog_table_count = ebd_4b3d_named_item_count(&source.text, "struct", "CatalogTable");
+        let catalog_table_alias_count =
+            ebd_4b3d_named_item_count(&source.text, "type", "CatalogTable");
+        if source.path != EBD_4B3D_TABLE_OWNER
+            && (catalog_table_count != 0 || catalog_table_alias_count != 0)
+        {
+            violations.insert(format!(
+                "neutral-table-model-secondary-owner: {}|count={}",
+                source.path,
+                catalog_table_count + catalog_table_alias_count
+            ));
+        }
+        for symbol in ebd_4b3d_macro_secondary_owners(&source.text) {
+            let canonical_owner = match symbol.as_str() {
+                "CatalogTable" => EBD_4B3D_TABLE_OWNER,
+                "CatalogProvider" => EBD_4B3D_PROVIDER_OWNER,
+                "LegacyRangePartition" => EBD_4B3D_PARTITION_OWNER,
+                _ => continue,
+            };
+            if source.path != canonical_owner {
+                violations.insert(format!(
+                    "neutral-table-macro-secondary-owner: {}|{symbol}",
+                    source.path
+                ));
+            }
+        }
+        for symbol in ebd_4b3d_public_reexports(&source.text) {
+            violations.insert(format!(
+                "neutral-table-public-reexport: {}|{symbol}",
+                source.path
+            ));
+        }
+    }
+
+    let planner_extension = sources
+        .get(EBD_4B3D_PLANNER_EXTENSION_OWNER)
+        .map(|source| rust_sanitized_production_text(&source.text))
+        .unwrap_or_default();
+    for required in [
+        "CatalogTable",
+        "resolve_table_for_analysis",
+        "get_iceberg_metadata_table",
+    ] {
+        if !planner_extension.contains(required) {
+            violations.insert(format!(
+                "neutral-table-planner-extension-missing: {EBD_4B3D_PLANNER_EXTENSION_OWNER}|{required}"
+            ));
+        }
+    }
+    if let Some(source) = sources.get(EBD_4B3D_PLANNER_EXTENSION_OWNER) {
+        let mut planner_methods = BTreeSet::new();
+        if let Ok(file) = syn::parse_file(&source.text) {
+            struct Visitor<'a> {
+                methods: &'a mut BTreeSet<String>,
+            }
+            impl syn::visit::Visit<'_> for Visitor<'_> {
+                fn visit_item_trait(&mut self, item: &syn::ItemTrait) {
+                    if item.ident == "PlannerTableProvider" {
+                        self.methods.extend(item.items.iter().filter_map(|item| {
+                            let syn::TraitItem::Fn(function) = item else {
+                                return None;
+                            };
+                            Some(function.sig.ident.to_string())
+                        }));
+                    }
+                    syn::visit::visit_item_trait(self, item);
+                }
+            }
+            syn::visit::Visit::visit_file(
+                &mut Visitor {
+                    methods: &mut planner_methods,
+                },
+                &file,
+            );
+        }
+        let allowed = BTreeSet::from([
+            "resolve_table_for_analysis".to_string(),
+            "iceberg_metadata_provider".to_string(),
+        ]);
+        for method in planner_methods.difference(&allowed) {
+            violations.insert(format!(
+                "neutral-table-planner-extra-entry: {EBD_4B3D_PLANNER_EXTENSION_OWNER}|{method}"
+            ));
+        }
+    }
+
+    let analyzer = sources
+        .get(EBD_4B3D_ANALYZER_ENTRY)
+        .map(|source| rust_sanitized_production_text(&source.text))
+        .unwrap_or_default();
+    for required in ["resolve_table_for_analysis", "get_iceberg_metadata_table"] {
+        if !analyzer.contains(required) {
+            violations.insert(format!(
+                "neutral-table-analyzer-seam-missing: {EBD_4B3D_ANALYZER_ENTRY}|{required}"
+            ));
+        }
+    }
+
+    let engine_provider = sources
+        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .map(|source| rust_sanitized_production_text(&source.text))
+        .unwrap_or_default();
+    for required in [
+        "crate::catalog::provider::CatalogProvider",
+        "PlannerTableProvider",
+        "IcebergMetadataTableProvider",
+    ] {
+        if !engine_provider.contains(required) {
+            violations.insert(format!(
+                "neutral-table-engine-provider-port-missing: {EBD_4B3D_ENGINE_PROVIDER}|{required}"
+            ));
+        }
+    }
+    for call in sources
+        .get(EBD_4B3D_ENGINE_PROVIDER)
+        .map(|source| ebd_4b3d_neutral_provider_connector_calls(&source.text))
+        .unwrap_or_default()
+    {
+        violations.insert(format!(
+            "neutral-table-ordinary-provider-connector-call: {EBD_4B3D_ENGINE_PROVIDER}|{call}"
+        ));
+    }
+
+    for source in sources.values() {
+        if source.path.starts_with("src/engine/") {
+            for symbol in ebd_4b3d_public_reexports(&source.text) {
+                violations.insert(format!(
+                    "neutral-table-engine-forwarding-provider: {}|{symbol}",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn ebd_4b3d_neutral_table_provider_split_is_complete() {
+    let sources = ebd_4b1_collect_repo_sources();
+    let violations = ebd_4b3d_completion_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "EBD-4B3D neutral table/provider split failed:\n{}",
+        violations.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn ebd_4b3d_detector_covers_dependencies_retired_surfaces_and_provider_leaks() {
+    let valid = vec![
+        GuardSource::new(
+            EBD_4B3D_TABLE_OWNER,
+            r#"
+pub(crate) struct CatalogTable;
+const COMMENT_NOISE: &str = "crate::sql::planner::table::TableDef";
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B3D_PROVIDER_OWNER,
+            "pub(crate) trait CatalogProvider {}",
+        ),
+        GuardSource::new(
+            EBD_4B3D_PARTITION_OWNER,
+            "pub(crate) struct LegacyRangePartition;",
+        ),
+        GuardSource::new(
+            EBD_4B3D_PLANNER_EXTENSION_OWNER,
+            r#"
+use crate::catalog::table::CatalogTable;
+struct ResolvedAnalyzerTable { catalog: CatalogTable }
+trait PlannerTableProvider {
+    fn resolve_table_for_analysis(&self) -> ResolvedAnalyzerTable;
+}
+trait IcebergMetadataTableProvider {
+    fn get_iceberg_metadata_table(&self);
+}
+"#,
+        ),
+        GuardSource::new(
+            EBD_4B3D_ANALYZER_ENTRY,
+            "fn resolve() { provider.resolve_table_for_analysis(); metadata.get_iceberg_metadata_table(); }",
+        ),
+        GuardSource::new(
+            EBD_4B3D_ENGINE_PROVIDER,
+            r#"
+use crate::catalog::provider::CatalogProvider;
+use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
+struct CatalogMgrProvider;
+impl CatalogProvider for CatalogMgrProvider {
+    fn get_table(&self) { self.resolve_table_for_analysis_once(); }
+}
+"#,
+        ),
+        GuardSource::new("src/engine/catalog.rs", "struct InMemoryCatalog;"),
+        GuardSource::new("src/engine/mod.rs", "mod catalog;"),
+    ];
+    let valid_violations = ebd_4b3d_completion_violations(&valid);
+    assert!(
+        valid_violations.is_empty(),
+        "legal neutral/planner split fixture must remain accepted: {valid_violations:?}"
+    );
+
+    let mut invalid = valid;
+    invalid[3] = GuardSource::new(
+        EBD_4B3D_PLANNER_EXTENSION_OWNER,
+        r#"
+use crate::catalog::table::CatalogTable;
+struct ResolvedAnalyzerTable { catalog: CatalogTable }
+trait PlannerTableProvider {
+    fn resolve_table_for_analysis(&self) -> ResolvedAnalyzerTable;
+    fn get_table(&self);
+}
+trait IcebergMetadataTableProvider {
+    fn get_iceberg_metadata_table(&self);
+}
+"#,
+    );
+    invalid[0] = GuardSource::new(
+        EBD_4B3D_TABLE_OWNER,
+        r#"
+use super::super::sql::{catalog::PlannerTableProvider as Provider, planner::*};
+pub(crate) struct CatalogTable;
+"#,
+    );
+    invalid.push(GuardSource::new(
+        "src/sql/legacy_provider.rs",
+        r#"
+trait CatalogProvider {}
+enum TableLookupMode { SchemaOnly }
+fn get_table_with_mode() {}
+"#,
+    ));
+    invalid[5] = GuardSource::new(
+        EBD_4B3D_ENGINE_PROVIDER,
+        r#"
+use crate::catalog::provider::CatalogProvider;
+use crate::sql::catalog::{IcebergMetadataTableProvider, PlannerTableProvider};
+struct CatalogMgrProvider;
+impl CatalogProvider for CatalogMgrProvider {
+    fn get_table(&self) {
+        self.lookup_neutral();
+        nested::nested_lookup(self);
+    }
+}
+impl CatalogMgrProvider {
+    fn lookup_neutral(&self) {
+        self.catalog_backend();
+        self.load_table_for_read();
+        self.build_table_def();
+    }
+}
+struct DuplicateMethodOwner;
+impl DuplicateMethodOwner {
+    fn lookup_neutral(&self) {}
+}
+mod nested {
+    fn nested_lookup(provider: &super::CatalogMgrProvider) {
+        provider.table_source();
+        provider.build_schema_table_def();
+    }
+}
+"#,
+    );
+    invalid[6] = GuardSource::new(
+        "src/engine/catalog.rs",
+        "pub use crate::catalog::provider::CatalogProvider as EngineCatalogProvider;",
+    );
+    invalid.push(GuardSource::new(
+        "src/sql/nested_provider.rs",
+        r#"
+mod nested {
+    trait CatalogProvider {}
+    type LegacyRangePartition = ();
+}
+"#,
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/provider_reexport.rs",
+        "pub use crate::catalog::provider::*;",
+    ));
+    invalid.push(GuardSource::new(
+        "src/sql/provider_macro.rs",
+        "macro_rules! define_provider { () => { trait CatalogProvider {} } }",
+    ));
+
+    let violations = ebd_4b3d_completion_violations(&invalid);
+    for expected in [
+        "neutral-table-owner-dependency: src/catalog/table.rs|crate::sql",
+        "neutral-table-planner-extra-entry: src/sql/catalog.rs|get_table",
+        "neutral-table-provider-secondary-owner: src/sql/legacy_provider.rs",
+        "neutral-table-provider-secondary-owner: src/sql/nested_provider.rs",
+        "neutral-table-partition-secondary-owner: src/sql/nested_provider.rs",
+        "neutral-table-macro-secondary-owner: src/sql/provider_macro.rs|CatalogProvider",
+        "neutral-table-public-reexport: src/sql/provider_reexport.rs|CatalogProvider",
+        "neutral-table-retired-surface: src/sql/legacy_provider.rs|TableLookupMode",
+        "neutral-table-retired-surface: src/sql/legacy_provider.rs|get_table_with_mode",
+        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|catalog_backend",
+        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|load_table_for_read",
+        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_table_def",
+        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|table_source",
+        "neutral-table-ordinary-provider-connector-call: src/engine/catalog_mgr/provider.rs|build_schema_table_def",
+        "neutral-table-engine-forwarding-provider: src/engine/catalog.rs",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "EBD-4B3D detector missed {expected}: {violations:?}"
+        );
+    }
 }
 
 #[test]

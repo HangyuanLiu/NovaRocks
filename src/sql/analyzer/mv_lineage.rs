@@ -647,7 +647,7 @@ impl ExpressionKindHint {
 mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
-    use crate::sql::catalog::CatalogProvider;
+    use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
@@ -706,7 +706,7 @@ mod tests {
 
     struct SingleLineageCatalog;
 
-    impl CatalogProvider for SingleLineageCatalog {
+    impl SingleLineageCatalog {
         fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
             match table {
                 "fact" => Ok(TableDef {
@@ -742,6 +742,20 @@ mod tests {
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
+        }
+    }
+
+    impl PlannerTableProvider for SingleLineageCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = self.get_table(database, table)?;
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 
@@ -802,7 +816,7 @@ mod tests {
 
     struct JoinLineageCatalog;
 
-    impl CatalogProvider for JoinLineageCatalog {
+    impl JoinLineageCatalog {
         fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
             match table {
                 "left_tbl" | "right_tbl" => Ok(TableDef {
@@ -838,6 +852,20 @@ mod tests {
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
+        }
+    }
+
+    impl PlannerTableProvider for JoinLineageCatalog {
+        fn resolve_table_for_analysis(
+            &self,
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
+            let planner = self.get_table(database, table)?;
+            Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                catalog, database, planner,
+            ))
         }
     }
 

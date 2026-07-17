@@ -23,9 +23,13 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::identifier::normalize_identifier;
-pub use crate::sql::catalog::CatalogProvider;
-use crate::sql::catalog::LegacyRangePartition;
+use crate::catalog::identifier::{TableIdentity, normalize_identifier};
+use crate::catalog::partition::LegacyRangePartition;
+use crate::catalog::provider::CatalogProvider;
+use crate::catalog::table::CatalogTable;
+use crate::sql::catalog::{
+    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
+};
 #[cfg(any(test, feature = "compat"))]
 use crate::sql::planner::table::ScanSource;
 use crate::sql::planner::table::TableDef;
@@ -186,6 +190,26 @@ impl InMemoryCatalog {
         Ok(())
     }
 
+    pub(crate) fn get_legacy_range_partition(
+        &self,
+        database: &str,
+        table: &str,
+        partition: &str,
+    ) -> Result<Option<LegacyRangePartition>, String> {
+        let db_key = normalize_identifier(database)?;
+        let table_key = normalize_identifier(table)?;
+        let partition_key = normalize_identifier(partition)?;
+        Ok(self
+            .legacy_range_partitions
+            .get(&(db_key, table_key))
+            .and_then(|partitions| {
+                partitions
+                    .iter()
+                    .find(|p| normalize_identifier(&p.name).ok().as_deref() == Some(&partition_key))
+                    .cloned()
+            }))
+    }
+
     pub(crate) fn rename_column(
         &mut self,
         database_name: &str,
@@ -234,8 +258,13 @@ impl InMemoryCatalog {
 }
 
 impl CatalogProvider for InMemoryCatalog {
-    fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
-        self.get(database, table)
+    fn get_table(&self, database: &str, table: &str) -> Result<CatalogTable, String> {
+        let planner = self.get(database, table)?;
+        Ok(CatalogTable {
+            identity: TableIdentity::new("default_catalog", database, &planner.name),
+            columns: planner.columns,
+            hidden_columns: planner.iceberg_row_lineage_metadata_columns,
+        })
     }
 
     fn get_legacy_range_partition(
@@ -244,18 +273,39 @@ impl CatalogProvider for InMemoryCatalog {
         table: &str,
         partition: &str,
     ) -> Result<Option<LegacyRangePartition>, String> {
-        let db_key = normalize_identifier(database)?;
-        let table_key = normalize_identifier(table)?;
-        let partition_key = normalize_identifier(partition)?;
-        Ok(self
-            .legacy_range_partitions
-            .get(&(db_key, table_key))
-            .and_then(|partitions| {
-                partitions
-                    .iter()
-                    .find(|p| normalize_identifier(&p.name).ok().as_deref() == Some(&partition_key))
-                    .cloned()
-            }))
+        InMemoryCatalog::get_legacy_range_partition(self, database, table, partition)
+    }
+}
+
+impl PlannerTableProvider for InMemoryCatalog {
+    fn resolve_table_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        let planner = self.get(database, table)?;
+        Ok(ResolvedAnalyzerTable::from_planner(
+            catalog.or(Some("default_catalog")),
+            database,
+            planner,
+        ))
+    }
+
+    fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
+        Some(self)
+    }
+}
+
+impl IcebergMetadataTableProvider for InMemoryCatalog {
+    fn get_iceberg_metadata_table(
+        &self,
+        _catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        _metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<TableDef, String> {
+        self.get(database, table)
     }
 }
 
@@ -265,6 +315,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::schema::ColumnDef;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
 
     fn test_table(name: &str) -> TableDef {
         TableDef {
@@ -280,6 +333,42 @@ mod tests {
             source: ScanSource::StarRocks {
                 db_id: 10,
                 table_id: 20,
+            },
+        }
+    }
+
+    fn test_iceberg_table(name: &str) -> TableDef {
+        TableDef {
+            name: name.to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: IcebergTableInfo {
+                    catalog: "default_catalog".to_string(),
+                    namespace: DEFAULT_DATABASE.to_string(),
+                    table: name.to_string(),
+                    table_uuid: Some("local-uuid".to_string()),
+                    current_snapshot_id: None,
+                    schema_id: 0,
+                    location: "file:///tmp/local_iceberg".to_string(),
+                    schema: IcebergSchemaDef { fields: vec![] },
+                    serialized_metadata: Some(
+                        serde_json::to_string(
+                            &crate::sql::analyzer::iceberg_ref::test_utils::metadata_empty(),
+                        )
+                        .expect("serialize metadata"),
+                    ),
+                    serialized_metadata_rows: None,
+                },
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding: IcebergDataFileBinding::CurrentSnapshot,
             },
         }
     }
@@ -302,6 +391,71 @@ mod tests {
                 .expect("overwritten logical table")
                 .columns[0]
                 .nullable
+        );
+    }
+
+    #[test]
+    fn neutral_provider_preserves_local_identity_and_schema() {
+        let mut catalog = InMemoryCatalog::default();
+        let mut table = test_table("starrocks_tbl");
+        table.iceberg_row_lineage_metadata_columns = vec![ColumnDef {
+            name: "_row_id".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        catalog
+            .register(DEFAULT_DATABASE, table)
+            .expect("register StarRocks table");
+
+        let table = CatalogProvider::get_table(&catalog, DEFAULT_DATABASE, "starrocks_tbl")
+            .expect("resolve neutral table");
+
+        assert_eq!(
+            table.identity,
+            TableIdentity::new("default_catalog", DEFAULT_DATABASE, "starrocks_tbl")
+        );
+        assert_eq!(table.columns[0].name, "id");
+        assert_eq!(table.hidden_columns[0].name, "_row_id");
+    }
+
+    #[test]
+    fn local_iceberg_metadata_lookup_preserves_analyzer_behavior_and_errors() {
+        let mut catalog = InMemoryCatalog::default();
+        catalog
+            .register(DEFAULT_DATABASE, test_iceberg_table("local_ice"))
+            .expect("register local iceberg table");
+
+        let statement = crate::sql::parser::parse_sql_raw("SELECT * FROM local_ice$snapshots")
+            .expect("parse metadata query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        crate::sql::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+            .expect("analyze local metadata query");
+
+        let statement = crate::sql::parser::parse_sql_raw("SELECT * FROM missing$snapshots")
+            .expect("parse missing table query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            crate::sql::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+                .expect_err("missing table must fail"),
+            "unknown table: missing"
+        );
+
+        let statement =
+            crate::sql::parser::parse_sql_raw("SELECT * FROM missing_db.local_ice$snapshots")
+                .expect("parse missing database query");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            crate::sql::analyzer::analyze(&query, &catalog, DEFAULT_DATABASE)
+                .expect_err("missing database must fail"),
+            "unknown database: missing_db"
         );
     }
 }

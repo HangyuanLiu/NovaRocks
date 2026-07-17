@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use crate::sql::catalog::CatalogProvider;
+use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
@@ -54,7 +54,7 @@ fn supports_current_mv_rewrite_shape(desc: &SpjgDescriptor) -> bool {
 
 pub(crate) fn prepare_mv_rewrite_candidates(
     state: &Arc<StandaloneState>,
-    analyzer_catalog: &dyn CatalogProvider,
+    analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
@@ -81,7 +81,7 @@ pub(crate) fn prepare_mv_rewrite_candidates(
 
 fn try_prepare(
     state: &Arc<StandaloneState>,
-    analyzer_catalog: &dyn CatalogProvider,
+    analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
@@ -149,7 +149,7 @@ fn try_prepare(
 
 fn build_candidate(
     state: &Arc<StandaloneState>,
-    analyzer_catalog: &dyn CatalogProvider,
+    analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     def: &crate::meta::repository::mv::StoredMvDefinition,
     factory: &mut ColumnRefFactory,

@@ -380,13 +380,16 @@ impl<'a> super::AnalyzerContext<'a> {
                         }
                     };
 
-                    let table_def = self.catalog.get_table_with_mode(
+                    let metadata_provider =
+                        self.catalog.iceberg_metadata_provider().ok_or_else(|| {
+                            "iceberg metadata table lookup is not supported by this catalog"
+                                .to_string()
+                        })?;
+                    let table_def = metadata_provider.get_iceberg_metadata_table(
                         catalog_override.as_deref(),
                         &db_lower,
                         &tbl_lower,
-                        crate::sql::catalog::TableLookupMode::IcebergMetadata {
-                            metadata_table_type: metadata_ty.clone(),
-                        },
+                        metadata_ty.clone(),
                     )?;
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
@@ -501,30 +504,33 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
-                let table_def = self.catalog.get_table_in_catalog(
+                let resolved_table = self.catalog.resolve_table_for_analysis(
                     catalog_override.as_deref(),
                     &db_lower,
                     &tbl_lower,
                 )?;
+                let table_def = resolved_table.planner;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                 // Build scope
                 let mut scope = self.new_scope();
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-                let mut column_ids = scope.add_table(Some(qualifier), &table_def.columns);
+                let mut column_ids =
+                    scope.add_table(Some(qualifier), &resolved_table.catalog.columns);
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name
                     && !a.eq_ignore_ascii_case(&table_def.name)
                 {
-                    scope.add_table_qualified_only(&table_def.name, &table_def.columns);
+                    scope
+                        .add_table_qualified_only(&table_def.name, &resolved_table.catalog.columns);
                 }
                 // Register Iceberg V3 row-lineage pseudo-columns (_row_id,
                 // _last_updated_sequence_number) when the table carries them.
                 // These are hidden from SELECT * but resolvable by explicit name.
-                if !table_def.iceberg_row_lineage_metadata_columns.is_empty() {
+                if !resolved_table.catalog.hidden_columns.is_empty() {
                     let meta_ids = scope.add_iceberg_metadata_columns(
                         qualifier,
-                        &table_def.iceberg_row_lineage_metadata_columns,
+                        &resolved_table.catalog.hidden_columns,
                     );
                     column_ids.extend(meta_ids);
                 }
@@ -974,8 +980,11 @@ impl<'a> super::AnalyzerContext<'a> {
         // Look up the base table. `__nr_ivm_delta` requires that the table
         // exposes Iceberg v3 row-lineage metadata columns — without them
         // we cannot recover row identity across snapshots.
-        let table_def = self.catalog.get_table(&namespace, &table_name)?;
-        if table_def.iceberg_row_lineage_metadata_columns.is_empty() {
+        let resolved_table =
+            self.catalog
+                .resolve_table_for_analysis(None, &namespace, &table_name)?;
+        let table_def = resolved_table.planner;
+        if resolved_table.catalog.hidden_columns.is_empty() {
             return Err(format!(
                 "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
                  row-lineage metadata columns; rebuild the table with \
@@ -991,11 +1000,9 @@ impl<'a> super::AnalyzerContext<'a> {
         // Collect analyzer-allocated ColumnIds so the planner can reuse them on
         // the scan's output_columns, keeping ColumnRef ids consistent throughout
         // the plan (same pattern as `Relation::Scan`).
-        let mut column_ids = scope.add_table(Some(qualifier), &table_def.columns);
-        let meta_ids = scope.add_iceberg_metadata_columns(
-            qualifier,
-            &table_def.iceberg_row_lineage_metadata_columns,
-        );
+        let mut column_ids = scope.add_table(Some(qualifier), &resolved_table.catalog.columns);
+        let meta_ids =
+            scope.add_iceberg_metadata_columns(qualifier, &resolved_table.catalog.hidden_columns);
         column_ids.extend(meta_ids);
 
         let relation = Relation::IcebergDeltaScan(IcebergDeltaScanRelation {
