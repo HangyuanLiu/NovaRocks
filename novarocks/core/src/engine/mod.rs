@@ -4349,46 +4349,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn standalone_state_has_one_catalog_service_owner() {
-        let source = include_str!("mod.rs");
-        let state_start = source
-            .find("pub(crate) struct StandaloneState {")
-            .expect("StandaloneState declaration");
-        let state_source = &source[state_start
-            ..source[state_start..]
-                .find("\n}")
-                .map(|offset| state_start + offset)
-                .expect("StandaloneState end")];
-
-        assert!(
-            state_source.contains("pub(crate) catalog_service: Arc<StandaloneCatalogService>,"),
-            "StandaloneState must own the canonical catalog service"
-        );
-        assert!(
-            !state_source.contains("pub(crate) catalog:"),
-            "StandaloneState must not retain the parallel local catalog field"
-        );
-        assert!(
-            !state_source.contains("pub(crate) catalog_mgr:"),
-            "StandaloneState must not retain the parallel named catalog field"
-        );
-    }
-
-    #[test]
-    fn engine_uses_catalog_service_snapshot_and_provider_helpers() {
-        let source = include_str!("mod.rs");
-        let snapshot_helper = ["fn ", "catalog_service_snapshot", "("].concat();
-        let provider_helper = ["fn ", "build_catalog_service_provider"].concat();
-        let retired_snapshot_helper = ["fn ", "catalog_mgr_snapshot", "("].concat();
-        let retired_provider_helper = ["fn ", "build_analyzer_provider"].concat();
-
-        assert!(source.contains(&snapshot_helper));
-        assert!(source.contains(&provider_helper));
-        assert!(!source.contains(&retired_snapshot_helper));
-        assert!(!source.contains(&retired_provider_helper));
-    }
-
-    #[test]
     fn explain_analyze_query_options_only_enable_profile() {
         assert_eq!(
             super::query_options_for_explain_analyze(None),

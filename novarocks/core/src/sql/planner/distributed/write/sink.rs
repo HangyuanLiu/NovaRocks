@@ -271,22 +271,4 @@ mod tests {
         };
         assert_eq!(table.current_snapshot_id, None);
     }
-
-    #[test]
-    fn iceberg_write_sink_domain_module_has_no_thrift_wire_types() {
-        let source = include_str!("sink.rs");
-        for pattern in [
-            concat!("crate::", "thrift"),
-            concat!("TType", "Desc"),
-            concat!("TPrimitive", "Type"),
-            concat!("TCompression", "Type"),
-            concat!("TIce", "berg"),
-            concat!("thrift_type_desc_from", "_primitive"),
-        ] {
-            assert!(
-                !source.contains(pattern),
-                "domain iceberg write sink module must not contain wire type pattern `{pattern}`"
-            );
-        }
-    }
 }

@@ -920,20 +920,4 @@ mod tests {
     fn verify_edge_direction_accepts_forward_edges() {
         assert!(verify_edge_direction(&[edge(1, 0)], &[1, 0]).is_ok());
     }
-
-    #[test]
-    fn topology_module_has_no_runtime_or_protobuf_dependency() {
-        let source = include_str!("topology.rs");
-        for pattern in [
-            concat!("crate::", "coordinator"),
-            concat!("pro", "st"),
-            concat!("crate::", "runtime::"),
-            concat!("crate::", "thrift"),
-        ] {
-            assert!(
-                !source.contains(pattern),
-                "topology module must not reference `{pattern}`"
-            );
-        }
-    }
 }

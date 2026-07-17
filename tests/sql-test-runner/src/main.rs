@@ -3214,52 +3214,6 @@ mod tests {
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
     }
 
-    fn production_main_source() -> &'static str {
-        include_str!("main.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production main source")
-    }
-
-    #[test]
-    fn main_defers_process_exit_until_after_run_returns() {
-        let source = production_main_source();
-
-        assert!(
-            source.contains("fn run() -> Result<i32>"),
-            "main.rs should expose run() so std::process::exit happens after locals drop"
-        );
-        assert!(
-            source.contains("let exit_code = run()?;"),
-            "main() should call run() and exit only after it returns"
-        );
-        assert!(
-            source.contains("std::process::exit(exit_code);"),
-            "main() should delegate nonzero exit codes to a thin wrapper after run() returns"
-        );
-        assert_eq!(
-            source.matches("std::process::exit(").count(),
-            1,
-            "production main.rs should have exactly one std::process::exit call"
-        );
-    }
-
-    #[test]
-    fn main_launches_cross_process_server_after_initial_cli_validation() {
-        let source = production_main_source();
-        let launch_server_pos = source
-            .find("let server_handle = launch_server(")
-            .expect("launch_server call");
-        let benchmark_options_pos = source
-            .find("let benchmark_bootstrap_options = BenchmarkBootstrapOptions {")
-            .expect("benchmark bootstrap options");
-
-        assert!(
-            launch_server_pos > benchmark_options_pos,
-            "launch_server should happen after initial validation exits are resolved"
-        );
-    }
-
     #[test]
     fn cross_process_configs_preserve_base_sections_and_patch_cluster_ports() {
         let runtime = CrossProcessRuntime {

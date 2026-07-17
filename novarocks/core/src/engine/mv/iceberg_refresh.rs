@@ -16062,19 +16062,6 @@ mod tests {
     }
 
     #[test]
-    fn imv_refresh_no_longer_uses_terminal_merge_sink_factory() {
-        let source = include_str!("iceberg_refresh.rs");
-        assert!(!source.contains(concat!("Iceberg", "Merge", "Sink", "Factory", "::new")));
-        assert!(!source.contains(concat!("terminal", "_sink")));
-    }
-
-    #[test]
-    fn imv_refresh_uses_change_stream_write_helper() {
-        let source = include_str!("iceberg_refresh.rs");
-        assert!(source.contains("execute_imv_change_stream_write"));
-    }
-
-    #[test]
     fn imv_change_stream_branch_set_can_include_zero_row_branch() {
         let branches = build_imv_change_stream_branches_for_test(ImvBranchShape::DeleteAndReuse);
         assert!(

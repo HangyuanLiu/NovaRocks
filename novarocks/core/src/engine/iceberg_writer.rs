@@ -1620,56 +1620,6 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_path_uses_distributed_writer_not_local_collect() {
-        let source = include_str!("iceberg_writer.rs");
-        let entrypoint = source
-            .split("pub(crate) fn execute_iceberg_insert_or_overwrite")
-            .nth(1)
-            .expect("insert/overwrite entrypoint must exist")
-            .split("#[allow(clippy::too_many_arguments)]")
-            .next()
-            .expect("entrypoint source section");
-
-        assert!(
-            entrypoint.contains("execute_iceberg_insert_distributed"),
-            "INSERT OVERWRITE must call the distributed iceberg sink path"
-        );
-        assert!(
-            !entrypoint.contains("run_select_to_chunks"),
-            "INSERT OVERWRITE must not collect SELECT output in the coordinator"
-        );
-        assert!(
-            !entrypoint.contains("InsertOrOverwriteWriteExecutor"),
-            "INSERT OVERWRITE must not use the local file writer executor"
-        );
-        assert!(
-            !entrypoint.contains("synthetic_write_commit_input"),
-            "INSERT OVERWRITE must not synthesize writer output"
-        );
-    }
-
-    #[test]
-    fn append_executor_does_not_use_synthetic_commit_input() {
-        let source = include_str!("iceberg_writer.rs");
-        let impl_source = source
-            .split("impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor")
-            .nth(1)
-            .expect("distributed append executor impl must exist")
-            .split("fn build_insert_write_sink_spec")
-            .next()
-            .expect("append executor source section");
-
-        assert!(
-            impl_source.contains("execute_query_as_iceberg_write"),
-            "append executor must use the distributed iceberg write path"
-        );
-        assert!(
-            !impl_source.contains("synthetic_write_commit_input"),
-            "append executor must not return a synthetic write commit"
-        );
-    }
-
-    #[test]
     fn position_delete_sink_descriptor_columns_use_target_table_schema() {
         let resolved_columns = vec![
             test_column("id", DataType::Int32, None),

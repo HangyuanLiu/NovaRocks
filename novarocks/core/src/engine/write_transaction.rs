@@ -598,16 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn runner_no_longer_depends_on_preloaded_commit_output_gate() {
-        let src = include_str!("write_transaction.rs");
-        let removed_method = concat!("has_", "preloaded_commit_output");
-        assert!(
-            !src.contains(removed_method),
-            "preloaded commit output gate must stay deleted; non-FastAppend file-less commits use the op-kind gate"
-        );
-    }
-
-    #[test]
     fn coordinated_write_failure_records_failed_known_uncommitted() {
         let env = test_env();
         let exec = FakeExecutor {

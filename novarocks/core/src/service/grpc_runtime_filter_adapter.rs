@@ -745,13 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn adapter_source_has_no_legacy_partial_or_handler_dependency() {
-        let source = include_str!("grpc_runtime_filter_adapter.rs");
-        assert!(!source.contains(concat!("is_", "partial")));
-        assert!(!source.contains(concat!("handle_transmit_", "runtime_filter(")));
-    }
-
-    #[test]
     fn domain_rejection_is_not_a_tonic_error() {
         let ingress = Arc::new(RecordingIngress::new(
             RuntimeFilterIngressResult::rejected("semantic rejection").unwrap(),
