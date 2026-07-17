@@ -234,6 +234,32 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "imv_stateless_rebuild" => {
                 meta.imv_stateless_rebuild = Some(parse_imv_stateless_rebuild(&raw_value)?);
             }
+            "be_log_contains" => {
+                meta.be_log_contains.push(raw_value);
+            }
+            "be_log_count_at_least" => {
+                let (pattern, count) = raw_value.rsplit_once(',').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "@be_log_count_at_least requires <pattern>,<positive-count>"
+                    )
+                })?;
+                let pattern = pattern.trim();
+                if pattern.is_empty() {
+                    bail!("@be_log_count_at_least pattern must not be empty");
+                }
+                let count_raw = count.trim();
+                let count = count_raw.parse::<usize>().with_context(|| {
+                    format!("invalid @be_log_count_at_least count: {count_raw}")
+                })?;
+                if count == 0 {
+                    bail!("@be_log_count_at_least count must be positive");
+                }
+                meta.be_log_count_at_least
+                    .push((pattern.to_string(), count));
+            }
+            "compat_probe" => {
+                meta.compat_probes.push(raw_value);
+            }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
@@ -319,6 +345,21 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .imv_stateless_rebuild
             .clone()
             .or_else(|| base.imv_stateless_rebuild.clone()),
+        be_log_contains: if override_meta.be_log_contains.is_empty() {
+            base.be_log_contains.clone()
+        } else {
+            override_meta.be_log_contains.clone()
+        },
+        be_log_count_at_least: if override_meta.be_log_count_at_least.is_empty() {
+            base.be_log_count_at_least.clone()
+        } else {
+            override_meta.be_log_count_at_least.clone()
+        },
+        compat_probes: if override_meta.compat_probes.is_empty() {
+            base.compat_probes.clone()
+        } else {
+            override_meta.compat_probes.clone()
+        },
     }
 }
 
@@ -853,5 +894,43 @@ mod opt5_directive_tests {
         assert_eq!(merged.network_partition_be, Some(4));
         assert_eq!(merged.heartbeat_delay_ms, Some(750));
         assert_eq!(merged.restart_be_delay_ms, Some(1000));
+    }
+
+    #[test]
+    fn compat_directive_parser_collects_log_and_probe_directives() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @be_log_contains=compat_ingress method=exec_batch_plan_fragments".to_string(),
+            "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
+            "-- @compat_probe=malformed-runtime-filter".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse compatibility directives");
+
+        assert_eq!(
+            meta.be_log_contains,
+            vec!["compat_ingress method=exec_batch_plan_fragments".to_string()]
+        );
+        assert_eq!(
+            meta.be_log_count_at_least,
+            vec![("runtime_filter_receive".to_string(), 2)]
+        );
+        assert_eq!(
+            meta.compat_probes,
+            vec!["malformed-runtime-filter".to_string()]
+        );
+    }
+
+    #[test]
+    fn compat_directive_parser_rejects_invalid_log_count() {
+        let re = meta_re();
+        let lines = vec!["-- @be_log_count_at_least=runtime_filter_receive,zero".to_string()];
+
+        let error = parse_meta(&lines, &re).expect_err("invalid count must fail");
+
+        assert!(
+            format!("{error:#}").contains("invalid @be_log_count_at_least count: zero"),
+            "unexpected error: {error:#}"
+        );
     }
 }

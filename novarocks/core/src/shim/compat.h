@@ -224,7 +224,44 @@ int32_t novarocks_rs_lake_vacuum(const uint8_t* ptr,
                                NovaRocksRustBuf* out_resp,
                                NovaRocksRustBuf* out_err);
 
-// C++ brpc client wrappers for Rust.
+// Production brpc network clients. Response and error buffers are owned by the
+// caller and must be released with novarocks_compat_free_buf.
+int32_t novarocks_compat_exec_plan_fragment(const char* host,
+                                            uint16_t port,
+                                            const uint8_t* request_ptr,
+                                            size_t request_len,
+                                            const uint8_t* attachment_ptr,
+                                            size_t attachment_len,
+                                            NovaRocksRustBuf* out_resp,
+                                            NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_exec_batch_plan_fragments(const char* host,
+                                                   uint16_t port,
+                                                   const uint8_t* request_ptr,
+                                                   size_t request_len,
+                                                   const uint8_t* attachment_ptr,
+                                                   size_t attachment_len,
+                                                   NovaRocksRustBuf* out_resp,
+                                                   NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_fetch_data(const char* host,
+                                    uint16_t port,
+                                    const uint8_t* request_ptr,
+                                    size_t request_len,
+                                    const uint8_t* attachment_ptr,
+                                    size_t attachment_len,
+                                    NovaRocksRustBuf* out_resp,
+                                    NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_cancel_plan_fragment(const char* host,
+                                              uint16_t port,
+                                              const uint8_t* request_ptr,
+                                              size_t request_len,
+                                              const uint8_t* attachment_ptr,
+                                              size_t attachment_len,
+                                              NovaRocksRustBuf* out_resp,
+                                              NovaRocksRustBuf* out_err);
+
 int32_t novarocks_compat_transmit_chunk(const char* host,
                                         uint16_t port,
                                         const uint8_t* ptr,

@@ -18,6 +18,7 @@
 mod benchmark_bootstrap;
 mod cluster;
 mod compat_artifact;
+mod compat_directive;
 mod config;
 mod fault_injection;
 mod imv_stateless;
@@ -1472,6 +1473,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        let compat_ok = match ctx.server_handle.lock() {
+                            Ok(server_handle) => compat_directive::run(
+                                step,
+                                server_handle.as_ref(),
+                                &mut log,
+                            )
+                            .map_err(|error| format!("compatibility directive failed: {error:#}")),
+                            Err(_) => Err("server handle mutex is poisoned".to_string()),
+                        };
+                        let compat_ok = match compat_ok {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                                false
+                            }
+                        };
                         // @imv_stateless_rebuild: trigger the lake-native stateless
                         // rebuild procedure for the named MV and assert its read
                         // face is unchanged. Runs before @imv_equivalence_check so
@@ -1529,7 +1547,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         } else {
                             true
                         };
-                        if explain_ok {
+                        if explain_ok && compat_ok {
                             if !ctx.verify_enabled {
                                 let _ = writeln!(
                                     log,
@@ -2681,6 +2699,19 @@ fn run() -> Result<i32> {
         if cases.is_empty() {
             println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
             continue;
+        }
+
+        for case in &cases {
+            for step in &case.steps {
+                if let Err(error) = compat_directive::validate_mode(&step.meta, selected_cluster_mode)
+                {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
+            }
         }
 
         if let Err(exc) = validate_fault_injection_jobs(&cases, jobs) {

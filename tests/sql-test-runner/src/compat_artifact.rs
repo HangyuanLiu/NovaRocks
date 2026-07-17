@@ -426,10 +426,12 @@ mod tests {
             &hook,
             r##"#!/usr/bin/env bash
 set -euo pipefail
-test "$*" = "cargo build --profile dev-opt --features compat --bin novarocks"
+test "$*" = "cargo build --profile dev-opt --features compat --bin novarocks --bin starrocks-compat-probe"
 mkdir -p "$CARGO_TARGET_DIR/dev-opt"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/novarocks"
 chmod +x "$CARGO_TARGET_DIR/dev-opt/novarocks"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/starrocks-compat-probe"
+chmod +x "$CARGO_TARGET_DIR/dev-opt/starrocks-compat-probe"
 "##,
         )
         .expect("write fake builder");
@@ -451,6 +453,14 @@ chmod +x "$CARGO_TARGET_DIR/dev-opt/novarocks"
         );
         assert_eq!(built.git_head, git_head(&repo_root));
         assert_eq!(built.profile, "dev-opt");
+        assert!(
+            built
+                .binary
+                .parent()
+                .expect("artifact bin directory")
+                .join("starrocks-compat-probe")
+                .is_file()
+        );
 
         fs::remove_dir_all(&root).expect("cleanup compat artifact test dir");
         if let Some(runtime_dir) = built.binary.parent().and_then(Path::parent) {

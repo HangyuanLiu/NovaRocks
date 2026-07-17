@@ -261,7 +261,13 @@ pub(crate) trait ServerHandle: Send {
         bail!("BE log assertions are unsupported by this server mode (index={index})")
     }
     #[allow(dead_code)]
-    fn run_compat_probe(&self, probe: &str) -> Result<()> {
+    fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
+        bail!(
+            "BE log counting is unsupported by this server mode (index={index}, pattern={needle:?})"
+        )
+    }
+    #[allow(dead_code)]
+    fn run_compat_probe(&self, probe: &str, _endpoint: &CompatBeEndpoint) -> Result<()> {
         bail!("compatibility probes are unsupported by this server mode (probe={probe})")
     }
     fn residual_process_ids(&self) -> Vec<u32> {

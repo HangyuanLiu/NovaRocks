@@ -38,6 +38,7 @@ use crate::cluster::ServerHandle;
 pub(crate) const COMPAT_BE_COUNT: usize = 3;
 const FE_START_MARKER: &str = "using java version";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FE_CONFIG_KEYS: &[&str] = &[
     "cloud_native_storage_type",
@@ -767,6 +768,7 @@ pub(crate) struct StarRocksCompatServerHandle {
     target_port: u16,
     runtime_dir: Option<PathBuf>,
     artifact_binary: PathBuf,
+    probe_binary: PathBuf,
     endpoints: Vec<CompatBeEndpoint>,
     be_workdirs: Vec<PathBuf>,
     be_config_paths: Vec<PathBuf>,
@@ -885,11 +887,21 @@ impl StarRocksCompatServerHandle {
             .map(ManagedProcess::pid)
             .collect::<Vec<_>>();
         process_ids.push(fe_process.pid());
+        let probe_binary = std::env::var_os("NOVAROCKS_COMPAT_PROBE_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                artifact
+                    .binary
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("starrocks-compat-probe")
+            });
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
             target_port: topology.fe.query,
             runtime_dir: Some(runtime_dir.into_path()),
             artifact_binary: artifact.binary,
+            probe_binary,
             endpoints,
             be_workdirs,
             be_config_paths,
@@ -1018,8 +1030,51 @@ impl ServerHandle for StarRocksCompatServerHandle {
         self.be_processes[index].assert_log_contains(needle)
     }
 
-    fn run_compat_probe(&self, probe: &str) -> Result<()> {
-        bail!("compatibility probe {probe:?} is unavailable until the probe binary is installed")
+    fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].log_count(needle)
+    }
+
+    fn run_compat_probe(&self, probe: &str, endpoint: &CompatBeEndpoint) -> Result<()> {
+        if !self.endpoints.contains(endpoint) {
+            bail!(
+                "compatibility probe endpoint is not a managed BE: {}:{}",
+                endpoint.host,
+                endpoint.brpc_port
+            );
+        }
+        if !self.probe_binary.is_file() {
+            bail!(
+                "compatibility probe binary is missing: {}",
+                self.probe_binary.display()
+            );
+        }
+        let marker = format!(
+            "probe={probe} status=PASS endpoint={}:{}",
+            endpoint.host, endpoint.brpc_port
+        );
+        let mut command = Command::new(&self.probe_binary);
+        command
+            .args(["--host", endpoint.host.as_str(), "--brpc-port"])
+            .arg(endpoint.brpc_port.to_string())
+            .args(["--probe", probe]);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let log_path = self
+            .runtime_dir
+            .as_ref()
+            .context("compatibility runtime is removed")?
+            .join(format!("probe-{probe}-{nonce}.log"));
+        let mut process = ManagedProcess::spawn(
+            format!("compatibility probe {probe}"),
+            command,
+            ReadyMarker::StdoutContains(marker),
+            PROBE_TIMEOUT,
+            log_path,
+        )?;
+        process.stop().context("wait for compatibility probe")
     }
 
     fn residual_process_ids(&self) -> Vec<u32> {

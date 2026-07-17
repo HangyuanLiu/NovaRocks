@@ -27,7 +27,7 @@ cat >"$fake_builder" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected='cargo build --profile dev-opt --features compat --bin novarocks'
+expected='cargo build --profile dev-opt --features compat --bin novarocks --bin starrocks-compat-probe'
 if [ "$*" != "$expected" ]; then
   echo "unexpected compat build command: $*" >&2
   exit 1
@@ -41,6 +41,8 @@ fi
 mkdir -p "$CARGO_TARGET_DIR/dev-opt"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/novarocks"
 chmod +x "$CARGO_TARGET_DIR/dev-opt/novarocks"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/starrocks-compat-probe"
+chmod +x "$CARGO_TARGET_DIR/dev-opt/starrocks-compat-probe"
 EOF
 chmod +x "$fake_builder"
 
@@ -79,6 +81,10 @@ fi
 expected_binary="$(cd "$output_dir/bin" && pwd -P)/novarocks-compat"
 if [ "${artifact[binary]}" != "$expected_binary" ]; then
   echo "compat binary path differs: ${artifact[binary]}" >&2
+  exit 1
+fi
+if [ ! -x "$output_dir/bin/starrocks-compat-probe" ]; then
+  echo "compat probe must be installed next to the compat binary" >&2
   exit 1
 fi
 if [ "${artifact[profile]}" != dev-opt ] || [ "${artifact[features]}" != compat ]; then

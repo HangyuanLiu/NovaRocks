@@ -301,7 +301,9 @@ int32_t invoke_internal_brpc_client(
                 const Request*,
                 Response*,
                 google::protobuf::Closure*),
-        const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr) {
+        const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr,
+        const uint8_t* attachment_ptr = nullptr,
+        size_t attachment_len = 0) {
     init_compat_buf(out_resp);
     init_compat_buf(out_err);
 
@@ -315,6 +317,10 @@ int32_t invoke_internal_brpc_client(
     }
     if (ptr == nullptr) {
         write_compat_buf(std::string(rpc_name) + " request ptr is null", out_err);
+        return 2;
+    }
+    if (attachment_len > 0 && attachment_ptr == nullptr) {
+        write_compat_buf(std::string(rpc_name) + " attachment ptr is null", out_err);
         return 2;
     }
 
@@ -358,12 +364,21 @@ int32_t invoke_internal_brpc_client(
     starrocks::PInternalService_Stub stub(channel.get());
     brpc::Controller cntl;
     cntl.set_timeout_ms(600000);
+    if (attachment_len > 0 &&
+        cntl.request_attachment().append(attachment_ptr, attachment_len) != 0) {
+        write_compat_buf(std::string(rpc_name) + " attachment allocation failed", out_err);
+        return 1;
+    }
     if (configure) {
         configure(&cntl, request);
     }
     Response response;
     (stub.*method)(&cntl, &request, &response, nullptr);
     if (cntl.Failed()) {
+        std::string response_bytes;
+        if (response.IsInitialized() && response.SerializeToString(&response_bytes)) {
+            write_compat_buf(response_bytes, out_resp);
+        }
         write_compat_buf(std::string(rpc_name) + " request failed: " + cntl.ErrorText(), out_err);
         return 1;
     }
@@ -2462,6 +2477,97 @@ std::unique_ptr<LakeServiceImpl> g_lake_service;
 std::atomic<bool> g_brpc_started{false};
 
 } // namespace
+
+int32_t novarocks_compat_exec_plan_fragment(const char* host,
+                                            uint16_t port,
+                                            const uint8_t* request_ptr,
+                                            size_t request_len,
+                                            const uint8_t* attachment_ptr,
+                                            size_t attachment_len,
+                                            NovaRocksRustBuf* out_resp,
+                                            NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PExecPlanFragmentRequest,
+                                       starrocks::PExecPlanFragmentResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "exec_plan_fragment",
+            &starrocks::PInternalService_Stub::exec_plan_fragment,
+            nullptr,
+            attachment_ptr,
+            attachment_len);
+}
+
+int32_t novarocks_compat_exec_batch_plan_fragments(const char* host,
+                                                   uint16_t port,
+                                                   const uint8_t* request_ptr,
+                                                   size_t request_len,
+                                                   const uint8_t* attachment_ptr,
+                                                   size_t attachment_len,
+                                                   NovaRocksRustBuf* out_resp,
+                                                   NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PExecBatchPlanFragmentsRequest,
+                                       starrocks::PExecBatchPlanFragmentsResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "exec_batch_plan_fragments",
+            &starrocks::PInternalService_Stub::exec_batch_plan_fragments,
+            nullptr,
+            attachment_ptr,
+            attachment_len);
+}
+
+int32_t novarocks_compat_fetch_data(const char* host,
+                                    uint16_t port,
+                                    const uint8_t* request_ptr,
+                                    size_t request_len,
+                                    const uint8_t* attachment_ptr,
+                                    size_t attachment_len,
+                                    NovaRocksRustBuf* out_resp,
+                                    NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PFetchDataRequest, starrocks::PFetchDataResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "fetch_data",
+            &starrocks::PInternalService_Stub::fetch_data,
+            nullptr,
+            attachment_ptr,
+            attachment_len);
+}
+
+int32_t novarocks_compat_cancel_plan_fragment(const char* host,
+                                              uint16_t port,
+                                              const uint8_t* request_ptr,
+                                              size_t request_len,
+                                              const uint8_t* attachment_ptr,
+                                              size_t attachment_len,
+                                              NovaRocksRustBuf* out_resp,
+                                              NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PCancelPlanFragmentRequest,
+                                       starrocks::PCancelPlanFragmentResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "cancel_plan_fragment",
+            &starrocks::PInternalService_Stub::cancel_plan_fragment,
+            nullptr,
+            attachment_ptr,
+            attachment_len);
+}
 
 int32_t novarocks_compat_transmit_chunk(const char* host,
                                         uint16_t port,

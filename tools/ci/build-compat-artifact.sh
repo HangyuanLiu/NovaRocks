@@ -54,7 +54,12 @@ fi
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd -P)"
 target_dir="$output_dir/target"
-build_command=(cargo build --profile "$profile" --features compat --bin novarocks)
+build_command=(
+  cargo build --profile "$profile"
+  -p novarocks-server -p novarocks
+  --features compat
+  --bin novarocks --bin starrocks-compat-probe
+)
 
 if [ -n "${SCT_COMPAT_BUILD_HOOK:-}" ]; then
   (
@@ -65,7 +70,7 @@ else
   (
     cd "$REPO_ROOT"
     CARGO_TARGET_DIR="$target_dir" \
-      cargo build --profile "$profile" --features compat --bin novarocks
+      "${build_command[@]}"
   )
 fi
 
@@ -74,8 +79,13 @@ case "$profile" in
   *) artifact_profile="$profile" ;;
 esac
 built_binary="$target_dir/$artifact_profile/novarocks"
+probe_binary="$target_dir/$artifact_profile/starrocks-compat-probe"
 if [ ! -x "$built_binary" ]; then
   echo "Compat build did not produce an executable: $built_binary" >&2
+  exit 1
+fi
+if [ ! -x "$probe_binary" ]; then
+  echo "Compat build did not produce an executable: $probe_binary" >&2
   exit 1
 fi
 
@@ -83,6 +93,8 @@ mkdir -p "$output_dir/bin"
 compat_binary="$output_dir/bin/novarocks-compat"
 cp "$built_binary" "$compat_binary"
 chmod +x "$compat_binary"
+cp "$probe_binary" "$output_dir/bin/starrocks-compat-probe"
+chmod +x "$output_dir/bin/starrocks-compat-probe"
 
 sha256="$(shasum -a 256 "$compat_binary" | awk '{print $1}')"
 git_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"

@@ -109,6 +109,12 @@ pub struct QueryMeta {
     /// `Package`) — i.e. its lake-native metadata is sufficient to reproduce
     /// current contents without relying on in-process incremental state.
     pub imv_stateless_rebuild: Option<ImvStatelessDirective>,
+    /// Require a substring to occur in at least one runner-owned BE log.
+    pub be_log_contains: Vec<String>,
+    /// Require the total non-overlapping substring count across all BE logs.
+    pub be_log_count_at_least: Vec<(String, usize)>,
+    /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
+    pub compat_probes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

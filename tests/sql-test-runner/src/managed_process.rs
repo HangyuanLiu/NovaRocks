@@ -786,6 +786,16 @@ impl ManagedProcess {
         )
     }
 
+    pub(crate) fn log_count(&self, needle: &str) -> Result<usize> {
+        if needle.is_empty() {
+            bail!("durable log count pattern must not be empty");
+        }
+        self.ensure_output_io_ok("count durable log contents")?;
+        let log = fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read durable process log {}", self.log_path.display()))?;
+        Ok(log.match_indices(needle).count())
+    }
+
     pub(crate) fn restart(
         &mut self,
         command: Command,
