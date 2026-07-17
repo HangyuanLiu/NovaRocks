@@ -143,6 +143,17 @@ pub struct ConnectionConfig {
     pub db: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatBeEndpoint {
+    pub host: String,
+    pub heartbeat_port: u16,
+    pub be_port: u16,
+    pub brpc_port: u16,
+    pub http_port: u16,
+    pub grpc_port: u16,
+    pub starlet_port: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryExecution {
     pub header: Vec<String>,

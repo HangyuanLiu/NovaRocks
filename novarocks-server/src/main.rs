@@ -832,7 +832,12 @@ fn main() {
 
             #[cfg(feature = "compat")]
             println!(
-                "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
+                "NOVAROCKS_READY role=compat-be heartbeat_port={} brpc_port={} grpc_port={} pid={}",
+                server.heartbeat_port, server.brpc_port, server.grpc_port, pid
+            );
+            #[cfg(feature = "compat")]
+            println!(
+                "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, grpc_port={}, starlet_port={})",
                 server.host,
                 advertise_endpoint.host,
                 advertise_endpoint.port,
@@ -840,6 +845,7 @@ fn main() {
                 server.be_port,
                 server.brpc_port,
                 server.http_port,
+                server.grpc_port,
                 server.starlet_port
             );
             #[cfg(not(feature = "compat"))]

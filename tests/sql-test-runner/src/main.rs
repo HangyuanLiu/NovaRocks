@@ -27,6 +27,7 @@ mod results;
 mod runner;
 mod session;
 mod shell;
+mod starrocks_compat_cluster;
 mod suite_manifest;
 mod types;
 
@@ -34,6 +35,7 @@ use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
+use crate::compat_artifact::CompatArtifact;
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -50,7 +52,7 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
-use crate::suite_manifest::select_suite_names;
+use crate::suite_manifest::{SuiteServerMode, select_suite_names};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -74,6 +76,29 @@ fn resolve_effective_target_port(
     match server_port {
         Some(port) => Ok(port.to_string()),
         None => resolve_target_port(cli_port, runner_config),
+    }
+}
+
+fn resolve_selected_cluster(
+    server_mode: SuiteServerMode,
+    manifest_cluster_size: usize,
+    cli_mode: ClusterMode,
+    cli_cluster_size: Option<usize>,
+) -> Result<(ClusterMode, usize)> {
+    match server_mode {
+        SuiteServerMode::Native => Ok((cli_mode, cli_cluster_size.unwrap_or(1))),
+        SuiteServerMode::StarRocksCompat => {
+            if let Some(cluster_size) = cli_cluster_size
+                && cluster_size != manifest_cluster_size
+            {
+                bail!(
+                    "starrocks-compat mode requires --cluster-size {} (got {})",
+                    manifest_cluster_size,
+                    cluster_size
+                );
+            }
+            Ok((ClusterMode::StarRocksCompat, manifest_cluster_size))
+        }
     }
 }
 
@@ -287,8 +312,8 @@ struct Cli {
 
     /// Number of BE processes to launch in cross-process cluster mode (>= 1).
     /// All-in-one mode requires cluster_size = 1.
-    #[arg(long, default_value_t = 1)]
-    cluster_size: usize,
+    #[arg(long)]
+    cluster_size: Option<usize>,
 
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
@@ -2295,11 +2320,6 @@ fn run() -> Result<i32> {
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
 
-    if let Err(e) = validate_cluster_args(cli.cluster_mode, cli.cluster_size) {
-        println!("❌ ERROR: {}", e);
-        return Ok(1);
-    }
-
     ensure_managed_lake_prereqs(&runner_config)?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
@@ -2315,6 +2335,26 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
+    let selected_manifest = &suite_configs
+        .get(&suite_names[0])
+        .expect("selected suite exists")
+        .manifest;
+    let (selected_cluster_mode, selected_cluster_size) = match resolve_selected_cluster(
+        selected_manifest.server_mode,
+        selected_manifest.cluster_size,
+        cli.cluster_mode,
+        cli.cluster_size,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            println!("❌ ERROR: {error}");
+            return Ok(1);
+        }
+    };
+    if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;
@@ -2339,15 +2379,27 @@ fn run() -> Result<i32> {
         scales: parse_scale_overrides(&cli.benchmark_scale)?,
     };
 
+    let launch_cluster_mode = if cli.dry_run {
+        ClusterMode::AllInOne
+    } else {
+        selected_cluster_mode
+    };
+    let launch_cluster_size = if cli.dry_run {
+        1
+    } else {
+        selected_cluster_size
+    };
+    let compat_artifact = if launch_cluster_mode == ClusterMode::StarRocksCompat {
+        Some(CompatArtifact::resolve(&base_dir, "dev-opt")?)
+    } else {
+        None
+    };
     let server_handle = launch_server(
-        if cli.dry_run {
-            ClusterMode::AllInOne
-        } else {
-            cli.cluster_mode
-        },
-        cli.cluster_size,
+        launch_cluster_mode,
+        launch_cluster_size,
         &base_dir,
         &runner_config,
+        compat_artifact,
     )?;
 
     // Resolve global connection params
@@ -2649,9 +2701,10 @@ fn run() -> Result<i32> {
         println!("mode={}", mode_name(cli.mode));
         println!(
             "cluster_mode={}",
-            match cli.cluster_mode {
+            match selected_cluster_mode {
                 ClusterMode::AllInOne => "all-in-one",
                 ClusterMode::CrossProcess => "cross-process",
+                ClusterMode::StarRocksCompat => "starrocks-compat",
             }
         );
         println!("sql_dir={}", sql_dir.display());
@@ -2874,7 +2927,24 @@ fn run() -> Result<i32> {
     }
     println!("{}", "=".repeat(72));
 
-    if grand_failed > 0 || !all_cleanup_errors.is_empty() {
+    let lifecycle_error = {
+        let mut handle = server_handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server handle lock poisoned during shutdown"))?;
+        handle.shutdown().and_then(|()| {
+            let residual = handle.residual_process_ids();
+            if residual.is_empty() {
+                Ok(())
+            } else {
+                bail!("residual server process IDs after shutdown: {residual:?}")
+            }
+        })
+    };
+    if let Err(error) = &lifecycle_error {
+        println!("❌ ERROR: server lifecycle cleanup failed: {error:#}");
+    }
+
+    if grand_failed > 0 || !all_cleanup_errors.is_empty() || lifecycle_error.is_err() {
         return Ok(1);
     }
 
@@ -3195,6 +3265,59 @@ mod tests {
             "cross-process",
         ]);
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
+    }
+
+    #[test]
+    fn cli_cannot_select_internal_starrocks_compat_cluster_mode() {
+        let error = Cli::try_parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "star-rocks-compat",
+        ])
+        .expect_err("internal compatibility mode must not be a CLI escape hatch");
+        let message = error.to_string();
+        assert!(
+            message.contains("[possible values: all-in-one, cross-process]"),
+            "hidden mode leaked into CLI choices: {message}"
+        );
+    }
+
+    #[test]
+    fn selected_cluster_is_manifest_driven_for_starrocks_compat() {
+        let native = super::resolve_selected_cluster(
+            crate::suite_manifest::SuiteServerMode::Native,
+            1,
+            crate::cluster::ClusterMode::CrossProcess,
+            Some(2),
+        )
+        .expect("native CLI selection");
+        assert_eq!(native, (crate::cluster::ClusterMode::CrossProcess, 2));
+
+        for override_size in [None, Some(3)] {
+            let compat = super::resolve_selected_cluster(
+                crate::suite_manifest::SuiteServerMode::StarRocksCompat,
+                3,
+                crate::cluster::ClusterMode::AllInOne,
+                override_size,
+            )
+            .expect("manifest-selected compatibility cluster");
+            assert_eq!(compat, (crate::cluster::ClusterMode::StarRocksCompat, 3));
+        }
+        let error = super::resolve_selected_cluster(
+            crate::suite_manifest::SuiteServerMode::StarRocksCompat,
+            3,
+            crate::cluster::ClusterMode::CrossProcess,
+            Some(2),
+        )
+        .expect_err("compatibility cluster size override must be exactly three");
+        assert!(
+            error
+                .to_string()
+                .contains("starrocks-compat mode requires --cluster-size 3"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -3618,7 +3741,7 @@ enable_path_style_access = true
     #[test]
     fn cli_cluster_size_defaults_to_one() {
         let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb"]).expect("parse cli");
-        assert_eq!(cli.cluster_size, 1);
+        assert_eq!(cli.cluster_size, None);
     }
 
     #[test]
@@ -3633,7 +3756,7 @@ enable_path_style_access = true
             "2",
         ])
         .expect("parse cli");
-        assert_eq!(cli.cluster_size, 2);
+        assert_eq!(cli.cluster_size, Some(2));
         assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::CrossProcess);
     }
 
@@ -3650,7 +3773,11 @@ enable_path_style_access = true
         ])
         .expect("parse cli");
         // Parsing succeeds; validation rejects it.
-        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        let err = validate_cluster_args(
+            cli.cluster_mode,
+            cli.cluster_size.expect("explicit cluster size"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("--cluster-size must be >= 1"),
             "unexpected: {err}"
@@ -3662,7 +3789,11 @@ enable_path_style_access = true
         let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb", "--cluster-size", "2"])
             .expect("parse cli");
         assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::AllInOne);
-        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        let err = validate_cluster_args(
+            cli.cluster_mode,
+            cli.cluster_size.expect("explicit cluster size"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("all-in-one mode requires --cluster-size 1"),
