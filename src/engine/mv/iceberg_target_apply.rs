@@ -28,7 +28,7 @@
 //! keeps direct iceberg-rust reads out of the release binary.
 
 #[cfg(test)]
-use crate::engine::mv::partition::TargetPartitionFilter;
+use crate::mv::model::TargetPartitionFilter;
 
 pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
 pub(crate) const ICEBERG_MV_JOIN_APPLY_KEY_COLUMN: &str = "__nova_join_row_key";
@@ -1211,7 +1211,7 @@ fn locator_data_file_matches_partition_filter(
             &file.path,
             &value.value,
         )?;
-        fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+        fields.push(crate::mv::model::MvPartitionKeyField::new(
             value.field_name.clone(),
             mv_value,
         ));
@@ -1222,7 +1222,7 @@ fn locator_data_file_matches_partition_filter(
         }
         TargetPartitionFilter::None => spec_id,
     };
-    let key = crate::engine::mv::partition::MvPartitionKey::new(key_spec_id, fields);
+    let key = crate::mv::model::MvPartitionKey::new(key_spec_id, fields);
     Ok(partition_filter.matches(&key))
 }
 
@@ -1594,7 +1594,7 @@ async fn locate_target_rows_by_apply_key_impl(
                     .map_err(|e| {
                         iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e)
                     })?;
-                fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+                fields.push(crate::mv::model::MvPartitionKeyField::new(
                     value.field_name.clone(),
                     mv_value,
                 ));
@@ -1614,7 +1614,7 @@ async fn locate_target_rows_by_apply_key_impl(
                 }
                 TargetPartitionFilter::None => spec_id,
             };
-            let key = crate::engine::mv::partition::MvPartitionKey::new(key_spec_id, fields);
+            let key = crate::mv::model::MvPartitionKey::new(key_spec_id, fields);
             if !filter_owned.matches(&key) {
                 return Ok(None);
             }
@@ -1697,7 +1697,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 mod tests {
     use super::*;
     use crate::connector::iceberg::commit::PositionDeleteGroup;
-    use crate::engine::mv::partition::TargetPartitionFilter;
+    use crate::mv::model::TargetPartitionFilter;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -3372,7 +3372,7 @@ mod tests {
 
     #[test]
     fn framework_locate_allow_list_parity() {
-        use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+        use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
@@ -3619,7 +3619,7 @@ mod tests {
     /// filter; exactly one PositionDeleteGroup is produced.
     #[test]
     fn allow_list_with_contract_spec_id_keeps_matching_partition() {
-        use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+        use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let fixture = build_partitioned_apply_key_target_with_rows();

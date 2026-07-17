@@ -89,7 +89,7 @@ pub(crate) struct IcebergMvRefreshContext {
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
-    pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
     pub pruning_limits: MvRefreshPruningLimits,
 }
 
@@ -682,7 +682,7 @@ impl IcebergMvRefreshContext {
             target_entry,
             iceberg_catalog,
             target_table,
-            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+            crate::mv::model::AffectedTargetPartitions::not_derived(
                 "refresh context was constructed without planned affected partitions",
             ),
             pruning_limits,
@@ -703,7 +703,7 @@ impl IcebergMvRefreshContext {
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
-        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        affected_partitions: crate::mv::model::AffectedTargetPartitions,
     ) -> Result<Self, String> {
         Self::new_with_affected_partitions_and_pruning_limits(
             target,
@@ -737,7 +737,7 @@ impl IcebergMvRefreshContext {
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
-        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        affected_partitions: crate::mv::model::AffectedTargetPartitions,
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
@@ -775,9 +775,9 @@ impl IcebergMvRefreshContext {
 
     pub(crate) fn affected_partitions_to_target_partition_filter(
         &self,
-    ) -> crate::engine::mv::partition::TargetPartitionFilter {
+    ) -> crate::mv::model::TargetPartitionFilter {
         match &self.affected_partitions {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::mv::model::AffectedTargetPartitions::Known { partitions } => {
                 if self
                     .pruning_limits
                     .affected_partition_count_exceeds_limit(partitions.len())
@@ -789,16 +789,14 @@ impl IcebergMvRefreshContext {
                         fallback_reason = "affected_partition_threshold",
                         "falling back to unpartitioned target scan because affected partition allow-list exceeds configured threshold"
                     );
-                    crate::engine::mv::partition::TargetPartitionFilter::None
+                    crate::mv::model::TargetPartitionFilter::None
                 } else {
-                    crate::engine::mv::partition::TargetPartitionFilter::AllowList(
-                        partitions.clone(),
-                    )
+                    crate::mv::model::TargetPartitionFilter::AllowList(partitions.clone())
                 }
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
-            | crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { .. } => {
-                crate::engine::mv::partition::TargetPartitionFilter::None
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned
+            | crate::mv::model::AffectedTargetPartitions::NotDerived { .. } => {
+                crate::mv::model::TargetPartitionFilter::None
             }
         }
     }
@@ -1052,17 +1050,17 @@ impl IcebergMvRefreshContext {
     fn target_state_partition_allow_list(
         &self,
         scan: &IcebergMvTargetStateScan,
-    ) -> Result<Option<BTreeSet<crate::engine::mv::partition::MvPartitionKey>>, String> {
+    ) -> Result<Option<BTreeSet<crate::mv::model::MvPartitionKey>>, String> {
         match scan.partition_constraint {
             crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
                 Ok(None)
             }
             crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 match &self.affected_partitions {
-                    crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
+                    crate::mv::model::AffectedTargetPartitions::Unpartitioned => {
                         Ok(None)
                     }
-                    crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                    crate::mv::model::AffectedTargetPartitions::Known {
                         partitions,
                     } => {
                         if self
@@ -1082,7 +1080,7 @@ impl IcebergMvRefreshContext {
                             Ok(Some(partitions.clone()))
                         }
                     }
-                    crate::engine::mv::partition::AffectedTargetPartitions::NotDerived {
+                    crate::mv::model::AffectedTargetPartitions::NotDerived {
                         reason,
                     } => {
                         tracing::warn!(
@@ -1205,7 +1203,7 @@ fn data_files_at_snapshot(
 
 fn filter_target_state_files_by_partition(
     contract: &MvSchemaContract,
-    allow_list: &BTreeSet<crate::engine::mv::partition::MvPartitionKey>,
+    allow_list: &BTreeSet<crate::mv::model::MvPartitionKey>,
     files: Vec<IcebergDataFileInfo>,
     scan: &IcebergMvTargetStateScan,
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
@@ -1234,7 +1232,7 @@ fn filter_target_state_files_by_partition(
 fn target_file_partition_key(
     contract: &MvSchemaContract,
     file: &IcebergDataFileInfo,
-) -> Result<Option<crate::engine::mv::partition::MvPartitionKey>, String> {
+) -> Result<Option<crate::mv::model::MvPartitionKey>, String> {
     let Some(partition) = &contract.target.partition else {
         return Ok(None);
     };
@@ -1276,40 +1274,38 @@ fn target_file_partition_key(
                     file.path, partition_field.partition_field_name, expected_transform
                 )
             })?;
-        fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+        fields.push(crate::mv::model::MvPartitionKeyField::new(
             partition_field.partition_field_name.clone(),
             target_partition_value_to_mv_value(value)?,
         ));
     }
 
-    Ok(Some(crate::engine::mv::partition::MvPartitionKey::new(
-        spec_id, fields,
-    )))
+    Ok(Some(crate::mv::model::MvPartitionKey::new(spec_id, fields)))
 }
 
 fn target_partition_value_to_mv_value(
     value: &IcebergPartitionFieldValue,
-) -> Result<crate::engine::mv::partition::MvPartitionValue, String> {
+) -> Result<crate::mv::model::MvPartitionValue, String> {
     match &value.value {
-        None => Ok(crate::engine::mv::partition::MvPartitionValue::Null),
-        Some(IcebergPartitionValue::Boolean(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int32(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int64(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Float(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Double(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::String(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.clone()),
-        ),
+        None => Ok(crate::mv::model::MvPartitionValue::Null),
+        Some(IcebergPartitionValue::Boolean(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Int32(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Int64(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Float(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Double(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::String(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.clone()))
+        }
         Some(IcebergPartitionValue::Binary(_)) => Err(format!(
             "target partition field {} has unsupported binary value",
             value.field_name
@@ -1835,8 +1831,9 @@ pub(crate) mod tests_support {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog: fixture.iceberg_catalog.clone(),
             target_table: fixture.target_table.clone(),
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         }
     }
@@ -1968,8 +1965,9 @@ pub(crate) mod tests_support {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         };
         let scan = IcebergMvTargetStateScan {
@@ -2709,8 +2707,9 @@ mod tests {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         };
         let table = IcebergTableInfo {
@@ -3011,8 +3010,9 @@ mod tests {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits {
                 max_touched_groups: 100_000,
                 max_affected_partitions: 2,
@@ -3046,12 +3046,10 @@ mod tests {
             "unknown affected partitions should disable pruning"
         );
 
-        let new_key = crate::engine::mv::partition::MvPartitionKey::new(1, Vec::new());
-        let old_key = crate::engine::mv::partition::MvPartitionKey::new(2, Vec::new());
-        ctx.affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::known([
-            new_key.clone(),
-            old_key.clone(),
-        ]);
+        let new_key = crate::mv::model::MvPartitionKey::new(1, Vec::new());
+        let old_key = crate::mv::model::MvPartitionKey::new(2, Vec::new());
+        ctx.affected_partitions =
+            crate::mv::model::AffectedTargetPartitions::known([new_key.clone(), old_key.clone()]);
         let allow_list = ctx
             .target_state_partition_allow_list(&scan)
             .expect("known affected partitions should satisfy partition contract")
@@ -3069,7 +3067,7 @@ mod tests {
         );
         assert_eq!(
             ctx.affected_partitions_to_target_partition_filter(),
-            crate::engine::mv::partition::TargetPartitionFilter::None,
+            crate::mv::model::TargetPartitionFilter::None,
             "over-threshold affected partitions should disable merge-sink plan-time pruning"
         );
     }

@@ -2870,7 +2870,7 @@ pub(crate) fn refresh_iceberg_mv(
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+    let affected_partitions = crate::mv::model::AffectedTargetPartitions::not_derived(
         "refresh was executed without a planned affected partition set",
     );
     refresh_iceberg_mv_with_planned_partitions(
@@ -3299,7 +3299,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
-    planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
@@ -4088,7 +4088,7 @@ fn refresh_iceberg_aggregate_mv(
     all_bases_is_fan_in: bool,
     join_aliases: Option<&crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     // Tier-2 dispatch (Phase 3 / B2): single-base aggregate, fan-in aggregate
@@ -4206,7 +4206,7 @@ fn refresh_single_aggregate_iceberg_mv(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let [base_ref] = base_refs else {
         return Err(
@@ -4493,7 +4493,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     base_refs: &[TableIdentity],
     refresh: AllBasesAggregateRefresh<'_>,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     // Identity-gated branch-contract validation. `FanIn` already received its
     // validated schema contract; `BranchUnion` re-derives + validates it here,
@@ -4810,7 +4810,7 @@ fn refresh_join_aggregate_iceberg_mv(
     join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
     aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     _apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
         return Err(
@@ -5019,8 +5019,8 @@ fn refresh_join_aggregate_iceberg_mv(
 //     distribution, properties).
 // See the rejection in refresh_iceberg_mv for the user-facing error.
 
-fn unknown_join_affected_partitions() -> crate::engine::mv::partition::AffectedTargetPartitions {
-    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+fn unknown_join_affected_partitions() -> crate::mv::model::AffectedTargetPartitions {
+    crate::mv::model::AffectedTargetPartitions::not_derived(
         "join MV affected partition planning is not implemented",
     )
 }
@@ -5053,54 +5053,49 @@ fn base_snapshot_statuses_for_plan(
 
 fn noop_affected_partitions(
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-) -> crate::engine::mv::partition::AffectedTargetPartitions {
+) -> crate::mv::model::AffectedTargetPartitions {
     if is_unpartitioned_mv_contract(schema_contract) {
-        crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+        crate::mv::model::AffectedTargetPartitions::Unpartitioned
     } else {
-        crate::engine::mv::partition::AffectedTargetPartitions::known(std::iter::empty::<
-            crate::engine::mv::partition::MvPartitionKey,
+        crate::mv::model::AffectedTargetPartitions::known(std::iter::empty::<
+            crate::mv::model::MvPartitionKey,
         >())
     }
 }
 
 fn merge_affected_partition_results(
     context: &str,
-    results: impl IntoIterator<
-        Item = (
-            String,
-            crate::engine::mv::partition::AffectedTargetPartitions,
-        ),
-    >,
-) -> crate::engine::mv::partition::AffectedTargetPartitions {
+    results: impl IntoIterator<Item = (String, crate::mv::model::AffectedTargetPartitions)>,
+) -> crate::mv::model::AffectedTargetPartitions {
     let mut merged = BTreeSet::new();
     let mut saw_unpartitioned = false;
 
     for (base, result) in results {
         match result {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::mv::model::AffectedTargetPartitions::Known { partitions } => {
                 merged.extend(partitions);
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned => {
                 saw_unpartitioned = true;
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { reason } => {
-                return crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                    format!("{context}: {base}: {reason}"),
-                );
+            crate::mv::model::AffectedTargetPartitions::NotDerived { reason } => {
+                return crate::mv::model::AffectedTargetPartitions::not_derived(format!(
+                    "{context}: {base}: {reason}"
+                ));
             }
         }
     }
 
     if saw_unpartitioned {
         if merged.is_empty() {
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned
         } else {
-            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(format!(
+            crate::mv::model::AffectedTargetPartitions::not_derived(format!(
                 "{context}: mixed unpartitioned and partitioned branch results"
             ))
         }
     } else {
-        crate::engine::mv::partition::AffectedTargetPartitions::known(merged)
+        crate::mv::model::AffectedTargetPartitions::known(merged)
     }
 }
 
@@ -5112,21 +5107,21 @@ fn plan_multi_base_affected_partitions<'a>(
     current_snapshots: &BTreeMap<String, Option<i64>>,
     mut table_for_base: impl FnMut(&TableIdentity) -> Option<&'a iceberg::table::Table>,
     context: &str,
-) -> crate::engine::mv::partition::AffectedTargetPartitions {
+) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
         RefreshMode::Noop => noop_affected_partitions(schema_contract),
         RefreshMode::Full | RefreshMode::Rebuild => {
             if is_unpartitioned_mv_contract(schema_contract) {
-                crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+                crate::mv::model::AffectedTargetPartitions::Unpartitioned
             } else {
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived(format!(
+                crate::mv::model::AffectedTargetPartitions::not_derived(format!(
                     "{context}: full refresh affected partition planning is not implemented"
                 ))
             }
         }
         RefreshMode::Incremental => {
             if is_unpartitioned_mv_contract(schema_contract) {
-                return crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned;
+                return crate::mv::model::AffectedTargetPartitions::Unpartitioned;
             }
 
             let results = base_refs.iter().map(|base_ref| {
@@ -5136,8 +5131,8 @@ fn plan_multi_base_affected_partitions<'a>(
                     current_snapshots.get(&fqn).copied().flatten(),
                 ) {
                     (Some(previous), Some(current)) if previous == current => {
-                        crate::engine::mv::partition::AffectedTargetPartitions::known(
-                            std::iter::empty::<crate::engine::mv::partition::MvPartitionKey>(),
+                        crate::mv::model::AffectedTargetPartitions::known(
+                            std::iter::empty::<crate::mv::model::MvPartitionKey>(),
                         )
                     }
                     (Some(previous), Some(current)) => match table_for_base(base_ref) {
@@ -5149,19 +5144,19 @@ fn plan_multi_base_affected_partitions<'a>(
                                 },
                             ),
                             Err(err) => {
-                                crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                                crate::mv::model::AffectedTargetPartitions::not_derived(
                                     format!("failed to plan Iceberg changes for affected partitions: {err}"),
                                 )
                             }
                         },
-                        None => crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                        None => crate::mv::model::AffectedTargetPartitions::not_derived(
                             "base table was not loaded for affected partition planning",
                         ),
                     },
-                    (None, _) => crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                    (None, _) => crate::mv::model::AffectedTargetPartitions::not_derived(
                         "incremental affected partition planning missing previous snapshot",
                     ),
-                    (_, None) => crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                    (_, None) => crate::mv::model::AffectedTargetPartitions::not_derived(
                         "incremental affected partition planning missing current snapshot",
                     ),
                 };
@@ -5179,20 +5174,20 @@ fn plan_aggregate_mv_affected_partitions(
     previous_snapshot_id: Option<i64>,
     current_snapshot_id: Option<i64>,
     base_table: &iceberg::table::Table,
-) -> crate::engine::mv::partition::AffectedTargetPartitions {
+) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
         RefreshMode::Noop => noop_affected_partitions(schema_contract),
         RefreshMode::Incremental => {
             if is_unpartitioned_mv_contract(schema_contract) {
-                crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+                crate::mv::model::AffectedTargetPartitions::Unpartitioned
             } else {
                 let Some(previous) = previous_snapshot_id else {
-                    return crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                    return crate::mv::model::AffectedTargetPartitions::not_derived(
                         "incremental aggregate MV affected partition planning missing previous snapshot",
                     );
                 };
                 let Some(current) = current_snapshot_id else {
-                    return crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                    return crate::mv::model::AffectedTargetPartitions::not_derived(
                         "incremental aggregate MV affected partition planning missing current snapshot",
                     );
                 };
@@ -5203,19 +5198,15 @@ fn plan_aggregate_mv_affected_partitions(
                             change_batch: Some(&batch),
                         },
                     ),
-                    Err(err) => {
-                        crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                            format!(
-                                "failed to plan Iceberg changes for affected partitions: {err}"
-                            ),
-                        )
-                    }
+                    Err(err) => crate::mv::model::AffectedTargetPartitions::not_derived(format!(
+                        "failed to plan Iceberg changes for affected partitions: {err}"
+                    )),
                 }
             }
         }
         RefreshMode::Full | RefreshMode::Rebuild => {
             if is_unpartitioned_mv_contract(schema_contract) {
-                crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+                crate::mv::model::AffectedTargetPartitions::Unpartitioned
             } else {
                 crate::engine::mv::partition::planner::plan_affected_partitions(
                     &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
@@ -5240,7 +5231,7 @@ fn is_unpartitioned_mv_contract(
 
 fn log_planned_iceberg_mv_affected_partitions(
     iceberg_target: &IcebergMvTarget,
-    affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) {
     tracing::info!(
         target = %format!(
@@ -5612,43 +5603,42 @@ pub(crate) fn plan_iceberg_mv_refresh(
     let mode = plan_refresh_mode_from_decision(refresh_decision)?;
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
-    let affected_partitions =
-        match mode {
-            RefreshMode::Noop => noop_affected_partitions(schema_contract),
-            RefreshMode::Incremental => {
-                if is_unpartitioned_mv_contract(schema_contract) {
-                    crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
-                } else {
-                    let previous =
-                        previous_snapshot_id.expect("incremental refresh has previous snapshot");
-                    let current =
-                        current_snapshot_id.expect("incremental refresh has current snapshot");
-                    match plan_changes(&loaded.table, previous, Some(current), &[]) {
+    let affected_partitions = match mode {
+        RefreshMode::Noop => noop_affected_partitions(schema_contract),
+        RefreshMode::Incremental => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::mv::model::AffectedTargetPartitions::Unpartitioned
+            } else {
+                let previous =
+                    previous_snapshot_id.expect("incremental refresh has previous snapshot");
+                let current =
+                    current_snapshot_id.expect("incremental refresh has current snapshot");
+                match plan_changes(&loaded.table, previous, Some(current), &[]) {
                     Ok(batch) => crate::engine::mv::partition::planner::plan_affected_partitions(
                         &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
                             schema_contract,
                             change_batch: Some(&batch),
                         },
                     ),
-                    Err(err) => crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                        format!("failed to plan Iceberg changes for affected partitions: {err}"),
-                    ),
-                }
-                }
-            }
-            RefreshMode::Full | RefreshMode::Rebuild => {
-                if is_unpartitioned_mv_contract(schema_contract) {
-                    crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
-                } else {
-                    crate::engine::mv::partition::planner::plan_affected_partitions(
-                        &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
-                            schema_contract,
-                            change_batch: None,
-                        },
-                    )
+                    Err(err) => crate::mv::model::AffectedTargetPartitions::not_derived(format!(
+                        "failed to plan Iceberg changes for affected partitions: {err}"
+                    )),
                 }
             }
-        };
+        }
+        RefreshMode::Full | RefreshMode::Rebuild => {
+            if is_unpartitioned_mv_contract(schema_contract) {
+                crate::mv::model::AffectedTargetPartitions::Unpartitioned
+            } else {
+                crate::engine::mv::partition::planner::plan_affected_partitions(
+                    &crate::engine::mv::partition::planner::AffectedPartitionPlanInput {
+                        schema_contract,
+                        change_batch: None,
+                    },
+                )
+            }
+        }
+    };
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
         mv_id: Some(mv_definition.mv_id),
@@ -6239,7 +6229,7 @@ fn build_iceberg_refresh_plan(
     base_refs: &[TableIdentity],
     snapshot_pins: BTreeMap<String, Option<i64>>,
     mode: RefreshMode,
-    affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    affected_partitions: crate::mv::model::AffectedTargetPartitions,
 ) -> RefreshPlan {
     RefreshPlan {
         mv_id: Some(mv_definition.mv_id),
@@ -7831,7 +7821,7 @@ fn finalize_iceberg_mv_refresh(
 
 enum IcebergMvPartitionStateFinalize<'a> {
     Clear,
-    FromAffected(&'a crate::engine::mv::partition::AffectedTargetPartitions),
+    FromAffected(&'a crate::mv::model::AffectedTargetPartitions),
 }
 
 fn finalize_iceberg_mv_refresh_with_partition_state(
@@ -8148,7 +8138,7 @@ fn finalize_iceberg_mv_partition_state(
                 .map_err(|e| format!("clear iceberg mv partition state failed: {e}"))?;
         }
         IcebergMvPartitionStateFinalize::FromAffected(affected) => match affected {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::mv::model::AffectedTargetPartitions::Known { partitions } => {
                 let partition_keys = partitions
                     .iter()
                     .map(|key| key.canonical_string())
@@ -8177,13 +8167,13 @@ fn finalize_iceberg_mv_partition_state(
                     "iceberg mv partition state refreshed"
                 );
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned => {
                 state
                     .mv_repo
                     .clear_partition_states(txn, mv_id)
                     .map_err(|e| format!("clear unpartitioned iceberg mv state failed: {e}"))?;
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { reason } => {
+            crate::mv::model::AffectedTargetPartitions::NotDerived { reason } => {
                 state
                     .mv_repo
                     .clear_partition_states(txn, mv_id)
@@ -11883,12 +11873,12 @@ mod partition_planning_tests {
         TargetContract, TargetVisibleColumn,
     };
 
-    fn key(value: &str) -> crate::engine::mv::partition::MvPartitionKey {
-        crate::engine::mv::partition::MvPartitionKey::new(
+    fn key(value: &str) -> crate::mv::model::MvPartitionKey {
+        crate::mv::model::MvPartitionKey::new(
             7,
-            vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+            vec![crate::mv::model::MvPartitionKeyField::new(
                 "region".to_string(),
-                crate::engine::mv::partition::MvPartitionValue::String(value.to_string()),
+                crate::mv::model::MvPartitionValue::String(value.to_string()),
             )],
         )
     }
@@ -11968,24 +11958,18 @@ mod partition_planning_tests {
             vec![
                 (
                     "ice.db.left".to_string(),
-                    crate::engine::mv::partition::AffectedTargetPartitions::known([
-                        key("west"),
-                        key("east"),
-                    ]),
+                    crate::mv::model::AffectedTargetPartitions::known([key("west"), key("east")]),
                 ),
                 (
                     "ice.db.right".to_string(),
-                    crate::engine::mv::partition::AffectedTargetPartitions::known([
-                        key("east"),
-                        key("north"),
-                    ]),
+                    crate::mv::model::AffectedTargetPartitions::known([key("east"), key("north")]),
                 ),
             ],
         );
 
         assert_eq!(
             merged,
-            crate::engine::mv::partition::AffectedTargetPartitions::known([
+            crate::mv::model::AffectedTargetPartitions::known([
                 key("east"),
                 key("north"),
                 key("west"),
@@ -12000,11 +11984,11 @@ mod partition_planning_tests {
             vec![
                 (
                     "ice.db.left".to_string(),
-                    crate::engine::mv::partition::AffectedTargetPartitions::known([key("west")]),
+                    crate::mv::model::AffectedTargetPartitions::known([key("west")]),
                 ),
                 (
                     "ice.db.right".to_string(),
-                    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+                    crate::mv::model::AffectedTargetPartitions::not_derived(
                         "missing file partition metadata",
                     ),
                 ),
@@ -12044,8 +12028,8 @@ mod partition_planning_tests {
 
         assert_eq!(
             planned,
-            crate::engine::mv::partition::AffectedTargetPartitions::known(std::iter::empty::<
-                crate::engine::mv::partition::MvPartitionKey,
+            crate::mv::model::AffectedTargetPartitions::known(std::iter::empty::<
+                crate::mv::model::MvPartitionKey,
             >(),)
         );
     }
@@ -14067,7 +14051,7 @@ fn execute_join_delta_branches(
     aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     ctx: &IcebergMvRefreshContext,
-    affected_partitions: &crate::engine::mv::partition::AffectedTargetPartitions,
+    affected_partitions: &crate::mv::model::AffectedTargetPartitions,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
@@ -23205,7 +23189,7 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("second refresh plan");
 
-        let crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } =
+        let crate::mv::model::AffectedTargetPartitions::Known { partitions } =
             plan.affected_partitions
         else {
             panic!(
@@ -23224,11 +23208,11 @@ mod tests {
                 .metadata()
                 .default_partition_spec()
                 .spec_id();
-        let expected_partition = crate::engine::mv::partition::MvPartitionKey::new(
+        let expected_partition = crate::mv::model::MvPartitionKey::new(
             target_spec_id,
-            vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+            vec![crate::mv::model::MvPartitionKeyField::new(
                 "id".to_string(),
-                crate::engine::mv::partition::MvPartitionValue::String("2".to_string()),
+                crate::mv::model::MvPartitionValue::String("2".to_string()),
             )],
         );
         assert_eq!(
@@ -23256,7 +23240,7 @@ mod tests {
 
         assert_eq!(
             plan.affected_partitions,
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned
         );
     }
 
@@ -23638,12 +23622,12 @@ mod tests {
             .expect("record staging");
         record_iceberg_mv_publish_commit(&env.state, refresh_id, 40).expect("record publish");
 
-        let affected = crate::engine::mv::partition::AffectedTargetPartitions::known([
-            crate::engine::mv::partition::MvPartitionKey::new(
+        let affected = crate::mv::model::AffectedTargetPartitions::known([
+            crate::mv::model::MvPartitionKey::new(
                 7,
-                vec![crate::engine::mv::partition::MvPartitionKeyField::new(
+                vec![crate::mv::model::MvPartitionKeyField::new(
                     "region".to_string(),
-                    crate::engine::mv::partition::MvPartitionValue::String("east".to_string()),
+                    crate::mv::model::MvPartitionValue::String("east".to_string()),
                 )],
             ),
         ]);

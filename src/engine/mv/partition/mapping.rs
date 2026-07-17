@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::connector::iceberg::changes::{ChangePartitionFieldValue, ChangePartitionValue};
-use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::meta::repository::mv_contract::{
     ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
 };
+use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
 pub(crate) fn map_file_partition_to_mv_key(
     contract: &MvSchemaContract,

@@ -26,70 +26,11 @@
 use std::collections::BTreeSet;
 
 use crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout;
-use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
+use crate::mv::model::{MvPartitionKey, MvPartitionKeyField};
 #[cfg(test)]
 use crate::runtime::query_result::record_batch_to_chunk;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AffectedTargetPartitions {
-    Unpartitioned,
-    Known {
-        partitions: BTreeSet<MvPartitionKey>,
-    },
-    NotDerived {
-        reason: String,
-    },
-}
-
-impl AffectedTargetPartitions {
-    pub(crate) fn known<I: IntoIterator<Item = MvPartitionKey>>(partitions: I) -> Self {
-        Self::Known {
-            partitions: partitions.into_iter().collect(),
-        }
-    }
-
-    pub(crate) fn not_derived(reason: impl Into<String>) -> Self {
-        Self::NotDerived {
-            reason: reason.into(),
-        }
-    }
-
-    pub(crate) fn not_derived_reason(&self) -> Option<&str> {
-        match self {
-            Self::NotDerived { reason } => Some(reason.as_str()),
-            Self::Unpartitioned | Self::Known { .. } => None,
-        }
-    }
-
-    pub(crate) fn is_not_derived(&self) -> bool {
-        matches!(self, Self::NotDerived { .. })
-    }
-
-    pub(crate) fn partition_count(&self) -> usize {
-        match self {
-            Self::Unpartitioned | Self::NotDerived { .. } => 0,
-            Self::Known { partitions } => partitions.len(),
-        }
-    }
-
-    /// Convert to a `TargetPartitionFilter` for file-scan pruning. `Known`
-    /// becomes an `AllowList`; `Unpartitioned` and `NotDerived` become `None`
-    /// (no pruning). Pruning is an optimization (umbrella spec §4.3 / D5
-    /// BestEffort): a `NotDerived` outcome must never restrict the scan. The
-    /// empty `Known` set legitimately produces an empty `AllowList` (nothing
-    /// affected), which the locator honors by scanning zero files.
-    pub(crate) fn to_target_partition_filter(
-        &self,
-    ) -> crate::engine::mv::partition::TargetPartitionFilter {
-        use crate::engine::mv::partition::TargetPartitionFilter;
-        match self {
-            Self::Known { partitions } => TargetPartitionFilter::AllowList(partitions.clone()),
-            Self::Unpartitioned | Self::NotDerived { .. } => TargetPartitionFilter::None,
-        }
-    }
-}
 
 /// Reasons aggregate-delta partition derivation can refuse a delta batch.
 /// Every variant carries enough context for the refresh error message to
@@ -432,8 +373,8 @@ fn arrow_array_row_to_partition_value(
     array: &dyn arrow::array::Array,
     row: usize,
     field: &str,
-) -> Result<crate::engine::mv::partition::MvPartitionValue, AffectedPartitionError> {
-    use crate::engine::mv::partition::MvPartitionValue;
+) -> Result<crate::mv::model::MvPartitionValue, AffectedPartitionError> {
+    use crate::mv::model::MvPartitionValue;
     use arrow::array::{
         BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
         Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -550,7 +491,9 @@ fn arrow_array_row_to_partition_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+    use crate::mv::model::{
+        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
+    };
 
     fn key(value: &str) -> MvPartitionKey {
         MvPartitionKey::new(
@@ -578,7 +521,7 @@ mod tests {
     fn to_target_partition_filter_maps_known_to_allow_list() {
         let result = AffectedTargetPartitions::known([key("a"), key("b")]);
         let filter = result.to_target_partition_filter();
-        let crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) = filter else {
+        let crate::mv::model::TargetPartitionFilter::AllowList(set) = filter else {
             panic!("expected AllowList");
         };
         assert_eq!(set.len(), 2);
@@ -590,7 +533,7 @@ mod tests {
     fn to_target_partition_filter_maps_empty_known_to_empty_allow_list() {
         let filter = AffectedTargetPartitions::known(std::iter::empty::<MvPartitionKey>())
             .to_target_partition_filter();
-        let crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) = filter else {
+        let crate::mv::model::TargetPartitionFilter::AllowList(set) = filter else {
             panic!("expected AllowList for empty Known set");
         };
         assert!(set.is_empty());
@@ -600,11 +543,11 @@ mod tests {
     fn to_target_partition_filter_maps_unpartitioned_and_not_derived_to_none() {
         assert_eq!(
             AffectedTargetPartitions::Unpartitioned.to_target_partition_filter(),
-            crate::engine::mv::partition::TargetPartitionFilter::None
+            crate::mv::model::TargetPartitionFilter::None
         );
         assert_eq!(
             AffectedTargetPartitions::not_derived("x").to_target_partition_filter(),
-            crate::engine::mv::partition::TargetPartitionFilter::None
+            crate::mv::model::TargetPartitionFilter::None
         );
     }
 
