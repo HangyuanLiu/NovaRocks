@@ -70,17 +70,12 @@ use crate::engine::mv::lifecycle::{
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
-use crate::engine::mv::refresh_contract::{ApplyKeyContract, ImvRefreshContract, RewriteEvidence};
-use crate::engine::mv::refresh_driver::{
-    BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
-};
 use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
 use crate::engine::mv::refresh_property::{
-    RefreshCapabilities, RefreshFragmentProperty, RefreshIdentity, TargetIdentity,
-    derive_fragment_property,
+    RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
@@ -101,6 +96,12 @@ use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
 use crate::mv::persistence::schema as mv_schema;
+use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
+use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
+use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::snapshot::{
+    BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
+};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -211,8 +212,7 @@ pub(crate) fn create_iceberg_mv(
         current_database,
         &canonical_select_query,
     )?;
-    let refresh_contract =
-        crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)?;
+    let refresh_contract = derive_imv_refresh_contract(&analysis)?;
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let created_at_ms = now_ms();
     let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
@@ -9985,7 +9985,7 @@ fn derive_refresh_contract_for_strategy_dispatch(
 ) -> Result<
     (
         sqlparser::ast::Query,
-        crate::engine::mv::refresh_contract::ImvRefreshContract,
+        crate::mv::refresh::contract::ImvRefreshContract,
     ),
     String,
 > {
@@ -10030,9 +10030,9 @@ fn derive_refresh_contract_from_query(
     current_catalog: Option<&str>,
     current_database: &str,
     select_query: &sqlparser::ast::Query,
-) -> Result<crate::engine::mv::refresh_contract::ImvRefreshContract, String> {
+) -> Result<crate::mv::refresh::contract::ImvRefreshContract, String> {
     let analysis = analyze_mv_select(state, current_catalog, current_database, select_query)?;
-    crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)
+    derive_imv_refresh_contract(&analysis)
 }
 
 fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
@@ -14584,7 +14584,7 @@ fn rewrite_merge_refresh_evidence(apply_key: ApplyKeyContract) -> RewriteMergeRe
         (RewriteEvidence::None, _) => RewriteMergeRefreshEvidence::None,
         (
             RewriteEvidence::Aggregate,
-            crate::engine::mv::apply_key::ApplyKeyValueType::BranchUtf8,
+            crate::mv::refresh::apply_key::ApplyKeyValueType::BranchUtf8,
         ) => RewriteMergeRefreshEvidence::BranchUnionAggregate,
         (RewriteEvidence::Aggregate, _) => RewriteMergeRefreshEvidence::Aggregate,
         (RewriteEvidence::JoinAggregate, _) => RewriteMergeRefreshEvidence::JoinAggregate,
@@ -16034,8 +16034,8 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::apply_key::ApplyKeyValueType;
-    use crate::engine::mv::refresh_property::PartitionPruningPolicy;
+    use crate::mv::refresh::apply_key::ApplyKeyValueType;
+    use crate::mv::refresh::capabilities::PartitionPruningPolicy;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
@@ -16509,7 +16509,7 @@ mod tests {
 
     #[test]
     fn create_apply_key_metadata_comes_from_refresh_contract() {
-        use crate::engine::mv::refresh_contract::ApplyKeyContract;
+        use crate::mv::refresh::apply_key::ApplyKeyContract;
 
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
@@ -16920,8 +16920,7 @@ mod tests {
         .expect("parse");
         let analysis =
             analyze_mv_select(&env.state, Some("ice_fan_in"), "sales", &query).expect("analyze");
-        let contract = crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)
-            .expect("derive");
+        let contract = derive_imv_refresh_contract(&analysis).expect("derive");
         // FanInAggregate: aggregate over a UNION ALL of simple scans.
         // Contract fields: aggregate present, branch present (the fan-in union),
         // no join, apply key is aggregate_group_row (Utf8, group-row-id column).
@@ -16939,7 +16938,7 @@ mod tests {
         );
         assert_eq!(
             contract.apply_key,
-            crate::engine::mv::refresh_contract::ApplyKeyContract::aggregate_group_row(),
+            crate::mv::refresh::apply_key::ApplyKeyContract::aggregate_group_row(),
         );
         assert_eq!(contract.base_refs.len(), 2);
     }
@@ -22123,9 +22122,7 @@ mod tests {
             find_apply_key_field_id_by_column(&loaded.table, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN)
                 .expect("apply-key field");
 
-        let refresh_contract =
-            crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)
-                .expect("refresh contract");
+        let refresh_contract = derive_imv_refresh_contract(&analysis).expect("refresh contract");
         let property =
             derive_fragment_property(&analysis.resolved_query).expect("fragment property");
         let contract = build_iceberg_mv_schema_contract(

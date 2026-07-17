@@ -15,10 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::catalog::identifier::TableIdentity;
+use crate::mv::refresh::apply_key::ApplyKeyContract;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImvRefreshContract {
+    pub(crate) base_refs: Vec<TableIdentity>,
+    pub(crate) apply_key: ApplyKeyContract,
+    pub(crate) aggregate: Option<AggregateRefreshContract>,
+    pub(crate) join: Option<JoinRefreshContract>,
+    pub(crate) branch: Option<BranchRefreshContract>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ApplyKeyValueType {
-    Int64,
-    Utf8,
-    BranchInt64,
-    BranchUtf8,
+pub(crate) struct AggregateRefreshContract {
+    pub(crate) group_key_count: usize,
+    pub(crate) aggregate_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinRefreshContract {
+    pub(crate) join_key_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BranchRefreshContract {
+    pub(crate) branch_count: usize,
 }
