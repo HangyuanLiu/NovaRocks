@@ -28,11 +28,7 @@ use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::identifier::resolve_local_table_name;
 use crate::catalog::partition::LegacyRangePartition;
 use crate::catalog::schema::SqlType;
-use crate::engine::{
-    StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
-    delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
-    persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
-};
+use crate::engine::{StandaloneState, StatementResult, delete_catalog_attachment_if_needed};
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
 use sqlparser::keywords::Keyword;
@@ -847,9 +843,6 @@ pub(crate) fn execute_create_database_statement(
         return Ok(StatementResult::Ok);
     }
     backend.create_namespace(&target.catalog, &target.namespace)?;
-    if target.backend_name == "iceberg" {
-        persist_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
-    }
     Ok(StatementResult::Ok)
 }
 
@@ -938,14 +931,6 @@ pub(crate) fn execute_create_table_statement(
                 properties,
             })?;
             let _ = legacy_range_partitions;
-            if target.backend_name == "iceberg" {
-                persist_iceberg_table_if_needed(
-                    state,
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                )?;
-            }
             Ok(StatementResult::Ok)
         }
     }
@@ -1024,12 +1009,7 @@ pub(crate) fn execute_drop_database_statement(
         )?;
     }
     match backend.drop_namespace(&target.catalog, &target.namespace, force) {
-        Ok(()) => {
-            if target.backend_name == "iceberg" {
-                delete_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
-            }
-            Ok(StatementResult::Ok)
-        }
+        Ok(()) => Ok(StatementResult::Ok),
         Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
         Err(err) if if_exists && target.backend_name == "iceberg" && err.contains("namespace") => {
             Ok(StatementResult::Ok)
@@ -1095,12 +1075,6 @@ pub(crate) fn execute_drop_table_statement(
     match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
         Ok(()) => {
             if target.backend_name == "iceberg" {
-                delete_iceberg_table_if_needed(
-                    state,
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                )?;
                 state.catalog_service.invalidate_table(
                     &target.catalog,
                     &target.namespace,
