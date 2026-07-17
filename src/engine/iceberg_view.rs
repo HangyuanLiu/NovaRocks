@@ -212,6 +212,7 @@ fn analyze_view_query(
         Some(catalog),
         &catalog_service_snapshot,
         &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, namespace)
         .map_err(|e| format!("analyze view definition failed: {e}"))?;

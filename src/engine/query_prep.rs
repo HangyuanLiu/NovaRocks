@@ -956,6 +956,7 @@ mod tests {
             Some("ice"),
             &catalog_service,
             &connectors,
+            crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let query = parse_query_for_table_names("SELECT * FROM parted");
 
