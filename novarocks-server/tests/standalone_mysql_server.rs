@@ -51,7 +51,7 @@ impl ServerGuard {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn standalone-server");
+            .expect("spawn standalone");
         Self { child, _lock: lock }
     }
 
@@ -78,7 +78,7 @@ fn wait_for_mysql(port: u16, user: &str, password: Option<&str>, child: &mut Chi
             if let Some(mut stderr) = child.stderr.take() {
                 let _ = stderr.read_to_string(&mut output);
             }
-            panic!("standalone-server exited early with status {status}: {output}");
+            panic!("standalone exited early with status {status}: {output}");
         }
 
         let builder = OptsBuilder::new()
@@ -102,7 +102,7 @@ fn wait_for_mysql(port: u16, user: &str, password: Option<&str>, child: &mut Chi
                         let _ = stderr.read_to_string(&mut output);
                     }
                     panic!(
-                        "mysql connection to standalone-server failed: {}\nchild output:\n{output}",
+                        "mysql connection to standalone failed: {}\nchild output:\n{output}",
                         err_text
                     );
                 }
@@ -209,7 +209,7 @@ user = "root"
 fn standalone_server_args_with_metadata(mysql_port: u16) -> (TempDir, Vec<String>) {
     let (config_dir, config_path) = write_standalone_metadata_config(mysql_port);
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--config".to_string(),
         config_path.display().to_string(),
     ];
@@ -288,14 +288,14 @@ fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> Str
 fn standalone_mysql_server_accepts_queries_and_session_noops_without_bootstrap_tables() {
     let port = alloc_port();
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
-    conn.ping().expect("ping standalone-server");
+    conn.ping().expect("ping standalone");
     conn.query_drop("USE default").expect("USE default");
     conn.query_drop("SET NAMES utf8mb4")
         .expect("SET NAMES utf8mb4");
@@ -312,7 +312,7 @@ fn standalone_mysql_server_accepts_queries_and_session_noops_without_bootstrap_t
 fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
     let port = alloc_port();
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
@@ -563,7 +563,7 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 fn standalone_mysql_server_rejects_no_catalog_persistent_table() {
     let port = alloc_port();
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
@@ -581,7 +581,7 @@ fn standalone_mysql_server_rejects_no_catalog_persistent_table() {
 fn standalone_mysql_server_rejects_default_catalog_persistent_table() {
     let port = alloc_port();
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--port".to_string(),
         port.to_string(),
     ];
@@ -604,7 +604,7 @@ fn standalone_mysql_server_rejects_legacy_starrocks_table_config_target() {
     let (_config_dir, config_path) = write_legacy_starrocks_table_config(port);
 
     let args = vec![
-        "standalone-server".to_string(),
+        "standalone".to_string(),
         "--config".to_string(),
         config_path.display().to_string(),
     ];

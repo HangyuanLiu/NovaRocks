@@ -447,13 +447,13 @@ start_server_stage() {
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "standalone-server" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "standalone-server failed to become ready" "$log_path"
+    ci_record_stage "standalone" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "standalone failed to become ready" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "standalone-server" "PASS" "$duration" "$log_path"
+  ci_record_stage "standalone" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
@@ -878,20 +878,20 @@ stop_server_for_native_cross_process_stage() {
 
   start="$(ci_epoch)"
   {
-    echo "Stopping standalone-server before native cross-process SQL suites."
+    echo "Stopping standalone before native cross-process SQL suites."
     ci_stop_standalone_server
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "standalone-server stop for native cross-process" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "standalone-server stop for native cross-process failed" "$log_path"
+    ci_record_stage "standalone stop for native cross-process" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "standalone stop for native cross-process failed" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "standalone-server stop for native cross-process" "PASS" "$duration" "$log_path"
+  ci_record_stage "standalone stop for native cross-process" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
@@ -1074,7 +1074,7 @@ main() {
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
     start_server_stage
   else
-    ci_record_stage "standalone-server" "SKIP" "0" ""
+    ci_record_stage "standalone" "SKIP" "0" ""
     ci_render_summary "RUNNING"
   fi
   run_sql_suites

@@ -84,7 +84,7 @@ struct ProcessGuard {
 impl ProcessGuard {
     fn spawn(config_path: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
-            .arg("standalone-server")
+            .arg("standalone")
             .arg("--config")
             .arg(config_path)
             .stdout(Stdio::piped())

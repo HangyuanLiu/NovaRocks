@@ -1,0 +1,27 @@
+[package]
+name = "novarocks-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "novarocks"
+path = "src/main.rs"
+
+[dependencies]
+novarocks = { path = "../novarocks/core" }
+anyhow = "1"
+ctrlc = "3.4"
+libc = "0.2"
+tracing = "0.1"
+
+[features]
+# Forward to the core crate's compat feature so the FE-compatible daemon
+# startup blocks (`#[cfg(feature = "compat")]` in main.rs) compile and the
+# compat-only services are exposed. Off by default (native build).
+compat = ["novarocks/compat"]
+
+[dev-dependencies]
+# E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.
+mysql = "25"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

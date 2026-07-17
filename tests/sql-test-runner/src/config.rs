@@ -443,7 +443,7 @@ pub fn suite_default_catalog(suite_name: &str) -> String {
         // NDV (Puffin statistics) reaches the cost-based optimizer; managed-lake
         // (StarRocks-type) tables are intentionally not exercised here. The
         // `iceberg_opt` catalog is created by `sql-tests/optimizer/init.sql`. A
-        // stable catalog name is safe: each worktree's standalone-server has its
+        // stable catalog name is safe: each worktree's standalone has its
         // own in-memory catalog registry, and per-case `${case_db}` reset
         // isolates data between cases.
         "optimizer" | "optimizer-dist" => "iceberg_opt".to_string(),

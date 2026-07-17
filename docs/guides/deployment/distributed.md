@@ -108,7 +108,7 @@ enable_path_style_access = true
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone-server --role be --config ./be-1.toml
+./target/release/novarocks standalone --role be --config ./be-1.toml
 ```
 
 启动成功后会输出：
@@ -159,7 +159,7 @@ backends = [
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone-server --role fe --config ./fe.toml
+./target/release/novarocks standalone --role fe --config ./fe.toml
 ```
 
 启动成功后会输出：

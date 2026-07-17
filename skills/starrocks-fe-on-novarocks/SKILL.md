@@ -122,7 +122,7 @@ ls -la "${STARROCKS_ROOT}/output/fe/lib/fe-core-main.jar"
 
 如果联调同时涉及 NovaRocks Rust 代码，修改源码后用 `--package --output` 直接覆盖 BE 运行目录。
 
-**关键：必须加 `--features compat`**，否则 brpc 通信层不会编译，FE 无法与 BE 正常交互（heartbeat、plan submission 等全部走 brpc/C++ shim）。没有 `compat` feature 的 binary 只能用于 standalone-server 模式。
+**关键：必须加 `--features compat`**，否则 brpc 通信层不会编译，FE 无法与 BE 正常交互（heartbeat、plan submission 等全部走 brpc/C++ shim）。没有 `compat` feature 的 binary 只能用于 standalone 模式。
 
 ```bash
 cd "${NOVAROCKS_ROOT}"

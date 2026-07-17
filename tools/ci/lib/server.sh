@@ -46,12 +46,12 @@ ci_start_standalone_server() {
   binary_path="$(ci_novarocks_binary_path "$cargo_profile")"
 
   {
-    printf "+ NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 NO_PROXY=127.0.0.1,localhost %q standalone-server --config %q\n" \
+    printf "+ NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 NO_PROXY=127.0.0.1,localhost %q standalone --config %q\n" \
       "$binary_path" \
       "$config_path"
     NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 \
     NO_PROXY=127.0.0.1,localhost \
-      "$binary_path" standalone-server \
+      "$binary_path" standalone \
         --config "$config_path"
   } >"$log_path" 2>&1 &
   CI_SERVER_PID=$!

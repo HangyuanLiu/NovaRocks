@@ -26,7 +26,7 @@ under the License.
 Only Iceberg REST, managed-lake, and other object-store-backed suites require a
 reachable MinIO-compatible object store at `http://127.0.0.1:9000`.
 
-Default credentials (matching the standalone-server defaults):
+Default credentials (matching the standalone defaults):
 
 - access key: `admin`
 - secret key: `admin123`
@@ -53,7 +53,7 @@ minio server ~/minio-data --console-address :9001 &
 Start the standalone server on `9030`:
 
 ```bash
-NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
 ```
 
 Then run a suite:

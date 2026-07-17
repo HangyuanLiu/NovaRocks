@@ -1,0 +1,137 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "novarocks"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "state-store-foundationdb-helper"
+path = "tests/support/state_store_foundationdb_helper.rs"
+required-features = ["foundationdb-provider", "state-store-test-hooks"]
+test = false
+bench = false
+
+[[bin]]
+name = "state-store-mysql-helper"
+path = "tests/support/state_store_mysql_helper.rs"
+required-features = ["mysql-state-store-provider", "state-store-test-hooks"]
+test = false
+bench = false
+
+[dependencies]
+novarocks-version = { path = "../version" }
+
+# logging/config
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
+chrono = "0.4"
+chrono-tz = "0.10"
+atty = "0.2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# engine/connectors
+arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+arrow-buffer = { version = "58.2.0" }
+arrow-data = { version = "58.2.0" }
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+orc-rust = { version = "0.8.0", default-features = false }
+apache-avro = "0.21.0"
+iceberg = "0.9.0"
+iceberg-catalog-rest = "0.9.0"
+iceberg-catalog-hms = "0.9.0"
+typetag = "0.2"
+opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
+futures = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+mysql = "25"
+mysql_common = "0.32"
+mysql_async = { version = "=0.37.0", optional = true, default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false }
+url = "2"
+rand = "0.8"
+regex = "1.10"
+sqlparser = "0.61.0"
+hex = "0.4"
+libm = "0.2"
+num-traits = "0.2"
+ordered-float = "4"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+fs2 = "0.4"
+as-any = "0.3"
+opensrv-mysql = { version = "0.7", default-features = false }
+foundationdb = { version = "=0.11.0", optional = true, default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
+
+# starust core
+thrift = "0.17"
+threadpool = "1"
+serde_json = "1"
+bytes = "1"
+csv = "1"
+hashbrown = { version = "0.14", features = ["raw"] }
+prost = "0.13"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.12", features = ["transport"] }
+axum = "0.7"
+tokio-stream = "0.1"
+ctrlc = "3.4"
+prometheus = "0.13"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+md-5 = "0.10"
+openssl = "0.10"
+sha2 = "0.10"
+sm3 = "0.4"
+twox-hash = "2.1"
+ryu = "1"
+
+# cache
+moka = { version = "0.12", features = ["sync"] }
+once_cell = "1.19"
+libc = "0.2"
+num_cpus = "1"
+crc32c = "0.6"
+crc32fast = "1"
+lz4_flex = "0.11"
+roaring = "0.10"
+datasketches = "0.2.0"
+tdigest = { version = "0.2.3", features = ["use_serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+
+[features]
+foundationdb-provider = ["dep:foundationdb"]
+mysql-state-store-provider = ["dep:mysql_async", "dep:rustls"]
+state-store-test-hooks = []
+ssb = []
+compat = []
+
+[build-dependencies]
+cc = "1.2"
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+which = "6"

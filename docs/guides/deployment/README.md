@@ -46,7 +46,7 @@ under the License.
 
 ## 分布式部署
 
-分布式部署使用 `standalone-server` 的 `fe` / `be` 角色拆分执行链路。FE 角色负责 MySQL 协议、SQL 解析、优化和任务调度；BE 角色负责接收 fragment、执行算子并回传结果。
+分布式部署使用 `standalone` 的 `fe` / `be` 角色拆分执行链路。FE 角色负责 MySQL 协议、SQL 解析、优化和任务调度；BE 角色负责接收 fragment、执行算子并回传结果。
 
 阅读：[分布式部署](distributed.md)
 

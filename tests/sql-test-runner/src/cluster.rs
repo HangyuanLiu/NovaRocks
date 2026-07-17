@@ -365,7 +365,7 @@ pub(crate) fn resolve_base_app_config_path(
         return Ok(fallback);
     }
 
-    bail!("failed to locate standalone-server config for cross-process mode")
+    bail!("failed to locate standalone config for cross-process mode")
 }
 
 /// Render the per-process TOML config for cross-process mode.
@@ -1084,7 +1084,7 @@ impl Drop for ProcessGuard {
 pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) -> Command {
     let mut command = Command::new(binary);
     command
-        .arg("standalone-server")
+        .arg("standalone")
         .arg("--role")
         .arg(role)
         .arg("--config")

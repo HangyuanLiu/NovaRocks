@@ -42,7 +42,7 @@ cargo build
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/debug/novarocks standalone-server --config ./novarocks.toml
+./target/debug/novarocks standalone --config ./novarocks.toml
 ```
 
 生产或准生产部署建议使用 release 构建：
@@ -113,21 +113,21 @@ enable_path_style_access = true
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config ./novarocks.toml
+cargo run -p novarocks-server -- standalone --config ./novarocks.toml
 ```
 
 使用已构建的二进制启动：
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone-server --config ./novarocks.toml
+./target/release/novarocks standalone --config ./novarocks.toml
 ```
 
 也可以临时覆盖 MySQL 端口：
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone-server --port 9030 --config ./novarocks.toml
+./target/release/novarocks standalone --port 9030 --config ./novarocks.toml
 ```
 
 启动成功后，标准输出会出现类似以下 readiness 标记：
@@ -162,7 +162,7 @@ docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
 该环境会生成当前工作区专用的 NovaRocks 配置、SQL test 配置和端口。不要假设固定端口，优先使用 `docker/iceberg-rest/runtime/current/env.sh` 中导出的变量。

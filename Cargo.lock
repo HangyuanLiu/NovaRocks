@@ -3217,6 +3217,7 @@ dependencies = [
  "mysql",
  "mysql_async",
  "mysql_common 0.32.4",
+ "novarocks-version",
  "num-traits",
  "num_cpus",
  "once_cell",
@@ -3258,6 +3259,24 @@ dependencies = [
  "uuid",
  "which",
 ]
+
+[[package]]
+name = "novarocks-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "libc",
+ "mysql",
+ "novarocks",
+ "reqwest",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "novarocks-version"
+version = "0.1.0"
 
 [[package]]
 name = "nu-ansi-term"

@@ -54,11 +54,11 @@ docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 ```
 
-Start NovaRocks standalone-server with the generated worktree config:
+Start NovaRocks standalone with the generated worktree config:
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 ```
 
 In another shell, source the same environment and run the bootstrap script:

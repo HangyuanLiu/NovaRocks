@@ -28,8 +28,19 @@ fn manifest_dir() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
 }
 
+/// The workspace root, where `idl/` lives. `CARGO_MANIFEST_DIR` is
+/// `<repo>/novarocks/core`, so the root is two levels up. Recording schema
+/// paths relative to this keeps them stable (`idl/novarocks/...`) regardless
+/// of where the crate sits under the workspace.
+fn workspace_root() -> &'static Path {
+    Path::new(manifest_dir())
+        .ancestors()
+        .nth(2)
+        .expect("CARGO_MANIFEST_DIR should have at least two ancestors")
+}
+
 fn rel(path: &Path) -> String {
-    path.strip_prefix(manifest_dir())
+    path.strip_prefix(workspace_root())
         .unwrap_or(path)
         .display()
         .to_string()
@@ -1067,7 +1078,7 @@ fn parse_proto_schema(path: &str, input: &str) -> Result<ProtoFileSchema, String
 
 fn parse_current_novarocks_proto_schema() -> Result<ProtoSchema, String> {
     let mut files = BTreeMap::new();
-    for file in proto_files(&Path::new(manifest_dir()).join("idl/novarocks")) {
+    for file in proto_files(&workspace_root().join("idl/novarocks")) {
         let relative = rel(&file);
         let input = fs::read_to_string(&file)
             .map_err(|err| format!("{}: failed to read proto file: {err}", relative))?;

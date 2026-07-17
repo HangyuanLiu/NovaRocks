@@ -19,7 +19,7 @@
 //!
 //! Background: `restore_metadata_if_needed` (`src/engine/mod.rs`) calls
 //! `rebuild_imv_cache_from_lake` (`src/engine/mv/lake_rebuild.rs`) on every
-//! standalone-server startup, so a FE that boots against a fresh, empty
+//! standalone startup, so a FE that boots against a fresh, empty
 //! `[metadata]` SQLite path should rediscover any lake-native Iceberg MV
 //! packages purely from the lake (Iceberg projection view marker + storage
 //! table inline descriptor properties) and serve them normally. That
@@ -31,7 +31,7 @@
 //! `novarocks_imv_stateless_rebuild` test procedure).
 //!
 //! This module is the **cross-process acceptance harness** for the same
-//! claim: two separate `novarocks standalone-server` process launches over
+//! claim: two separate `novarocks standalone` process launches over
 //! the *same* lake/object-store/warehouse, where the second launch's FE has a
 //! completely fresh SQLite metadata file (no shared process, no shared
 //! in-memory cache — only the lake is shared). It:
@@ -129,13 +129,13 @@ pub(crate) struct ImvStatelessL2Report {
 /// refreshed.
 ///
 /// `repo_root` is the NovaRocks repo root (see `config::resolve_repo_root`);
-/// `runner_config` supplies the base standalone-server config used to derive
+/// `runner_config` supplies the base standalone config used to derive
 /// both cluster launches (see `cluster::resolve_base_app_config_path`) — the
 /// base config's own `[metadata].path` becomes cluster A's metadata path,
 /// and a freshly-generated path under `repo_root`'s runtime scratch area
 /// becomes cluster B's.
 ///
-/// This function is CI-gated: it spawns real `novarocks standalone-server`
+/// This function is CI-gated: it spawns real `novarocks standalone`
 /// processes and requires a reachable Iceberg catalog backend (Hadoop-style
 /// catalog over an S3-compatible object store, matching the
 /// `docker/iceberg-rest/` fixture). It is not invoked from the `sql-tests`

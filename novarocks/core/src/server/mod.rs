@@ -2169,7 +2169,7 @@ mod tests {
     fn backend_management_reaches_embedded_engine() {
         assert!(
             is_backend_management_statement("ADD BACKEND '127.0.0.1:19050'"),
-            "ADD BACKEND must bypass the standalone-server unsupported-SQL gate"
+            "ADD BACKEND must bypass the standalone unsupported-SQL gate"
         );
         assert!(
             is_backend_management_statement("DROP BACKEND '127.0.0.1:19050' FORCE"),

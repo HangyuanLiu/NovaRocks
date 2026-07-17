@@ -28,6 +28,17 @@ fn manifest_dir() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
 }
 
+/// Repo root, where `docker/` lives. `CARGO_MANIFEST_DIR` is
+/// `<repo>/novarocks/core`, so the root is two levels up. Fixture guards that
+/// read `docker/mysql-state-store/...` must resolve against this, not the
+/// crate manifest dir.
+fn repo_root() -> &'static Path {
+    Path::new(manifest_dir())
+        .ancestors()
+        .nth(2)
+        .expect("CARGO_MANIFEST_DIR should have at least two ancestors")
+}
+
 fn src_dir() -> PathBuf {
     Path::new(manifest_dir()).join("src")
 }
@@ -2850,7 +2861,7 @@ fn mysql_provider_variant_cfg_violations(path: &str, text: &str) -> Vec<String> 
 
 #[test]
 fn mysql_state_store_open_cancellation_gate_is_feature_gated_and_provider_owned() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let mysql_mod =
         fs::read_to_string(root.join("src/state_store/mysql/mod.rs")).expect("read MySQL module");
     let hooks = fs::read_to_string(root.join("src/state_store/mysql/open_test_hooks.rs"))
@@ -3266,7 +3277,7 @@ fn mysql_state_store_fixture_detector_rejects_security_and_lifecycle_bypasses() 
 
 #[test]
 fn mysql_state_store_fixture_detector_rejects_shared_deadlock_named_gate() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture = root.join("docker/mysql-state-store");
     let mut sources = Vec::new();
     collect_mysql_fixture_sources(&fixture, root, &mut sources);
@@ -3339,7 +3350,7 @@ fn mysql_state_store_fixture_detector_rejects_provisioner_boundary_bypasses() {
 
 #[test]
 fn mysql_state_store_fixture_detector_rejects_each_missing_required_owner() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture = root.join("docker/mysql-state-store");
     let mut sources = Vec::new();
     collect_mysql_fixture_sources(&fixture, root, &mut sources);
@@ -3370,7 +3381,7 @@ fn mysql_state_store_fixture_detector_rejects_each_missing_required_owner() {
 
 #[test]
 fn mysql_state_store_down_preserves_runtime_until_project_cleanup_is_confirmed() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture_source = root.join("docker/mysql-state-store");
     for (
         mode,
@@ -3544,7 +3555,7 @@ exec /bin/rm "$@"
 
 #[test]
 fn mysql_state_store_status_accepts_mode_0600_with_gnu_stat() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture_source = root.join("docker/mysql-state-store");
     let temp = tempfile::tempdir().expect("create GNU stat status workspace");
     let workspace = fs::canonicalize(temp.path()).expect("canonical GNU stat status workspace");
@@ -3653,7 +3664,7 @@ fn mysql_state_store_down_removes_container_owned_runtime_data() {
         String::from_utf8_lossy(&docker_ready.stderr)
     );
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture_source = root.join("docker/mysql-state-store");
     let temp = tempfile::tempdir().expect("create real MySQL fixture workspace");
     let workspace = fs::canonicalize(temp.path()).expect("canonical real fixture workspace");
@@ -3923,7 +3934,7 @@ fn mysql_state_store_down_removes_container_owned_runtime_data() {
 
 #[test]
 fn mysql_state_store_fixture_is_pinned_isolated_and_fail_closed() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture = root.join("docker/mysql-state-store");
     assert!(fixture.is_dir(), "missing MySQL state-store fixture root");
     let mut sources = Vec::new();
@@ -3980,7 +3991,7 @@ fn mysql_state_store_fixture_is_pinned_isolated_and_fail_closed() {
 
 #[test]
 fn mysql_state_store_physical_probe_inventory_is_exact() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = repo_root();
     let fixture = root.join("docker/mysql-state-store");
     let schema_path = fixture.join("probes/schema.sql");
     let contract_path = fixture.join("probes/contract.sh");

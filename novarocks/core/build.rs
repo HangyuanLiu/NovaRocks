@@ -126,10 +126,13 @@ fn compat_feature_enabled() -> bool {
     env::var_os("CARGO_FEATURE_COMPAT").is_some()
 }
 
-const NOVAROCKS_IDL_DIR: &str = "idl/novarocks";
-const COMPAT_THRIFT_DIR: &str = "idl/compat/thrift";
-const COMPAT_PROTO_DIR: &str = "idl/compat/proto";
-const COMPAT_STAROS_DIR: &str = "idl/compat/staros";
+// Paths are relative to this crate's manifest dir (novarocks/core); `idl/`
+// lives at the repo root, two levels up. `src/shim/` moved here with the
+// crate, so shim references below stay relative and are unchanged.
+const NOVAROCKS_IDL_DIR: &str = "../../idl/novarocks";
+const COMPAT_THRIFT_DIR: &str = "../../idl/compat/thrift";
+const COMPAT_PROTO_DIR: &str = "../../idl/compat/proto";
+const COMPAT_STAROS_DIR: &str = "../../idl/compat/staros";
 
 fn idl_path(dir: &str, file: &str) -> PathBuf {
     Path::new(dir).join(file)
@@ -168,30 +171,6 @@ fn validate_thrift_rs_namespaces() {
             missing.join(", ")
         );
     }
-}
-
-fn emit_git_version() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
-
-    let commit_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let commit_time = std::process::Command::new("git")
-        .args(["log", "-1", "--format=%ci"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    println!("cargo:rustc-env=NOVAROCKS_GIT_HASH={}", commit_hash);
-    println!("cargo:rustc-env=NOVAROCKS_GIT_TIME={}", commit_time);
 }
 
 fn emit_proto_root_mod(out_dir: &Path, compat: bool) {
@@ -245,7 +224,6 @@ pub mod proto {
 }
 
 fn main() {
-    emit_git_version();
     let compat = compat_feature_enabled();
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_COMPAT");
     print_rerun_files(

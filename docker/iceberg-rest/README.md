@@ -33,7 +33,7 @@ By default, all worktrees share one Docker Compose project
 (`nr-iceberg-rest`) on the services' conventional local ports: MinIO `9000`,
 MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each worktree
 still gets its own generated runtime entry, object-store prefixes, SQL test
-config, and allocated NovaRocks standalone-server MySQL / gRPC ports.
+config, and allocated NovaRocks standalone MySQL / gRPC ports.
 
 Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
 `NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose
@@ -73,7 +73,7 @@ Important generated files (under the runtime entry):
 - `env.sh` — shell exports for this workspace.
 - `manifest.json` — machine-readable ports, endpoints, compose project, and config paths.
 - `README.md` — human-readable summary of the active environment.
-- `standalone-managed-lake.toml` — NovaRocks standalone-server config.
+- `standalone-managed-lake.toml` — NovaRocks standalone config.
 - `sql-test.conf` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
@@ -85,7 +85,7 @@ Use the generated configs:
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
 
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
@@ -203,9 +203,9 @@ designed to be safe to call from CI:
   allocated NovaRocks port if `env.sh` already exists.
 - Docker service ports come from `shared.env` and default to `9000`, `9001`,
   `8181`, and `4040`.
-- The NovaRocks standalone-server MySQL port is allocated per worktree from
+- The NovaRocks standalone MySQL port is allocated per worktree from
   `NOVA_ENV_MYSQL_PORT_START` / `NOVA_ENV_MYSQL_PORT_RANGE`.
-- The NovaRocks standalone-server gRPC port is allocated per worktree from
+- The NovaRocks standalone gRPC port is allocated per worktree from
   `NOVA_ENV_GRPC_PORT_START` / `NOVA_ENV_GRPC_PORT_RANGE`.
 - `down.sh --runtime-only --purge` removes only the per-worktree runtime
   directory.
@@ -219,7 +219,7 @@ source docker/iceberg-rest/runtime/current/env.sh
 trap "docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run --release -- standalone-server --config "$NOVAROCKS_STANDALONE_CONFIG" &
+cargo run --release -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG" &
 SERVER_PID=$!
 trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 
