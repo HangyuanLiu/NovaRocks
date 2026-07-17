@@ -1,0 +1,506 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+
+use crate::common::types::UniqueId;
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
+use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, ScanAssignmentKind};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::query_context::QueryId;
+use crate::runtime::query_options::QueryOptions;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct FragmentInstanceId(UniqueId);
+
+impl FragmentInstanceId {
+    pub(crate) const fn new(value: UniqueId) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> UniqueId {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BackendNum(i32);
+
+impl BackendNum {
+    pub(crate) fn try_new(value: i32) -> Result<Self, FragmentBindingError> {
+        if value < 0 {
+            return Err(FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("backend number must be non-negative, got {value}"),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanAssignment {
+    kind: ScanAssignmentKind,
+    ranges: Vec<ScanRangeParams>,
+}
+
+impl ScanAssignment {
+    pub(crate) fn try_new(
+        node_id: FragmentNodeId,
+        kind: ScanAssignmentKind,
+        ranges: Vec<ScanRangeParams>,
+    ) -> Result<Self, FragmentBindingError> {
+        for (index, range) in ranges.iter().enumerate() {
+            let matches_kind = matches!(
+                (kind, &range.range),
+                (ScanAssignmentKind::File, ScanRange::File(_))
+                    | (
+                        ScanAssignmentKind::StarRocksTablet,
+                        ScanRange::StarRocksTablet(_)
+                    )
+            );
+            if !matches_kind {
+                return Err(FragmentBindingError::new(
+                    FragmentBindingTarget::ScanNode(node_id.get()),
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!("scan range {index} does not match assignment kind {kind:?}"),
+                ));
+            }
+        }
+        Ok(Self { kind, ranges })
+    }
+
+    pub(crate) const fn kind(&self) -> ScanAssignmentKind {
+        self.kind
+    }
+
+    pub(crate) fn ranges(&self) -> &[ScanRangeParams] {
+        &self.ranges
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScanAssignments(BTreeMap<FragmentNodeId, ScanAssignment>);
+
+impl ScanAssignments {
+    pub(crate) fn new(assignments: BTreeMap<FragmentNodeId, ScanAssignment>) -> Self {
+        Self(assignments)
+    }
+
+    pub(crate) fn get(&self, node_id: &FragmentNodeId) -> Option<&ScanAssignment> {
+        self.0.get(node_id)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ScanAssignment)> {
+        self.0.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExchangeInputAssignment {
+    sender_count: NonZeroUsize,
+}
+
+impl ExchangeInputAssignment {
+    pub(crate) const fn new(sender_count: NonZeroUsize) -> Self {
+        Self { sender_count }
+    }
+
+    pub(crate) const fn sender_count(&self) -> NonZeroUsize {
+        self.sender_count
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExchangeInputAssignments(BTreeMap<FragmentNodeId, ExchangeInputAssignment>);
+
+impl ExchangeInputAssignments {
+    pub(crate) fn new(assignments: BTreeMap<FragmentNodeId, ExchangeInputAssignment>) -> Self {
+        Self(assignments)
+    }
+
+    pub(crate) fn get(&self, node_id: &FragmentNodeId) -> Option<&ExchangeInputAssignment> {
+        self.0.get(node_id)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&FragmentNodeId, &ExchangeInputAssignment)> {
+        self.0.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FragmentSinkAssignment {
+    None,
+    StreamDestinations(Vec<FragmentDestination>),
+    DestinationGroups(Vec<Vec<FragmentDestination>>),
+    SenderIdentity { sender_id: Option<i32> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FragmentRuntimeOptions {
+    query_options: QueryOptions,
+    report_endpoint: Option<RuntimeEndpoint>,
+    typed_result_sink: bool,
+}
+
+impl FragmentRuntimeOptions {
+    pub(crate) fn new(
+        query_options: QueryOptions,
+        report_endpoint: Option<RuntimeEndpoint>,
+        typed_result_sink: bool,
+    ) -> Self {
+        Self {
+            query_options,
+            report_endpoint,
+            typed_result_sink,
+        }
+    }
+
+    pub(crate) fn query_options(&self) -> &QueryOptions {
+        &self.query_options
+    }
+
+    pub(crate) fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
+        self.report_endpoint.as_ref()
+    }
+
+    pub(crate) const fn typed_result_sink(&self) -> bool {
+        self.typed_result_sink
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FragmentInstanceSpec {
+    contract_version: FragmentContractVersion,
+    query_id: QueryId,
+    fragment_instance_id: FragmentInstanceId,
+    scan_assignments: ScanAssignments,
+    exchange_inputs: ExchangeInputAssignments,
+    sink_assignment: FragmentSinkAssignment,
+    runtime_filter_params: RuntimeFilterParams,
+    runtime_options: FragmentRuntimeOptions,
+    pipeline_dop: NonZeroUsize,
+    backend_num: BackendNum,
+}
+
+impl FragmentInstanceSpec {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        contract_version: FragmentContractVersion,
+        query_id: QueryId,
+        fragment_instance_id: FragmentInstanceId,
+        scan_assignments: ScanAssignments,
+        exchange_inputs: ExchangeInputAssignments,
+        sink_assignment: FragmentSinkAssignment,
+        runtime_filter_params: RuntimeFilterParams,
+        runtime_options: FragmentRuntimeOptions,
+        pipeline_dop: NonZeroUsize,
+        backend_num: BackendNum,
+    ) -> Self {
+        Self {
+            contract_version,
+            query_id,
+            fragment_instance_id,
+            scan_assignments,
+            exchange_inputs,
+            sink_assignment,
+            runtime_filter_params,
+            runtime_options,
+            pipeline_dop,
+            backend_num,
+        }
+    }
+
+    pub(crate) const fn contract_version(&self) -> FragmentContractVersion {
+        self.contract_version
+    }
+
+    pub(crate) const fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    pub(crate) const fn fragment_instance_id(&self) -> FragmentInstanceId {
+        self.fragment_instance_id
+    }
+
+    pub(crate) const fn scan_assignments(&self) -> &ScanAssignments {
+        &self.scan_assignments
+    }
+
+    pub(crate) const fn exchange_inputs(&self) -> &ExchangeInputAssignments {
+        &self.exchange_inputs
+    }
+
+    pub(crate) const fn sink_assignment(&self) -> &FragmentSinkAssignment {
+        &self.sink_assignment
+    }
+
+    pub(crate) const fn runtime_filter_params(&self) -> &RuntimeFilterParams {
+        &self.runtime_filter_params
+    }
+
+    pub(crate) const fn runtime_options(&self) -> &FragmentRuntimeOptions {
+        &self.runtime_options
+    }
+
+    pub(crate) const fn pipeline_dop(&self) -> NonZeroUsize {
+        self.pipeline_dop
+    }
+
+    pub(crate) const fn backend_num(&self) -> BackendNum {
+        self.backend_num
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+
+    use crate::common::types::UniqueId;
+    use crate::exec::fragment::error::{FragmentBindingErrorKind, FragmentBindingTarget};
+    use crate::exec::fragment::program::{
+        FragmentContractVersion, FragmentNodeId, ScanAssignmentKind,
+    };
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::query_options::QueryOptions;
+    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+    use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRangeParams};
+
+    use super::*;
+
+    fn file_range() -> ScanRangeParams {
+        ScanRangeParams::file(FileScanRange {
+            file_format: FileFormat::Parquet,
+            full_path: Some("s3://bucket/data.parquet".to_string()),
+            relative_path: None,
+            table_id: None,
+            offset: 0,
+            length: 16,
+            file_length: 16,
+            delete_files: Vec::new(),
+            deletion_vector_descriptor: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            modification_time: None,
+            datacache_options: None,
+            included_positions: Vec::new(),
+            serialized_split: None,
+            use_iceberg_jni_metadata_reader: false,
+            ivm_change_op: None,
+            file_pruning_min_max_values: None,
+        })
+    }
+
+    #[test]
+    fn backend_num_rejects_negative_values() {
+        let error = BackendNum::try_new(-1).expect_err("negative backend number must fail");
+        assert_eq!(error.target(), FragmentBindingTarget::Instance);
+        assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        assert!(error.detail().contains("-1"), "{}", error.detail());
+
+        assert_eq!(BackendNum::try_new(0).expect("zero is valid").get(), 0);
+    }
+
+    #[test]
+    fn fragment_instance_id_round_trips_unique_id() {
+        let raw = UniqueId { hi: 7, lo: 11 };
+        assert_eq!(FragmentInstanceId::new(raw).get(), raw);
+    }
+
+    #[test]
+    fn scan_assignment_preserves_empty_kind_and_rejects_mixed_ranges() {
+        let node_id = FragmentNodeId::new(17);
+        for kind in [
+            ScanAssignmentKind::File,
+            ScanAssignmentKind::StarRocksTablet,
+        ] {
+            let assignment = ScanAssignment::try_new(node_id, kind, Vec::new())
+                .expect("empty assignment keeps its explicit kind");
+            assert_eq!(assignment.kind(), kind);
+            assert!(assignment.ranges().is_empty());
+        }
+
+        let tablet_range =
+            ScanRangeParams::starrocks_tablet(300, 100, 7).expect("valid StarRocks tablet range");
+        for (kind, ranges) in [
+            (ScanAssignmentKind::File, vec![tablet_range]),
+            (ScanAssignmentKind::StarRocksTablet, vec![file_range()]),
+        ] {
+            let error = ScanAssignment::try_new(node_id, kind, ranges)
+                .expect_err("mismatched scan range kind must fail");
+            assert_eq!(error.target(), FragmentBindingTarget::ScanNode(17));
+            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        }
+    }
+
+    #[test]
+    fn assignment_collections_use_typed_ordered_node_ids_and_nonzero_senders() {
+        let scan_node = FragmentNodeId::new(3);
+        let scan_assignment =
+            ScanAssignment::try_new(scan_node, ScanAssignmentKind::File, vec![file_range()])
+                .expect("file assignment");
+        let scans = ScanAssignments::new(BTreeMap::from([(scan_node, scan_assignment)]));
+        assert_eq!(scans.len(), 1);
+        assert!(!scans.is_empty());
+        assert!(scans.get(&scan_node).is_some());
+        assert_eq!(
+            scans
+                .iter()
+                .map(|(node_id, _)| node_id.get())
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        assert!(NonZeroUsize::new(0).is_none());
+        let exchange_node = FragmentNodeId::new(5);
+        let exchange_assignment =
+            ExchangeInputAssignment::new(NonZeroUsize::new(2).expect("non-zero sender count"));
+        let exchanges =
+            ExchangeInputAssignments::new(BTreeMap::from([(exchange_node, exchange_assignment)]));
+        assert_eq!(exchanges.len(), 1);
+        assert!(!exchanges.is_empty());
+        assert_eq!(
+            exchanges
+                .get(&exchange_node)
+                .expect("exchange assignment")
+                .sender_count()
+                .get(),
+            2
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|(node_id, _)| node_id.get())
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn sink_assignment_variants_preserve_explicit_placement() {
+        assert!(matches!(
+            FragmentSinkAssignment::None,
+            FragmentSinkAssignment::None
+        ));
+        assert!(matches!(
+            FragmentSinkAssignment::StreamDestinations(Vec::new()),
+            FragmentSinkAssignment::StreamDestinations(destinations) if destinations.is_empty()
+        ));
+        assert!(matches!(
+            FragmentSinkAssignment::DestinationGroups(vec![Vec::new()]),
+            FragmentSinkAssignment::DestinationGroups(groups) if groups.len() == 1
+        ));
+        assert!(matches!(
+            FragmentSinkAssignment::SenderIdentity { sender_id: Some(9) },
+            FragmentSinkAssignment::SenderIdentity { sender_id: Some(9) }
+        ));
+    }
+
+    #[test]
+    fn instance_spec_exposes_immutable_domain_parts() {
+        let scan_node = FragmentNodeId::new(3);
+        let scans = ScanAssignments::new(BTreeMap::from([(
+            scan_node,
+            ScanAssignment::try_new(scan_node, ScanAssignmentKind::File, Vec::new())
+                .expect("empty file assignment"),
+        )]));
+        let exchange_node = FragmentNodeId::new(5);
+        let exchanges = ExchangeInputAssignments::new(BTreeMap::from([(
+            exchange_node,
+            ExchangeInputAssignment::new(NonZeroUsize::new(2).expect("sender count")),
+        )]));
+        let report_endpoint = RuntimeEndpoint::new("127.0.0.1", 8060).expect("endpoint");
+        let runtime_options = FragmentRuntimeOptions::new(
+            QueryOptions::default(),
+            Some(report_endpoint.clone()),
+            true,
+        );
+        let spec = FragmentInstanceSpec::new(
+            FragmentContractVersion::CURRENT,
+            QueryId { hi: 13, lo: 17 },
+            FragmentInstanceId::new(UniqueId { hi: 19, lo: 23 }),
+            scans,
+            exchanges,
+            FragmentSinkAssignment::SenderIdentity { sender_id: None },
+            RuntimeFilterParams::default(),
+            runtime_options,
+            NonZeroUsize::new(4).expect("pipeline DOP"),
+            BackendNum::try_new(0).expect("backend number"),
+        );
+
+        assert_eq!(spec.contract_version(), FragmentContractVersion::CURRENT);
+        assert_eq!(spec.query_id(), QueryId { hi: 13, lo: 17 });
+        assert_eq!(
+            spec.fragment_instance_id().get(),
+            UniqueId { hi: 19, lo: 23 }
+        );
+        assert!(spec.scan_assignments().get(&scan_node).is_some());
+        assert_eq!(
+            spec.exchange_inputs()
+                .get(&exchange_node)
+                .expect("exchange assignment")
+                .sender_count()
+                .get(),
+            2
+        );
+        assert!(matches!(
+            spec.sink_assignment(),
+            FragmentSinkAssignment::SenderIdentity { sender_id: None }
+        ));
+        assert!(spec.runtime_filter_params().is_empty());
+        assert!(
+            spec.runtime_options()
+                .query_options()
+                .eq(&QueryOptions::default())
+        );
+        assert_eq!(
+            spec.runtime_options().report_endpoint(),
+            Some(&report_endpoint)
+        );
+        assert!(spec.runtime_options().typed_result_sink());
+        assert_eq!(spec.pipeline_dop().get(), 4);
+        assert_eq!(spec.backend_num().get(), 0);
+    }
+}
