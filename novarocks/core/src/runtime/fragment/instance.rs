@@ -478,6 +478,16 @@ mod tests {
                 sender_id: None,
             } if groups.len() == 1
         ));
+        assert!(matches!(
+            FragmentSinkAssignment::DestinationGroups {
+                groups: vec![Vec::new()],
+                sender_id: Some(11),
+            },
+            FragmentSinkAssignment::DestinationGroups {
+                groups,
+                sender_id: Some(11),
+            } if groups.len() == 1
+        ));
     }
 
     #[test]
