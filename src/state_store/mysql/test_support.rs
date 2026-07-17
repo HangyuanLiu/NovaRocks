@@ -91,6 +91,12 @@ pub struct MysqlPostDispatchTestControl {
     inner: super::commit::CommitHookControl,
 }
 #[cfg(feature = "state-store-test-hooks")]
+#[derive(Clone, Copy, Debug)]
+pub enum MysqlPrepareRollbackFailure {
+    Error,
+    Timeout,
+}
+#[cfg(feature = "state-store-test-hooks")]
 pub struct MysqlStatementTestApi;
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -468,6 +474,18 @@ impl MysqlPollQueryTestControl {
 
 #[cfg(feature = "state-store-test-hooks")]
 impl MysqlCommitTestApi {
+    pub fn fail_next_prepare_after_reservation(rollback: MysqlPrepareRollbackFailure) {
+        let mode = match rollback {
+            MysqlPrepareRollbackFailure::Error => 1,
+            MysqlPrepareRollbackFailure::Timeout => 2,
+        };
+        super::txn::fail_next_prepare_after_reservation_for_test(mode);
+    }
+
+    pub fn last_prepare_failure_connection_id() -> u64 {
+        super::txn::last_prepare_failure_connection_id_for_test()
+    }
+
     pub async fn auxiliary_statement_timeout_disposes(
         runtime: &StateStoreRuntime,
         database: &str,
@@ -497,6 +515,41 @@ impl MysqlCommitTestApi {
         MysqlPostDispatchTestControl {
             inner: super::commit::arm_commit_hook(mode),
         }
+    }
+
+    pub fn arm_terminalization() -> MysqlPostDispatchTestControl {
+        MysqlPostDispatchTestControl {
+            inner: super::commit::arm_cleanup_hook(),
+        }
+    }
+
+    pub async fn force_committed_ledger(
+        runtime: &StateStoreRuntime,
+        database: &str,
+        transaction_id: TransactionId,
+        revision: u64,
+    ) -> Result<(), StateStoreError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut connection = super::client::checkout_hygienic_connection(
+            runtime.mysql_test_pool(database)?,
+            deadline,
+        )
+        .await?;
+        connection
+            .exec_drop(
+                "UPDATE state_store_commits
+                 SET state = ?, reservation_token = NULL, revision = ?, updated_at_ms = ?
+                 WHERE transaction_id = ?",
+                (
+                    2_u8,
+                    revision,
+                    1_u64,
+                    transaction_id.as_uuid().as_bytes().to_vec(),
+                ),
+            )
+            .await
+            .map_err(super::error::MysqlNativeError::from)
+            .map_err(super::error::MysqlNativeError::into_public)
     }
 
     pub async fn run_scenario(

@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "state-store-test-hooks")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "state-store-test-hooks")]
 use std::sync::{Mutex, OnceLock};
@@ -47,6 +49,12 @@ const PROVISIONAL_VERSION_TAG: &[u8] = b"mysql-provisional-v1\0";
 static EXPLICIT_ROLLBACKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "state-store-test-hooks")]
 static LAST_WRITE_ACTOR_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static PREPARE_FAILURE_ROLLBACK_MODE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static NEXT_ROLLBACK_FAILURE_MODE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "state-store-test-hooks")]
+static LAST_PREPARE_FAILURE_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "state-store-test-hooks")]
 static LAST_TOUCHED_LOCK_ORDER: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 
@@ -817,6 +825,29 @@ impl OwnedMysqlTransaction {
         }
         let connection = self.connection.take().ok_or_else(transaction_finished)?;
         self.statement_in_flight = true;
+        #[cfg(feature = "state-store-test-hooks")]
+        match NEXT_ROLLBACK_FAILURE_MODE.swap(0, Ordering::AcqRel) {
+            1 => {
+                self.statement_in_flight = false;
+                self.active = false;
+                connection.destroy().await;
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected MySQL rollback failure",
+                ));
+            }
+            2 => {
+                self.active = false;
+                connection.destroy().await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.statement_in_flight = false;
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::DeadlineExceeded,
+                    "injected MySQL rollback timeout",
+                ));
+            }
+            _ => {}
+        }
         let cleanup_deadline = self
             .deadline
             .max(Instant::now() + std::time::Duration::from_secs(1));
@@ -1466,25 +1497,45 @@ impl MysqlWriteActorState {
                 }
             }
             Err(error) => {
-                let rollback = match self.take_transaction() {
-                    Ok(transaction) => transaction.rollback().await,
-                    Err(rollback_error) => return CommitOutcome::DefiniteFailure(rollback_error),
-                };
-                if let Err(rollback_error) = rollback {
-                    return CommitOutcome::DefiniteFailure(rollback_error);
-                }
-                let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-                let cleanup = super::commit::terminalize_undispatched(
-                    Arc::clone(&self.pool),
-                    &self.codec,
-                    self.transaction_id,
-                    reservation_token,
-                    cleanup_deadline,
-                )
-                .await;
-                classify_terminalized_prepare(error, cleanup)
+                self.terminalize_failed_prepare(reservation_token, error)
+                    .await
             }
         }
+    }
+
+    async fn terminalize_failed_prepare(
+        &mut self,
+        reservation_token: [u8; 16],
+        prepare_error: StateStoreError,
+    ) -> CommitOutcome {
+        let local_cleanup = match self.take_transaction() {
+            Ok(transaction) => match transaction.rollback().await {
+                Ok(()) => LocalPrepareCleanup::RolledBack,
+                Err(_) => LocalPrepareCleanup::Unknown,
+            },
+            Err(_) => LocalPrepareCleanup::Unknown,
+        };
+        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let terminalization = match timeout_at(
+            cleanup_deadline,
+            super::commit::terminalize_undispatched(
+                Arc::clone(&self.pool),
+                &self.codec,
+                self.transaction_id,
+                reservation_token,
+                cleanup_deadline,
+            ),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(_) => Err(terminalization_deadline_error()),
+        };
+        classify_prepare_failure(PrepareFailureEvidence {
+            prepare_error,
+            local_cleanup,
+            terminalization,
+        })
     }
 
     async fn prepare_and_apply_commit(
@@ -1519,6 +1570,25 @@ impl MysqlWriteActorState {
             return Err(conflict(
                 "MySQL commit reservation is not owned by this transaction",
             ));
+        }
+        #[cfg(feature = "state-store-test-hooks")]
+        {
+            let rollback_mode = PREPARE_FAILURE_ROLLBACK_MODE.swap(0, Ordering::AcqRel);
+            if rollback_mode != 0 {
+                let connection_id: Option<u64> = self
+                    .transaction()?
+                    .run(|connection| Box::pin(connection.query_first("SELECT CONNECTION_ID()")))
+                    .await?;
+                LAST_PREPARE_FAILURE_CONNECTION_ID.store(
+                    connection_id.ok_or_else(persisted_corruption)?,
+                    Ordering::Release,
+                );
+                NEXT_ROLLBACK_FAILURE_MODE.store(rollback_mode, Ordering::Release);
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::ProviderUnavailable,
+                    "injected MySQL prepare failure after durable reservation",
+                ));
+            }
         }
         let revision_bytes: Option<Vec<u8>> = self
             .transaction()?
@@ -1890,7 +1960,34 @@ fn classify_terminalized_prepare(
     prepare_error: StateStoreError,
     decision: Result<super::commit::TerminalizeDecision, StateStoreError>,
 ) -> CommitOutcome {
-    match decision {
+    classify_prepare_failure(PrepareFailureEvidence {
+        prepare_error,
+        local_cleanup: LocalPrepareCleanup::NotRequired,
+        terminalization: decision,
+    })
+}
+
+enum LocalPrepareCleanup {
+    NotRequired,
+    RolledBack,
+    Unknown,
+}
+
+struct PrepareFailureEvidence {
+    prepare_error: StateStoreError,
+    local_cleanup: LocalPrepareCleanup,
+    terminalization: Result<super::commit::TerminalizeDecision, StateStoreError>,
+}
+
+fn classify_prepare_failure(evidence: PrepareFailureEvidence) -> CommitOutcome {
+    let PrepareFailureEvidence {
+        prepare_error,
+        local_cleanup,
+        terminalization,
+    } = evidence;
+    // Local rollback is connection hygiene only; the durable ledger is the outcome authority.
+    drop(local_cleanup);
+    match terminalization {
         Ok(super::commit::TerminalizeDecision::Committed(receipt)) => {
             CommitOutcome::Committed(receipt)
         }
@@ -1905,6 +2002,13 @@ fn classify_terminalized_prepare(
         }
         Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
     }
+}
+
+const fn terminalization_deadline_error() -> StateStoreError {
+    StateStoreError::new(
+        StateStoreErrorKind::DeadlineExceeded,
+        "MySQL commit terminalization exceeded its independent cleanup deadline",
+    )
 }
 
 const fn conflict(message: &'static str) -> StateStoreError {
@@ -1960,6 +2064,18 @@ pub(crate) fn explicit_rollback_count_for_test() -> u64 {
 #[cfg(feature = "state-store-test-hooks")]
 pub(crate) fn last_write_actor_connection_id_for_test() -> u64 {
     LAST_WRITE_ACTOR_CONNECTION_ID.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn fail_next_prepare_after_reservation_for_test(rollback_mode: u8) {
+    assert!(matches!(rollback_mode, 1 | 2));
+    LAST_PREPARE_FAILURE_CONNECTION_ID.store(0, Ordering::Release);
+    PREPARE_FAILURE_ROLLBACK_MODE.store(rollback_mode, Ordering::Release);
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+pub(crate) fn last_prepare_failure_connection_id_for_test() -> u64 {
+    LAST_PREPARE_FAILURE_CONNECTION_ID.load(Ordering::Acquire)
 }
 
 #[cfg(feature = "state-store-test-hooks")]

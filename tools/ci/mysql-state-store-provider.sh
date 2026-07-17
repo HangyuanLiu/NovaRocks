@@ -101,5 +101,7 @@ cargo test --features mysql-state-store-provider,state-store-test-hooks \
   --test state_store_mysql_cross_process mysql_cross_process_suite \
   -- --exact --nocapture --test-threads=1
 cargo build --profile dev-opt --features mysql-state-store-provider
-cargo test --test cluster_mvp cross_process_three_be_state_store_baseline -- --nocapture
+cargo test --test cluster_mvp -- --list | \
+  awk '$1 == "cross_process_three_be_state_store_baseline:" { n++ } END { exit(n != 1) }'
+cargo test --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture
 git diff --check

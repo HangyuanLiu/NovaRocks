@@ -17,6 +17,7 @@
 
 #![cfg(feature = "mysql-state-store-provider")]
 
+#[cfg(feature = "state-store-test-hooks")]
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -32,7 +33,7 @@ use novarocks::state_store::ContinuationToken;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks::state_store::mysql::test_support::{
     MysqlChangeTestApi, MysqlCommitTestApi, MysqlOpenGatePhase, MysqlPostDispatchTestControl,
-    MysqlStatementTestApi, arm_mysql_open_gate,
+    MysqlPrepareRollbackFailure, MysqlStatementTestApi, arm_mysql_open_gate, hold_connection,
 };
 use novarocks::state_store::mysql::test_support::{
     MysqlOccTestApi, MysqlSchemaColumnSnapshot, MysqlSchemaMutation, MysqlSchemaTableSnapshot,
@@ -3010,6 +3011,180 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
             .expect("resolve terminalized pre-dispatch commit"),
         novarocks::state_store::CommitResolution::NotCommitted
     );
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+async fn assert_prepare_failure_terminalizes_after_rollback_failure(
+    test_name: &str,
+    rollback: MysqlPrepareRollbackFailure,
+) {
+    let database = TestDatabase::provision(test_name, "prepare_rollback");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 2;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let transaction_id = transaction_id();
+    MysqlCommitTestApi::fail_next_prepare_after_reservation(rollback);
+    let mut writer = store
+        .begin_write(transaction_id, "prepare failure after reservation")
+        .await
+        .expect("begin prepare failure writer");
+    writer
+        .put(
+            key(Bytes::from_static(b"prepare/rollback-failure")),
+            value(Bytes::from_static(b"must-not-commit")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage prepare failure mutation");
+    let outcome = writer.commit().await;
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::TransientBeforeCommit(ref error)
+                if error.kind() == StateStoreErrorKind::ProviderUnavailable
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve terminalized prepare failure"),
+        novarocks::state_store::CommitResolution::NotCommitted
+    );
+    let failed_connection = MysqlCommitTestApi::last_prepare_failure_connection_id();
+    assert_ne!(failed_connection, 0);
+    let replacement = active_readiness(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("checkout after failed rollback")
+        .connection_id;
+    assert_ne!(replacement, failed_connection);
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_prepare_error_terminalizes_own_pending_after_rollback_error() {
+    assert_prepare_failure_terminalizes_after_rollback_failure(
+        "prepare_rollback_error",
+        MysqlPrepareRollbackFailure::Error,
+    )
+    .await;
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_prepare_error_terminalizes_own_pending_after_rollback_timeout() {
+    assert_prepare_failure_terminalizes_after_rollback_failure(
+        "prepare_rollback_timeout",
+        MysqlPrepareRollbackFailure::Timeout,
+    )
+    .await;
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkout() {
+    let database = TestDatabase::provision("prepare_terminalize_timeout", "pool_exhausted");
+    let mut client = fixture_client_config();
+    client.pool_min = 1;
+    client.pool_max = 1;
+    let mut runtime = StateStoreRuntime::mysql(client).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let transaction_id = transaction_id();
+    MysqlCommitTestApi::fail_next_prepare_after_reservation(MysqlPrepareRollbackFailure::Error);
+    let terminalization = MysqlCommitTestApi::arm_terminalization();
+    let mut writer = store
+        .begin_write(transaction_id, "terminalization checkout timeout")
+        .await
+        .expect("begin terminalization timeout writer");
+    writer
+        .put(
+            key(Bytes::from_static(b"prepare/terminalize-timeout")),
+            value(Bytes::from_static(b"must-not-commit")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage terminalization timeout mutation");
+    let waiter = tokio::spawn(async move { writer.commit().await });
+    terminalization.wait_dispatched().await;
+    let held = hold_connection(&runtime, &database.name, Duration::from_secs(4))
+        .await
+        .expect("exhaust pool before terminalization checkout");
+    terminalization.allow_provider_progress();
+    let outcome = waiter.await.expect("join terminalization timeout waiter");
+    assert!(
+        matches!(outcome, CommitOutcome::CommitUnknown(_)),
+        "{outcome:?}"
+    );
+    drop(held);
+    assert_eq!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve pending after unknown terminalization"),
+        novarocks::state_store::CommitResolution::Unresolved
+    );
+    drop(store);
+    runtime.shutdown().await.expect("shutdown MySQL runtime");
+}
+
+#[cfg(feature = "state-store-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
+    let database = TestDatabase::provision("prepare_committed_precedence", "committed");
+    let mut runtime =
+        StateStoreRuntime::mysql(fixture_client_config()).expect("construct MySQL runtime");
+    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+        .await
+        .expect("open MySQL state store");
+    let transaction_id = transaction_id();
+    MysqlCommitTestApi::fail_next_prepare_after_reservation(MysqlPrepareRollbackFailure::Error);
+    let terminalization = MysqlCommitTestApi::arm_terminalization();
+    let mut writer = store
+        .begin_write(transaction_id, "committed terminalization precedence")
+        .await
+        .expect("begin committed precedence writer");
+    writer
+        .put(
+            key(Bytes::from_static(b"prepare/committed-precedence")),
+            value(Bytes::from_static(b"ignored")),
+            Precondition::Any,
+        )
+        .await
+        .expect("stage committed precedence mutation");
+    let waiter = tokio::spawn(async move { writer.commit().await });
+    terminalization.wait_dispatched().await;
+    MysqlCommitTestApi::force_committed_ledger(&runtime, &database.name, transaction_id, 91)
+        .await
+        .expect("publish authoritative committed ledger");
+    terminalization.allow_provider_progress();
+    let outcome = waiter.await.expect("join committed precedence waiter");
+    assert!(
+        matches!(
+            outcome,
+            CommitOutcome::Committed(ref receipt)
+                if receipt.transaction_id == transaction_id
+                    && receipt.revision.as_bytes() == 91_u64.to_be_bytes()
+        ),
+        "{outcome:?}"
+    );
+    assert!(matches!(
+        store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve authoritative committed ledger"),
+        novarocks::state_store::CommitResolution::Committed(_)
+    ));
     drop(store);
     runtime.shutdown().await.expect("shutdown MySQL runtime");
 }
