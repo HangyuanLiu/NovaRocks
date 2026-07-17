@@ -91,27 +91,15 @@ fn run_command_bounded_observed(
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn bounded child");
     let pid = child.id();
-    let stdin = child.stdin.take().expect("take bounded child stdin");
+    let mut stdin = Some(child.stdin.take().expect("take bounded child stdin"));
     let stdout = child.stdout.take().expect("take bounded child stdout");
     let stderr = child.stderr.take().expect("take bounded child stderr");
-    let mut writer = if let Some(input) = input {
-        let input = input.to_vec();
-        Some(std::thread::spawn(move || {
-            let mut stdin = stdin;
-            stdin.write_all(&input)
-        }))
-    } else {
-        drop(stdin);
-        None
-    };
     let mut stdout_reader = Some(spawn_capped_reader(stdout, diagnostic_cap));
     let mut stderr_reader = Some(spawn_capped_reader(stderr, diagnostic_cap));
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(pid))) {
         let _ = child.kill();
         let _ = child.wait();
-        if let Some(writer) = writer.take() {
-            let _ = writer.join();
-        }
+        drop(stdin.take());
         let _ = stdout_reader
             .take()
             .expect("stdout reader is installed")
@@ -122,6 +110,14 @@ fn run_command_bounded_observed(
             .join();
         std::panic::resume_unwind(panic);
     }
+    let mut writer = if let Some(input) = input {
+        let input = input.to_vec();
+        let mut stdin = stdin.take().expect("stdin is installed");
+        Some(std::thread::spawn(move || stdin.write_all(&input)))
+    } else {
+        drop(stdin.take());
+        None
+    };
     let stop_at = std::time::Instant::now() + deadline;
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll bounded child") {
@@ -295,6 +291,33 @@ fn mysql_helper_pure_protocol_child_has_empty_environment() {
         },
     );
     assert!(output.status.success());
+}
+
+#[test]
+fn mysql_helper_shutdown_observer_runs_before_stdin_delivery() {
+    for iteration in 0..8 {
+        let marker = format!("observer-order-{iteration}");
+        let mut command = Command::new(HELPER);
+        command.env_clear().env("SS3_OBSERVER_ORDER", &marker);
+        let result = run_command_bounded_observed(
+            &mut command,
+            Some(b"{\"id\":1,\"command\":\"Shutdown\"}\n"),
+            HELPER_TOTAL_DEADLINE,
+            HELPER_DIAGNOSTIC_CAP_BYTES,
+            |pid| {
+                std::thread::sleep(Duration::from_millis(100));
+                let environment = process_environment(pid);
+                assert!(
+                    contains_bytes(
+                        &environment,
+                        format!("SS3_OBSERVER_ORDER={marker}").as_bytes()
+                    ),
+                    "observer must inspect the live child before Shutdown is delivered"
+                );
+            },
+        );
+        assert!(result.output.status.success());
+    }
 }
 
 #[test]
@@ -1053,11 +1076,17 @@ fn process_environment(pid: u32) -> Vec<u8> {
     let environment =
         std::fs::read(format!("/proc/{pid}/environ")).expect("read helper process environment");
     #[cfg(not(target_os = "linux"))]
-    let environment = Command::new("ps")
+    let output = Command::new("ps")
         .args(["eww", "-p", &pid.to_string(), "-o", "command="])
         .output()
-        .expect("inspect helper process environment")
-        .stdout;
+        .expect("inspect helper process environment");
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        output.status.success(),
+        "helper process must remain observable"
+    );
+    #[cfg(not(target_os = "linux"))]
+    let environment = output.stdout;
     environment
 }
 
