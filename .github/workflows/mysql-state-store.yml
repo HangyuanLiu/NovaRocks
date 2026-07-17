@@ -56,6 +56,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: TDD RED - reproduce container-owned runtime cleanup failure
+        env:
+          NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: "1"
+        run: |
+          cargo test --test architecture_guard state_store_boundary::mysql_state_store_down_removes_container_owned_runtime_data -- --exact --nocapture
+
       - name: Run MySQL state-store production gate
         run: |
           set -euo pipefail
