@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod attachment;
 pub(crate) mod identifier;
 pub(crate) mod memory;
 pub(crate) mod partition;
