@@ -1187,6 +1187,7 @@ fn cross_process_three_be_state_store_baseline() {
     let cluster = MultiBeClusterHarness::start_n_be(3, "", "");
     eprintln!("NOVAROCKS_CLUSTER_BASELINE_READY fe=1 be=3");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
     let rows: Vec<i64> = conn
         .query(multi_submit_query_sql())
         .expect("multi-fragment CTE+JOIN query must succeed on 3-BE cluster");
