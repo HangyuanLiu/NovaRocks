@@ -46413,7 +46413,7 @@ const PBF_1A_TOP_LEVEL_ERRORS: [&str; 6] = [
 ];
 
 fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static str] {
-    if source_rel.starts_with("src/protocol/common/") {
+    if source_rel == "src/protocol/mod.rs" || source_rel.starts_with("src/protocol/common/") {
         &[
             "exec",
             "runtime",
@@ -46426,7 +46426,7 @@ fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static 
             "prost",
             "thrift",
         ]
-    } else if source_rel.starts_with("src/exec/fragment/") {
+    } else if source_rel == "src/exec/mod.rs" || source_rel.starts_with("src/exec/fragment/") {
         &[
             "protocol", "runtime", "proto", "protobuf", "prost", "thrift",
         ]
@@ -46441,6 +46441,45 @@ fn pbf_1a_visibility_is_pub_crate(visibility: &syn::Visibility) -> bool {
         syn::Visibility::Restricted(restricted)
             if restricted.in_token.is_none() && restricted.path.is_ident("crate")
     )
+}
+
+fn pbf_1a_visibility_is_private(visibility: &syn::Visibility) -> bool {
+    matches!(visibility, syn::Visibility::Inherited)
+        || matches!(
+            visibility,
+            syn::Visibility::Restricted(restricted) if restricted.path.is_ident("self")
+        )
+}
+
+fn pbf_1a_expected_vocabulary_owner(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "ProtocolFamily"
+        | "FieldPath"
+        | "FieldPathSegment"
+        | "TransportDecodeError"
+        | "TransportDecodeErrorKind"
+        | "ProtocolError"
+        | "ProtocolErrorKind" => Some(&["crate", "protocol", "common", "error"]),
+        "ExecPlanBuildError"
+        | "ExecPlanInvariant"
+        | "FragmentBindingError"
+        | "FragmentBindingTarget"
+        | "FragmentBindingErrorKind" => Some(&["crate", "exec", "fragment", "error"]),
+        "FragmentLaunchError"
+        | "FragmentLaunchStage"
+        | "FragmentLaunchErrorKind"
+        | "FragmentExecutionError"
+        | "FragmentExecutionErrorKind" => Some(&["crate", "runtime", "fragment", "error"]),
+        _ => None,
+    }
+}
+
+fn pbf_1a_path_starts_with(path: &[String], expected: &[&str]) -> bool {
+    path.len() == expected.len() + 1
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected)
 }
 
 fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &str) -> Vec<String> {
@@ -46491,13 +46530,36 @@ fn pbf_1a_module_contract_violations(source_rel: &str, text: &str, protected: &s
     }
     for item in &file.items {
         if let syn::Item::Use(import) = item
-            && !matches!(import.vis, syn::Visibility::Inherited)
+            && !pbf_1a_visibility_is_private(&import.vis)
         {
             violations.push(format!(
-                "PBF-1A module owner `{source_rel}` must not contain production re-exports"
+                "PBF-1A module owner `{source_rel}` must not contain an outward re-export"
             ));
         }
     }
+    let forbidden = pbf_1a_forbidden_dependency_segments(source_rel);
+    for path in rust_production_canonical_paths(text, source_rel) {
+        if let Some(segment) = path
+            .iter()
+            .find(|segment| forbidden.contains(&segment.as_str()))
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` has forbidden `{segment}` dependency `{}`",
+                path.join("::")
+            ));
+        }
+        if let Some(name) = path.last()
+            && let Some(expected_owner) = pbf_1a_expected_vocabulary_owner(name)
+            && !pbf_1a_path_starts_with(&path, expected_owner)
+        {
+            violations.push(format!(
+                "PBF-1A module owner `{source_rel}` imports vocabulary `{name}` from legacy owner `{}`",
+                path.join("::")
+            ));
+        }
+    }
+    violations.sort();
+    violations.dedup();
     violations
 }
 
@@ -46739,6 +46801,57 @@ fn pbf_1a_module_owner_detector_requires_external_top_level_pub_crate_modules() 
             .iter()
             .any(|violation| violation.contains("re-export")),
         "protected child re-export must be diagnosed: {child_reexport:?}"
+    );
+}
+
+#[test]
+fn pbf_1a_module_import_audit_distinguishes_private_dependencies_from_reexports() {
+    for allowed in [
+        "pub(crate) mod common; use std::fmt;",
+        "pub(crate) mod common; pub(self) use std::error::Error;",
+    ] {
+        let violations =
+            pbf_1a_module_contract_violations("src/protocol/mod.rs", allowed, "common");
+        assert!(
+            violations.is_empty(),
+            "unrelated private imports must remain allowed: {allowed}: {violations:?}"
+        );
+    }
+
+    let forbidden = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::runtime::query_context::QueryContext;",
+        "common",
+    );
+    assert!(
+        forbidden
+            .iter()
+            .any(|violation| violation.contains("forbidden `runtime` dependency")),
+        "private imports must not bypass the protocol layer: {forbidden:?}"
+    );
+
+    let legacy_private = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; use crate::common::error::ProtocolError;",
+        "common",
+    );
+    assert!(
+        legacy_private
+            .iter()
+            .any(|violation| violation.contains("legacy owner")),
+        "private vocabulary imports must not revive a legacy owner: {legacy_private:?}"
+    );
+
+    let legacy_reexport = pbf_1a_module_contract_violations(
+        "src/protocol/mod.rs",
+        "pub(crate) mod common; pub(crate) use crate::common::error::LegacyProtocolError;",
+        "common",
+    );
+    assert!(
+        legacy_reexport
+            .iter()
+            .any(|violation| violation.contains("outward re-export")),
+        "outward legacy-owner re-exports must fail: {legacy_reexport:?}"
     );
 }
 
