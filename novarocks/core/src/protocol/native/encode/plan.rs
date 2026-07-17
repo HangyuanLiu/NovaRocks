@@ -17,6 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     sync::Arc,
 };
 
@@ -29,10 +30,28 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
+use crate::coordinator::prepare::PreparedFragmentSet;
+use crate::coordinator::prepare::runtime_filter_binding::{
+    PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
+    PreparedRuntimeFilterContract, RuntimeFilterBindingTable,
+};
 use crate::coordinator::prepare::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
 };
 use crate::proto::{common, plan};
+use crate::runtime_filter::model::contract::{
+    ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
+    OrderKeyContract, SortDirection, TopKSummaryRequirement,
+};
+use crate::runtime_filter::model::graph::ApplyPoint;
+use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+use crate::runtime_filter::port::ordered_bound::{
+    OrderContractDigest, RuntimeOrderContract, RuntimeOrderKey,
+};
+use crate::runtime_filter::port::topk_summary::{
+    RuntimeTopKSummaryContract, TopKSummaryContractDigest,
+};
 use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 // Consumed only by `#[cfg(test)]` encoder fixtures (the production write/router
 // encoding reads finalized planner types, not these analysis constructors).
@@ -92,6 +111,7 @@ pub(super) struct NativePlanEncodeContext<'a> {
     /// encode a write or router fragment.
     pub(super) write_contracts: ContextRef<'a, WriteContractCatalog>,
     pub(super) runtime_filter_projection: ContextRef<'a, RuntimeFilterGraphProjection>,
+    pub(super) runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
 }
 
 impl<'a> NativePlanEncodeContext<'a> {
@@ -99,6 +119,7 @@ impl<'a> NativePlanEncodeContext<'a> {
         src: &'a DistributedPlan,
         scan_bindings: &'a ScanExecutionBindings,
         runtime_filter_projection: &'a RuntimeFilterGraphProjection,
+        runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
     ) -> Self {
         Self {
             #[cfg(not(test))]
@@ -121,6 +142,7 @@ impl<'a> NativePlanEncodeContext<'a> {
             runtime_filter_projection,
             #[cfg(test)]
             runtime_filter_projection: Some(runtime_filter_projection),
+            runtime_filter_bindings,
         }
     }
 }
@@ -150,14 +172,34 @@ fn required_context_ref<'a, T>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode_distributed_plan(
     src: &DistributedPlan,
     scan_bindings: &ScanExecutionBindings,
     runtime_filter_projection: &RuntimeFilterGraphProjection,
 ) -> Result<plan::DistributedPlan, String> {
+    let prepared = crate::coordinator::prepare::prepared_fragment_set_for_native_encode_test(src)?;
+    encode_distributed_plan_from_prepared(src, scan_bindings, runtime_filter_projection, &prepared)
+}
+
+pub(super) fn encode_distributed_plan_from_prepared(
+    src: &DistributedPlan,
+    scan_bindings: &ScanExecutionBindings,
+    runtime_filter_projection: &RuntimeFilterGraphProjection,
+    prepared: &PreparedFragmentSet,
+) -> Result<plan::DistributedPlan, String> {
+    #[cfg(not(test))]
+    let runtime_filter_bindings = prepared;
+    #[cfg(test)]
+    let runtime_filter_bindings = Some(prepared);
     encode_distributed_plan_with_context_inner(
         src,
-        NativePlanEncodeContext::complete(src, scan_bindings, runtime_filter_projection),
+        NativePlanEncodeContext::complete(
+            src,
+            scan_bindings,
+            runtime_filter_projection,
+            runtime_filter_bindings,
+        ),
     )
 }
 
@@ -169,6 +211,10 @@ pub(super) fn encode_distributed_plan_with_context(
     let runtime_filter_projection = required_context_ref(ctx.runtime_filter_projection, || {
         "native distributed plan encoding requires prepared runtime filter projection".to_string()
     })?;
+    let runtime_filter_bindings = required_context_ref(ctx.runtime_filter_bindings, || {
+        "native distributed plan encoding requires prepared runtime filter binding tables"
+            .to_string()
+    })?;
     encode_distributed_plan_with_context_inner(
         src,
         NativePlanEncodeContext {
@@ -177,6 +223,7 @@ pub(super) fn encode_distributed_plan_with_context(
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
             runtime_filter_projection: Some(runtime_filter_projection),
+            runtime_filter_bindings: Some(runtime_filter_bindings),
         },
     )
 }
@@ -324,7 +371,361 @@ fn encode_plan_fragment_with_context(
                 column_ids: column_ids.iter().map(|id| id.0).collect(),
             })
             .collect(),
+        runtime_filter_bindings: Some({
+            let prepared = required_context_ref(ctx.runtime_filter_bindings, || {
+                format!(
+                    "native fragment {} encoding requires prepared runtime filter binding tables",
+                    src.fragment_id
+                )
+            })?;
+            let prepared_fragment = prepared.fragment(src.fragment_id).ok_or_else(|| {
+                format!(
+                    "prepared fragment {} missing while encoding runtime filter bindings",
+                    src.fragment_id
+                )
+            })?;
+            encode_runtime_filter_binding_table(
+                src.fragment_id,
+                prepared_fragment.runtime_filter_bindings(),
+            )?
+        }),
     })
+}
+
+pub(super) fn encode_runtime_filter_binding_table(
+    enclosing_fragment_id: crate::sql::planner::distributed::FragmentId,
+    table: &RuntimeFilterBindingTable,
+) -> Result<plan::RuntimeFilterBindingTable, String> {
+    if table.fragment_id() != enclosing_fragment_id {
+        return Err(format!(
+            "native runtime filter binding table fragment mismatch: enclosing_fragment_id={enclosing_fragment_id} table_fragment_id={}",
+            table.fragment_id()
+        ));
+    }
+    let mut previous_binding_id = None;
+    let mut bindings = Vec::with_capacity(table.bindings().len());
+    for binding in table.bindings() {
+        let binding_id = binding.binding_id().get();
+        if previous_binding_id.is_some_and(|previous| previous >= binding_id) {
+            return Err(format!(
+                "native runtime filter binding table is not strictly ordered by binding id: previous={previous_binding_id:?} current={binding_id}"
+            ));
+        }
+        previous_binding_id = Some(binding_id);
+        bindings.push(encode_runtime_filter_binding(binding)?);
+    }
+    Ok(plan::RuntimeFilterBindingTable {
+        fragment_id: table.fragment_id(),
+        bindings,
+    })
+}
+
+fn encode_runtime_filter_binding(
+    binding: &PreparedRuntimeFilterBinding,
+) -> Result<plan::RuntimeFilterBinding, String> {
+    let contract = encode_runtime_filter_contract(binding)?;
+    let reduction = encode_runtime_filter_reduction(binding)?;
+    let role = Some(match binding.role() {
+        PreparedRuntimeFilterBindingRole::Producer {
+            contribution_kinds,
+            completion_requirement,
+        } => plan::runtime_filter_binding::Role::Producer(plan::RuntimeFilterProducerRole {
+            contribution_kinds: contribution_kinds
+                .iter()
+                .copied()
+                .map(encode_runtime_filter_contribution_kind)
+                .collect(),
+            completion_requirement: encode_runtime_filter_completion(*completion_requirement),
+        }),
+        PreparedRuntimeFilterBindingRole::Consumer {
+            capabilities,
+            activation,
+        } => plan::runtime_filter_binding::Role::Consumer(plan::RuntimeFilterConsumerRole {
+            capabilities: capabilities
+                .iter()
+                .copied()
+                .map(encode_runtime_filter_capability)
+                .collect(),
+            activation: Some(encode_runtime_filter_activation(*activation)),
+        }),
+    });
+    Ok(plan::RuntimeFilterBinding {
+        binding_id: binding.binding_id().get(),
+        channel_id: binding.channel_id().get(),
+        node_id: binding.node_id().get(),
+        apply_point: encode_runtime_filter_apply_point(binding.apply_point()),
+        expression: Some(encode_expr(binding.expression())?),
+        contract: Some(contract),
+        reduction: Some(reduction),
+        role,
+    })
+}
+
+fn encode_runtime_filter_contract(
+    binding: &PreparedRuntimeFilterBinding,
+) -> Result<plan::RuntimeFilterContract, String> {
+    use plan::runtime_filter_contract::Kind;
+
+    let kind = match binding.contract() {
+        PreparedRuntimeFilterContract::Membership {
+            canonical_schema,
+            schema_digest,
+        } => Kind::Membership(encode_runtime_filter_membership_contract(
+            binding.binding_id().get(),
+            canonical_schema,
+            schema_digest.bytes(),
+        )?),
+        PreparedRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } => Kind::Ordered(encode_runtime_filter_ordered_contract(
+            binding.binding_id().get(),
+            keys,
+            *comparator_digest,
+            *order_contract_digest,
+        )?),
+    };
+    Ok(plan::RuntimeFilterContract { kind: Some(kind) })
+}
+
+fn encode_runtime_filter_ordered_contract(
+    binding_id: u32,
+    keys: &[RuntimeOrderKey],
+    comparator_digest: ComparatorDigest,
+    order_contract_digest: OrderContractDigest,
+) -> Result<plan::RuntimeFilterOrderedContract, String> {
+    if keys.is_empty() {
+        return Err(format!(
+            "native runtime filter binding id={binding_id} has no canonical order keys"
+        ));
+    }
+    let plan_contract = OrderContract {
+        keys: keys
+            .iter()
+            .map(|key| OrderKeyContract {
+                data_type: key.data_type().clone(),
+                direction: key.direction(),
+                null_order: key.null_order(),
+            })
+            .collect(),
+        inclusive: true,
+        comparator_digest,
+    };
+    let canonical = RuntimeOrderContract::try_from_plan(&plan_contract).map_err(|error| {
+        format!(
+            "native runtime filter binding id={binding_id} has a noncanonical ordered contract: {error:?}"
+        )
+    })?;
+    if canonical.digest() != order_contract_digest {
+        return Err(format!(
+            "native runtime filter binding id={binding_id} order contract digest does not match typed keys"
+        ));
+    }
+    Ok(plan::RuntimeFilterOrderedContract {
+        keys: keys
+            .iter()
+            .map(|key| {
+                Ok(plan::RuntimeFilterOrderKey {
+                    r#type: Some(encode_type(key.data_type())?),
+                    direction: encode_runtime_filter_sort_direction(key.direction()),
+                    null_order: encode_runtime_filter_null_order(key.null_order()),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        comparator_digest: comparator_digest.get().to_vec(),
+        order_contract_digest: order_contract_digest.bytes().to_vec(),
+    })
+}
+
+fn encode_runtime_filter_membership_contract(
+    binding_id: u32,
+    canonical_schema: &[u8],
+    schema_digest: [u8; 32],
+) -> Result<plan::RuntimeFilterMembershipContract, String> {
+    if canonical_schema.is_empty() {
+        return Err(format!(
+            "native runtime filter binding id={binding_id} has an empty canonical membership schema"
+        ));
+    }
+    let canonical = ArtifactMembershipSchema::view(canonical_schema).map_err(|error| {
+        format!(
+            "native runtime filter binding id={binding_id} has a noncanonical membership schema: {error:?}"
+        )
+    })?;
+    if canonical.digest().bytes() != schema_digest {
+        return Err(format!(
+            "native runtime filter binding id={binding_id} membership schema digest does not match canonical bytes"
+        ));
+    }
+    Ok(plan::RuntimeFilterMembershipContract {
+        canonical_schema: canonical_schema.to_vec(),
+        schema_digest: schema_digest.to_vec(),
+    })
+}
+
+fn encode_runtime_filter_reduction(
+    binding: &PreparedRuntimeFilterBinding,
+) -> Result<plan::RuntimeFilterReductionContract, String> {
+    use plan::runtime_filter_reduction_contract::Kind;
+
+    let kind = match binding.reduction() {
+        PreparedReductionContract::SetUnion => Kind::SetUnion(true),
+        PreparedReductionContract::TightenOrderedBound => Kind::TightenOrderedBound(true),
+        PreparedReductionContract::MergeTopKSummary { k, contract_digest } => {
+            let PreparedRuntimeFilterContract::Ordered {
+                keys,
+                comparator_digest,
+                ..
+            } = binding.contract()
+            else {
+                return Err(format!(
+                    "native runtime filter binding id={} has TopK reduction without an ordered contract",
+                    binding.binding_id().get()
+                ));
+            };
+            Kind::MergeTopkSummary(encode_runtime_filter_topk_reduction(
+                binding.binding_id().get(),
+                keys,
+                *comparator_digest,
+                *k,
+                *contract_digest,
+            )?)
+        }
+    };
+    Ok(plan::RuntimeFilterReductionContract { kind: Some(kind) })
+}
+
+fn encode_runtime_filter_topk_reduction(
+    binding_id: u32,
+    keys: &[RuntimeOrderKey],
+    comparator_digest: ComparatorDigest,
+    k: NonZeroU32,
+    contract_digest: TopKSummaryContractDigest,
+) -> Result<plan::RuntimeFilterTopKReduction, String> {
+    let order = OrderContract {
+        keys: keys
+            .iter()
+            .map(|key| OrderKeyContract {
+                data_type: key.data_type().clone(),
+                direction: key.direction(),
+                null_order: key.null_order(),
+            })
+            .collect(),
+        inclusive: true,
+        comparator_digest,
+    };
+    let requirement =
+        TopKSummaryRequirement::try_new(k.get()).expect("prepared TopK K is nonzero by type");
+    let canonical = RuntimeTopKSummaryContract::try_from_plan(&order, requirement).map_err(
+        |error| {
+            format!(
+                "native runtime filter binding id={binding_id} has a noncanonical TopK contract: {error:?}"
+            )
+        },
+    )?;
+    if canonical.digest() != contract_digest {
+        return Err(format!(
+            "native runtime filter binding id={binding_id} TopK digest does not match typed order keys and K"
+        ));
+    }
+    Ok(plan::RuntimeFilterTopKReduction {
+        k: k.get(),
+        contract_digest: contract_digest.bytes().to_vec(),
+    })
+}
+
+fn encode_runtime_filter_apply_point(value: ApplyPoint) -> i32 {
+    match value {
+        ApplyPoint::NodeInput => i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
+        ApplyPoint::NodeOutput => i32::from(plan::RuntimeFilterApplyPoint::NodeOutput),
+    }
+}
+
+fn encode_runtime_filter_contribution_kind(value: ContributionKind) -> i32 {
+    match value {
+        ContributionKind::ValueDomainDelta => {
+            i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta)
+        }
+        ContributionKind::FinalDomainShard => {
+            i32::from(plan::RuntimeFilterContributionKind::FinalDomainShard)
+        }
+        ContributionKind::OrderedBoundUpdate => {
+            i32::from(plan::RuntimeFilterContributionKind::OrderedBoundUpdate)
+        }
+        ContributionKind::TopKSummary => {
+            i32::from(plan::RuntimeFilterContributionKind::TopkSummary)
+        }
+        ContributionKind::ProducerClosed => {
+            i32::from(plan::RuntimeFilterContributionKind::ProducerClosed)
+        }
+    }
+}
+
+fn encode_runtime_filter_completion(value: CompletionRequirement) -> i32 {
+    match value {
+        CompletionRequirement::ProducerClosed => {
+            i32::from(plan::RuntimeFilterCompletionRequirement::ProducerClosed)
+        }
+        CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen) => {
+            i32::from(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen)
+        }
+    }
+}
+
+fn encode_runtime_filter_capability(value: ArtifactCapability) -> i32 {
+    match value {
+        ArtifactCapability::Membership => {
+            i32::from(plan::RuntimeFilterArtifactCapability::Membership)
+        }
+        ArtifactCapability::OrderedRange => {
+            i32::from(plan::RuntimeFilterArtifactCapability::OrderedRange)
+        }
+        ArtifactCapability::EmptyDomain => {
+            i32::from(plan::RuntimeFilterArtifactCapability::EmptyDomain)
+        }
+    }
+}
+
+fn encode_runtime_filter_activation(
+    value: ConsumerActivation,
+) -> plan::RuntimeFilterConsumerActivation {
+    use plan::runtime_filter_consumer_activation::Kind;
+
+    plan::RuntimeFilterConsumerActivation {
+        kind: Some(match value {
+            ConsumerActivation::BlockingSnapshot => Kind::BlockingSnapshot(true),
+            ConsumerActivation::NonBlockingLive { late_apply } => {
+                Kind::NonBlockingLive(encode_runtime_filter_late_apply(late_apply))
+            }
+        }),
+    }
+}
+
+fn encode_runtime_filter_late_apply(value: LateApplyGranularity) -> i32 {
+    match value {
+        LateApplyGranularity::Row => i32::from(plan::RuntimeFilterLateApplyGranularity::Row),
+        LateApplyGranularity::Batch => i32::from(plan::RuntimeFilterLateApplyGranularity::Batch),
+        LateApplyGranularity::RowGroup => {
+            i32::from(plan::RuntimeFilterLateApplyGranularity::RowGroup)
+        }
+        LateApplyGranularity::Split => i32::from(plan::RuntimeFilterLateApplyGranularity::Split),
+        LateApplyGranularity::File => i32::from(plan::RuntimeFilterLateApplyGranularity::File),
+    }
+}
+
+fn encode_runtime_filter_sort_direction(value: SortDirection) -> i32 {
+    match value {
+        SortDirection::Ascending => i32::from(plan::RuntimeFilterSortDirection::Ascending),
+        SortDirection::Descending => i32::from(plan::RuntimeFilterSortDirection::Descending),
+    }
+}
+
+fn encode_runtime_filter_null_order(value: NullOrder) -> i32 {
+    match value {
+        NullOrder::First => i32::from(plan::RuntimeFilterNullOrder::First),
+        NullOrder::Last => i32::from(plan::RuntimeFilterNullOrder::Last),
+    }
 }
 
 fn encode_fragment_output_contract(
@@ -412,6 +813,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             fragment_edge_outputs: None,
             write_contracts: None,
             runtime_filter_projection: Some(&RuntimeFilterGraphProjection::default()),
+            runtime_filter_bindings: None,
         },
     )
 }
@@ -468,6 +870,11 @@ pub(super) fn encode_node_with_context(
             .iter()
             .map(encode_graph_runtime_filter_probe)
             .collect::<Result<Vec<_>, _>>()?,
+        runtime_filter_binding_ids: src
+            .runtime_filter_binding_ids
+            .iter()
+            .map(|binding_id| binding_id.get())
+            .collect(),
         children,
         payload: Some(payload),
     };
@@ -2479,6 +2886,13 @@ mod tests {
         Box::leak(Box::new(ScanExecutionBindings::default()))
     }
 
+    fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static PreparedFragmentSet {
+        Box::leak(Box::new(
+            crate::coordinator::prepare::prepared_fragment_set_for_native_encode_test(plan)
+                .expect("materialize native encoder test binding tables"),
+        ))
+    }
+
     #[test]
     fn full_plan_encoding_requires_prepared_runtime_filter_projection() {
         let plan = iceberg_delta_distributed_plan_for_test();
@@ -2491,6 +2905,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: missing_projection,
+                runtime_filter_bindings: None,
             },
         )
         .expect_err("full-plan encoding without prepared RF projection must fail");
@@ -2498,6 +2913,28 @@ mod tests {
         assert_eq!(
             error,
             "native distributed plan encoding requires prepared runtime filter projection"
+        );
+    }
+
+    #[test]
+    fn full_plan_encoding_requires_prepared_runtime_filter_binding_tables() {
+        let plan = iceberg_delta_distributed_plan_for_test();
+        let error = encode_distributed_plan_with_context(
+            &plan,
+            NativePlanEncodeContext {
+                scan_bindings: None,
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
+                runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: None,
+            },
+        )
+        .expect_err("full-plan encoding without prepared RF binding tables must fail");
+
+        assert_eq!(
+            error,
+            "native distributed plan encoding requires prepared runtime filter binding tables"
         );
     }
 
@@ -2823,7 +3260,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_runtime_filter_graph_is_the_only_source_of_native_wire_filters() {
+    fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
         let probe_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(1),
@@ -2921,6 +3358,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(prepared.runtime_filter_projection()),
+                runtime_filter_bindings: Some(&prepared),
             },
         )
         .expect("encode Graph-owned RF plan");
@@ -2939,6 +3377,355 @@ mod tests {
         };
         assert_eq!(join.build_runtime_filters.len(), 1);
         assert_eq!(join.build_runtime_filters[0].filter_id, 0);
+
+        let bundle = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(
+            &distributed,
+            &prepared,
+        )
+        .expect("encode prepared fragment binding tables");
+        let encoded_binding_count = bundle
+            .fragments_in_id_order()
+            .map(|(_, fragment)| {
+                fragment
+                    .runtime_filter_bindings
+                    .as_ref()
+                    .expect("every fragment owns an explicit binding table")
+                    .bindings
+                    .len()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            encoded_binding_count,
+            distributed.runtime_filter_graph().binding_count(),
+            "the encoder must materialize every prepared binding exactly once"
+        );
+
+        for (_, fragment) in bundle.fragments_in_id_order() {
+            let bindings = &fragment
+                .runtime_filter_bindings
+                .as_ref()
+                .expect("every fragment owns an explicit binding table")
+                .bindings;
+            assert!(
+                bindings
+                    .windows(2)
+                    .all(|pair| pair[0].binding_id < pair[1].binding_id),
+                "each fragment-local table must use deterministic binding-id order"
+            );
+        }
+        let encoded_bindings = bundle
+            .fragments_in_id_order()
+            .flat_map(|(_, fragment)| {
+                fragment
+                    .runtime_filter_bindings
+                    .as_ref()
+                    .expect("every fragment owns an explicit binding table")
+                    .bindings
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        let mut producer_count = 0;
+        let mut consumer_count = 0;
+        for binding in &encoded_bindings {
+            let source = distributed
+                .runtime_filter_graph()
+                .binding(crate::runtime_filter::model::contract::BindingId::new(
+                    binding.binding_id,
+                ))
+                .expect("encoded binding originates in the sealed graph");
+            assert_eq!(binding.channel_id, source.channel_id.get());
+            assert_eq!(binding.node_id, source.location.node_id.get());
+            assert_eq!(
+                binding.apply_point,
+                encode_runtime_filter_apply_point(source.apply_point)
+            );
+            assert!(binding.expression.is_some());
+            let Some(plan::runtime_filter_contract::Kind::Membership(contract)) = binding
+                .contract
+                .as_ref()
+                .and_then(|contract| contract.kind.as_ref())
+            else {
+                panic!("broadcast join fixture must encode membership contracts");
+            };
+            assert!(!contract.canonical_schema.is_empty());
+            assert_eq!(contract.schema_digest.len(), 32);
+            assert!(matches!(
+                binding
+                    .reduction
+                    .as_ref()
+                    .and_then(|reduction| reduction.kind.as_ref()),
+                Some(plan::runtime_filter_reduction_contract::Kind::SetUnion(
+                    true
+                ))
+            ));
+            match (binding.role.as_ref().expect("binding role"), &source.role) {
+                (
+                    plan::runtime_filter_binding::Role::Producer(role),
+                    crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Producer(
+                        source_role,
+                    ),
+                ) => {
+                    producer_count += 1;
+                    assert_eq!(
+                        role.contribution_kinds,
+                        source_role
+                            .contribution_kinds
+                            .iter()
+                            .copied()
+                            .map(encode_runtime_filter_contribution_kind)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        role.completion_requirement,
+                        encode_runtime_filter_completion(source_role.completion_requirement)
+                    );
+                }
+                (
+                    plan::runtime_filter_binding::Role::Consumer(role),
+                    crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer(
+                        source_role,
+                    ),
+                ) => {
+                    consumer_count += 1;
+                    assert_eq!(
+                        role.capabilities,
+                        source_role
+                            .capabilities
+                            .iter()
+                            .copied()
+                            .map(encode_runtime_filter_capability)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        role.activation,
+                        Some(encode_runtime_filter_activation(source_role.activation))
+                    );
+                }
+                _ => panic!("encoded binding role must match the sealed graph role"),
+            }
+        }
+        assert_eq!((producer_count, consumer_count), (1, 1));
+
+        fn collect_binding_ids(node: &plan::DistributedNode, ids: &mut Vec<u32>) {
+            ids.extend_from_slice(&node.runtime_filter_binding_ids);
+            for child in &node.children {
+                collect_binding_ids(child, ids);
+            }
+        }
+        let mut attached_ids = Vec::new();
+        for (_, fragment) in bundle.fragments_in_id_order() {
+            collect_binding_ids(
+                fragment.root.as_ref().expect("fragment root"),
+                &mut attached_ids,
+            );
+        }
+        attached_ids.sort_unstable();
+        assert_eq!(
+            attached_ids,
+            encoded_bindings
+                .iter()
+                .map(|binding| binding.binding_id)
+                .collect::<Vec<_>>(),
+            "sealed node binding attachments must round-trip with the table"
+        );
+
+        let second = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(
+            &distributed,
+            &prepared,
+        )
+        .expect("deterministic second encoding");
+        for (fragment_id, first_fragment) in bundle.fragments_in_id_order() {
+            assert_eq!(
+                first_fragment.runtime_filter_bindings,
+                second
+                    .get(fragment_id)
+                    .expect("same prepared fragment set")
+                    .runtime_filter_bindings
+            );
+        }
+
+        let (&fragment_id, prepared_fragment) = prepared
+            .fragment_ids()
+            .iter()
+            .find_map(|fragment_id| {
+                prepared
+                    .fragment(*fragment_id)
+                    .filter(|fragment| !fragment.runtime_filter_bindings().is_empty())
+                    .map(|fragment| (fragment_id, fragment))
+            })
+            .expect("fixture has a nonempty binding table");
+        let mismatch = encode_runtime_filter_binding_table(
+            fragment_id
+                .checked_add(100)
+                .expect("small fixture fragment id"),
+            prepared_fragment.runtime_filter_bindings(),
+        )
+        .expect_err("enclosing fragment mismatch must fail");
+        assert!(mismatch.contains("fragment mismatch"), "{mismatch}");
+    }
+
+    #[test]
+    fn native_encoder_rejects_noncanonical_membership_digest() {
+        let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
+            &DataType::Int64,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .expect("canonical membership schema");
+        let error =
+            encode_runtime_filter_membership_contract(7, schema.canonical_bytes(), [0xAB; 32])
+                .expect_err("digest drift must fail before encoding");
+        assert_eq!(
+            error,
+            "native runtime filter binding id=7 membership schema digest does not match canonical bytes"
+        );
+    }
+
+    fn canonical_order_contract_for_encoder_test() -> OrderContract {
+        let keys = vec![
+            OrderKeyContract {
+                data_type: DataType::Int64,
+                direction: SortDirection::Descending,
+                null_order: NullOrder::First,
+            },
+            OrderKeyContract {
+                data_type: DataType::Utf8,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            },
+        ];
+        OrderContract {
+            comparator_digest:
+                crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
+                    &keys,
+                    crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
+                ),
+            keys,
+            inclusive: true,
+        }
+    }
+
+    #[test]
+    fn native_encoder_preserves_ordered_and_topk_contracts() {
+        let order = canonical_order_contract_for_encoder_test();
+        let runtime_order = RuntimeOrderContract::try_from_plan(&order).expect("canonical order");
+        let encoded_order = encode_runtime_filter_ordered_contract(
+            19,
+            runtime_order.keys(),
+            runtime_order.plan_comparator_digest(),
+            runtime_order.digest(),
+        )
+        .expect("encode canonical ordered contract");
+        assert_eq!(encoded_order.keys.len(), 2);
+        assert_eq!(
+            encoded_order.keys[0].r#type,
+            Some(encode_type(&DataType::Int64).expect("encode Int64"))
+        );
+        assert_eq!(
+            encoded_order.keys[0].direction,
+            i32::from(plan::RuntimeFilterSortDirection::Descending)
+        );
+        assert_eq!(
+            encoded_order.keys[0].null_order,
+            i32::from(plan::RuntimeFilterNullOrder::First)
+        );
+        assert_eq!(
+            encoded_order.keys[1].r#type,
+            Some(encode_type(&DataType::Utf8).expect("encode Utf8"))
+        );
+        assert_eq!(
+            encoded_order.keys[1].direction,
+            i32::from(plan::RuntimeFilterSortDirection::Ascending)
+        );
+        assert_eq!(
+            encoded_order.keys[1].null_order,
+            i32::from(plan::RuntimeFilterNullOrder::Last)
+        );
+        assert_eq!(
+            encoded_order.comparator_digest,
+            runtime_order.plan_comparator_digest().get()
+        );
+        assert_eq!(
+            encoded_order.order_contract_digest,
+            runtime_order.digest().bytes()
+        );
+
+        let requirement = TopKSummaryRequirement::try_new(13).expect("nonzero K");
+        let runtime_topk = RuntimeTopKSummaryContract::try_from_plan(&order, requirement)
+            .expect("canonical TopK contract");
+        let encoded_topk = encode_runtime_filter_topk_reduction(
+            19,
+            runtime_order.keys(),
+            runtime_order.plan_comparator_digest(),
+            runtime_topk.k(),
+            runtime_topk.digest(),
+        )
+        .expect("encode canonical TopK reduction");
+        assert_eq!(encoded_topk.k, 13);
+        assert_eq!(encoded_topk.contract_digest, runtime_topk.digest().bytes());
+    }
+
+    #[test]
+    fn native_encoder_rejects_corrupt_ordered_and_topk_digests() {
+        let order = canonical_order_contract_for_encoder_test();
+        let runtime_order = RuntimeOrderContract::try_from_plan(&order).expect("canonical order");
+        let ordered_error = encode_runtime_filter_ordered_contract(
+            23,
+            runtime_order.keys(),
+            runtime_order.plan_comparator_digest(),
+            crate::runtime_filter::port::ordered_bound::OrderContractDigest::from_bytes_for_codec(
+                [0xA5; 32],
+            ),
+        )
+        .expect_err("corrupt order digest must fail");
+        assert_eq!(
+            ordered_error,
+            "native runtime filter binding id=23 order contract digest does not match typed keys"
+        );
+
+        let canonical_topk = RuntimeTopKSummaryContract::try_from_plan(
+            &order,
+            TopKSummaryRequirement::try_new(13).expect("nonzero K"),
+        )
+        .expect("canonical TopK contract");
+        let topk_error = encode_runtime_filter_topk_reduction(
+            23,
+            runtime_order.keys(),
+            runtime_order.plan_comparator_digest(),
+            TopKSummaryRequirement::try_new(14)
+                .expect("different nonzero K")
+                .k(),
+            canonical_topk.digest(),
+        )
+        .expect_err("digest for a different K must fail");
+        assert_eq!(
+            topk_error,
+            "native runtime filter binding id=23 TopK digest does not match typed order keys and K"
+        );
+    }
+
+    #[test]
+    fn native_encoder_emits_explicit_empty_fragment_table() {
+        let distributed = two_fragment_stream_plan_for_test();
+        assert!(distributed.runtime_filter_graph().is_empty());
+        let prepared = crate::coordinator::prepare::prepare_fragments(
+            &distributed,
+            &crate::connector::ConnectorRegistry::new(),
+            None,
+        )
+        .expect("prepare no-runtime-filter plan");
+        let bundle = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(
+            &distributed,
+            &prepared,
+        )
+        .expect("encode explicit empty tables");
+        for (fragment_id, fragment) in bundle.fragments_in_id_order() {
+            let table = fragment
+                .runtime_filter_bindings
+                .as_ref()
+                .expect("empty table is explicit, never absent");
+            assert_eq!(table.fragment_id, fragment_id);
+            assert!(table.bindings.is_empty());
+        }
     }
 
     #[test]
@@ -3274,6 +4061,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect("encode prepared delta binding");
@@ -3367,6 +4155,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect("encode ordinary Iceberg binding");
@@ -3486,6 +4275,7 @@ mod tests {
                     fragment_edge_outputs: None,
                     write_contracts: None,
                     runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                    runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
                 },
             )
             .expect("encode refresh binding");
@@ -3559,6 +4349,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect_err("delta source without prepared binding must fail");
@@ -3579,6 +4370,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect_err("binding at another node id must not be reused");
@@ -3607,6 +4399,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect_err("delta source with file binding must fail");
@@ -3673,6 +4466,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
         .expect("encode bound VARIANT scan");

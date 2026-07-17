@@ -239,6 +239,7 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: columns.clone(),
@@ -286,6 +287,7 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns,
@@ -707,6 +709,7 @@ mod tests {
             limit: -1,
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: vec![scan],
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: vec![output_column(1, "id", DataType::Int64)],

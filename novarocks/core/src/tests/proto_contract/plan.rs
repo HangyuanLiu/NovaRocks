@@ -293,6 +293,7 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         limit: -1,
         build_runtime_filters: vec![],
         probe_runtime_filters: vec![],
+        runtime_filter_binding_ids: vec![],
         children: node.children.iter().map(node_to_proto).collect(),
         payload: Some(payload),
     }
@@ -369,6 +370,10 @@ fn fragment_to_proto(fragment: &IFragment) -> plan::PlanFragment {
         output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
         cte_id: None,
         cte_exchange_nodes: vec![],
+        runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+            fragment_id: fragment.fragment_id,
+            bindings: vec![],
+        }),
     }
 }
 
@@ -545,6 +550,7 @@ fn missing_plan_payload_reports_boundary_error() {
         limit: -1,
         build_runtime_filters: vec![],
         probe_runtime_filters: vec![],
+        runtime_filter_binding_ids: vec![],
         children: vec![],
         payload: None,
     };

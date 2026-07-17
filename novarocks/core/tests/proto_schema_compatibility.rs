@@ -2986,3 +2986,56 @@ fn proto_schema_comparator_returns_stable_sorted_deduped_violations() {
         "expected sorted output, got: {violations:?}"
     );
 }
+
+#[test]
+fn rfd5b_proto_additive_binding_fields_are_exact() {
+    let schema = parse_current_novarocks_proto_schema().expect("parse current native proto schema");
+    let plan = &schema.files["idl/novarocks/plan.proto"];
+
+    let fragment_field = &plan.messages["PlanFragment"].fields[&10];
+    assert_eq!(fragment_field.name, "runtime_filter_bindings");
+    assert_eq!(fragment_field.type_name, "RuntimeFilterBindingTable");
+    assert_eq!(fragment_field.label, "singular");
+
+    let node_field = &plan.messages["DistributedNode"].fields[&9];
+    assert_eq!(node_field.name, "runtime_filter_binding_ids");
+    assert_eq!(node_field.type_name, "uint32");
+    assert_eq!(node_field.label, "repeated");
+
+    for (number, name, type_name) in [
+        (6, "build_runtime_filters", "RuntimeFilterBuild"),
+        (7, "probe_runtime_filters", "RuntimeFilterProbe"),
+    ] {
+        let transitional = &plan.messages["DistributedNode"].fields[&number];
+        assert_eq!(transitional.name, name);
+        assert_eq!(transitional.type_name, type_name);
+    }
+    let transitional_join = &plan.messages["HashJoinNode"].fields[&6];
+    assert_eq!(transitional_join.name, "build_runtime_filters");
+    assert_eq!(transitional_join.type_name, "RuntimeFilterBuildIntent");
+
+    let table = &plan.messages["RuntimeFilterBindingTable"];
+    assert_eq!(table.fields[&1].name, "fragment_id");
+    assert_eq!(table.fields[&2].name, "bindings");
+    assert_eq!(table.fields[&2].label, "repeated");
+    assert_eq!(
+        plan.messages["RuntimeFilterOrderedContract"].fields[&1].type_name,
+        "RuntimeFilterOrderKey"
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterOrderedContract"].fields[&1].label,
+        "repeated"
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterConsumerActivation"].fields[&1]
+            .oneof
+            .as_deref(),
+        Some("kind")
+    );
+    assert_eq!(
+        plan.messages["RuntimeFilterConsumerActivation"].fields[&2]
+            .oneof
+            .as_deref(),
+        Some("kind")
+    );
+}

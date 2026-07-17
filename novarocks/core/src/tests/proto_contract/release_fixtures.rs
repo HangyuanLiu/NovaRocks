@@ -247,6 +247,7 @@ fn release_plan_fragment() -> plan::PlanFragment {
             limit: -1,
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
+            runtime_filter_binding_ids: vec![],
             children: vec![
                 plan::DistributedNode {
                     node_id: 11,
@@ -256,6 +257,7 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     limit: -1,
                     build_runtime_filters: vec![],
                     probe_runtime_filters: vec![],
+                    runtime_filter_binding_ids: vec![],
                     children: vec![],
                     payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                         output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
@@ -291,6 +293,7 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     limit: -1,
                     build_runtime_filters: vec![],
                     probe_runtime_filters: vec![],
+                    runtime_filter_binding_ids: vec![],
                     children: vec![],
                     payload: Some(plan::distributed_node::Payload::Exchange(
                         plan::ExchangeReceiver {
@@ -347,6 +350,10 @@ fn release_plan_fragment() -> plan::PlanFragment {
         output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
         cte_id: None,
         cte_exchange_nodes: vec![],
+        runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![],
+        }),
     }
 }
 

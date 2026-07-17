@@ -1531,6 +1531,7 @@ mod tests {
                 fragment_edge_outputs: None,
                 write_contracts: None,
                 runtime_filter_projection: Some(empty_runtime_filter_projection()),
+                runtime_filter_bindings: None,
             },
         )
         .expect("encode StarRocks native scan source");

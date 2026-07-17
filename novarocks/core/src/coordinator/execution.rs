@@ -3216,6 +3216,7 @@ mod native_contract_tests {
                 limit: -1,
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
+                runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 payload: Some(native_plan::distributed_node::Payload::Physical(
                     native_plan::PlanNode {
