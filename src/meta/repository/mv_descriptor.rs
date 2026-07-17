@@ -353,6 +353,18 @@ mod tests {
     }
 
     #[test]
+    fn schema_contract_typed_preserves_absence() {
+        let mut descriptor = sample();
+        descriptor.schema_contract = None;
+
+        assert_eq!(descriptor.schema_contract_typed().unwrap(), None);
+
+        let round_trip = MvDescriptorV1::from_json(&descriptor.to_canonical_json().unwrap())
+            .expect("round-trip descriptor without schema contract");
+        assert_eq!(round_trip.schema_contract_typed().unwrap(), None);
+    }
+
+    #[test]
     fn schema_contract_typed_round_trips() {
         use crate::meta::repository::mv_contract::{
             ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
