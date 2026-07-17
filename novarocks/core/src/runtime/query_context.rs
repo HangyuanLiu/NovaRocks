@@ -208,7 +208,6 @@ impl QueryContext {
         Instant::now() >= self.delivery_deadline
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_query_expired(&self) -> bool {
         Instant::now() >= self.query_deadline
     }
@@ -640,23 +639,47 @@ impl QueryContextManager {
     fn clean_expired(&self) {
         let expired = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let to_remove = guard
+            let expired_second_chance = guard
                 .second_chance
                 .iter()
                 .filter_map(|(qid, ctx)| {
                     (ctx.has_no_active_instances() && ctx.is_delivery_expired()).then_some(*qid)
                 })
                 .collect::<Vec<_>>();
-            to_remove
-                .into_iter()
-                .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx)))
-                .collect::<Vec<_>>()
+            let expired_active = guard
+                .active
+                .iter()
+                .filter_map(|(qid, ctx)| {
+                    (ctx.has_no_active_instances() && ctx.is_query_expired()).then_some(*qid)
+                })
+                .collect::<Vec<_>>();
+            let mut expired = Vec::with_capacity(
+                expired_second_chance
+                    .len()
+                    .saturating_add(expired_active.len()),
+            );
+            expired.extend(
+                expired_second_chance
+                    .into_iter()
+                    .filter_map(|qid| guard.second_chance.remove(&qid).map(|ctx| (qid, ctx))),
+            );
+            expired.extend(
+                expired_active
+                    .into_iter()
+                    .filter_map(|qid| guard.active.remove(&qid).map(|ctx| (qid, ctx))),
+            );
+            expired
         };
         for (qid, ctx) in expired {
             ctx.runtime_filter_service().shutdown();
             drop(ctx);
             self.remove_runtime_filter_lifecycle_if_context_absent(qid);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clean_expired_for_test(&self) {
+        self.clean_expired();
     }
 
     fn remove_runtime_filter_lifecycle_if_context_absent(&self, query_id: QueryId) {
@@ -2335,6 +2358,177 @@ mod runtime_filter_service_lifecycle_tests {
                 .second_chance
                 .contains_key(&query_id)
         );
+    }
+
+    #[test]
+    fn clean_expired_shuts_down_expired_claim_only_active_context_after_releasing_manager_lock() {
+        let manager = test_manager();
+        let query_id = query_id(72);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("runtime-filter RPC claim-only context");
+        let (service, receiver) = install_probed_service(&manager, query_id);
+        manager
+            .inner
+            .lock()
+            .expect("query manager")
+            .active
+            .get_mut(&query_id)
+            .expect("claim-only active query")
+            .query_deadline = Instant::now() - Duration::from_millis(1);
+
+        manager.clean_expired();
+
+        assert_terminal_probe(receiver);
+        assert!(
+            !manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .active
+                .contains_key(&query_id)
+        );
+        assert!(registry.snapshot(query_key).is_none());
+        let error = service
+            .install(participant_install())
+            .expect_err("expired claim-only service must remain closed");
+        assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
+    }
+
+    #[test]
+    fn clean_expired_preserves_unexpired_claim_only_active_context() {
+        let manager = test_manager();
+        let query_id = query_id(73);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("runtime-filter RPC claim-only context");
+        let before = service(&manager, query_id);
+
+        manager.clean_expired();
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("claim remains active");
+        assert_eq!(context.num_active_fragments, 0);
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+        assert!(Arc::ptr_eq(&before, &context.runtime_filter_service()));
+    }
+
+    #[test]
+    fn clean_expired_preserves_active_fragment_past_query_deadline() {
+        let manager = test_manager();
+        let query_id = query_id(74);
+        manager
+            .get_or_register_native(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("active Native fragment");
+        manager
+            .inner
+            .lock()
+            .expect("query manager")
+            .active
+            .get_mut(&query_id)
+            .expect("active query")
+            .query_deadline = Instant::now() - Duration::from_millis(1);
+
+        manager.clean_expired();
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard
+            .active
+            .get(&query_id)
+            .expect("active fragment retained");
+        assert_eq!(context.num_active_fragments, 1);
+    }
+
+    #[test]
+    fn concurrent_native_fragment_recreates_context_while_expired_claim_shuts_down() {
+        let manager = test_manager();
+        let query_id = query_id(75);
+        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
+        let registry = RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        manager
+            .ensure_native_context(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("claim-only Native context");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let sink = Arc::new(BlockingShutdownSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let old_service = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("claim-only query");
+            context.query_deadline = Instant::now() - Duration::from_millis(1);
+            let service = Arc::new(RuntimeFilterService::new_for_query(
+                uid(query_id.lo),
+                sink,
+                &context.mem_tracker,
+            ));
+            context.runtime_filter_service = Arc::clone(&service);
+            service
+        };
+        assert_eq!(
+            old_service
+                .install(participant_install())
+                .expect("valid install"),
+            InstallOutcome::Installed
+        );
+
+        let cleaner = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.clean_expired())
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expired claim shutdown must start");
+
+        manager
+            .get_or_register_native(
+                query_id,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .expect("legal concurrent Native fragment");
+        release_tx.send(()).expect("release old shutdown");
+        cleaner.join().expect("cleaner");
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("replacement context");
+        assert_eq!(context.num_active_fragments, 1);
+        assert_eq!(
+            context.legacy_runtime_filter_execution_claim(),
+            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        );
+        assert!(registry.snapshot(query_key).is_some());
+        registry.remove_query(query_key);
     }
 
     #[test]

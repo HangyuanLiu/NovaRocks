@@ -627,6 +627,51 @@ mod native_runtime_filter_mode_tests {
     }
 
     #[test]
+    fn native_rf_rpc_before_fragment_claim_only_context_expires() {
+        let query_id = QueryId {
+            hi: 71_101,
+            lo: 71_102,
+        };
+        let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
+            query_id.hi,
+            query_id.lo,
+        );
+        let registry =
+            crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+
+        let response =
+            handle_transmit_runtime_filter(proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: true,
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                }),
+                filter_id: 9,
+                data: vec![1, 2, 3],
+                build_be_number: 0,
+                column_type: None,
+            });
+        assert_ne!(response.status.expect("status").code, 0);
+
+        let manager = query_context_manager();
+        assert!(registry.snapshot(query_key).is_some());
+        manager
+            .with_context_mut(query_id, |context| {
+                assert_eq!(context.num_active_fragments, 0);
+                context.query_deadline =
+                    std::time::Instant::now() - std::time::Duration::from_millis(1);
+                Ok(())
+            })
+            .expect("claim-only active context");
+
+        manager.clean_expired_for_test();
+
+        assert!(manager.query_mem_tracker(query_id).is_none());
+        assert!(registry.snapshot(query_key).is_none());
+    }
+
+    #[test]
     fn native_fragment_before_rf_rpc_claims_disabled_and_queues_nothing() {
         let query_id = QueryId {
             hi: 71_003,

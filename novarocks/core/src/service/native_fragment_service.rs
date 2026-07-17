@@ -507,6 +507,52 @@ mod tests {
     }
 
     #[test]
+    fn rejected_native_fragment_claim_only_context_expires() {
+        let query_id = QueryId {
+            hi: 73_101,
+            lo: 73_102,
+        };
+        let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
+            query_id.hi,
+            query_id.lo,
+        );
+        let registry =
+            crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global();
+        registry.remove_query(query_key);
+        let invalid = native_instance_params(
+            query_id,
+            crate::proto::novarocks::RuntimeFilterParams {
+                runtime_filter_builder_number: HashMap::from([(7, 1)]),
+                ..Default::default()
+            },
+        );
+
+        let error =
+            submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), invalid)
+                .expect_err("native fragment must reject legacy runtime-filter params");
+        assert!(
+            error.contains("contains legacy runtime-filter params"),
+            "{error}"
+        );
+
+        let manager = query_context_manager();
+        assert!(registry.snapshot(query_key).is_some());
+        manager
+            .with_context_mut(query_id, |context| {
+                assert_eq!(context.num_active_fragments, 0);
+                context.query_deadline =
+                    std::time::Instant::now() - std::time::Duration::from_millis(1);
+                Ok(())
+            })
+            .expect("claim-only active context");
+
+        manager.clean_expired_for_test();
+
+        assert!(manager.query_mem_tracker(query_id).is_none());
+        assert!(registry.snapshot(query_key).is_none());
+    }
+
+    #[test]
     fn legacy_runtime_filter_rejection_preserves_existing_context_state() {
         let query_id = QueryId {
             hi: 73_003,
