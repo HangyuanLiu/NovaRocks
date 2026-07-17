@@ -3242,7 +3242,6 @@ dependencies = [
  "sha2",
  "sm3",
  "sqlparser",
- "syn 2.0.119",
  "tdigest",
  "tempfile",
  "threadpool",
