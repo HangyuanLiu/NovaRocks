@@ -36,7 +36,7 @@ use novarocks::meta::repository::mv::{
     MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup,
     RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
     RefreshCommitMarker, RefreshExternalOutcome, ReplaceMvPartitionStatesRequest,
-    StoredMvRefreshPolicy, UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
+    UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::starrocks_table::{
@@ -55,6 +55,7 @@ use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
     SqliteMetaStoreProvider,
 };
+use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
 use novarocks::mv::persistence::schema::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
@@ -189,6 +190,116 @@ fn sample_mv_partition_contract() -> MvPartitionContract {
             transform: MvPartitionTransformContract::Bucket { num_buckets: 16 },
         }],
     }
+}
+
+#[derive(Debug, Serialize)]
+struct StoredMvDefinitionAvroV1 {
+    mv_id: i64,
+    select_sql: String,
+    base_table_refs: Vec<String>,
+    primary_key_columns: Vec<String>,
+    storage_engine: String,
+    target_catalog: Option<String>,
+    target_namespace: Option<String>,
+    target_table: Option<String>,
+    schema_contract: Option<String>,
+    partition_spec: Option<String>,
+    last_refresh_ms: Option<i64>,
+    last_refresh_rows: Option<i64>,
+    last_refresh_snapshots: BTreeMap<String, i64>,
+    last_refresh_table_uuids: BTreeMap<String, String>,
+    last_refreshed_iceberg_snapshot_id: Option<i64>,
+    refresh_in_progress: bool,
+    active_refresh_id: Option<i64>,
+    refresh_target_snapshots: BTreeMap<String, i64>,
+    refresh_policy: StoredMvRefreshPolicyAvroV1,
+    refresh_paused: bool,
+    refresh_interval_ms: Option<i64>,
+    max_staleness_ms: Option<i64>,
+    last_scheduler_error: Option<String>,
+    next_refresh_after_ms: Option<i64>,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StoredMvRefreshPolicyAvroV1 {
+    AsyncOnChange,
+}
+
+#[test]
+fn mv_definition_v1_reads_with_partition_state_incomplete() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let partition = sample_mv_partition_contract();
+    let schema_contract = sample_mv_schema_contract(partition.clone());
+    let mv_id = 41;
+    let writer = novarocks::meta::avro::schema_catalog()?.entry("mv.definition", 1)?;
+    let payload = novarocks::meta::avro::encode_payload_with_schema(
+        writer,
+        &StoredMvDefinitionAvroV1 {
+            mv_id,
+            select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+            base_table_refs: vec!["ice.sales.orders".to_string()],
+            primary_key_columns: vec!["id".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("ice".to_string()),
+            target_namespace: Some("analytics".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            schema_contract: Some(serde_json::to_string(&schema_contract)?),
+            partition_spec: Some(serde_json::to_string(&partition)?),
+            last_refresh_ms: Some(1_700_000_000_000),
+            last_refresh_rows: Some(12),
+            last_refresh_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 101)]),
+            last_refresh_table_uuids: BTreeMap::from([(
+                "ice.sales.orders".to_string(),
+                "11111111-1111-1111-1111-111111111111".to_string(),
+            )]),
+            last_refreshed_iceberg_snapshot_id: Some(101),
+            refresh_in_progress: true,
+            active_refresh_id: Some(7),
+            refresh_target_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 102)]),
+            refresh_policy: StoredMvRefreshPolicyAvroV1::AsyncOnChange,
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: Some(60_000),
+            last_scheduler_error: None,
+            next_refresh_after_ms: Some(1_700_000_060_000),
+            created_at_ms: 1_699_999_000_000,
+        },
+    )?;
+    assert_eq!(payload.schema_id, 1);
+
+    {
+        let mut txn = provider.begin_write("seed mv definition v1")?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("mv", ["by-id".to_string(), mv_id.to_string()])?,
+            MetaRecordKind::new("mv.definition")?,
+            ExpectedRevision::NotExists,
+            payload,
+        ))?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("v1 definition should remain readable");
+    assert!(!definition.partition_state_complete);
+    assert_eq!(definition.schema_contract, Some(schema_contract));
+    assert_eq!(definition.partition_spec, Some(partition));
+    assert_eq!(
+        definition.refresh_policy,
+        StoredMvRefreshPolicy::AsyncOnChange
+    );
+    assert_eq!(definition.last_refresh_snapshots["ice.sales.orders"], 101);
+    assert_eq!(definition.refresh_target_snapshots["ice.sales.orders"], 102);
+    assert_eq!(definition.target_catalog.as_deref(), Some("ice"));
+    assert_eq!(definition.target_namespace.as_deref(), Some("analytics"));
+    assert_eq!(definition.target_table.as_deref(), Some("orders_mv"));
+    Ok(())
 }
 
 #[test]

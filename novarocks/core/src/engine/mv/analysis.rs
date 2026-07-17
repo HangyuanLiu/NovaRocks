@@ -33,8 +33,9 @@ use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
 use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::meta::MetaReadTxn;
-use crate::meta::repository::mv::{MvRefreshState, StoredMvDefinition};
+use crate::meta::repository::mv::MvRefreshState;
 use crate::mv::model::MvStorageEngine;
+use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
@@ -328,10 +329,7 @@ fn refresh_status_for_mv(
     {
         return Ok(("FAILED_BACKOFF".to_string(), retry_after_time));
     }
-    if matches!(
-        mv.refresh_policy,
-        crate::meta::repository::mv::StoredMvRefreshPolicy::Manual
-    ) {
+    if matches!(mv.refresh_policy, StoredMvRefreshPolicy::Manual) {
         return Ok(("MANUAL".to_string(), retry_after_time));
     }
     if mv

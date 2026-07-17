@@ -24,8 +24,11 @@ use crate::engine::StandaloneState;
 use crate::engine::mv::analysis::ResolvedTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
-    MvDependencyStorageEngine, StoredMvDefinition,
+    MvDependencyStorageEngine,
 };
+use crate::mv::persistence::definition::StoredMvDefinition;
+#[cfg(test)]
+use crate::mv::persistence::definition::StoredMvRefreshPolicy;
 
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,
@@ -648,7 +651,7 @@ mod tests {
             refresh_in_progress: false,
             active_refresh_id: None,
             refresh_target_snapshots: std::collections::BTreeMap::new(),
-            refresh_policy: crate::meta::repository::mv::StoredMvRefreshPolicy::Manual,
+            refresh_policy: StoredMvRefreshPolicy::Manual,
             refresh_paused: false,
             refresh_interval_ms: None,
             max_staleness_ms: None,

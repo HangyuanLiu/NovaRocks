@@ -151,7 +151,7 @@ fn build_candidate(
     state: &Arc<StandaloneState>,
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
-    def: &crate::meta::repository::mv::StoredMvDefinition,
+    def: &crate::mv::persistence::definition::StoredMvDefinition,
     factory: &mut ColumnRefFactory,
 ) -> Result<Option<PreparedMvRewriteCandidate>, String> {
     // 2b. Strict freshness: every base table's CURRENT snapshot must equal

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::engine::StandaloneState;
-use crate::meta::repository::mv::StoredMvDefinition;
+use crate::mv::persistence::definition::StoredMvDefinition;
 
 use super::policy::{SnapshotInfo, TableMaintenanceStats};
 
@@ -152,7 +152,7 @@ pub(crate) fn collect_table_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv::{StoredMvDefinition, StoredMvRefreshPolicy};
+    use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
     use std::collections::BTreeMap;
 
     fn definition_with_consumed(fqn: &str, snapshot_id: i64) -> StoredMvDefinition {

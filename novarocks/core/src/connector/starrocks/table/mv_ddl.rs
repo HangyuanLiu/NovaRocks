@@ -32,14 +32,13 @@ use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
 #[cfg(test)]
-use crate::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
-};
-use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState, StoredMvDefinition};
+use crate::meta::repository::mv::{BeginIcebergMvRefreshRequest, UpdateMvRefreshMetadataRequest};
+use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState};
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest,
     StarRocksTableKind as RepoStarRocksTableKind,
 };
+use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::column_id::ColumnId;
@@ -1204,10 +1203,7 @@ fn refresh_status_for_mv(
     {
         return Ok(("FAILED_BACKOFF".to_string(), retry_after_time));
     }
-    if matches!(
-        mv.refresh_policy,
-        crate::meta::repository::mv::StoredMvRefreshPolicy::Manual
-    ) {
+    if matches!(mv.refresh_policy, StoredMvRefreshPolicy::Manual) {
         return Ok(("MANUAL".to_string(), retry_after_time));
     }
     if mv

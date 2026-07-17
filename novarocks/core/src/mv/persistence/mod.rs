@@ -15,5 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod definition;
 pub mod descriptor;
 pub mod schema;

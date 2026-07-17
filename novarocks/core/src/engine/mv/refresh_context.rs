@@ -39,7 +39,7 @@ use crate::connector::iceberg::scan_model::{
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-use crate::meta::repository::mv::StoredMvDefinition;
+use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::sql::planner::table::{
     IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
@@ -1475,7 +1475,7 @@ pub(crate) mod tests_support {
 
     use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::meta::repository::mv::StoredMvDefinition;
+    use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
