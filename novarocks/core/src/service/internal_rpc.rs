@@ -763,8 +763,8 @@ mod pending_runtime_filter_enqueue_error_tests {
         let status = response.status.expect("status");
         assert_ne!(status.code, 0);
         assert!(status.message.contains("injected pending enqueue failure"));
-     }
- }
+    }
+}
 
 #[cfg(all(test, feature = "compat"))]
 mod tests {
@@ -875,6 +875,8 @@ mod tests {
             pipeline_sink_dop: None,
             report_when_finish: None,
             exec_debug_options: None,
+            per_look_up_num_fetchers: None,
+            per_fetch_target_nodes: None,
         };
         let request = thrift_internal_service::TExecPlanFragmentParams {
             protocol_version: thrift_internal_service::InternalServiceVersion::V1,

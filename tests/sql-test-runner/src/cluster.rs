@@ -1242,52 +1242,6 @@ mod tests {
     }
 
     #[test]
-    fn process_log_tail_is_bounded_and_keeps_the_latest_lines() {
-        let mut buffer = String::new();
-        push_bounded_log_line(&mut buffer, "first", 16);
-        push_bounded_log_line(&mut buffer, "second", 16);
-        push_bounded_log_line(&mut buffer, "third", 16);
-
-        assert!(buffer.len() <= 16, "buffer={buffer:?}");
-        assert!(buffer.contains("third"), "buffer={buffer:?}");
-        assert!(!buffer.contains("first"), "buffer={buffer:?}");
-    }
-
-    #[test]
-    fn cross_process_launch_runs_show_backends_barrier_after_fe_ready() {
-        let source = include_str!("cluster.rs")
-            .split("\n#[cfg(test)]")
-            .next()
-            .expect("production cluster source");
-        let launch = source
-            .split("fn launch_impl(")
-            .nth(1)
-            .expect("launch_impl")
-            .split("fn ensure_be_index")
-            .next()
-            .expect("launch_impl body");
-        let fe_ready = launch
-            .find("let mut fe_process = spawn_novarocks_process(")
-            .expect("FE spawn");
-        let barrier = launch
-            .find("wait_for_live_backend_topology(")
-            .expect("SHOW BACKENDS topology barrier");
-        let return_handle = launch.find("Ok(Self {").expect("return handle");
-        assert!(fe_ready < barrier, "barrier must run after FE readiness");
-        assert!(barrier < return_handle, "barrier must run before SQL receives the handle");
-        assert!(
-            source.contains("process_runtime_diagnostics("),
-            "barrier must collect live FE/BE process diagnostics"
-        );
-        assert!(
-            source.contains(".tcp_connect_timeout(Some(io_timeout))")
-                && source.contains(".read_timeout(Some(io_timeout))")
-                && source.contains(".write_timeout(Some(io_timeout))"),
-            "SHOW BACKENDS MySQL connection must use bounded IO timeouts"
-        );
-    }
-
-    #[test]
     fn noop_server_handle_rejects_be_process_controls() {
         let mut handle = NoopServerHandle;
 

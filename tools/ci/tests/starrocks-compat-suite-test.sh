@@ -76,7 +76,8 @@ if [ "$actual_order" != "$expected_order" ]; then
   exit 1
 fi
 grep -q 'build-compat-artifact.sh --profile dev-opt --output-dir ' <<<"$explicit_output"
-grep -q 'cargo test --profile dev-opt --features compat -- --test-threads=1' <<<"$explicit_output"
+grep -q 'cargo clippy -p novarocks-server -p novarocks --all-targets --features compat' <<<"$explicit_output"
+grep -q 'cargo test -p novarocks-server -p novarocks --profile dev-opt --features compat -- --test-threads=1' <<<"$explicit_output"
 grep -q 'run_starrocks_compat_suite .*manifest.txt' <<<"$explicit_output"
 
 default_binary="$tmpdir/novarocks-default"

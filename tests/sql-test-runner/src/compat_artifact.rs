@@ -762,7 +762,7 @@ mod tests {
             &hook,
             r##"#!/usr/bin/env bash
 set -euo pipefail
-test "$*" = "cargo build --profile dev-opt --features compat --bin novarocks --bin starrocks-compat-probe"
+test "$*" = "cargo build --profile dev-opt -p novarocks-server -p novarocks --features compat --bin novarocks --bin starrocks-compat-probe"
 mkdir -p "$CARGO_TARGET_DIR/dev-opt"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CARGO_TARGET_DIR/dev-opt/novarocks"
 chmod +x "$CARGO_TARGET_DIR/dev-opt/novarocks"

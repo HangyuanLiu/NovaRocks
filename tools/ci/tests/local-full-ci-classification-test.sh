@@ -252,9 +252,9 @@ fi
 
 run_compat_gates_text="$(declare -f run_compat_gates)"
 for expected in \
-  'cargo clippy --all-targets --features compat' \
+  'cargo clippy -p novarocks-server -p novarocks --all-targets --features compat' \
   'tools/ci/build-compat-artifact.sh' \
-  'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
+  'cargo test -p novarocks-server -p novarocks --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
   'run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"'; do
   if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
     echo "explicit compat gates must include: $expected" >&2

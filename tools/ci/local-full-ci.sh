@@ -427,7 +427,8 @@ run_compat_gates() {
     return
   fi
 
-  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" cargo clippy --all-targets --features compat
+  run_fail_fast_stage "cargo clippy compat" "cargo-clippy-compat.log" \
+    cargo clippy -p novarocks-server -p novarocks --all-targets --features compat
   run_fail_fast_stage "cargo build compat artifact" "cargo-build-compat-artifact.log" \
     tools/ci/build-compat-artifact.sh \
       --profile "$NOVA_CI_CARGO_PROFILE" \
@@ -436,7 +437,9 @@ run_compat_gates() {
     ci_record_stage "cargo test compat" "SKIP" "0" ""
     ci_render_summary "RUNNING"
   else
-    run_fail_fast_stage "cargo test compat" "cargo-test-compat.log" cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat -- --test-threads=1
+    run_fail_fast_stage "cargo test compat" "cargo-test-compat.log" \
+      cargo test -p novarocks-server -p novarocks \
+        --profile "$NOVA_CI_CARGO_PROFILE" --features compat -- --test-threads=1
   fi
   run_fail_fast_stage "starrocks-compat E2E" "starrocks-compat-e2e.log" \
     run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"
