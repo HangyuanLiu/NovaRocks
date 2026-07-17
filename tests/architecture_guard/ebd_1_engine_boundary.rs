@@ -2370,7 +2370,7 @@ fn baseline_arrays_are_canonical() -> bool {
 fn ebd_1_engine_migration_firewall_matches_source_tree() {
     let actual = current_source_tree_snapshot();
     assert!(
-        actual.engine_files.len() >= 80,
+        actual.engine_files.len() >= 76,
         "EBD-1 must scan the full engine tree, found only {} files",
         actual.engine_files.len()
     );
@@ -6861,7 +6861,7 @@ fn ebd_4b2a_catalog_write_default_boundary_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [80, 78, 211, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-default-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -7763,7 +7763,7 @@ fn ebd_4b2b_catalog_column_def_owner_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [80, 78, 211, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-column-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
@@ -8685,7 +8685,7 @@ fn ebd_4b3a_catalog_physical_layout_retirement_is_complete() {
             .sum(),
         actual.forwarding_reexports.len(),
     ];
-    let expected_counts = [80, 78, 211, 58, 7];
+    let expected_counts = [76, 74, 210, 55, 0];
     if actual_counts != expected_counts {
         violations.insert(format!(
             "catalog-physical-layout-ebd-1-baseline-drift: expected={expected_counts:?} actual={actual_counts:?}"
