@@ -25,9 +25,7 @@ use crate::lower::novarocks::execute_fragment_native;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::native_fragment_wire::{
-    endpoint_from_native, query_options_from_native, runtime_filter_params_from_native,
-};
+use crate::runtime::native_fragment_wire::{endpoint_from_native, query_options_from_native};
 use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
@@ -246,23 +244,16 @@ pub fn submit_exec_plan_fragment_native(
         .as_ref()
         .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
         .map(unique_id_from_native)?;
+    if instance_params.runtime_filter_params.is_some() {
+        return Err(format!(
+            "native fragment query_id={query_id} contains legacy runtime-filter params"
+        ));
+    }
     let query_opts = instance_params
         .query_options
         .as_ref()
         .map(query_options_from_native)
         .transpose()?;
-    if let Some(rf_params) = instance_params
-        .runtime_filter_params
-        .as_ref()
-        .map(runtime_filter_params_from_native)
-        .transpose()?
-    {
-        if !rf_params.is_empty() {
-            return Err(format!(
-                "native fragment query_id={query_id} contains legacy runtime-filter params"
-            ));
-        }
-    }
     let (delivery_expire, query_expire) = query_expire_durations(query_opts.as_ref());
     let mgr = query_context_manager();
     mgr.get_or_register_native(query_id, false, delivery_expire, query_expire)?;
@@ -416,6 +407,7 @@ mod tests {
             query_id,
             crate::proto::novarocks::RuntimeFilterParams::default(),
         );
+        retry.runtime_filter_params = None;
         retry.query_options = Some(crate::proto::novarocks::QueryOptions {
             datacache_evict_probability: Some(101),
             ..Default::default()

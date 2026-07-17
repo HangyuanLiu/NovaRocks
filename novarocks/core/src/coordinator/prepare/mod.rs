@@ -102,8 +102,6 @@ pub(crate) fn prepare_fragments(
         plan.boundaries().contracts(),
         &sealed_ids,
     )?;
-    let runtime_filter_projection =
-        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?;
     let mut runtime_filter_binding_tables =
         runtime_filter_binding::materialize_runtime_filter_binding_tables(
             plan.runtime_filter_graph(),
@@ -238,7 +236,6 @@ pub(crate) fn prepare_fragments(
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan_bindings,
-        runtime_filter_projection,
         topological_fragment_order,
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
@@ -289,7 +286,6 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan::ScanExecutionBindings::default(),
-        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?,
         plan.topology().topological_fragment_order().to_vec(),
         plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),

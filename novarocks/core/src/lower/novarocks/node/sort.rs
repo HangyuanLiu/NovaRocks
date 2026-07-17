@@ -214,8 +214,6 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
             runtime_filter_binding_ids: Vec::new(),
             children,
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {

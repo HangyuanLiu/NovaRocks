@@ -977,8 +977,14 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        let entrypoint = include_str!("mod.rs");
-        let transitional_projection = include_str!("projection.rs");
+        let entrypoint = include_str!("mod.rs")
+            .split("pub(crate) fn prepare_fragments(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]\npub(crate) fn prepared_fragment_set_for_native_encode_test")
+            .next()
+            .unwrap();
+        let projection = include_str!("projection.rs");
         assert_eq!(
             owner
                 .matches("pub(super) fn materialize_runtime_filter_binding_tables")
@@ -991,6 +997,6 @@ mod tests {
                 .count(),
             1
         );
-        assert!(transitional_projection.contains("transitional_until_task_5"));
+        assert!(!projection.contains("transitional_until_task_5"));
     }
 }

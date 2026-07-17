@@ -245,8 +245,6 @@ fn release_plan_fragment() -> plan::PlanFragment {
             tuple_ids: vec![10],
             nullable_tuple_ids: vec![],
             limit: -1,
-            build_runtime_filters: vec![],
-            probe_runtime_filters: vec![],
             runtime_filter_binding_ids: vec![],
             children: vec![
                 plan::DistributedNode {
@@ -255,8 +253,6 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     tuple_ids: vec![11],
                     nullable_tuple_ids: vec![],
                     limit: -1,
-                    build_runtime_filters: vec![],
-                    probe_runtime_filters: vec![],
                     runtime_filter_binding_ids: vec![],
                     children: vec![],
                     payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
@@ -291,8 +287,6 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     tuple_ids: vec![12],
                     nullable_tuple_ids: vec![],
                     limit: -1,
-                    build_runtime_filters: vec![],
-                    probe_runtime_filters: vec![],
                     runtime_filter_binding_ids: vec![],
                     children: vec![],
                     payload: Some(plan::distributed_node::Payload::Exchange(
@@ -325,13 +319,6 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     other_condition: None,
                     distribution: plan::JoinDistribution::Shuffle as i32,
                     execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
-                    build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
-                        filter_id: 77,
-                        build_expr: Some(column_expr(1, "l_orderkey")),
-                        probe_expr: Some(column_expr(2, "o_orderkey")),
-                        expr_order: 0,
-                        execution_mode: plan::JoinExecutionMode::Partitioned as i32,
-                    }],
                 })),
             })),
         }),

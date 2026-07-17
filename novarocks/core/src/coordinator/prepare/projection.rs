@@ -24,7 +24,6 @@ use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection;
 use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,9 +117,6 @@ struct PreparedPlanProjection {
 pub(crate) struct PreparedFragmentSet {
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
     scan_bindings: ScanExecutionBindings,
-    // transitional_until_task_5: legacy scheduler/encoder consumers still read this
-    // projection while the exact fragment-local binding table migrates additively.
-    runtime_filter_projection: RuntimeFilterGraphProjection,
     projection: PreparedPlanProjection,
 }
 
@@ -128,7 +124,6 @@ impl PreparedFragmentSet {
     pub(super) fn new(
         by_fragment: BTreeMap<FragmentId, PreparedFragment>,
         scan_bindings: ScanExecutionBindings,
-        runtime_filter_projection: RuntimeFilterGraphProjection,
         topological_fragment_order: Vec<FragmentId>,
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
@@ -136,7 +131,6 @@ impl PreparedFragmentSet {
         Self {
             by_fragment,
             scan_bindings,
-            runtime_filter_projection,
             projection: PreparedPlanProjection {
                 topological_fragment_order,
                 execution_anchor_fragment_id,
@@ -155,10 +149,6 @@ impl PreparedFragmentSet {
 
     pub(crate) fn scan_bindings(&self) -> &ScanExecutionBindings {
         &self.scan_bindings
-    }
-
-    pub(crate) fn runtime_filter_projection(&self) -> &RuntimeFilterGraphProjection {
-        &self.runtime_filter_projection
     }
 
     pub(crate) fn fragment_ids(&self) -> BTreeSet<FragmentId> {
@@ -282,7 +272,6 @@ pub(crate) fn prepared_fragment_set_for_test(
     PreparedFragmentSet::new(
         by_fragment,
         scan_bindings,
-        RuntimeFilterGraphProjection::default(),
         topological_fragment_order,
         execution_anchor_fragment_id,
         edges,

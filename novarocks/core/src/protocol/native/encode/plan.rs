@@ -59,12 +59,7 @@ use crate::catalog::schema::{ColumnDefault, SqlType, validate_column_default};
 use crate::connector::scan_model::starrocks::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
 };
-#[cfg(test)]
-use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::planner::distributed::runtime_filter::{
-    GraphRuntimeFilterBuild, GraphRuntimeFilterProbe, RuntimeFilterGraphProjection,
-};
 use crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding;
 use crate::sql::planner::distributed::write::sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
@@ -110,7 +105,6 @@ pub(super) struct NativePlanEncodeContext<'a> {
     /// `None` only in bare-node/bare-fragment encoder unit tests, which never
     /// encode a write or router fragment.
     pub(super) write_contracts: ContextRef<'a, WriteContractCatalog>,
-    pub(super) runtime_filter_projection: ContextRef<'a, RuntimeFilterGraphProjection>,
     pub(super) runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
 }
 
@@ -118,7 +112,6 @@ impl<'a> NativePlanEncodeContext<'a> {
     fn complete(
         src: &'a DistributedPlan,
         scan_bindings: &'a ScanExecutionBindings,
-        runtime_filter_projection: &'a RuntimeFilterGraphProjection,
         runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
     ) -> Self {
         Self {
@@ -138,10 +131,6 @@ impl<'a> NativePlanEncodeContext<'a> {
             write_contracts: src.write_contracts(),
             #[cfg(test)]
             write_contracts: Some(src.write_contracts()),
-            #[cfg(not(test))]
-            runtime_filter_projection,
-            #[cfg(test)]
-            runtime_filter_projection: Some(runtime_filter_projection),
             runtime_filter_bindings,
         }
     }
@@ -176,16 +165,14 @@ fn required_context_ref<'a, T>(
 pub(super) fn encode_distributed_plan(
     src: &DistributedPlan,
     scan_bindings: &ScanExecutionBindings,
-    runtime_filter_projection: &RuntimeFilterGraphProjection,
 ) -> Result<plan::DistributedPlan, String> {
     let prepared = crate::coordinator::prepare::prepared_fragment_set_for_native_encode_test(src)?;
-    encode_distributed_plan_from_prepared(src, scan_bindings, runtime_filter_projection, &prepared)
+    encode_distributed_plan_from_prepared(src, scan_bindings, &prepared)
 }
 
 pub(super) fn encode_distributed_plan_from_prepared(
     src: &DistributedPlan,
     scan_bindings: &ScanExecutionBindings,
-    runtime_filter_projection: &RuntimeFilterGraphProjection,
     prepared: &PreparedFragmentSet,
 ) -> Result<plan::DistributedPlan, String> {
     #[cfg(not(test))]
@@ -194,12 +181,7 @@ pub(super) fn encode_distributed_plan_from_prepared(
     let runtime_filter_bindings = Some(prepared);
     encode_distributed_plan_with_context_inner(
         src,
-        NativePlanEncodeContext::complete(
-            src,
-            scan_bindings,
-            runtime_filter_projection,
-            runtime_filter_bindings,
-        ),
+        NativePlanEncodeContext::complete(src, scan_bindings, runtime_filter_bindings),
     )
 }
 
@@ -208,9 +190,6 @@ pub(super) fn encode_distributed_plan_with_context(
     src: &DistributedPlan,
     ctx: NativePlanEncodeContext<'_>,
 ) -> Result<plan::DistributedPlan, String> {
-    let runtime_filter_projection = required_context_ref(ctx.runtime_filter_projection, || {
-        "native distributed plan encoding requires prepared runtime filter projection".to_string()
-    })?;
     let runtime_filter_bindings = required_context_ref(ctx.runtime_filter_bindings, || {
         "native distributed plan encoding requires prepared runtime filter binding tables"
             .to_string()
@@ -222,7 +201,6 @@ pub(super) fn encode_distributed_plan_with_context(
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
-            runtime_filter_projection: Some(runtime_filter_projection),
             runtime_filter_bindings: Some(runtime_filter_bindings),
         },
     )
@@ -236,9 +214,6 @@ fn encode_distributed_plan_with_context_inner(
     // node, so bind it here: all fragment/node encoding then reads each covered
     // node's execution output from it instead of re-deriving or repairing it,
     // regardless of how the incoming context was constructed.
-    let _ = required_context_ref(ctx.runtime_filter_projection, || {
-        "native distributed plan encoding requires prepared runtime filter projection".to_string()
-    })?;
     let mut fragments = src
         .fragments()
         .iter()
@@ -812,7 +787,6 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
-            runtime_filter_projection: Some(&RuntimeFilterGraphProjection::default()),
             runtime_filter_bindings: None,
         },
     )
@@ -858,18 +832,6 @@ pub(super) fn encode_node_with_context(
         tuple_ids: src.tuple_ids.clone(),
         nullable_tuple_ids: src.nullable_tuple_ids.clone(),
         limit: src.limit,
-        build_runtime_filters: optional_context_ref(ctx.runtime_filter_projection)
-            .map(|projection| projection.builds_for(src.fragment_id, src.node_id))
-            .unwrap_or_default()
-            .iter()
-            .map(encode_graph_runtime_filter_build)
-            .collect::<Result<Vec<_>, _>>()?,
-        probe_runtime_filters: optional_context_ref(ctx.runtime_filter_projection)
-            .map(|projection| projection.probes_for(src.fragment_id, src.node_id))
-            .unwrap_or_default()
-            .iter()
-            .map(encode_graph_runtime_filter_probe)
-            .collect::<Result<Vec<_>, _>>()?,
         runtime_filter_binding_ids: src
             .runtime_filter_binding_ids
             .iter()
@@ -1245,20 +1207,6 @@ fn encode_physical_node(
                 other_condition: node.other_condition.as_ref().map(encode_expr).transpose()?,
                 distribution: encode_join_distribution(&node.distribution),
                 execution_mode: node.execution_mode.map(encode_join_execution_mode),
-                build_runtime_filters: optional_context_ref(ctx.runtime_filter_projection)
-                    .map(|projection| projection.builds_for_node(node_id))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|rf| {
-                        Ok(plan::RuntimeFilterBuildIntent {
-                            filter_id: rf.filter_id,
-                            build_expr: Some(encode_expr(&rf.build_expr)?),
-                            probe_expr: Some(encode_expr(&rf.probe_expr)?),
-                            expr_order: usize_to_u32(rf.expr_order)?,
-                            execution_mode: encode_join_execution_mode(rf.execution_mode),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
             }),
         ),
         PhysicalPlanKind::NestLoopJoin(node) => (
@@ -1670,30 +1618,6 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
             }),
         }),
     }
-}
-
-fn encode_graph_runtime_filter_build(
-    src: &GraphRuntimeFilterBuild,
-) -> Result<plan::RuntimeFilterBuild, String> {
-    Ok(plan::RuntimeFilterBuild {
-        filter_id: src.filter_id,
-        build_expr: Some(encode_expr(&src.build_expr)?),
-        probe_expr: Some(encode_expr(&src.probe_expr)?),
-        expr_order: usize_to_u32(src.expr_order)?,
-        execution_mode: encode_join_execution_mode(src.execution_mode),
-        source_fragment_id: src.source_fragment_id,
-        target_fragment_ids: src.target_fragment_ids.clone(),
-    })
-}
-
-fn encode_graph_runtime_filter_probe(
-    src: &GraphRuntimeFilterProbe,
-) -> Result<plan::RuntimeFilterProbe, String> {
-    Ok(plan::RuntimeFilterProbe {
-        filter_id: src.filter_id,
-        probe_expr: Some(encode_expr(&src.probe_expr)?),
-        source_fragment_id: src.source_fragment_id,
-    })
 }
 
 fn encode_table_def_with_context(
@@ -2878,10 +2802,6 @@ mod tests {
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use arrow::datatypes::{DataType, TimeUnit};
 
-    fn empty_runtime_filter_projection() -> &'static RuntimeFilterGraphProjection {
-        Box::leak(Box::new(RuntimeFilterGraphProjection::default()))
-    }
-
     fn empty_scan_bindings() -> &'static ScanExecutionBindings {
         Box::leak(Box::new(ScanExecutionBindings::default()))
     }
@@ -2894,29 +2814,6 @@ mod tests {
     }
 
     #[test]
-    fn full_plan_encoding_requires_prepared_runtime_filter_projection() {
-        let plan = iceberg_delta_distributed_plan_for_test();
-        let missing_projection = Option::default();
-        let error = encode_distributed_plan_with_context(
-            &plan,
-            NativePlanEncodeContext {
-                scan_bindings: None,
-                node_outputs: None,
-                fragment_edge_outputs: None,
-                write_contracts: None,
-                runtime_filter_projection: missing_projection,
-                runtime_filter_bindings: None,
-            },
-        )
-        .expect_err("full-plan encoding without prepared RF projection must fail");
-
-        assert_eq!(
-            error,
-            "native distributed plan encoding requires prepared runtime filter projection"
-        );
-    }
-
-    #[test]
     fn full_plan_encoding_requires_prepared_runtime_filter_binding_tables() {
         let plan = iceberg_delta_distributed_plan_for_test();
         let error = encode_distributed_plan_with_context(
@@ -2926,7 +2823,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: None,
             },
         )
@@ -3209,57 +3105,6 @@ mod tests {
     }
 
     #[test]
-    fn rfd_5a_graph_projection_encodes_native_runtime_filter_wire_fields() {
-        let build_expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(1),
-                qualifier: Some("build".to_string()),
-                column: "k".to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let probe_expr = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId::new_for_test(2),
-                qualifier: Some("probe".to_string()),
-                column: "k".to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let build = GraphRuntimeFilterBuild {
-            filter_id: 7,
-            channel_id: ChannelId::new(7),
-            build_expr: build_expr.clone(),
-            probe_expr: probe_expr.clone(),
-            expr_order: 3,
-            execution_mode: JoinExecutionMode::Partitioned,
-            source_fragment_id: 4,
-            target_fragment_ids: vec![1, 2],
-        };
-        let probe = GraphRuntimeFilterProbe {
-            filter_id: 7,
-            channel_id: ChannelId::new(7),
-            probe_expr,
-            source_fragment_id: 4,
-        };
-
-        let encoded_build = encode_graph_runtime_filter_build(&build).expect("encode build");
-        let encoded_probe = encode_graph_runtime_filter_probe(&probe).expect("encode probe");
-
-        assert_eq!(encoded_build.filter_id, 7);
-        assert_eq!(encoded_build.expr_order, 3);
-        assert_eq!(encoded_build.source_fragment_id, 4);
-        assert_eq!(encoded_build.target_fragment_ids, vec![1, 2]);
-        assert!(encoded_build.build_expr.is_some());
-        assert!(encoded_build.probe_expr.is_some());
-        assert_eq!(encoded_probe.filter_id, 7);
-        assert_eq!(encoded_probe.source_fragment_id, 4);
-        assert!(encoded_probe.probe_expr.is_some());
-    }
-
-    #[test]
     fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
         let probe_expr = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -3357,26 +3202,20 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(prepared.runtime_filter_projection()),
                 runtime_filter_bindings: Some(&prepared),
             },
         )
         .expect("encode Graph-owned RF plan");
         let root = encoded.fragments[0].root.as_ref().expect("encoded root");
-        assert_eq!(root.build_runtime_filters.len(), 1);
-        assert_eq!(root.build_runtime_filters[0].filter_id, 0);
-        assert_eq!(root.build_runtime_filters[0].expr_order, 0);
-        assert_eq!(root.children[0].probe_runtime_filters.len(), 1);
-        assert_eq!(root.children[0].probe_runtime_filters[0].filter_id, 0);
+        assert!(!root.runtime_filter_binding_ids.is_empty());
+        assert!(!root.children[0].runtime_filter_binding_ids.is_empty());
         let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
         else {
             panic!("expected physical HashJoin root");
         };
-        let Some(plan::plan_node::Kind::HashJoin(join)) = physical.kind.as_ref() else {
+        let Some(plan::plan_node::Kind::HashJoin(_join)) = physical.kind.as_ref() else {
             panic!("expected HashJoin payload");
         };
-        assert_eq!(join.build_runtime_filters.len(), 1);
-        assert_eq!(join.build_runtime_filters[0].filter_id, 0);
 
         let bundle = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(
             &distributed,
@@ -3732,12 +3571,8 @@ mod tests {
     fn change_stream_router_encoder_materializes_partition_exprs() {
         let plan = single_fragment_router_plan_for_test();
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let root = encoded
             .fragments
             .iter()
@@ -3768,12 +3603,8 @@ mod tests {
     fn stream_sink_projection_and_receiver_schema_follow_edge_output_slots() {
         let plan = two_fragment_stream_plan_for_test();
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
 
         let source = encoded
             .fragments
@@ -3811,12 +3642,8 @@ mod tests {
     fn stream_sink_uses_source_slots_while_receiver_schema_uses_exchange_columns() {
         let plan = two_fragment_stream_plan_with_lowered_slots_for_test();
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
 
         let source = encoded
             .fragments
@@ -3854,12 +3681,8 @@ mod tests {
     fn stream_sink_allows_zero_column_values_source() {
         let plan = two_fragment_zero_column_stream_plan_for_test();
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
 
         let source = encoded
             .fragments
@@ -3971,12 +3794,8 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let root = encoded.fragments[0].root.as_ref().expect("root");
         let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
         else {
@@ -4060,7 +3879,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4126,12 +3944,8 @@ mod tests {
         scan.required_columns = Some(vec!["order_id".to_string()]);
         let plan = plan.seal().expect("seal ordinary Iceberg fixture");
 
-        let without_binding = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode ordinary Iceberg scan");
+        let without_binding = encode_distributed_plan(&plan, empty_scan_bindings())
+            .expect("encode ordinary Iceberg scan");
         let mut bindings = ScanExecutionBindings::default();
         bindings
             .insert_binding(file_binding_for_test(
@@ -4154,7 +3968,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4274,7 +4087,6 @@ mod tests {
                     node_outputs: None,
                     fragment_edge_outputs: None,
                     write_contracts: None,
-                    runtime_filter_projection: Some(empty_runtime_filter_projection()),
                     runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
                 },
             )
@@ -4348,7 +4160,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4369,7 +4180,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4398,7 +4208,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4465,7 +4274,6 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: Some(empty_runtime_filter_projection()),
                 runtime_filter_bindings: Some(prepared_runtime_filter_bindings(&plan)),
             },
         )
@@ -4689,12 +4497,8 @@ mod tests {
     fn stream_sink_derives_generate_series_source_schema() {
         let plan = two_fragment_generate_series_stream_plan_for_test();
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
 
         let source = encoded
             .fragments
@@ -4808,12 +4612,8 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let fragment = encoded
             .fragments
             .iter()
@@ -4857,12 +4657,8 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let fragment = encoded
             .fragments
             .iter()
@@ -4955,12 +4751,8 @@ mod tests {
 
         // The encoder maps that sealed contract 1:1 onto the wire, never
         // re-deriving from the children or join type.
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let root = encoded.fragments[0].root.as_ref().expect("encoded root");
         let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
         else {
@@ -5048,12 +4840,8 @@ mod tests {
 
         // The encoder maps that sealed contract 1:1 onto the wire, never
         // re-deriving from the children or join type.
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let root = encoded.fragments[0].root.as_ref().expect("encoded root");
         let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
         else {
@@ -5120,12 +4908,8 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let fragment = encoded
             .fragments
             .iter()
@@ -5201,12 +4985,8 @@ mod tests {
             edges: Vec::new(),
         };
 
-        let encoded = encode_distributed_plan(
-            &plan,
-            empty_scan_bindings(),
-            empty_runtime_filter_projection(),
-        )
-        .expect("encode native plan");
+        let encoded =
+            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
         let fragment = encoded
             .fragments
             .iter()

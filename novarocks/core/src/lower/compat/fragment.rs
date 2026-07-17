@@ -23,7 +23,7 @@ use thrift::OrderedFloat;
 
 use crate::common::thrift::thrift_compact_serialize;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, push_down_local_runtime_filters};
+use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::novarocks_connectors::ConnectorRegistry;
 
@@ -973,7 +973,10 @@ pub(crate) fn execute_fragment(
                 query_context_manager().register_row_pos_descs(query_id, row_pos_descs)?;
             }
         }
-        push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
+        super::runtime_filter_pushdown::push_down_local_runtime_filters(
+            &mut exec_plan.root,
+            &exec_plan.arena,
+        );
         let root_plan_node_id = plan.nodes.first().map(|n| n.node_id).unwrap_or(-1);
 
         match sink.type_ {

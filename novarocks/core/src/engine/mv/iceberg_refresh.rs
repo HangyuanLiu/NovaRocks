@@ -14661,7 +14661,6 @@ fn execute_imv_change_stream_write(
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
-        planned.runtime_filters,
         None,
     )?;
     if let Some(abort) = result.write_abort.as_ref() {

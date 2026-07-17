@@ -54,7 +54,6 @@ pub(crate) fn encode_native_fragment_bundle(
     let encoded = super::plan::encode_distributed_plan_from_prepared(
         plan,
         prepared.scan_bindings(),
-        prepared.runtime_filter_projection(),
         prepared,
     )?;
     let sealed_ids = plan

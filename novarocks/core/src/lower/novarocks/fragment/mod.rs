@@ -30,7 +30,7 @@ use super::runtime_filter_binding::RuntimeFilterBindingLookupLedger;
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
-use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+use crate::exec::node::ExecPlan;
 use crate::exec::operators::DataStreamSinkFactoryInput;
 use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
@@ -73,17 +73,17 @@ pub(crate) fn execute_fragment_native(
         .as_ref()
         .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
         .map(unique_id_from_native)?;
-    let runtime_filter_params = instance_params
-        .runtime_filter_params
-        .as_ref()
-        .map(native_wire::runtime_filter_params_from_native)
-        .transpose()?;
+    if instance_params.runtime_filter_params.is_some() {
+        return Err(
+            "native InstanceParams must not carry legacy runtime-filter params".to_string(),
+        );
+    }
     let result_buffer_tracker = mem_tracker.clone();
     let runtime_state = build_runtime_state(
         RuntimeStateInputs {
             query_options: query_options.clone(),
             query_id: Some(query_id),
-            runtime_filter_params,
+            runtime_filter_params: None,
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(instance_params.backend_num),
             mem_tracker,
@@ -125,11 +125,10 @@ pub(crate) fn execute_fragment_native(
         lowered
     };
 
-    let mut exec_plan = ExecPlan {
+    let exec_plan = ExecPlan {
         arena,
         root: lowered.node,
     };
-    push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     prepare_result_buffer_for_native_sink(
         sink,

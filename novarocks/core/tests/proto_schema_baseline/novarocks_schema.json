@@ -2269,8 +2269,14 @@
               "oneof": "payload"
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            6,
+            7
+          ],
+          "reserved_names": [
+            "build_runtime_filters",
+            "probe_runtime_filters"
+          ]
         },
         "DistributedPlan": {
           "fields": {
@@ -2657,8 +2663,12 @@
               "oneof": null
             }
           },
-          "reserved_numbers": [],
-          "reserved_names": []
+          "reserved_numbers": [
+            6
+          ],
+          "reserved_names": [
+            "build_runtime_filters"
+          ]
         },
         "IcebergChangeStreamBranchRoute": {
           "fields": {

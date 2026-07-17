@@ -281,7 +281,6 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
         let crate::engine::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
-            runtime_filters,
             commit_plan,
             ..
         } = planned;
@@ -292,7 +291,6 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
         crate::engine::execute_planned_iceberg_change_stream_write(
             prepared,
             native_bundle,
-            runtime_filters,
             build_input.query_opts.clone(),
         )
     }

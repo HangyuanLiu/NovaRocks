@@ -229,29 +229,20 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
                 mv_rewritten_from: None,
             })),
         }),
-        IPayload::HashJoin { runtime_filter_id } => {
-            plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: vec![output_column(3, "joined_id", common::PrimitiveType::Bigint)],
-                kind: Some(plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
-                    join_type: plan::JoinKind::Inner as i32,
-                    eq_conditions: vec![plan::HashJoinEqCondition {
-                        left: Some(column_expr(1)),
-                        right: Some(column_expr(2)),
-                        null_safe: false,
-                    }],
-                    other_condition: None,
-                    distribution: plan::JoinDistribution::Shuffle as i32,
-                    execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
-                    build_runtime_filters: vec![plan::RuntimeFilterBuildIntent {
-                        filter_id: *runtime_filter_id,
-                        build_expr: Some(column_expr(1)),
-                        probe_expr: Some(column_expr(2)),
-                        expr_order: 0,
-                        execution_mode: plan::JoinExecutionMode::Partitioned as i32,
-                    }],
-                })),
-            })
-        }
+        IPayload::HashJoin { .. } => plan::distributed_node::Payload::Physical(plan::PlanNode {
+            output_columns: vec![output_column(3, "joined_id", common::PrimitiveType::Bigint)],
+            kind: Some(plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: plan::JoinKind::Inner as i32,
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_expr(1)),
+                    right: Some(column_expr(2)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: plan::JoinDistribution::Shuffle as i32,
+                execution_mode: Some(plan::JoinExecutionMode::Partitioned as i32),
+            })),
+        }),
         IPayload::Exchange { source_fragment_id } => {
             plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
                 partition_type: plan::PartitionType::Hash as i32,
@@ -291,9 +282,13 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         tuple_ids: vec![node.node_id],
         nullable_tuple_ids: vec![],
         limit: -1,
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
-        runtime_filter_binding_ids: vec![],
+        runtime_filter_binding_ids: match &node.payload {
+            IPayload::HashJoin { runtime_filter_id } => vec![
+                u32::try_from(*runtime_filter_id)
+                    .expect("runtime-filter fixture id must fit a binding id"),
+            ],
+            _ => Vec::new(),
+        },
         children: node.children.iter().map(node_to_proto).collect(),
         payload: Some(payload),
     }
@@ -320,12 +315,14 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
                         file_count,
                     }
                 }
-                plan::plan_node::Kind::HashJoin(join) => IPayload::HashJoin {
-                    runtime_filter_id: join
-                        .build_runtime_filters
-                        .first()
-                        .ok_or("HashJoinNode.build_runtime_filters missing")?
-                        .filter_id,
+                plan::plan_node::Kind::HashJoin(_) => IPayload::HashJoin {
+                    runtime_filter_id: i32::try_from(
+                        *proto
+                            .runtime_filter_binding_ids
+                            .first()
+                            .ok_or("DistributedNode.runtime_filter_binding_ids missing")?,
+                    )
+                    .map_err(|_| "runtime-filter binding id does not fit i32".to_string())?,
                 },
                 plan::plan_node::Kind::Redistribute(redistribute) => {
                     let mode = redistribute
@@ -548,8 +545,6 @@ fn missing_plan_payload_reports_boundary_error() {
         tuple_ids: vec![],
         nullable_tuple_ids: vec![],
         limit: -1,
-        build_runtime_filters: vec![],
-        probe_runtime_filters: vec![],
         runtime_filter_binding_ids: vec![],
         children: vec![],
         payload: None,

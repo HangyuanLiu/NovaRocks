@@ -2570,8 +2570,6 @@ fn explain_analyze_query(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let planning_elapsed = planning_start.elapsed();
 
     let query_opts = query_options_for_explain_analyze(query_opts);
@@ -2580,7 +2578,6 @@ fn explain_analyze_query(
     let outcome = crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         Some(query_opts),
@@ -2957,13 +2954,10 @@ pub(crate) fn execute_query_as_iceberg_write(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3083,7 +3077,6 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::coordinator::prepare::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    pub(crate) runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3127,8 +3120,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
@@ -3136,7 +3127,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     Ok(PlannedIcebergChangeStreamWrite {
         prepared,
         native_bundle,
-        runtime_filters,
         commit_plan,
         #[cfg(test)]
         topology,
@@ -3146,14 +3136,12 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::coordinator::prepare::PreparedFragmentSet,
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3184,12 +3172,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     if let Some(result) = observe_change_stream_write_build_for_test(&planned.topology) {
         return Ok(result);
     }
-    execute_planned_iceberg_change_stream_write(
-        planned.prepared,
-        planned.native_bundle,
-        planned.runtime_filters,
-        query_opts,
-    )
+    execute_planned_iceberg_change_stream_write(planned.prepared, planned.native_bundle, query_opts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3530,13 +3513,10 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -3594,13 +3574,10 @@ pub(crate) fn execute_logical_plan_with_options(
         &distributed_plan,
         &prepared,
     )?;
-    let runtime_filters =
-        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
         native_bundle,
-        runtime_filters,
         execution_ports,
         scheduler,
         query_opts,
@@ -5331,7 +5308,6 @@ mysql_port = 47892
     ) -> (
         crate::coordinator::prepare::PreparedFragmentSet,
         crate::protocol::native::encode::NativeFragmentBundle,
-        Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     ) {
         use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
@@ -5442,11 +5418,7 @@ mysql_port = 47892
             &prepared,
         )
         .expect("encode fragments");
-        let runtime_filters = crate::coordinator::scheduler::plan_runtime_filters(
-            prepared.runtime_filter_projection(),
-        )
-        .expect("plan runtime filters");
-        (prepared, native_bundle, runtime_filters)
+        (prepared, native_bundle)
     }
 
     /// Build a `ConnectorRegistry` with a mock StarRocks scan planner that
@@ -6275,64 +6247,40 @@ mysql_port = 47892
         assert!(text.contains("Profile: active="), "{text}");
     }
 
-    /// OQ-5 Task 6: preparation must project the query-global runtime-filter
-    /// Graph for native descriptors on the join node and the scheduler-facing
-    /// `RuntimeFilterPlanResult`. Exercises the full
+    /// RFD-5B: preparation must materialize the query-global runtime-filter
+    /// Graph into fragment-local tables and sealed node binding IDs. Exercises the full
     /// standalone pipeline (analyze -> plan -> optimize -> planner RF Graph ->
     /// preparation -> encode/schedule) over the test catalog's fact-like
     /// `tbl(id int, name varchar)` joined to the small `date_dim` fixture on `id`.
     #[test]
     #[cfg(feature = "compat")]
-    fn preparation_projects_graph_runtime_filters_into_native_and_scheduler_artifacts() {
-        let (_prepared, native_bundle, runtime_filters) =
+    fn preparation_materializes_graph_runtime_filters_into_native_binding_tables() {
+        let (_prepared, native_bundle) =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
-        fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {
-            !node.build_runtime_filters.is_empty() || node.children.iter().any(has_build_filter)
+        fn has_binding_attachment(node: &crate::proto::plan::DistributedNode) -> bool {
+            !node.runtime_filter_binding_ids.is_empty()
+                || node.children.iter().any(has_binding_attachment)
         }
-        let has_rf = native_bundle
+        let has_attachment = native_bundle
             .fragments_in_id_order()
             .map(|(_, fragment)| fragment)
-            .any(|fragment| fragment.root.as_ref().is_some_and(has_build_filter));
+            .any(|fragment| fragment.root.as_ref().is_some_and(has_binding_attachment));
         assert!(
-            has_rf,
-            "expected a native hash join node with build_runtime_filters"
+            has_attachment,
+            "expected a native node with sealed runtime-filter binding IDs"
         );
-        // The coordinator-facing RF plan must be assembled with native
-        // descriptor metadata plus build/probe placement maps.
-        let rf_plan = runtime_filters
-            .as_ref()
-            .expect("rf_plan should be Some when a join emits filters");
-        assert!(
-            !rf_plan.all_filters.is_empty(),
-            "all_filters must carry the native descriptor"
-        );
-        let descriptor = rf_plan
-            .all_filters
-            .values()
-            .next()
-            .expect("expected one native runtime filter descriptor");
-        assert!(
-            descriptor.build_plan_node_id >= 0,
-            "native descriptor must record the build plan node"
-        );
-        assert!(
-            !descriptor.probe_target_node_ids.is_empty(),
-            "native descriptor must record probe target plan nodes"
-        );
-        assert!(
-            rf_plan.build_side_filters.values().any(|v| !v.is_empty()),
-            "build_side_filters must record the join fragment"
-        );
-        assert!(
-            rf_plan.probe_side_filters.values().any(|v| !v.is_empty()),
-            "probe_side_filters must record the probe target"
-        );
+        assert!(native_bundle.fragments_in_id_order().any(|(_, fragment)| {
+            fragment
+                .runtime_filter_bindings
+                .as_ref()
+                .is_some_and(|table| !table.bindings.is_empty())
+        }));
     }
 
     #[test]
     #[cfg(feature = "compat")]
     fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
-        let (prepared, _native_bundle, _runtime_filters) = build_fragments_for_query(
+        let (prepared, _native_bundle) = build_fragments_for_query(
             "SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1",
         );
 
@@ -6352,7 +6300,7 @@ mysql_port = 47892
     #[test]
     #[cfg(feature = "compat")]
     fn builder_preserves_cte_coordinator_shape_for_nested_cte_query() {
-        let (prepared, _native_bundle, _runtime_filters) = build_fragments_for_query(
+        let (prepared, _native_bundle) = build_fragments_for_query(
             "WITH outer_cte AS ( \
                 WITH inner_cte AS (SELECT id FROM tbl) \
                 SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \

@@ -53,9 +53,7 @@ use crate::coordinator::profile::{
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 #[cfg(test)]
 use crate::coordinator::scheduler::SchedulingPlan;
-use crate::coordinator::scheduler::{
-    FragmentInstancePlacement, FragmentScheduler, RuntimeFilterPlanResult,
-};
+use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -94,7 +92,6 @@ pub(crate) struct CoordinatedQueryResult {
 pub(crate) struct ExecutionCoordinator {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
-    runtime_filters: Option<RuntimeFilterPlanResult>,
     execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
     query_options: Option<QueryOptions>,
@@ -113,7 +110,6 @@ impl ExecutionCoordinator {
     pub(crate) fn new(
         prepared: PreparedFragmentSet,
         native_bundle: NativeFragmentBundle,
-        runtime_filters: Option<RuntimeFilterPlanResult>,
         execution_ports: CoordinatorExecutionPorts,
         scheduler: Arc<FragmentScheduler>,
         query_options: Option<QueryOptions>,
@@ -121,7 +117,6 @@ impl ExecutionCoordinator {
         Self {
             prepared,
             native_bundle,
-            runtime_filters,
             execution_ports,
             scheduler,
             query_options,
@@ -144,7 +139,6 @@ impl ExecutionCoordinator {
     ) -> Result<CoordinatedQueryResult, String> {
         let prepared = self.prepared;
         let native_bundle = self.native_bundle;
-        let runtime_filters = self.runtime_filters;
         let query_options = self.query_options;
         #[cfg(test)]
         let scheduled_plan_test_drift = self.scheduled_plan_test_drift;
@@ -194,11 +188,7 @@ impl ExecutionCoordinator {
         }
 
         validate_prepared_native_payloads(&prepared, &native_bundle)?;
-        let plan = scheduler.schedule(
-            prepared.scheduling_view(),
-            query_id.clone(),
-            runtime_filters.as_ref(),
-        )?;
+        let plan = scheduler.schedule(prepared.scheduling_view(), query_id.clone())?;
         #[cfg(test)]
         let plan = apply_scheduled_plan_test_drift(plan, scheduled_plan_test_drift);
         validate_artifact_fragment_sets(&prepared, &native_bundle, &plan)?;
@@ -308,15 +298,6 @@ impl ExecutionCoordinator {
             })
             .collect();
 
-        // Build a fragment-id -> instance count map from the scheduling plan.
-        // Builder numbers must equal the number of build-side instances, not a
-        // hardcoded 1.
-        let instance_counts: BTreeMap<FragmentId, usize> = plan
-            .by_fragment
-            .iter()
-            .map(|(&fid, insts)| (fid, insts.len()))
-            .collect();
-
         let mut tracker = InFlightTracker::default();
         // Collect submissions by fragment, then submit consumers before
         // producers. This ensures downstream exchange receivers/result buffers
@@ -411,16 +392,11 @@ impl ExecutionCoordinator {
                     }
                 }
                 let typed_result_sink = is_root && needs_fragment_status_report;
-                let native_rf_prober_params = std::collections::BTreeMap::new();
-                let native_rf_builder_number = std::collections::BTreeMap::new();
                 let native_instance_params =
                     crate::protocol::native::encode::encode_instance_params(
                         &query_id,
                         placement,
                         query_options.as_ref(),
-                        &native_rf_prober_params,
-                        &native_rf_builder_number,
-                        0,
                         placement.instance_index as i32,
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,
@@ -1278,25 +1254,6 @@ fn native_cte_multicast_contract_slot_map(
     map
 }
 
-fn runtime_filter_builder_number_for_instance(
-    rf_plan: Option<&RuntimeFilterPlanResult>,
-    instance_counts: &BTreeMap<FragmentId, usize>,
-) -> BTreeMap<i32, i32> {
-    let mut builder_number = BTreeMap::new();
-    if let Some(rf_plan) = rf_plan {
-        for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
-            let n_builders = instance_counts
-                .get(build_frag_id)
-                .map(|&n| n as i32)
-                .unwrap_or(1);
-            for filter_id in filter_ids {
-                builder_number.insert(*filter_id, n_builders);
-            }
-        }
-    }
-    builder_number
-}
-
 // ---------------------------------------------------------------------------
 // In-flight instance tracking (per-backend cancellation)
 // ---------------------------------------------------------------------------
@@ -1900,7 +1857,6 @@ mod native_contract_tests {
         ExecutionCoordinator {
             prepared,
             native_bundle,
-            runtime_filters: None,
             execution_ports: CoordinatorExecutionPorts::new(
                 dispatcher,
                 crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
@@ -1937,7 +1893,6 @@ mod native_contract_tests {
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -3207,8 +3162,6 @@ mod native_contract_tests {
                 tuple_ids: Vec::new(),
                 nullable_tuple_ids: Vec::new(),
                 limit: -1,
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
                 runtime_filter_binding_ids: Vec::new(),
                 children: Vec::new(),
                 payload: Some(native_plan::distributed_node::Payload::Physical(
@@ -3348,7 +3301,6 @@ mod native_contract_tests {
             endpoint: crate::runtime::endpoint::RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
             destinations: Vec::new(),
-            runtime_filter_prober_params: BTreeMap::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
 
@@ -3516,17 +3468,5 @@ mod native_contract_tests {
             ],
             "target fragment 4 has no placements",
         );
-    }
-
-    #[test]
-    fn runtime_filter_builder_number_uses_native_instance_counts() {
-        let rf = RuntimeFilterPlanResult {
-            all_filters: Default::default(),
-            build_side_filters: std::collections::HashMap::from([(3, vec![11, 12])]),
-            probe_side_filters: Default::default(),
-        };
-        let numbers =
-            runtime_filter_builder_number_for_instance(Some(&rf), &BTreeMap::from([(3, 4_usize)]));
-        assert_eq!(numbers, BTreeMap::from([(11, 4), (12, 4)]));
     }
 }
