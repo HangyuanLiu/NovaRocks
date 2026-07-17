@@ -29,6 +29,7 @@ pub mod lookup;
 pub mod nljoin;
 pub mod project;
 pub mod repeat;
+pub mod runtime_filter;
 pub mod scan;
 pub mod set_op;
 pub mod sort;
@@ -100,6 +101,8 @@ pub enum ExecNodeKind {
     TableFunction(TableFunctionNode),
     Analytic(AnalyticNode),
     SetOp(SetOpNode),
+    NativeRuntimeFilterConsumer(runtime_filter::NativeRuntimeFilterConsumerNode),
+    InterimDormantNativeRuntimeFilterProducer(runtime_filter::InterimDormantNativeProducerNode),
 }
 
 #[derive(Clone, Debug)]
@@ -282,6 +285,12 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
             output_slots_for_node(input)
         }
         ExecNodeKind::Filter(FilterNode { input, .. }) => output_slots_for_node(input),
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            output_slots_for_node(&consumer.input)
+        }
+        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
+            output_slots_for_node(&producer.input)
+        }
         ExecNodeKind::Repeat(RepeatNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::ChangeEventExpand(node) => {
             Some(node.output_slot_ids.iter().copied().collect())
@@ -348,6 +357,12 @@ fn push_down_local_runtime_filters_inner(
             push_down_local_runtime_filters_inner(input, arena, &filtered);
         }
         ExecNodeKind::Values(_) => {}
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            push_down_local_runtime_filters_inner(&mut consumer.input, arena, inherited);
+        }
+        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
+            push_down_local_runtime_filters_inner(&mut producer.input, arena, inherited);
+        }
         ExecNodeKind::Project(project) => {
             let mut rewritten = Vec::new();
             for spec in inherited {

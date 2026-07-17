@@ -379,6 +379,8 @@ pub struct ScanNode {
     op: Arc<dyn ScanOp>,
     node_id: Option<i32>,
     runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
+    native_runtime_filter_specs:
+        Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
     conjunct_predicate: Option<ExprId>,
     output_chunk_schema: ChunkSchemaRef,
     connector_io_tasks_per_scan_operator: Option<i32>,
@@ -402,6 +404,7 @@ impl ScanNode {
             op,
             node_id: None,
             runtime_filter_specs: Vec::new(),
+            native_runtime_filter_specs: Vec::new(),
             conjunct_predicate: None,
             output_chunk_schema: Arc::new(ChunkSchema::empty()),
             connector_io_tasks_per_scan_operator: None,
@@ -426,6 +429,13 @@ impl ScanNode {
     pub fn with_runtime_filter_specs(mut self, specs: Vec<RuntimeFilterProbeSpec>) -> Self {
         self.add_runtime_filter_specs(&specs);
         self
+    }
+
+    pub(crate) fn set_native_runtime_filter_specs(
+        &mut self,
+        specs: Vec<crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec>,
+    ) {
+        self.native_runtime_filter_specs = specs;
     }
 
     pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {
@@ -498,6 +508,12 @@ impl ScanNode {
 
     pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
         &self.runtime_filter_specs
+    }
+
+    pub(crate) fn native_runtime_filter_specs(
+        &self,
+    ) -> &[crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec] {
+        &self.native_runtime_filter_specs
     }
 
     pub fn output_chunk_schema(&self) -> ChunkSchemaRef {

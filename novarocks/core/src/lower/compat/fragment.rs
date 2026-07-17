@@ -149,6 +149,12 @@ fn collect_glm_metadata(
                 collect_glm_metadata(input, row_pos_descs)?;
             }
         }
+        ExecNodeKind::NativeRuntimeFilterConsumer(node) => {
+            collect_glm_metadata(&node.input, row_pos_descs)?;
+        }
+        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(node) => {
+            collect_glm_metadata(&node.input, row_pos_descs)?;
+        }
         ExecNodeKind::Values(_) => {}
         ExecNodeKind::IcebergDeltaScan(_) => {}
     }

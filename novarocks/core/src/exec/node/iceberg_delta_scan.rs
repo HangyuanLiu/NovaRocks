@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use crate::exec::chunk::ChunkSchemaRef;
+use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 
@@ -64,6 +65,20 @@ pub struct IcebergDeltaScanNode {
     pub object_store_config: Option<ObjectStoreConfig>,
     pub iceberg_runtime: Arc<IcebergRuntimeHandles>,
     pub node_id: i32,
+    pub(crate) native_runtime_filter_specs: Vec<NativeRuntimeFilterConsumerSpec>,
+}
+
+impl IcebergDeltaScanNode {
+    pub(crate) fn native_runtime_filter_specs(&self) -> &[NativeRuntimeFilterConsumerSpec] {
+        &self.native_runtime_filter_specs
+    }
+
+    pub(crate) fn set_native_runtime_filter_specs(
+        &mut self,
+        specs: Vec<NativeRuntimeFilterConsumerSpec>,
+    ) {
+        self.native_runtime_filter_specs = specs;
+    }
 }
 
 /// Three-part identifier of the base Iceberg table that an `IcebergDeltaScan`

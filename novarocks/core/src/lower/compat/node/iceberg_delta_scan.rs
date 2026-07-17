@@ -122,6 +122,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
             delete_side,
         }),
         node_id: node.node_id,
+        native_runtime_filter_specs: Vec::new(),
     };
 
     Ok(Lowered {

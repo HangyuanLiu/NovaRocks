@@ -25,7 +25,8 @@ use std::time::Duration;
 use sink_factory::{prepare_result_buffer_for_native_sink, sink_factory_from_native};
 
 use super::expr::lower_proto_expr;
-use super::node::{NodeLoweringContext, lower_proto_node};
+use super::node::{NodeLoweringContext, lower_proto_node_with_bindings};
+use super::runtime_filter_binding::RuntimeFilterBindingLookupLedger;
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
@@ -52,6 +53,10 @@ pub(crate) fn execute_fragment_native(
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
 ) -> Result<FragmentOutput, String> {
+    let mut runtime_filter_bindings = RuntimeFilterBindingLookupLedger::decode(
+        fragment.fragment_id,
+        fragment.runtime_filter_bindings.as_ref(),
+    )?;
     let query_options = instance_params
         .query_options
         .as_ref()
@@ -114,7 +119,10 @@ pub(crate) fn execute_fragment_native(
     });
     let lowered = {
         let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
-        lower_proto_node(root, &mut arena, &ctx)?
+        let lowered =
+            lower_proto_node_with_bindings(root, &mut arena, &ctx, &mut runtime_filter_bindings)?;
+        runtime_filter_bindings.finish()?;
+        lowered
     };
 
     let mut exec_plan = ExecPlan {
@@ -323,6 +331,10 @@ mod tests {
                 kind: Some(plan::data_sink::Kind::Noop(true)),
             }),
             output_columns: columns,
+            runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                fragment_id: 1,
+                bindings: Vec::new(),
+            }),
             ..Default::default()
         }
     }

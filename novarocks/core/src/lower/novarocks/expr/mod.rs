@@ -114,6 +114,237 @@ fn decode_expr_type(e: &expr::Expr) -> Result<DataType, String> {
     decode_type(desc).map_err(|err| format!("Expr.type decode failed: {err}"))
 }
 
+pub(crate) fn validate_proto_expr_shape(e: &expr::Expr) -> Result<(), String> {
+    decode_expr_type(e)?;
+    let kind = e
+        .kind
+        .as_ref()
+        .ok_or_else(|| "Expr.kind missing".to_string())?;
+    match kind {
+        expr::expr::Kind::ColumnRef(column) => {
+            if column.column_id == 0 {
+                return Err("ColumnRef.column_id must be positive".to_string());
+            }
+        }
+        expr::expr::Kind::Literal(literal) => {
+            let value = literal
+                .value
+                .as_ref()
+                .ok_or_else(|| "LiteralExpr.value missing".to_string())?;
+            if value.value.is_none() {
+                return Err("LiteralValue.value missing".to_string());
+            }
+        }
+        expr::expr::Kind::BinaryOp(binary) => {
+            let op = expr::BinaryOp::try_from(binary.op)
+                .map_err(|_| format!("unknown BinaryOp {}", binary.op))?;
+            if op == expr::BinaryOp::Unspecified {
+                return Err("BinaryOp.op is unspecified".to_string());
+            }
+            validate_required_child(&binary.left, "BinaryOp.left")?;
+            validate_required_child(&binary.right, "BinaryOp.right")?;
+        }
+        expr::expr::Kind::UnaryOp(unary) => {
+            let op = expr::UnaryOp::try_from(unary.op)
+                .map_err(|_| format!("unknown UnaryOp {}", unary.op))?;
+            if op == expr::UnaryOp::Unspecified {
+                return Err("UnaryOp.op is unspecified".to_string());
+            }
+            validate_required_child(&unary.operand, "UnaryOp.operand")?;
+        }
+        expr::expr::Kind::FunctionCall(call) => {
+            validate_function_name(&call.function_name, "FunctionCall")?;
+            validate_expr_list(&call.args)?;
+        }
+        expr::expr::Kind::AggregateCall(call) => {
+            validate_function_name(&call.function_name, "AggregateCall")?;
+            validate_expr_list(&call.args)?;
+            validate_sort_items(&call.order_by)?;
+        }
+        expr::expr::Kind::WindowCall(call) => {
+            validate_function_name(&call.function_name, "WindowCall")?;
+            validate_expr_list(&call.args)?;
+            validate_expr_list(&call.partition_by)?;
+            validate_sort_items(&call.order_by)?;
+            if let Some(frame) = &call.frame {
+                validate_window_frame(frame)?;
+            }
+        }
+        expr::expr::Kind::Cast(cast) => {
+            validate_required_child(&cast.operand, "Cast.operand")?;
+            let target = cast
+                .target
+                .as_ref()
+                .ok_or_else(|| "Cast.target missing".to_string())?;
+            decode_type(target).map_err(|error| format!("Cast.target decode failed: {error}"))?;
+        }
+        expr::expr::Kind::IsNull(is_null) => {
+            validate_required_child(&is_null.operand, "IsNull.operand")?;
+        }
+        expr::expr::Kind::InList(in_list) => {
+            validate_required_child(&in_list.operand, "InList.operand")?;
+            if in_list.list.is_empty() {
+                return Err("InList.list is empty".to_string());
+            }
+            validate_expr_list(&in_list.list)?;
+        }
+        expr::expr::Kind::Between(between) => {
+            validate_required_child(&between.operand, "Between.operand")?;
+            validate_required_child(&between.low, "Between.low")?;
+            validate_required_child(&between.high, "Between.high")?;
+        }
+        expr::expr::Kind::Like(like) => {
+            validate_required_child(&like.operand, "Like.operand")?;
+            validate_required_child(&like.pattern, "Like.pattern")?;
+        }
+        expr::expr::Kind::CaseExpr(case_expr) => {
+            if let Some(operand) = &case_expr.operand {
+                validate_proto_expr_shape(operand)?;
+            }
+            if case_expr.when_then.is_empty() {
+                return Err("CaseExpr.when_then is empty".to_string());
+            }
+            for (index, branch) in case_expr.when_then.iter().enumerate() {
+                validate_required_unboxed_child(
+                    &branch.when,
+                    &format!("CaseExpr.when_then[{index}].when"),
+                )?;
+                validate_required_unboxed_child(
+                    &branch.then,
+                    &format!("CaseExpr.when_then[{index}].then"),
+                )?;
+            }
+            if let Some(else_expr) = &case_expr.else_expr {
+                validate_proto_expr_shape(else_expr)?;
+            }
+        }
+        expr::expr::Kind::IsTruth(is_truth) => {
+            validate_required_child(&is_truth.operand, "IsTruth.operand")?;
+        }
+        expr::expr::Kind::LambdaParamRef(param) => {
+            if param.slot_id <= 0 {
+                return Err("LambdaParamRef.slot_id must be positive".to_string());
+            }
+        }
+        expr::expr::Kind::Lambda(lambda) => {
+            if lambda.params.is_empty() {
+                return Err("LambdaExpr.params is empty".to_string());
+            }
+            let mut slots = std::collections::BTreeSet::new();
+            for (index, param) in lambda.params.iter().enumerate() {
+                if param.slot_id <= 0 {
+                    return Err(format!("Lambda.params[{index}].slot_id must be positive"));
+                }
+                if !slots.insert(param.slot_id) {
+                    return Err(format!("Lambda.params duplicate slot_id={}", param.slot_id));
+                }
+                let param_type = param
+                    .r#type
+                    .as_ref()
+                    .ok_or_else(|| format!("Lambda.params[{index}].type missing"))?;
+                decode_type(param_type).map_err(|error| {
+                    format!("Lambda.params[{index}].type decode failed: {error}")
+                })?;
+            }
+            validate_required_child(&lambda.body, "Lambda.body")?;
+        }
+        expr::expr::Kind::Nested(nested) => {
+            validate_required_child(&nested.inner, "NestedExpr.inner")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_child(
+    child: &Option<Box<expr::Expr>>,
+    field_name: &str,
+) -> Result<(), String> {
+    validate_proto_expr_shape(
+        child
+            .as_deref()
+            .ok_or_else(|| format!("{field_name} missing"))?,
+    )
+}
+
+fn validate_required_unboxed_child(
+    child: &Option<expr::Expr>,
+    field_name: &str,
+) -> Result<(), String> {
+    validate_proto_expr_shape(
+        child
+            .as_ref()
+            .ok_or_else(|| format!("{field_name} missing"))?,
+    )
+}
+
+fn validate_expr_list(values: &[expr::Expr]) -> Result<(), String> {
+    values.iter().try_for_each(validate_proto_expr_shape)
+}
+
+fn validate_function_name(name: &str, owner: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{owner}.function_name is empty"));
+    }
+    Ok(())
+}
+
+fn validate_sort_items(items: &[expr::SortItem]) -> Result<(), String> {
+    for (index, item) in items.iter().enumerate() {
+        validate_required_unboxed_child(&item.expr, &format!("SortItem[{index}].expr"))?;
+    }
+    Ok(())
+}
+
+fn validate_window_frame(frame: &expr::WindowFrame) -> Result<(), String> {
+    let frame_type = expr::WindowFrameType::try_from(frame.frame_type)
+        .map_err(|_| format!("unknown WindowFrameType {}", frame.frame_type))?;
+    if frame_type == expr::WindowFrameType::Unspecified {
+        return Err("WindowFrame.frame_type is unspecified".to_string());
+    }
+    validate_window_bound(
+        frame
+            .start
+            .as_ref()
+            .ok_or_else(|| "WindowFrame.start missing".to_string())?,
+        "WindowFrame.start",
+    )?;
+    validate_window_bound(
+        frame
+            .end
+            .as_ref()
+            .ok_or_else(|| "WindowFrame.end missing".to_string())?,
+        "WindowFrame.end",
+    )?;
+    Ok(())
+}
+
+fn validate_window_bound(bound: &expr::WindowBound, field_name: &str) -> Result<(), String> {
+    match bound
+        .bound
+        .as_ref()
+        .ok_or_else(|| format!("{field_name}.bound missing"))?
+    {
+        expr::window_bound::Bound::UnboundedPreceding(true)
+        | expr::window_bound::Bound::CurrentRow(true)
+        | expr::window_bound::Bound::UnboundedFollowing(true) => Ok(()),
+        expr::window_bound::Bound::UnboundedPreceding(false)
+        | expr::window_bound::Bound::CurrentRow(false)
+        | expr::window_bound::Bound::UnboundedFollowing(false) => {
+            Err(format!("{field_name} marker must be true"))
+        }
+        expr::window_bound::Bound::Preceding(offset)
+        | expr::window_bound::Bound::Following(offset)
+            if *offset >= 0 =>
+        {
+            Ok(())
+        }
+        expr::window_bound::Bound::Preceding(offset)
+        | expr::window_bound::Bound::Following(offset) => Err(format!(
+            "{field_name} offset must be nonnegative, got {offset}"
+        )),
+    }
+}
+
 fn set_proto_field_schema(e: &expr::Expr, arena: &mut ExprArena, id: ExprId) {
     let Some(desc) = e.r#type.as_ref() else {
         return;

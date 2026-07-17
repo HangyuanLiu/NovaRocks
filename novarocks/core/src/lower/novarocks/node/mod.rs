@@ -37,16 +37,25 @@ mod topn;
 mod values;
 mod window;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use self::common::*;
 
 use super::layout::Layout;
+use super::runtime_filter_binding::{
+    DecodedBindingRole, DecodedRuntimeFilterBinding, DecodedRuntimeFilterContract,
+    DecodedRuntimeFilterReduction, RuntimeFilterBindingLookupLedger,
+};
 use crate::common::types::UniqueId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::limit::LimitNode;
+use crate::exec::node::runtime_filter::{
+    InterimDormantNativeProducerBinding, InterimDormantNativeProducerNode,
+    NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
+    NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::runtime::exchange::ExchangeKey;
@@ -155,17 +164,61 @@ pub(crate) fn lower_proto_node(
     arena: &mut ExprArena,
     ctx: &NodeLoweringContext,
 ) -> Result<LoweredNode, String> {
-    let children = node
-        .children
+    lower_proto_node_inner(node, arena, ctx, None)
+}
+
+pub(crate) fn lower_proto_node_with_bindings(
+    node: &plan::DistributedNode,
+    arena: &mut ExprArena,
+    ctx: &NodeLoweringContext,
+    ledger: &mut RuntimeFilterBindingLookupLedger,
+) -> Result<LoweredNode, String> {
+    lower_proto_node_inner(node, arena, ctx, Some(ledger))
+}
+
+fn lower_proto_node_inner(
+    node: &plan::DistributedNode,
+    arena: &mut ExprArena,
+    ctx: &NodeLoweringContext,
+    mut ledger: Option<&mut RuntimeFilterBindingLookupLedger>,
+) -> Result<LoweredNode, String> {
+    let mut children = Vec::with_capacity(node.children.len());
+    for child in &node.children {
+        children.push(lower_proto_node_inner(
+            child,
+            arena,
+            ctx,
+            ledger.as_deref_mut(),
+        )?);
+    }
+
+    let attached = ledger
+        .as_deref()
+        .map(|ledger| {
+            ledger.peek_attached(
+                &node.runtime_filter_binding_ids,
+                node.node_id,
+                node.fragment_id,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let direct_inputs = children
         .iter()
-        .map(|child| lower_proto_node(child, arena, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|child| (child.layout.clone(), child.output_schema.clone()))
+        .collect::<Vec<_>>();
+    let (consumer_bindings, producer_bindings): (Vec<_>, Vec<_>) = attached
+        .into_iter()
+        .partition(|binding| matches!(binding.role, DecodedBindingRole::Consumer { .. }));
+    if !children.is_empty() {
+        attach_direct_input_consumers(node.node_id, &consumer_bindings, &mut children, arena)?;
+    }
 
     let payload = node
         .payload
         .as_ref()
         .ok_or_else(|| format!("DistributedNode node_id={} payload missing", node.node_id))?;
-    let lowered = match payload {
+    let mut lowered = match payload {
         plan::distributed_node::Payload::Physical(physical) => {
             lower_physical_node(node, physical, children, arena, ctx)
         }
@@ -173,7 +226,549 @@ pub(crate) fn lower_proto_node(
             exchange::lower_exchange_receiver(node, exchange, children, arena, ctx)
         }
     }?;
-    apply_distributed_limit_if_needed(node, lowered)
+    if children_are_absent(node) && !consumer_bindings.is_empty() {
+        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena)?;
+    }
+    if !producer_bindings.is_empty() {
+        attach_hash_join_producers(
+            node,
+            &producer_bindings,
+            &direct_inputs,
+            &mut lowered,
+            arena,
+        )?;
+    }
+    let lowered = apply_distributed_limit_if_needed(node, lowered)?;
+    if let Some(ledger) = ledger {
+        ledger.commit_consumed_many(&node.runtime_filter_binding_ids)?;
+    }
+    Ok(lowered)
+}
+
+fn children_are_absent(node: &plan::DistributedNode) -> bool {
+    node.children.is_empty()
+}
+
+fn attach_direct_input_consumers(
+    owner_node_id: i32,
+    bindings: &[DecodedRuntimeFilterBinding],
+    children: &mut [LoweredNode],
+    arena: &mut ExprArena,
+) -> Result<(), String> {
+    let clean_checkpoint = arena.clone();
+    let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
+    for binding in bindings {
+        let mut candidates = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            let mut scratch = clean_checkpoint.clone();
+            if lower_binding_expression(binding, &child.layout, &child.output_schema, &mut scratch)
+                .is_ok()
+            {
+                candidates.push(index);
+            }
+        }
+        if candidates.len() != 1 {
+            return Err(format!(
+                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} must match exactly one direct input, matched {}",
+                binding.binding_id,
+                candidates.len()
+            ));
+        }
+        let index = candidates[0];
+        let expr_id = lower_binding_expression(
+            binding,
+            &children[index].layout,
+            &children[index].output_schema,
+            arena,
+        )?;
+        grouped
+            .entry(index)
+            .or_default()
+            .push(consumer_spec(binding, expr_id)?);
+    }
+    for (index, specs) in grouped {
+        let child = &mut children[index];
+        let input = child.node.clone();
+        child.node = ExecNode {
+            kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                input: Box::new(input),
+                owner_node_id,
+                bindings: specs,
+            }),
+        };
+    }
+    Ok(())
+}
+
+fn attach_leaf_consumers(
+    wire_node: &plan::DistributedNode,
+    bindings: &[DecodedRuntimeFilterBinding],
+    lowered: &mut LoweredNode,
+    arena: &mut ExprArena,
+) -> Result<(), String> {
+    let specs = bindings
+        .iter()
+        .map(|binding| {
+            let expr_id =
+                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
+            consumer_spec(binding, expr_id)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let payload = wire_node
+        .payload
+        .as_ref()
+        .ok_or_else(|| format!("native node_id={} payload missing", wire_node.node_id))?;
+    match payload {
+        plan::distributed_node::Payload::Exchange(_) => {
+            let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
+                format!(
+                    "native node_id={} exchange lowering lost ExchangeSource boundary",
+                    wire_node.node_id
+                )
+            })?;
+            exchange.set_native_runtime_filter_specs(specs);
+        }
+        plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::Scan(_)) => {
+                set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                    format!(
+                        "native node_id={} scan lowering lost Scan boundary",
+                        wire_node.node_id
+                    )
+                })?;
+            }
+            Some(plan::plan_node::Kind::Values(_))
+            | Some(plan::plan_node::Kind::GenerateSeries(_)) => {
+                wrap_source_boundary(&mut lowered.node, wire_node.node_id, specs);
+            }
+            kind => {
+                return Err(format!(
+                    "native runtime-filter consumer binding on leaf node_id={} has unsupported source capability: {kind:?}",
+                    wire_node.node_id
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn wrap_source_boundary(
+    node: &mut ExecNode,
+    owner_node_id: i32,
+    bindings: Vec<NativeRuntimeFilterConsumerSpec>,
+) {
+    let input = node.clone();
+    *node = ExecNode {
+        kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+            input: Box::new(input),
+            owner_node_id,
+            bindings,
+        }),
+    };
+}
+
+fn set_native_scan_specs(
+    node: &mut ExecNode,
+    specs: Vec<NativeRuntimeFilterConsumerSpec>,
+) -> Result<(), Vec<NativeRuntimeFilterConsumerSpec>> {
+    match &mut node.kind {
+        ExecNodeKind::Scan(scan) => {
+            scan.set_native_runtime_filter_specs(specs);
+            Ok(())
+        }
+        ExecNodeKind::IcebergDeltaScan(scan) => {
+            scan.set_native_runtime_filter_specs(specs);
+            Ok(())
+        }
+        ExecNodeKind::Project(project) if project.is_subordinate => {
+            set_native_scan_specs(&mut project.input, specs)
+        }
+        ExecNodeKind::Filter(filter) => set_native_scan_specs(&mut filter.input, specs),
+        _ => Err(specs),
+    }
+}
+
+fn find_exchange_source_mut(
+    node: &mut ExecNode,
+) -> Option<&mut crate::exec::node::exchange_source::ExchangeSourceNode> {
+    match &mut node.kind {
+        ExecNodeKind::ExchangeSource(exchange) => Some(exchange),
+        ExecNodeKind::Limit(limit) => find_exchange_source_mut(&mut limit.input),
+        ExecNodeKind::Sort(sort) => find_exchange_source_mut(&mut sort.input),
+        _ => None,
+    }
+}
+
+fn attach_hash_join_producers(
+    wire_node: &plan::DistributedNode,
+    bindings: &[DecodedRuntimeFilterBinding],
+    direct_inputs: &[(Layout, ChunkSchemaRef)],
+    lowered: &mut LoweredNode,
+    arena: &mut ExprArena,
+) -> Result<(), String> {
+    let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
+        return Err(format!(
+            "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
+            wire_node.node_id
+        ));
+    };
+    if direct_inputs.len() != 2 {
+        return Err(format!(
+            "native HashJoin node_id={} missing two direct inputs",
+            wire_node.node_id
+        ));
+    }
+    let build_input_index = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+        0
+    } else {
+        1
+    };
+    let (build_layout, build_schema) = &direct_inputs[build_input_index];
+    let plan::distributed_node::Payload::Physical(physical) =
+        wire_node.payload.as_ref().ok_or_else(|| {
+            format!(
+                "native HashJoin node_id={} payload missing",
+                wire_node.node_id
+            )
+        })?
+    else {
+        return Err(format!(
+            "native runtime-filter producer node_id={} is not physical HashJoin",
+            wire_node.node_id
+        ));
+    };
+    let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
+        return Err(format!(
+            "native runtime-filter producer node_id={} is not HashJoin",
+            wire_node.node_id
+        ));
+    };
+    let mut producers = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let DecodedBindingRole::Producer {
+            contribution_kinds,
+            completion_requirement,
+        } = &binding.role
+        else {
+            return Err(format!(
+                "native runtime-filter binding_id={} expected producer role",
+                binding.binding_id
+            ));
+        };
+        let matches = wire_join
+            .eq_conditions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, condition)| {
+                if condition.null_safe {
+                    return None;
+                }
+                let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+                    condition.left.as_ref()
+                } else {
+                    condition.right.as_ref()
+                }?;
+                if raw_build != &binding.expression {
+                    return None;
+                }
+                validate_column_refs_exact(
+                    binding.binding_id,
+                    raw_build,
+                    build_layout,
+                    build_schema,
+                )
+                .ok()?;
+                Some(index)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "native runtime-filter producer binding_id={} must match exactly one non-null-safe raw build expression, matched {}",
+                binding.binding_id,
+                matches.len()
+            ));
+        }
+        let build_key_index = matches[0];
+        let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
+        producers.push(InterimDormantNativeProducerBinding {
+            binding_id: binding.binding_id,
+            channel_id: binding.channel_id,
+            build_expr_id,
+            build_key_index,
+            contribution_kinds: contribution_kinds.clone(),
+            completion_requirement: *completion_requirement,
+            contract: native_contract(&binding.contract),
+            reduction: native_reduction(&binding.reduction),
+            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+        });
+    }
+    let input = lowered.node.clone();
+    lowered.node = ExecNode {
+        kind: ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(
+            InterimDormantNativeProducerNode {
+                input: Box::new(input),
+                owner_node_id: wire_node.node_id,
+                bindings: producers,
+            },
+        ),
+    };
+    Ok(())
+}
+
+fn consumer_spec(
+    binding: &DecodedRuntimeFilterBinding,
+    expr_id: crate::exec::expr::ExprId,
+) -> Result<NativeRuntimeFilterConsumerSpec, String> {
+    let DecodedBindingRole::Consumer {
+        capabilities,
+        activation,
+    } = &binding.role
+    else {
+        return Err(format!(
+            "native runtime-filter binding_id={} expected consumer role",
+            binding.binding_id
+        ));
+    };
+    Ok(NativeRuntimeFilterConsumerSpec {
+        binding_id: binding.binding_id,
+        channel_id: binding.channel_id,
+        expr_id,
+        activation: *activation,
+        capabilities: capabilities.clone(),
+        contract: native_contract(&binding.contract),
+        reduction: native_reduction(&binding.reduction),
+        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+    })
+}
+
+fn native_contract(contract: &DecodedRuntimeFilterContract) -> NativeRuntimeFilterContract {
+    match contract {
+        DecodedRuntimeFilterContract::Membership {
+            canonical_schema,
+            schema_digest,
+        } => NativeRuntimeFilterContract::Membership {
+            canonical_schema: Arc::clone(canonical_schema),
+            schema_digest: *schema_digest,
+        },
+        DecodedRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } => NativeRuntimeFilterContract::Ordered {
+            keys: Arc::clone(keys),
+            comparator_digest: *comparator_digest,
+            order_contract_digest: *order_contract_digest,
+        },
+    }
+}
+
+fn native_reduction(reduction: &DecodedRuntimeFilterReduction) -> NativeRuntimeFilterReduction {
+    match reduction {
+        DecodedRuntimeFilterReduction::SetUnion => NativeRuntimeFilterReduction::SetUnion,
+        DecodedRuntimeFilterReduction::TightenOrderedBound => {
+            NativeRuntimeFilterReduction::TightenOrderedBound
+        }
+        DecodedRuntimeFilterReduction::MergeTopKSummary { k, contract_digest } => {
+            NativeRuntimeFilterReduction::MergeTopKSummary {
+                k: *k,
+                contract_digest: *contract_digest,
+            }
+        }
+    }
+}
+
+fn lower_binding_expression(
+    binding: &DecodedRuntimeFilterBinding,
+    layout: &Layout,
+    schema: &ChunkSchemaRef,
+    arena: &mut ExprArena,
+) -> Result<crate::exec::expr::ExprId, String> {
+    validate_column_refs_exact(binding.binding_id, &binding.expression, layout, schema)?;
+    super::expr::lower_proto_expr(&binding.expression, arena, layout).map_err(|error| {
+        format!(
+            "native runtime-filter binding_id={} expression: {error}",
+            binding.binding_id
+        )
+    })
+}
+
+fn validate_column_refs_exact(
+    binding_id: u32,
+    expression: &crate::proto::expr::Expr,
+    layout: &Layout,
+    schema: &ChunkSchemaRef,
+) -> Result<(), String> {
+    use crate::proto::expr::expr::Kind;
+    let kind = expression.kind.as_ref().ok_or_else(|| {
+        format!("native runtime-filter binding_id={binding_id} expression kind missing")
+    })?;
+    if let Kind::ColumnRef(column) = kind {
+        let slot_id = layout
+            .resolve_column_id(column.column_id)
+            .map_err(|error| format!("native runtime-filter binding_id={binding_id}: {error}"))?;
+        let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
+            format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} has no ChunkSchema field", column.column_id)
+        })?;
+        let type_desc = expression.r#type.as_ref().ok_or_else(|| {
+            format!(
+                "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type missing",
+                column.column_id
+            )
+        })?;
+        let actual = super::decode_field_type("_runtime_filter_column", expression.nullable, type_desc)
+            .map_err(|error| format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}", column.column_id))?;
+        if expected.data_type() != actual.data_type()
+            || expected.is_nullable() != actual.is_nullable()
+            || crate::exec::chunk::ChunkFieldSchema::from_field(expected)?
+                != crate::exec::chunk::ChunkFieldSchema::from_field(&actual)?
+        {
+            return Err(format!(
+                "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
+                column.column_id
+            ));
+        }
+    }
+    let mut visit = |child: &crate::proto::expr::Expr| {
+        validate_column_refs_exact(binding_id, child, layout, schema)
+    };
+    match kind {
+        Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
+        Kind::BinaryOp(binary) => {
+            visit(
+                binary
+                    .left
+                    .as_ref()
+                    .ok_or_else(|| "BinaryOp.left missing".to_string())?,
+            )?;
+            visit(
+                binary
+                    .right
+                    .as_ref()
+                    .ok_or_else(|| "BinaryOp.right missing".to_string())?,
+            )
+        }
+        Kind::UnaryOp(unary) => visit(
+            unary
+                .operand
+                .as_ref()
+                .ok_or_else(|| "UnaryOp.operand missing".to_string())?,
+        ),
+        Kind::FunctionCall(call) => call.args.iter().try_for_each(&mut visit),
+        Kind::AggregateCall(call) => {
+            call.args.iter().try_for_each(&mut visit)?;
+            call.order_by.iter().try_for_each(|item| {
+                visit(
+                    item.expr
+                        .as_ref()
+                        .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                )
+            })
+        }
+        Kind::WindowCall(call) => {
+            call.args.iter().try_for_each(&mut visit)?;
+            call.partition_by.iter().try_for_each(&mut visit)?;
+            call.order_by.iter().try_for_each(|item| {
+                visit(
+                    item.expr
+                        .as_ref()
+                        .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                )
+            })
+        }
+        Kind::Cast(cast) => visit(
+            cast.operand
+                .as_ref()
+                .ok_or_else(|| "Cast.operand missing".to_string())?,
+        ),
+        Kind::IsNull(is_null) => visit(
+            is_null
+                .operand
+                .as_ref()
+                .ok_or_else(|| "IsNull.operand missing".to_string())?,
+        ),
+        Kind::InList(in_list) => {
+            visit(
+                in_list
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| "InList.operand missing".to_string())?,
+            )?;
+            in_list.list.iter().try_for_each(&mut visit)
+        }
+        Kind::Between(between) => {
+            visit(
+                between
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| "Between.operand missing".to_string())?,
+            )?;
+            visit(
+                between
+                    .low
+                    .as_ref()
+                    .ok_or_else(|| "Between.low missing".to_string())?,
+            )?;
+            visit(
+                between
+                    .high
+                    .as_ref()
+                    .ok_or_else(|| "Between.high missing".to_string())?,
+            )
+        }
+        Kind::Like(like) => {
+            visit(
+                like.operand
+                    .as_ref()
+                    .ok_or_else(|| "Like.operand missing".to_string())?,
+            )?;
+            visit(
+                like.pattern
+                    .as_ref()
+                    .ok_or_else(|| "Like.pattern missing".to_string())?,
+            )
+        }
+        Kind::CaseExpr(case_expr) => {
+            if let Some(operand) = &case_expr.operand {
+                visit(operand)?;
+            }
+            for branch in &case_expr.when_then {
+                visit(
+                    branch
+                        .when
+                        .as_ref()
+                        .ok_or_else(|| "Case.when missing".to_string())?,
+                )?;
+                visit(
+                    branch
+                        .then
+                        .as_ref()
+                        .ok_or_else(|| "Case.then missing".to_string())?,
+                )?;
+            }
+            if let Some(else_expr) = &case_expr.else_expr {
+                visit(else_expr)?;
+            }
+            Ok(())
+        }
+        Kind::IsTruth(is_truth) => visit(
+            is_truth
+                .operand
+                .as_ref()
+                .ok_or_else(|| "IsTruth.operand missing".to_string())?,
+        ),
+        Kind::Lambda(lambda) => visit(
+            lambda
+                .body
+                .as_ref()
+                .ok_or_else(|| "Lambda.body missing".to_string())?,
+        ),
+        Kind::Nested(nested) => visit(
+            nested
+                .inner
+                .as_ref()
+                .ok_or_else(|| "Nested.inner missing".to_string())?,
+        ),
+    }
 }
 
 fn apply_distributed_limit_if_needed(
@@ -271,9 +866,12 @@ fn lower_physical_node(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
     use arrow::datatypes::DataType;
 
-    use super::{NodeLoweringContext, lower_proto_node};
+    use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
@@ -281,6 +879,23 @@ mod tests {
     use crate::exec::node::set_op::SetOpKind;
     use crate::proto::{common, expr, plan};
     use crate::types::native_proto::encode_type;
+
+    struct DummyScanOp;
+
+    impl crate::exec::node::scan::ScanOp for DummyScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: crate::exec::node::scan::ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn build_morsels(&self) -> Result<crate::exec::node::scan::ScanMorsels, String> {
+            Ok(crate::exec::node::scan::ScanMorsels::default())
+        }
+    }
 
     pub(super) fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
@@ -462,6 +1077,27 @@ mod tests {
         )
     }
 
+    fn one_col_values_node_typed(
+        node_id: i32,
+        column_id: u32,
+        name: &str,
+        value: i64,
+        data_type: DataType,
+    ) -> plan::DistributedNode {
+        let columns = vec![output_column(column_id, name, data_type)];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![int_literal(value)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
     pub(super) fn two_col_values_node(node_id: i32) -> plan::DistributedNode {
         let columns = vec![
             output_column(1, "a", DataType::Int64),
@@ -502,6 +1138,562 @@ mod tests {
     pub(super) fn lower(node: &plan::DistributedNode) -> super::LoweredNode {
         let mut arena = ExprArena::default();
         lower_proto_node(node, &mut arena, &NodeLoweringContext::default()).expect("lower node")
+    }
+
+    fn dormant_consumer(
+        binding_id: u32,
+        node_id: i32,
+        column_id: u32,
+    ) -> DecodedRuntimeFilterBinding {
+        DecodedRuntimeFilterBinding {
+            binding_id,
+            channel_id: binding_id + 10,
+            node_id,
+            apply_point: super::super::runtime_filter_binding::DecodedApplyPoint::NodeInput,
+            expression: column_ref(column_id, DataType::Int64),
+            role: DecodedBindingRole::Consumer {
+                capabilities: BTreeSet::from([
+                    crate::runtime_filter::model::contract::ArtifactCapability::Membership,
+                    crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
+                ]),
+                activation:
+                    crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
+            },
+            contract: DecodedRuntimeFilterContract::Membership {
+                canonical_schema: Arc::from([]),
+                schema_digest: [0; 32],
+            },
+            reduction: DecodedRuntimeFilterReduction::SetUnion,
+        }
+    }
+
+    fn membership_producer_wire(
+        binding_id: u32,
+        node_id: i32,
+        expression: expr::Expr,
+        data_type: &DataType,
+    ) -> plan::RuntimeFilterBinding {
+        let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
+            data_type,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        plan::RuntimeFilterBinding {
+            binding_id,
+            channel_id: binding_id + 10,
+            node_id,
+            apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeOutput),
+            expression: Some(expression),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                    plan::RuntimeFilterMembershipContract {
+                        canonical_schema: schema.canonical_bytes().to_vec(),
+                        schema_digest: schema.digest().bytes().to_vec(),
+                    },
+                )),
+            }),
+            reduction: Some(plan::RuntimeFilterReductionContract {
+                kind: Some(plan::runtime_filter_reduction_contract::Kind::SetUnion(
+                    true,
+                )),
+            }),
+            role: Some(plan::runtime_filter_binding::Role::Producer(
+                plan::RuntimeFilterProducerRole {
+                    contribution_kinds: vec![
+                        i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta),
+                        i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+                    ],
+                    completion_requirement: i32::from(
+                        plan::RuntimeFilterCompletionRequirement::ProducerClosed,
+                    ),
+                },
+            )),
+        }
+    }
+
+    fn cast_expr(operand: expr::Expr, data_type: DataType, nullable: bool) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&data_type)),
+            nullable,
+            kind: Some(expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                operand: Some(Box::new(operand)),
+                target: Some(type_desc(&data_type)),
+            }))),
+        }
+    }
+
+    #[test]
+    fn producer_lookup_is_validated_and_consumed_by_interim_dormant_seam() {
+        let left_wire = one_col_values_node_with(10, 1, "lhs", 10);
+        let right_wire = one_col_values_node_with(11, 2, "rhs", 20);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![left_wire.clone(), right_wire.clone()],
+        );
+        wire.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![membership_producer_wire(
+                1,
+                30,
+                column_ref(2, DataType::Int64),
+                &DataType::Int64,
+            )],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+            .expect("decode producer table");
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node_with_bindings(
+            &wire,
+            &mut arena,
+            &NodeLoweringContext::default(),
+            &mut ledger,
+        )
+        .expect("producer seam");
+        ledger.finish().expect("producer binding consumed");
+        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
+        else {
+            panic!("producer seam")
+        };
+        assert_eq!(producer.bindings.len(), 1);
+        assert!(matches!(producer.input.kind, ExecNodeKind::Join(_)));
+
+        let mut nullable_mismatch = column_ref(2, DataType::Int64);
+        nullable_mismatch.nullable = false;
+        let invalid_table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![membership_producer_wire(
+                1,
+                30,
+                nullable_mismatch,
+                &DataType::Int64,
+            )],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&invalid_table))
+            .expect("decode invalid lowering table");
+        assert!(
+            lower_proto_node_with_bindings(
+                &wire,
+                &mut ExprArena::default(),
+                &NodeLoweringContext::default(),
+                &mut ledger,
+            )
+            .is_err()
+        );
+        assert!(
+            ledger.finish().is_err(),
+            "failed lowering must not consume binding"
+        );
+    }
+
+    #[test]
+    fn producer_matches_and_references_once_lowered_raw_build_expression() {
+        let left = one_col_values_node_typed(10, 1, "lhs", 10, DataType::Int64);
+        let right = one_col_values_node_typed(11, 2, "rhs", 20, DataType::Int32);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int32)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![membership_producer_wire(
+                1,
+                30,
+                column_ref(2, DataType::Int32),
+                &DataType::Int32,
+            )],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+            .expect("decode producer table");
+        let mut arena = ExprArena::default();
+        let lowered = lower_proto_node_with_bindings(
+            &wire,
+            &mut arena,
+            &NodeLoweringContext::default(),
+            &mut ledger,
+        )
+        .expect("coerced producer seam");
+        ledger.finish().expect("producer binding consumed");
+        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
+        else {
+            panic!("producer seam")
+        };
+        let build_expr_id = producer.bindings[0].build_expr_id;
+        assert_eq!(arena.data_type(build_expr_id), Some(&DataType::Int32));
+        assert!(matches!(
+            arena.node(build_expr_id),
+            Some(crate::exec::expr::ExprNode::SlotId(_))
+        ));
+    }
+
+    #[test]
+    fn distinct_producer_bindings_may_share_one_unique_raw_build_key() {
+        let left = one_col_values_node_with(10, 1, "lhs", 10);
+        let right = one_col_values_node_with(11, 2, "rhs", 20);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(column_ref(2, DataType::Int64)),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1, 2];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![
+                membership_producer_wire(1, 30, column_ref(2, DataType::Int64), &DataType::Int64),
+                membership_producer_wire(2, 30, column_ref(2, DataType::Int64), &DataType::Int64),
+            ],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+            .expect("decode shared-key producer table");
+        let lowered = lower_proto_node_with_bindings(
+            &wire,
+            &mut ExprArena::default(),
+            &NodeLoweringContext::default(),
+            &mut ledger,
+        )
+        .expect("two channels may bind the same unique raw key");
+        ledger.finish().expect("both producer bindings consumed");
+        let ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) = lowered.node.kind
+        else {
+            panic!("producer seam")
+        };
+        assert_eq!(
+            producer
+                .bindings
+                .iter()
+                .map(|binding| binding.binding_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn producer_rejects_nested_intermediate_nullability_mismatch() {
+        let raw_build = cast_expr(
+            cast_expr(column_ref(2, DataType::Int64), DataType::Int64, true),
+            DataType::Int64,
+            true,
+        );
+        let left = one_col_values_node_with(10, 1, "lhs", 10);
+        let right = one_col_values_node_with(11, 2, "rhs", 20);
+        let mut wire = physical_node(
+            30,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                join_type: i32::from(plan::JoinKind::Inner),
+                eq_conditions: vec![plan::HashJoinEqCondition {
+                    left: Some(column_ref(1, DataType::Int64)),
+                    right: Some(raw_build.clone()),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: i32::from(plan::JoinDistribution::Broadcast),
+                execution_mode: None,
+                build_runtime_filters: Vec::new(),
+            }),
+            Vec::new(),
+            vec![left, right],
+        );
+        wire.runtime_filter_binding_ids = vec![1];
+        let mut mismatched = raw_build;
+        let Some(expr::expr::Kind::Cast(outer)) = mismatched.kind.as_mut() else {
+            panic!("outer cast")
+        };
+        let inner = outer.operand.as_mut().expect("inner cast");
+        inner.nullable = false;
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![membership_producer_wire(
+                1,
+                30,
+                mismatched,
+                &DataType::Int64,
+            )],
+        };
+        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+            .expect("decode nested mismatch table");
+        assert!(
+            lower_proto_node_with_bindings(
+                &wire,
+                &mut ExprArena::default(),
+                &NodeLoweringContext::default(),
+                &mut ledger,
+            )
+            .is_err(),
+            "nested intermediate nullability drift must not match"
+        );
+        assert!(
+            ledger.finish().is_err(),
+            "failed match must remain unconsumed"
+        );
+    }
+
+    #[test]
+    fn scan_binding_uses_leaf_local_native_consumer_spec() {
+        let wire = physical_node(
+            10,
+            plan::plan_node::Kind::Scan(plan::ScanNode::default()),
+            vec![output_column(1, "v", DataType::Int64)],
+            Vec::new(),
+        );
+        let baseline = lower(&one_col_values_node(10));
+        let mut lowered = LoweredNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new(Arc::new(
+                    DummyScanOp,
+                ))),
+            },
+            layout: baseline.layout,
+            output_schema: baseline.output_schema,
+        };
+        attach_leaf_consumers(
+            &wire,
+            &[dormant_consumer(1, 10, 1)],
+            &mut lowered,
+            &mut ExprArena::default(),
+        )
+        .expect("scan leaf binding");
+        let ExecNodeKind::Scan(scan) = &lowered.node.kind else {
+            panic!("scan")
+        };
+        assert_eq!(scan.native_runtime_filter_specs().len(), 1);
+        assert!(scan.runtime_filter_specs().is_empty());
+    }
+
+    #[test]
+    fn exchange_binding_uses_leaf_local_native_consumer_spec() {
+        let baseline = lower(&one_col_values_node(10));
+        let mut wire = physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+        wire.payload = Some(plan::distributed_node::Payload::Exchange(
+            plan::ExchangeReceiver::default(),
+        ));
+        let mut lowered = LoweredNode {
+            node: ExecNode {
+                kind: ExecNodeKind::ExchangeSource(
+                    crate::exec::node::exchange_source::ExchangeSourceNode::new(
+                        crate::runtime::exchange::ExchangeKey {
+                            finst_id_hi: 1,
+                            finst_id_lo: 2,
+                            node_id: 3,
+                        },
+                        1,
+                        std::time::Duration::from_secs(1),
+                        Arc::clone(&baseline.output_schema),
+                    ),
+                ),
+            },
+            layout: baseline.layout,
+            output_schema: baseline.output_schema,
+        };
+        attach_leaf_consumers(
+            &wire,
+            &[dormant_consumer(1, 10, 1)],
+            &mut lowered,
+            &mut ExprArena::default(),
+        )
+        .expect("exchange leaf binding");
+        let ExecNodeKind::ExchangeSource(exchange) = &lowered.node.kind else {
+            panic!("exchange")
+        };
+        assert_eq!(exchange.native_runtime_filter_specs().len(), 1);
+        assert!(exchange.runtime_filter_specs().is_empty());
+    }
+
+    #[test]
+    fn unary_node_wraps_only_its_direct_input() {
+        let mut children = vec![lower(&one_col_values_node(10))];
+        let mut arena = ExprArena::default();
+        attach_direct_input_consumers(20, &[dormant_consumer(1, 20, 1)], &mut children, &mut arena)
+            .expect("attach");
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
+            panic!("consumer wrapper")
+        };
+        assert_eq!(consumer.owner_node_id, 20);
+        assert!(matches!(consumer.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn multi_input_requires_exactly_one_matching_direct_input() {
+        let mut children = vec![
+            lower(&one_col_values_node_with(10, 1, "left", 1)),
+            lower(&one_col_values_node_with(11, 2, "right", 2)),
+        ];
+        let mut arena = ExprArena::default();
+        attach_direct_input_consumers(20, &[dormant_consumer(1, 20, 1)], &mut children, &mut arena)
+            .expect("unique left input");
+        assert!(matches!(
+            children[0].node.kind,
+            ExecNodeKind::NativeRuntimeFilterConsumer(_)
+        ));
+        assert!(matches!(children[1].node.kind, ExecNodeKind::Values(_)));
+
+        let mut ambiguous = dormant_consumer(2, 20, 1);
+        ambiguous.expression = int_literal(1);
+        let mut children = vec![
+            lower(&one_col_values_node(10)),
+            lower(&one_col_values_node(11)),
+        ];
+        assert!(
+            attach_direct_input_consumers(
+                20,
+                &[ambiguous],
+                &mut children,
+                &mut ExprArena::default()
+            )
+            .is_err()
+        );
+
+        let mut children = vec![
+            lower(&one_col_values_node_with(10, 1, "left", 1)),
+            lower(&one_col_values_node_with(11, 2, "right", 2)),
+        ];
+        assert!(
+            attach_direct_input_consumers(
+                20,
+                &[dormant_consumer(3, 20, 3)],
+                &mut children,
+                &mut ExprArena::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filter_binding_does_not_move_to_scan_without_scan_binding() {
+        let baseline = lower(&one_col_values_node(10));
+        let mut children = vec![LoweredNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(crate::exec::node::scan::ScanNode::new(Arc::new(
+                    DummyScanOp,
+                ))),
+            },
+            layout: baseline.layout,
+            output_schema: baseline.output_schema,
+        }];
+        attach_direct_input_consumers(
+            20,
+            &[dormant_consumer(1, 20, 1)],
+            &mut children,
+            &mut ExprArena::default(),
+        )
+        .expect("filter input boundary");
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
+            panic!("exact filter input wrapper")
+        };
+        let ExecNodeKind::Scan(scan) = &consumer.input.kind else {
+            panic!("scan remains the direct input")
+        };
+        assert!(scan.native_runtime_filter_specs().is_empty());
+        assert!(scan.runtime_filter_specs().is_empty());
+    }
+
+    #[test]
+    fn values_binding_wraps_the_source_boundary() {
+        let wire = one_col_values_node(10);
+        let mut lowered = lower(&wire);
+        attach_leaf_consumers(
+            &wire,
+            &[dormant_consumer(1, 10, 1)],
+            &mut lowered,
+            &mut ExprArena::default(),
+        )
+        .expect("values source boundary");
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
+            panic!("consumer")
+        };
+        assert!(matches!(consumer.input.kind, ExecNodeKind::Values(_)));
+    }
+
+    #[test]
+    fn generate_series_binding_wraps_the_source_boundary() {
+        let wire = physical_node(
+            10,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 3,
+                step: 1,
+                output_column_id: 1,
+                column_name: "v".to_string(),
+                alias: None,
+            }),
+            vec![output_column_with_nullable(1, "v", DataType::Int64, false)],
+            Vec::new(),
+        );
+        let mut lowered = lower(&wire);
+        let mut binding = dormant_consumer(1, 10, 1);
+        binding.expression.nullable = false;
+        attach_leaf_consumers(&wire, &[binding], &mut lowered, &mut ExprArena::default())
+            .expect("generate series source boundary");
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
+            panic!("consumer")
+        };
+        assert!(matches!(
+            consumer.input.kind,
+            ExecNodeKind::TableFunction(_)
+        ));
+    }
+
+    #[test]
+    fn unsupported_leaf_capability_fails_before_execution() {
+        let wire = physical_node(
+            10,
+            plan::plan_node::Kind::Decode(plan::DecodeNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut lowered = lower(&one_col_values_node(10));
+        assert!(
+            attach_leaf_consumers(
+                &wire,
+                &[dormant_consumer(1, 10, 1)],
+                &mut lowered,
+                &mut ExprArena::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

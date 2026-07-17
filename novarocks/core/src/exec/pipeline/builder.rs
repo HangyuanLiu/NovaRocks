@@ -418,6 +418,12 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         }
         ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
         ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            output_chunk_schema_for_node(&consumer.input)
+        }
+        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
+            output_chunk_schema_for_node(&producer.input)
+        }
         ExecNodeKind::IcebergDeltaScan(scan) => Some(Arc::clone(&scan.output_chunk_schema)),
         #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
@@ -546,6 +552,12 @@ fn build_pipeline_for_node(
     ctx: &mut PipelineBuildContext,
 ) -> Result<PipelineBuildResult, String> {
     match &node.kind {
+        ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
+            build_pipeline_for_node(&consumer.input, ctx)
+        }
+        ExecNodeKind::InterimDormantNativeRuntimeFilterProducer(producer) => {
+            build_pipeline_for_node(&producer.input, ctx)
+        }
         ExecNodeKind::AssertNumRows(AssertNumRowsNode {
             input,
             node_id,
@@ -1491,13 +1503,15 @@ fn new_source_pipeline_with_dop(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
 
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
@@ -1505,6 +1519,11 @@ mod tests {
         JoinDistributionMode, JoinNode, JoinRuntimeFilterSpec, JoinType,
     };
     use crate::exec::node::lookup::LookUpNode;
+    use crate::exec::node::runtime_filter::{
+        NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
+        NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    };
+    use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::dependency::DependencyManager;
     use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
@@ -1527,6 +1546,171 @@ mod tests {
                 output_chunk_schema,
             }),
         }
+    }
+
+    fn assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+        activation: crate::runtime_filter::model::contract::ConsumerActivation,
+    ) {
+        let schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            &[SlotId::new(1)],
+        );
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let baseline = ExecPlan {
+            arena: arena.clone(),
+            root: lookup_node(1, Arc::clone(&schema)),
+        };
+        let build = |plan: &ExecPlan| {
+            build_pipeline_graph_for_exec_plan_with_dop(
+                plan,
+                false,
+                DependencyManager::new(),
+                None,
+                2,
+                Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            )
+            .expect("graph")
+        };
+        let baseline = build(&baseline);
+        let wrapped = ExecPlan {
+            arena: arena.clone(),
+            root: ExecNode {
+                kind: ExecNodeKind::NativeRuntimeFilterConsumer(NativeRuntimeFilterConsumerNode {
+                    input: Box::new(lookup_node(1, Arc::clone(&schema))),
+                    owner_node_id: 2,
+                    bindings: vec![NativeRuntimeFilterConsumerSpec {
+                        binding_id: 1,
+                        channel_id: 1,
+                        expr_id,
+                        activation,
+                        capabilities: BTreeSet::from([
+                            crate::runtime_filter::model::contract::ArtifactCapability::Membership,
+                            crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
+                        ]),
+                        contract: NativeRuntimeFilterContract::Membership {
+                            canonical_schema: Arc::from([]),
+                            schema_digest: [0; 32],
+                        },
+                        reduction: NativeRuntimeFilterReduction::SetUnion,
+                        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                    }],
+                }),
+            },
+        };
+        let wrapped = build(&wrapped);
+        assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
+        assert_eq!(
+            wrapped.pipelines[0].factories.len(),
+            baseline.pipelines[0].factories.len()
+        );
+        assert_eq!(
+            wrapped.pipelines[0].factories[0].name(),
+            baseline.pipelines[0].factories[0].name()
+        );
+    }
+
+    #[test]
+    fn dormant_blocking_consumer_has_no_dependency_or_wait() {
+        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
+        );
+    }
+
+    #[test]
+    fn dormant_live_consumer_has_no_snapshot_poll() {
+        assert_dormant_consumer_adds_no_factory_dependency_or_wait(
+            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            },
+        );
+    }
+
+    #[test]
+    fn dormant_consumer_pipeline_is_chunk_exact_passthrough() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .expect("batch");
+        let chunk_schema = chunk_schema_of(&schema, &[SlotId::new(1)]);
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let baseline = ExecPlan {
+            arena: arena.clone(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: chunk.clone(),
+                    node_id: 1,
+                }),
+            },
+        };
+        let wrapped = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::NativeRuntimeFilterConsumer(
+                    NativeRuntimeFilterConsumerNode {
+                        input: Box::new(ExecNode {
+                            kind: ExecNodeKind::Values(ValuesNode {
+                                chunk: chunk.clone(),
+                                node_id: 1,
+                            }),
+                        }),
+                        owner_node_id: 2,
+                        bindings: vec![NativeRuntimeFilterConsumerSpec {
+                            binding_id: 1,
+                            channel_id: 1,
+                            expr_id,
+                            activation: crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
+                                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+                            },
+                            capabilities: BTreeSet::from([
+                                crate::runtime_filter::model::contract::ArtifactCapability::Membership,
+                                crate::runtime_filter::model::contract::ArtifactCapability::EmptyDomain,
+                            ]),
+                            contract: NativeRuntimeFilterContract::Membership { canonical_schema: Arc::from([]), schema_digest: [0; 32] },
+                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+                        }],
+                    },
+                ),
+            },
+        };
+        let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &wrapped.root.kind else {
+            panic!("consumer")
+        };
+        let ExecNodeKind::Values(values) = &consumer.input.kind else {
+            panic!("values")
+        };
+        assert!(Arc::ptr_eq(
+            values.chunk.batch.column(0),
+            chunk.batch.column(0)
+        ));
+
+        let build = |plan: &ExecPlan| {
+            build_pipeline_graph_for_exec_plan_with_dop(
+                plan,
+                false,
+                DependencyManager::new(),
+                None,
+                2,
+                Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+            )
+            .expect("graph")
+        };
+        let baseline = build(&baseline);
+        let wrapped = build(&wrapped);
+        assert_eq!(wrapped.pipelines.len(), baseline.pipelines.len());
+        assert_eq!(
+            wrapped.pipelines[0].factories.len(),
+            baseline.pipelines[0].factories.len()
+        );
+        assert_eq!(
+            wrapped.pipelines[0].factories[0].name(),
+            baseline.pipelines[0].factories[0].name()
+        );
     }
 
     #[test]

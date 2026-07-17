@@ -313,7 +313,7 @@ fn validate_runtime_filter_intent(
     Ok(())
 }
 
-fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
+pub(super) fn exprs_equivalent(arena: &ExprArena, left: ExprId, right: ExprId) -> bool {
     if arena.data_type(left) != arena.data_type(right) {
         return false;
     }
