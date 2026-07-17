@@ -32,13 +32,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, TimeUnit};
 use iceberg::spec::Schema;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::StoredMvDefinition;
 use crate::meta::repository::mv_contract::MvSchemaContract;
 use crate::sql::planner::table::{
@@ -67,7 +67,7 @@ pub(crate) struct IcebergMvRewriteContext {
     pub canonical_select_query: Arc<sqlparser::ast::Query>,
 
     // ---- Base table inputs ----
-    pub base_refs: Arc<[IcebergTableRef]>,
+    pub base_refs: Arc<[TableIdentity]>,
     pub pin: Arc<RefreshSnapshotPin>,
     pub previous_snapshot_ids: BTreeMap<String, i64>,
     pub previous_table_uuids: BTreeMap<String, String>,
@@ -89,7 +89,7 @@ pub(crate) struct IcebergMvRefreshContext {
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
-    pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
     pub pruning_limits: MvRefreshPruningLimits,
 }
 
@@ -163,7 +163,7 @@ impl IcebergMvRewriteContext {
         current_database: String,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
@@ -421,7 +421,8 @@ fn aggregate_input_types_from_schema_contract(
     calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::engine::mv::agg_state::mv_shape::{AggregateInput, VisibleAggregateOutput};
+    use crate::engine::mv::agg_state::mv_shape::AggregateInput;
+    use crate::mv::model::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
@@ -629,7 +630,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -661,7 +662,7 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
@@ -682,7 +683,7 @@ impl IcebergMvRefreshContext {
             target_entry,
             iceberg_catalog,
             target_table,
-            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
+            crate::mv::model::AffectedTargetPartitions::not_derived(
                 "refresh context was constructed without planned affected partitions",
             ),
             pruning_limits,
@@ -697,13 +698,13 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
-        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        affected_partitions: crate::mv::model::AffectedTargetPartitions,
     ) -> Result<Self, String> {
         Self::new_with_affected_partitions_and_pruning_limits(
             target,
@@ -731,13 +732,13 @@ impl IcebergMvRefreshContext {
         current_database: &str,
         mv_definition: Arc<StoredMvDefinition>,
         canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[IcebergTableRef]>,
+        base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
-        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        affected_partitions: crate::mv::model::AffectedTargetPartitions,
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
@@ -775,9 +776,9 @@ impl IcebergMvRefreshContext {
 
     pub(crate) fn affected_partitions_to_target_partition_filter(
         &self,
-    ) -> crate::engine::mv::partition::TargetPartitionFilter {
+    ) -> crate::mv::model::TargetPartitionFilter {
         match &self.affected_partitions {
-            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+            crate::mv::model::AffectedTargetPartitions::Known { partitions } => {
                 if self
                     .pruning_limits
                     .affected_partition_count_exceeds_limit(partitions.len())
@@ -789,16 +790,14 @@ impl IcebergMvRefreshContext {
                         fallback_reason = "affected_partition_threshold",
                         "falling back to unpartitioned target scan because affected partition allow-list exceeds configured threshold"
                     );
-                    crate::engine::mv::partition::TargetPartitionFilter::None
+                    crate::mv::model::TargetPartitionFilter::None
                 } else {
-                    crate::engine::mv::partition::TargetPartitionFilter::AllowList(
-                        partitions.clone(),
-                    )
+                    crate::mv::model::TargetPartitionFilter::AllowList(partitions.clone())
                 }
             }
-            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
-            | crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { .. } => {
-                crate::engine::mv::partition::TargetPartitionFilter::None
+            crate::mv::model::AffectedTargetPartitions::Unpartitioned
+            | crate::mv::model::AffectedTargetPartitions::NotDerived { .. } => {
+                crate::mv::model::TargetPartitionFilter::None
             }
         }
     }
@@ -1052,17 +1051,17 @@ impl IcebergMvRefreshContext {
     fn target_state_partition_allow_list(
         &self,
         scan: &IcebergMvTargetStateScan,
-    ) -> Result<Option<BTreeSet<crate::engine::mv::partition::MvPartitionKey>>, String> {
+    ) -> Result<Option<BTreeSet<crate::mv::model::MvPartitionKey>>, String> {
         match scan.partition_constraint {
             crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
                 Ok(None)
             }
             crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 match &self.affected_partitions {
-                    crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
+                    crate::mv::model::AffectedTargetPartitions::Unpartitioned => {
                         Ok(None)
                     }
-                    crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                    crate::mv::model::AffectedTargetPartitions::Known {
                         partitions,
                     } => {
                         if self
@@ -1082,7 +1081,7 @@ impl IcebergMvRefreshContext {
                             Ok(Some(partitions.clone()))
                         }
                     }
-                    crate::engine::mv::partition::AffectedTargetPartitions::NotDerived {
+                    crate::mv::model::AffectedTargetPartitions::NotDerived {
                         reason,
                     } => {
                         tracing::warn!(
@@ -1205,7 +1204,7 @@ fn data_files_at_snapshot(
 
 fn filter_target_state_files_by_partition(
     contract: &MvSchemaContract,
-    allow_list: &BTreeSet<crate::engine::mv::partition::MvPartitionKey>,
+    allow_list: &BTreeSet<crate::mv::model::MvPartitionKey>,
     files: Vec<IcebergDataFileInfo>,
     scan: &IcebergMvTargetStateScan,
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
@@ -1234,7 +1233,7 @@ fn filter_target_state_files_by_partition(
 fn target_file_partition_key(
     contract: &MvSchemaContract,
     file: &IcebergDataFileInfo,
-) -> Result<Option<crate::engine::mv::partition::MvPartitionKey>, String> {
+) -> Result<Option<crate::mv::model::MvPartitionKey>, String> {
     let Some(partition) = &contract.target.partition else {
         return Ok(None);
     };
@@ -1276,40 +1275,38 @@ fn target_file_partition_key(
                     file.path, partition_field.partition_field_name, expected_transform
                 )
             })?;
-        fields.push(crate::engine::mv::partition::MvPartitionKeyField::new(
+        fields.push(crate::mv::model::MvPartitionKeyField::new(
             partition_field.partition_field_name.clone(),
             target_partition_value_to_mv_value(value)?,
         ));
     }
 
-    Ok(Some(crate::engine::mv::partition::MvPartitionKey::new(
-        spec_id, fields,
-    )))
+    Ok(Some(crate::mv::model::MvPartitionKey::new(spec_id, fields)))
 }
 
 fn target_partition_value_to_mv_value(
     value: &IcebergPartitionFieldValue,
-) -> Result<crate::engine::mv::partition::MvPartitionValue, String> {
+) -> Result<crate::mv::model::MvPartitionValue, String> {
     match &value.value {
-        None => Ok(crate::engine::mv::partition::MvPartitionValue::Null),
-        Some(IcebergPartitionValue::Boolean(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int32(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Int64(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Float(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::Double(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.to_string()),
-        ),
-        Some(IcebergPartitionValue::String(v)) => Ok(
-            crate::engine::mv::partition::MvPartitionValue::String(v.clone()),
-        ),
+        None => Ok(crate::mv::model::MvPartitionValue::Null),
+        Some(IcebergPartitionValue::Boolean(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Int32(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Int64(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Float(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::Double(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.to_string()))
+        }
+        Some(IcebergPartitionValue::String(v)) => {
+            Ok(crate::mv::model::MvPartitionValue::String(v.clone()))
+        }
         Some(IcebergPartitionValue::Binary(_)) => Err(format!(
             "target partition field {} has unsupported binary value",
             value.field_name
@@ -1348,7 +1345,7 @@ fn target_contract_transform_text(
 
 fn collect_base_catalog_entries(
     iceberg_catalogs: &IcebergCatalogRegistry,
-    base_refs: &[IcebergTableRef],
+    base_refs: &[TableIdentity],
 ) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
     let mut entries = BTreeMap::new();
     for base_ref in base_refs {
@@ -1487,8 +1484,8 @@ pub(crate) mod tests_support {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
+    use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv::StoredMvDefinition;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -1502,8 +1499,8 @@ pub(crate) mod tests_support {
 
     use super::*;
 
-    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> TableIdentity {
+        TableIdentity {
             catalog: c.to_string(),
             namespace: n.to_string(),
             table: t.to_string(),
@@ -1667,7 +1664,7 @@ pub(crate) mod tests_support {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -1801,7 +1798,7 @@ pub(crate) mod tests_support {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         Arc::new(
@@ -1835,8 +1832,9 @@ pub(crate) mod tests_support {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog: fixture.iceberg_catalog.clone(),
             target_table: fixture.target_table.clone(),
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         }
     }
@@ -1968,8 +1966,9 @@ pub(crate) mod tests_support {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         };
         let scan = IcebergMvTargetStateScan {
@@ -2000,8 +1999,8 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
+    use crate::catalog::identifier::TableIdentity;
     use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::engine::mv::table_ref::IcebergTableRef;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
@@ -2015,7 +2014,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2061,7 +2060,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
 
@@ -2091,7 +2090,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(Vec::<IcebergTableRef>::new());
+        let base_refs: Arc<[TableIdentity]> = Arc::from(Vec::<TableIdentity>::new());
         let pin = Arc::new(RefreshSnapshotPin::default());
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2119,7 +2118,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> =
+        let base_refs: Arc<[TableIdentity]> =
             Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
@@ -2148,7 +2147,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         // Pin has the right count but the entry is for a different fqn.
         let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
         let schema = make_target_schema();
@@ -2183,7 +2182,7 @@ mod tests {
             .insert("ice.db.b".to_string(), "uuid-OLD".to_string());
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2214,7 +2213,7 @@ mod tests {
         def.last_refresh_table_uuids.clear();
         let mv_def = Arc::new(def);
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
@@ -2243,7 +2242,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let mut contract = make_schema_contract();
@@ -2276,7 +2275,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         // Contract has two columns (matching schema count) but one has a wrong
@@ -2310,7 +2309,7 @@ mod tests {
     fn summary_orders_by_base_refs_declared_order() {
         let target = make_target();
         let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![
             make_ref("ice", "db", "b"),
             make_ref("ice", "db", "a"),
             make_ref("ice", "db", "c"),
@@ -2390,7 +2389,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
         let mut contract = make_schema_contract();
@@ -2420,7 +2419,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         // Three-field target schema: 100=k (visible), 101=v (visible),
@@ -2478,7 +2477,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         let schema = Arc::new(
@@ -2545,7 +2544,7 @@ mod tests {
         let target = make_target();
         let mv_def = Arc::new(make_mv_definition());
         let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[IcebergTableRef]> = Arc::from(vec![make_ref("ice", "db", "b")]);
+        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         // Aggregate target schema: visible columns 100=k and 101=v, hidden
@@ -2709,8 +2708,9 @@ mod tests {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits::default(),
         };
         let table = IcebergTableInfo {
@@ -3011,8 +3011,9 @@ mod tests {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "test context",
+            ),
             pruning_limits: MvRefreshPruningLimits {
                 max_touched_groups: 100_000,
                 max_affected_partitions: 2,
@@ -3046,12 +3047,10 @@ mod tests {
             "unknown affected partitions should disable pruning"
         );
 
-        let new_key = crate::engine::mv::partition::MvPartitionKey::new(1, Vec::new());
-        let old_key = crate::engine::mv::partition::MvPartitionKey::new(2, Vec::new());
-        ctx.affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::known([
-            new_key.clone(),
-            old_key.clone(),
-        ]);
+        let new_key = crate::mv::model::MvPartitionKey::new(1, Vec::new());
+        let old_key = crate::mv::model::MvPartitionKey::new(2, Vec::new());
+        ctx.affected_partitions =
+            crate::mv::model::AffectedTargetPartitions::known([new_key.clone(), old_key.clone()]);
         let allow_list = ctx
             .target_state_partition_allow_list(&scan)
             .expect("known affected partitions should satisfy partition contract")
@@ -3069,7 +3068,7 @@ mod tests {
         );
         assert_eq!(
             ctx.affected_partitions_to_target_partition_filter(),
-            crate::engine::mv::partition::TargetPartitionFilter::None,
+            crate::mv::model::TargetPartitionFilter::None,
             "over-threshold affected partitions should disable merge-sink plan-time pruning"
         );
     }

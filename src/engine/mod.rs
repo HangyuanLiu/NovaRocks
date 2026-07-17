@@ -5690,10 +5690,9 @@ mysql_port = 47892
             base_catalog_entries: std::collections::BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions:
-                crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                    "engine test context",
-                ),
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "engine test context",
+            ),
             pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
         }
     }

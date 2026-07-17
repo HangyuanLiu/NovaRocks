@@ -36,8 +36,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::engine::StandaloneState;
-use crate::engine::mv::table_ref::IcebergTableRef;
 
 /// Per-refresh snapshot pin: each base table is pinned to the
 /// `current_snapshot_id` it had at refresh entry time.
@@ -57,7 +57,7 @@ impl RefreshSnapshotPin {
     /// layer; the caller is expected to handle that earlier.
     pub(crate) fn capture(
         state: &Arc<StandaloneState>,
-        base_refs: &[IcebergTableRef],
+        base_refs: &[TableIdentity],
     ) -> Result<Self, String> {
         let mut pin = RefreshSnapshotPin::default();
         for base_ref in base_refs {
@@ -85,11 +85,11 @@ impl RefreshSnapshotPin {
         Ok(pin)
     }
 
-    pub(crate) fn get(&self, base: &IcebergTableRef) -> Option<i64> {
+    pub(crate) fn get(&self, base: &TableIdentity) -> Option<i64> {
         self.snapshots.get(&base.fqn()).copied()
     }
 
-    pub(crate) fn uuid(&self, base: &IcebergTableRef) -> Option<&str> {
+    pub(crate) fn uuid(&self, base: &TableIdentity) -> Option<&str> {
         self.table_uuids.get(&base.fqn()).map(String::as_str)
     }
 
@@ -151,7 +151,7 @@ impl RefreshSnapshotPin {
 pub(crate) fn inject_pin_as_for_version_as_of(
     query: &mut sqlparser::ast::Query,
     pin: &RefreshSnapshotPin,
-    delta_bearing: &HashSet<IcebergTableRef>,
+    delta_bearing: &HashSet<TableIdentity>,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<usize, String> {
@@ -177,7 +177,7 @@ pub(crate) fn inject_pin_as_for_version_as_of(
 
 struct InjectState<'a> {
     pin: &'a RefreshSnapshotPin,
-    delta_bearing: &'a HashSet<IcebergTableRef>,
+    delta_bearing: &'a HashSet<TableIdentity>,
     current_catalog: Option<&'a str>,
     current_database: &'a str,
     count: usize,
@@ -277,21 +277,21 @@ fn resolve_table_factor(
     parts: &[String],
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Option<IcebergTableRef> {
+) -> Option<TableIdentity> {
     let current_database = current_database.to_ascii_lowercase();
     let current_catalog = current_catalog.map(|s| s.to_ascii_lowercase());
     match parts {
-        [tbl] => current_catalog.map(|cat| IcebergTableRef {
+        [tbl] => current_catalog.map(|cat| TableIdentity {
             catalog: cat,
             namespace: current_database,
             table: tbl.clone(),
         }),
-        [db, tbl] => current_catalog.map(|cat| IcebergTableRef {
+        [db, tbl] => current_catalog.map(|cat| TableIdentity {
             catalog: cat,
             namespace: db.clone(),
             table: tbl.clone(),
         }),
-        [cat, db, tbl] => Some(IcebergTableRef {
+        [cat, db, tbl] => Some(TableIdentity {
             catalog: cat.clone(),
             namespace: db.clone(),
             table: tbl.clone(),
@@ -378,8 +378,8 @@ mod tests {
         pin
     }
 
-    fn make_ref(c: &str, n: &str, t: &str) -> IcebergTableRef {
-        IcebergTableRef {
+    fn make_ref(c: &str, n: &str, t: &str) -> TableIdentity {
+        TableIdentity {
             catalog: c.to_string(),
             namespace: n.to_string(),
             table: t.to_string(),
@@ -395,7 +395,7 @@ mod tests {
             .insert("ice.db.a".to_string(), "uuid-a".to_string());
         pin.table_uuids
             .insert("ice.db.b".to_string(), "uuid-b".to_string());
-        let a = IcebergTableRef {
+        let a = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "a".to_string(),

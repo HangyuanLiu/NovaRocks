@@ -43,7 +43,7 @@ pub(crate) struct ImvPlanAnnotation {
 /// Plan-time partition derivation outcome (umbrella spec §4.2).
 ///
 /// This is the *plan-time* sibling of the runtime result
-/// [`crate::engine::mv::partition::AffectedTargetPartitions`]: `Derivable`
+/// [`crate::mv::model::AffectedTargetPartitions`]: `Derivable`
 /// records that a spec can be resolved (the rule attaches it), whereas the
 /// runtime type later evaluates that spec over delta chunks into concrete
 /// partition keys. The naming mirrors that split — `NotDerivable` is a

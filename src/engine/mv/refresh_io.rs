@@ -18,9 +18,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::load_table;
 use crate::engine::StandaloneState;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::mv_flow::execute_query_for_mv_refresh_with_catalog;
 use crate::exec::chunk::Chunk;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
@@ -46,7 +46,7 @@ pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, 
 
 pub(crate) fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
 ) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let entry = {
         let registry = state
@@ -60,7 +60,7 @@ pub(crate) fn load_current_iceberg_base_table(
 }
 
 pub(crate) fn single_snapshot_map(
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
     snapshot_id: i64,
 ) -> BTreeMap<String, i64> {
     let mut snapshots = BTreeMap::new();
@@ -69,7 +69,7 @@ pub(crate) fn single_snapshot_map(
 }
 
 pub(crate) fn single_table_uuid_map(
-    table_ref: &IcebergTableRef,
+    table_ref: &TableIdentity,
     table_uuid: &str,
 ) -> BTreeMap<String, String> {
     let mut uuids = BTreeMap::new();
@@ -87,7 +87,7 @@ fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String>
         .map_err(|_| "materialized view refresh lock poisoned".to_string())
 }
 
-pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTableRef>, String> {
+pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
     refs.iter()
         .map(|fqn| {
             let parts = fqn.split('.').collect::<Vec<_>>();
@@ -96,7 +96,7 @@ pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTab
                     "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
                 ));
             };
-            Ok(IcebergTableRef {
+            Ok(TableIdentity {
                 catalog: crate::catalog::identifier::normalize_identifier(catalog)?,
                 namespace: crate::catalog::identifier::normalize_identifier(namespace)?,
                 table: crate::catalog::identifier::normalize_identifier(table)?,

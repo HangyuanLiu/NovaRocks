@@ -20,10 +20,9 @@ use crate::engine::mv::agg_state::mv_agg_state::{
     AGG_RETRACTION_COUNT_STATE_COLUMN, aggregate_shape_needs_retraction_count_state,
     sanitize_state_column_name,
 };
-use crate::engine::mv::agg_state::mv_shape::{
-    AggregateCallShape, AggregateFunctionKind, AggregateInput, VisibleAggregateOutput,
-};
+use crate::engine::mv::agg_state::mv_shape::{AggregateCallShape, AggregateInput};
 use crate::exec::change_op::CHANGE_OP_COLUMN;
+use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
     ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, Value,

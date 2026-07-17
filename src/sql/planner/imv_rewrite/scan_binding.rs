@@ -21,9 +21,9 @@
 //! windows from `IcebergMvRewriteContext`. It must never fall back to the
 //! current Iceberg snapshot: the refresh pin is the read upper bound.
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-use crate::engine::mv::table_ref::IcebergTableRef;
 pub(crate) use crate::sql::common::ImvVersionRole;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -219,7 +219,7 @@ fn resolve_snapshot_window(
 fn find_base_ref<'a>(
     mv_ctx: &'a IcebergMvRewriteContext,
     table: &IcebergTableInfo,
-) -> Result<&'a IcebergTableRef, String> {
+) -> Result<&'a TableIdentity, String> {
     mv_ctx
         .base_refs
         .iter()

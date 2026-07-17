@@ -21,14 +21,14 @@ use std::sync::Arc;
 
 use crate::catalog::identifier::normalize_identifier;
 use crate::engine::mv::lifecycle::{
-    CreateMvRequest, DropMvRequest, ListMvsRequest, MvStorageEngine, MvTarget, RefreshCtx,
-    RefreshError, RefreshRequest,
+    CreateMvRequest, DropMvRequest, ListMvsRequest, RefreshCtx, RefreshError, RefreshRequest,
 };
 use crate::engine::statement::{AlterIcebergPropertiesStmt, PropertiesOp};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::mv::{
     StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
+use crate::mv::model::{MvStorageEngine, MvTarget};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
@@ -52,13 +52,14 @@ fn backend_by_engine(
 mod lifecycle_tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::catalog::identifier::TableIdentity;
     use crate::connector::backend::MvBackend;
     use crate::engine::mv::lifecycle::{
         BackendRefreshOutcome, BackendRefreshPlan, CreateMvRequest, DropMvRequest, ListMvsRequest,
-        MvBaseRef, MvListRow, MvStorageEngine, MvTarget, RefreshCtx, RefreshError, RefreshMode,
-        RefreshOutcome, RefreshPlan, RefreshRequest, StarRocksTableRefreshOutcome,
-        StarRocksTableRefreshPlan,
+        MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
+        StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
     };
+    use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 
     #[derive(Default)]
     struct Calls {
@@ -115,16 +116,15 @@ mod lifecycle_tests {
                 target: req.target,
                 storage_engine: MvStorageEngine::StarRocks,
                 mode: RefreshMode::Incremental,
-                base_refs: vec![MvBaseRef {
+                base_refs: vec![TableIdentity {
                     catalog: "ice".to_string(),
                     namespace: "ns".to_string(),
                     table: "base".to_string(),
                 }],
                 snapshot_pins: Default::default(),
-                affected_partitions:
-                    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                        "mock MV backend does not plan affected partitions",
-                    ),
+                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                    "mock MV backend does not plan affected partitions",
+                ),
                 backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {
                     stmt: req.statement,
                     current_catalog: req.current_catalog,
@@ -778,7 +778,7 @@ pub(crate) fn execute_query_for_mv_refresh_with_catalog(
 }
 
 fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::engine::mv::table_ref::IcebergTableRef,
+    base_ref: &crate::catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -789,7 +789,7 @@ fn normalize_incremental_mv_base_ref(
 
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
-    base_ref: &crate::engine::mv::table_ref::IcebergTableRef,
+    base_ref: &crate::catalog::identifier::TableIdentity,
 ) -> Result<(String, String, String), String> {
     let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
@@ -893,8 +893,8 @@ mod tests {
         *query
     }
 
-    fn base_ref() -> crate::engine::mv::table_ref::IcebergTableRef {
-        crate::engine::mv::table_ref::IcebergTableRef {
+    fn base_ref() -> crate::catalog::identifier::TableIdentity {
+        crate::catalog::identifier::TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),

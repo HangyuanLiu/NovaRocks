@@ -33,12 +33,12 @@ use std::sync::Arc;
 use crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1;
 use crate::engine::StandaloneState;
 use crate::engine::mv::iceberg_discovery::{DiscoveredIcebergMv, discover_iceberg_mvs_from_entry};
-use crate::engine::mv::lifecycle::MvStorageEngine;
 use crate::meta::repository::mv::{
     CreateMvDefinitionRequest, CreateMvDependencyRequest, MvDependencyObjectRef,
     MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::meta::repository::mv_descriptor::DescriptorDependency;
+use crate::mv::model::MvStorageEngine;
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the definition-create
 /// request `create_iceberg_mv` would have issued, plus the refresh watermark

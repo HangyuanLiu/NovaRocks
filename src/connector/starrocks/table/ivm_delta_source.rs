@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::changes::{
     DeletedDataFileRef, IcebergChangeBatch, build_factory_for_table,
     expected_object_store_bucket_for_table, normalize_delete_projection_path,
     previous_snapshot_data_file_lineage_index, scan_deleted_data_file_rows,
     scan_equality_delete_rows_for_table_at,
 };
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -44,7 +44,7 @@ pub(crate) struct IvmDeltaSourceFiles {
 pub(crate) struct IvmDeltaSourceInput<'a> {
     pub state: &'a Arc<StandaloneState>,
     pub current_database: &'a str,
-    pub base_ref: &'a IcebergTableRef,
+    pub base_ref: &'a TableIdentity,
     pub loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 

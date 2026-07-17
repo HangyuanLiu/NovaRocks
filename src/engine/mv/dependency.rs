@@ -17,22 +17,22 @@
 
 use std::sync::Arc;
 
+use crate::catalog::identifier::TableIdentity;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
 use crate::engine::mv::analysis::ResolvedTableRef;
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine, StoredMvDefinition,
 };
 
 pub(crate) struct ResolvedCreateMvDependencies {
-    pub(crate) base_refs: Vec<IcebergTableRef>,
+    pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
 }
 
-pub(crate) fn iceberg_table_dependency_ref(base: &IcebergTableRef) -> MvDependencyObjectRef {
+pub(crate) fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependencyObjectRef {
     MvDependencyObjectRef {
         catalog: Some(base.catalog.clone()),
         database_or_namespace: base.namespace.clone(),
@@ -157,7 +157,7 @@ pub(crate) fn resolve_create_mv_dependencies(
                     .find_by_target(read.as_ref(), catalog, namespace, table)
                     .map_err(|e| format!("load MV target dependency failed: {e}"))?
                     .is_some();
-                let base = IcebergTableRef {
+                let base = TableIdentity {
                     catalog: catalog.clone(),
                     namespace: namespace.clone(),
                     table: table.clone(),
@@ -477,8 +477,8 @@ pub(crate) fn topological_upstream_order_for_edges(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvRefreshDependencyStep {
     pub(crate) object: MvDependencyObjectRef,
-    pub(crate) target: crate::engine::mv::lifecycle::MvTarget,
-    pub(crate) storage_engine: crate::engine::mv::lifecycle::MvStorageEngine,
+    pub(crate) target: crate::mv::model::MvTarget,
+    pub(crate) storage_engine: crate::mv::model::MvStorageEngine,
 }
 
 pub(crate) fn refresh_step_for_dependency_object(
@@ -491,12 +491,8 @@ pub(crate) fn refresh_step_for_dependency_object(
         ));
     }
     let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::StarRocks => {
-            crate::engine::mv::lifecycle::MvStorageEngine::StarRocks
-        }
-        MvDependencyStorageEngine::Iceberg => {
-            crate::engine::mv::lifecycle::MvStorageEngine::Iceberg
-        }
+        MvDependencyStorageEngine::StarRocks => crate::mv::model::MvStorageEngine::StarRocks,
+        MvDependencyStorageEngine::Iceberg => crate::mv::model::MvStorageEngine::Iceberg,
         MvDependencyStorageEngine::ExternalTable => {
             return Err(format!(
                 "external table cannot be refreshed as materialized view: {}",
@@ -506,7 +502,7 @@ pub(crate) fn refresh_step_for_dependency_object(
     };
     Ok(MvRefreshDependencyStep {
         object: object.clone(),
-        target: crate::engine::mv::lifecycle::MvTarget {
+        target: crate::mv::model::MvTarget {
             catalog: object.catalog.clone(),
             database: object.database_or_namespace.clone(),
             name: object.name.clone(),
@@ -664,7 +660,7 @@ mod tests {
 
     #[test]
     fn dependency_ref_display_distinguishes_table_and_mv() {
-        let table = iceberg_table_dependency_ref(&IcebergTableRef {
+        let table = iceberg_table_dependency_ref(&TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "orders".to_string(),

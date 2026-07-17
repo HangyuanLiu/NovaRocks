@@ -21,8 +21,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::catalog::identifier::TableIdentity;
 use crate::engine::mv::refresh_io::{load_current_iceberg_base_table, parse_iceberg_table_refs};
-use crate::engine::mv::table_ref::IcebergTableRef;
 use crate::meta::repository::mv::{
     MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
 };
@@ -410,7 +410,7 @@ pub(crate) fn scheduler_guard_for_definition(
 }
 
 pub(crate) trait SnapshotSource {
-    fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String>;
+    fn current_snapshot(&mut self, table_ref: &TableIdentity) -> Result<Option<i64>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -430,7 +430,7 @@ impl IcebergSnapshotSource {
 }
 
 impl SnapshotSource for IcebergSnapshotSource {
-    fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String> {
+    fn current_snapshot(&mut self, table_ref: &TableIdentity) -> Result<Option<i64>, String> {
         let loaded = load_current_iceberg_base_table(&self.state, table_ref)?;
         Ok(loaded
             .table
@@ -964,7 +964,7 @@ mod tests {
     }
 
     impl SnapshotSource for FakeSnapshotSource {
-        fn current_snapshot(&mut self, table_ref: &IcebergTableRef) -> Result<Option<i64>, String> {
+        fn current_snapshot(&mut self, table_ref: &TableIdentity) -> Result<Option<i64>, String> {
             self.snapshots
                 .get(&table_ref.fqn())
                 .cloned()

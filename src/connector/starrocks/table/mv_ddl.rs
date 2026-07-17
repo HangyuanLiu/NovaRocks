@@ -53,6 +53,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
 
+use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
     StarRocksTableCatalog, register_starrocks_table_in_catalog,
 };
@@ -66,16 +67,14 @@ use crate::connector::starrocks::table::model::{
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema,
 };
-use crate::engine::mv::agg_state::mv_shape::{
-    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
-};
+use crate::engine::mv::agg_state::mv_shape::{AggregateMvShape, IncrementalMvShape};
 use crate::engine::mv::agg_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
 };
 use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
-use crate::engine::mv::lifecycle::{MvListRow, MvStorageEngine};
-use crate::engine::mv::table_ref::IcebergTableRef;
+use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::mv::model::{AggregateFunctionKind, MvStorageEngine, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
@@ -1032,8 +1031,8 @@ pub(crate) fn drop_mv(
     Ok(StatementResult::Ok)
 }
 
-pub(crate) fn iceberg_table_ref_fqns(base_refs: &[IcebergTableRef]) -> Vec<String> {
-    base_refs.iter().map(IcebergTableRef::fqn).collect()
+pub(crate) fn iceberg_table_ref_fqns(base_refs: &[TableIdentity]) -> Vec<String> {
+    base_refs.iter().map(TableIdentity::fqn).collect()
 }
 
 pub(crate) fn list_mv_rows(

@@ -89,7 +89,7 @@ fn try_prepare(
 ) -> Result<Vec<MvRewriteCandidate>, String> {
     // 1. Iceberg base tables referenced by the query, as "cat.ns.tbl" FQNs
     //    (the exact format of StoredMvDefinition.base_table_refs, produced
-    //    by IcebergTableRef::fqn at MV creation).
+    //    by TableIdentity::fqn at MV creation).
     let mut query_fqns: Vec<String> = Vec::new();
     collect_iceberg_fqns(logical, &mut query_fqns);
     if query_fqns.is_empty() {
@@ -298,7 +298,7 @@ fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
 /// plan being optimized.
 fn current_snapshot_id(
     state: &Arc<StandaloneState>,
-    r: &crate::engine::mv::table_ref::IcebergTableRef,
+    r: &crate::catalog::identifier::TableIdentity,
 ) -> Result<Option<i64>, String> {
     let registry = state
         .iceberg_catalogs
@@ -317,7 +317,7 @@ fn current_snapshot_id(
 /// view as `current_snapshot_id` (no cache invalidation; see its docs).
 fn current_table_uuid(
     state: &Arc<StandaloneState>,
-    r: &crate::engine::mv::table_ref::IcebergTableRef,
+    r: &crate::catalog::identifier::TableIdentity,
 ) -> Result<Option<String>, String> {
     let registry = state
         .iceberg_catalogs

@@ -17,8 +17,8 @@
 
 use crate::connector::iceberg::changes::IcebergChangeBatch;
 use crate::engine::mv::partition::mapping::map_file_partition_to_mv_key;
-use crate::engine::mv::partition::{AffectedTargetPartitions, MvPartitionKey};
 use crate::meta::repository::mv_contract::MvSchemaContract;
+use crate::mv::model::{AffectedTargetPartitions, MvPartitionKey};
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub schema_contract: &'a MvSchemaContract,
@@ -82,14 +82,14 @@ mod tests {
         ChangePartitionFieldValue, ChangePartitionValue, DataFileRef, DeletedDataFileRef,
         IcebergChangeBatch, PositionDeleteRef,
     };
-    use crate::engine::mv::partition::{
-        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
-    };
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
+    };
+    use crate::mv::model::{
+        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
     };
 
     fn contract_with_identity_partition() -> MvSchemaContract {

@@ -1584,10 +1584,9 @@ mod tests {
                 base_catalog_entries,
                 iceberg_catalog,
                 target_table: loaded.table,
-                affected_partitions:
-                    crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                        "test context",
-                    ),
+                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                    "test context",
+                ),
                 pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(
                 ),
             },

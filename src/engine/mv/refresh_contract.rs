@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::catalog::identifier::TableIdentity;
 use crate::engine::mv::apply_key::ApplyKeyValueType;
-use crate::engine::mv::table_ref::IcebergTableRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteEvidence {
@@ -98,7 +98,7 @@ impl ApplyKeyContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvRefreshContract {
-    pub(crate) base_refs: Vec<IcebergTableRef>,
+    pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) apply_key: ApplyKeyContract,
     pub(crate) aggregate: Option<AggregateRefreshContract>,
     pub(crate) join: Option<JoinRefreshContract>,
@@ -261,11 +261,7 @@ mod tests {
     }
 
     fn base_refs(contract: &ImvRefreshContract) -> Vec<String> {
-        contract
-            .base_refs
-            .iter()
-            .map(IcebergTableRef::fqn)
-            .collect()
+        contract.base_refs.iter().map(TableIdentity::fqn).collect()
     }
 
     fn int_literal(value: i64) -> TypedExpr {

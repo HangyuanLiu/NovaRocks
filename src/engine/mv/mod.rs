@@ -41,4 +41,3 @@ pub(crate) mod refresh_property;
 pub(crate) mod scan_binding;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;
-pub(crate) mod table_ref;
