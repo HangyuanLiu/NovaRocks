@@ -82,6 +82,21 @@ grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
 targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt")"
 grep -qx "optimizer-dist" <<<"$targeted_suites"
 
+RUN_MODE="all-discovered"
+resolve_suites
+if printf '%s\n' "${SUITES[@]}" | grep -qx "starrocks-compat"; then
+  echo "all-discovered mode must exclude explicit-only SQL suites" >&2
+  exit 1
+fi
+
+RUN_MODE="explicit"
+REQUESTED_SUITES=("starrocks-compat")
+resolve_suites
+if [ "${#SUITES[@]}" -ne 1 ] || [ "${SUITES[0]}" != "starrocks-compat" ]; then
+  echo "explicit mode must continue to accept explicit-only SQL suites" >&2
+  exit 1
+fi
+
 if [ "$SQL_CLUSTER_MODE" != "cross-process" ]; then
   echo "default SQL cluster mode must be cross-process" >&2
   exit 1
@@ -233,3 +248,5 @@ for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
     exit 1
   fi
 done
+
+echo "local-full-ci-classification-test: PASS"
