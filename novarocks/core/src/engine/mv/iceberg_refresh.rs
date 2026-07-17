@@ -93,10 +93,10 @@ use crate::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvDependencyObjectType,
     MvDependencyStorageEngine, MvRefreshFinalizeRequest, MvRefreshState,
     RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
-    ReplaceMvPartitionStatesRequest, StoredMvDefinition, StoredMvRefresh, StoredMvRefreshPolicy,
-    UpdateMvPartitionContractRequest,
+    ReplaceMvPartitionStatesRequest, StoredMvRefresh, UpdateMvPartitionContractRequest,
 };
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };

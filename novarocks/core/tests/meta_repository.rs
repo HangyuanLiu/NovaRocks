@@ -36,7 +36,7 @@ use novarocks::meta::repository::mv::{
     MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup,
     RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
     RefreshCommitMarker, RefreshExternalOutcome, ReplaceMvPartitionStatesRequest,
-    StoredMvRefreshPolicy, UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
+    UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
     UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::starrocks_table::{
@@ -55,6 +55,7 @@ use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
     SqliteMetaStoreProvider,
 };
+use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
 use novarocks::mv::persistence::schema::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,

@@ -27,9 +27,11 @@ use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
     MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
+use crate::mv::persistence::definition::{
+    MV_DEFINITION_SUBJECT, StoredMvDefinition, StoredMvDefinitionAvro, StoredMvRefreshPolicy,
+};
 use crate::mv::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
-const MV_DEFINITION_KIND: &str = "mv.definition";
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";
 const MV_REFRESH_KIND: &str = "mv.refresh";
 const MV_PARTITION_STATE_KIND: &str = "mv.partition_state";
@@ -37,183 +39,6 @@ const MV_DEPENDENCY_KIND: &str = "mv.dependency";
 
 #[derive(Default)]
 pub struct MvMetaRepository;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMvDefinition {
-    pub mv_id: i64,
-    pub select_sql: String,
-    pub base_table_refs: Vec<String>,
-    pub primary_key_columns: Vec<String>,
-    pub storage_engine: String,
-    pub target_catalog: Option<String>,
-    pub target_namespace: Option<String>,
-    pub target_table: Option<String>,
-    #[serde(default)]
-    pub schema_contract: Option<MvSchemaContract>,
-    #[serde(default)]
-    pub partition_spec: Option<MvPartitionContract>,
-    #[serde(default)]
-    pub partition_state_complete: bool,
-    pub last_refresh_ms: Option<i64>,
-    pub last_refresh_rows: Option<i64>,
-    pub last_refresh_snapshots: BTreeMap<String, i64>,
-    pub last_refresh_table_uuids: BTreeMap<String, String>,
-    pub last_refreshed_iceberg_snapshot_id: Option<i64>,
-    pub refresh_in_progress: bool,
-    #[serde(default)]
-    pub active_refresh_id: Option<i64>,
-    pub refresh_target_snapshots: BTreeMap<String, i64>,
-    #[serde(default)]
-    pub refresh_policy: StoredMvRefreshPolicy,
-    #[serde(default)]
-    pub refresh_paused: bool,
-    #[serde(default)]
-    pub refresh_interval_ms: Option<i64>,
-    #[serde(default)]
-    pub max_staleness_ms: Option<i64>,
-    #[serde(default)]
-    pub last_scheduler_error: Option<String>,
-    #[serde(default)]
-    pub next_refresh_after_ms: Option<i64>,
-    pub created_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct StoredMvDefinitionAvro {
-    mv_id: i64,
-    select_sql: String,
-    base_table_refs: Vec<String>,
-    primary_key_columns: Vec<String>,
-    storage_engine: String,
-    target_catalog: Option<String>,
-    target_namespace: Option<String>,
-    target_table: Option<String>,
-    schema_contract: Option<String>,
-    partition_spec: Option<String>,
-    #[serde(default)]
-    partition_state_complete: bool,
-    last_refresh_ms: Option<i64>,
-    last_refresh_rows: Option<i64>,
-    last_refresh_snapshots: BTreeMap<String, i64>,
-    last_refresh_table_uuids: BTreeMap<String, String>,
-    last_refreshed_iceberg_snapshot_id: Option<i64>,
-    refresh_in_progress: bool,
-    active_refresh_id: Option<i64>,
-    refresh_target_snapshots: BTreeMap<String, i64>,
-    refresh_policy: StoredMvRefreshPolicy,
-    refresh_paused: bool,
-    refresh_interval_ms: Option<i64>,
-    max_staleness_ms: Option<i64>,
-    last_scheduler_error: Option<String>,
-    next_refresh_after_ms: Option<i64>,
-    created_at_ms: i64,
-}
-
-impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
-    type Error = RepositoryError;
-
-    fn try_from(value: &StoredMvDefinition) -> RepositoryResult<Self> {
-        Ok(Self {
-            mv_id: value.mv_id,
-            select_sql: value.select_sql.clone(),
-            base_table_refs: value.base_table_refs.clone(),
-            primary_key_columns: value.primary_key_columns.clone(),
-            storage_engine: value.storage_engine.clone(),
-            target_catalog: value.target_catalog.clone(),
-            target_namespace: value.target_namespace.clone(),
-            target_table: value.target_table.clone(),
-            schema_contract: value
-                .schema_contract
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| {
-                    RepositoryError::invalid(format!(
-                        "failed to encode MV schema contract as JSON: {err}"
-                    ))
-                })?,
-            partition_spec: value
-                .partition_spec
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| {
-                    RepositoryError::invalid(format!(
-                        "failed to encode MV partition contract as JSON: {err}"
-                    ))
-                })?,
-            partition_state_complete: value.partition_state_complete,
-            last_refresh_ms: value.last_refresh_ms,
-            last_refresh_rows: value.last_refresh_rows,
-            last_refresh_snapshots: value.last_refresh_snapshots.clone(),
-            last_refresh_table_uuids: value.last_refresh_table_uuids.clone(),
-            last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
-            refresh_in_progress: value.refresh_in_progress,
-            active_refresh_id: value.active_refresh_id,
-            refresh_target_snapshots: value.refresh_target_snapshots.clone(),
-            refresh_policy: value.refresh_policy.clone(),
-            refresh_paused: value.refresh_paused,
-            refresh_interval_ms: value.refresh_interval_ms,
-            max_staleness_ms: value.max_staleness_ms,
-            last_scheduler_error: value.last_scheduler_error.clone(),
-            next_refresh_after_ms: value.next_refresh_after_ms,
-            created_at_ms: value.created_at_ms,
-        })
-    }
-}
-
-impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
-    type Error = RepositoryError;
-
-    fn try_from(value: StoredMvDefinitionAvro) -> RepositoryResult<Self> {
-        Ok(Self {
-            mv_id: value.mv_id,
-            select_sql: value.select_sql,
-            base_table_refs: value.base_table_refs,
-            primary_key_columns: value.primary_key_columns,
-            storage_engine: value.storage_engine,
-            target_catalog: value.target_catalog,
-            target_namespace: value.target_namespace,
-            target_table: value.target_table,
-            schema_contract: value
-                .schema_contract
-                .as_deref()
-                .map(serde_json::from_str::<MvSchemaContract>)
-                .transpose()
-                .map_err(|err| {
-                    RepositoryError::invalid(format!(
-                        "failed to decode MV schema contract JSON: {err}"
-                    ))
-                })?,
-            partition_spec: value
-                .partition_spec
-                .as_deref()
-                .map(serde_json::from_str::<MvPartitionContract>)
-                .transpose()
-                .map_err(|err| {
-                    RepositoryError::invalid(format!(
-                        "failed to decode MV partition contract JSON: {err}"
-                    ))
-                })?,
-            partition_state_complete: value.partition_state_complete,
-            last_refresh_ms: value.last_refresh_ms,
-            last_refresh_rows: value.last_refresh_rows,
-            last_refresh_snapshots: value.last_refresh_snapshots,
-            last_refresh_table_uuids: value.last_refresh_table_uuids,
-            last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
-            refresh_in_progress: value.refresh_in_progress,
-            active_refresh_id: value.active_refresh_id,
-            refresh_target_snapshots: value.refresh_target_snapshots,
-            refresh_policy: value.refresh_policy,
-            refresh_paused: value.refresh_paused,
-            refresh_interval_ms: value.refresh_interval_ms,
-            max_staleness_ms: value.max_staleness_ms,
-            last_scheduler_error: value.last_scheduler_error,
-            next_refresh_after_ms: value.next_refresh_after_ms,
-            created_at_ms: value.created_at_ms,
-        })
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionedMvDefinition {
@@ -233,29 +58,6 @@ pub struct CreateMvDefinitionRequest {
     pub schema_contract: Option<MvSchemaContract>,
     pub partition_spec: Option<MvPartitionContract>,
     pub created_at_ms: i64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum StoredMvRefreshPolicy {
-    #[default]
-    Manual,
-    AsyncOnChange,
-    AsyncInterval,
-}
-
-impl StoredMvRefreshPolicy {
-    pub fn as_sql_str(&self) -> &'static str {
-        match self {
-            Self::Manual => "DEFERRED_MANUAL",
-            Self::AsyncOnChange => "ASYNC_ON_CHANGE",
-            Self::AsyncInterval => "ASYNC_INTERVAL",
-        }
-    }
-
-    fn accepts_interval(&self) -> bool {
-        matches!(self, Self::AsyncInterval)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -570,11 +372,12 @@ impl MvMetaRepository {
 
         txn.put(MetaRecordPut::new(
             key_by_id(mv_id)?,
-            record_kind(MV_DEFINITION_KIND)?,
+            record_kind(MV_DEFINITION_SUBJECT)?,
             ExpectedRevision::NotExists,
             encode_record_payload(
-                MV_DEFINITION_KIND,
-                &StoredMvDefinitionAvro::try_from(&definition)?,
+                MV_DEFINITION_SUBJECT,
+                &StoredMvDefinitionAvro::try_from(&definition)
+                    .map_err(|err| RepositoryError::invalid(err.to_string()))?,
             )?,
         ))?;
 
@@ -1553,8 +1356,9 @@ struct VersionedMvRefresh {
 }
 
 fn decode_definition_record(record: MetaRecord) -> RepositoryResult<VersionedMvDefinition> {
-    let value =
-        decode_record_payload::<StoredMvDefinitionAvro>(&record, MV_DEFINITION_KIND)?.try_into()?;
+    let value = decode_record_payload::<StoredMvDefinitionAvro>(&record, MV_DEFINITION_SUBJECT)?;
+    let value = StoredMvDefinition::try_from(value)
+        .map_err(|err| RepositoryError::invalid(err.to_string()))?;
     Ok(VersionedMvDefinition {
         record_revision: record.revision,
         value,
@@ -1585,11 +1389,12 @@ fn put_definition(
 ) -> RepositoryResult<()> {
     txn.put(MetaRecordPut::new(
         key_by_id(definition.value.mv_id)?,
-        record_kind(MV_DEFINITION_KIND)?,
+        record_kind(MV_DEFINITION_SUBJECT)?,
         expected,
         encode_record_payload(
-            MV_DEFINITION_KIND,
-            &StoredMvDefinitionAvro::try_from(&definition.value)?,
+            MV_DEFINITION_SUBJECT,
+            &StoredMvDefinitionAvro::try_from(&definition.value)
+                .map_err(|err| RepositoryError::invalid(err.to_string()))?,
         )?,
     ))?;
     Ok(())

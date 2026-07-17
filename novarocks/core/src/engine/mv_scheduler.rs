@@ -23,9 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::catalog::identifier::TableIdentity;
 use crate::engine::mv::refresh_io::{load_current_iceberg_base_table, parse_iceberg_table_refs};
-use crate::meta::repository::mv::{
-    MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
-};
+use crate::meta::repository::mv::{MvRefreshState, UpdateMvRefreshMetadataRequest};
+use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::novarocks_config::StandaloneServerConfig;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
 
@@ -932,7 +931,8 @@ pub(crate) fn scan_refresh_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::repository::mv::{MvRefreshState, StoredMvDefinition, StoredMvRefreshPolicy};
+    use crate::meta::repository::mv::MvRefreshState;
+    use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
     use std::collections::BTreeMap;
 
     #[derive(Default)]

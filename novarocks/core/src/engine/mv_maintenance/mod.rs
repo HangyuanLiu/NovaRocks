@@ -342,7 +342,7 @@ fn load_candidates(
     state: &Arc<StandaloneState>,
 ) -> Result<
     (
-        Vec<crate::meta::repository::mv::StoredMvDefinition>,
+        Vec<crate::mv::persistence::definition::StoredMvDefinition>,
         Vec<MaintenanceCandidate>,
     ),
     String,
