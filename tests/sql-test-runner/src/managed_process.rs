@@ -1030,15 +1030,20 @@ impl ManagedProcess {
                     }
                 },
                 ReadyMarker::FileContains { path, needle } => {
-                    if FileReadinessSnapshot::read(path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|snapshot| {
-                            readiness_baseline.file_contains_fresh_marker(&snapshot, needle)
-                        })
-                    {
-                        self.ensure_output_io_ok("confirm readiness")?;
-                        return Ok(());
+                    match FileReadinessSnapshot::read(path) {
+                        Ok(Some(snapshot))
+                            if readiness_baseline.file_contains_fresh_marker(&snapshot, needle) =>
+                        {
+                            self.ensure_output_io_ok("confirm readiness")?;
+                            return Ok(());
+                        }
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("poll readiness file {}", path.display())
+                            });
+                        }
                     }
                 }
             }
@@ -1315,16 +1320,49 @@ fn spawn_reader<R: Read + Send + 'static>(
                 }
                 match log_file.lock() {
                     Ok(mut log) => {
-                        if let Err(error) = log.write_all(chunk) {
-                            record_output_io_error(
-                                &output_io_error,
-                                format!("write durable process log from {stream_name}: {error}"),
-                            );
-                        } else if let Err(error) = log.flush() {
-                            record_output_io_error(
-                                &output_io_error,
-                                format!("flush durable process log from {stream_name}: {error}"),
-                            );
+                        let write_succeeded =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                log.write_all(chunk)
+                            })) {
+                                Ok(Ok(())) => true,
+                                Ok(Err(error)) => {
+                                    record_output_io_error(
+                                        &output_io_error,
+                                        format!(
+                                            "write durable process log from {stream_name}: {error}"
+                                        ),
+                                    );
+                                    false
+                                }
+                                Err(payload) => {
+                                    record_reader_panic(
+                                        stream_name,
+                                        &output_io_error,
+                                        payload.as_ref(),
+                                    );
+                                    return;
+                                }
+                            };
+                        if write_succeeded {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                log.flush()
+                            })) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => record_output_io_error(
+                                    &output_io_error,
+                                    format!(
+                                        "flush durable process log from {stream_name}: {error}"
+                                    ),
+                                ),
+                                Err(payload) => {
+                                    record_reader_panic(
+                                        stream_name,
+                                        &output_io_error,
+                                        payload.as_ref(),
+                                    );
+                                    return;
+                                }
+                            }
                         }
                     }
                     Err(_) => record_output_io_error(
@@ -1356,14 +1394,22 @@ fn run_reader_with_panic_boundary(
     body: impl FnOnce(),
 ) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        record_output_io_error(
-            output_io_error,
-            format!(
-                "{stream_name} reader thread panicked: {}",
-                panic_payload_message(payload.as_ref())
-            ),
-        );
+        record_reader_panic(stream_name, output_io_error, payload.as_ref());
     }
+}
+
+fn record_reader_panic(
+    stream_name: &str,
+    output_io_error: &SharedOutputIoError,
+    payload: &(dyn std::any::Any + Send),
+) {
+    record_output_io_error(
+        output_io_error,
+        format!(
+            "{stream_name} reader thread panicked: {}",
+            panic_payload_message(payload)
+        ),
+    );
 }
 
 fn record_output_io_error(errors: &SharedOutputIoError, error: String) {
@@ -1434,11 +1480,11 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 mod tests {
     use super::{
         FileReadinessSnapshot, ManagedProcess, ProcessGroupOwnership, ReadinessBaseline,
-        ReadyMarker, WaitSiginfo, run_reader_with_panic_boundary, unsupported_runtime_exit_status,
-        wait_siginfo_abi_supported,
+        ReadyMarker, WaitSiginfo, run_reader_with_panic_boundary, spawn_reader,
+        unsupported_runtime_exit_status, wait_siginfo_abi_supported,
     };
     use std::fs;
-    use std::io::{self, Write};
+    use std::io::{self, Cursor, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -1591,6 +1637,11 @@ mod tests {
         file: fs::File,
     }
 
+    struct PanicWhileStderrWaits {
+        stdout_holds_log: Arc<(Mutex<bool>, Condvar)>,
+        stderr_tail: Arc<Mutex<String>>,
+    }
+
     impl Write for BlockingLogWriter {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             let (lock, wake) = &*self.release;
@@ -1646,6 +1697,40 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             self.file.flush()
+        }
+    }
+
+    impl Write for PanicWhileStderrWaits {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer
+                .windows(b"PANIC_STDOUT".len())
+                .any(|window| window == b"PANIC_STDOUT")
+            {
+                let (lock, wake) = &*self.stdout_holds_log;
+                *lock.lock().expect("lock stdout writer state") = true;
+                wake.notify_one();
+
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !self
+                    .stderr_tail
+                    .lock()
+                    .expect("lock stderr tail from writer")
+                    .contains("STDERR_WAITING")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "stderr reader did not reach its tail before writer panic"
+                    );
+                    thread::yield_now();
+                }
+                thread::sleep(Duration::from_millis(25));
+                panic!("injected coordinated stdout writer panic");
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1958,6 +2043,66 @@ mod tests {
         assert!(
             message.contains("injected pre-readiness stdout reader panic"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn writer_panic_preserves_payload_with_concurrent_stderr_reader() {
+        let stdout_holds_log = Arc::new((Mutex::new(false), Condvar::new()));
+        let stdout_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_tail_guard = stderr_tail.lock().expect("hold stderr tail before readers");
+        let output_io_error = Arc::new(Mutex::new(None));
+        let log_file: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(PanicWhileStderrWaits {
+                stdout_holds_log: Arc::clone(&stdout_holds_log),
+                stderr_tail: Arc::clone(&stderr_tail),
+            })));
+
+        let stderr_thread = spawn_reader(
+            "stderr",
+            Cursor::new(b"STDERR_WAITING\n".to_vec()),
+            Arc::clone(&stderr_tail),
+            Arc::clone(&log_file),
+            Arc::clone(&output_io_error),
+            None,
+            None,
+        );
+        let stdout_thread = spawn_reader(
+            "stdout",
+            Cursor::new(b"PANIC_STDOUT\n".to_vec()),
+            stdout_tail,
+            Arc::clone(&log_file),
+            Arc::clone(&output_io_error),
+            None,
+            None,
+        );
+
+        let (lock, wake) = &*stdout_holds_log;
+        let mut holds_log = lock.lock().expect("lock stdout writer state");
+        while !*holds_log {
+            holds_log = wake
+                .wait(holds_log)
+                .expect("wait for stdout to hold durable log writer");
+        }
+        drop(holds_log);
+        drop(stderr_tail_guard);
+
+        stdout_thread.join().expect("join stdout reader");
+        stderr_thread.join().expect("join stderr reader");
+        let recorded = output_io_error
+            .lock()
+            .expect("lock output I/O error")
+            .clone()
+            .expect("writer panic must be recorded");
+
+        assert!(
+            !log_file.is_poisoned(),
+            "writer panic must be caught while the guard is held; first_error={recorded}"
+        );
+        assert!(
+            recorded.contains("injected coordinated stdout writer panic"),
+            "writer panic payload was replaced by a concurrent lock error: {recorded}"
         );
     }
 
@@ -2350,6 +2495,41 @@ mod tests {
         )
         .expect("file marker becomes ready");
         process.kill_now().expect("kill file marker fixture");
+    }
+
+    #[test]
+    fn managed_process_file_readiness_surfaces_poll_io_error_immediately() {
+        let temp = TempDir::new("file-ready-poll-error");
+        let ready_path = temp.path().join("ready.txt");
+        let timeout = Duration::from_secs(2);
+        let started = Instant::now();
+
+        let error = ManagedProcess::spawn(
+            "file marker poll error fixture".to_string(),
+            shell_with_arg("sleep 0.05; mkdir \"$1\"; sleep 30", &ready_path),
+            ReadyMarker::FileContains {
+                path: ready_path.clone(),
+                needle: "FILE_READY".to_string(),
+            },
+            timeout,
+            temp.path().join("fixture.log"),
+        )
+        .expect_err("a readiness path that becomes a directory must fail immediately");
+        let elapsed = started.elapsed();
+        let message = format!("{error:#}");
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "poll I/O error was swallowed until timeout: elapsed={elapsed:?}; {message}"
+        );
+        assert!(
+            message.contains(&ready_path.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("Is a directory") || message.contains("os error 21"),
+            "{message}"
+        );
     }
 
     #[test]
