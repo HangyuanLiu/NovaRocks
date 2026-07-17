@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const FORMAT: &str = "novarocks-compat-artifact-v1";
 const PROBE_FORMAT: &str = "novarocks-compat-probe-v1";
+const PROFILE_ENV: &str = "NOVAROCKS_COMPAT_ARTIFACT_PROFILE";
 const MANIFEST_KEYS: [&str; 6] = [
     "format", "binary", "sha256", "git_head", "profile", "features",
 ];
@@ -45,7 +46,33 @@ pub(crate) struct CompatArtifact {
     pub(crate) probe_sha256: String,
 }
 
+pub(crate) fn expected_profile() -> Result<String> {
+    expected_profile_from_override(std::env::var_os(PROFILE_ENV))
+}
+
+fn expected_profile_from_override(override_value: Option<std::ffi::OsString>) -> Result<String> {
+    let profile = match override_value {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("compat artifact profile must be valid UTF-8"))?,
+        None => "dev-opt".to_string(),
+    };
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("compat artifact profile must be a non-empty Cargo profile name");
+    }
+    Ok(profile)
+}
+
 impl CompatArtifact {
+    pub(crate) fn resolve_expected(repo_root: &Path) -> Result<Self> {
+        let profile = expected_profile()?;
+        Self::resolve(repo_root, &profile)
+    }
+
     pub(crate) fn resolve(repo_root: &Path, profile: &str) -> Result<Self> {
         if std::env::var_os("NOVAROCKS_COMPAT_PROBE_BIN").is_some() {
             bail!(
@@ -113,6 +140,9 @@ impl CompatArtifact {
                 .context("canonicalize NOVAROCKS_BIN")?;
             if default_binary == binary {
                 bail!("default and compat artifacts are identical");
+            }
+            if sha256_file(&default_binary)? == actual_sha {
+                bail!("default and compat artifacts have identical SHA-256 identities");
             }
         }
 
@@ -344,13 +374,20 @@ fn git_head(repo_root: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CompatArtifact;
+    use super::{CompatArtifact, expected_profile_from_override};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct EnvGuard {
         keys: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -447,7 +484,80 @@ mod tests {
     }
 
     #[test]
+    fn compat_artifact_profile_defaults_and_propagates_explicit_profiles() {
+        assert_eq!(
+            expected_profile_from_override(None).unwrap(),
+            "dev-opt",
+            "direct starrocks-compat runs retain the dev-opt default"
+        );
+        for profile in ["dev", "dev-opt", "release"] {
+            assert_eq!(
+                expected_profile_from_override(Some(profile.into())).unwrap(),
+                profile
+            );
+        }
+        for invalid in ["", "  ", "dev opt", "../release"] {
+            let error = expected_profile_from_override(Some(invalid.into()))
+                .expect_err("invalid artifact profile must fail closed");
+            assert!(
+                error.to_string().contains("compat artifact profile"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_profile_drives_manifest_validation_for_supported_profiles() {
+        let _lock = lock_env();
+        let _env = EnvGuard::capture(&[
+            "NOVAROCKS_COMPAT_ARTIFACT_MANIFEST",
+            "NOVAROCKS_COMPAT_ARTIFACT_PROFILE",
+            "NOVAROCKS_COMPAT_PROBE_BIN",
+            "NOVAROCKS_BIN",
+        ]);
+        let repo_root = repo_root();
+        let root = test_dir(&repo_root);
+        let binary = root.join("novarocks-compat");
+        let probe = root.join("starrocks-compat-probe");
+        let binary_bytes = b"#!/usr/bin/env bash\necho compat\n";
+        let probe_bytes = b"#!/usr/bin/env bash\necho probe\n";
+        write_executable(&binary, binary_bytes);
+        write_executable(&probe, probe_bytes);
+        let head = git_head(&repo_root);
+        let manifest = root.join("manifest.txt");
+        let probe_manifest = root.join("probe-manifest.txt");
+        unsafe {
+            std::env::set_var("NOVAROCKS_COMPAT_ARTIFACT_MANIFEST", &manifest);
+            std::env::remove_var("NOVAROCKS_COMPAT_PROBE_BIN");
+            std::env::remove_var("NOVAROCKS_BIN");
+        }
+
+        for profile in ["dev", "dev-opt", "release"] {
+            fs::write(
+                &manifest,
+                manifest_text(&binary, &sha256(binary_bytes), &head)
+                    .replace("profile=dev-opt", &format!("profile={profile}")),
+            )
+            .expect("write profile manifest");
+            fs::write(
+                &probe_manifest,
+                probe_manifest_text(&probe, &sha256(probe_bytes), &head)
+                    .replace("profile=dev-opt", &format!("profile={profile}")),
+            )
+            .expect("write profile probe manifest");
+            unsafe { std::env::set_var("NOVAROCKS_COMPAT_ARTIFACT_PROFILE", profile) };
+
+            let artifact = CompatArtifact::resolve_expected(&repo_root)
+                .expect("runner expectation must match the propagated manifest profile");
+            assert_eq!(artifact.profile, profile);
+        }
+
+        fs::remove_dir_all(root).expect("cleanup profile artifact fixture");
+    }
+
+    #[test]
     fn compat_artifact_resolve_enforces_build_and_integrity_contract() {
+        let _lock = lock_env();
         let _env = EnvGuard::capture(&[
             "NOVAROCKS_COMPAT_ARTIFACT_MANIFEST",
             "NOVAROCKS_COMPAT_PROBE_BIN",
@@ -597,6 +707,15 @@ mod tests {
         assert_eq!(
             resolve_error(&repo_root),
             "default and compat artifacts are identical"
+        );
+        unsafe { std::env::remove_var("NOVAROCKS_BIN") };
+
+        let default_binary = root.join("novarocks-default");
+        write_executable(&default_binary, bytes);
+        unsafe { std::env::set_var("NOVAROCKS_BIN", &default_binary) };
+        assert_eq!(
+            resolve_error(&repo_root),
+            "default and compat artifacts have identical SHA-256 identities"
         );
         unsafe { std::env::remove_var("NOVAROCKS_BIN") };
 

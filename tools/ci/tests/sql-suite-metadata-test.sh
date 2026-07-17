@@ -22,11 +22,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 source "$REPO_ROOT/tools/ci/lib/sql_suites.sh"
 
-all="$(ci_discover_sql_suites "$REPO_ROOT")"
-if grep -qx 'starrocks-compat' <<<"$all"; then
-  echo "explicit-only starrocks-compat leaked into shell discovery" >&2
-  exit 1
-fi
+assert_starrocks_compat_hidden() {
+  local repo_root="$1"
+  local all
+
+  all="$(ci_discover_sql_suites "$repo_root")" || return $?
+  if grep -qx 'starrocks-compat' <<<"$all"; then
+    echo "explicit-only starrocks-compat leaked into shell discovery" >&2
+    return 1
+  fi
+}
+
+assert_starrocks_compat_hidden "$REPO_ROOT"
 ci_suite_exists "$REPO_ROOT" starrocks-compat
 ci_suite_is_explicit_only "$REPO_ROOT" starrocks-compat
 ! ci_suite_is_explicit_only "$REPO_ROOT" filter
@@ -34,6 +41,16 @@ ci_suite_is_explicit_only "$REPO_ROOT" starrocks-compat
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
+
+default_leak_root="$tmpdir/default-leak"
+mkdir -p "$default_leak_root/sql-tests/starrocks-compat/sql"
+printf '%s\n' 'explicit_only = false' \
+  >"$default_leak_root/sql-tests/starrocks-compat/suite.toml"
+if assert_starrocks_compat_hidden "$default_leak_root" 2>"$default_leak_root/leak.err"; then
+  echo "default-discovery leak mutation was not detected" >&2
+  exit 1
+fi
+grep -q 'leaked into shell discovery' "$default_leak_root/leak.err"
 
 assert_metadata_error() {
   local repo_root="$1"

@@ -239,6 +239,29 @@ if ! (
   exit 1
 fi
 
+run_cargo_gates_text="$(declare -f run_cargo_gates)"
+if grep -q -- '--features compat' <<<"$run_cargo_gates_text"; then
+  echo "default cargo gates must not build or test compat" >&2
+  exit 1
+fi
+
+if ! declare -F run_compat_gates >/dev/null; then
+  echo "local-full-ci must define explicit compat gates" >&2
+  exit 1
+fi
+
+run_compat_gates_text="$(declare -f run_compat_gates)"
+for expected in \
+  'cargo clippy --all-targets --features compat' \
+  'tools/ci/build-compat-artifact.sh' \
+  'cargo test --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
+  'run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"'; do
+  if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
+    echo "explicit compat gates must include: $expected" >&2
+    exit 1
+  fi
+done
+
 default_compat_output="$({
   WITH_COMPAT="false"
   ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
@@ -250,7 +273,11 @@ if grep -q '^run:' <<<"$default_compat_output"; then
   echo "default local-full-ci must not execute compat gates" >&2
   exit 1
 fi
-for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+for stage in \
+  "cargo clippy compat" \
+  "cargo build compat artifact" \
+  "cargo test compat" \
+  "starrocks-compat E2E"; do
   if ! grep -qx "record:$stage:SKIP" <<<"$default_compat_output"; then
     echo "default local-full-ci must record $stage as SKIP" >&2
     exit 1
@@ -260,12 +287,17 @@ done
 explicit_compat_output="$({
   WITH_COMPAT="true"
   SKIP_CARGO_TEST="false"
+  CI_RUN_DIR="$tmpdir/compat-run"
   ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
   ci_render_summary() { :; }
   run_fail_fast_stage() { printf 'run:%s\n' "$1"; }
   run_compat_gates
 })"
-for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+for stage in \
+  "cargo clippy compat" \
+  "cargo build compat artifact" \
+  "cargo test compat" \
+  "starrocks-compat E2E"; do
   if ! grep -qx "run:$stage" <<<"$explicit_compat_output"; then
     echo "--with-compat must execute $stage" >&2
     exit 1

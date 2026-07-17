@@ -2534,7 +2534,7 @@ fn run() -> Result<i32> {
         selected_cluster_size
     };
     let compat_artifact = if launch_cluster_mode == ClusterMode::StarRocksCompat {
-        Some(CompatArtifact::resolve(&base_dir, "dev-opt")?)
+        Some(CompatArtifact::resolve_expected(&base_dir)?)
     } else {
         None
     };
