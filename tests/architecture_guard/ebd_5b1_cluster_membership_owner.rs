@@ -128,14 +128,33 @@ fn ebd_5b1_source_indirection_violations(source: &str) -> Vec<String> {
     if tokens.windows(2).any(|pair| pair == ["include", "!"]) {
         violations.push("cluster owner contains include! source indirection".to_string());
     }
-    for module in rust_module_items(&production) {
-        if module.is_external {
+    let file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => {
+            violations.push(format!("cluster owner source does not parse: {error}"));
+            return violations;
+        }
+    };
+    for item in file.items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let name = module.ident.to_string();
+        let is_external = module.content.is_none();
+        let is_allowed_child = is_external
+            && module.attrs.is_empty()
+            && matches!(name.as_str(), "lifecycle" | "query_cleanup");
+        if is_external && !is_allowed_child {
             violations.push(format!(
-                "cluster owner contains external module declaration {}",
-                module.name
+                "cluster owner contains external module declaration {name}"
             ));
         }
-        if module.name == "std" {
+        if matches!(name.as_str(), "lifecycle" | "query_cleanup")
+            && !matches!(module.vis, syn::Visibility::Inherited)
+        {
+            violations.push(format!("cluster child module {name} must remain private"));
+        }
+        if name == "std" {
             violations.push("cluster owner must not shadow the std root".to_string());
         }
     }
@@ -379,10 +398,31 @@ fn ebd_5b1_cluster_membership_boundary_violations(repo: &Path) -> Vec<String> {
         ),
         ("src/coordinator/execution.rs", "backend_registry", false),
         ("src/coordinator/execution.rs", "BeId", false),
-        ("src/runtime/heartbeat_mgr.rs", "BackendRegistry", false),
-        ("src/runtime/heartbeat_mgr.rs", "HeartbeatOutcome", false),
-        ("src/runtime/heartbeat_mgr.rs", "RegistryEvent", false),
-        ("src/runtime/registry_cleanup.rs", "RegistryEvent", false),
+        (
+            "src/coordinator/cluster/lifecycle.rs",
+            "BackendRegistry",
+            false,
+        ),
+        (
+            "src/coordinator/cluster/lifecycle.rs",
+            "HeartbeatOutcome",
+            false,
+        ),
+        (
+            "src/coordinator/cluster/lifecycle.rs",
+            "RegistryEvent",
+            false,
+        ),
+        (
+            "src/coordinator/cluster/query_cleanup.rs",
+            "RegistryEvent",
+            false,
+        ),
+        (
+            "src/service/cluster_heartbeat.rs",
+            "HeartbeatOutcome",
+            false,
+        ),
         ("src/engine/backend_ops.rs", "BackendRegistry", false),
         ("src/engine/backend_ops.rs", "BackendState", false),
         ("src/engine/mod.rs", "backend_registry", false),
@@ -518,6 +558,23 @@ fn ebd_5b1_detector_rejects_secondary_owner_alias_indirection_and_decoys() {
             "comment/string/raw-string decoy must be ignored: {decoy}"
         );
     }
+
+    for visible_child in [
+        "pub mod lifecycle;",
+        "pub(crate) mod lifecycle;",
+        "pub(super) mod query_cleanup;",
+        "pub(in crate) mod lifecycle;",
+        "pub(in crate::coordinator) mod query_cleanup;",
+    ] {
+        assert!(
+            !ebd_5b1_source_indirection_violations(visible_child).is_empty(),
+            "visible cluster child must be rejected: {visible_child}"
+        );
+    }
+    assert!(
+        ebd_5b1_source_indirection_violations("mod lifecycle; mod query_cleanup;").is_empty(),
+        "inherited visibility must remain allowed for canonical private children"
+    );
 
     let retired_crate_path = ["crate::runtime::", "backend_registry"].concat();
     let retired_root_path = ["root::runtime::", "backend_registry"].concat();
