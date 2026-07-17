@@ -46403,11 +46403,14 @@ const PBF_1A_ERROR_OWNERS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-const PBF_1A_TOP_LEVEL_ERRORS: [&str; 6] = [
+const PBF_1A_UNIQUE_VOCABULARY: [&str; 9] = [
     "TransportDecodeError",
     "ProtocolError",
     "ExecPlanBuildError",
+    "ExecPlanInvariant",
     "FragmentBindingError",
+    "FragmentBindingTarget",
+    "FragmentBindingErrorKind",
     "FragmentLaunchError",
     "FragmentExecutionError",
 ];
@@ -46827,7 +46830,7 @@ fn pbf_1a_error_vocabulary_violations(repo: &Path) -> Vec<String> {
     if production_sources.is_empty() {
         violations.push("PBF-1A production source inventory is empty".to_string());
     }
-    for name in PBF_1A_TOP_LEVEL_ERRORS {
+    for name in PBF_1A_UNIQUE_VOCABULARY {
         let count = production_sources
             .iter()
             .map(|(_, source)| rust_named_type_declaration_count(source, name))

@@ -14,17 +14,5 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod change_op;
-pub mod chunk;
-pub mod dict_encode;
-pub mod expr;
-pub(crate) mod fragment;
-pub mod hash_table;
-pub mod node;
-pub mod operators;
-pub mod pipeline;
-pub mod row_position;
-pub mod runtime_filter;
-pub mod spill;
-pub mod variant;
-pub mod variant_encode;
+
+pub(crate) mod error;
