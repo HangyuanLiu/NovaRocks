@@ -2996,7 +2996,7 @@ mod tests {
                     Some(&refresh_ctx),
                 )
                 .expect("join projection coalesce plan must prepare");
-                crate::sql::codegen::fragment::encode_native_fragment_bundle(
+                crate::protocol::native::encode::encode_native_fragment_bundle(
                     &distributed_plan,
                     &prepared,
                 )

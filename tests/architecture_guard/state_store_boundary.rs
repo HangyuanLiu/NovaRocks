@@ -787,6 +787,26 @@ fn foundationdb_workflow_covers_each_gate_owner_exactly_once() {
 }
 
 #[test]
+fn foundationdb_gate_serializes_sqlite_conformance_tests() {
+    let gate_path = src_dir()
+        .parent()
+        .expect("workspace root")
+        .join("tools/ci/foundationdb-provider.sh");
+    let gate = fs::read_to_string(&gate_path).expect("read FoundationDB production gate");
+    let sqlite_invocations = gate
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("cargo test --test state_store_sqlite"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sqlite_invocations,
+        ["cargo test --test state_store_sqlite -- --test-threads=1"],
+        "the constrained Linux runner must invoke the SQLite conformance binary exactly once and serialize its libtest harness"
+    );
+}
+
+#[test]
 fn foundationdb_operator_readme_matches_structured_commit_log_contract() {
     let readme_path = src_dir()
         .parent()

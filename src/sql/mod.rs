@@ -28,7 +28,6 @@ pub(crate) mod parser;
 pub(crate) mod optimizer;
 
 pub(crate) mod analyzer;
-pub(crate) mod codegen;
 pub(crate) mod explain;
 pub(crate) mod planner;
 

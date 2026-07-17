@@ -15,11 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod expr;
+#[cfg(test)]
+mod boundary_schema;
+#[cfg(test)]
+mod build;
+mod bundle;
+mod expr;
 mod iceberg_delta_scan;
 mod iceberg_literal_json;
 pub(crate) mod instance;
 pub(crate) mod plan;
+
+#[cfg(test)]
+pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
+pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
+pub(crate) use instance::encode_instance_params;
+pub(crate) use plan::encode_data_partition;
 
 #[cfg(test)]
 mod tests {
@@ -42,6 +53,18 @@ mod tests {
         BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
     };
     use crate::types::native_proto::decode_type;
+
+    fn empty_runtime_filter_projection()
+    -> &'static crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection {
+        Box::leak(Box::new(
+            crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection::default(
+            ),
+        ))
+    }
+
+    fn empty_scan_bindings() -> &'static ScanExecutionBindings {
+        Box::leak(Box::new(ScanExecutionBindings::default()))
+    }
 
     fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
         TypedExpr {
@@ -688,7 +711,12 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let decoded =
             crate::proto::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
                 .expect("decode proto message");
@@ -821,7 +849,12 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -924,7 +957,12 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1036,7 +1074,12 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1118,7 +1161,12 @@ mod tests {
             }],
         };
 
-        let encoded = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let target_fragment = encoded
             .fragments
             .iter()
@@ -1186,7 +1234,12 @@ mod tests {
             runtime_filter_graph: RuntimeFilterGraph::default(),
             edges: Vec::new(),
         };
-        let encoded_plan = plan::encode_distributed_plan(&plan).expect("encode distributed plan");
+        let encoded_plan = plan::encode_distributed_plan(
+            &plan,
+            empty_scan_bindings(),
+            empty_runtime_filter_projection(),
+        )
+        .expect("encode distributed plan");
         let encoded = encoded_plan
             .fragments
             .iter()
@@ -1477,7 +1530,7 @@ mod tests {
                 node_outputs: None,
                 fragment_edge_outputs: None,
                 write_contracts: None,
-                runtime_filter_projection: None,
+                runtime_filter_projection: Some(empty_runtime_filter_projection()),
             },
         )
         .expect("encode StarRocks native scan source");

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Test-only full-plan encoder fixtures.
+
 use super::NativeFragmentBundle;
 use super::boundary_schema::{BoundarySchemaReport, project_boundary_reports};
 use crate::connector::ConnectorRegistry;
@@ -558,7 +560,7 @@ mod tests {
                 crate::coordinator::prepare::scan::ResolvedScanExecution::IcebergDelta(
                     crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
                         runtime_plan:
-                            crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan {
+                            crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
                                 table_location: "s3://bucket/test_table".to_string(),
                                 data_columns: Vec::new(),
                                 cloud_properties: BTreeMap::new(),

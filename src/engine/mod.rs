@@ -2692,9 +2692,12 @@ fn explain_analyze_query(
     let distributed_plan = crate::sql::planner::pipeline::build_distributed_plan(physical_plan)?;
     let prepared =
         crate::coordinator::prepare::prepare_fragments(&distributed_plan, connectors, None)?;
-    let native_bundle =
-        crate::sql::codegen::fragment::encode_native_fragment_bundle(&distributed_plan, &prepared)?;
-    let runtime_filters = crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let runtime_filters =
+        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let planning_elapsed = planning_start.elapsed();
 
     let query_opts = query_options_for_explain_analyze(query_opts);
@@ -3085,9 +3088,12 @@ pub(crate) fn execute_query_as_iceberg_write(
         &connectors_snapshot,
         None,
     )?;
-    let native_bundle =
-        crate::sql::codegen::fragment::encode_native_fragment_bundle(&distributed_plan, &prepared)?;
-    let runtime_filters = crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let runtime_filters =
+        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
@@ -3211,8 +3217,8 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::coordinator::prepare::PreparedFragmentSet,
-    pub(crate) native_bundle: crate::sql::codegen::fragment::NativeFragmentBundle,
-    pub(crate) runtime_filters: Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
+    pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    pub(crate) runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     pub(crate) commit_plan:
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
@@ -3252,9 +3258,12 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         &connectors_snapshot,
         scan_binding_resolver,
     )?;
-    let native_bundle =
-        crate::sql::codegen::fragment::encode_native_fragment_bundle(&distributed_plan, &prepared)?;
-    let runtime_filters = crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let runtime_filters =
+        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let commit_plan =
         crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
             &topology,
@@ -3271,8 +3280,8 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
 
 pub(crate) fn execute_planned_iceberg_change_stream_write(
     prepared: crate::coordinator::prepare::PreparedFragmentSet,
-    native_bundle: crate::sql::codegen::fragment::NativeFragmentBundle,
-    runtime_filters: Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    runtime_filters: Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     query_opts: Option<QueryOptions>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let (execution_ports, scheduler) = coordinated_execution_services()?;
@@ -3656,9 +3665,12 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         connectors,
         scan_binding_resolver,
     )?;
-    let native_bundle =
-        crate::sql::codegen::fragment::encode_native_fragment_bundle(&distributed_plan, &prepared)?;
-    let runtime_filters = crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let runtime_filters =
+        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
@@ -3718,9 +3730,12 @@ pub(crate) fn execute_logical_plan_with_options(
         connectors,
         scan_binding_resolver,
     )?;
-    let native_bundle =
-        crate::sql::codegen::fragment::encode_native_fragment_bundle(&distributed_plan, &prepared)?;
-    let runtime_filters = crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let runtime_filters =
+        crate::coordinator::scheduler::plan_runtime_filters(prepared.runtime_filter_projection())?;
     let (execution_ports, scheduler) = coordinated_execution_services()?;
     crate::coordinator::execution::ExecutionCoordinator::new(
         prepared,
@@ -5443,8 +5458,8 @@ mysql_port = 47892
         sql: &str,
     ) -> (
         crate::coordinator::prepare::PreparedFragmentSet,
-        crate::sql::codegen::fragment::NativeFragmentBundle,
-        Option<crate::sql::codegen::fragment::RuntimeFilterPlanResult>,
+        crate::protocol::native::encode::NativeFragmentBundle,
+        Option<crate::coordinator::scheduler::RuntimeFilterPlanResult>,
     ) {
         use crate::catalog::schema::ColumnDef;
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
@@ -5551,14 +5566,15 @@ mysql_port = 47892
         let prepared =
             crate::coordinator::prepare::prepare_fragments(&distributed_plan, &registry, None)
                 .expect("prepare fragments");
-        let native_bundle = crate::sql::codegen::fragment::encode_native_fragment_bundle(
+        let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
             &distributed_plan,
             &prepared,
         )
         .expect("encode fragments");
-        let runtime_filters =
-            crate::sql::codegen::fragment::plan_runtime_filters(&distributed_plan)
-                .expect("plan runtime filters");
+        let runtime_filters = crate::coordinator::scheduler::plan_runtime_filters(
+            prepared.runtime_filter_projection(),
+        )
+        .expect("plan runtime filters");
         (prepared, native_bundle, runtime_filters)
     }
 
@@ -6389,15 +6405,15 @@ mysql_port = 47892
         assert!(text.contains("Profile: active="), "{text}");
     }
 
-    /// OQ-5 Task 6: codegen must project the query-global runtime-filter Graph
-    /// into native descriptors on the join node and an independent
-    /// coordinator-facing `RuntimeFilterPlanResult`. Exercises the full
+    /// OQ-5 Task 6: preparation must project the query-global runtime-filter
+    /// Graph for native descriptors on the join node and the scheduler-facing
+    /// `RuntimeFilterPlanResult`. Exercises the full
     /// standalone pipeline (analyze -> plan -> optimize -> planner RF Graph ->
-    /// codegen) over the test catalog's fact-like `tbl(id int, name varchar)`
-    /// joined to the small `date_dim` fixture on `id`.
+    /// preparation -> encode/schedule) over the test catalog's fact-like
+    /// `tbl(id int, name varchar)` joined to the small `date_dim` fixture on `id`.
     #[test]
     #[cfg(feature = "compat")]
-    fn codegen_projects_graph_runtime_filters_into_native_and_coordinator_artifacts() {
+    fn preparation_projects_graph_runtime_filters_into_native_and_scheduler_artifacts() {
         let (_prepared, native_bundle, runtime_filters) =
             build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
         fn has_build_filter(node: &crate::proto::plan::DistributedNode) -> bool {

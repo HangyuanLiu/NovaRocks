@@ -1423,7 +1423,7 @@ fn nidl_d3g_native_runtime_query_options_do_not_use_thrift_model() {
         "src/cache/mod.rs",
         "src/coordinator/execution.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     let repo = Path::new(manifest_dir());
     for path in forbidden {
@@ -1443,7 +1443,7 @@ fn nidl_d3h_native_runtime_filter_params_do_not_use_thrift_model() {
         "src/runtime/query_context.rs",
         "src/runtime/native_fragment_wire.rs",
         "src/coordinator/execution.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
         "src/lower/common/fragment_runtime.rs",
         "src/exec/operators/hashjoin/hash_join_build_sink.rs",
         "src/runtime/runtime_filter_worker.rs",
@@ -2004,7 +2004,7 @@ fn nidl_d2c_rust_wire_imports_stay_inside_owned_boundaries() {
         }
     }
 
-    for file in rs_files_under(&["src/sql/codegen/proto_encode"]) {
+    for file in rs_files_under(&["src/protocol/native/encode"]) {
         for (line, text) in rust_wire_reference_hits(&file, RustWirePolicy::StarRocksProtoOnly) {
             violations.push(format!("{}:{}: {}", rel(&file), line, text));
         }
@@ -2231,7 +2231,7 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
     fs::remove_dir_all(&root).ok();
     for relative in [
         "src/sql/planner/physical/runtime_filter.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/runtime/runtime_filter_duplicate.rs",
     ] {
         let path = root.join(relative);
@@ -2248,8 +2248,8 @@ fn planner_runtime_filter_source_inventory_covers_entire_src_tree() {
     assert_eq!(
         actual,
         BTreeSet::from([
+            "src/coordinator/scheduler/runtime_filter.rs".to_string(),
             "src/runtime/runtime_filter_duplicate.rs".to_string(),
-            "src/sql/codegen/fragment/runtime_filter.rs".to_string(),
             "src/sql/planner/physical/runtime_filter.rs".to_string(),
         ]),
         "runtime-filter type uniqueness must inspect every Rust source file"
@@ -2284,10 +2284,8 @@ mod runtime_filter;
 }
 
 #[test]
-fn planner_distributed_and_codegen_do_not_import_optimizer() {
-    let mut checked = production_rs_files(&src_dir().join("sql/planner/distributed"));
-    checked.extend(production_rs_files(&src_dir().join("sql/codegen")));
-
+fn planner_distributed_does_not_import_optimizer() {
+    let checked = production_rs_files(&src_dir().join("sql/planner/distributed"));
     let mut violations = Vec::new();
     for file in &checked {
         for (line, text) in non_test_optimizer_refs(file) {
@@ -2307,7 +2305,7 @@ fn planner_distributed_and_codegen_do_not_import_optimizer() {
 
     assert!(
         violations.is_empty(),
-        "planner distributed/codegen production paths must not reference optimizer types; \
+        "planner distributed production paths must not reference optimizer types; \
          optimizer_bridge/** is the conversion boundary. Violations:\n{}",
         violations.join("\n")
     );
@@ -3145,7 +3143,7 @@ fn coordinator_prepare_dependency_detector_is_source_aware() {
 
     assert_eq!(
         coordinator_prepare_dependency_violations_in(
-            "src/sql/codegen/scan/connector.rs",
+            "src/protocol/native/encode/plan.rs",
             "use crate::engine::*;",
         ),
         Vec::<String>::new(),
@@ -3984,10 +3982,6 @@ fn codegen_explain_owner_detector_covers_paths_aliases_relative_and_test_noise()
         ),
         (
             "src/sql/codegen/ir/mod.rs",
-            "use crate::sql::planner::distributed::DistributedPlan;\npub(crate) fn lower_distributed_plan() {}",
-        ),
-        (
-            "src/sql/codegen/ir/mod.rs",
             r#"
 #[cfg(test)]
 mod explain;
@@ -3995,21 +3989,6 @@ mod explain;
 use crate::sql::explain::distributed::explain_distributed_plan;
 #[cfg(test)]
 fn explain_distributed_plan_analyze() {}
-"#,
-        ),
-        (
-            "src/sql/codegen/ir/mod.rs",
-            r#"
-mod left {
-    use crate::sql as owner;
-}
-mod right {
-    mod safe {
-        pub mod presentation { pub struct X; }
-    }
-    use self::safe as owner;
-    use owner::presentation::X;
-}
 "#,
         ),
         (
@@ -4144,28 +4123,6 @@ fn codegen_explain_owner_violations_in(source_rel: &str, text: &str) -> Vec<Stri
     violations
 }
 
-#[test]
-fn codegen_production_cannot_own_or_import_distributed_explain() {
-    assert!(
-        !src_dir().join("sql/codegen/ir/explain.rs").exists(),
-        "the retired codegen EXPLAIN owner source must stay deleted"
-    );
-
-    let mut violations = Vec::new();
-    for file in production_rs_files(&src_dir().join("sql/codegen")) {
-        let source_rel = rel(&file);
-        let text = fs::read_to_string(&file).unwrap();
-        for violation in codegen_explain_owner_violations_in(&source_rel, &text) {
-            violations.push(format!("{source_rel}: {violation}"));
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "codegen production must not own or import distributed EXPLAIN:\n{}",
-        violations.join("\n")
-    );
-}
-
 fn native_lowering_codegen_dependency_violations_in(source_rel: &str, text: &str) -> Vec<String> {
     const FORBIDDEN: &[&str] = &["crate", "sql", "codegen"];
 
@@ -4236,7 +4193,7 @@ fn native_lowering_codegen_dependency_detector_covers_bypasses() {
             "#[cfg(test)] use crate::sql::codegen::proto_encode::types::encode_type;",
         ),
         (
-            "src/sql/codegen/proto_encode/types.rs",
+            "src/protocol/native/encode/types.rs",
             "use crate::sql::*; type LocalOwner = codegen::Codegen;",
         ),
     ];
@@ -5447,7 +5404,7 @@ fn planner_logical_module_use_surface_is_closed() {
 fn planner_physical_legacy_owner_detector_distinguishes_sibling_and_unrelated_paths() {
     assert!(!rust_use_imports_legacy_planner_owner(
         "private|crate::proto::plan::plan_node::Kind",
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
     ));
     assert!(rust_use_imports_legacy_planner_owner(
         "private|crate::sql::planner::plan::PhysicalPlanNode",
@@ -6880,26 +6837,6 @@ fn planner_distributed_core_has_stage_namespace() {
         );
     }
 
-    for item in [
-        "FragmentId",
-        "FragmentEdgeKind",
-        "FragmentStreamKind",
-        "FragmentEdge",
-    ] {
-        let declarations = rs_files(&repo.join("src/sql/codegen"))
-            .into_iter()
-            .filter_map(|path| {
-                let text = fs::read_to_string(&path).unwrap();
-                let count = rust_named_type_declaration_count(&text, item);
-                (count > 0).then(|| format!("{} ({count})", rel(&path)))
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            declarations.is_empty(),
-            "codegen must not own distributed edge topology type {item}: {declarations:?}"
-        );
-    }
-
     assert_eq!(
         planner_namespace_module_declarations(&distributed_mod),
         BTreeSet::from([
@@ -7649,9 +7586,9 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
     let planner = repo.join("src/sql/planner");
     let physical_owner = planner.join("physical/runtime_filter.rs");
     let distributed_owner = planner.join("distributed/runtime_filter.rs");
-    let codegen_owner = repo.join("src/sql/codegen/fragment/runtime_filter.rs");
+    let scheduler_owner = repo.join("src/coordinator/scheduler/runtime_filter.rs");
 
-    for owner in [&codegen_owner, &distributed_owner, &physical_owner] {
+    for owner in [&scheduler_owner, &distributed_owner, &physical_owner] {
         assert!(
             owner.is_file(),
             "missing runtime-filter stage owner: {}",
@@ -7683,7 +7620,7 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
                 "RuntimeFilterGraphProjection",
             ][..],
         ),
-        (&codegen_owner, &["PlannedRuntimeFilter"][..]),
+        (&scheduler_owner, &["PlannedRuntimeFilter"][..]),
     ] {
         for item in items {
             let declarations = lifecycle_sources
@@ -7757,10 +7694,10 @@ fn planner_runtime_filter_lifecycle_has_stage_owners() {
         "distributed/mod.rs must not flat re-export runtime-filter projection types: {distributed_uses:?}"
     );
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/mod.rs")).unwrap();
+    let scheduler_mod = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     assert!(
-        has_non_comment_line(&codegen_mod, "mod runtime_filter;"),
-        "codegen/fragment/mod.rs must declare its Planned runtime-filter owner"
+        has_non_comment_line(&scheduler_mod, "mod runtime_filter;"),
+        "coordinator/scheduler/mod.rs must declare its planned runtime-filter owner"
     );
 
     let builder_path = planner.join("distributed/build/runtime_filter_binding.rs");
@@ -13592,6 +13529,7 @@ fn runtime_filter_router_artifact_surface_violations(text: &str) -> Vec<String> 
 fn runtime_filter_m2_live_namespace_is_monitored(source_rel: &str) -> bool {
     source_rel.starts_with("src/exec/")
         || source_rel.starts_with("src/sql/")
+        || source_rel.starts_with("src/protocol/native/encode/")
         || source_rel.starts_with("src/lower/")
         || source_rel.starts_with("src/service/")
         || matches!(
@@ -15550,7 +15488,7 @@ fn runtime_filter_graph_model_has_planner_neutral_boundaries() {
     let graph_path = model.join("graph.rs");
     let fragment_path = repo.join("src/sql/planner/distributed/fragment.rs");
     let seal_path = repo.join("src/sql/planner/distributed/seal.rs");
-    let proto_encode = repo.join("src/sql/codegen/proto_encode");
+    let proto_encode = repo.join("src/protocol/native/encode");
 
     assert!(contract_path.is_file());
     assert!(graph_path.is_file());
@@ -16175,7 +16113,7 @@ fn runtime_filter_m2_live_boundary_detector_rejects_alias_glob_reexport_and_deco
             "pub use crate::runtime_filter::materializer::codec::decode_leaf as decode;",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "fn decoy() { if false { crate::runtime_filter::materializer::Materializer::plan(); } }",
         ),
         (
@@ -16220,7 +16158,7 @@ fn runtime_filter_m2_live_boundary_detector_rejects_source_indirection() {
             "#[path = \"../../../../runtime_filter/materializer/mod.rs\"] mod hidden;",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "#[cfg_attr(unix, path = \"../../../../runtime_filter/port/artifact.rs\")] mod hidden;",
         ),
         (
@@ -16883,7 +16821,7 @@ fn runtime_filter_harness_only_detector_rejects_operator_rpc_and_encoder_calls()
             "fn receive(service: &RuntimeFilterService) { service.open_producer(); }",
         ),
         (
-            "src/sql/codegen/proto_encode/runtime_filter.rs",
+            "src/protocol/native/encode/runtime_filter.rs",
             "fn encode(service: &RuntimeFilterService) { service.open_subscription(); }",
         ),
         (
@@ -20404,7 +20342,7 @@ fn nidl_d3f_native_runtime_layers_do_not_import_thrift_scan_ranges() {
     let repo = Path::new(manifest_dir());
     let guarded_files = [
         "src/coordinator/scheduler/mod.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     let forbidden = ["TScanRangeParams", "THdfsScanRange", "TInternalScanRange"];
     let mut violations = Vec::new();
@@ -20947,7 +20885,7 @@ fn nidl_d3e_native_runtime_routing_has_no_thrift_shaped_endpoint_model() {
 
     let checked_sources = [
         "src/coordinator/scheduler/mod.rs",
-        "src/sql/codegen/proto_encode/instance.rs",
+        "src/protocol/native/encode/instance.rs",
     ];
     for source in checked_sources {
         let path = repo.join(source);
@@ -21063,10 +21001,10 @@ fn nidl_d3j_native_delta_scan_sidecar_is_not_patched_from_thrift_plan() {
         }
     }
 
-    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let proto_plan = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
     if proto_plan.contains("delta_plan: None") {
         violations.push(
-            "src/sql/codegen/proto_encode/plan.rs: IcebergDeltaTable native encoder must not leave delta_plan as None".to_string(),
+            "src/protocol/native/encode/plan.rs: IcebergDeltaTable native encoder must not leave delta_plan as None".to_string(),
         );
     }
 
@@ -21179,7 +21117,7 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
     let repo = Path::new(manifest_dir());
     let mut violations = Vec::new();
 
-    let bundle = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let bundle = fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let bundle_production = rust_sanitized_production_text(&bundle);
     let bundle_compact = compact_line(&bundle_production);
     if rust_named_type_declaration_count(&bundle_production, "NativeFragmentBundle") != 1
@@ -21188,7 +21126,7 @@ fn nfe_1_task_2_native_fragment_build_owns_submission_payload() {
         || bundle_compact.contains("pub(crate)by_fragment:")
     {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: private NativeFragmentBundle must uniquely own required native fragments".to_string(),
+            "src/protocol/native/encode/bundle.rs: private NativeFragmentBundle must uniquely own required native fragments".to_string(),
         );
     }
 
@@ -22115,6 +22053,10 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
             repo.join("src/service"),
             vec![repo.join("src/service/grpc_fragment_dispatcher.rs")],
         ),
+        (
+            repo.join("src/protocol"),
+            vec![repo.join("src/protocol/mod.rs")],
+        ),
         (runner.clone(), vec![runner.join("main.rs")]),
     ] {
         match nfe_4_collect_production_owner_files(&root, &entries) {
@@ -22128,7 +22070,7 @@ fn nfe_4_fe_owned_raw_sources_are_starrocks_idl_free() {
     let owner_rel = owners.iter().map(|path| rel(path)).collect::<BTreeSet<_>>();
     for required in [
         "src/sql/mod.rs",
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "src/engine/mod.rs",
         "src/engine/statement.rs",
         "src/coordinator/dispatch.rs",
@@ -22310,11 +22252,13 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     for source in [
-        "src/sql/codegen/fragment/bundle.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/protocol/native/encode/bundle.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         match fs::symlink_metadata(repo.join(source)) {
@@ -22325,11 +22269,11 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     }
 
     let fragment_bundle =
-        fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let fragment_production = rust_sanitized_production_text(&fragment_bundle);
     if fragment_production.contains("cfg") && fragment_production.contains("compat") {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be compat-neutral"
+            "src/protocol/native/encode/bundle.rs: unique native bundle must be compat-neutral"
                 .to_string(),
         );
     }
@@ -22337,7 +22281,7 @@ fn nfe_4_ledger_audit_native_structure_and_external_ingress_are_fixed() {
     let bundle_compact = compact_line(&fragment_production);
     if !bundle_compact.contains("by_fragment:BTreeMap<FragmentId,NativePlanFragment>") {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: NativeFragmentBundle must own required native PlanFragment map"
+            "src/protocol/native/encode/bundle.rs: NativeFragmentBundle must own required native PlanFragment map"
                 .to_string(),
         );
     }
@@ -23784,9 +23728,12 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
         "src/runtime/fragment_exec_params.rs",
         "src/runtime/scan_range.rs",
         "src/runtime/native_fragment_wire.rs",
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).expect(source);
@@ -23832,12 +23779,18 @@ fn nfe_3_fe_owned_helpers_are_raw_starrocks_idl_free() {
 fn nfe_3_native_planning_owners_are_named_explicitly() {
     let repo = Path::new(manifest_dir());
     let expected_owners = [
-        "src/sql/codegen/scan/iceberg_delta.rs",
-        "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "src/protocol/native/encode/iceberg_delta_scan.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ];
     let retired_owners = [
+        "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/scan/connector.rs",
+        "src/sql/codegen/scan/iceberg_delta.rs",
         "src/sql/codegen/connector_scan_wire.rs",
         "src/sql/codegen/iceberg_delta_scan_wire.rs",
         "src/sql/planner/distributed/build/runtime_filter_wire.rs",
@@ -23859,15 +23812,21 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
 
-    let scan_mod = fs::read_to_string(repo.join("src/sql/codegen/scan/mod.rs")).unwrap();
+    let prepare_mod = fs::read_to_string(repo.join("src/coordinator/prepare/mod.rs")).unwrap();
+    let scheduler_mod = fs::read_to_string(repo.join("src/coordinator/scheduler/mod.rs")).unwrap();
     let build_mod =
         fs::read_to_string(repo.join("src/sql/planner/distributed/build/mod.rs")).unwrap();
-    let proto_mod = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/mod.rs")).unwrap();
+    let proto_mod = fs::read_to_string(repo.join("src/protocol/native/encode/mod.rs")).unwrap();
     for (source, text, required) in [
         (
-            "src/sql/codegen/scan/mod.rs",
-            scan_mod.as_str(),
-            &["pub(crate) mod iceberg_delta;"][..],
+            "src/coordinator/prepare/mod.rs",
+            prepare_mod.as_str(),
+            &["mod iceberg_delta;"][..],
+        ),
+        (
+            "src/coordinator/scheduler/mod.rs",
+            scheduler_mod.as_str(),
+            &["mod runtime_filter;"][..],
         ),
         (
             "src/sql/planner/distributed/build/mod.rs",
@@ -23875,7 +23834,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
             &["mod runtime_filter_binding;"][..],
         ),
         (
-            "src/sql/codegen/proto_encode/mod.rs",
+            "src/protocol/native/encode/mod.rs",
             proto_mod.as_str(),
             &["mod iceberg_delta_scan;"][..],
         ),
@@ -23888,7 +23847,8 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
         }
     }
     for (source, text) in [
-        ("src/sql/codegen/scan/mod.rs", scan_mod.as_str()),
+        ("src/coordinator/prepare/mod.rs", prepare_mod.as_str()),
+        ("src/coordinator/scheduler/mod.rs", scheduler_mod.as_str()),
         (
             "src/sql/planner/distributed/build/mod.rs",
             build_mod.as_str(),
@@ -23907,7 +23867,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     let planning_path = repo.join("src/connector/scan_model/starrocks.rs");
-    let encoder_path = repo.join("src/sql/codegen/proto_encode/plan.rs");
+    let encoder_path = repo.join("src/protocol/native/encode/plan.rs");
     if planning_path.is_file() {
         let planning = fs::read_to_string(&planning_path).unwrap();
         let encoder = fs::read_to_string(&encoder_path).unwrap();
@@ -23934,7 +23894,7 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     let delta_planning_path = repo.join("src/engine/mv/scan_binding.rs");
-    let delta_encoder_path = repo.join("src/sql/codegen/proto_encode/iceberg_delta_scan.rs");
+    let delta_encoder_path = repo.join("src/protocol/native/encode/iceberg_delta_scan.rs");
     if delta_planning_path.is_file() && delta_encoder_path.is_file() {
         let planning = fs::read_to_string(&delta_planning_path).unwrap();
         if rust_named_function_declaration_count(&planning, "encode_iceberg_delta_scan_plan_native")
@@ -24002,8 +23962,11 @@ fn nfe_3_native_planning_owners_are_named_explicitly() {
     }
 
     for source in [
-        "src/sql/codegen/scan/connector.rs",
-        "src/sql/codegen/scan/iceberg_delta.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "src/sql/planner/distributed/build/runtime_filter_binding.rs",
     ] {
         if let Ok(text) = fs::read_to_string(repo.join(source)) {
@@ -24531,23 +24494,12 @@ fn codegen_fragment_namespace_detector_covers_legacy_aliases_reexports_and_test_
 
     let valid = [
         (
-            "src/sql/codegen/fragment/mod.rs",
-            r#"
-mod build;
-mod request;
-mod result;
-pub(crate) use build::build;
-pub(crate) use request::FragmentBuildRequest;
-pub(crate) use result::MultiFragmentBuildResult;
-"#,
+            "src/protocol/native/encode/bundle.rs",
+            "use crate::coordinator::prepare::PreparedFragmentSet;",
         ),
         (
             "src/coordinator/execution.rs",
-            "use crate::sql::codegen::fragment::{FragmentBuildRequest, MultiFragmentBuildResult};",
-        ),
-        (
-            "src/engine/mod.rs",
-            "let result: crate::sql::codegen::fragment::MultiFragmentBuildResult = crate::sql::codegen::fragment::build(request)?;",
+            "use crate::protocol::native::encode::NativeFragmentBundle;",
         ),
         (
             "src/sql/codegen/fragment/mod.rs",
@@ -24580,73 +24532,62 @@ pub(crate) use crate::runtime::legacy_build as lower_distributed_plan;
     );
 }
 
+fn cgo_13_sql_codegen_retirement_violations(repo: &Path) -> Vec<String> {
+    novarocks_codegen_audit::audit_sql_codegen_retirement(repo)
+        .expect("run shared sql::codegen retirement audit")
+        .into_iter()
+        .map(|violation| violation.to_string())
+        .collect()
+}
+
 #[test]
-fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
+fn cgo_13_sql_codegen_retirement_detector_is_source_aware_and_non_vacuous() {
+    novarocks_codegen_audit::run_self_tests().expect("run shared codegen audit self-tests");
+}
+
+#[test]
+fn cgo_13_plan_ir_codegen_audit_self_tests_production_stripping() {
+    novarocks_codegen_audit::run_self_tests().expect("run shared codegen audit self-tests");
+    let violations = novarocks_codegen_audit::audit_native_encoder(Path::new(manifest_dir()))
+        .expect("run shared native encoder audit");
+    assert!(
+        violations.is_empty(),
+        "shared native encoder audit failed:\n{}",
+        violations
+            .into_iter()
+            .map(|violation| violation.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn cgo_13_sql_codegen_namespace_is_physically_retired() {
     let repo = Path::new(manifest_dir());
-    let mut violations = Vec::new();
+    let mut violations = cgo_13_sql_codegen_retirement_violations(repo);
 
     let codegen_root = repo.join("src/sql/codegen");
-    let codegen_mod = fs::read_to_string(codegen_root.join("mod.rs")).unwrap();
-    let actual_root_modules = rust_module_item_declarations(&codegen_mod);
-    let expected_root_modules = BTreeSet::from([
-        "fragment".to_string(),
-        "proto_encode".to_string(),
-        "scan".to_string(),
-    ]);
-    if actual_root_modules != expected_root_modules {
-        violations.push(format!(
-            "src/sql/codegen/mod.rs: production modules must be exactly {expected_root_modules:?}, got {actual_root_modules:?}"
-        ));
-    }
-
-    for retired in [
-        "src/sql/codegen/ir",
-        "src/sql/codegen/fragment_builder.rs",
-        "src/sql/codegen/scalar_materialize.rs",
-        "src/sql/codegen/fragment_request.rs",
-        "src/sql/codegen/boundary_schema.rs",
-        "src/sql/codegen/runtime_filter.rs",
-        "src/sql/codegen/connector_scan_planning.rs",
-        "src/sql/codegen/iceberg_delta_scan_planning.rs",
-        "src/sql/codegen/iceberg_literal_json.rs",
-    ] {
-        match fs::symlink_metadata(repo.join(retired)) {
-            Ok(_) => violations.push(format!("{retired}: retired path still exists")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => violations.push(format!(
-                "{retired}: failed to inspect retired path metadata: {error}"
-            )),
-        }
-    }
-
-    let fragment_mod_path = codegen_root.join("fragment/mod.rs");
-    let fragment_mod = fs::read_to_string(&fragment_mod_path).unwrap();
-    let fragment_production = rust_sanitized_production_text(&fragment_mod);
-    let actual_fragment_modules = rust_module_item_declarations(&fragment_production);
-    let expected_fragment_modules =
-        BTreeSet::from(["bundle".to_string(), "runtime_filter".to_string()]);
-    if actual_fragment_modules != expected_fragment_modules {
-        violations.push(format!(
-            "src/sql/codegen/fragment/mod.rs: production modules must be exactly {expected_fragment_modules:?}, got {actual_fragment_modules:?}"
-        ));
-    }
-
     let codegen_sources = rs_files(&codegen_root)
         .into_iter()
         .map(|path| (rel(&path), fs::read_to_string(path).unwrap()))
         .collect::<Vec<_>>();
+    let production_sources = cgo_8_production_source_texts(repo);
     for (name, expected_owner) in [
         (
             "NativeFragmentBundle",
-            "src/sql/codegen/fragment/bundle.rs (1)",
+            "src/protocol/native/encode/bundle.rs (1)",
         ),
         (
             "RuntimeFilterPlanResult",
-            "src/sql/codegen/fragment/runtime_filter.rs (1)",
+            "src/coordinator/scheduler/runtime_filter.rs (1)",
+        ),
+        (
+            "StarRocksScanSourceDescriptor",
+            "src/connector/scan_model/starrocks.rs (1)",
         ),
     ] {
         let owners = rust_named_declaration_owners(
-            &codegen_sources,
+            &production_sources,
             name,
             rust_named_type_declaration_count,
         );
@@ -24670,10 +24611,11 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         &cgo_8_production_source_texts(repo),
     ));
 
-    let fragment_build = fs::read_to_string(codegen_root.join("fragment/bundle.rs")).unwrap();
+    let fragment_build =
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let production = rust_sanitized_production_text(&fragment_build);
     violations.extend(nfe_3_raw_starrocks_idl_violations(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fragment_build,
     ));
     let production_tokens = rust_use_tokens(&production);
@@ -24683,7 +24625,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
         || production_tokens.iter().any(|token| token == "compat")
     {
         violations.push(
-            "src/sql/codegen/fragment/bundle.rs: unique native bundle must be feature-neutral"
+            "src/protocol/native/encode/bundle.rs: unique native bundle must be feature-neutral"
                 .to_string(),
         );
     }
@@ -24736,7 +24678,7 @@ fn nfe_1_task_4_fragment_build_is_unique_and_native_only() {
 
     assert!(
         violations.is_empty(),
-        "NFE-1 Task 4 unique native builder guard failed:\n{}",
+        "CGO-13 retired sql::codegen namespace guard failed:\n{}",
         violations.join("\n")
     );
 }
@@ -24809,7 +24751,7 @@ fn nidl_d3l_native_mainline_thrift_usage_is_explicitly_allowlisted() {
         );
     }
 
-    for path in rs_files(&repo.join("src/sql/codegen/proto_encode")) {
+    for path in rs_files(&repo.join("src/protocol/native/encode")) {
         let source = rel(&path);
         let text = fs::read_to_string(&path).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -26764,7 +26706,7 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "src/sql/planner/physical/runtime_filter_placement.rs",
         "src/sql/planner/physical/stats.rs",
         "src/sql/planner/physical/vocab.rs",
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
     ] {
         let text = fs::read_to_string(repo.join(source)).unwrap();
         let text = rust_production_text_without_cfg_test(&text);
@@ -26783,11 +26725,12 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         );
     }
 
-    let codegen_mod = fs::read_to_string(repo.join("src/sql/codegen/fragment/bundle.rs")).unwrap();
+    let codegen_mod =
+        fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
     let codegen_mod = rust_production_text_without_cfg_test(&codegen_mod);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &codegen_mod,
         &[
             "pub compat_output_partition:",
@@ -26796,11 +26739,11 @@ fn nidl_e3_planner_ir_uses_native_partition_and_runtime_filter_types() {
         "codegen public IR must not expose thrift partition/RF descriptor fields",
     );
 
-    let proto_plan = fs::read_to_string(repo.join("src/sql/codegen/proto_encode/plan.rs")).unwrap();
+    let proto_plan = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
     let proto_plan = rust_production_text_without_cfg_test(&proto_plan);
     push_forbidden_terms(
         &mut violations,
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         &proto_plan,
         &["crate::thrift::partitions", "TPartitionType"],
         "native proto encoder must encode ExchangeReceiver from native DataPartition",
@@ -29877,9 +29820,10 @@ fn cgo_8_ast_analysis(source: &Cgo8GuardSource) -> Result<Cgo8AstResult, String>
     let mut visitor = Cgo8AstVisitor {
         source: &source.path,
         codegen: source.path.starts_with("src/sql/codegen/")
+            || source.path.starts_with("src/protocol/native/encode/")
             || source.path == "src/coordinator/prepare/scan_preparation.rs",
         preparation: source.path == "src/coordinator/prepare/scan_preparation.rs",
-        encoder: source.path.starts_with("src/sql/codegen/proto_encode/"),
+        encoder: source.path.starts_with("src/protocol/native/encode/"),
         scopes: vec![Cgo8AstScope {
             module_path: rust_source_module_segments(&source.path)
                 .unwrap_or_else(|| vec!["crate".to_string()]),
@@ -29940,7 +29884,7 @@ fn cgo_8_delta_owner_violations(sources: &[(String, String)]) -> Vec<String> {
         ),
         (
             "encode_iceberg_delta_scan_plan_native",
-            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs (1)",
+            "src/protocol/native/encode/iceberg_delta_scan.rs (1)",
             "delta-encoder-owner",
         ),
     ] {
@@ -29964,7 +29908,10 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
     ];
     let codegen = sources
         .iter()
-        .filter(|source| source.path.starts_with("src/sql/codegen/"))
+        .filter(|source| {
+            source.path.starts_with("src/sql/codegen/")
+                || source.path.starts_with("src/protocol/native/encode/")
+        })
         .collect::<Vec<_>>();
     let preparation = sources
         .iter()
@@ -29972,7 +29919,7 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
         .collect::<Vec<_>>();
     let encoders = sources
         .iter()
-        .filter(|source| source.path.starts_with("src/sql/codegen/proto_encode/"))
+        .filter(|source| source.path.starts_with("src/protocol/native/encode/"))
         .collect::<Vec<_>>();
     let mut violations = Vec::new();
     for (owner, collection) in [
@@ -30020,7 +29967,7 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
                 if source.path == "src/coordinator/prepare/scan_preparation.rs" {
                     preparation_functions += result.production_functions;
                 }
-                if source.path.starts_with("src/sql/codegen/proto_encode/") {
+                if source.path.starts_with("src/protocol/native/encode/") {
                     encoder_functions += result.production_functions;
                 }
             }
@@ -30043,14 +29990,14 @@ fn cgo_8_immutable_scan_preparation_violations(sources: &[Cgo8GuardSource]) -> V
 fn cgo_8_fixture_sources(preparation: &str, encoder: &str, other: &str) -> Vec<Cgo8GuardSource> {
     vec![
         Cgo8GuardSource::new("src/coordinator/prepare/scan_preparation.rs", preparation),
-        Cgo8GuardSource::new("src/sql/codegen/proto_encode/plan.rs", encoder),
+        Cgo8GuardSource::new("src/protocol/native/encode/plan.rs", encoder),
         Cgo8GuardSource::new("src/lib.rs", other),
         Cgo8GuardSource::new(
             "src/engine/mv/scan_binding.rs",
             "fn build_iceberg_delta_scan_runtime_plan() {}",
         ),
         Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/iceberg_delta_scan.rs",
+            "src/protocol/native/encode/iceberg_delta_scan.rs",
             "fn encode_iceberg_delta_scan_plan_native() {}",
         ),
     ]
@@ -30360,7 +30307,7 @@ fn cgo_8_detector_closes_alias_generic_and_owner_bypasses() {
             !matches!(
                 source.path.as_str(),
                 "src/engine/mv/scan_binding.rs"
-                    | "src/sql/codegen/proto_encode/iceberg_delta_scan.rs"
+                    | "src/protocol/native/encode/iceberg_delta_scan.rs"
             )
         })
         .cloned()
@@ -30385,7 +30332,7 @@ fn cgo_8_detector_closes_alias_generic_and_owner_bypasses() {
         "fn build_iceberg_delta_scan_runtime_plan() {}",
     ));
     duplicate_owners.push(Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/duplicate.rs",
+        "src/protocol/native/encode/duplicate.rs",
         "fn encode_iceberg_delta_scan_plan_native() {}",
     ));
     let duplicate_violations = cgo_8_immutable_scan_preparation_violations(&duplicate_owners);
@@ -30510,7 +30457,7 @@ fn local_fn_shadow() { fn plan_changes() {} plan_changes(); }
     assert!(
         parse_violations.iter().any(|violation| {
             violation.contains("ast-parse")
-                && violation.contains("src/sql/codegen/proto_encode/plan.rs")
+                && violation.contains("src/protocol/native/encode/plan.rs")
         }),
         "invalid production Rust must fail closed with its source path: {parse_violations:?}"
     );
@@ -33941,39 +33888,41 @@ fn distributed_plan_seal_task2_enforces_private_draft_and_single_typed_seal() {
 
 // ---------------------------------------------------------------------------
 // CGO-9A Task 3: distributed-plan structural validation lives in the planner
-// seal, never in codegen.
+// seal, never in the native encoder.
 //
-// Task 3 moved `validate_distributed_plan` (and its helpers) out of
-// `src/sql/codegen/fragment/build.rs` into
-// `crate::sql::planner::distributed::validation`, where it runs inside
-// `seal_draft`. These guards keep it there: codegen must not (re)own the
-// structural validator, and the planner distributed module must define it.
+// Task 3 moved `validate_distributed_plan` (and its helpers) from the retired
+// SQL encoder owner into `crate::sql::planner::distributed::validation`, where
+// it runs inside `seal_draft`. These guards keep it there: the encoder must not
+// (re)own the structural validator, and the planner distributed module must
+// define it.
 //
 // The detector keys on function *definitions* (`fn validate_distributed_plan`
-// / `fn validate_distributed_structure`), so codegen helpers that legitimately
+// / `fn validate_distributed_structure`), so encoder helpers that legitimately
 // stay (e.g. `validate_native_fragment_ownership`, `output_column_for_boundary`)
 // and prose comments referencing the planner module are not matched.
 // ---------------------------------------------------------------------------
 
-const CGO_9A_TASK3_CODEGEN_ROOT: &str = "src/sql/codegen/";
+const CGO_9A_TASK3_ENCODER_ROOT: &str = "src/protocol/native/encode/";
 const CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
 const CGO_9A_TASK3_STRUCTURAL_VALIDATOR_ENTRY: &str = "fn validate_distributed_structure(";
-const CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS: [&str; 2] = [
+const CGO_9A_TASK3_FORBIDDEN_ENCODER_DEFS: [&str; 2] = [
     "fn validate_distributed_structure(",
     "fn validate_distributed_plan(",
 ];
 
 fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
     let mut violations = Vec::new();
+    let mut encoder_inventory = 0usize;
     let mut planner_defines_structural_validator = false;
 
     for source in sources {
-        if source.path.starts_with(CGO_9A_TASK3_CODEGEN_ROOT) {
-            for needle in CGO_9A_TASK3_FORBIDDEN_CODEGEN_DEFS {
+        if source.path.starts_with(CGO_9A_TASK3_ENCODER_ROOT) {
+            encoder_inventory += 1;
+            for needle in CGO_9A_TASK3_FORBIDDEN_ENCODER_DEFS {
                 if source.text.contains(needle) {
                     let function = needle.trim_start_matches("fn ").trim_end_matches('(');
                     violations.push(format!(
-                        "codegen-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
+                        "encoder-owns-structural-validator: {} defines `{function}`; distributed-plan structural validation must live under {}",
                         source.path, CGO_9A_TASK3_PLANNER_DISTRIBUTED_ROOT
                     ));
                 }
@@ -33990,6 +33939,11 @@ fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<St
         }
     }
 
+    if encoder_inventory == 0 {
+        violations.push(format!(
+            "empty-encoder-inventory: no production source found under {CGO_9A_TASK3_ENCODER_ROOT}"
+        ));
+    }
     if !planner_defines_structural_validator {
         violations.push(format!(
             "missing-planner-structural-validator: no {} source defines `{}`",
@@ -34006,7 +33960,7 @@ fn distributed_plan_seal_task3_violations(sources: &[Cgo8GuardSource]) -> Vec<St
 fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
     let sources = [
         Cgo8GuardSource::new(
-            "src/sql/codegen/fragment/build.rs",
+            "src/protocol/native/encode/build.rs",
             "fn build() {} fn output_column_for_boundary() {} fn validate_native_fragment_ownership() {}",
         ),
         Cgo8GuardSource::new(
@@ -34017,12 +33971,12 @@ fn distributed_plan_seal_task3_detector_accepts_planner_owned_validator() {
     let violations = distributed_plan_seal_task3_violations(&sources);
     assert!(
         violations.is_empty(),
-        "planner-owned structural validator with clean codegen must pass: {violations:?}"
+        "planner-owned structural validator with clean encoder must pass: {violations:?}"
     );
 }
 
 #[test]
-fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
+fn distributed_plan_seal_task3_detector_rejects_encoder_owned_validator() {
     let planner_owner = Cgo8GuardSource::new(
         "src/sql/planner/distributed/validation.rs",
         "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
@@ -34033,15 +33987,15 @@ fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
         "pub(crate) fn validate_distributed_structure(dp: &DistributedPlan) { let _ = dp; }",
     ] {
         let sources = [
-            Cgo8GuardSource::new("src/sql/codegen/fragment/build.rs", forbidden),
+            Cgo8GuardSource::new("src/protocol/native/encode/build.rs", forbidden),
             planner_owner.clone(),
         ];
         let violations = distributed_plan_seal_task3_violations(&sources);
         assert!(
             violations
                 .iter()
-                .any(|violation| violation.contains("codegen-owns-structural-validator")),
-            "codegen re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
+                .any(|violation| violation.contains("encoder-owns-structural-validator")),
+            "encoder re-owning the structural validator must fail closed for `{forbidden}`: {violations:?}"
         );
     }
 }
@@ -34049,7 +34003,7 @@ fn distributed_plan_seal_task3_detector_rejects_codegen_owned_validator() {
 #[test]
 fn distributed_plan_seal_task3_detector_requires_planner_owner() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/build.rs",
+        "src/protocol/native/encode/build.rs",
         "fn build() {} fn validate_native_fragment_ownership() {}",
     )];
     let violations = distributed_plan_seal_task3_violations(&sources);
@@ -34058,6 +34012,21 @@ fn distributed_plan_seal_task3_detector_requires_planner_owner() {
             .iter()
             .any(|violation| violation.contains("missing-planner-structural-validator")),
         "a tree with no planner-owned structural validator must fail closed: {violations:?}"
+    );
+}
+
+#[test]
+fn distributed_plan_seal_task3_detector_rejects_empty_encoder_inventory() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/distributed/validation.rs",
+        "pub(in crate::sql::planner::distributed) fn validate_distributed_structure() {}",
+    )];
+    let violations = distributed_plan_seal_task3_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("empty-encoder-inventory")),
+        "the structural-validation guard must fail closed without encoder sources: {violations:?}"
     );
 }
 
@@ -34729,7 +34698,7 @@ fn planner_topology_contract() {
 // semantic repair.
 //
 // CGO-9C retired every "repair a stale/incomplete plan" surface from the
-// encoder (`src/sql/codegen/proto_encode/`). The planner seal now finalizes all
+// encoder (`src/protocol/native/encode/`). The planner seal now finalizes all
 // node / fragment / stream-edge / write / aggregate outputs
 // (`sql::planner::distributed`), and the encoder maps that sealed contract onto
 // the wire without re-deriving it. Task 5 deleted the last surviving repair --
@@ -34774,14 +34743,14 @@ fn planner_topology_contract() {
 // emits RF wire columns still passes.
 // ---------------------------------------------------------------------------
 
-const CGO_9C_ENCODER_ROOT: &str = "src/sql/codegen/proto_encode/";
+const CGO_9C_ENCODER_ROOT: &str = "src/protocol/native/encode/";
 const CGO_9C_PLANNER_DISTRIBUTED_ROOT: &str = "src/sql/planner/distributed/";
 const CGO_9C_AGGREGATE_TYPE_CONTRACT: &str = "src/types/aggregate.rs";
 
 // Retired encoder semantic-repair helpers. Reintroducing any of these names in
 // the encoder is a regression: it re-derives output the planner already sealed.
 // These are exactly the names the retired-inventory `rg` in the CGO-9C plan
-// bans under `src/sql/codegen/proto_encode`.
+// bans under `src/protocol/native/encode`.
 const CGO_9C_RETIRED_ENCODER_HELPERS: [&str; 6] = [
     "patch_exchange_receiver",
     "normalize_encoded_node_output",
@@ -34930,7 +34899,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_sealed_mapping_encoder() {
     // outputs through 1:1 enum/presence/range mappers, and reads the sealed
     // fragment/stream contract through its own (distinctly named) readers.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode_distributed_plan(plan: &DistributedPlan) -> Result<Encoded, String> {\n\
              let _ = encode_data_partition(&plan.data_partition())?;\n\
              let _ = encode_type(&column.data_type)?;\n\
@@ -34950,7 +34919,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_sealed_mapping_encoder() {
 fn cgo_9c_encoder_semantic_repair_detector_rejects_each_retired_helper() {
     for helper in CGO_9C_RETIRED_ENCODER_HELPERS {
         let sources = [Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/plan.rs",
+            "src/protocol/native/encode/plan.rs",
             format!("fn repair(node: &Node) {{ let _ = {helper}(node); }}"),
         )];
         let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
@@ -34967,7 +34936,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_each_retired_helper() {
 fn cgo_9c_encoder_semantic_repair_detector_rejects_planner_finalizer_calls() {
     for finalizer in CGO_9C_PLANNER_OUTPUT_FINALIZERS {
         let sources = [Cgo8GuardSource::new(
-            "src/sql/codegen/proto_encode/plan.rs",
+            "src/protocol/native/encode/plan.rs",
             format!("fn encode(node: &Node) {{ let _ = {finalizer}(node); }}"),
         )];
         let violations = cgo_9c_encoder_semantic_repair_violations(&sources);
@@ -34983,7 +34952,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_planner_finalizer_calls() {
 #[test]
 fn cgo_9c_encoder_semantic_repair_detector_rejects_draft_and_mutable_borrow() {
     let draft = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(draft: DistributedPlanDraft) { let _ = draft; }",
     )];
     assert!(
@@ -34994,7 +34963,7 @@ fn cgo_9c_encoder_semantic_repair_detector_rejects_draft_and_mutable_borrow() {
     );
 
     let mutable = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(plan: &mut DistributedPlan) { let _ = plan; }",
     )];
     assert!(
@@ -35026,7 +34995,7 @@ fn cgo_9c_encoder_semantic_repair_detector_ignores_test_only_and_comment_surface
     // module is not production semantic repair; the sanitizer strips both, so the
     // detector must not trip.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(plan: &DistributedPlan) { let _ = plan; } // encoded_node_output_columns is retired\n\
          #[cfg(test)]\n\
          mod tests {\n    fn probe() { let _ = encoded_fragment_root_output_columns(&fragment); }\n}",
@@ -35057,7 +35026,7 @@ fn cgo_9c_encoder_semantic_repair_detector_accepts_runtime_filter_wire_encoding(
     // The encoder mapping node-carried runtime filters onto the wire is
     // legitimate 1:1 encoding, not semantic repair; it must pass.
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode_node(node: &DistributedNode) -> plan::DistributedNode {\n\
              plan::DistributedNode {\n\
                  build_runtime_filters: encode_runtime_filters(&node.build_runtime_filters),\n\
@@ -36932,7 +36901,53 @@ fn coor_3b_native_bundle_type_names(
     (names, violations)
 }
 
-fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>, String> {
+fn coor_3b_native_bundle_binding_violations(
+    source: &str,
+    allow_canonical_facade_reexport: bool,
+) -> Result<Vec<String>, String> {
+    fn direct_bundle_name_count(tree: &syn::UseTree) -> usize {
+        match tree {
+            syn::UseTree::Name(name)
+                if coor_3b_ident_text(&name.ident) == "NativeFragmentBundle" =>
+            {
+                1
+            }
+            syn::UseTree::Group(group) => group.items.iter().map(direct_bundle_name_count).sum(),
+            syn::UseTree::Path(_)
+            | syn::UseTree::Name(_)
+            | syn::UseTree::Rename(_)
+            | syn::UseTree::Glob(_) => 0,
+        }
+    }
+
+    fn canonical_facade_bundle_reexport_count(item: &syn::ItemUse) -> usize {
+        let syn::Visibility::Restricted(visibility) = &item.vis else {
+            return 0;
+        };
+        if !visibility.path.is_ident("crate") {
+            return 0;
+        }
+        let syn::UseTree::Path(path) = &item.tree else {
+            return 0;
+        };
+        if coor_3b_ident_text(&path.ident) != "bundle" {
+            return 0;
+        }
+        direct_bundle_name_count(&path.tree)
+    }
+
+    fn use_imports_bundle(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => use_imports_bundle(&path.tree),
+            syn::UseTree::Name(name) => coor_3b_ident_text(&name.ident) == "NativeFragmentBundle",
+            syn::UseTree::Rename(rename) => {
+                coor_3b_ident_text(&rename.ident) == "NativeFragmentBundle"
+            }
+            syn::UseTree::Group(group) => group.items.iter().any(use_imports_bundle),
+            syn::UseTree::Glob(_) => false,
+        }
+    }
+
     fn use_renames_bundle(tree: &syn::UseTree) -> bool {
         match tree {
             syn::UseTree::Path(path) => use_renames_bundle(&path.tree),
@@ -36945,8 +36960,9 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
         }
     }
 
-    #[derive(Default)]
     struct Audit {
+        allow_canonical_facade_reexport: bool,
+        canonical_facade_bundle_reexports: usize,
         violations: Vec<String>,
     }
     struct NativeBundleMention {
@@ -37037,6 +37053,24 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
                 self.violations
                     .push("forbidden NativeFragmentBundle import alias or re-export".to_string());
             }
+            if !matches!(item.vis, syn::Visibility::Inherited) && use_imports_bundle(&item.tree) {
+                let canonical_count = self
+                    .allow_canonical_facade_reexport
+                    .then(|| canonical_facade_bundle_reexport_count(item))
+                    .unwrap_or(0);
+                if canonical_count == 1 {
+                    self.canonical_facade_bundle_reexports += 1;
+                } else {
+                    self.violations
+                        .push("forbidden NativeFragmentBundle re-export".to_string());
+                    if self.allow_canonical_facade_reexport {
+                        self.violations.push(
+                            "NativeFragmentBundle facade re-export must be one pub(crate) direct export from `bundle`"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             syn::visit::visit_item_use(self, item);
         }
 
@@ -37054,8 +37088,18 @@ fn coor_3b_native_bundle_binding_violations(source: &str) -> Result<Vec<String>,
 
     let file = syn::parse_file(source)
         .map_err(|error| format!("parse COOR-3B bundle binding source: {error}"))?;
-    let mut audit = Audit::default();
+    let mut audit = Audit {
+        allow_canonical_facade_reexport,
+        canonical_facade_bundle_reexports: 0,
+        violations: Vec::new(),
+    };
     syn::visit::Visit::visit_file(&mut audit, &file);
+    if allow_canonical_facade_reexport && audit.canonical_facade_bundle_reexports != 1 {
+        audit.violations.push(format!(
+            "NativeFragmentBundle facade re-export must appear exactly once, found {}",
+            audit.canonical_facade_bundle_reexports
+        ));
+    }
     audit.violations.sort();
     audit.violations.dedup();
     Ok(audit.violations)
@@ -37424,8 +37468,540 @@ fn coor_3b_old_codegen_scan_reexport_violations(
     Ok(violations)
 }
 
+const COOR_3B_RF_PROJECTION_FN: &str = "project_runtime_filters";
+const COOR_3B_RF_PROJECTION_PLANNER_OWNER: &str = "src/sql/planner/distributed/runtime_filter.rs";
+const COOR_3B_RF_PROJECTION_PREPARE_OWNER: &str = "src/coordinator/prepare/mod.rs";
+
+#[derive(Default)]
+struct Coor3bRuntimeFilterProjectionAudit {
+    definitions: Vec<String>,
+    use_bindings: Vec<(String, String, bool)>,
+    expression_paths: Vec<(Vec<String>, String)>,
+    macro_mentions: usize,
+    visible_functions: BTreeSet<String>,
+    function_stack: Vec<String>,
+}
+
+impl Coor3bRuntimeFilterProjectionAudit {
+    fn current_function(&self) -> String {
+        self.function_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn collect_use_tree(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>, public: bool) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(coor_3b_ident_text(&path.ident));
+                self.collect_use_tree(&path.tree, prefix, public);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let original = coor_3b_ident_text(&name.ident);
+                if original == "self" {
+                    if let Some(binding) = prefix.last() {
+                        self.use_bindings
+                            .push((prefix.join("::"), binding.clone(), public));
+                    }
+                } else {
+                    let mut path = prefix.clone();
+                    path.push(original.clone());
+                    self.use_bindings.push((path.join("::"), original, public));
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut path = prefix.clone();
+                let original = coor_3b_ident_text(&rename.ident);
+                if original != "self" {
+                    path.push(original);
+                }
+                self.use_bindings.push((
+                    path.join("::"),
+                    coor_3b_ident_text(&rename.rename),
+                    public,
+                ));
+            }
+            syn::UseTree::Glob(_) => {
+                self.use_bindings
+                    .push((prefix.join("::"), "*".to_string(), public));
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.collect_use_tree(item, prefix, public);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Coor3bRuntimeFilterProjectionAudit {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, statement: &'ast syn::Stmt) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(statement)) {
+            return;
+        }
+        syn::visit::visit_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expression)) {
+            return;
+        }
+        syn::visit::visit_expr(self, expression);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if nfe_4_syn_attrs_require_test(&arm.attrs) {
+            return;
+        }
+        syn::visit::visit_arm(self, arm);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.macro_mentions += rust_use_tokens(&rust_lexically_sanitized(&mac.tokens.to_string()))
+            .iter()
+            .filter(|token| token.as_str() == COOR_3B_RF_PROJECTION_FN)
+            .count();
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.collect_use_tree(
+            &item.tree,
+            &mut Vec::new(),
+            !matches!(item.vis, syn::Visibility::Inherited),
+        );
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let name = coor_3b_ident_text(&item.sig.ident);
+        if name == COOR_3B_RF_PROJECTION_FN {
+            self.definitions.push(name.clone());
+        }
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            self.visible_functions.insert(name.clone());
+        }
+        self.function_stack.push(name);
+        syn::visit::visit_block(self, &item.block);
+        self.function_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let name = coor_3b_ident_text(&item.sig.ident);
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            self.visible_functions.insert(name.clone());
+        }
+        self.function_stack.push(name);
+        syn::visit::visit_block(self, &item.block);
+        self.function_stack.pop();
+    }
+
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        if !expression.path.segments.is_empty() {
+            self.expression_paths.push((
+                expression
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| coor_3b_ident_text(&segment.ident))
+                    .collect(),
+                self.current_function(),
+            ));
+        }
+        syn::visit::visit_expr_path(self, expression);
+    }
+}
+
+struct Coor3bRuntimeFilterProjectionSource {
+    path: String,
+    has_projection_glob: bool,
+    projector_uses: Vec<(String, bool)>,
+    audit: Coor3bRuntimeFilterProjectionAudit,
+}
+
+fn coor_3b_may_contain_projection_module_use(source: &Cgo8GuardSource) -> bool {
+    source.text.contains("runtime_filter")
+        && (source.path.starts_with("src/sql/planner/distributed/")
+            || (source.path.starts_with("src/sql/planner/") && source.text.contains("distributed"))
+            || (source.text.contains("planner") && source.text.contains("distributed")))
+}
+
+fn coor_3b_projection_use_audit(source: &Cgo8GuardSource) -> (Vec<(String, bool)>, Vec<String>) {
+    const TARGET_MODULE: &[&str] = &["crate", "sql", "planner", "distributed", "runtime_filter"];
+
+    let sanitized = rust_sanitized_production_text(&source.text);
+    let raw_imports = rust_raw_use_statements(&sanitized);
+    let mut aliases = RustScopedAliases::new();
+    for raw in &raw_imports {
+        let local_name = match raw.path.alias.as_deref() {
+            Some("_") => None,
+            Some(alias) => Some(alias.to_string()),
+            None => raw
+                .path
+                .segments
+                .last()
+                .filter(|leaf| !matches!(leaf.as_str(), "*" | "crate" | "self" | "super"))
+                .cloned(),
+        };
+        let Some(local_name) = local_name else {
+            continue;
+        };
+        let target = RustScopedUsePath {
+            segments: raw.path.segments.clone(),
+            inline_modules: raw.inline_modules.clone(),
+        };
+        let targets = aliases
+            .entry((raw.inline_modules.clone(), local_name))
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    let mut projector_uses = BTreeSet::new();
+    let mut violations = Vec::new();
+    for raw in raw_imports {
+        let glob = raw
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment == "*");
+        let resolved = rust_resolve_scoped_paths(
+            &raw.path.segments,
+            &raw.inline_modules,
+            &aliases,
+            &mut BTreeSet::new(),
+            0,
+        );
+        let Some(resolved) = resolved else {
+            if glob && source.text.contains("runtime_filter") {
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {}: projection glob alias resolution failed closed",
+                    source.path
+                ));
+            }
+            continue;
+        };
+        for path in resolved {
+            let Some(canonical) = rust_canonical_path_segments_in_scope(
+                &path.segments,
+                &source.path,
+                &path.inline_modules,
+            ) else {
+                if path
+                    .segments
+                    .iter()
+                    .any(|segment| segment == "runtime_filter")
+                    && path.segments.last().is_some_and(|segment| segment == "*")
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {}: projection glob escapes the crate root",
+                        source.path
+                    ));
+                }
+                continue;
+            };
+            let target = canonical.iter().map(String::as_str).collect::<Vec<_>>();
+            if target == *TARGET_MODULE {
+                let binding = raw
+                    .path
+                    .alias
+                    .clone()
+                    .or_else(|| raw.path.segments.last().cloned())
+                    .unwrap_or_default();
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {}: projection module alias `{binding}` is forbidden",
+                    source.path
+                ));
+                continue;
+            }
+            if target.len() != TARGET_MODULE.len() + 1
+                || target[..TARGET_MODULE.len()] != *TARGET_MODULE
+                || !matches!(
+                    target.last().copied(),
+                    Some("*") | Some(COOR_3B_RF_PROJECTION_FN)
+                )
+            {
+                continue;
+            }
+            let binding = raw
+                .path
+                .alias
+                .clone()
+                .or_else(|| raw.path.segments.last().cloned())
+                .unwrap_or_default();
+            projector_uses.insert((binding, raw.visibility != "private"));
+        }
+    }
+    (projector_uses.into_iter().collect(), violations)
+}
+
+fn coor_3b_runtime_filter_projection_owner_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let production_inventory = sources.iter().any(|source| source.path == "src/lib.rs");
+    if !production_inventory
+        && !sources.iter().any(|source| {
+            source.text.contains(COOR_3B_RF_PROJECTION_FN)
+                || (source.text.contains("runtime_filter") && source.text.contains('*'))
+                || coor_3b_may_contain_projection_module_use(source)
+        })
+    {
+        return violations;
+    }
+
+    let mut audited = Vec::new();
+    for source in sources {
+        let owner = matches!(
+            source.path.as_str(),
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER | COOR_3B_RF_PROJECTION_PREPARE_OWNER
+        );
+        let may_contain_projection_glob =
+            source.text.contains("runtime_filter") && source.text.contains('*');
+        let may_contain_projection_module_use = coor_3b_may_contain_projection_module_use(source);
+        if !owner
+            && !source.text.contains(COOR_3B_RF_PROJECTION_FN)
+            && !may_contain_projection_glob
+            && !may_contain_projection_module_use
+        {
+            continue;
+        }
+        let (projector_uses, projection_use_violations) = coor_3b_projection_use_audit(source);
+        let has_projection_glob = projector_uses.iter().any(|(binding, _)| binding == "*");
+        violations.extend(projection_use_violations);
+        if !owner && !source.text.contains(COOR_3B_RF_PROJECTION_FN) && projector_uses.is_empty() {
+            continue;
+        }
+        let file = match syn::parse_file(&source.text) {
+            Ok(file) => file,
+            Err(error) => {
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {}: parse failed: {error}",
+                    source.path
+                ));
+                continue;
+            }
+        };
+        let mut audit = Coor3bRuntimeFilterProjectionAudit::default();
+        syn::visit::Visit::visit_file(&mut audit, &file);
+        audited.push(Coor3bRuntimeFilterProjectionSource {
+            path: source.path.clone(),
+            has_projection_glob,
+            projector_uses,
+            audit,
+        });
+    }
+
+    if production_inventory {
+        for owner in [
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER,
+            COOR_3B_RF_PROJECTION_PREPARE_OWNER,
+        ] {
+            if !audited.iter().any(|source| source.path == owner) {
+                violations.push(format!(
+                    "runtime-filter-projection-owner: missing production owner {owner}"
+                ));
+            }
+        }
+    }
+
+    let mut exported_prepare_bindings = BTreeSet::new();
+    for source in &audited {
+        let aliases = source
+            .projector_uses
+            .iter()
+            .map(|(binding, _)| binding.as_str())
+            .filter(|binding| *binding != "*")
+            .collect::<BTreeSet<_>>();
+        let references = source
+            .audit
+            .expression_paths
+            .iter()
+            .filter(|(path, _)| {
+                path.last().is_some_and(|name| {
+                    name == COOR_3B_RF_PROJECTION_FN || aliases.contains(name.as_str())
+                })
+            })
+            .map(|(path, function)| (path.clone(), function.clone()))
+            .collect::<Vec<_>>();
+
+        match source.path.as_str() {
+            COOR_3B_RF_PROJECTION_PLANNER_OWNER => {
+                if source.audit.definitions.len() != 1
+                    || !source.projector_uses.is_empty()
+                    || !references.is_empty()
+                    || source.audit.macro_mentions != 0
+                    || source.has_projection_glob
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} must contain exactly one function definition and no other production reference; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
+                        source.path,
+                        source.audit.definitions.len(),
+                        source.projector_uses.len(),
+                        source.audit.macro_mentions,
+                        source.has_projection_glob,
+                    ));
+                }
+            }
+            COOR_3B_RF_PROJECTION_PREPARE_OWNER => {
+                let direct_prepare_reference = references.as_slice()
+                    == [(
+                        vec![
+                            "crate".to_string(),
+                            "sql".to_string(),
+                            "planner".to_string(),
+                            "distributed".to_string(),
+                            "runtime_filter".to_string(),
+                            COOR_3B_RF_PROJECTION_FN.to_string(),
+                        ],
+                        "prepare_fragments".to_string(),
+                    )];
+                if source.audit.definitions.is_empty()
+                    && source.projector_uses.is_empty()
+                    && direct_prepare_reference
+                    && source.audit.macro_mentions == 0
+                    && !source.has_projection_glob
+                {
+                    continue;
+                }
+                violations.push(format!(
+                    "runtime-filter-projection-owner: {} must contain exactly one direct production reference inside prepare_fragments and no definition/use/re-export; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
+                    source.path,
+                    source.audit.definitions.len(),
+                    source.projector_uses.len(),
+                    source.audit.macro_mentions,
+                    source.has_projection_glob,
+                ));
+                for (binding, public) in &source.projector_uses {
+                    if *public && binding != "*" {
+                        exported_prepare_bindings.insert(binding.clone());
+                    }
+                }
+                for (_, function) in references.iter().filter(|(_, function)| {
+                    function.as_str() != "prepare_fragments"
+                        && source.audit.visible_functions.contains(function.as_str())
+                }) {
+                    exported_prepare_bindings.insert(function.clone());
+                }
+            }
+            _ => {
+                if !source.audit.definitions.is_empty()
+                    || !source.projector_uses.is_empty()
+                    || !references.is_empty()
+                    || source.audit.macro_mentions != 0
+                    || source.has_projection_glob
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} must not reference {}; definitions={} uses={} references={references:?} macro_mentions={} projection_glob={}",
+                        source.path,
+                        COOR_3B_RF_PROJECTION_FN,
+                        source.audit.definitions.len(),
+                        source.projector_uses.len(),
+                        source.audit.macro_mentions,
+                        source.has_projection_glob,
+                    ));
+                }
+            }
+        }
+    }
+
+    if !exported_prepare_bindings.is_empty() {
+        for source in sources {
+            if source.path == COOR_3B_RF_PROJECTION_PREPARE_OWNER {
+                continue;
+            }
+            if !exported_prepare_bindings
+                .iter()
+                .any(|binding| source.text.contains(binding))
+            {
+                continue;
+            }
+            let production = rust_sanitized_production_text(&source.text);
+            let tokens = rust_use_tokens(&production);
+            if !tokens
+                .iter()
+                .any(|token| exported_prepare_bindings.contains(token))
+            {
+                continue;
+            }
+            let file = match syn::parse_file(&source.text) {
+                Ok(file) => file,
+                Err(error) => {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {}: wrapper consumer parse failed: {error}",
+                        source.path
+                    ));
+                    continue;
+                }
+            };
+            let mut audit = Coor3bRuntimeFilterProjectionAudit::default();
+            syn::visit::Visit::visit_file(&mut audit, &file);
+            let imported_aliases = audit
+                .use_bindings
+                .iter()
+                .filter(|(original, _, _)| {
+                    original
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|name| exported_prepare_bindings.contains(name))
+                })
+                .map(|(_, binding, _)| binding.as_str())
+                .collect::<BTreeSet<_>>();
+            for (path, function) in &audit.expression_paths {
+                let Some(name) = path.last() else {
+                    continue;
+                };
+                if exported_prepare_bindings.contains(name)
+                    || imported_aliases.contains(name.as_str())
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} function {function} consumes preparation projection wrapper `{name}`",
+                        source.path
+                    ));
+                }
+            }
+            for (original, binding, _) in &audit.use_bindings {
+                if original
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|name| exported_prepare_bindings.contains(name))
+                {
+                    violations.push(format!(
+                        "runtime-filter-projection-owner: {} imports preparation projection wrapper `{original}` as `{binding}`",
+                        source.path
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
 fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
     let (bundle_type_names, mut violations) = coor_3b_native_bundle_type_names(sources);
+    violations.extend(coor_3b_runtime_filter_projection_owner_violations(sources));
     for source in sources {
         let production = rust_sanitized_production_text(&source.text);
         let compact = compact_line(&production);
@@ -37499,7 +38075,7 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
             }
         }
 
-        if source.path != "src/sql/codegen/fragment/bundle.rs"
+        if source.path != "src/protocol/native/encode/bundle.rs"
             && tokens.iter().any(|token| token == "by_fragment")
         {
             match coor_3b_native_bundle_field_accesses(&source.text) {
@@ -37509,9 +38085,12 @@ fn coor_3b_forbidden_path_violations(sources: &[Cgo8GuardSource]) -> Vec<String>
                 Err(error) => violations.push(format!("source-parse: {}: {error}", source.path)),
             }
         }
-        let bundle_owner = source.path == "src/sql/codegen/fragment/bundle.rs";
+        let bundle_owner = source.path == "src/protocol/native/encode/bundle.rs";
         if !bundle_owner {
-            match coor_3b_native_bundle_binding_violations(&source.text) {
+            match coor_3b_native_bundle_binding_violations(
+                &source.text,
+                source.path == "src/protocol/native/encode/mod.rs",
+            ) {
                 Ok(binding_violations) => {
                     violations.extend(binding_violations.into_iter().map(|violation| {
                         format!("bundle-interface: {}: {violation}", source.path)
@@ -37676,7 +38255,7 @@ fn coordinator_preparation_owner_guard_rejects_grouped_aliased_scan_reexport() {
 #[test]
 fn coordinator_preparation_owner_guard_allows_scan_binding_parameter() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/scan/connector.rs",
+        "src/coordinator/prepare/scan.rs",
         "fn encode(binding: &ScanBinding) { let _ = binding; }",
     )];
     assert!(
@@ -37811,7 +38390,7 @@ fn coordinator_artifact_guard_allows_scheduling_plan_placement_map() {
 #[test]
 fn coordinator_artifact_guard_rejects_mutable_bundle_map_accessor() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "impl NativeFragmentBundle { fn get_mut(&mut self, id: FragmentId) -> Option<&mut NativePlanFragment> { self.by_fragment.get_mut(&id) } }",
         "get_mut",
     );
@@ -37839,7 +38418,7 @@ fn collect_native_fragment_bundle(by_fragment: BTreeMap<FragmentId, NativePlanFr
 fn coordinator_artifact_guard_rejects_arbitrary_mutable_bundle_method() {
     let fixture = coor_3b_bundle_interface_fixture("fn fragments_mut(&mut self) {}");
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "fragments_mut",
     );
@@ -38056,7 +38635,7 @@ fn coordinator_artifact_guard_ignores_test_only_bundle_use_alias_impl() {
 fn coordinator_artifact_guard_allows_private_direct_bundle_import() {
     let sources = [Cgo8GuardSource::new(
         "src/coordinator/execution.rs",
-        "use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "use crate::protocol::native::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
@@ -38065,15 +38644,45 @@ fn coordinator_artifact_guard_allows_private_direct_bundle_import() {
 }
 
 #[test]
-fn coordinator_artifact_guard_allows_canonical_bundle_reexport() {
-    let sources = [Cgo8GuardSource::new(
+fn coordinator_artifact_guard_rejects_canonical_bundle_reexport() {
+    assert_coor_3b_fixture_rejected(
         "src/coordinator/execution.rs",
-        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "pub(crate) use crate::protocol::native::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        "forbidden NativeFragmentBundle re-export",
+    );
+}
+
+#[test]
+fn coordinator_artifact_guard_allows_native_encoder_facade_reexport() {
+    let sources = [Cgo8GuardSource::new(
+        "src/protocol/native/encode/mod.rs",
+        "pub(crate) use bundle::NativeFragmentBundle;",
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
-        "a same-name canonical re-export does not introduce an alternate bundle type binding"
+        "the unique native encoder facade must retain its canonical same-name export"
     );
+}
+
+#[test]
+fn cgo_13_review_fix_rejects_non_exact_native_encoder_facade_reexports() {
+    for source in [
+        "pub use bundle::NativeFragmentBundle;",
+        "pub(crate) use shadow::NativeFragmentBundle;",
+        "pub(crate) use bundle::NativeFragmentBundle; pub(crate) use bundle::NativeFragmentBundle;",
+    ] {
+        let sources = [Cgo8GuardSource::new(
+            "src/protocol/native/encode/mod.rs",
+            source,
+        )];
+        let violations = coor_3b_forbidden_path_violations(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("NativeFragmentBundle facade re-export")),
+            "the encoder facade exception must allow exactly one pub(crate) re-export from `bundle`: {source}: {violations:?}"
+        );
+    }
 }
 
 #[test]
@@ -38107,7 +38716,7 @@ fn coordinator_artifact_guard_rejects_nested_owner_bundle_impl() {
         coor_3b_bundle_interface_fixture("")
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "nested NativeFragmentBundle impl",
     );
@@ -38120,7 +38729,7 @@ fn coordinator_artifact_guard_rejects_nested_owner_bundle_trait_impl() {
         coor_3b_bundle_interface_fixture("")
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "nested NativeFragmentBundle impl",
     );
@@ -38132,7 +38741,7 @@ fn coordinator_artifact_guard_rejects_mutable_bundle_return() {
         "fn payload_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> { &mut self.by_fragment }",
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "payload_mut",
     );
@@ -38144,7 +38753,7 @@ fn coordinator_artifact_guard_rejects_bundle_as_mut_trait() {
         "{}\nimpl AsMut<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_mut(&mut self) -> &mut BTreeMap<FragmentId, NativePlanFragment> {{ &mut self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsMut");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "AsMut");
 }
 
 #[test]
@@ -38153,7 +38762,7 @@ fn coordinator_artifact_guard_rejects_bundle_deref_mut_trait() {
         "{}\nimpl DerefMut for NativeFragmentBundle {{ fn deref_mut(&mut self) -> &mut Self::Target {{ &mut self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "DerefMut");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "DerefMut");
 }
 
 #[test]
@@ -38162,7 +38771,7 @@ fn coordinator_artifact_guard_rejects_bundle_map_as_ref_trait() {
         "{}\nimpl AsRef<BTreeMap<FragmentId, NativePlanFragment>> for NativeFragmentBundle {{ fn as_ref(&self) -> &BTreeMap<FragmentId, NativePlanFragment> {{ &self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "AsRef");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "AsRef");
 }
 
 #[test]
@@ -38171,7 +38780,7 @@ fn coordinator_artifact_guard_rejects_bundle_map_deref_trait() {
         "{}\nimpl Deref for NativeFragmentBundle {{ type Target = BTreeMap<FragmentId, NativePlanFragment>; fn deref(&self) -> &Self::Target {{ &self.by_fragment }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Deref");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "Deref");
 }
 
 #[test]
@@ -38180,14 +38789,14 @@ fn coordinator_artifact_guard_rejects_arbitrary_bundle_trait_impl() {
         "{}\nimpl Borrow<NativeFragmentBundle> for NativeFragmentBundle {{ fn borrow(&self) -> &NativeFragmentBundle {{ self }} }}",
         coor_3b_bundle_interface_fixture("")
     );
-    assert_coor_3b_fixture_rejected("src/sql/codegen/fragment/bundle.rs", &fixture, "Borrow");
+    assert_coor_3b_fixture_rejected("src/protocol/native/encode/bundle.rs", &fixture, "Borrow");
 }
 
 #[test]
 fn coordinator_artifact_guard_rejects_bundle_associated_item() {
     let fixture = coor_3b_bundle_interface_fixture("const LEAK: usize = 1;");
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "associated item `const`",
     );
@@ -38201,7 +38810,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_derive_macro() {
         1,
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "bundle owner struct attributes",
     );
@@ -38215,7 +38824,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_impl_attribute_macro() {
         1,
     );
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         &fixture,
         "bundle owner impl attributes",
     );
@@ -38224,7 +38833,7 @@ fn coordinator_artifact_guard_rejects_bundle_owner_impl_attribute_macro() {
 #[test]
 fn coordinator_artifact_guard_rejects_second_bundle_constructor() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/bundle.rs",
+        "src/protocol/native/encode/bundle.rs",
         "struct NativeFragmentBundle { by_fragment: BTreeMap<u32, NativePlanFragment> }\n\
          fn collect_native_fragment_bundle(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }\n\
          fn assemble_payloads(by_fragment: BTreeMap<u32, NativePlanFragment>) -> NativeFragmentBundle { NativeFragmentBundle { by_fragment } }",
@@ -38262,7 +38871,7 @@ fn coordinator_preparation_owner_guard_rejects_engine_concrete_import() {
 #[test]
 fn coordinator_artifact_guard_rejects_encoder_semantic_repair() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/proto_encode/plan.rs",
+        "src/protocol/native/encode/plan.rs",
         "fn encode(node: &Node) { let _ = encoded_node_output_columns(node); }",
         "encoder-semantic-repair",
     );
@@ -38325,16 +38934,264 @@ fn coordinator_scheduler_guard_rejects_terminal_reconstruction() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_requirement() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.runtime_filter_graph(); assert!(!graph.is_empty()); }",
         "graph-derived-runtime-filter",
     );
 }
 
 #[test]
+fn coordinator_runtime_filter_guard_rejects_codegen_projection_call() {
+    assert_coor_3b_fixture_rejected(
+        "src/protocol/native/encode/bundle.rs",
+        "fn encode(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_scheduler_projection_call() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_preparation_projection_wrapper() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "fn prepare_fragments(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); } pub(crate) fn reproject(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_renamed_projection_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/prepare/mod.rs",
+        "pub(crate) use crate::sql::planner::distributed::runtime_filter::project_runtime_filters as reproject; fn prepare_fragments(plan: &DistributedPlan) { let _ = reproject(plan); }",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_projection_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "pub(crate) use crate::sql::planner::distributed::runtime_filter::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_aliased_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "use crate::sql::planner::distributed::runtime_filter as rf; pub(crate) use rf::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_aliased_distributed_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        "use crate::sql::planner::distributed as dp; pub(crate) use dp::runtime_filter::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_relative_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/planner/distributed/projection_escape.rs",
+        "use super::runtime_filter as rf; pub(crate) use rf::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_nested_relative_runtime_filter_glob_reexport() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/planner/distributed/build/projection_escape.rs",
+        "use super::super::runtime_filter as rf; pub(crate) use rf::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_grouped_chained_raw_relative_glob() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/planner/distributed/projection_escape.rs",
+        "use super::{runtime_filter as r#rf}; use r#rf as owner; pub(crate) use owner::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_scopes_sibling_inline_aliases() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/projection_escape.rs",
+        r#"
+mod left {
+    use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection as rf;
+}
+mod right {
+    use crate::connector as rf;
+    pub(crate) use rf::*;
+}
+"#,
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a sibling module's non-projector item alias must not contaminate a safe glob"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_resolves_parent_inline_alias_in_child() {
+    assert_coor_3b_fixture_rejected(
+        "src/coordinator/projection_escape.rs",
+        r#"
+mod parent {
+    use crate::sql::planner::distributed::runtime_filter as rf;
+    mod child {
+        pub(crate) use super::rf::*;
+    }
+}
+"#,
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_fails_closed_on_super_escape() {
+    assert_coor_3b_fixture_rejected(
+        "src/sql/planner/distributed/projection_escape.rs",
+        "pub(crate) use super::super::super::super::super::runtime_filter::*;",
+        "runtime-filter-projection-owner",
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_cross_file_projection_module_alias() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/mod.rs",
+            "pub(crate) use runtime_filter as rf;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/projection_escape.rs",
+            "use crate::sql::planner::distributed::rf::project_runtime_filters as run; fn escape(plan: &DistributedPlan) { run(plan); }",
+        ),
+    ];
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("runtime-filter-projection-owner")
+                && violation.contains("src/sql/planner/distributed/mod.rs")
+                && violation.contains("module alias")
+        }),
+        "the parent projection-module alias must be rejected explicitly: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_allows_direct_non_projector_item_import() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/scheduler/runtime_filter.rs",
+            "use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection; fn consume(_: RuntimeFilterGraphProjection) {}",
+        ),
+    ];
+    let violations = coor_3b_runtime_filter_projection_owner_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a direct import of a non-projector item must remain allowed: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_rejects_consumer_of_projection_wrapper() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); } pub(crate) fn reproject(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        ),
+        Cgo8GuardSource::new(
+            "src/protocol/native/encode/bundle.rs",
+            "use crate::coordinator::prepare::reproject as reroute; fn encode(plan: &DistributedPlan) { reroute(plan); }",
+        ),
+    ];
+    let violations = coor_3b_forbidden_path_violations(&sources);
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("runtime-filter-projection-owner")
+                && violation.contains("src/protocol/native/encode/bundle.rs")
+                && violation.contains("reproject")
+        }),
+        "the aliased consumer of a preparation wrapper must be rejected explicitly: {violations:?}"
+    );
+}
+
+#[test]
+fn coordinator_runtime_filter_guard_fails_closed_on_missing_and_duplicate_owners() {
+    let missing_reference = [
+        Cgo8GuardSource::new("src/lib.rs", "mod coordinator; mod sql;"),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) {}",
+        ),
+    ];
+    let missing_violations = coor_3b_runtime_filter_projection_owner_violations(&missing_reference);
+    assert!(
+        missing_violations.iter().any(|violation| {
+            violation.contains(COOR_3B_RF_PROJECTION_PREPARE_OWNER)
+                && violation.contains("exactly one direct production reference")
+        }),
+        "missing preparation reference must fail closed: {missing_violations:?}"
+    );
+
+    let duplicate_definition = [
+        Cgo8GuardSource::new("src/lib.rs", "mod coordinator; mod sql;"),
+        Cgo8GuardSource::new(
+            "src/sql/planner/distributed/runtime_filter.rs",
+            "pub(crate) fn project_runtime_filters(plan: &DistributedPlan) {} fn project_runtime_filters(other: &DistributedPlan) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/coordinator/prepare/mod.rs",
+            "fn prepare_fragments(plan: &DistributedPlan) { let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan); }",
+        ),
+    ];
+    let duplicate_violations =
+        coor_3b_runtime_filter_projection_owner_violations(&duplicate_definition);
+    assert!(
+        duplicate_violations.iter().any(|violation| {
+            violation.contains(COOR_3B_RF_PROJECTION_PLANNER_OWNER)
+                && violation.contains("definitions=2")
+        }),
+        "duplicate planner definition must fail closed: {duplicate_violations:?}"
+    );
+}
+
+#[test]
 fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.r#runtime_filter_graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38343,7 +39200,7 @@ fn coordinator_runtime_filter_guard_rejects_raw_graph_method() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_aliased_graph_requirement() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let graph = plan.graph(); require_non_empty(graph); }",
         "graph-derived-runtime-filter",
     );
@@ -38352,7 +39209,7 @@ fn coordinator_runtime_filter_guard_rejects_aliased_graph_requirement() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_ufcs() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = DistributedPlan::runtime_filter_graph(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38361,7 +39218,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_ufcs() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_scoped_graph_function_item() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let read = DistributedPlan::runtime_filter_graph; let _ = read(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38370,7 +39227,7 @@ fn coordinator_runtime_filter_guard_rejects_scoped_graph_function_item() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_parenthesized_graph_ufcs() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = (DistributedPlan::runtime_filter_graph)(plan); }",
         "graph-derived-runtime-filter",
     );
@@ -38379,7 +39236,7 @@ fn coordinator_runtime_filter_guard_rejects_parenthesized_graph_ufcs() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_field_access() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn plan_runtime_filters(plan: &DistributedPlan) { let _ = plan.runtime_filter_graph; }",
         "graph-derived-runtime-filter",
     );
@@ -38397,7 +39254,7 @@ fn coordinator_preparation_owner_guard_rejects_production_include_macro() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_expr_struct_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { runtime_filter_graph: usize } fn make() { let _ = Holder { runtime_filter_graph: 0 }; }",
         "graph-derived-runtime-filter",
     );
@@ -38406,7 +39263,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_expr_struct_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_pattern_struct_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { graph: usize } fn read(holder: Holder) { let Holder { graph: _ } = holder; }",
         "graph-derived-runtime-filter",
     );
@@ -38415,7 +39272,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_pattern_struct_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_expression_macro_tokens() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "fn read() { inspect!(r#runtime_filter_graph); }",
         "graph-derived-runtime-filter",
     );
@@ -38424,7 +39281,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_expression_macro_tokens() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38433,7 +39290,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_self_field() {
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_field_through_aliased_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder { plan: DistributedPlan } impl Holder { fn leak(&self) { let first = &self.plan; let second = first; let _ = (*second).runtime_filter_graph; } }",
         "graph-derived-runtime-filter",
     );
@@ -38442,7 +39299,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_field_through_aliased_self_fie
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_parameter_type_alias() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "type P = DistributedPlan; fn leak(p: &P) { let _ = p.graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38451,7 +39308,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_parameter_type_al
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_aliased_named_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "type P = DistributedPlan; struct Holder { plan: P } impl Holder { fn leak(&self) { let _ = self.plan.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38460,7 +39317,7 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_aliased_named_sel
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_read_through_tuple_self_field() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Holder(DistributedPlan); impl Holder { fn leak(&self) { let _ = self.0.graph(); } }",
         "graph-derived-runtime-filter",
     );
@@ -38469,28 +39326,83 @@ fn coordinator_runtime_filter_guard_rejects_graph_read_through_tuple_self_field(
 #[test]
 fn coordinator_runtime_filter_guard_rejects_graph_type_dependency() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "use crate::runtime_filter::model::graph::RuntimeFilterGraph; fn require(graph: &RuntimeFilterGraph) {}",
         "graph-derived-runtime-filter",
     );
 }
 
 #[test]
-fn coordinator_runtime_filter_guard_allows_read_only_graph_projection_owner() {
+fn coordinator_preparation_runtime_filter_guard_allows_projection_owner() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
-        "use crate::sql::planner::distributed::runtime_filter::{RuntimeFilterGraphProjection, project_runtime_filters}; fn plan(plan: &DistributedPlan) { let _ = project_runtime_filters(plan); }",
+        "src/coordinator/prepare/mod.rs",
+        r#"
+// project_runtime_filters(plan) in a comment is ignored.
+const NOTE: &str = "project_runtime_filters(plan)";
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+}
+#[cfg(test)]
+pub(crate) fn reproject(plan: &DistributedPlan) {
+    let _ = project_runtime_filters(plan);
+}
+"#,
     )];
     assert!(
         coor_3b_forbidden_path_violations(&sources).is_empty(),
-        "the independent RF sidecar owner may consume the sealed Graph projection API"
+        "preparation may consume the sealed Graph projection API"
+    );
+}
+
+#[test]
+fn coordinator_preparation_runtime_filter_guard_ignores_cfg_test_trait_default_method() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        r#"
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+}
+trait TestOnlyProjection {
+    #[cfg(test)]
+    fn reproject(plan: &DistributedPlan) {
+        let _ = project_runtime_filters(plan);
+    }
+}
+"#,
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a cfg(test) trait default method is outside production projection ownership"
+    );
+}
+
+#[test]
+fn coordinator_preparation_runtime_filter_guard_ignores_cfg_test_match_arm() {
+    let sources = [Cgo8GuardSource::new(
+        "src/coordinator/prepare/mod.rs",
+        r#"
+fn prepare_fragments(plan: &DistributedPlan) {
+    let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan);
+    match 0 {
+        #[cfg(test)]
+        _ => {
+            let _ = project_runtime_filters(plan);
+        }
+        _ => {}
+    }
+}
+"#,
+    )];
+    assert!(
+        coor_3b_forbidden_path_violations(&sources).is_empty(),
+        "a cfg(test) match arm is outside production projection ownership"
     );
 }
 
 #[test]
 fn coordinator_runtime_filter_guard_rejects_unrelated_graph_method_in_opaque_scope() {
     assert_coor_3b_fixture_rejected(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Other; impl Other { fn graph(&self) {} } fn inspect(other: &Other) { other.graph(); }",
         "graph-derived-runtime-filter",
     );
@@ -38523,7 +39435,7 @@ fn coordinator_runtime_filter_guard_allows_unrelated_self_field_graph_method() {
 #[test]
 fn coordinator_runtime_filter_guard_ignores_test_only_self_field_graph_read() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "#[cfg(test)] struct Holder { plan: DistributedPlan } #[cfg(test)] impl Holder { fn leak(&self) { let _ = self.plan.runtime_filter_graph; } }",
     )];
     assert!(
@@ -38535,7 +39447,7 @@ fn coordinator_runtime_filter_guard_ignores_test_only_self_field_graph_read() {
 #[test]
 fn coordinator_runtime_filter_guard_ignores_test_only_impl_method_graph_read() {
     let sources = [Cgo8GuardSource::new(
-        "src/sql/codegen/fragment/runtime_filter.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
         "struct Other; impl Other { #[cfg(test)] fn inspect(&self) { self.graph(); } }",
     )];
     assert!(
@@ -38570,6 +39482,7 @@ fn coordinator_preparation_guard_ignores_comments_and_test_only_items() {
     let sources = [Cgo8GuardSource::new(
         "src/coordinator/prepare/mod.rs",
         "// struct MultiFragmentBuildResult; fn prepare(plan: &mut DistributedPlan) {}\n\
+         fn prepare_fragments(plan: &DistributedPlan) { let _ = crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan); }\n\
          #[cfg(test)] mod tests { fn clone_and_patch(plan: &DistributedPlan) { let mut patched = plan.clone(); patched.fragments_mut(); } }",
     )];
     assert!(
@@ -38675,14 +39588,14 @@ fn coor_3b_production_guard_sources(repo: &Path) -> Vec<Cgo8GuardSource> {
 }
 
 #[test]
-fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_modules() {
+fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_encoder_modules() {
     let root = std::env::temp_dir().join(format!(
         "coor_3b_recursive_guard_{}_{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ));
     let files = [
-        ("src/lib.rs", "mod coordinator; mod sql;"),
+        ("src/lib.rs", "mod coordinator; mod protocol; mod sql;"),
         ("src/coordinator/mod.rs", "mod scheduler;"),
         ("src/coordinator/scheduler/mod.rs", "mod drift;"),
         (
@@ -38703,7 +39616,9 @@ fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_m
             "pub(crate) fn prepare_scan_bindings() {}",
         ),
         ("src/sql/codegen/fragment/mod.rs", ""),
-        ("src/sql/codegen/proto_encode/mod.rs", ""),
+        ("src/protocol/mod.rs", "mod native;"),
+        ("src/protocol/native/mod.rs", "mod encode;"),
+        ("src/protocol/native/encode/mod.rs", ""),
     ];
     for (relative, source) in files {
         let path = root.join(relative);
@@ -38720,6 +39635,7 @@ fn coordinator_preparation_owner_guard_recurses_new_scheduler_and_codegen_scan_m
         "src/coordinator/scheduler/drift.rs",
         "src/sql/codegen/scan/mod.rs",
         "src/sql/codegen/scan/preparation.rs",
+        "src/protocol/native/encode/mod.rs",
     ] {
         assert!(
             paths.contains(expected),
@@ -38841,10 +39757,9 @@ fn coordinator_preparation_owner() {
         owner_violations.join("\n")
     );
     for root in [
+        "src/coordinator/prepare/",
         "src/coordinator/scheduler/",
-        "src/sql/codegen/scan/",
-        "src/sql/codegen/fragment/",
-        "src/sql/codegen/proto_encode/",
+        "src/protocol/native/encode/",
     ] {
         assert!(
             source_paths.iter().any(|path| path.starts_with(root)),
@@ -38854,7 +39769,7 @@ fn coordinator_preparation_owner() {
     assert_eq!(
         source_paths
             .iter()
-            .filter(|path| **path == "src/sql/codegen/fragment/bundle.rs")
+            .filter(|path| **path == "src/protocol/native/encode/bundle.rs")
             .count(),
         1,
         "COOR-3B production inventory must contain exactly one native bundle owner"
@@ -38949,10 +39864,630 @@ fn coordinator_prepared_fragment_set() {
     }
 }
 
+fn cgo_13_sql_encoder_surface_violations(sources: &[Cgo8GuardSource]) -> Vec<String> {
+    const ENCODER_ROOT: &[&str] = &["crate", "protocol", "native", "encode"];
+    const OLD_FRAGMENT_ROOT: &[&str] = &["crate", "sql", "codegen", "fragment"];
+    const OLD_PROTO_ROOT: &[&str] = &["crate", "sql", "codegen", "proto_encode"];
+    const FACADE_FUNCTIONS: &[&str] = &[
+        "encode_native_fragment_bundle",
+        "encode_data_partition",
+        "encode_instance_params",
+    ];
+
+    fn path_starts_with(path: &[String], prefix: &[&str]) -> bool {
+        path.len() >= prefix.len()
+            && path
+                .iter()
+                .zip(prefix)
+                .all(|(actual, expected)| actual == expected)
+    }
+
+    fn path_targets_encoder_source(path: &str) -> bool {
+        let normalized = path.replace('\\', "/");
+        normalized.contains("protocol/native/encode")
+            || normalized.contains("sql/codegen/fragment")
+            || normalized.contains("sql/codegen/proto_encode")
+    }
+
+    fn encoder_call_path(
+        expression: &syn::Expr,
+        aliases: &RustScopedAliases,
+        source_path: &str,
+        inline_modules: &[String],
+    ) -> Option<String> {
+        let expression = match expression {
+            syn::Expr::Return(returned) => returned.expr.as_deref()?,
+            syn::Expr::Try(try_expr) => try_expr.expr.as_ref(),
+            syn::Expr::Await(await_expr) => await_expr.base.as_ref(),
+            syn::Expr::Paren(paren) => paren.expr.as_ref(),
+            syn::Expr::Group(group) => group.expr.as_ref(),
+            expression => expression,
+        };
+        let syn::Expr::Call(call) = expression else {
+            return None;
+        };
+        let syn::Expr::Path(path) = call.func.as_ref() else {
+            return None;
+        };
+        let segments = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| coor_3b_ident_text(&segment.ident))
+            .collect::<Vec<_>>();
+        let resolved =
+            rust_resolve_scoped_paths(&segments, inline_modules, aliases, &mut BTreeSet::new(), 0)
+                .unwrap_or_else(|| {
+                    vec![RustScopedUsePath {
+                        segments,
+                        inline_modules: inline_modules.to_vec(),
+                    }]
+                });
+        resolved.into_iter().find_map(|path| {
+            let canonical = rust_canonical_path_segments_in_scope(
+                &path.segments,
+                source_path,
+                &path.inline_modules,
+            )?;
+            (path_starts_with(&canonical, ENCODER_ROOT)
+                && canonical
+                    .get(ENCODER_ROOT.len())
+                    .is_some_and(|name| FACADE_FUNCTIONS.contains(&name.as_str())))
+            .then(|| canonical.join("::"))
+        })
+    }
+
+    fn collect_forwarders(
+        items: &[syn::Item],
+        aliases: &RustScopedAliases,
+        source_path: &str,
+        inline_modules: &[String],
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                continue;
+            }
+            match item {
+                syn::Item::Fn(function) if !matches!(function.vis, syn::Visibility::Inherited) => {
+                    let expression = match function.block.stmts.last() {
+                        Some(syn::Stmt::Expr(expression, _)) => Some(expression),
+                        _ => None,
+                    };
+                    if let Some(path) = expression.and_then(|expression| {
+                        encoder_call_path(expression, aliases, source_path, inline_modules)
+                    }) {
+                        violations.push(format!(
+                            "sql-encoder-forwarder: {source_path} visible function `{}` forwards directly to `{path}`",
+                            function.sig.ident
+                        ));
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, nested)) = &module.content {
+                        let mut nested_modules = inline_modules.to_vec();
+                        nested_modules.push(coor_3b_ident_text(&module.ident));
+                        collect_forwarders(
+                            nested,
+                            aliases,
+                            source_path,
+                            &nested_modules,
+                            violations,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_include_indirections(
+        file: &syn::File,
+        source_path: &str,
+        violations: &mut Vec<String>,
+    ) {
+        struct Audit<'a> {
+            source_path: &'a str,
+            violations: &'a mut Vec<String>,
+        }
+
+        impl<'ast> syn::visit::Visit<'ast> for Audit<'_> {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_item(self, item);
+            }
+
+            fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_impl_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_impl_item(self, item);
+            }
+
+            fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_trait_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_trait_item(self, item);
+            }
+
+            fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_foreign_item_attrs(item)) {
+                    return;
+                }
+                syn::visit::visit_foreign_item(self, item);
+            }
+
+            fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_stmt_attrs(stmt)) {
+                    return;
+                }
+                syn::visit::visit_stmt(self, stmt);
+            }
+
+            fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+                if nfe_4_syn_attrs_require_test(nfe_4_syn_expr_attrs(expr)) {
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+
+            fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+                if nfe_4_syn_attrs_require_test(&arm.attrs) {
+                    return;
+                }
+                syn::visit::visit_arm(self, arm);
+            }
+
+            fn visit_macro(&mut self, item: &'ast syn::Macro) {
+                if item.path.is_ident("include") {
+                    match syn::parse2::<syn::LitStr>(item.tokens.clone()) {
+                        Ok(path) if path_targets_encoder_source(&path.value()) => {
+                            self.violations.push(format!(
+                                "sql-encoder-source-indirection: {} includes an encoder source",
+                                self.source_path
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(_) => self.violations.push(format!(
+                            "sql-encoder-source-indirection: {} has a production include target that cannot be proven safe",
+                            self.source_path
+                        )),
+                    }
+                }
+                syn::visit::visit_macro(self, item);
+            }
+        }
+
+        let mut audit = Audit {
+            source_path,
+            violations,
+        };
+        syn::visit::Visit::visit_file(&mut audit, file);
+    }
+
+    let mut violations = Vec::new();
+    for source in sources {
+        if !source.path.starts_with("src/sql/") {
+            continue;
+        }
+        let canonical_paths = rust_production_canonical_paths(&source.text, &source.path);
+        if canonical_paths.iter().any(|path| {
+            path_starts_with(path, OLD_FRAGMENT_ROOT) || path_starts_with(path, OLD_PROTO_ROOT)
+        }) {
+            violations.push(format!(
+                "old-sql-encoder-path: {} references a retired sql::codegen encoder owner",
+                source.path
+            ));
+        }
+
+        let scoped_aliases = rust_production_scoped_aliases(&source.text);
+        for raw in rust_raw_production_use_statements(&source.text) {
+            let resolved = rust_resolve_scoped_paths(
+                &raw.path.segments,
+                &raw.inline_modules,
+                &scoped_aliases,
+                &mut BTreeSet::new(),
+                0,
+            )
+            .unwrap_or_else(|| {
+                vec![RustScopedUsePath {
+                    segments: raw.path.segments.clone(),
+                    inline_modules: raw.inline_modules.clone(),
+                }]
+            });
+            let resolves_to_encoder = resolved.into_iter().any(|path| {
+                rust_canonical_path_segments_in_scope(
+                    &path.segments,
+                    &source.path,
+                    &path.inline_modules,
+                )
+                .is_some_and(|canonical| path_starts_with(&canonical, ENCODER_ROOT))
+            });
+            if resolves_to_encoder && !path_starts_with(&raw.path.segments, ENCODER_ROOT) {
+                violations.push(format!(
+                    "sql-encoder-alias-shell: {} imports the encoder through non-canonical path `{}`",
+                    source.path,
+                    raw.path.segments.join("::")
+                ));
+            }
+        }
+
+        for import in rust_production_scoped_use_statements(&source.text) {
+            let path = rust_use_path(&import.import)
+                .split("::")
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !path_starts_with(&path, ENCODER_ROOT) {
+                continue;
+            }
+            let tail = &path[ENCODER_ROOT.len()..];
+            let alias = import
+                .import
+                .split_once(" as ")
+                .map(|(_, alias)| alias.to_string());
+            if rust_use_is_public(&import.import) {
+                violations.push(format!(
+                    "sql-encoder-reexport: {} publicly re-exports `{}`",
+                    source.path,
+                    rust_use_path(&import.import)
+                ));
+            }
+            if tail.is_empty() || tail.first().is_some_and(|leaf| leaf == "*") || alias.is_some() {
+                violations.push(format!(
+                    "sql-encoder-alias-shell: {} imports the encoder through `{}`",
+                    source.path, import.import
+                ));
+            }
+        }
+
+        for module in rust_module_items(&source.text) {
+            if cfg_attributes_test_requirement(module.attributes.iter().map(String::as_str))
+                == CfgTestRequirement::RequiresTest
+            {
+                continue;
+            }
+            let paths = module
+                .attributes
+                .iter()
+                .filter_map(|attribute| path_attribute_value(attribute))
+                .chain(
+                    module
+                        .attributes
+                        .iter()
+                        .flat_map(|attribute| cfg_attr_generated_path_values(attribute)),
+                );
+            if paths
+                .into_iter()
+                .any(|path| path_targets_encoder_source(&path))
+            {
+                violations.push(format!(
+                    "sql-encoder-source-indirection: {} module `{}` redirects to an encoder source",
+                    source.path, module.name
+                ));
+            }
+        }
+
+        match syn::parse_file(&source.text) {
+            Ok(file) => {
+                collect_forwarders(
+                    &file.items,
+                    &scoped_aliases,
+                    &source.path,
+                    &[],
+                    &mut violations,
+                );
+                collect_include_indirections(&file, &source.path, &mut violations);
+            }
+            Err(error) => violations.push(format!(
+                "sql-encoder-source-parse: {} production AST parse failed: {error}",
+                source.path
+            )),
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_old_path_reexport() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "pub(crate) use crate::sql::codegen::fragment::NativeFragmentBundle;",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("old-sql-encoder-path")),
+        "old-path SQL encoder re-export must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_forwarding_wrapper() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { crate::protocol::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-forwarder")),
+        "SQL forwarding wrapper must be rejected: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_rejects_reexport_alias_and_indirection() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/reexport.rs",
+            "pub(crate) use crate::protocol::native::encode::NativeFragmentBundle;",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/alias.rs",
+            "use crate::protocol::native::encode as native_wire; fn consume(_: native_wire::NativeFragmentBundle) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/hidden.rs",
+            "#[path = \"../../protocol/native/encode/mod.rs\"] mod encode;",
+        ),
+    ];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    for expected in [
+        "sql-encoder-reexport",
+        "sql-encoder-alias-shell",
+        "sql-encoder-source-indirection",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "SQL encoder surface guard must reject `{expected}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_13_sql_encoder_surface_guard_allows_canonical_private_consumption() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/caller.rs",
+        "use crate::protocol::native::encode::{NativeFragmentBundle, encode_native_fragment_bundle}; fn consume(bundle: &NativeFragmentBundle) { let _ = bundle; } fn call(plan: &DistributedPlan, prepared: &PreparedFragmentSet) { let _ = encode_native_fragment_bundle(plan, prepared); }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "ordinary canonical SQL consumers must remain legal: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_review_fix_rejects_chained_encoder_alias_and_visible_tail_forwarder() {
+    let sources = [
+        Cgo8GuardSource::new(
+            "src/sql/codegen/alias.rs",
+            "use crate::protocol::native as native_protocol; use native_protocol::encode::NativeFragmentBundle; fn consume(_: &NativeFragmentBundle) {}",
+        ),
+        Cgo8GuardSource::new(
+            "src/sql/codegen/forwarder.rs",
+            "pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { validate(plan)?; crate::protocol::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+        ),
+    ];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    for expected in ["sql-encoder-alias-shell", "sql-encoder-forwarder"] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "SQL encoder surface guard must reject `{expected}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn cgo_13_review_fix_ignores_test_only_include_indirection_with_production_include() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(\"safe.rs\"); #[cfg(test)] include!(\"../../protocol/native/encode/mod.rs\");",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "test-only encoder include must stay outside the production surface: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_rejects_upper_module_alias_forwarder() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "use crate::protocol as p; use crate::protocol::native::encode::NativeFragmentBundle; pub(crate) fn encode(plan: &DistributedPlan, prepared: &PreparedFragmentSet) -> Result<NativeFragmentBundle, String> { p::native::encode::encode_native_fragment_bundle(plan, prepared) }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-forwarder")),
+        "an upper-module alias must not hide a visible SQL encoder forwarder: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_allows_private_upper_module_alias_consumption() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/planner/caller.rs",
+        "use crate::protocol as p; fn consume(plan: &DistributedPlan, prepared: &PreparedFragmentSet) { let _ = p::native::encode::encode_native_fragment_bundle(plan, prepared); }",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "an ordinary private canonical consumer is not a forwarding surface: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_rejects_dynamic_production_include_indirection() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/protocol/native/encode/mod.rs\"));",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("sql-encoder-source-indirection")),
+        "a dynamic production include must fail closed before it can include encoder source: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_final_review_allows_safe_literal_and_test_only_dynamic_include() {
+    let sources = [Cgo8GuardSource::new(
+        "src/sql/codegen/mod.rs",
+        "include!(\"safe.rs\"); #[cfg(test)] include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/protocol/native/encode/mod.rs\"));",
+    )];
+    let violations = cgo_13_sql_encoder_surface_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "a safe literal include and test-only dynamic include must remain legal: {violations:?}"
+    );
+}
+
+#[test]
+fn cgo_13_native_encoder_has_one_top_level_owner() {
+    let repo = Path::new(manifest_dir());
+    let encoder_root = repo.join("src/protocol/native/encode");
+    let encoder_sources = rs_files(&encoder_root);
+    assert!(
+        !encoder_sources.is_empty(),
+        "CGO-13 native encoder inventory must be non-empty under src/protocol/native/encode"
+    );
+
+    let encoder_production = encoder_sources
+        .iter()
+        .map(|path| {
+            rust_sanitized_production_text(
+                &fs::read_to_string(path).expect("read top-level native encoder source"),
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        rust_named_type_declaration_count(&encoder_production, "NativeFragmentBundle"),
+        1,
+        "src/protocol/native/encode must contain exactly one production NativeFragmentBundle declaration"
+    );
+    assert_eq!(
+        rust_named_function_declaration_count(&encoder_production, "encode_native_fragment_bundle"),
+        1,
+        "src/protocol/native/encode must contain exactly one production native bundle constructor"
+    );
+
+    let sql_sources = rs_files(&repo.join("src/sql"))
+        .into_iter()
+        .map(|path| {
+            Cgo8GuardSource::new(
+                rel(&path),
+                fs::read_to_string(&path).expect("read SQL production source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sql_sources.is_empty(),
+        "CGO-13 SQL production inventory must be non-empty"
+    );
+    let sql_encoder_declarations = sql_sources
+        .iter()
+        .flat_map(|source| {
+            let production = rust_sanitized_production_text(&source.text);
+            [
+                "NativeFragmentBundle",
+                "NativePlanEncodeContext",
+                "encode_native_fragment_bundle",
+                "encode_distributed_plan",
+                "encode_distributed_plan_with_context",
+                "encode_data_partition",
+                "encode_instance_params",
+            ]
+            .into_iter()
+            .filter_map(move |name| {
+                let declarations = rust_named_type_declaration_count(&production, name)
+                    + rust_named_function_declaration_count(&production, name);
+                (declarations > 0).then(|| format!("{} declares `{name}`", source.path))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        sql_encoder_declarations.is_empty(),
+        "native protobuf encoder declarations must not remain under src/sql:\n{}",
+        sql_encoder_declarations.join("\n")
+    );
+    let sql_surface_violations = cgo_13_sql_encoder_surface_violations(&sql_sources);
+    assert!(
+        sql_surface_violations.is_empty(),
+        "native protobuf encoder surfaces must not remain under src/sql:\n{}",
+        sql_surface_violations.join("\n")
+    );
+}
+
+#[test]
+fn cgo_13_preparation_owns_native_scan_and_runtime_filter_projection() {
+    let repo = Path::new(manifest_dir());
+    for required in [
+        "src/coordinator/prepare/iceberg_delta.rs",
+        "src/coordinator/scheduler/runtime_filter.rs",
+        "src/connector/iceberg/scan_range.rs",
+        "src/connector/scan_model/starrocks.rs",
+        "src/connector/scan_planning/starrocks.rs",
+    ] {
+        assert!(
+            repo.join(required).is_file(),
+            "missing CGO-13 owner {required}"
+        );
+    }
+    assert!(
+        cgo_13_sql_codegen_retirement_violations(repo).is_empty(),
+        "the retired SQL namespace must not remain as a preparation owner"
+    );
+    let projection =
+        fs::read_to_string(repo.join("src/coordinator/prepare/projection.rs")).unwrap();
+    assert!(projection.contains("runtime_filter_projection: RuntimeFilterGraphProjection"));
+    assert!(projection.contains("fn runtime_filter_projection(&self)"));
+    let bundle = fs::read_to_string(repo.join("src/protocol/native/encode/bundle.rs")).unwrap();
+    assert!(bundle.contains("prepared.scan_bindings()"));
+    assert!(bundle.contains("prepared.runtime_filter_projection()"));
+    assert!(!bundle.contains("NativePlanEncodeContext"));
+    let encoder = fs::read_to_string(repo.join("src/protocol/native/encode/plan.rs")).unwrap();
+    assert!(!encoder.contains("project_runtime_filters"));
+    let preparation =
+        fs::read_to_string(repo.join("src/coordinator/prepare/scan_preparation.rs")).unwrap();
+    for required in [
+        "plan_iceberg_scan_ranges",
+        "plan_native_starrocks_scan",
+        "ScanExecutionBindings",
+    ] {
+        assert!(
+            preparation.contains(required),
+            "coordinator preparation must consume canonical connector planning and own prepared sidecars: missing `{required}`"
+        );
+    }
+    assert!(
+        !repo.join("src/coordinator/prepare/native_scan.rs").exists(),
+        "coordinator must not duplicate canonical connector scan models or planning"
+    );
+}
+
 #[test]
 fn coordinator_artifact_separation() {
-    let bundle_path = src_dir().join("sql/codegen/fragment/bundle.rs");
-    assert!(bundle_path.is_file(), "COOR-3B requires fragment/bundle.rs");
+    let bundle_path = src_dir().join("protocol/native/encode/bundle.rs");
+    assert!(
+        bundle_path.is_file(),
+        "COOR-3B requires protocol/native/encode/bundle.rs"
+    );
     let bundle = fs::read_to_string(bundle_path).expect("read native bundle");
     for required in [
         "struct NativeFragmentBundle",
@@ -39005,12 +40540,12 @@ fn coordinator_artifact_separation() {
     validate_native_bundle_construction_contract(&bundle)
         .expect("bundle construction must be unique to the file-private collector");
 
-    let fragment_dir = src_dir().join("sql/codegen/fragment");
+    let encoder_dir = src_dir().join("protocol/native/encode");
     assert!(
-        !fragment_dir.join("request.rs").exists(),
+        !encoder_dir.join("request.rs").exists(),
         "FragmentBuildRequest must be deleted"
     );
-    let production = production_rs_files(&fragment_dir)
+    let production = production_rs_files(&encoder_dir)
         .into_iter()
         .map(|path| fs::read_to_string(path).expect("read fragment source"))
         .collect::<String>();
@@ -39021,7 +40556,7 @@ fn coordinator_artifact_separation() {
         );
     }
     let test_build =
-        fs::read_to_string(fragment_dir.join("build.rs")).expect("read test-only fragment fixture");
+        fs::read_to_string(encoder_dir.join("build.rs")).expect("read test-only fragment fixture");
     assert!(
         !test_build.contains("struct TestBuildFixture"),
         "test fixture must pass prepared/native/boundary artifacts explicitly"

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic Iceberg literal JSON serialization for native protobuf fields.
+
 pub(crate) fn serialize_iceberg_literal_json(
     literal: &iceberg::spec::Literal,
 ) -> Result<String, String> {

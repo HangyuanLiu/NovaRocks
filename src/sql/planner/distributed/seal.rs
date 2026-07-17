@@ -79,8 +79,8 @@ impl DistributedPlan {
         &self.data.runtime_filter_graph
     }
 
-    // Consumed on the production codegen path (`project_boundary_reports` in
-    // `sql::codegen::fragment`) and, later, by CGO-9C occurrence allocation.
+    // Consumed by coordinator preparation for production boundary validation.
+    // The remaining boundary projection is test-only diagnostics.
     pub(crate) fn boundaries(&self) -> &BoundaryCatalog {
         &self.data.boundaries
     }

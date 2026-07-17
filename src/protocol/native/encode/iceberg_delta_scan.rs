@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic Iceberg delta scan-to-protobuf mapping for the native boundary.
+
 use std::collections::HashMap;
 
+use crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan;
 use crate::exec::node::iceberg_delta_scan::{
     BaseDataFileLineage, DeletedFileVisibility, DeltaScanDeleteSidePayload, DeltaSourceFile,
     DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
 };
-use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
 pub(super) fn encode_iceberg_delta_scan_plan_native(
     plan: &IcebergDeltaScanRuntimePlan,

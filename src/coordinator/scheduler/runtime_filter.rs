@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Codegen-stage runtime-filter plan metadata.
+//! Scheduler-stage runtime-filter plan metadata.
 
 use std::collections::HashMap;
 
-use crate::sql::planner::distributed::runtime_filter::{
-    RuntimeFilterGraphProjection, project_runtime_filters,
-};
-use crate::sql::planner::distributed::{DistributedPlan, FragmentId};
+use crate::sql::planner::distributed::FragmentId;
+use crate::sql::planner::distributed::runtime_filter::RuntimeFilterGraphProjection;
 use crate::sql::planner::physical::JoinExecutionMode;
 
 #[derive(Clone, Debug)]
@@ -42,9 +40,9 @@ pub(crate) struct RuntimeFilterPlanResult {
 }
 
 pub(crate) fn plan_runtime_filters(
-    plan: &DistributedPlan,
+    projection: &RuntimeFilterGraphProjection,
 ) -> Result<Option<RuntimeFilterPlanResult>, String> {
-    runtime_filter_plan(&project_runtime_filters(plan)?)
+    runtime_filter_plan(projection)
 }
 
 fn runtime_filter_plan(
@@ -120,6 +118,7 @@ mod tests {
     use crate::runtime_filter::model::graph::RuntimeFilterGraph;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::distributed::runtime_filter::project_runtime_filters;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
@@ -194,9 +193,11 @@ mod tests {
         };
 
         assert!(plan.runtime_filter_graph().is_empty());
+        let projection =
+            project_runtime_filters(&plan).expect("project empty runtime-filter graph");
         assert!(
-            plan_runtime_filters(&plan)
-                .expect("project empty runtime-filter graph")
+            plan_runtime_filters(&projection)
+                .expect("plan empty runtime-filter projection")
                 .is_none()
         );
     }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod iceberg_delta;
 mod projection;
 pub(crate) mod scan;
 mod scan_preparation;
@@ -100,6 +101,8 @@ pub(crate) fn prepare_fragments(
         plan.boundaries().contracts(),
         &sealed_ids,
     )?;
+    let runtime_filter_projection =
+        crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?;
     let scan_bindings = prepare_scan_bindings(plan, connectors, resolver)?;
 
     let mut by_fragment = BTreeMap::new();
@@ -225,6 +228,7 @@ pub(crate) fn prepare_fragments(
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan_bindings,
+        runtime_filter_projection,
         topological_fragment_order,
         execution_anchor_fragment_id,
         plan.edges().to_vec(),

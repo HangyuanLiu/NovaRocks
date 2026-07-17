@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Deterministic expression-to-protobuf mapping for the native boundary.
+
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 

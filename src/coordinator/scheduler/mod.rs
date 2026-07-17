@@ -48,11 +48,13 @@
 //!
 //! # Scan-split policy (Scheme C)
 //!
-//! D2 scan split policy: scheme C — partition the codegen-built per_node_scan_ranges
+//! D2 scan split policy: scheme C — partition the preparation-built per_node_scan_ranges
 //! across instances. The scheduler never re-invokes to_thrift_scan, so the
-//! min_max/cloud_props/change_op context (only known at codegen) is preserved.
+//! min_max/cloud_props/change_op context (known during preparation) is preserved.
 //!
 //! Round-robin: `range[i]` goes to `instance[i % count]`.
+
+mod runtime_filter;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -63,9 +65,12 @@ use crate::runtime::endpoint::{
     FragmentDestination, RuntimeEndpoint, RuntimeFilterProberDestination,
 };
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::sql::codegen::fragment::RuntimeFilterPlanResult;
 use crate::sql::planner::distributed::{
     FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
+};
+
+pub(crate) use runtime_filter::{
+    PlannedRuntimeFilter, RuntimeFilterPlanResult, plan_runtime_filters,
 };
 
 pub(crate) type LiveBackend = (usize, SocketAddr);
@@ -574,10 +579,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
 
+    use super::RuntimeFilterPlanResult;
     use crate::coordinator::prepare::{
         PreparedFragmentRole, PreparedFragmentSet, prepared_fragment_set_for_test,
     };
-    use crate::sql::codegen::fragment::RuntimeFilterPlanResult;
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };

@@ -53,16 +53,18 @@ use crate::coordinator::profile::{
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
 #[cfg(test)]
 use crate::coordinator::scheduler::SchedulingPlan;
-use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
+use crate::coordinator::scheduler::{
+    FragmentInstancePlacement, FragmentScheduler, RuntimeFilterPlanResult,
+};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
 use crate::coordinator::write::{RegisteredWriteCoordinator, WriteCoordinator};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
+use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_state::QueryState;
 use crate::sql::analysis::cte::CteId;
-use crate::sql::codegen::fragment::{NativeFragmentBundle, RuntimeFilterPlanResult};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{FragmentEdge, FragmentEdgeKind, FragmentId};
 
@@ -240,10 +242,9 @@ impl ExecutionCoordinator {
                     cte_id,
                     receive_producer_column_ids,
                 } => {
-                    let native_partition =
-                        crate::sql::codegen::proto_encode::plan::encode_data_partition(
-                            &e.output_partition,
-                        )?;
+                    let native_partition = crate::protocol::native::encode::encode_data_partition(
+                        &e.output_partition,
+                    )?;
                     cte_consumers.entry(*cte_id).or_default().push((
                         e.target_fragment_id,
                         e.target_exchange_node_id,
@@ -420,7 +421,7 @@ impl ExecutionCoordinator {
                     0
                 };
                 let native_instance_params =
-                    crate::sql::codegen::proto_encode::instance::encode_instance_params(
+                    crate::protocol::native::encode::encode_instance_params(
                         &query_id,
                         placement,
                         query_options.as_ref(),
@@ -1878,7 +1879,7 @@ mod native_contract_tests {
         )
         .expect("prepare production execution artifact");
         let native_bundle =
-            crate::sql::codegen::fragment::encode_native_fragment_bundle(&plan, &prepared)
+            crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
                 .expect("encode production execution artifact");
         (prepared, native_bundle)
     }
@@ -2290,12 +2291,12 @@ mod native_contract_tests {
     }
 
     fn assert_native_bundle_drift_rejected(
-        drift: crate::sql::codegen::fragment::NativeBundleTestDrift,
+        drift: crate::protocol::native::encode::NativeBundleTestDrift,
         expected_error: &str,
     ) {
         let (prepared, native_bundle) = real_execution_artifacts();
         let native_bundle =
-            crate::sql::codegen::fragment::corrupt_native_fragment_bundle_for_execution_test(
+            crate::protocol::native::encode::corrupt_native_fragment_bundle_for_execution_test(
                 native_bundle,
                 drift,
             );
@@ -2315,7 +2316,7 @@ mod native_contract_tests {
     #[test]
     fn coordinator_rejects_missing_native_fragment_before_dispatch() {
         assert_native_bundle_drift_rejected(
-            crate::sql::codegen::fragment::NativeBundleTestDrift::Missing(7),
+            crate::protocol::native::encode::NativeBundleTestDrift::Missing(7),
             "missing prepared fragment id=7",
         );
     }
@@ -2323,7 +2324,7 @@ mod native_contract_tests {
     #[test]
     fn coordinator_rejects_unknown_native_fragment_before_dispatch() {
         assert_native_bundle_drift_rejected(
-            crate::sql::codegen::fragment::NativeBundleTestDrift::Unknown(99),
+            crate::protocol::native::encode::NativeBundleTestDrift::Unknown(99),
             "native fragment ids mismatch",
         );
     }

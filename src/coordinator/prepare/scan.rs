@@ -24,10 +24,11 @@ use crate::connector::iceberg::scan_model::{
 use crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
-use crate::sql::codegen::scan::iceberg_delta::IcebergDeltaScanRuntimePlan;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
+
+pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
     fn resolve_scan(

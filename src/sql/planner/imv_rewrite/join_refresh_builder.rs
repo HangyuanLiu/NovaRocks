@@ -1412,7 +1412,7 @@ mod tests {
                     &connectors,
                     None,
                 )?;
-                crate::sql::codegen::fragment::encode_native_fragment_bundle(
+                crate::protocol::native::encode::encode_native_fragment_bundle(
                     &distributed_plan,
                     &prepared,
                 )
