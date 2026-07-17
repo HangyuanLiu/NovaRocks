@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use crate::exec::chunk::ChunkSchemaRef;
+use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
 };
@@ -140,6 +140,7 @@ impl ProgramInventory {
             ExecNodeKind::TableFunction(node) => self.visit(&node.input),
             ExecNodeKind::Analytic(node) => self.visit(&node.input),
             ExecNodeKind::SetOp(node) => self.visit_inputs(&node.inputs),
+            ExecNodeKind::NativeRuntimeFilterConsumer(node) => self.visit(&node.input),
         }
     }
 
@@ -191,12 +192,13 @@ fn schema_summary(schema: &ChunkSchemaRef) -> String {
                 .map_or_else(|| "none".to_string(), |id| id.to_string());
             let metadata = metadata_suffix(slot.field().metadata());
             format!(
-                "slot={},name={},type={},nullable={},unique_id={}{}",
+                "slot={},name={},type={},nullable={},unique_id={},field_schema={}{}",
                 slot.slot_id(),
                 slot.name(),
                 data_type_summary(slot.data_type()),
                 slot.nullable(),
                 unique_id,
+                field_schema_summary(slot.field_schema()),
                 metadata,
             )
         })
@@ -205,6 +207,10 @@ fn schema_summary(schema: &ChunkSchemaRef) -> String {
     let schema_metadata = schema.arrow_schema_ref();
     let schema_metadata = metadata_suffix(schema_metadata.metadata());
     format!("[{slots}]{schema_metadata}")
+}
+
+fn field_schema_summary(field_schema: &ChunkFieldSchema) -> String {
+    format!("{field_schema:?}")
 }
 
 fn data_type_summary(data_type: &DataType) -> String {
@@ -514,7 +520,9 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+    use crate::exec::chunk::{
+        Chunk, ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
+    };
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::error::{
         FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -529,7 +537,10 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
-    use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
+    use crate::exec::node::join::{
+        JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
+    };
+    use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerNode;
     use crate::exec::node::scan::{
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
@@ -550,6 +561,7 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+    use crate::types::logical::{LogicalType, field_with_logical_type};
     use crate::types::native_proto::encode_type;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
 
@@ -701,8 +713,7 @@ mod tests {
             tuple_ids: Vec::new(),
             nullable_tuple_ids: Vec::new(),
             limit: -1,
-            build_runtime_filters: Vec::new(),
-            probe_runtime_filters: Vec::new(),
+            runtime_filter_binding_ids: Vec::new(),
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: vec![output.clone()],
@@ -1219,7 +1230,7 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none], got [slot=1,name=v,type=Int32,nullable=true,unique_id=none]"
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }], got [slot=1,name=v,type=Int32,nullable=true,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }]"
         );
     }
 
@@ -1271,7 +1282,63 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,metadata={\"contract\":\"expected\"}], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,metadata={\"contract\":\"actual\"}]"
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] },metadata={\"contract\":\"expected\"}], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] },metadata={\"contract\":\"actual\"}]"
+        );
+    }
+
+    #[test]
+    fn reports_field_schema_only_exchange_schema_mismatch() {
+        let id = FragmentNodeId::new(20);
+        let field = Field::new("v", DataType::Int32, false);
+        let expected_field_schema = ChunkFieldSchema::empty();
+        let actual_field_schema = ChunkFieldSchema::from_field(&field_with_logical_type(
+            Field::new("logical", DataType::Utf8, true),
+            LogicalType::Json,
+        ))
+        .expect("logical field schema");
+        let with_field_schema = |field_schema| {
+            Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    field.clone(),
+                    Some(field_schema),
+                    None,
+                )])
+                .expect("chunk schema with explicit field schema"),
+            )
+        };
+        let expected = with_field_schema(expected_field_schema);
+        let actual = with_field_schema(actual_field_schema);
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: exchange_node(20, actual, uid(5, 8)),
+            },
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::from([(id, expected)]),
+            BTreeSet::new(),
+        );
+        let error = assert_error(
+            FragmentSubmission::try_new(
+                program,
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 344),
+                    BTreeMap::new(),
+                    BTreeMap::from([(id, 1)]),
+                    FragmentSinkAssignment::None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::ExchangeNode(20),
+            FragmentBindingErrorKind::SchemaMismatch,
+        );
+        assert_eq!(
+            error.detail(),
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: Some(Json), children: [] }]"
         );
     }
 
@@ -1323,7 +1390,7 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"expected\"})]),nullable=false,unique_id=none], got [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"actual\"})]),nullable=false,unique_id=none]"
+            "exchange node 20 expected schema [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"expected\"})]),nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [ChunkFieldSchema { logical_type: None, children: [] }] }], got [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"actual\"})]),nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [ChunkFieldSchema { logical_type: None, children: [] }] }]"
         );
     }
 
@@ -1369,7 +1436,7 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none],metadata={\"owner\":\"expected\"}, got [slot=1,name=v,type=Int32,nullable=false,unique_id=none],metadata={\"owner\":\"actual\"}"
+            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }],metadata={\"owner\":\"expected\"}, got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }],metadata={\"owner\":\"actual\"}"
         );
     }
 
@@ -1898,6 +1965,42 @@ mod tests {
     }
 
     #[test]
+    fn native_runtime_filter_consumer_wrapper_is_traversed() {
+        let id = FragmentNodeId::new(10);
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::NativeRuntimeFilterConsumer(
+                        NativeRuntimeFilterConsumerNode {
+                            input: Box::new(scan_node(Some(10))),
+                            owner_node_id: 30,
+                            bindings: Vec::new(),
+                        },
+                    ),
+                },
+            },
+            result_sink(),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query_id(1, 2),
+            uid(1, 67),
+            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
+            FragmentSinkAssignment::None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+
+        FragmentSubmission::try_new(program, instance)
+            .expect("native runtime filter consumer child scan");
+    }
+
+    #[test]
     fn binary_right_child_is_traversed() {
         let id = FragmentNodeId::new(10);
         let empty_schema = Arc::new(ChunkSchema::empty());
@@ -1918,7 +2021,9 @@ mod tests {
                         build_keys: Vec::new(),
                         eq_null_safe: Vec::new(),
                         residual_predicate: None,
-                        runtime_filters: Vec::new(),
+                        runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                            producers: Vec::new(),
+                        },
                     }),
                 },
             },
