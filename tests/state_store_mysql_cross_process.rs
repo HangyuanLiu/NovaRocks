@@ -23,6 +23,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -90,11 +91,10 @@ fn run_command_bounded_observed(
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn bounded child");
     let pid = child.id();
-    observe(pid);
     let stdin = child.stdin.take().expect("take bounded child stdin");
     let stdout = child.stdout.take().expect("take bounded child stdout");
     let stderr = child.stderr.take().expect("take bounded child stderr");
-    let writer = if let Some(input) = input {
+    let mut writer = if let Some(input) = input {
         let input = input.to_vec();
         Some(std::thread::spawn(move || {
             let mut stdin = stdin;
@@ -104,8 +104,24 @@ fn run_command_bounded_observed(
         drop(stdin);
         None
     };
-    let stdout_reader = spawn_capped_reader(stdout, diagnostic_cap);
-    let stderr_reader = spawn_capped_reader(stderr, diagnostic_cap);
+    let mut stdout_reader = Some(spawn_capped_reader(stdout, diagnostic_cap));
+    let mut stderr_reader = Some(spawn_capped_reader(stderr, diagnostic_cap));
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(pid))) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(writer) = writer.take() {
+            let _ = writer.join();
+        }
+        let _ = stdout_reader
+            .take()
+            .expect("stdout reader is installed")
+            .join();
+        let _ = stderr_reader
+            .take()
+            .expect("stderr reader is installed")
+            .join();
+        std::panic::resume_unwind(panic);
+    }
     let stop_at = std::time::Instant::now() + deadline;
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll bounded child") {
@@ -117,16 +133,20 @@ fn run_command_bounded_observed(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    if let Some(writer) = writer {
+    if let Some(writer) = writer.take() {
         let write_result = writer.join().expect("join bounded child stdin writer");
         if !timed_out {
             write_result.expect("write bounded child input");
         }
     }
     let stdout = stdout_reader
+        .take()
+        .expect("stdout reader is installed")
         .join()
         .expect("join bounded child stdout reader");
     let stderr = stderr_reader
+        .take()
+        .expect("stderr reader is installed")
         .join()
         .expect("join bounded child stderr reader");
     BoundedCommandOutput {
@@ -247,11 +267,7 @@ fn run_helper_observed(
         HELPER_DIAGNOSTIC_CAP_BYTES,
         observe,
     );
-    let diagnostics = redact_test_material(&format!(
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&result.output.stdout),
-        String::from_utf8_lossy(&result.output.stderr)
-    ));
+    let diagnostics = bounded_output_diagnostics(&result);
     assert!(
         !result.timed_out,
         "helper exceeded total deadline: {diagnostics}"
@@ -265,14 +281,15 @@ fn run_helper_observed(
 
 #[test]
 fn mysql_helper_pure_protocol_child_has_empty_environment() {
-    let leak_canary = required_process_env("SS3_HELPER_ENV_LEAK_CANARY");
+    let parent_path = std::env::var_os("PATH").expect("parent PATH must exist");
+    assert!(!parent_path.is_empty(), "parent PATH must not be empty");
     let output = run_helper_observed(
         b"{\"id\":1,\"command\":\"Shutdown\"}\n",
         HelperEnvironment::Empty,
         |pid| {
             let environment = process_environment(pid);
             assert!(
-                !contains_bytes(&environment, leak_canary.as_bytes()),
+                !contains_bytes(&environment, b"PATH="),
                 "pure protocol helper inherited parent environment"
             );
         },
@@ -330,6 +347,37 @@ fn mysql_helper_runner_caps_stderr_flood_and_reaps_child() {
 }
 
 #[test]
+fn mysql_helper_runner_reaps_child_when_observer_panics() {
+    let observed_pid = Arc::new(AtomicU32::new(0));
+    let observed = Arc::clone(&observed_pid);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("0.2");
+        let _ = run_command_bounded_observed(
+            &mut command,
+            None,
+            Duration::from_secs(1),
+            TEST_DIAGNOSTIC_CAP_BYTES,
+            move |pid| {
+                observed.store(pid, Ordering::Release);
+                panic!("observer panic for reap verification");
+            },
+        );
+    }));
+    assert!(panic.is_err(), "observer panic must propagate");
+    let pid = observed_pid.load(Ordering::Acquire);
+    assert!(pid > 0, "observer must receive the child PID");
+    let was_alive_after_unwind = process_is_alive(pid);
+    if was_alive_after_unwind {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        !was_alive_after_unwind,
+        "observer panic must kill and reap the child before unwinding"
+    );
+}
+
+#[test]
 fn mysql_helper_interactive_timeout_kills_child_without_diagnostic_deadlock() {
     let mut helper = HelperProcess::spawn_silent_for_test(Duration::from_secs(1));
     let pid = helper.id();
@@ -343,6 +391,75 @@ fn mysql_helper_interactive_timeout_kills_child_without_diagnostic_deadlock() {
         "interactive timeout must not block on diagnostics"
     );
     assert!(!process_is_alive(pid), "interactive child must be reaped");
+}
+
+#[test]
+fn mysql_helper_interactive_timeout_diagnostic_omits_raw_protocol_payload() {
+    let canaries = [
+        "timeout-key-canary",
+        "timeout-value-canary",
+        "timeout-records-canary",
+        "timeout-hints-canary",
+    ];
+    let payload = format!(
+        "{{\"id\":77,\"event\":\"Record\",\"code\":\"Pending\",\"record\":{{\"key\":\"{}\",\"value\":\"{}\"}},\"records\":[\"{}\"],\"hints\":[\"{}\"]}}",
+        canaries[0], canaries[1], canaries[2], canaries[3]
+    );
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        &format!("printf '%s' '{payload}'; while :; do :; done"),
+    ]);
+    let mut helper = HelperProcess::spawn_command(command);
+    let pid = helper.id();
+    let diagnostic = helper
+        .receive_with_timeout(Duration::from_millis(100))
+        .expect_err("unterminated protocol payload must time out");
+    assert!(diagnostic.contains("timed out"));
+    for canary in canaries {
+        assert!(
+            !diagnostic.contains(canary),
+            "timeout diagnostic exposed raw protocol payload"
+        );
+    }
+    assert!(!process_is_alive(pid), "timed-out helper must be reaped");
+}
+
+#[test]
+fn mysql_helper_one_shot_timeout_diagnostic_omits_raw_protocol_payload() {
+    let canaries = [
+        "one-shot-key-canary",
+        "one-shot-value-canary",
+        "one-shot-records-canary",
+        "one-shot-hints-canary",
+    ];
+    let payload = format!(
+        "{{\"id\":88,\"event\":\"Record\",\"code\":\"Pending\",\"record\":{{\"key\":\"{}\",\"value\":\"{}\"}},\"records\":[\"{}\"],\"hints\":[\"{}\"]}}",
+        canaries[0], canaries[1], canaries[2], canaries[3]
+    );
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        &format!("printf '%s' '{payload}'; while :; do :; done"),
+    ]);
+    let result = run_command_bounded(
+        &mut command,
+        None,
+        Duration::from_millis(100),
+        TEST_DIAGNOSTIC_CAP_BYTES,
+    );
+    assert!(result.timed_out, "unterminated payload must time out");
+    let diagnostic = bounded_output_diagnostics(&result);
+    for canary in canaries {
+        assert!(
+            !diagnostic.contains(canary),
+            "one-shot timeout diagnostic exposed raw protocol payload"
+        );
+    }
+    assert!(
+        !process_is_alive(result.pid),
+        "timed-out child must be reaped"
+    );
 }
 
 #[test]
@@ -729,7 +846,7 @@ impl HelperProcess {
         let stderr = self.stderr.lock().expect("lock helper stderr");
         format!(
             "stdout={} stderr={}",
-            render_capture(&stdout),
+            protocol_stdout_summary(&stdout.bytes, stdout.truncated),
             render_capture(&stderr)
         )
     }
@@ -787,6 +904,50 @@ fn render_capture(capture: &CappedCapture) -> String {
         rendered.push_str("<truncated>");
     }
     rendered
+}
+
+fn bounded_output_diagnostics(result: &BoundedCommandOutput) -> String {
+    let stderr = CappedCapture {
+        bytes: result.output.stderr.clone(),
+        truncated: result.stderr_truncated,
+    };
+    format!(
+        "stdout={} stderr={}",
+        protocol_stdout_summary(&result.output.stdout, result.stdout_truncated),
+        render_capture(&stderr)
+    )
+}
+
+fn protocol_stdout_summary(bytes: &[u8], truncated: bool) -> String {
+    let metadata = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<JsonValue>(line).ok())
+        .filter_map(|value| {
+            let id = value.get("id").and_then(JsonValue::as_u64)?;
+            let event = safe_protocol_token(value.get("event")?)?;
+            let code = value.get("code").and_then(safe_protocol_token);
+            Some((id, event.to_owned(), code.map(str::to_owned)))
+        })
+        .last();
+    let mut summary = format!("bytes={} truncated={truncated}", bytes.len());
+    if let Some((id, event, code)) = metadata {
+        summary.push_str(&format!(" last_id={id} last_event={event}"));
+        if let Some(code) = code {
+            summary.push_str(&format!(" last_code={code}"));
+        }
+    }
+    summary
+}
+
+fn safe_protocol_token(value: &JsonValue) -> Option<&str> {
+    let token = value.as_str()?;
+    (!token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(token)
 }
 
 fn redact_test_material(raw: &str) -> String {
