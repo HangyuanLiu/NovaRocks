@@ -219,27 +219,8 @@ fn rewrite_table_factor(
                         .expect("iceberg catalog registry read lock");
                     match registry.get(cat) {
                         Ok(entry) => {
-                            let mut databases =
+                            let databases =
                                 crate::connector::iceberg::catalog::list_namespaces(&entry)?;
-                            if let Some(provider) = state.metadata_provider.as_ref() {
-                                let read = provider.begin_read().map_err(|e| {
-                                    format!("read iceberg namespace metadata failed: {e}")
-                                })?;
-                                let records = state
-                                    .iceberg_catalog_repo
-                                    .list_namespaces(read.as_ref())
-                                    .map_err(|e| {
-                                        format!("read iceberg namespace metadata failed: {e}")
-                                    })?;
-                                databases.extend(
-                                    records
-                                        .into_iter()
-                                        .filter(|record| record.catalog.eq_ignore_ascii_case(cat))
-                                        .map(|record| record.namespace),
-                                );
-                                databases.sort();
-                                databases.dedup();
-                            }
                             let schemata_cols =
                                 crate::engine::information_schema::schemata_columns();
                             let batches = crate::engine::information_schema::build_schemata_batch(
@@ -623,8 +604,11 @@ mod tests {
         let warehouse_path = warehouse_dir.path().to_str().unwrap();
         let state = state_with_local_catalog("myice", warehouse_path);
 
+        std::fs::create_dir_all(warehouse_dir.path().join("ns_live"))
+            .expect("create live namespace");
         let mut query = parse_query("SELECT schema_name FROM myice.information_schema.schemata");
         super::rewrite_query(&state, &mut query).expect("rewrite_query");
+        assert!(format!("{query:?}").contains("ns_live"));
 
         // The FROM clause must now be a VALUES-backed Derived table (not a raw
         // Iceberg Table reference).
