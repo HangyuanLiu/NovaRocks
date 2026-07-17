@@ -30,9 +30,7 @@ const COMPAT_PROBES: &[&str] = &[
 ];
 
 pub(crate) fn has_directives(meta: &QueryMeta) -> bool {
-    !meta.be_log_contains.is_empty()
-        || !meta.be_log_count_at_least.is_empty()
-        || !meta.compat_probes.is_empty()
+    meta.has_compat_directives()
 }
 
 pub(crate) fn validate_mode(meta: &QueryMeta, mode: ClusterMode) -> Result<()> {

@@ -87,6 +87,42 @@ if [ ! -x "$output_dir/bin/starrocks-compat-probe" ]; then
   echo "compat probe must be installed next to the compat binary" >&2
   exit 1
 fi
+current_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+probe_manifest="$output_dir/probe-manifest.txt"
+test -f "$probe_manifest"
+probe_actual_keys="$(cut -d= -f1 "$probe_manifest")"
+probe_expected_keys="$(printf '%s\n' format path sha256 git_head profile features)"
+if [ "$probe_actual_keys" != "$probe_expected_keys" ]; then
+  echo "compat probe manifest keys differ" >&2
+  diff -u <(printf '%s\n' "$probe_expected_keys") <(printf '%s\n' "$probe_actual_keys") >&2 || true
+  exit 1
+fi
+declare -A probe_artifact=()
+while IFS='=' read -r key value; do
+  probe_artifact["$key"]="$value"
+done <"$probe_manifest"
+if [ "${probe_artifact[format]}" != 'novarocks-compat-probe-v1' ]; then
+  echo "unexpected compat probe manifest format" >&2
+  exit 1
+fi
+expected_probe="$(cd "$output_dir/bin" && pwd -P)/starrocks-compat-probe"
+if [ "${probe_artifact[path]}" != "$expected_probe" ] || [ ! -x "${probe_artifact[path]}" ]; then
+  echo "compat probe path must identify the installed executable" >&2
+  exit 1
+fi
+if [ "${probe_artifact[profile]}" != dev-opt ] || [ "${probe_artifact[features]}" != compat ]; then
+  echo "compat probe build metadata differs" >&2
+  exit 1
+fi
+if ! [[ "${probe_artifact[sha256]}" =~ ^[0-9a-f]{64}$ ]] \
+  || [ "${probe_artifact[sha256]}" != "$(shasum -a 256 "${probe_artifact[path]}" | awk '{print $1}')" ]; then
+  echo "compat probe SHA-256 does not match the copied binary" >&2
+  exit 1
+fi
+if [ "${probe_artifact[git_head]}" != "$current_head" ]; then
+  echo "compat probe git head does not match the current checkout" >&2
+  exit 1
+fi
 if [ "${artifact[profile]}" != dev-opt ] || [ "${artifact[features]}" != compat ]; then
   echo "compat build metadata differs" >&2
   exit 1
@@ -99,7 +135,6 @@ if [ "${artifact[sha256]}" != "$(shasum -a 256 "${artifact[binary]}" | awk '{pri
   echo "compat SHA-256 does not match the copied binary" >&2
   exit 1
 fi
-current_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 if ! [[ "${artifact[git_head]}" =~ ^[0-9a-f]{40}$ ]] \
   || [ "${artifact[git_head]}" != "$current_head" ]; then
   echo "compat git head does not match the current checkout" >&2

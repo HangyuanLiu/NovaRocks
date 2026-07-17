@@ -978,6 +978,53 @@ fn run_explain_directive_checks(
     Ok(())
 }
 
+fn run_compat_directives_for_successful_step(
+    step: &SqlStep,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    log: &mut String,
+) -> Result<(), String> {
+    match server_handle.lock() {
+        Ok(server_handle) => compat_directive::run(step, server_handle.as_ref(), log)
+            .map_err(|error| format!("compatibility directive failed: {error:#}")),
+        Err(_) => Err("server handle mutex is poisoned".to_string()),
+    }
+}
+
+fn finish_expected_error_step(
+    step: &SqlStep,
+    matched_expected_error: bool,
+    last_failure: &str,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    log: &mut String,
+) -> bool {
+    if !matched_expected_error {
+        let _ = writeln!(
+            log,
+            "    ❌ {}",
+            annotate_failure_with_engine_error_code(last_failure, last_failure)
+        );
+        return false;
+    }
+    if let Err(reason) = run_compat_directives_for_successful_step(step, server_handle, log) {
+        let _ = writeln!(log, "    ❌ FAIL: {reason}");
+        return false;
+    }
+    if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+        let _ = writeln!(
+            log,
+            "    ✅ PASS (expected error matched): engine_error_code={} {}",
+            expected_code, last_failure
+        );
+    } else {
+        let _ = writeln!(
+            log,
+            "    ✅ PASS (expected error matched): {}",
+            last_failure
+        );
+    }
+    true
+}
+
 // Per-case execution
 // ---------------------------------------------------------------------------
 
@@ -1429,36 +1476,15 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    if matched_expected_error {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS (expected error matched): engine_error_code={} {}",
-                            expected_code, last_failure
-                        );
-                    } else {
+                if step.meta.expect_error_code.is_some() || step.meta.expect_error.is_some() {
+                    if !finish_expected_error_step(
+                        step,
+                        matched_expected_error,
+                        &last_failure,
+                        &ctx.server_handle,
+                        &mut log,
+                    ) {
                         case_failed = true;
-                        let _ = writeln!(
-                            log,
-                            "    ❌ {}",
-                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
-                        );
-                    }
-                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                    if matched_expected_error {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS (expected error matched): {}",
-                            last_failure
-                        );
-                    } else {
-                        case_failed = true;
-                        let _ = writeln!(
-                            log,
-                            "    ❌ {}",
-                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
-                        );
-                        let _ = expected_error;
                     }
                 } else if let Some(execution) = passed_execution {
                     // Run wait_alter post-execution polling if annotated.
@@ -1473,15 +1499,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
-                        let compat_ok = match ctx.server_handle.lock() {
-                            Ok(server_handle) => compat_directive::run(
-                                step,
-                                server_handle.as_ref(),
-                                &mut log,
-                            )
-                            .map_err(|error| format!("compatibility directive failed: {error:#}")),
-                            Err(_) => Err("server handle mutex is poisoned".to_string()),
-                        };
+                        let compat_ok = run_compat_directives_for_successful_step(
+                            step,
+                            &ctx.server_handle,
+                            &mut log,
+                        );
                         let compat_ok = match compat_ok {
                             Ok(()) => true,
                             Err(reason) => {
@@ -3026,13 +3048,14 @@ mod tests {
     use crate::{
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        validate_fault_injection_jobs,
+        finish_expected_error_step, validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_runtime_dir() -> PathBuf {
@@ -3261,6 +3284,130 @@ mod tests {
         let msg = "target execute failed: plain execution error";
 
         assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
+    }
+
+    struct MissingCompatEvidenceServer {
+        endpoints: Vec<crate::types::CompatBeEndpoint>,
+    }
+
+    impl crate::cluster::ServerHandle for MissingCompatEvidenceServer {
+        fn target_host(&self) -> Option<&str> {
+            Some("127.0.0.1")
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            Some(9030)
+        }
+
+        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
+            &self.endpoints
+        }
+
+        fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn expected_error_compat_directive_failure_prevents_pass_marker() {
+        let step = SqlStep {
+            query_number: 1,
+            sql: "SELECT rejected".to_string(),
+            meta: QueryMeta {
+                expect_error: Some("planned rejection".to_string()),
+                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                ..QueryMeta::default()
+            },
+        };
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
+            Mutex::new(Box::new(MissingCompatEvidenceServer {
+                endpoints: vec![crate::types::CompatBeEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    heartbeat_port: 19050,
+                    be_port: 19060,
+                    brpc_port: 18060,
+                    http_port: 18040,
+                    grpc_port: 18070,
+                    starlet_port: 19070,
+                }],
+            })),
+        );
+        let mut log = String::new();
+
+        let passed = finish_expected_error_step(
+            &step,
+            true,
+            "planned rejection",
+            &server_handle,
+            &mut log,
+        );
+
+        assert!(!passed, "directive failure must fail the step");
+        assert!(log.contains("compatibility directive failed"), "{log}");
+        assert!(!log.contains("PASS (expected error matched)"), "{log}");
+    }
+
+    struct PresentCompatEvidenceServer(MissingCompatEvidenceServer);
+
+    impl crate::cluster::ServerHandle for PresentCompatEvidenceServer {
+        fn target_host(&self) -> Option<&str> {
+            self.0.target_host()
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            self.0.target_port()
+        }
+
+        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
+            self.0.be_endpoints()
+        }
+
+        fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn expected_error_runs_compat_directives_before_pass_marker() {
+        let step = SqlStep {
+            query_number: 1,
+            sql: "SELECT rejected".to_string(),
+            meta: QueryMeta {
+                expect_error_code: Some("ProtocolDecodeError".to_string()),
+                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                ..QueryMeta::default()
+            },
+        };
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
+            Mutex::new(Box::new(PresentCompatEvidenceServer(
+                MissingCompatEvidenceServer {
+                    endpoints: vec![crate::types::CompatBeEndpoint {
+                        host: "127.0.0.1".to_string(),
+                        heartbeat_port: 19050,
+                        be_port: 19060,
+                        brpc_port: 18060,
+                        http_port: 18040,
+                        grpc_port: 18070,
+                        starlet_port: 19070,
+                    }],
+                },
+            ))),
+        );
+        let mut log = String::new();
+
+        assert!(finish_expected_error_step(
+            &step,
+            true,
+            "[ProtocolDecodeError] planned rejection",
+            &server_handle,
+            &mut log,
+        ));
+
+        let directive = log.find("@be_log_contains PASS").expect("directive PASS");
+        let expected_error = log
+            .find("PASS (expected error matched)")
+            .expect("expected-error PASS");
+        assert!(directive < expected_error, "{log}");
     }
 
     #[test]

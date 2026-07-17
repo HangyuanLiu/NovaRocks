@@ -27,8 +27,12 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FORMAT: &str = "novarocks-compat-artifact-v1";
+const PROBE_FORMAT: &str = "novarocks-compat-probe-v1";
 const MANIFEST_KEYS: [&str; 6] = [
     "format", "binary", "sha256", "git_head", "profile", "features",
+];
+const PROBE_MANIFEST_KEYS: [&str; 6] = [
+    "format", "path", "sha256", "git_head", "profile", "features",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,10 +41,17 @@ pub(crate) struct CompatArtifact {
     pub(crate) sha256: String,
     pub(crate) git_head: String,
     pub(crate) profile: String,
+    pub(crate) probe_binary: PathBuf,
+    pub(crate) probe_sha256: String,
 }
 
 impl CompatArtifact {
     pub(crate) fn resolve(repo_root: &Path, profile: &str) -> Result<Self> {
+        if std::env::var_os("NOVAROCKS_COMPAT_PROBE_BIN").is_some() {
+            bail!(
+                "NOVAROCKS_COMPAT_PROBE_BIN is unsupported; the probe must come from a validated probe manifest"
+            );
+        }
         let manifest_path = match std::env::var_os("NOVAROCKS_COMPAT_ARTIFACT_MANIFEST") {
             Some(path) => PathBuf::from(path),
             None => build_artifact(repo_root, profile)?,
@@ -105,11 +116,63 @@ impl CompatArtifact {
             }
         }
 
+        let probe_manifest_path = manifest_path
+            .parent()
+            .context("compat artifact manifest has no parent directory")?
+            .join("probe-manifest.txt");
+        let probe_values = parse_probe_manifest(&probe_manifest_path)?;
+        require_probe_value(&probe_values, "format", PROBE_FORMAT)?;
+        require_probe_value(&probe_values, "features", "compat")?;
+        require_probe_value(&probe_values, "profile", profile)?;
+
+        let probe_path_value = probe_values.get("path").expect("required key checked");
+        let probe_path = PathBuf::from(probe_path_value);
+        if !probe_path.is_absolute() {
+            bail!("compat probe path is not absolute: {probe_path_value}");
+        }
+        let probe_binary = probe_path
+            .canonicalize()
+            .with_context(|| format!("canonicalize compat probe {}", probe_path.display()))?;
+        if !probe_binary.is_file() {
+            bail!("compat probe is not a file: {}", probe_binary.display());
+        }
+        #[cfg(unix)]
+        if fs::metadata(&probe_binary)?.permissions().mode() & 0o111 == 0 {
+            bail!("compat probe is not executable: {}", probe_binary.display());
+        }
+
+        let expected_probe_sha = probe_values.get("sha256").expect("required key checked");
+        if !is_lower_hex(expected_probe_sha, 64) {
+            bail!("compat probe sha256 must be 64 lowercase hex");
+        }
+        let probe_sha256 = sha256_file(&probe_binary)?;
+        if &probe_sha256 != expected_probe_sha {
+            bail!(
+                "compat probe SHA-256 mismatch: manifest={} actual={}",
+                expected_probe_sha,
+                probe_sha256
+            );
+        }
+
+        let expected_probe_head = probe_values.get("git_head").expect("required key checked");
+        if !is_lower_hex(expected_probe_head, 40) {
+            bail!("compat probe git_head must be 40 lowercase hex");
+        }
+        if expected_probe_head != &current_head {
+            bail!(
+                "compat probe git head mismatch: manifest={} current={}",
+                expected_probe_head,
+                current_head
+            );
+        }
+
         Ok(Self {
             binary,
             sha256: actual_sha,
             git_head: current_head,
             profile: profile.to_string(),
+            probe_binary,
+            probe_sha256,
         })
     }
 }
@@ -170,10 +233,49 @@ fn parse_manifest(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(values)
 }
 
+fn parse_probe_manifest(path: &Path) -> Result<BTreeMap<String, String>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read compat probe manifest {}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for (index, line) in contents.lines().enumerate() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid compat probe manifest line {}: {}",
+                index + 1,
+                line
+            )
+        })?;
+        if !PROBE_MANIFEST_KEYS.contains(&key) {
+            bail!("unknown probe manifest key: {key}");
+        }
+        if values.insert(key.to_string(), value.to_string()).is_some() {
+            bail!("duplicate probe manifest key: {key}");
+        }
+    }
+    for key in PROBE_MANIFEST_KEYS {
+        if !values.contains_key(key) {
+            bail!("missing probe manifest key: {key}");
+        }
+    }
+    Ok(values)
+}
+
 fn require_value(values: &BTreeMap<String, String>, key: &str, expected: &str) -> Result<()> {
     let actual = values.get(key).expect("required key checked");
     if actual != expected {
         bail!("invalid manifest {key}: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn require_probe_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    expected: &str,
+) -> Result<()> {
+    let actual = values.get(key).expect("required key checked");
+    if actual != expected {
+        bail!("invalid probe manifest {key}: expected {expected}, got {actual}");
     }
     Ok(())
 }
@@ -311,6 +413,15 @@ mod tests {
         )
     }
 
+    fn probe_manifest_text(probe: &Path, sha256: &str, git_head: &str) -> String {
+        format!(
+            "format=novarocks-compat-probe-v1\npath={}\nsha256={}\ngit_head={}\nprofile=dev-opt\nfeatures=compat\n",
+            probe.display(),
+            sha256,
+            git_head
+        )
+    }
+
     fn resolve_error(repo_root: &Path) -> String {
         CompatArtifact::resolve(repo_root, "dev-opt")
             .expect_err("compat artifact validation must fail")
@@ -321,11 +432,13 @@ mod tests {
     fn compat_artifact_resolve_enforces_build_and_integrity_contract() {
         let _env = EnvGuard::capture(&[
             "NOVAROCKS_COMPAT_ARTIFACT_MANIFEST",
+            "NOVAROCKS_COMPAT_PROBE_BIN",
             "NOVAROCKS_BIN",
             "SCT_COMPAT_BUILD_HOOK",
         ]);
         unsafe {
             std::env::remove_var("NOVAROCKS_COMPAT_ARTIFACT_MANIFEST");
+            std::env::remove_var("NOVAROCKS_COMPAT_PROBE_BIN");
             std::env::remove_var("NOVAROCKS_BIN");
             std::env::remove_var("SCT_COMPAT_BUILD_HOOK");
         }
@@ -335,10 +448,19 @@ mod tests {
         let binary = root.join("novarocks-compat");
         let bytes = b"#!/usr/bin/env bash\nexit 0\n";
         write_executable(&binary, bytes);
+        let probe = root.join("starrocks-compat-probe");
+        let probe_bytes = b"#!/usr/bin/env bash\necho probe\n";
+        write_executable(&probe, probe_bytes);
         let head = git_head(&repo_root);
         let manifest = root.join("manifest.txt");
+        let probe_manifest = root.join("probe-manifest.txt");
         fs::write(&manifest, manifest_text(&binary, &sha256(bytes), &head))
             .expect("write valid manifest");
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(&probe, &sha256(probe_bytes), &head),
+        )
+        .expect("write valid probe manifest");
         let must_not_build = root.join("must-not-build.sh");
         fs::write(
             &must_not_build,
@@ -363,6 +485,63 @@ mod tests {
         assert_eq!(artifact.sha256, sha256(bytes));
         assert_eq!(artifact.git_head, head);
         assert_eq!(artifact.profile, "dev-opt");
+        assert_eq!(
+            artifact.probe_binary,
+            probe.canonicalize().expect("canonical probe binary")
+        );
+        assert_eq!(artifact.probe_sha256, sha256(probe_bytes));
+
+        fs::write(&probe, b"tampered probe\n").expect("tamper probe binary");
+        assert!(resolve_error(&repo_root).contains("probe SHA-256 mismatch"));
+        write_executable(&probe, probe_bytes);
+
+        fs::remove_file(&probe_manifest).expect("remove probe manifest");
+        assert!(resolve_error(&repo_root).contains("probe-manifest.txt"));
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(&probe, &sha256(probe_bytes), &head),
+        )
+        .expect("restore probe manifest");
+
+        fs::write(
+            &probe_manifest,
+            format!(
+                "{}profile=release\n",
+                probe_manifest_text(&probe, &sha256(probe_bytes), &head)
+            ),
+        )
+        .expect("write duplicate probe manifest key");
+        assert!(resolve_error(&repo_root).contains("duplicate probe manifest key: profile"));
+
+        fs::write(
+            &probe_manifest,
+            format!(
+                "{}unexpected=value\n",
+                probe_manifest_text(&probe, &sha256(probe_bytes), &head)
+            ),
+        )
+        .expect("write unknown probe manifest key");
+        assert!(resolve_error(&repo_root).contains("unknown probe manifest key: unexpected"));
+
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(
+                &probe,
+                &sha256(probe_bytes),
+                "0000000000000000000000000000000000000000",
+            ),
+        )
+        .expect("write stale probe manifest");
+        assert!(resolve_error(&repo_root).contains("probe git head mismatch"));
+        fs::write(
+            &probe_manifest,
+            probe_manifest_text(&probe, &sha256(probe_bytes), &head),
+        )
+        .expect("restore valid probe manifest");
+
+        unsafe { std::env::set_var("NOVAROCKS_COMPAT_PROBE_BIN", &probe) };
+        assert!(resolve_error(&repo_root).contains("NOVAROCKS_COMPAT_PROBE_BIN"));
+        unsafe { std::env::remove_var("NOVAROCKS_COMPAT_PROBE_BIN") };
 
         let mut permissions = fs::metadata(&binary)
             .expect("binary metadata")
@@ -453,13 +632,11 @@ chmod +x "$CARGO_TARGET_DIR/dev-opt/starrocks-compat-probe"
         );
         assert_eq!(built.git_head, git_head(&repo_root));
         assert_eq!(built.profile, "dev-opt");
-        assert!(
-            built
-                .binary
-                .parent()
-                .expect("artifact bin directory")
-                .join("starrocks-compat-probe")
-                .is_file()
+        assert!(built.probe_binary.is_file());
+        assert_eq!(
+            built.probe_binary.parent(),
+            built.binary.parent(),
+            "the independently proven probe remains in the same artifact bin directory"
         );
 
         fs::remove_dir_all(&root).expect("cleanup compat artifact test dir");

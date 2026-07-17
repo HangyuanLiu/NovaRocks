@@ -117,6 +117,14 @@ pub struct QueryMeta {
     pub compat_probes: Vec<String>,
 }
 
+impl QueryMeta {
+    pub fn has_compat_directives(&self) -> bool {
+        !self.be_log_contains.is_empty()
+            || !self.be_log_count_at_least.is_empty()
+            || !self.compat_probes.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SqlStep {
     pub query_number: usize,

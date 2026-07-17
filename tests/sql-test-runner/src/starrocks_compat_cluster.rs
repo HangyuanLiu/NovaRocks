@@ -887,21 +887,12 @@ impl StarRocksCompatServerHandle {
             .map(ManagedProcess::pid)
             .collect::<Vec<_>>();
         process_ids.push(fe_process.pid());
-        let probe_binary = std::env::var_os("NOVAROCKS_COMPAT_PROBE_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                artifact
-                    .binary
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join("starrocks-compat-probe")
-            });
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
             target_port: topology.fe.query,
             runtime_dir: Some(runtime_dir.into_path()),
             artifact_binary: artifact.binary,
-            probe_binary,
+            probe_binary: artifact.probe_binary,
             endpoints,
             be_workdirs,
             be_config_paths,
@@ -1067,14 +1058,14 @@ impl ServerHandle for StarRocksCompatServerHandle {
             .as_ref()
             .context("compatibility runtime is removed")?
             .join(format!("probe-{probe}-{nonce}.log"));
-        let mut process = ManagedProcess::spawn(
+        ManagedProcess::run_to_completion(
             format!("compatibility probe {probe}"),
             command,
             ReadyMarker::StdoutContains(marker),
             PROBE_TIMEOUT,
             log_path,
-        )?;
-        process.stop().context("wait for compatibility probe")
+        )
+        .context("wait for compatibility probe natural completion")
     }
 
     fn residual_process_ids(&self) -> Vec<u32> {

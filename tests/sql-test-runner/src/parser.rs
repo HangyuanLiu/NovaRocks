@@ -933,4 +933,24 @@ mod opt5_directive_tests {
             "unexpected error: {error:#}"
         );
     }
+
+    #[test]
+    fn expected_error_parser_preserves_compat_directives_for_post_error_checks() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @expect_error=planned rejection".to_string(),
+            "-- @be_log_contains=compat_ingress rejected".to_string(),
+            "-- @compat_probe=malformed-plan".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse expected error with compat directives");
+
+        assert_eq!(meta.expect_error.as_deref(), Some("planned rejection"));
+        assert!(meta.has_compat_directives());
+        assert_eq!(
+            meta.be_log_contains,
+            vec!["compat_ingress rejected".to_string()]
+        );
+        assert_eq!(meta.compat_probes, vec!["malformed-plan".to_string()]);
+    }
 }

@@ -355,6 +355,18 @@ impl ProcessGroupOwnership {
         Ok(())
     }
 
+    fn record_natural_reap(&mut self) -> Result<()> {
+        if self.phase != ProcessGroupPhase::SignalsAllowed {
+            bail!(
+                "process group {} cannot record a natural reap in phase {:?}",
+                self.id,
+                self.phase
+            );
+        }
+        self.phase = ProcessGroupPhase::LeaderReaped;
+        Ok(())
+    }
+
     fn awaiting_reap(&self) -> bool {
         self.phase == ProcessGroupPhase::FinalSignalSent
     }
@@ -572,6 +584,21 @@ impl std::fmt::Debug for ManagedProcess {
 }
 
 impl ManagedProcess {
+    pub(crate) fn run_to_completion(
+        label: String,
+        command: Command,
+        marker: ReadyMarker,
+        timeout: Duration,
+        log_path: PathBuf,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
+        let mut process = Self::spawn_impl(
+            label, command, marker, timeout, log_path, None, false, true,
+        )?;
+        process.wait_for_successful_exit(deadline, timeout)
+    }
+
     pub(crate) fn spawn(
         label: String,
         command: Command,
@@ -579,7 +606,9 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None, false)
+        Self::spawn_impl(
+            label, command, marker, timeout, log_path, None, false, false,
+        )
     }
 
     #[cfg(test)]
@@ -599,6 +628,7 @@ impl ManagedProcess {
             log_path,
             Some(log_writer),
             false,
+            false,
         )
     }
 
@@ -610,7 +640,7 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None, true)
+        Self::spawn_impl(label, command, marker, timeout, log_path, None, true, false)
     }
 
     fn spawn_impl(
@@ -621,6 +651,7 @@ impl ManagedProcess {
         log_path: PathBuf,
         log_writer: Option<Box<dyn Write + Send>>,
         poison_stdout_tail: bool,
+        one_shot: bool,
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
@@ -702,7 +733,14 @@ impl ManagedProcess {
             stopped: false,
         };
         if let Err(error) =
-            process.wait_for_ready(&marker, &readiness_baseline, &ready_rx, deadline, timeout)
+            process.wait_for_ready(
+                &marker,
+                &readiness_baseline,
+                &ready_rx,
+                deadline,
+                timeout,
+                one_shot,
+            )
         {
             let cleanup = process.kill_now();
             return match cleanup {
@@ -902,6 +940,57 @@ impl ManagedProcess {
         }
     }
 
+    fn wait_for_successful_exit(&mut self, deadline: Instant, timeout: Duration) -> Result<()> {
+        loop {
+            #[cfg(unix)]
+            if self.leader_exit_observed()? {
+                let status = self.reap_natural_exit(short_output_join_deadline())?;
+                self.ensure_output_io_ok("complete one-shot process")?;
+                if status.success() {
+                    return Ok(());
+                }
+                bail!(
+                    "{} exited with status {status}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+            #[cfg(not(unix))]
+            if let Some(status) = self.child.try_wait()? {
+                self.stopped = true;
+                self.join_output_threads_until(short_output_join_deadline());
+                self.ensure_output_io_ok("complete one-shot process")?;
+                if status.success() {
+                    return Ok(());
+                }
+                bail!(
+                    "{} exited with status {status}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                let message = format!(
+                    "{} timed out waiting for successful completion after {timeout:?}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+                self.kill_now()
+                    .with_context(|| format!("{message}; also failed to kill timed out process"))?;
+                bail!("{message}");
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+        }
+    }
+
     pub(crate) fn runtime_diagnostic(
         &mut self,
         label: &str,
@@ -954,10 +1043,31 @@ impl ManagedProcess {
         ready_rx: &mpsc::Receiver<()>,
         deadline: Instant,
         timeout: Duration,
+        one_shot: bool,
     ) -> Result<()> {
         loop {
+            if matches!(marker, ReadyMarker::StdoutContains(_))
+                && matches!(ready_rx.try_recv(), Ok(()))
+            {
+                self.ensure_output_io_ok("confirm readiness")?;
+                return Ok(());
+            }
             #[cfg(unix)]
             if self.leader_exit_observed()? {
+                if one_shot {
+                    self.join_output_threads_until(short_output_join_deadline());
+                    if self.readiness_marker_observed(marker, readiness_baseline)? {
+                        return Ok(());
+                    }
+                    let status = self.reap_natural_exit(short_output_join_deadline())?;
+                    bail!(
+                        "{} exited before readiness marker with status {status}; stdout_tail={:?}; stderr_tail={}; log={}",
+                        self.label,
+                        self.stdout_tail(),
+                        self.stderr_tail(),
+                        self.log_path.display()
+                    );
+                }
                 let status = self.finish_group_with_signal(
                     SIGKILL,
                     "wait after exit before readiness marker",
@@ -1069,6 +1179,26 @@ impl ManagedProcess {
                 );
             }
             thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+        }
+    }
+
+    fn readiness_marker_observed(
+        &self,
+        marker: &ReadyMarker,
+        readiness_baseline: &ReadinessBaseline,
+    ) -> Result<bool> {
+        match marker {
+            ReadyMarker::StdoutContains(needle) => Ok(self.stdout_tail().contains(needle)),
+            ReadyMarker::FileContains { path, needle } => {
+                match FileReadinessSnapshot::read(path) {
+                    Ok(Some(snapshot)) => {
+                        Ok(readiness_baseline.file_contains_fresh_marker(&snapshot, needle))
+                    }
+                    Ok(None) => Ok(false),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("read readiness file {}", path.display())),
+                }
+            }
         }
     }
 
@@ -1282,6 +1412,18 @@ impl ManagedProcess {
             .wait()
             .with_context(|| format!("{wait_context} for {}", self.label))?;
         self.process_group.record_reaped()?;
+        self.stopped = true;
+        self.join_output_threads_until(cleanup_deadline);
+        Ok(status)
+    }
+
+    #[cfg(unix)]
+    fn reap_natural_exit(&mut self, cleanup_deadline: Instant) -> Result<ExitStatus> {
+        let status = self
+            .child
+            .wait()
+            .with_context(|| format!("wait for {} natural exit", self.label))?;
+        self.process_group.record_natural_reap()?;
         self.stopped = true;
         self.join_output_threads_until(cleanup_deadline);
         Ok(status)
@@ -2886,5 +3028,77 @@ mod tests {
         assert_ne!(process.pid(), first_pid);
         assert!(process.stdout_tail().contains("SECOND_READY"));
         process.kill_now().expect("kill restarted process");
+    }
+
+    #[test]
+    fn managed_process_one_shot_accepts_fast_marker_and_successful_exit() {
+        let temp = TempDir::new("one-shot-success");
+        let log_path = temp.path().join("fixture.log");
+
+        ManagedProcess::run_to_completion(
+            "successful one-shot fixture".to_string(),
+            shell("printf 'PASS_MARKER\\n'; printf 'diagnostic\\n' >&2; exit 0"),
+            ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
+            Duration::from_secs(2),
+            log_path.clone(),
+        )
+        .expect("a one-shot command must naturally exit successfully after its marker");
+
+        let log = fs::read_to_string(log_path).expect("read one-shot durable log");
+        assert!(log.contains("PASS_MARKER"), "{log:?}");
+        assert!(log.contains("diagnostic"), "{log:?}");
+    }
+
+    #[test]
+    fn managed_process_one_shot_rejects_nonzero_exit_after_marker() {
+        let temp = TempDir::new("one-shot-nonzero");
+        let pid_path = temp.path().join("fixture.pid");
+        let command = shell_with_arg(
+            "printf '%s' $$ > \"$1\"; printf 'PASS_MARKER\\n'; printf 'failed\\n' >&2; exit 7",
+            &pid_path,
+        );
+
+        let error = ManagedProcess::run_to_completion(
+            "failing one-shot fixture".to_string(),
+            command,
+            ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect_err("a marker must not hide a later nonzero exit");
+
+        let child_pid = fs::read_to_string(pid_path)
+            .expect("read one-shot pid")
+            .parse::<u32>()
+            .expect("parse one-shot pid");
+        assert!(format!("{error:#}").contains("status"), "{error:#}");
+        assert!(format!("{error:#}").contains('7'), "{error:#}");
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
+    }
+
+    #[test]
+    fn managed_process_one_shot_timeout_kills_and_reaps_process() {
+        let temp = TempDir::new("one-shot-timeout");
+        let pid_path = temp.path().join("fixture.pid");
+        let command = shell_with_arg(
+            "printf '%s' $$ > \"$1\"; printf 'PASS_MARKER\\n'; sleep 30",
+            &pid_path,
+        );
+
+        let error = ManagedProcess::run_to_completion(
+            "timed out one-shot fixture".to_string(),
+            command,
+            ReadyMarker::StdoutContains("PASS_MARKER".to_string()),
+            Duration::from_millis(150),
+            temp.path().join("fixture.log"),
+        )
+        .expect_err("a one-shot command must time out after the marker if it does not exit");
+
+        let child_pid = fs::read_to_string(pid_path)
+            .expect("read timed out one-shot pid")
+            .parse::<u32>()
+            .expect("parse timed out one-shot pid");
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(wait_until(Duration::from_secs(1), || !pid_exists(child_pid)));
     }
 }

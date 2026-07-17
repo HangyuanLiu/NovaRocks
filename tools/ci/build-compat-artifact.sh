@@ -97,9 +97,11 @@ cp "$probe_binary" "$output_dir/bin/starrocks-compat-probe"
 chmod +x "$output_dir/bin/starrocks-compat-probe"
 
 sha256="$(shasum -a 256 "$compat_binary" | awk '{print $1}')"
+probe_sha256="$(shasum -a 256 "$output_dir/bin/starrocks-compat-probe" | awk '{print $1}')"
 git_head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 manifest_tmp="$(mktemp "$output_dir/manifest.txt.XXXXXX")"
-trap 'rm -f "$manifest_tmp"' EXIT
+probe_manifest_tmp="$(mktemp "$output_dir/probe-manifest.txt.XXXXXX")"
+trap 'rm -f "$manifest_tmp" "$probe_manifest_tmp"' EXIT
 {
   echo "format=novarocks-compat-artifact-v1"
   echo "binary=$compat_binary"
@@ -108,5 +110,14 @@ trap 'rm -f "$manifest_tmp"' EXIT
   echo "profile=$profile"
   echo "features=compat"
 } >"$manifest_tmp"
+{
+  echo "format=novarocks-compat-probe-v1"
+  echo "path=$output_dir/bin/starrocks-compat-probe"
+  echo "sha256=$probe_sha256"
+  echo "git_head=$git_head"
+  echo "profile=$profile"
+  echo "features=compat"
+} >"$probe_manifest_tmp"
 mv "$manifest_tmp" "$output_dir/manifest.txt"
+mv "$probe_manifest_tmp" "$output_dir/probe-manifest.txt"
 trap - EXIT
