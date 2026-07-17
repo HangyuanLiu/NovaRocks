@@ -99,7 +99,7 @@ pub(crate) struct FragmentInstancePlacement {
 }
 
 /// The result of scheduling a multi-fragment plan.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SchedulingPlan {
     /// Fragment chosen as the execution anchor for fetch/write coordination.
     pub(crate) root_fragment_id: FragmentId,

@@ -61,6 +61,21 @@ pub(crate) enum DecodedBindingRole {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeRuntimeFilterDormancyRole {
+    Producer,
+    Consumer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeRuntimeFilterDormancyFact {
+    pub(crate) binding_id: u32,
+    pub(crate) channel_id: u32,
+    pub(crate) node_id: i32,
+    pub(crate) apply_point: DecodedApplyPoint,
+    pub(crate) role: NativeRuntimeFilterDormancyRole,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedRuntimeFilterContract {
     Membership {
@@ -206,7 +221,7 @@ impl RuntimeFilterBindingLookupLedger {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<(), String> {
+    pub(crate) fn finish(self) -> Result<Vec<NativeRuntimeFilterDormancyFact>, String> {
         if let Some(binding_id) = self
             .records
             .keys()
@@ -217,7 +232,24 @@ impl RuntimeFilterBindingLookupLedger {
                 self.fragment_id
             ));
         }
-        Ok(())
+        Ok(self
+            .records
+            .into_values()
+            .map(|binding| NativeRuntimeFilterDormancyFact {
+                binding_id: binding.binding_id,
+                channel_id: binding.channel_id,
+                node_id: binding.node_id,
+                apply_point: binding.apply_point,
+                role: match binding.role {
+                    DecodedBindingRole::Producer { .. } => {
+                        NativeRuntimeFilterDormancyRole::Producer
+                    }
+                    DecodedBindingRole::Consumer { .. } => {
+                        NativeRuntimeFilterDormancyRole::Consumer
+                    }
+                },
+            })
+            .collect())
     }
 }
 
@@ -1193,5 +1225,61 @@ mod tests {
             .expect("empty")
             .finish()
             .expect("all consumed");
+    }
+
+    #[test]
+    fn finish_returns_sorted_dormancy_facts_only_after_complete_consumption() {
+        let consumer = membership_binding(1, 11);
+        let mut producer = membership_binding(2, 12);
+        producer.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
+        producer.role = Some(plan::runtime_filter_binding::Role::Producer(
+            plan::RuntimeFilterProducerRole {
+                contribution_kinds: vec![
+                    i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta),
+                    i32::from(plan::RuntimeFilterContributionKind::ProducerClosed),
+                ],
+                completion_requirement: i32::from(
+                    plan::RuntimeFilterCompletionRequirement::ProducerClosed,
+                ),
+            },
+        ));
+        let mut ledger =
+            RuntimeFilterBindingLookupLedger::decode(7, Some(&table(7, vec![consumer, producer])))
+                .expect("decode");
+
+        ledger.lookup_for_node(2, 12, 7).expect("producer lookup");
+        ledger.commit_consumed(2).expect("producer consumed");
+        ledger.lookup_for_node(1, 11, 7).expect("consumer lookup");
+        ledger.commit_consumed(1).expect("consumer consumed");
+
+        let facts = ledger.finish().expect("all bindings consumed");
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| (
+                    fact.binding_id,
+                    fact.channel_id,
+                    fact.node_id,
+                    fact.apply_point,
+                    fact.role
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    1,
+                    9,
+                    11,
+                    DecodedApplyPoint::NodeInput,
+                    NativeRuntimeFilterDormancyRole::Consumer
+                ),
+                (
+                    2,
+                    9,
+                    12,
+                    DecodedApplyPoint::NodeOutput,
+                    NativeRuntimeFilterDormancyRole::Producer
+                ),
+            ]
+        );
     }
 }

@@ -634,6 +634,7 @@ mod tests {
                 }),
                 write_abort: None,
                 fragment_profiles: Vec::new(),
+                runtime_filter_dormancy_proof: None,
             },
             commit_plan:
                 crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::new(
@@ -658,6 +659,7 @@ mod tests {
             write_commit: Some(empty_writer_commit_for_test()),
             write_abort: None,
             fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
         }
     }
 

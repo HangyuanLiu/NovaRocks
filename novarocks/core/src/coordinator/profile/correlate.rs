@@ -15,9 +15,220 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use crate::common::types::UniqueId;
+use crate::runtime::profile::{
+    NATIVE_RUNTIME_FILTER_BINDING_COUNT, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED,
+    NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP,
+    NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS,
+};
 use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeFilterDormancyApplyPoint {
+    NodeInput,
+    NodeOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeFilterDormancyBindingRole {
+    Producer,
+    Consumer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeFilterDormancyBindingExpectation {
+    pub(crate) fragment_id: u32,
+    pub(crate) binding_id: u32,
+    pub(crate) channel_id: u32,
+    pub(crate) node_id: i32,
+    pub(crate) apply_point: RuntimeFilterDormancyApplyPoint,
+    pub(crate) role: RuntimeFilterDormancyBindingRole,
+}
+
+pub(crate) type RuntimeFilterDormancyExpectations =
+    BTreeMap<UniqueId, BTreeMap<u32, RuntimeFilterDormancyBindingExpectation>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeFilterDormancyProof {
+    pub(crate) lookups_observed: bool,
+    pub(crate) all_deployment_not_installed: bool,
+    pub(crate) zero_side_effects: bool,
+    pub(crate) same_backend_partial_completion: bool,
+}
+
+pub(crate) fn prove_runtime_filter_dormancy(
+    expectations: &RuntimeFilterDormancyExpectations,
+    profiles: &BTreeMap<UniqueId, RuntimeProfileTree>,
+    same_backend_partial_completion: bool,
+) -> Result<Option<RuntimeFilterDormancyProof>, String> {
+    let expected_binding_count = expectations.values().map(BTreeMap::len).sum::<usize>();
+    if expected_binding_count == 0 {
+        return Ok(None);
+    }
+
+    let expected_finst = expectations.keys().copied().collect::<Vec<_>>();
+    let actual_finst = profiles.keys().copied().collect::<Vec<_>>();
+    if actual_finst != expected_finst {
+        return Err(format!(
+            "runtime-filter dormancy profile finst set mismatch: expected={expected_finst:?} actual={actual_finst:?}"
+        ));
+    }
+
+    for (finst_id, expected_bindings) in expectations {
+        let tree = profiles
+            .get(finst_id)
+            .expect("profile key set was checked above");
+        let dormancy_nodes = tree
+            .root
+            .children
+            .iter()
+            .filter(|child| child.name == NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE)
+            .collect::<Vec<_>>();
+        if dormancy_nodes.len() != 1 {
+            return Err(format!(
+                "runtime-filter dormancy profile finst_id={finst_id} must contain exactly one {NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE} child, found {}",
+                dormancy_nodes.len()
+            ));
+        }
+        let dormancy = dormancy_nodes[0];
+        if dormancy.counters.len() != 1
+            || exact_profile_counter(dormancy, NATIVE_RUNTIME_FILTER_BINDING_COUNT)?
+                != i64::try_from(expected_bindings.len())
+                    .expect("expected runtime-filter binding count fits i64")
+        {
+            return Err(format!(
+                "runtime-filter dormancy profile finst_id={finst_id} has invalid BindingCount"
+            ));
+        }
+        if dormancy.children.len() != expected_bindings.len() {
+            return Err(format!(
+                "runtime-filter dormancy profile finst_id={finst_id} binding fact count mismatch: expected={} actual={}",
+                expected_bindings.len(),
+                dormancy.children.len()
+            ));
+        }
+
+        for expected in expected_bindings.values() {
+            let expected_name = format!("Binding{}", expected.binding_id);
+            let matching = dormancy
+                .children
+                .iter()
+                .filter(|child| child.name == expected_name)
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                return Err(format!(
+                    "runtime-filter dormancy profile finst_id={finst_id} fragment_id={} binding_id={} must appear exactly once, found {}",
+                    expected.fragment_id,
+                    expected.binding_id,
+                    matching.len()
+                ));
+            }
+            let binding = matching[0];
+            assert_profile_info(
+                binding,
+                "BindingId",
+                &expected.binding_id.to_string(),
+                finst_id,
+            )?;
+            assert_profile_info(
+                binding,
+                "ChannelId",
+                &expected.channel_id.to_string(),
+                finst_id,
+            )?;
+            assert_profile_info(binding, "NodeId", &expected.node_id.to_string(), finst_id)?;
+            assert_profile_info(
+                binding,
+                "ApplyPoint",
+                match expected.apply_point {
+                    RuntimeFilterDormancyApplyPoint::NodeInput => "NodeInput",
+                    RuntimeFilterDormancyApplyPoint::NodeOutput => "NodeOutput",
+                },
+                finst_id,
+            )?;
+            assert_profile_info(
+                binding,
+                "Role",
+                match expected.role {
+                    RuntimeFilterDormancyBindingRole::Producer => "Producer",
+                    RuntimeFilterDormancyBindingRole::Consumer => "Consumer",
+                },
+                finst_id,
+            )?;
+
+            let expected_counter_count = 2 + NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS.len();
+            if binding.counters.len() != expected_counter_count {
+                return Err(format!(
+                    "runtime-filter dormancy profile finst_id={finst_id} binding_id={} counter set mismatch: expected={expected_counter_count} actual={}",
+                    expected.binding_id,
+                    binding.counters.len()
+                ));
+            }
+            if exact_profile_counter(binding, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP)? != 1 {
+                return Err(format!(
+                    "runtime-filter dormancy profile finst_id={finst_id} binding_id={} ValidatedLookup must equal 1",
+                    expected.binding_id
+                ));
+            }
+            if exact_profile_counter(binding, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED)? != 1
+            {
+                return Err(format!(
+                    "runtime-filter dormancy profile finst_id={finst_id} binding_id={} DeploymentNotInstalled must equal 1",
+                    expected.binding_id
+                ));
+            }
+            for counter in NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS {
+                if exact_profile_counter(binding, counter)? != 0 {
+                    return Err(format!(
+                        "runtime-filter dormancy profile finst_id={finst_id} binding_id={} {counter} must equal 0",
+                        expected.binding_id
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(Some(RuntimeFilterDormancyProof {
+        lookups_observed: true,
+        all_deployment_not_installed: true,
+        zero_side_effects: true,
+        same_backend_partial_completion,
+    }))
+}
+
+fn exact_profile_counter(node: &ProfileNode, name: &str) -> Result<i64, String> {
+    let matching = node
+        .counters
+        .iter()
+        .filter(|counter| counter.name == name)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(format!(
+            "runtime-filter dormancy profile node={} counter={name} must appear exactly once, found {}",
+            node.name,
+            matching.len()
+        ));
+    }
+    Ok(matching[0].value)
+}
+
+fn assert_profile_info(
+    node: &ProfileNode,
+    key: &str,
+    expected: &str,
+    finst_id: &UniqueId,
+) -> Result<(), String> {
+    let actual = node.info_strings.get(key).map(String::as_str);
+    if actual != Some(expected) {
+        return Err(format!(
+            "runtime-filter dormancy profile finst_id={finst_id} node={} info {key} mismatch: expected={expected:?} actual={actual:?}",
+            node.name
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ActualMetrics {
@@ -405,12 +616,179 @@ mod tests {
     use super::{
         ActualMetrics, COMMON_METRICS, DICT_HYDRATED_COLUMNS, DICT_HYDRATED_ROWS,
         DICT_INPUT_COLUMNS, DICT_INPUT_ROWS, DICT_KEPT_COLUMNS, DICT_KEPT_ROWS,
-        DICT_UNSUPPORTED_COLUMNS, UNIQUE_METRICS, collect_actuals_by_plan_node_id,
-        collect_actuals_by_plan_node_id_from_profile_trees, collect_actuals_by_plan_node_id_multi,
+        DICT_UNSUPPORTED_COLUMNS, RuntimeFilterDormancyApplyPoint,
+        RuntimeFilterDormancyBindingExpectation, RuntimeFilterDormancyBindingRole, UNIQUE_METRICS,
+        collect_actuals_by_plan_node_id, collect_actuals_by_plan_node_id_from_profile_trees,
+        collect_actuals_by_plan_node_id_multi,
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics,
+        prove_runtime_filter_dormancy,
     };
-    use crate::runtime::profile::{ProfileUnit, Profiler};
+    use crate::common::types::UniqueId;
+    use crate::runtime::profile::{
+        NATIVE_RUNTIME_FILTER_BINDING_COUNT, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED,
+        NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP,
+        NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS, ProfileUnit, Profiler, RuntimeProfileTree,
+    };
+
+    fn dormancy_expectation(
+        binding_id: u32,
+        role: RuntimeFilterDormancyBindingRole,
+    ) -> RuntimeFilterDormancyBindingExpectation {
+        RuntimeFilterDormancyBindingExpectation {
+            fragment_id: 7,
+            binding_id,
+            channel_id: 9,
+            node_id: 11,
+            apply_point: match role {
+                RuntimeFilterDormancyBindingRole::Producer => {
+                    RuntimeFilterDormancyApplyPoint::NodeOutput
+                }
+                RuntimeFilterDormancyBindingRole::Consumer => {
+                    RuntimeFilterDormancyApplyPoint::NodeInput
+                }
+            },
+            role,
+        }
+    }
+
+    fn dormancy_tree(
+        expectations: &[RuntimeFilterDormancyBindingExpectation],
+    ) -> RuntimeProfileTree {
+        let profiler = Profiler::new("native fragment");
+        let dormancy = profiler.child(NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE);
+        dormancy.counter_set_unit(
+            NATIVE_RUNTIME_FILTER_BINDING_COUNT,
+            expectations.len() as i64,
+        );
+        for expected in expectations {
+            let binding = dormancy.child(format!("Binding{}", expected.binding_id));
+            binding.add_info_string("BindingId", expected.binding_id.to_string());
+            binding.add_info_string("ChannelId", expected.channel_id.to_string());
+            binding.add_info_string("NodeId", expected.node_id.to_string());
+            binding.add_info_string(
+                "ApplyPoint",
+                match expected.apply_point {
+                    RuntimeFilterDormancyApplyPoint::NodeInput => "NodeInput",
+                    RuntimeFilterDormancyApplyPoint::NodeOutput => "NodeOutput",
+                },
+            );
+            binding.add_info_string(
+                "Role",
+                match expected.role {
+                    RuntimeFilterDormancyBindingRole::Producer => "Producer",
+                    RuntimeFilterDormancyBindingRole::Consumer => "Consumer",
+                },
+            );
+            binding.counter_set_unit(NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP, 1);
+            binding.counter_set_unit(NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED, 1);
+            for counter in NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS {
+                binding.counter_set_unit(counter, 0);
+            }
+        }
+        profiler.to_native_tree()
+    }
+
+    #[test]
+    fn dormancy_proof_requires_exact_finst_and_binding_facts() {
+        let producer = dormancy_expectation(1, RuntimeFilterDormancyBindingRole::Producer);
+        let consumer = dormancy_expectation(2, RuntimeFilterDormancyBindingRole::Consumer);
+        let producer_finst = UniqueId { hi: 80, lo: 1 };
+        let empty_finst = UniqueId { hi: 80, lo: 2 };
+        let expectations = std::collections::BTreeMap::from([
+            (
+                producer_finst,
+                std::collections::BTreeMap::from([
+                    (producer.binding_id, producer),
+                    (consumer.binding_id, consumer),
+                ]),
+            ),
+            (empty_finst, std::collections::BTreeMap::new()),
+        ]);
+        let profiles = std::collections::BTreeMap::from([
+            (producer_finst, dormancy_tree(&[producer, consumer])),
+            (empty_finst, dormancy_tree(&[])),
+        ]);
+
+        let proof = prove_runtime_filter_dormancy(&expectations, &profiles, true)
+            .expect("exact keyed profiles prove dormancy")
+            .expect("runtime-filter bindings produce a proof");
+        assert!(proof.lookups_observed);
+        assert!(proof.all_deployment_not_installed);
+        assert!(proof.zero_side_effects);
+        assert!(proof.same_backend_partial_completion);
+
+        let mut unknown = profiles.clone();
+        unknown.insert(UniqueId { hi: 80, lo: 3 }, dormancy_tree(&[]));
+        assert!(prove_runtime_filter_dormancy(&expectations, &unknown, true).is_err());
+
+        let mut missing = profiles;
+        missing.remove(&producer_finst);
+        assert!(prove_runtime_filter_dormancy(&expectations, &missing, true).is_err());
+    }
+
+    #[test]
+    fn dormancy_proof_rejects_missing_or_nonzero_side_effect_counters() {
+        let expected = dormancy_expectation(1, RuntimeFilterDormancyBindingRole::Consumer);
+        let finst = UniqueId { hi: 81, lo: 1 };
+        let expectations = std::collections::BTreeMap::from([(
+            finst,
+            std::collections::BTreeMap::from([(expected.binding_id, expected)]),
+        )]);
+
+        let mut missing_tree = dormancy_tree(&[expected]);
+        let binding = &mut missing_tree.root.children[0].children[0];
+        binding
+            .counters
+            .retain(|counter| counter.name != "ArtifactPublish");
+        assert!(
+            prove_runtime_filter_dormancy(
+                &expectations,
+                &std::collections::BTreeMap::from([(finst, missing_tree)]),
+                false,
+            )
+            .is_err()
+        );
+
+        let mut nonzero_tree = dormancy_tree(&[expected]);
+        let binding = &mut nonzero_tree.root.children[0].children[0];
+        binding
+            .counters
+            .iter_mut()
+            .find(|counter| counter.name == "ArtifactBuild")
+            .expect("counter")
+            .value = 1;
+        assert!(
+            prove_runtime_filter_dormancy(
+                &expectations,
+                &std::collections::BTreeMap::from([(finst, nonzero_tree)]),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dormancy_proof_rejects_duplicate_binding_facts() {
+        let expected = dormancy_expectation(1, RuntimeFilterDormancyBindingRole::Producer);
+        let finst = UniqueId { hi: 82, lo: 1 };
+        let expectations = std::collections::BTreeMap::from([(
+            finst,
+            std::collections::BTreeMap::from([(expected.binding_id, expected)]),
+        )]);
+        let mut tree = dormancy_tree(&[expected]);
+        let duplicate = tree.root.children[0].children[0].clone();
+        tree.root.children[0].children.push(duplicate);
+
+        assert!(
+            prove_runtime_filter_dormancy(
+                &expectations,
+                &std::collections::BTreeMap::from([(finst, tree)]),
+                true,
+            )
+            .is_err()
+        );
+    }
 
     fn add_operator_metrics(
         parent: &Profiler,

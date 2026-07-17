@@ -2582,7 +2582,7 @@ fn explain_analyze_query(
         scheduler,
         Some(query_opts),
     )
-    .execute_with_profile_outcome()?;
+    .execute_with_profile_outcome(&distributed_plan)?;
     let execution_elapsed = execution_start.elapsed();
     if let Some(abort) = outcome.write_abort.as_ref() {
         return Err(abort.reason.clone());
@@ -2611,6 +2611,9 @@ fn explain_analyze_query(
         outcome.query_result.row_count()
     ));
     lines.push(format_distributed_profile_summary(&profile_summary));
+    if let Some(proof) = outcome.runtime_filter_dormancy_proof.as_ref() {
+        lines.push(format_runtime_filter_dormancy_proof(proof));
+    }
     if let Some(counters) =
         crate::coordinator::profile::correlate::format_counter_sums_from_profile_trees(
             &outcome.fragment_profiles,
@@ -2662,6 +2665,18 @@ fn format_distributed_profile_summary(
         format_explain_analyze_duration_ns(summary.exchange_process_time_ns),
         format_explain_analyze_duration_ns(summary.network_time_ns),
         format_explain_analyze_duration_ns(summary.scan_io_time_ns)
+    )
+}
+
+fn format_runtime_filter_dormancy_proof(
+    proof: &crate::coordinator::profile::correlate::RuntimeFilterDormancyProof,
+) -> String {
+    format!(
+        "RuntimeFilterDormancy: lookups_observed={} all_deployment_not_installed={} zero_side_effects={} same_backend_partial_completion={}",
+        proof.lookups_observed,
+        proof.all_deployment_not_installed,
+        proof.zero_side_effects,
+        proof.same_backend_partial_completion,
     )
 }
 
@@ -3068,6 +3083,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
             write_commit: None,
             write_abort: None,
             fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
         })
     } else {
         None
@@ -4359,6 +4375,21 @@ mod tests {
         assert_eq!(
             super::query_options_for_explain_analyze(Some(options)),
             expected
+        );
+    }
+
+    #[test]
+    fn runtime_filter_dormancy_summary_is_stable() {
+        let proof = crate::coordinator::profile::correlate::RuntimeFilterDormancyProof {
+            lookups_observed: true,
+            all_deployment_not_installed: true,
+            zero_side_effects: true,
+            same_backend_partial_completion: false,
+        };
+
+        assert_eq!(
+            super::format_runtime_filter_dormancy_proof(&proof),
+            "RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false"
         );
     }
 
@@ -6235,6 +6266,12 @@ mysql_port = 47892
         assert!(text.contains("source_wait="), "{text}");
         assert!(text.contains("sink_wait="), "{text}");
         assert!(text.contains("exchange_wait="), "{text}");
+        assert!(
+            text.contains(
+                "RuntimeFilterDormancy: lookups_observed=true all_deployment_not_installed=true zero_side_effects=true same_backend_partial_completion=false"
+            ),
+            "{text}"
+        );
         assert!(text.contains("PLAN FRAGMENT 0"), "{text}");
         assert!(text.contains("stats={rows="), "{text}");
         assert!(text.contains("act={rows="), "{text}");
