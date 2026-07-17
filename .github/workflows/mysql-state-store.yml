@@ -1,0 +1,73 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: MySQL state store
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mysql-state-store.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "docker/mysql-state-store/**"
+      - "novarocks.toml.example"
+      - "src/common/app_config.rs"
+      - "src/state_store/**"
+      - "tests/state_store_boundary.rs"
+      - "tests/cluster_mvp.rs"
+      - "tests/common/state_store_conformance.rs"
+      - "tests/state_store_contract.rs"
+      - "tests/state_store_mysql.rs"
+      - "tests/state_store_mysql_cross_process.rs"
+      - "tests/state_store_mysql_runtime.rs"
+      - "tests/state_store_sqlite.rs"
+      - "tests/support/state_store_mysql_helper.rs"
+      - "tools/ci/mysql-state-store-provider.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mysql-state-store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Run MySQL state-store production gate
+        env:
+          NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: "1"
+        run: |
+          set -euo pipefail
+          trap 'docker/mysql-state-store/down.sh --docker' EXIT
+          docker/mysql-state-store/up.sh
+          source docker/mysql-state-store/runtime/current/env.sh
+          tools/ci/mysql-state-store-provider.sh
+
+      - name: Verify MySQL runtime residue is absent
+        if: always()
+        run: |
+          set -euo pipefail
+          test ! -e docker/mysql-state-store/runtime/current

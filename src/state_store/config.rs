@@ -17,13 +17,19 @@
 
 use std::fmt;
 use std::fs::File;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
-use super::limits::{StateStoreLimitOverrides, StateStoreLimits};
+use super::limits::{
+    MYSQL_MAX_KEY_BYTES, MYSQL_MAX_META_VALUE_BYTES, StateStoreLimitOverrides, StateStoreLimits,
+};
+
+const MYSQL_MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
+const MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS: u64 = 86_400_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateStoreProviderConfig {
@@ -34,6 +40,9 @@ pub enum StateStoreProviderConfig {
     Foundationdb {
         cluster_file: PathBuf,
         keyspace_id: Uuid,
+    },
+    Mysql {
+        database: String,
     },
 }
 
@@ -49,6 +58,7 @@ pub struct StateStoreConfig {
 enum StateStoreProviderKind {
     Sqlite,
     Foundationdb,
+    Mysql,
 }
 
 #[derive(Deserialize)]
@@ -60,8 +70,68 @@ struct StateStoreConfigWire {
     deployment_owner: Option<String>,
     cluster_file: Option<PathBuf>,
     keyspace_id: Option<Uuid>,
+    database: Option<String>,
     #[serde(default)]
     limits: StateStoreLimitOverrides,
+}
+
+fn state_store_config_from_wire<E>(
+    wire: StateStoreConfigWire,
+) -> std::result::Result<StateStoreConfig, E>
+where
+    E: serde::de::Error,
+{
+    let provider = match wire.provider {
+        StateStoreProviderKind::Sqlite => {
+            if wire.cluster_file.is_some() || wire.keyspace_id.is_some() || wire.database.is_some()
+            {
+                return Err(E::custom(
+                    "non-SQLite fields are not valid for the sqlite state store provider",
+                ));
+            }
+            StateStoreProviderConfig::Sqlite {
+                path: wire.path.ok_or_else(|| E::missing_field("path"))?,
+                deployment_owner: wire
+                    .deployment_owner
+                    .ok_or_else(|| E::missing_field("deployment_owner"))?,
+            }
+        }
+        StateStoreProviderKind::Foundationdb => {
+            if wire.path.is_some() || wire.deployment_owner.is_some() || wire.database.is_some() {
+                return Err(E::custom(
+                    "non-FoundationDB fields are not valid for the foundationdb state store provider",
+                ));
+            }
+            StateStoreProviderConfig::Foundationdb {
+                cluster_file: wire
+                    .cluster_file
+                    .ok_or_else(|| E::missing_field("cluster_file"))?,
+                keyspace_id: wire
+                    .keyspace_id
+                    .ok_or_else(|| E::missing_field("keyspace_id"))?,
+            }
+        }
+        StateStoreProviderKind::Mysql => {
+            if wire.path.is_some()
+                || wire.deployment_owner.is_some()
+                || wire.cluster_file.is_some()
+                || wire.keyspace_id.is_some()
+            {
+                return Err(E::custom(
+                    "non-MySQL fields are not valid for the mysql state store provider",
+                ));
+            }
+            StateStoreProviderConfig::Mysql {
+                database: wire.database.ok_or_else(|| E::missing_field("database"))?,
+            }
+        }
+    };
+
+    Ok(StateStoreConfig {
+        cluster_id: wire.cluster_id,
+        limits: wire.limits,
+        provider,
+    })
 }
 
 impl<'de> Deserialize<'de> for StateStoreConfig {
@@ -69,43 +139,7 @@ impl<'de> Deserialize<'de> for StateStoreConfig {
     where
         D: Deserializer<'de>,
     {
-        let wire = StateStoreConfigWire::deserialize(deserializer)?;
-        let provider = match wire.provider {
-            StateStoreProviderKind::Sqlite => {
-                if wire.cluster_file.is_some() || wire.keyspace_id.is_some() {
-                    return Err(D::Error::custom(
-                        "FoundationDB fields are not valid for the sqlite state store provider",
-                    ));
-                }
-                StateStoreProviderConfig::Sqlite {
-                    path: wire.path.ok_or_else(|| D::Error::missing_field("path"))?,
-                    deployment_owner: wire
-                        .deployment_owner
-                        .ok_or_else(|| D::Error::missing_field("deployment_owner"))?,
-                }
-            }
-            StateStoreProviderKind::Foundationdb => {
-                if wire.path.is_some() || wire.deployment_owner.is_some() {
-                    return Err(D::Error::custom(
-                        "SQLite fields are not valid for the foundationdb state store provider",
-                    ));
-                }
-                StateStoreProviderConfig::Foundationdb {
-                    cluster_file: wire
-                        .cluster_file
-                        .ok_or_else(|| D::Error::missing_field("cluster_file"))?,
-                    keyspace_id: wire
-                        .keyspace_id
-                        .ok_or_else(|| D::Error::missing_field("keyspace_id"))?,
-                }
-            }
-        };
-
-        Ok(Self {
-            cluster_id: wire.cluster_id,
-            limits: wire.limits,
-            provider,
-        })
+        state_store_config_from_wire(StateStoreConfigWire::deserialize(deserializer)?)
     }
 }
 
@@ -125,13 +159,237 @@ impl StateStoreConfig {
                 if deployment_owner.trim().is_empty() {
                     bail!("InvalidStateStoreConfig: deployment_owner must not be empty");
                 }
+                StateStoreLimits::from_overrides(&self.limits)?;
             }
             StateStoreProviderConfig::Foundationdb { cluster_file, .. } => {
                 validate_readable_file(cluster_file, "cluster_file")?;
+                StateStoreLimits::from_overrides(&self.limits)?;
+            }
+            StateStoreProviderConfig::Mysql { database } => {
+                if self.cluster_id.len() > MYSQL_MAX_META_VALUE_BYTES {
+                    bail!(
+                        "InvalidStateStoreConfig: MySQL cluster_id exceeds the physical meta value limit"
+                    );
+                }
+                if database.is_empty()
+                    || database.len() > 64
+                    || !database
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    bail!(
+                        "InvalidStateStoreConfig: database must match ASCII [A-Za-z0-9_]{{1,64}}"
+                    );
+                }
+                StateStoreLimits::from_overrides_with_max_key(&self.limits, MYSQL_MAX_KEY_BYTES)?;
             }
         }
-        StateStoreLimits::from_overrides(&self.limits)?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MySqlTlsMode {
+    Disabled,
+    Required,
+    VerifyIdentity,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MySqlClientConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password_env: String,
+    pub tls_mode: MySqlTlsMode,
+    pub tls_ca_path: Option<PathBuf>,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub connect_timeout_ms: u64,
+    pub pool_min: usize,
+    pub pool_max: usize,
+    pub inactive_connection_ttl_ms: u64,
+}
+
+impl MySqlClientConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.host.trim().is_empty() {
+            bail!("InvalidStateStoreConfig: mysql_client.host must not be empty");
+        }
+        if self.port == 0 {
+            bail!("InvalidStateStoreConfig: mysql_client.port must be non-zero");
+        }
+        if self.username.trim().is_empty() {
+            bail!("InvalidStateStoreConfig: mysql_client.username must not be empty");
+        }
+        if !valid_environment_variable_name(&self.password_env) {
+            bail!(
+                "InvalidStateStoreConfig: mysql_client.password_env must be a non-empty environment variable name"
+            );
+        }
+        if self.connect_timeout_ms == 0 || self.connect_timeout_ms > MYSQL_MAX_CONNECT_TIMEOUT_MS {
+            bail!(
+                "InvalidStateStoreConfig: mysql_client.connect_timeout_ms must be between 1 and {MYSQL_MAX_CONNECT_TIMEOUT_MS}"
+            );
+        }
+        if self.pool_min == 0 || self.pool_min > self.pool_max {
+            bail!("InvalidStateStoreConfig: mysql_client.pool_min must be between 1 and pool_max");
+        }
+        if self.inactive_connection_ttl_ms == 0
+            || self.inactive_connection_ttl_ms > MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS
+        {
+            bail!(
+                "InvalidStateStoreConfig: mysql_client.inactive_connection_ttl_ms must be between 1 and {MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS}"
+            );
+        }
+
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            let missing = if self.tls_cert_path.is_none() {
+                "tls_cert_path"
+            } else {
+                "tls_key_path"
+            };
+            bail!(
+                "InvalidStateStoreConfig: mysql_client.{missing} is required when the matching client TLS path is configured"
+            );
+        }
+        if self.tls_mode == MySqlTlsMode::VerifyIdentity {
+            if self.tls_ca_path.is_none() {
+                bail!(
+                    "InvalidStateStoreConfig: mysql_client.tls_ca_path is required for verify_identity"
+                );
+            }
+            if mysql_host_is_ip_address(&self.host) {
+                bail!(
+                    "InvalidStateStoreConfig: mysql_client.host must be a DNS hostname for verify_identity"
+                );
+            }
+        }
+        for (name, path) in [
+            ("tls_ca_path", self.tls_ca_path.as_deref()),
+            ("tls_cert_path", self.tls_cert_path.as_deref()),
+            ("tls_key_path", self.tls_key_path.as_deref()),
+        ] {
+            if let Some(path) = path {
+                validate_readable_file(path, &format!("mysql_client.{name}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MySqlClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MySqlClientConfig")
+            .field("host_configured", &!self.host.trim().is_empty())
+            .field("port_configured", &(self.port != 0))
+            .field("username_configured", &!self.username.trim().is_empty())
+            .field(
+                "password_env_configured",
+                &valid_environment_variable_name(&self.password_env),
+            )
+            .field("tls_enabled", &(self.tls_mode != MySqlTlsMode::Disabled))
+            .field(
+                "tls_verify_identity",
+                &(self.tls_mode == MySqlTlsMode::VerifyIdentity),
+            )
+            .field("tls_ca_path_configured", &self.tls_ca_path.is_some())
+            .field("tls_cert_path_configured", &self.tls_cert_path.is_some())
+            .field("tls_key_path_configured", &self.tls_key_path.is_some())
+            .field(
+                "connect_timeout_configured",
+                &(self.connect_timeout_ms != 0),
+            )
+            .field(
+                "pool_bounds_configured",
+                &(self.pool_min != 0 && self.pool_max != 0),
+            )
+            .field(
+                "inactive_connection_ttl_configured",
+                &(self.inactive_connection_ttl_ms != 0),
+            )
+            .finish()
+    }
+}
+
+fn mysql_host_is_ip_address(host: &str) -> bool {
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    normalized.parse::<IpAddr>().is_ok()
+}
+
+fn valid_environment_variable_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateStoreAppConfig {
+    pub store: StateStoreConfig,
+    pub mysql_client: Option<MySqlClientConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreAppConfigWire {
+    provider: StateStoreProviderKind,
+    cluster_id: String,
+    path: Option<PathBuf>,
+    deployment_owner: Option<String>,
+    cluster_file: Option<PathBuf>,
+    keyspace_id: Option<Uuid>,
+    database: Option<String>,
+    #[serde(default)]
+    limits: StateStoreLimitOverrides,
+    mysql_client: Option<MySqlClientConfig>,
+}
+
+impl<'de> Deserialize<'de> for StateStoreAppConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StateStoreAppConfigWire::deserialize(deserializer)?;
+        let mysql_client = wire.mysql_client;
+        let store = state_store_config_from_wire(StateStoreConfigWire {
+            provider: wire.provider,
+            cluster_id: wire.cluster_id,
+            path: wire.path,
+            deployment_owner: wire.deployment_owner,
+            cluster_file: wire.cluster_file,
+            keyspace_id: wire.keyspace_id,
+            database: wire.database,
+            limits: wire.limits,
+        })?;
+        Ok(Self {
+            store,
+            mysql_client,
+        })
+    }
+}
+
+impl StateStoreAppConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.store.validate()?;
+        match (&self.store.provider, &self.mysql_client) {
+            (StateStoreProviderConfig::Mysql { .. }, Some(client)) => client.validate(),
+            (StateStoreProviderConfig::Mysql { .. }, None) => {
+                bail!("InvalidStateStoreConfig: mysql provider requires [state_store.mysql_client]")
+            }
+            (_, None) => Ok(()),
+            (_, Some(_)) => bail!(
+                "InvalidStateStoreConfig: [state_store.mysql_client] requires the mysql state store provider"
+            ),
+        }
     }
 }
 

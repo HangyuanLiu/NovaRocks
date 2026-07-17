@@ -18,7 +18,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use sha2::{Digest, Sha256};
 
 fn manifest_dir() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
@@ -2524,4 +2528,2104 @@ fn use_local_module() { state_store::local_helper(); }
     ];
 
     assert!(state_store_boundary_violations(&sources).is_empty());
+}
+
+const MYSQL_ASYNC_EXTERNAL_OWNERS: &[&str] = &["mysql_async"];
+const MYSQL_JDBC_EXTERNAL_OWNERS: &[&str] = &["mysql", "mysql_common"];
+const MYSQL_JDBC_OWNER_TOKENS: &[&str] = &["JdbcScanConfig"];
+const MYSQL_RAW_SERVER_CODES: &[&str] = &["1062", "1205", "1213", "2006", "2013"];
+const MYSQL_TRANSACTION_SQL: &[&str] = &[
+    "start transaction",
+    "set transaction isolation level",
+    "lock in share mode",
+    "for update",
+];
+const MYSQL_SCHEMA_TOKENS: &[&str] = &[
+    "state_store_meta",
+    "state_store_kv",
+    "state_store_changes",
+    "state_store_commits",
+];
+
+fn is_state_store_mysql_source(path: &str) -> bool {
+    path.starts_with("src/state_store/mysql/")
+}
+
+fn is_mysql_native_owner(path: &str) -> bool {
+    is_state_store_mysql_source(path)
+}
+
+fn rust_string_literals(text: &str) -> Vec<String> {
+    let mut production = text.as_bytes().to_vec();
+    for span in rust_test_only_item_spans(text) {
+        for byte in &mut production[span] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    let production =
+        String::from_utf8(production).expect("production literal sanitizer must preserve UTF-8");
+    let bytes = production.as_bytes();
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                index += 1;
+            }
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            let mut depth = 1usize;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+        } else if let Some((hashes, opening_len)) = rust_raw_string_open(bytes, index) {
+            let start = index;
+            index += opening_len;
+            while index < bytes.len() {
+                let closes = bytes[index] == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'));
+                if closes {
+                    index += hashes + 1;
+                    if let Some(value) = decode_rust_string_literal(&production[start..index]) {
+                        values.push(value);
+                    }
+                    break;
+                }
+                index += 1;
+            }
+        } else if bytes[index] == b'"' {
+            let start = index;
+            index += 1;
+            let mut escaped = false;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    if let Some(value) = decode_rust_string_literal(&production[start..index]) {
+                        values.push(value);
+                    }
+                    break;
+                }
+            }
+        } else if bytes[index] == b'\''
+            && let Some(end) = rust_char_literal_end(&production, index)
+        {
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    values
+}
+
+fn external_owner_present(paths: &[Vec<String>], tokens: &[String], owner: &str) -> Option<String> {
+    if !tokens.iter().any(|token| token == owner) {
+        return None;
+    }
+    paths.iter().find_map(|path| {
+        path.iter()
+            .position(|segment| segment == owner)
+            .filter(|index| {
+                owner != "mysql"
+                    || (!(*index >= 2
+                        && path[*index - 2] == "crate"
+                        && path[*index - 1] == "state_store")
+                        && !(*index > 0
+                            && *index + 1 == path.len()
+                            && path[*index - 1] == "StateStoreRuntime"))
+            })
+            .filter(|_| {
+                !declares_module(tokens, owner)
+                    || references_absolute_or_extern_owner(tokens, owner)
+            })
+            .map(|index| path[index..].join("::"))
+    })
+}
+
+fn unqualified_external_namespace_present(tokens: &[String], owner: &str) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token == owner
+            && tokens.get(index + 1).is_some_and(|token| token == "::")
+            && (index == 0 || tokens[index - 1] != "::")
+    })
+}
+
+fn state_store_mysql_boundary_violations(sources: &[GuardSource]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for source in sources {
+        let production = rust_sanitized_production_text(&source.text);
+        let paths = rust_production_canonical_paths(&production, &source.path);
+        let tokens = rust_use_tokens(&production);
+
+        if !is_mysql_native_owner(&source.path) {
+            for owner in MYSQL_ASYNC_EXTERNAL_OWNERS {
+                if let Some(reference) =
+                    external_owner_present(&paths, &tokens, owner).or_else(|| {
+                        unqualified_external_namespace_present(&tokens, owner)
+                            .then(|| (*owner).to_owned())
+                    })
+                {
+                    violations.push(format!(
+                        "state-store-mysql-native-outside-owner: {} -> {reference}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if is_state_store_source(&source.path) && !is_state_store_mysql_source(&source.path) {
+            for owner in MYSQL_JDBC_EXTERNAL_OWNERS {
+                if let Some(reference) = external_owner_present(&paths, &tokens, owner) {
+                    violations.push(format!(
+                        "state-store-mysql-jdbc-outside-jdbc-owner: {} -> {reference}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if is_mysql_native_owner(&source.path) {
+            for owner in MYSQL_JDBC_EXTERNAL_OWNERS {
+                if let Some(reference) =
+                    external_owner_present(&paths, &tokens, owner).or_else(|| {
+                        unqualified_external_namespace_present(&tokens, owner)
+                            .then(|| (*owner).to_owned())
+                    })
+                {
+                    violations.push(format!(
+                        "state-store-mysql-jdbc-leak: {} -> {reference}",
+                        source.path
+                    ));
+                }
+            }
+            for token in MYSQL_JDBC_OWNER_TOKENS {
+                if tokens.iter().any(|actual| actual == token) {
+                    violations.push(format!(
+                        "state-store-mysql-jdbc-leak: {} -> {token}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        if is_state_store_source(&source.path)
+            && !is_mysql_native_owner(&source.path)
+            && !is_state_store_foundationdb_source(&source.path)
+        {
+            for code in MYSQL_RAW_SERVER_CODES {
+                if tokens.iter().any(|token| token == code) {
+                    violations.push(format!(
+                        "state-store-mysql-server-code-outside-owner: {} -> {code}",
+                        source.path
+                    ));
+                }
+            }
+        }
+
+        let string_literals = rust_string_literals(&source.text);
+        if is_state_store_source(&source.path)
+            && !is_state_store_mysql_source(&source.path)
+            && !is_state_store_sqlite_source(&source.path)
+        {
+            for literal in &string_literals {
+                let lower = literal.to_ascii_lowercase();
+                for sql in MYSQL_TRANSACTION_SQL {
+                    if lower.contains(sql) {
+                        violations.push(format!(
+                            "state-store-mysql-transaction-sql-outside-owner: {} -> {}",
+                            source.path,
+                            sql.to_ascii_uppercase()
+                        ));
+                    }
+                }
+            }
+        }
+        if !is_state_store_mysql_source(&source.path) && !is_state_store_sqlite_source(&source.path)
+        {
+            for literal in &string_literals {
+                let lower = literal.to_ascii_lowercase();
+                for table in MYSQL_SCHEMA_TOKENS {
+                    if lower.contains(table) {
+                        violations.push(format!(
+                            "state-store-mysql-schema-outside-owner: {} -> {table}",
+                            source.path
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+fn mysql_provider_variant_cfg_violations(path: &str, text: &str) -> Vec<String> {
+    let tokens = rust_source_tokens(text);
+    let mut violations = Vec::new();
+    let Some(body_open) = tokens.iter().enumerate().find_map(|(index, token)| {
+        (token.text == "enum"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|name| name.text == "StateStoreProviderConfig"))
+        .then(|| {
+            tokens[index + 2..]
+                .iter()
+                .position(|token| token.text == "{")
+                .map(|offset| index + 2 + offset)
+        })
+        .flatten()
+    }) else {
+        return violations;
+    };
+    let Some(body_close) = rust_matching_token(&tokens, body_open, "{", "}") else {
+        return vec![format!("state-store-mysql-provider-config-parse: {path}")];
+    };
+    let mut cursor = body_open + 1;
+    while cursor < body_close {
+        while tokens.get(cursor).is_some_and(|token| token.text == ",") {
+            cursor += 1;
+        }
+        let mut cfg_gated = false;
+        while tokens.get(cursor).is_some_and(|token| token.text == "#")
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.text == "[")
+        {
+            let Some(close) = rust_matching_token(&tokens, cursor + 1, "[", "]") else {
+                return vec![format!("state-store-mysql-provider-config-parse: {path}")];
+            };
+            cfg_gated |= tokens[cursor + 2..close]
+                .iter()
+                .any(|token| matches!(token.text.as_str(), "cfg" | "cfg_attr"));
+            cursor = close + 1;
+        }
+        if tokens
+            .get(cursor)
+            .is_some_and(|token| token.text == "Mysql")
+            && cfg_gated
+        {
+            violations.push(format!(
+                "state-store-mysql-provider-variant-feature-gated: {path} -> Mysql"
+            ));
+        }
+        while cursor < body_close && tokens[cursor].text != "," {
+            if matches!(tokens[cursor].text.as_str(), "{" | "(" | "[") {
+                let closing = match tokens[cursor].text.as_str() {
+                    "{" => "}",
+                    "(" => ")",
+                    "[" => "]",
+                    _ => unreachable!(),
+                };
+                let Some(close) =
+                    rust_matching_token(&tokens, cursor, &tokens[cursor].text, closing)
+                else {
+                    return vec![format!("state-store-mysql-provider-config-parse: {path}")];
+                };
+                cursor = close + 1;
+            } else {
+                cursor += 1;
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn mysql_state_store_open_cancellation_gate_is_feature_gated_and_provider_owned() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mysql_mod =
+        fs::read_to_string(root.join("src/state_store/mysql/mod.rs")).expect("read MySQL module");
+    let hooks = fs::read_to_string(root.join("src/state_store/mysql/open_test_hooks.rs"))
+        .expect("read MySQL open test hooks");
+    let schema = fs::read_to_string(root.join("src/state_store/mysql/schema.rs"))
+        .expect("read MySQL schema owner");
+    let runtime =
+        fs::read_to_string(root.join("src/state_store/runtime.rs")).expect("read runtime owner");
+
+    assert!(
+        mysql_mod.contains(
+            "#[cfg(feature = \"state-store-test-hooks\")]\npub(crate) mod open_test_hooks;"
+        ),
+        "MySQL open cancellation hooks must be entirely feature-gated"
+    );
+    for required in [
+        "AfterAdvisoryLock",
+        "AfterReadOnlyStart",
+        "HashMap<String, Arc<OpenGateState>>",
+        "connection_id",
+        "wait_completed",
+    ] {
+        assert!(
+            hooks.contains(required),
+            "MySQL open cancellation gate must freeze `{required}`"
+        );
+    }
+    for forbidden in [
+        "NOVA_MYSQL_PROVISIONER",
+        "provisioner.cnf",
+        "provision-test-database",
+    ] {
+        assert!(
+            !hooks.contains(forbidden),
+            "MySQL open cancellation gate must not access provisioner authority: {forbidden}"
+        );
+    }
+    for required in [
+        "take_mysql_open_gate(database, MysqlOpenGatePhase::AfterAdvisoryLock)",
+        "take_mysql_open_gate(database, MysqlOpenGatePhase::AfterReadOnlyStart)",
+        "session.destroy_connection().await",
+    ] {
+        assert!(
+            schema.contains(required),
+            "MySQL schema cancellation disposition must retain `{required}`"
+        );
+    }
+    for required in [
+        "tokio::spawn(async move",
+        "oneshot::channel()",
+        "MysqlOpenWaiterGuard",
+        "MysqlOpenCancellation",
+        "open_store_owned",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "MySQL runtime must retain provider-owned open supervision: {required}"
+        );
+    }
+    let operation_acquire = runtime
+        .find("let opening = self.acquire_operation()?;")
+        .expect("open must acquire its operation guard");
+    let pool_acquire = runtime
+        .find("let pool = self.get_or_create_pool(&database)?;")
+        .expect("open must acquire its database pool");
+    let owner_spawn = runtime
+        .find("tokio::spawn(async move")
+        .expect("open must spawn its provider owner");
+    assert!(
+        operation_acquire < pool_acquire && pool_acquire < owner_spawn,
+        "MySQL open must register its operation before creating its pool and spawning the provider owner"
+    );
+    let owner_start = runtime
+        .find("async fn open_store_owned(")
+        .expect("find provider-owned open");
+    let owner_end = runtime[owner_start..]
+        .find("async fn prepare_pool(")
+        .map(|offset| owner_start + offset)
+        .expect("find end of provider-owned open");
+    let owner = &runtime[owner_start..owner_end];
+    assert!(
+        owner.contains("_opening: MysqlRuntimeGuard")
+            && !owner.contains("MysqlRuntimeGuard::acquire"),
+        "the pre-registered operation guard must be moved into the provider owner"
+    );
+}
+
+fn collect_mysql_fixture_sources(dir: &Path, root: &Path, sources: &mut Vec<GuardSource>) {
+    let mut entries = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read MySQL fixture directory {}: {error}", dir.display()))
+        .map(|entry| entry.expect("read MySQL fixture entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) != Some("runtime") {
+                collect_mysql_fixture_sources(&path, root, sources);
+            }
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("fixture path below repository root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read MySQL fixture owner {relative}: {error}"));
+        sources.push(GuardSource::new(relative, text));
+    }
+}
+
+fn mysql_fixture_contract_violations(sources: &[GuardSource]) -> Vec<String> {
+    let pinned_image = format!(
+        "mysql:8.4.10@sha256:{}{}",
+        "c831a0f11348d402b43d77453e17d770", "be2eef356615a2823fe0f5a0d6c8b9af"
+    );
+    let create_database = ["CREATE", "DATABASE"].join(" ");
+    let drop_database = ["DROP", "DATABASE"].join(" ");
+    let provisioner = "docker/mysql-state-store/provision-test-database.sh";
+    let compose = "docker/mysql-state-store/compose.yml";
+    let up = "docker/mysql-state-store/up.sh";
+    let down = "docker/mysql-state-store/down.sh";
+    let contract = "docker/mysql-state-store/probes/contract.sh";
+    let mut violations = Vec::new();
+
+    for required in [
+        compose,
+        up,
+        "docker/mysql-state-store/status.sh",
+        down,
+        provisioner,
+        "docker/mysql-state-store/README.md",
+        "docker/mysql-state-store/probes/schema.sql",
+        contract,
+    ] {
+        if !sources.iter().any(|source| source.path == required) {
+            violations.push(format!("mysql-fixture-required-owner-missing: {required}"));
+        }
+    }
+
+    let image_owners = sources
+        .iter()
+        .filter(|source| source.text.contains(&pinned_image))
+        .map(|source| source.path.as_str())
+        .collect::<Vec<_>>();
+    if image_owners != [compose] {
+        violations.push(format!(
+            "mysql-fixture-pinned-image-owner: {image_owners:?}"
+        ));
+    }
+
+    for source in sources {
+        if ![compose, up, provisioner].contains(&source.path.as_str())
+            && [
+                "NOVA_MYSQL_PROVISIONER_",
+                "novarocks-mysql-provisioner.cnf",
+                "provisioner.cnf",
+                "mysql_admin",
+            ]
+            .iter()
+            .any(|token| source.text.contains(token))
+        {
+            violations.push(format!(
+                "mysql-fixture-provisioner-boundary: {}",
+                source.path
+            ));
+        }
+        if source.path != provisioner
+            && (source.text.contains(&create_database) || source.text.contains(&drop_database))
+        {
+            violations.push(format!("mysql-fixture-database-ddl-owner: {}", source.path));
+        }
+        for forbidden in [
+            "docker-entrypoint-initdb.d",
+            "/opt/homebrew",
+            "iceberg-rest",
+            "iceberg-hive",
+        ] {
+            if source.text.contains(forbidden) {
+                violations.push(format!(
+                    "mysql-fixture-isolation-leak: {} -> {forbidden}",
+                    source.path
+                ));
+            }
+        }
+    }
+
+    let source_text = |path: &str| {
+        sources
+            .iter()
+            .find(|source| source.path == path)
+            .map(|source| source.text.as_str())
+            .unwrap_or("")
+    };
+    let compose_text = source_text(compose);
+    let up_text = source_text(up);
+    let down_text = source_text(down);
+    let status_text = source_text("docker/mysql-state-store/status.sh");
+    let provision_text = source_text(provisioner);
+    let contract_text = source_text(contract);
+
+    if compose_text.contains("MYSQL_DATABASE:") {
+        violations.push("mysql-fixture-compose-shared-database".to_owned());
+    }
+    let cleaner_service = format!(
+        r#"  runtime-cleaner:
+    image: {pinned_image}
+    profiles:
+      - cleanup
+    user: "0:0"
+    network_mode: none
+    volumes:
+      - "${{NOVA_MYSQL_RUNTIME_DIR}}/data:/var/lib/mysql"
+    entrypoint:
+      - /bin/sh
+      - -eu
+      - -c
+    command:
+      - rm -rf -- /var/lib/mysql/* /var/lib/mysql/.[!.]* /var/lib/mysql/..?*"#
+    );
+    if compose_text.matches(&cleaner_service).count() != 1
+        || compose_text.matches(&pinned_image).count() != 2
+    {
+        violations.push("mysql-fixture-runtime-cleaner-boundary".to_owned());
+    }
+    if provision_text.contains("ON \\`${database}\\`.*")
+        || provision_text.contains("ON `${database}`.*")
+    {
+        violations.push("mysql-fixture-provider-database-wide-grant".to_owned());
+    }
+    if provision_text.contains("mysql_admin --execute")
+        && provision_text.contains("NOVAROCKS_MYSQL_PASSWORD")
+    {
+        violations.push("mysql-fixture-provider-secret-in-argv".to_owned());
+    }
+    if provision_text
+        .lines()
+        .any(|line| line.contains("REVOKE") && line.contains("|| true"))
+    {
+        violations.push("mysql-fixture-revoke-failure-swallowed".to_owned());
+    }
+    let disarm = provision_text.rfind("trap - EXIT");
+    let publish = provision_text.find("printf '%s\\n' \"$database\"");
+    if !matches!((publish, disarm), (Some(publish), Some(disarm)) if publish < disarm) {
+        violations.push("mysql-fixture-create-trap-disarmed-before-publish".to_owned());
+    }
+    for table in [
+        "state_store_meta",
+        "state_store_kv",
+        "state_store_changes",
+        "state_store_commits",
+        "fixture_readiness",
+        "ss3_probe_keys",
+        "ss3_probe_snapshot",
+        "ss3_probe_locks",
+        "ss3_probe_key_3073",
+    ] {
+        if !provision_text.contains(table) {
+            violations.push(format!("mysql-fixture-table-grant-missing: {table}"));
+        }
+    }
+    for required in [
+        "WORKSPACE_ROOT",
+        "compose_project=",
+        "project_running",
+        "runtime is retained",
+        "docker is required to stop",
+        "--profile cleanup",
+        "run --rm --no-deps runtime-cleaner",
+        "failed to clean MySQL container-owned runtime data",
+        "failed to remove MySQL cleanup project resources",
+        "MySQL runtime data requires --docker cleanup",
+        "failed to remove MySQL host runtime; current link and runtime are retained",
+    ] {
+        if !down_text.contains(required) {
+            violations.push(format!("mysql-fixture-down-fail-open: {required}"));
+        }
+    }
+    if !down_text.contains("run_with_timeout 30 rm -rf \"$runtime_dir\"") {
+        violations.push("mysql-fixture-unbounded-runtime-cleanup".to_owned());
+    }
+    let first_down = down_text.find("down --remove-orphans");
+    let cleaner = down_text.find("run --rm --no-deps runtime-cleaner");
+    let final_down = down_text.rfind("down --remove-orphans");
+    let unlink = down_text.find("rm -f \"$current_link\"");
+    let host_cleanup = down_text.find("run_with_timeout 30 rm -rf \"$runtime_dir\"");
+    if down_text.matches("down --remove-orphans").count() != 2
+        || !matches!(
+            (first_down, cleaner, final_down, unlink, host_cleanup),
+            (Some(first_down), Some(cleaner), Some(final_down), Some(unlink), Some(host_cleanup))
+                if first_down < cleaner
+                    && cleaner < final_down
+                    && final_down < host_cleanup
+                    && host_cleanup < unlink
+        )
+    {
+        violations.push("mysql-fixture-runtime-cleanup-order".to_owned());
+    }
+    if down_text.contains("sudo") {
+        violations.push("mysql-fixture-runtime-cleanup-sudo".to_owned());
+    }
+    for required in [
+        "file_mode",
+        "stat --version",
+        "stat -c '%a'",
+        "stat -f '%Lp'",
+        "MySQL runtime environment must have mode 600",
+    ] {
+        if !status_text.contains(required) {
+            violations.push(format!("mysql-fixture-status-file-mode: {required}"));
+        }
+    }
+    if status_text.contains("stat -f '%Lp' \"$exports_file\" 2>/dev/null || stat -c") {
+        violations.push("mysql-fixture-status-mixed-stat-output".to_owned());
+    }
+    if up_text.contains("if docker image inspect")
+        || !up_text.contains("run_with_timeout 15 docker image inspect")
+    {
+        violations.push("mysql-fixture-unbounded-image-inspect".to_owned());
+    }
+    for required in ["previous_database", "drop \"$previous_database\""] {
+        if !up_text.contains(required) {
+            violations.push(format!("mysql-fixture-readiness-leak: {required}"));
+        }
+    }
+    if contract_text.contains("DO SLEEP(")
+        || !contract_text.contains("wait_for_marker")
+        || !contract_text.contains("reader_one_ready")
+        || !contract_text.contains("reader_two_ready")
+        || !contract_text.contains("deadlock_a_ready")
+        || !contract_text.contains("deadlock_b_ready")
+        || !contract_text.contains("lock_holder_ready")
+        || !contract_text.contains("--unbuffered")
+        || !contract_text.contains("cleanup_deadline")
+    {
+        violations.push("mysql-fixture-probe-missing-explicit-barrier".to_owned());
+    }
+    if contract_text.contains("deadlock_gate=")
+        || contract_text.contains("GET_LOCK('${deadlock_gate}'")
+        || !contract_text.contains("deadlock_a_gate")
+        || !contract_text.contains("deadlock_b_gate")
+    {
+        violations.push("mysql-fixture-deadlock-shared-named-gate".to_owned());
+    }
+    violations.sort();
+    violations.dedup();
+    violations
+}
+
+#[test]
+fn mysql_state_store_fixture_detector_rejects_security_and_lifecycle_bypasses() {
+    let pinned_image = format!(
+        "mysql:8.4.10@sha256:{}{}",
+        "c831a0f11348d402b43d77453e17d770", "be2eef356615a2823fe0f5a0d6c8b9af"
+    );
+    let database_ddl = [
+        ["CREATE", "DATABASE"].join(" "),
+        ["DROP", "DATABASE"].join(" "),
+    ];
+    let sources = [
+        GuardSource::new(
+            "docker/mysql-state-store/compose.yml",
+            format!("image: {pinned_image}"),
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/probes/extra.sh",
+            format!(
+                "image={pinned_image}; {} x; {} x",
+                database_ddl[0], database_ddl[1]
+            ),
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/provision-test-database.sh",
+            "mysql_admin --execute=\"$NOVAROCKS_MYSQL_PASSWORD\"; \
+             GRANT CREATE ON `${database}`.*; REVOKE x || true; \
+             trap - EXIT; printf '%s\\n' \"$database\"",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/up.sh",
+            "if docker image inspect x; then :; fi",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/down.sh",
+            "rm -rf \"$runtime_dir\"",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/probes/contract.sh",
+            "DO SLEEP(2); sleep 1",
+        ),
+    ];
+    let violations = mysql_fixture_contract_violations(&sources);
+    for expected in [
+        "pinned-image-owner",
+        "database-ddl-owner",
+        "database-wide-grant",
+        "secret-in-argv",
+        "revoke-failure-swallowed",
+        "trap-disarmed-before-publish",
+        "down-fail-open",
+        "unbounded-runtime-cleanup",
+        "unbounded-image-inspect",
+        "readiness-leak",
+        "missing-explicit-barrier",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "synthetic MySQL fixture detector missed {expected}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_state_store_fixture_detector_rejects_shared_deadlock_named_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.join("docker/mysql-state-store");
+    let mut sources = Vec::new();
+    collect_mysql_fixture_sources(&fixture, root, &mut sources);
+    let mut shared_gate_sources = sources.clone();
+    let contract = shared_gate_sources
+        .iter_mut()
+        .find(|source| source.path == "docker/mysql-state-store/probes/contract.sh")
+        .expect("physical probe contract source");
+    contract.text = "deadlock_gate=x; GET_LOCK('${deadlock_gate}'); \
+        deadlock_a_ready; deadlock_b_ready; wait_for_marker; reader_one_ready; \
+        reader_two_ready; lock_holder_ready; --unbuffered; cleanup_deadline"
+        .to_owned();
+    let violations = mysql_fixture_contract_violations(&shared_gate_sources);
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains("deadlock-shared-named-gate")),
+        "detector must reject a shared named gate in the current deadlock probe: {violations:?}"
+    );
+}
+
+#[test]
+fn mysql_state_store_fixture_detector_rejects_provisioner_boundary_bypasses() {
+    let sources = [
+        GuardSource::new(
+            "docker/mysql-state-store/compose.yml",
+            "NOVA_MYSQL_PROVISIONER_PASSWORD; /run/secrets/novarocks-mysql-provisioner.cnf",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/up.sh",
+            "NOVA_MYSQL_PROVISIONER_PASSWORD; provisioner.cnf",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/provision-test-database.sh",
+            "mysql_admin; NOVA_MYSQL_PROVISIONER_PASSWORD; \
+             /run/secrets/novarocks-mysql-provisioner.cnf",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/status.sh",
+            "mysql_admin; /run/secrets/novarocks-mysql-provisioner.cnf",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/down.sh",
+            "NOVA_MYSQL_PROVISIONER_PASSWORD=cleanup-placeholder",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/probes/contract.sh",
+            "mysql_admin; /run/secrets/novarocks-mysql-provisioner.cnf",
+        ),
+        GuardSource::new(
+            "docker/mysql-state-store/probes/helper.sh",
+            "NOVA_MYSQL_PROVISIONER_USERNAME",
+        ),
+    ];
+    let violations = mysql_fixture_contract_violations(&sources);
+    for forbidden_owner in [
+        "docker/mysql-state-store/status.sh",
+        "docker/mysql-state-store/down.sh",
+        "docker/mysql-state-store/probes/contract.sh",
+        "docker/mysql-state-store/probes/helper.sh",
+    ] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("provisioner-boundary") && violation.contains(forbidden_owner)
+            }),
+            "detector must reject provisioner access in {forbidden_owner}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_state_store_fixture_detector_rejects_each_missing_required_owner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.join("docker/mysql-state-store");
+    let mut sources = Vec::new();
+    collect_mysql_fixture_sources(&fixture, root, &mut sources);
+    for required in [
+        "docker/mysql-state-store/compose.yml",
+        "docker/mysql-state-store/up.sh",
+        "docker/mysql-state-store/status.sh",
+        "docker/mysql-state-store/down.sh",
+        "docker/mysql-state-store/provision-test-database.sh",
+        "docker/mysql-state-store/README.md",
+        "docker/mysql-state-store/probes/schema.sql",
+        "docker/mysql-state-store/probes/contract.sh",
+    ] {
+        let without_required = sources
+            .iter()
+            .filter(|source| source.path != required)
+            .cloned()
+            .collect::<Vec<_>>();
+        let violations = mysql_fixture_contract_violations(&without_required);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("required-owner-missing") && violation.contains(required)
+            }),
+            "detector must reject missing required owner {required}: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn mysql_state_store_down_preserves_runtime_until_project_cleanup_is_confirmed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture_source = root.join("docker/mysql-state-store");
+    for (
+        mode,
+        prepare_runtime,
+        stop_docker,
+        expect_success,
+        expect_runtime,
+        expected_down_calls,
+        expect_cleaner,
+    ) in [
+        ("pre-prepare", false, true, true, false, 1, false),
+        ("running", true, false, true, true, 0, false),
+        ("stopped-with-data", true, false, true, true, 0, false),
+        ("inspect-fail", true, false, false, true, 0, false),
+        ("first-down-fail", true, true, false, true, 1, false),
+        ("cleaner-fail", true, true, false, true, 1, true),
+        ("final-down-fail", true, true, false, true, 2, true),
+        ("host-rm-fail", true, true, false, true, 2, true),
+        ("down-success", true, true, true, false, 2, true),
+    ] {
+        let temp = tempfile::tempdir().expect("create fake MySQL fixture workspace");
+        let workspace = fs::canonicalize(temp.path()).expect("canonical fake workspace");
+        let fixture = workspace.join("docker/mysql-state-store");
+        let fake_bin = workspace.join("fake-bin");
+        fs::create_dir_all(&fixture).expect("create fake fixture");
+        fs::create_dir_all(&fake_bin).expect("create fake bin");
+        fs::copy(fixture_source.join("down.sh"), fixture.join("down.sh"))
+            .expect("copy down script");
+        fs::copy(
+            fixture_source.join("compose.yml"),
+            fixture.join("compose.yml"),
+        )
+        .expect("copy compose file");
+
+        let fake_docker = fake_bin.join("docker");
+        fs::write(
+            &fake_docker,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$FAKE_DOCKER_MODE:$*" in
+  running:*" ps --all --quiet mysql")
+    printf 'fake-container-id\n'
+    ;;
+  inspect-fail:*" ps --all --quiet mysql")
+    exit 23
+    ;;
+  first-down-fail:*" ps --all --quiet mysql"|cleaner-fail:*" ps --all --quiet mysql"|final-down-fail:*" ps --all --quiet mysql"|host-rm-fail:*" ps --all --quiet mysql"|down-success:*" ps --all --quiet mysql")
+    printf 'fake-container-id\n'
+    ;;
+  first-down-fail:*" down --remove-orphans")
+    exit 24
+    ;;
+  cleaner-fail:*" run --rm --no-deps runtime-cleaner")
+    exit 25
+    ;;
+  final-down-fail:*" down --remove-orphans")
+    if [ "$(grep -c ' down --remove-orphans$' "$FAKE_DOCKER_LOG")" -ge 2 ]; then
+      exit 26
+    fi
+    ;;
+esac
+"#,
+        )
+        .expect("write fake docker");
+        fs::set_permissions(&fake_docker, fs::Permissions::from_mode(0o755))
+            .expect("make fake docker executable");
+
+        let fake_rm = fake_bin.join("rm");
+        fs::write(
+            &fake_rm,
+            r#"#!/bin/sh
+if [ "$FAKE_DOCKER_MODE" = host-rm-fail ] && [ "$1" = -rf ] && [ "$2" = "$FAKE_RUNTIME_DIR" ]; then
+  exit 27
+fi
+exec /bin/rm "$@"
+"#,
+        )
+        .expect("write fake rm");
+        fs::set_permissions(&fake_rm, fs::Permissions::from_mode(0o755))
+            .expect("make fake rm executable");
+
+        let workspace_hash = hex::encode(Sha256::digest(workspace.to_string_lossy().as_bytes()));
+        let env_id = format!("nr-mysql-{}", &workspace_hash[..12]);
+        let runtime_base = fixture.join("runtime");
+        let runtime_dir = runtime_base.join(&env_id);
+        let current_link = runtime_base.join("current");
+        if prepare_runtime {
+            fs::create_dir_all(runtime_dir.join("data")).expect("create fake runtime data");
+            fs::write(runtime_dir.join("sentinel"), mode).expect("write runtime sentinel");
+            symlink(&env_id, &current_link).expect("link fake current runtime");
+        }
+
+        let docker_log = workspace.join("docker.log");
+        let mut command = Command::new("/bin/bash");
+        command.arg(fixture.join("down.sh"));
+        if stop_docker {
+            command.arg("--docker");
+        }
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = command
+            .env("PATH", path)
+            .env("FAKE_DOCKER_MODE", mode)
+            .env("FAKE_DOCKER_LOG", &docker_log)
+            .env("FAKE_RUNTIME_DIR", &runtime_dir)
+            .env("NOVAROCKS_WORKSPACE_ROOT", &workspace)
+            .output()
+            .expect("run copied down script");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            expect_success,
+            "unexpected down result for {mode}: {stderr}"
+        );
+        assert_eq!(
+            runtime_dir.exists(),
+            expect_runtime,
+            "unexpected runtime state for {mode}: {stderr}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&current_link).is_ok(),
+            expect_runtime,
+            "unexpected current-link state for {mode}: {stderr}"
+        );
+        let docker_calls = fs::read_to_string(&docker_log).expect("read fake docker calls");
+        assert!(
+            docker_calls.contains(" ps --all --quiet mysql"),
+            "down must inspect the derived project for {mode}: {docker_calls}"
+        );
+        let calls = docker_calls.lines().collect::<Vec<_>>();
+        let down_positions = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| call.ends_with(" down --remove-orphans").then_some(index))
+            .collect::<Vec<_>>();
+        let cleaner_positions = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                call.ends_with(" run --rm --no-deps runtime-cleaner")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            down_positions.len(),
+            expected_down_calls,
+            "unexpected Compose down calls for {mode}: {docker_calls}"
+        );
+        assert_eq!(
+            cleaner_positions.len(),
+            usize::from(expect_cleaner),
+            "unexpected runtime-cleaner calls for {mode}: {docker_calls}"
+        );
+        if expect_cleaner {
+            assert!(
+                down_positions[0] < cleaner_positions[0],
+                "runtime cleaner must run after the first Compose down for {mode}: {docker_calls}"
+            );
+        }
+        if expected_down_calls == 2 {
+            assert!(
+                cleaner_positions[0] < down_positions[1],
+                "final Compose down must run after the runtime cleaner for {mode}: {docker_calls}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mysql_state_store_status_accepts_mode_0600_with_gnu_stat() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture_source = root.join("docker/mysql-state-store");
+    let temp = tempfile::tempdir().expect("create GNU stat status workspace");
+    let workspace = fs::canonicalize(temp.path()).expect("canonical GNU stat status workspace");
+    let fixture = workspace.join("docker/mysql-state-store");
+    let current = fixture.join("runtime/current");
+    let fake_bin = workspace.join("fake-bin");
+    fs::create_dir_all(&current).expect("create fake current runtime");
+    fs::create_dir_all(&fake_bin).expect("create fake command directory");
+    fs::copy(fixture_source.join("status.sh"), fixture.join("status.sh"))
+        .expect("copy real status script");
+    fs::set_permissions(fixture.join("status.sh"), fs::Permissions::from_mode(0o755))
+        .expect("make copied status script executable");
+
+    let exports_file = current.join("env.sh");
+    fs::write(
+        &exports_file,
+        format!(
+            "export NOVAROCKS_MYSQL_VERSION=8.4.10\n\
+             export NOVA_MYSQL_ENV_ID=nr-mysql-gnu-stat\n\
+             export NOVA_MYSQL_COMPOSE_PROJECT=nrss3gnustat\n\
+             export NOVA_MYSQL_COMPOSE_ENV={}\n\
+             export NOVA_MYSQL_COMPOSE_FILE={}\n\
+             export NOVAROCKS_MYSQL_DATABASE=novarocks_ss3_gnu_stat\n\
+             export NOVAROCKS_MYSQL_USERNAME=provider\n\
+             export NOVAROCKS_MYSQL_PASSWORD_ENV=NOVAROCKS_MYSQL_PASSWORD\n",
+            current.join("compose.env").display(),
+            fixture.join("compose.yml").display(),
+        ),
+    )
+    .expect("write fake status environment");
+    fs::set_permissions(&exports_file, fs::Permissions::from_mode(0o600))
+        .expect("set fake status environment mode");
+
+    let fake_stat = fake_bin.join("stat");
+    fs::write(
+        &fake_stat,
+        r#"#!/bin/sh
+case "$1" in
+  --version)
+    printf 'stat (GNU coreutils) 9.4\n'
+    ;;
+  -c)
+    printf '600\n'
+    ;;
+  -f)
+    printf '  File: "%s"\n    ID: deadbeef Namelen: 255 Type: ext2/ext3\n' "$2"
+    exit 1
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+    )
+    .expect("write fake GNU stat");
+    fs::set_permissions(&fake_stat, fs::Permissions::from_mode(0o755))
+        .expect("make fake GNU stat executable");
+
+    let fake_docker = fake_bin.join("docker");
+    fs::write(
+        &fake_docker,
+        "#!/bin/sh\nprintf '8.4.10\\t16384\\tInnoDB\\t+00:00\\tSTRICT_TRANS_TABLES\\n'\n",
+    )
+    .expect("write fake Docker readiness command");
+    fs::set_permissions(&fake_docker, fs::Permissions::from_mode(0o755))
+        .expect("make fake Docker executable");
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(fixture.join("status.sh"))
+        .arg("--self-check")
+        .env("PATH", path)
+        .output()
+        .expect("run real status script with GNU stat behavior");
+    assert!(
+        output.status.success(),
+        "status --self-check must accept a mode-0600 file with GNU stat: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn mysql_state_store_down_removes_container_owned_runtime_data() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIP: Docker Desktop does not preserve Linux container ownership on host bind mounts"
+        );
+        return;
+    }
+    if std::env::var_os("NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST").is_none() {
+        eprintln!("SKIP: set NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST=1 on Linux with Docker");
+        return;
+    }
+
+    let docker_ready = Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .expect("Docker is required for the opted-in MySQL ownership integration test");
+    assert!(
+        docker_ready.status.success(),
+        "Docker Compose is required for the opted-in MySQL ownership integration test: {}",
+        String::from_utf8_lossy(&docker_ready.stderr)
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture_source = root.join("docker/mysql-state-store");
+    let temp = tempfile::tempdir().expect("create real MySQL fixture workspace");
+    let workspace = fs::canonicalize(temp.path()).expect("canonical real fixture workspace");
+    let fixture = workspace.join("docker/mysql-state-store");
+    fs::create_dir_all(&fixture).expect("create real fixture directory");
+    for owner in ["up.sh", "down.sh", "compose.yml"] {
+        fs::copy(fixture_source.join(owner), fixture.join(owner))
+            .unwrap_or_else(|error| panic!("copy real fixture owner {owner}: {error}"));
+    }
+    for script in ["up.sh", "down.sh"] {
+        fs::set_permissions(fixture.join(script), fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| {
+                panic!("make real fixture script {script} executable: {error}")
+            });
+    }
+
+    let workspace_hash = hex::encode(Sha256::digest(workspace.to_string_lossy().as_bytes()));
+    let env_id = format!("nr-mysql-{}", &workspace_hash[..12]);
+    let compose_project = format!("nrss3{}", &workspace_hash[..12]);
+    let runtime_base = fixture.join("runtime");
+    let runtime_dir = runtime_base.join(&env_id);
+    let current_link = runtime_base.join("current");
+    let pre_prepare_down = Command::new("/bin/bash")
+        .arg(fixture.join("down.sh"))
+        .arg("--docker")
+        .env("NOVAROCKS_WORKSPACE_ROOT", &workspace)
+        .output()
+        .expect("run real MySQL fixture down before prepare");
+    assert!(
+        pre_prepare_down.status.success(),
+        "down --docker before prepare failed: {}",
+        String::from_utf8_lossy(&pre_prepare_down.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&runtime_base).is_err(),
+        "down --docker before prepare must not create a bind-mount source"
+    );
+    for (resource, output) in [
+        (
+            "container",
+            Command::new("docker")
+                .args([
+                    "ps",
+                    "--all",
+                    "--quiet",
+                    "--filter",
+                    &format!("label=com.docker.compose.project={compose_project}"),
+                ])
+                .output()
+                .expect("inspect pre-prepare container residue"),
+        ),
+        (
+            "network",
+            Command::new("docker")
+                .args([
+                    "network",
+                    "ls",
+                    "--quiet",
+                    "--filter",
+                    &format!("label=com.docker.compose.project={compose_project}"),
+                ])
+                .output()
+                .expect("inspect pre-prepare network residue"),
+        ),
+    ] {
+        assert!(
+            output.status.success() && output.stdout.is_empty(),
+            "down --docker before prepare retained {resource} residue: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let prepare = Command::new("/bin/bash")
+        .arg(fixture.join("up.sh"))
+        .arg("--prepare-only")
+        .env("NOVAROCKS_WORKSPACE_ROOT", &workspace)
+        .output()
+        .expect("prepare real MySQL fixture runtime");
+    assert!(
+        prepare.status.success(),
+        "prepare-only failed: {}",
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+
+    let data_dir = runtime_dir.join("data");
+    let compose_file = fixture.join("compose.yml");
+    let compose_env = runtime_dir.join("compose.env");
+    let cleanup_compose_env = workspace.join("cleanup-compose.env");
+    fs::copy(&compose_env, &cleanup_compose_env)
+        .expect("preserve Compose environment outside the runtime under test");
+    let image = fs::read_to_string(&compose_file)
+        .expect("read copied MySQL compose owner")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("image: "))
+        .expect("copied MySQL compose owner must declare its pinned image")
+        .to_owned();
+
+    let inspected = Command::new("docker")
+        .args(["image", "inspect", &image])
+        .output()
+        .expect("inspect pinned MySQL image");
+    if !inspected.status.success() {
+        let pulled = Command::new("docker")
+            .args(["pull", &image])
+            .output()
+            .expect("pull pinned MySQL image");
+        assert!(
+            pulled.status.success(),
+            "pull pinned MySQL image failed: {}",
+            String::from_utf8_lossy(&pulled.stderr)
+        );
+    }
+
+    let mount = format!("{}:/fixture", data_dir.display());
+    let create_owned = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "/bin/sh",
+            "--volume",
+            &mount,
+            &image,
+            "-c",
+            "mkdir -p /fixture/owned && printf owned > /fixture/owned/sentinel && chown -R 0:0 /fixture && chmod 0700 /fixture /fixture/owned /fixture/owned/sentinel",
+        ])
+        .output()
+        .expect("create container-owned MySQL runtime data");
+    assert!(
+        create_owned.status.success(),
+        "create container-owned MySQL runtime data failed: {}",
+        String::from_utf8_lossy(&create_owned.stderr)
+    );
+    let owned_metadata = fs::symlink_metadata(&data_dir)
+        .expect("container-owned MySQL data directory must remain visible to the host");
+    assert_eq!(
+        owned_metadata.uid(),
+        0,
+        "test precondition requires root ownership"
+    );
+    assert_eq!(
+        owned_metadata.mode() & 0o777,
+        0o700,
+        "test precondition requires a host-inaccessible data directory"
+    );
+
+    let down = Command::new("/bin/bash")
+        .arg(fixture.join("down.sh"))
+        .arg("--docker")
+        .env("NOVAROCKS_WORKSPACE_ROOT", &workspace)
+        .output()
+        .expect("run real MySQL fixture down script");
+    let runtime_present = fs::symlink_metadata(&runtime_dir).is_ok();
+    let current_present = fs::symlink_metadata(&current_link).is_ok();
+    let data_present = fs::symlink_metadata(&data_dir).is_ok();
+    let container_residue = Command::new("docker")
+        .args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            &format!("label=com.docker.compose.project={compose_project}"),
+        ])
+        .output()
+        .expect("inspect MySQL Compose container residue");
+    let network_residue = Command::new("docker")
+        .args([
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            &format!("label=com.docker.compose.project={compose_project}"),
+        ])
+        .output()
+        .expect("inspect MySQL Compose network residue");
+    let project_residue =
+        !container_residue.stdout.is_empty() || !network_residue.stdout.is_empty();
+
+    if data_present {
+        let owner = fs::metadata(&workspace).expect("read host workspace owner");
+        let cleanup_owned = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--entrypoint",
+                "/bin/sh",
+                "--volume",
+                &mount,
+                "--env",
+                &format!("HOST_UID={}", owner.uid()),
+                "--env",
+                &format!("HOST_GID={}", owner.gid()),
+                &image,
+                "-c",
+                "rm -rf /fixture/owned && chown \"$HOST_UID:$HOST_GID\" /fixture && chmod 0700 /fixture",
+            ])
+            .output()
+            .expect("clean container-owned MySQL runtime data");
+        assert!(
+            cleanup_owned.status.success(),
+            "clean container-owned MySQL runtime data failed: {}",
+            String::from_utf8_lossy(&cleanup_owned.stderr)
+        );
+    }
+    if project_residue {
+        let cleanup_project = Command::new("docker")
+            .args([
+                "compose",
+                "--env-file",
+                cleanup_compose_env
+                    .to_str()
+                    .expect("UTF-8 external cleanup Compose env path"),
+                "-p",
+                &compose_project,
+                "-f",
+                compose_file.to_str().expect("UTF-8 compose file path"),
+                "down",
+                "--remove-orphans",
+            ])
+            .output()
+            .expect("clean real MySQL fixture Compose project");
+        assert!(
+            cleanup_project.status.success(),
+            "clean real MySQL fixture Compose project failed: {}",
+            String::from_utf8_lossy(&cleanup_project.stderr)
+        );
+    }
+    if fs::symlink_metadata(&current_link).is_ok() {
+        fs::remove_file(&current_link).expect("remove retained current runtime link after capture");
+    }
+    if fs::symlink_metadata(&runtime_dir).is_ok() {
+        fs::remove_dir_all(&runtime_dir).expect("remove retained runtime after ownership cleanup");
+    }
+
+    let stderr = String::from_utf8_lossy(&down.stderr);
+    assert!(
+        container_residue.status.success(),
+        "inspect container residue: {}",
+        String::from_utf8_lossy(&container_residue.stderr)
+    );
+    assert!(
+        network_residue.status.success(),
+        "inspect network residue: {}",
+        String::from_utf8_lossy(&network_residue.stderr)
+    );
+    assert!(
+        down.status.success(),
+        "down --docker must remove container-owned runtime data: {stderr}"
+    );
+    assert!(
+        !runtime_present,
+        "down --docker retained the MySQL runtime directory: {stderr}"
+    );
+    assert!(
+        !current_present,
+        "down --docker retained the MySQL current runtime link: {stderr}"
+    );
+    assert!(
+        !project_residue,
+        "down --docker retained MySQL Compose project containers or networks"
+    );
+}
+
+#[test]
+fn mysql_state_store_fixture_is_pinned_isolated_and_fail_closed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.join("docker/mysql-state-store");
+    assert!(fixture.is_dir(), "missing MySQL state-store fixture root");
+    let mut sources = Vec::new();
+    collect_mysql_fixture_sources(&fixture, root, &mut sources);
+    let violations = mysql_fixture_contract_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "MySQL fixture architecture failed:\n{}",
+        violations.join("\n")
+    );
+
+    let combined = sources
+        .iter()
+        .map(|source| source.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "NOVA_MYSQL_ENV_ID",
+        "NOVA_MYSQL_COMPOSE_PROJECT",
+        "NOVA_MYSQL_COMPOSE_FILE",
+        "NOVA_MYSQL_RUNTIME_DIR",
+        "NOVAROCKS_MYSQL_HOST",
+        "NOVAROCKS_MYSQL_PORT",
+        "NOVAROCKS_MYSQL_DATABASE",
+        "NOVAROCKS_MYSQL_USERNAME",
+        "NOVAROCKS_MYSQL_PASSWORD_ENV",
+        "NOVA_MYSQL_PROVISIONER_USERNAME",
+        "NOVAROCKS_MYSQL_VERSION",
+        "NOVAROCKS_MYSQL_IMAGE",
+        "chmod 600",
+        "--prepare-only",
+        "--docker",
+        "runtime-cleaner",
+        "network_mode: none",
+        "run --rm --no-deps runtime-cleaner",
+        "SELECT VERSION()",
+        "@@innodb_page_size",
+        "@@default_storage_engine",
+        "@@session.time_zone",
+        "@@session.sql_mode",
+        "STRICT_TRANS_TABLES",
+        "16384",
+        "8.4.10",
+        "create <case-id>",
+        "drop <database-name>",
+        "novarocks_ss3_",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "MySQL fixture contract is missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn mysql_state_store_physical_probe_inventory_is_exact() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.join("docker/mysql-state-store");
+    let schema_path = fixture.join("probes/schema.sql");
+    let contract_path = fixture.join("probes/contract.sh");
+    assert!(
+        schema_path.is_file(),
+        "missing MySQL physical probe schema owner: {}",
+        schema_path.display()
+    );
+    assert!(
+        contract_path.is_file(),
+        "missing MySQL physical probe contract owner: {}",
+        contract_path.display()
+    );
+    let schema = fs::read_to_string(schema_path).expect("read MySQL physical probe schema");
+    let contract = fs::read_to_string(contract_path).expect("read MySQL physical probe contract");
+    let markers = [
+        "SS3_MYSQL_PROBE_PRIVILEGE_SEPARATION_PASS",
+        "SS3_MYSQL_PROBE_KEY_3072_PASS",
+        "SS3_MYSQL_PROBE_KEY_3073_ERROR_1071_PASS",
+        "SS3_MYSQL_PROBE_BINARY_ORDER_PASS",
+        "SS3_MYSQL_PROBE_RANGE_FORWARD_REVERSE_PASS",
+        "SS3_MYSQL_PROBE_PRIMARY_RANGE_EXPLAIN_PASS",
+        "SS3_MYSQL_PROBE_RR_SNAPSHOT_PASS",
+        "SS3_MYSQL_PROBE_RR_DUAL_NONLOCKING_READERS_PASS",
+        "SS3_MYSQL_PROBE_DEADLOCK_1213_PASS",
+        "SS3_MYSQL_PROBE_LOCK_TIMEOUT_1205_ROLLBACK_PASS",
+        "SS3_MYSQL_PROBE_SESSION_RESET_PASS",
+    ];
+    for marker in markers {
+        assert_eq!(
+            contract.matches(marker).count(),
+            1,
+            "physical probe marker must have exactly one contract owner: {marker}"
+        );
+    }
+    for expected in [
+        "VARBINARY(3072)",
+        "ROW_FORMAT=DYNAMIC",
+        "ss3_probe_keys",
+        "ss3_probe_snapshot",
+        "ss3_probe_locks",
+        "prior_write_visible_after_timeout=7",
+        "value_after_explicit_rollback=0",
+        "GET_LOCK(",
+        "KILL CONNECTION",
+        "--unbuffered",
+    ] {
+        assert!(
+            schema.contains(expected) || contract.contains(expected),
+            "physical probe owners are missing {expected}"
+        );
+    }
+
+    let provision = fs::read_to_string(fixture.join("provision-test-database.sh"))
+        .expect("read MySQL database provisioner");
+    assert!(
+        provision.contains("create <case-id>") && provision.contains("drop <database-name>"),
+        "physical probes must use the frozen unique-database provisioner"
+    );
+    assert!(
+        contract.contains("NOVAROCKS_MYSQL_DATABASE")
+            && contract.contains("novarocks_ss3_")
+            && !contract.contains("runtime-readiness"),
+        "physical probes must require a unique provisioned database, never the shared readiness database"
+    );
+    for expected in [
+        "requested_database=\"${NOVAROCKS_MYSQL_DATABASE:-}\"",
+        "readiness_database=\"$NOVAROCKS_MYSQL_DATABASE\"",
+        "NOVAROCKS_MYSQL_DATABASE=\"$requested_database\"",
+        "must not use the shared readiness database",
+    ] {
+        assert!(
+            contract.contains(expected),
+            "physical probes must preserve and validate the caller database override: {expected}"
+        );
+    }
+    assert!(
+        !contract.contains("NOVA_MYSQL_PROVISIONER_PASSWORD"),
+        "physical probes must not receive the provisioner credential"
+    );
+    assert!(
+        contract.contains("--commands") && contract.contains("'\\x'"),
+        "session reset must use the MySQL client resetconnection protocol command"
+    );
+    assert!(
+        contract.contains("grep -F 'reset=+00:00:'"),
+        "session reset must assert the literal UTC reset prefix"
+    );
+    assert!(
+        !contract.contains("RESET CONNECTION;"),
+        "RESET CONNECTION is not valid MySQL 8.4 SQL"
+    );
+}
+
+#[test]
+fn state_store_mysql_dependency_contract() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest_path).expect("read Cargo.toml");
+    let manifest: toml::Value = toml::from_str(&manifest_text).expect("parse Cargo.toml");
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .expect("[dependencies]");
+    let mysql_async = dependencies
+        .get("mysql_async")
+        .and_then(toml::Value::as_table)
+        .expect("mysql_async must be a structured optional dependency");
+    let rustls = dependencies
+        .get("rustls")
+        .and_then(toml::Value::as_table)
+        .expect("rustls must be a structured optional type dependency");
+
+    assert_eq!(
+        mysql_async.get("version").and_then(toml::Value::as_str),
+        Some("=0.37.0")
+    );
+    assert_eq!(
+        mysql_async.get("optional").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        mysql_async
+            .get("default-features")
+            .and_then(toml::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        mysql_async
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .expect("mysql_async features")
+            .iter()
+            .map(|feature| feature.as_str().expect("string feature"))
+            .collect::<Vec<_>>(),
+        ["minimal-rust", "rustls-tls", "ring", "tls12"]
+    );
+    assert_eq!(
+        rustls.get("version").and_then(toml::Value::as_str),
+        Some("0.23")
+    );
+    assert_eq!(
+        rustls.get("optional").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        rustls
+            .get("default-features")
+            .and_then(toml::Value::as_bool),
+        Some(false)
+    );
+
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .expect("[features]");
+    assert_eq!(
+        features
+            .get("mysql-state-store-provider")
+            .and_then(toml::Value::as_array)
+            .expect("mysql-state-store-provider feature")
+            .iter()
+            .map(|feature| feature.as_str().expect("string feature"))
+            .collect::<Vec<_>>(),
+        ["dep:mysql_async", "dep:rustls"]
+    );
+    assert!(
+        !dependencies.contains_key("mysql_common_037"),
+        "state store must not add a direct mysql_common 0.37 dependency"
+    );
+    assert_eq!(
+        dependencies.get("mysql").and_then(toml::Value::as_str),
+        Some("25"),
+        "the synchronous mysql dependency remains owned by JDBC scan"
+    );
+    assert_eq!(
+        dependencies
+            .get("mysql_common")
+            .and_then(toml::Value::as_str),
+        Some("0.32"),
+        "the synchronous mysql_common dependency remains owned by JDBC scan"
+    );
+    let direct_mysql_common_aliases = dependencies
+        .iter()
+        .filter(|(name, dependency)| {
+            name.as_str() != "mysql_common"
+                && dependency
+                    .as_table()
+                    .and_then(|dependency| dependency.get("package"))
+                    .and_then(toml::Value::as_str)
+                    == Some("mysql_common")
+        })
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        direct_mysql_common_aliases.is_empty(),
+        "state store must not add an aliased direct mysql_common dependency: {direct_mysql_common_aliases:?}"
+    );
+    for forbidden in ["tracing", "binlog"] {
+        assert!(
+            !mysql_async
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some(forbidden))
+                }),
+            "mysql_async feature {forbidden} must stay disabled"
+        );
+    }
+
+    let jdbc =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/connector/jdbc.rs"))
+            .expect("read JDBC owner");
+    assert!(
+        jdbc.contains("mysql::"),
+        "the synchronous mysql driver must remain in the JDBC owner"
+    );
+    assert!(
+        !jdbc.contains("mysql_async"),
+        "the async state-store driver must not leak into JDBC"
+    );
+}
+
+#[test]
+fn state_store_mysql_boundary_rejects_native_and_jdbc_leaks() {
+    let fixtures = [
+        GuardSource::new(
+            "src/state_store/config.rs",
+            "use mysql_async::Pool; fn leak(_: mysql_async::Result<()>) {}",
+        ),
+        GuardSource::new(
+            "src/state_store/mysql/mod.rs",
+            "use mysql::Pool; use mysql_common::value::Value;",
+        ),
+        GuardSource::new(
+            "src/state_store/mysql/txn.rs",
+            "use crate::connector::jdbc::JdbcScanConfig;",
+        ),
+        GuardSource::new(
+            "src/state_store/runtime.rs",
+            "use mysql_async::Conn; const DEADLOCK: u16 = 1213; \
+             const SQL: &str = \"START TRANSACTION\";",
+        ),
+        GuardSource::new(
+            "src/state_store/config.rs",
+            "const DEADLOCK: u16 = 1213; const SQL: &str = \"START TRANSACTION\";",
+        ),
+        GuardSource::new(
+            "src/meta/state_store.rs",
+            "const SQL: &str = \"CREATE TABLE state_store_kv (key_bytes VARBINARY(3072))\";",
+        ),
+    ];
+    let violations = state_store_mysql_boundary_violations(&fixtures);
+
+    for expected in [
+        "mysql_async",
+        "mysql_common",
+        "JdbcScanConfig",
+        "1213",
+        "START TRANSACTION",
+        "state_store_kv",
+    ] {
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains(expected)),
+            "MySQL boundary detector missed {expected}: {violations:?}"
+        );
+    }
+    assert!(
+        violations.iter().any(|violation| {
+            violation == "state-store-mysql-jdbc-leak: src/state_store/mysql/mod.rs -> mysql"
+        }),
+        "MySQL owner must reject the synchronous mysql crate: {violations:?}"
+    );
+    for expected in ["mysql_async", "1213", "START TRANSACTION"] {
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("src/state_store/runtime.rs") && violation.contains(expected)
+            }),
+            "runtime must not own MySQL driver/error/transaction behavior for {expected}: {violations:?}"
+        );
+    }
+
+    let allowed = [
+        GuardSource::new(
+            "src/state_store/mysql/mod.rs",
+            "use mysql_async::{Pool, Row}; const CODE: u16 = 1213; \
+             const SQL: &str = \"START TRANSACTION; CREATE TABLE state_store_kv (key_bytes VARBINARY(3072))\";",
+        ),
+        GuardSource::new(
+            "src/state_store/runtime.rs",
+            "use super::mysql::{MySqlProviderHandle, MySqlRuntime}; \
+             fn compose(_: MySqlRuntime, _: MySqlProviderHandle) {}",
+        ),
+        GuardSource::new(
+            "src/state_store/mysql/helper_protocol.rs",
+            "use crate::state_store::StateStoreRuntime; \
+             fn boot(config: MySqlClientConfig) { let _ = StateStoreRuntime::mysql(config); }",
+        ),
+        GuardSource::new(
+            "src/state_store/config.rs",
+            "enum StateStoreProviderConfig { Mysql { database: String } } \
+             struct MySqlClientConfig { host: String }",
+        ),
+        GuardSource::new(
+            "src/connector/unrelated.rs",
+            "const YEAR: u16 = 2006; const SQL: &str = \"SELECT id FROM work FOR UPDATE\";",
+        ),
+        GuardSource::new(
+            "src/engine/unrelated.rs",
+            "const YEAR: u16 = 2013; const SQL: &str = \"START TRANSACTION\";",
+        ),
+    ];
+    let allowed_violations = state_store_mysql_boundary_violations(&allowed);
+    assert!(
+        allowed_violations.is_empty(),
+        "narrow MySQL owners and provider-neutral config must remain allowed: {allowed_violations:?}"
+    );
+
+    let src = src_dir();
+    let files = production_rs_files_from_entries(&src, &[src.join("lib.rs"), src.join("main.rs")]);
+    assert!(
+        !files.is_empty(),
+        "MySQL boundary source scan must be non-vacuous"
+    );
+    let sources = files
+        .iter()
+        .map(|path| {
+            GuardSource::new(
+                rel(path),
+                fs::read_to_string(path).expect("read production source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let violations = state_store_mysql_boundary_violations(&sources);
+    assert!(
+        violations.is_empty(),
+        "MySQL architecture boundary failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn state_store_foundationdb_runtime_rejects_mysql_provider_variant() {
+    let runtime = src_dir().join("state_store/runtime.rs");
+    let text = fs::read_to_string(&runtime).expect("read state store runtime");
+    let tokens = rust_use_tokens(&rust_sanitized_production_text(&text));
+    assert!(
+        tokens.windows(3).any(|tokens| {
+            tokens[0] == "StateStoreProviderConfig" && tokens[1] == "::" && tokens[2] == "Mysql"
+        }),
+        "FoundationDB runtime composition must explicitly reject the feature-independent Mysql provider variant"
+    );
+    assert!(
+        rust_string_literals(&text)
+            .iter()
+            .any(|literal| { literal == "FoundationDB runtime cannot open a MySQL state store" }),
+        "FoundationDB runtime must return a typed provider-mismatch error for Mysql config"
+    );
+}
+
+#[test]
+fn state_store_mysql_provider_variant_is_feature_independent() {
+    let cfg_gated = r#"
+enum StateStoreProviderConfig {
+    #[cfg(feature = "mysql-state-store-provider")]
+    Mysql { database: String },
+}
+"#;
+    let detector = mysql_provider_variant_cfg_violations("fixture.rs", cfg_gated);
+    assert!(
+        detector.iter().any(|violation| violation.contains("Mysql")),
+        "feature-gated MySQL provider variant must be rejected: {detector:?}"
+    );
+
+    let config = src_dir().join("state_store/config.rs");
+    let text = fs::read_to_string(&config).expect("read state store config");
+    let violations = mysql_provider_variant_cfg_violations(&rel(&config), &text);
+    assert!(
+        violations.is_empty(),
+        "production MySQL provider variant must be feature-independent: {violations:?}"
+    );
+    assert!(
+        text.contains("Mysql {"),
+        "feature-independent MySQL provider vocabulary must be non-vacuous"
+    );
+}
+
+#[test]
+fn mysql_state_store_workflow_covers_gate_owners_and_exact_command_order() {
+    let source_root = src_dir();
+    let root = source_root.parent().expect("workspace root");
+    let workflow_path = root.join(".github/workflows/mysql-state-store.yml");
+    let gate_path = root.join("tools/ci/mysql-state-store-provider.sh");
+    assert!(
+        workflow_path.is_file(),
+        "missing dedicated MySQL state-store workflow owner: {}",
+        workflow_path.display()
+    );
+    assert!(
+        gate_path.is_file(),
+        "missing dedicated MySQL state-store production gate owner: {}",
+        gate_path.display()
+    );
+
+    let workflow = fs::read_to_string(&workflow_path).expect("read MySQL state-store workflow");
+    let gate = fs::read_to_string(&gate_path).expect("read MySQL state-store production gate");
+    let jobs = workflow
+        .split_once("\njobs:\n")
+        .map(|(_, jobs)| jobs)
+        .expect("MySQL workflow must have a jobs mapping");
+    let job_owners = jobs
+        .lines()
+        .filter(|line| {
+            line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':')
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        job_owners,
+        ["  mysql-state-store:"],
+        "the MySQL production workflow must have exactly one job"
+    );
+    assert_eq!(
+        workflow.matches("runs-on: ubuntu-24.04").count(),
+        1,
+        "the unique MySQL production gate must run on Linux x86_64"
+    );
+
+    let production_step = r#"      - name: Run MySQL state-store production gate
+        env:
+          NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: "1"
+        run: |
+          set -euo pipefail
+          trap 'docker/mysql-state-store/down.sh --docker' EXIT
+          docker/mysql-state-store/up.sh
+          source docker/mysql-state-store/runtime/current/env.sh
+          tools/ci/mysql-state-store-provider.sh"#;
+    assert_eq!(
+        workflow.matches(production_step).count(),
+        1,
+        "the workflow must own one strict trap -> up -> source -> gate production step"
+    );
+    assert_eq!(
+        workflow
+            .matches("NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: \"1\"")
+            .count(),
+        1,
+        "the unique production step must opt into the Linux ownership regression exactly once"
+    );
+    assert!(
+        !workflow.contains("TDD RED"),
+        "the temporary isolated RED workflow step must be removed after GREEN"
+    );
+    assert_eq!(
+        workflow.matches("if: always()").count(),
+        1,
+        "the workflow must always run exactly one runtime-only residue check"
+    );
+    assert_eq!(
+        workflow
+            .matches("test ! -e docker/mysql-state-store/runtime/current")
+            .count(),
+        1,
+        "the always step must fail on retained runtime residue"
+    );
+    assert_eq!(
+        workflow
+            .matches("docker/mysql-state-store/down.sh --docker")
+            .count(),
+        1,
+        "the workflow must not run a second stop that can mask a gate failure"
+    );
+    assert!(
+        !workflow.contains("foundationdb") && !workflow.contains("FoundationDB"),
+        "the MySQL workflow must not install or start FoundationDB"
+    );
+
+    for owner in [
+        ".github/workflows/mysql-state-store.yml",
+        "Cargo.lock",
+        "Cargo.toml",
+        "docker/mysql-state-store/**",
+        "novarocks.toml.example",
+        "src/common/app_config.rs",
+        "src/state_store/**",
+        "tests/state_store_boundary.rs",
+        "tests/cluster_mvp.rs",
+        "tests/common/state_store_conformance.rs",
+        "tests/state_store_contract.rs",
+        "tests/state_store_mysql.rs",
+        "tests/state_store_mysql_cross_process.rs",
+        "tests/state_store_mysql_runtime.rs",
+        "tests/state_store_sqlite.rs",
+        "tests/support/state_store_mysql_helper.rs",
+        "tools/ci/mysql-state-store-provider.sh",
+    ] {
+        let trigger = format!("      - \"{owner}\"");
+        assert_eq!(
+            workflow.lines().filter(|line| *line == trigger).count(),
+            1,
+            "MySQL gate owner `{owner}` must trigger the unique production job exactly once"
+        );
+    }
+
+    let mut fixture_sources = Vec::new();
+    collect_mysql_fixture_sources(
+        &root.join("docker/mysql-state-store"),
+        root,
+        &mut fixture_sources,
+    );
+    let pinned_image = format!(
+        "mysql:8.4.10@sha256:{}{}",
+        "c831a0f11348d402b43d77453e17d770", "be2eef356615a2823fe0f5a0d6c8b9af"
+    );
+    let image_owners = fixture_sources
+        .iter()
+        .filter(|source| source.text.contains(&pinned_image))
+        .map(|source| source.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        image_owners,
+        ["docker/mysql-state-store/compose.yml"],
+        "the fixture compose file must remain the only pinned image owner"
+    );
+    assert!(
+        !workflow.contains("mysql:8.4.10")
+            && !workflow.contains("c831a0f11348d402b43d77453e17d770")
+            && !gate.contains("mysql:8.4.10")
+            && !gate.contains("c831a0f11348d402b43d77453e17d770"),
+        "the workflow and gate must consume fixture version/digest instead of copying them"
+    );
+    for owner in [(&workflow, "workflow"), (&gate, "production gate")] {
+        assert!(
+            !owner.0.contains("NOVA_MYSQL_PROVISIONER_PASSWORD")
+                && !owner.0.contains("NOVA_MYSQL_PROVISIONER_USERNAME"),
+            "the MySQL {} must not own provisioner credentials",
+            owner.1
+        );
+    }
+
+    let logical_gate = gate
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\\\n", "");
+    let expected_commands = [
+        "cargo fmt --all -- --check",
+        "cargo test --lib state_store",
+        "cargo test --test state_store_contract",
+        "cargo test --test state_store_sqlite",
+        "cargo test --test state_store_contract -- --list | awk '$1 == \"foundationdb_config_feature_off_open_fails_without_fallback:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --test state_store_contract foundationdb_config_feature_off_open_fails_without_fallback -- --exact",
+        "cargo test --test state_store_boundary -- --list | awk '$1 == \"state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden_apis:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --test state_store_boundary state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden_apis -- --exact",
+        "cargo check --no-default-features",
+        "if cargo tree -e features --no-default-features | rg -q 'mysql_async|mysql_common v0\\.37'; then",
+        "cargo test --test state_store_boundary state_store",
+        "cargo build --profile dev-opt",
+        "PROBE_DB=\"$(docker/mysql-state-store/provision-test-database.sh create production-gate-probes)\"",
+        "docker/mysql-state-store/probes/contract.sh",
+        "cargo test --features mysql-state-store-provider --test state_store_mysql_runtime -- --nocapture --test-threads=1",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | awk '$1 == \"mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io -- --exact --nocapture --test-threads=1",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | awk '$1 == \"mysql_suite:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql mysql_suite -- --exact --nocapture --test-threads=1",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_cross_process -- --list | awk '$1 == \"mysql_cross_process_suite:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_cross_process mysql_cross_process_suite -- --exact --nocapture --test-threads=1",
+        "cargo build --profile dev-opt --features mysql-state-store-provider",
+        "cargo test --test cluster_mvp -- --list | awk '$1 == \"cross_process_three_be_state_store_baseline:\" { n++ } END { exit(n != 1) }'",
+        "cargo test --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture",
+        "git diff --check",
+    ];
+    let logical_lines = logical_gate.lines().collect::<Vec<_>>();
+    let mut previous = None;
+    for command in expected_commands {
+        assert_eq!(
+            logical_lines
+                .iter()
+                .filter(|line| **line == command)
+                .count(),
+            1,
+            "the production gate must contain exactly one command: {command}"
+        );
+        let position = logical_lines
+            .iter()
+            .position(|line| *line == command)
+            .expect("command count already proved nonzero");
+        assert!(
+            previous.is_none_or(|previous| previous < position),
+            "production gate command is out of order: {command}"
+        );
+        previous = Some(position);
+    }
+    assert_eq!(
+        logical_gate
+            .matches("docker/mysql-state-store/probes/contract.sh")
+            .count(),
+        1,
+        "the raw InnoDB contract must run exactly once"
+    );
+    assert!(
+        logical_gate.contains("mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io")
+            && logical_gate.contains("mysql_suite")
+            && logical_gate.contains("mysql_cross_process_suite"),
+        "the raw contract cannot replace the public 3072/3073, conformance, or cross-process suites"
+    );
+    assert!(
+        !logical_gate.contains("--features foundationdb-provider")
+            && !logical_gate.contains("docker/foundationdb/up.sh"),
+        "the MySQL gate must keep FoundationDB feature-off and non-live"
+    );
+}
+
+#[test]
+fn mysql_state_store_gate_restores_fixture_database_after_raw_probe() {
+    let source_root = src_dir();
+    let gate_path = source_root
+        .parent()
+        .expect("workspace root")
+        .join("tools/ci/mysql-state-store-provider.sh");
+    let gate = fs::read_to_string(gate_path).expect("read MySQL state-store production gate");
+    let ordered = [
+        "READINESS_DB=\"$NOVAROCKS_MYSQL_DATABASE\"",
+        "PROBE_DB=\"$(docker/mysql-state-store/provision-test-database.sh create production-gate-probes)\"",
+        "cleanup_probe_db_on_exit()",
+        "local gate_status=\"$?\"",
+        "cleanup_probe_db || true",
+        "exit \"$gate_status\"",
+        "trap cleanup_probe_db_on_exit EXIT",
+        "export NOVAROCKS_MYSQL_DATABASE=\"$PROBE_DB\"",
+        "docker/mysql-state-store/probes/contract.sh",
+        "cleanup_probe_db\n",
+        "export NOVAROCKS_MYSQL_DATABASE=\"$READINESS_DB\"",
+        "trap - EXIT",
+        "cargo test --features mysql-state-store-provider --test state_store_mysql_runtime",
+    ];
+    let mut previous = 0usize;
+    for owner in ordered {
+        let offset = gate[previous..]
+            .find(owner)
+            .unwrap_or_else(|| panic!("gate is missing ordered database owner: {owner}"));
+        previous += offset + owner.len();
+    }
 }

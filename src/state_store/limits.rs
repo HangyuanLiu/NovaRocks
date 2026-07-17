@@ -21,6 +21,8 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 
 pub const MAX_KEY_BYTES: usize = 8 * 1024;
+pub const MYSQL_MAX_KEY_BYTES: usize = 3072;
+pub const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 1_000;
 pub const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
@@ -53,6 +55,18 @@ pub struct StateStoreLimits {
 
 impl StateStoreLimits {
     pub fn from_overrides(overrides: &StateStoreLimitOverrides) -> Result<Self> {
+        Self::from_overrides_with_max_key(overrides, MAX_KEY_BYTES)
+    }
+
+    pub fn from_overrides_with_max_key(
+        overrides: &StateStoreLimitOverrides,
+        provider_max_key_bytes: usize,
+    ) -> Result<Self> {
+        if provider_max_key_bytes == 0 || provider_max_key_bytes > MAX_KEY_BYTES {
+            bail!(
+                "InvalidStateStoreConfig: provider_max_key_bytes must be between 1 and {MAX_KEY_BYTES}, got {provider_max_key_bytes}"
+            );
+        }
         let transaction_deadline_ms = tightened_u64(
             "transaction_deadline_ms",
             overrides.transaction_deadline_ms,
@@ -62,7 +76,7 @@ impl StateStoreLimits {
             max_key_bytes: tightened_usize(
                 "max_key_bytes",
                 overrides.max_key_bytes,
-                MAX_KEY_BYTES,
+                provider_max_key_bytes,
             )?,
             max_value_bytes: tightened_usize(
                 "max_value_bytes",
@@ -282,5 +296,62 @@ mod tests {
             assert!(message.contains("InvalidStateStoreConfig"), "{message}");
             assert!(message.contains(field), "{message}");
         }
+    }
+
+    #[test]
+    fn mysql_effective_key_limit_defaults_to_3072() {
+        let limits = StateStoreLimits::from_overrides_with_max_key(
+            &StateStoreLimitOverrides::default(),
+            MYSQL_MAX_KEY_BYTES,
+        )
+        .expect("MySQL effective limits");
+
+        assert_eq!(limits.max_key_bytes, 3072);
+    }
+
+    #[test]
+    fn mysql_effective_key_limit_rejects_3073_before_io() {
+        let error = StateStoreLimits::from_overrides_with_max_key(
+            &StateStoreLimitOverrides {
+                max_key_bytes: Some(3073),
+                ..StateStoreLimitOverrides::default()
+            },
+            MYSQL_MAX_KEY_BYTES,
+        )
+        .expect_err("3073-byte MySQL key limit must fail before provider I/O");
+
+        assert_eq!(
+            error.to_string(),
+            "InvalidStateStoreConfig: max_key_bytes must be between 1 and 3072, got 3073"
+        );
+    }
+
+    #[test]
+    fn mysql_limit_does_not_change_sqlite_or_foundationdb() {
+        let common = StateStoreLimits::from_overrides(&StateStoreLimitOverrides::default())
+            .expect("common provider limits");
+        let explicit_common = StateStoreLimits::from_overrides_with_max_key(
+            &StateStoreLimitOverrides::default(),
+            MAX_KEY_BYTES,
+        )
+        .expect("explicit common provider limits");
+        let mysql = StateStoreLimits::from_overrides_with_max_key(
+            &StateStoreLimitOverrides::default(),
+            MYSQL_MAX_KEY_BYTES,
+        )
+        .expect("MySQL effective limits");
+
+        assert_eq!(common.max_key_bytes, MAX_KEY_BYTES);
+        assert_eq!(explicit_common, common);
+        assert_eq!(mysql.max_key_bytes, 3072);
+        assert_eq!(mysql.max_value_bytes, common.max_value_bytes);
+        assert_eq!(mysql.max_page_size, common.max_page_size);
+        assert_eq!(
+            mysql.max_transaction_operations,
+            common.max_transaction_operations
+        );
+        assert_eq!(mysql.max_transaction_bytes, common.max_transaction_bytes);
+        assert_eq!(mysql.transaction_deadline, common.transaction_deadline);
+        assert_eq!(mysql.runner_max_attempts, common.runner_max_attempts);
     }
 }

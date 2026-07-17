@@ -138,6 +138,12 @@ impl SqliteStateStore {
                     "SQLite state store requires sqlite provider configuration",
                 ));
             }
+            StateStoreProviderConfig::Mysql { .. } => {
+                return Err(StateStoreError::new(
+                    StateStoreErrorKind::InvalidConfiguration,
+                    "SQLite state store requires sqlite provider configuration",
+                ));
+            }
         };
         if is_memory_path(path) {
             return Err(StateStoreError::new(
