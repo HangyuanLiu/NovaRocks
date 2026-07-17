@@ -47625,6 +47625,3 @@ macro_rules! hide_source {
 
 #[path = "architecture_guard/ebd_1_engine_boundary.rs"]
 mod ebd_1_engine_boundary;
-
-#[path = "architecture_guard/state_store_boundary.rs"]
-mod state_store_boundary;
