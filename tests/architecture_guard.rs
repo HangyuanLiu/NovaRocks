@@ -46403,24 +46403,134 @@ const PBF_1A_ERROR_OWNERS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-const PBF_1A_UNIQUE_VOCABULARY: [&str; 17] = [
-    "ProtocolFamily",
-    "FieldPath",
-    "FieldPathSegment",
-    "TransportDecodeError",
-    "TransportDecodeErrorKind",
-    "ProtocolError",
-    "ProtocolErrorKind",
-    "ExecPlanBuildError",
-    "ExecPlanInvariant",
-    "FragmentBindingError",
-    "FragmentBindingTarget",
-    "FragmentBindingErrorKind",
-    "FragmentLaunchError",
-    "FragmentLaunchStage",
-    "FragmentLaunchErrorKind",
-    "FragmentExecutionError",
-    "FragmentExecutionErrorKind",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pbf1aDeclarationKind {
+    Struct,
+    Enum,
+    TypeAlias,
+}
+
+impl Pbf1aDeclarationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Enum => "enum",
+            Self::TypeAlias => "type alias",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Pbf1aVocabularyEntry {
+    name: &'static str,
+    kind: Pbf1aDeclarationKind,
+    owner_rel: &'static str,
+    owner_path: &'static [&'static str],
+}
+
+const PBF_1A_VOCABULARY_LEDGER: [Pbf1aVocabularyEntry; 17] = [
+    Pbf1aVocabularyEntry {
+        name: "ProtocolFamily",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FieldPath",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FieldPathSegment",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "TransportDecodeError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "TransportDecodeErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ProtocolError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ProtocolErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/protocol/common/error.rs",
+        owner_path: &["crate", "protocol", "common", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ExecPlanBuildError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "ExecPlanInvariant",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingTarget",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentBindingErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/exec/fragment/error.rs",
+        owner_path: &["crate", "exec", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchStage",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentLaunchErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentExecutionError",
+        kind: Pbf1aDeclarationKind::Struct,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
+    Pbf1aVocabularyEntry {
+        name: "FragmentExecutionErrorKind",
+        kind: Pbf1aDeclarationKind::Enum,
+        owner_rel: "src/runtime/fragment/error.rs",
+        owner_path: &["crate", "runtime", "fragment", "error"],
+    },
 ];
 
 fn pbf_1a_forbidden_dependency_segments(source_rel: &str) -> &'static [&'static str] {
@@ -46455,26 +46565,10 @@ fn pbf_1a_visibility_is_pub_crate(visibility: &syn::Visibility) -> bool {
 }
 
 fn pbf_1a_expected_vocabulary_owner(name: &str) -> Option<&'static [&'static str]> {
-    match name {
-        "ProtocolFamily"
-        | "FieldPath"
-        | "FieldPathSegment"
-        | "TransportDecodeError"
-        | "TransportDecodeErrorKind"
-        | "ProtocolError"
-        | "ProtocolErrorKind" => Some(&["crate", "protocol", "common", "error"]),
-        "ExecPlanBuildError"
-        | "ExecPlanInvariant"
-        | "FragmentBindingError"
-        | "FragmentBindingTarget"
-        | "FragmentBindingErrorKind" => Some(&["crate", "exec", "fragment", "error"]),
-        "FragmentLaunchError"
-        | "FragmentLaunchStage"
-        | "FragmentLaunchErrorKind"
-        | "FragmentExecutionError"
-        | "FragmentExecutionErrorKind" => Some(&["crate", "runtime", "fragment", "error"]),
-        _ => None,
-    }
+    PBF_1A_VOCABULARY_LEDGER
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.owner_path)
 }
 
 fn pbf_1a_path_starts_with(path: &[String], expected: &[&str]) -> bool {
@@ -46685,10 +46779,35 @@ fn pbf_1a_meta_contains_path(meta: &syn::Meta) -> Result<bool, syn::Error> {
     }
 }
 
+fn pbf_1a_path_is_std_include(path: &[String]) -> bool {
+    path == ["std", "include"]
+}
+
 fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<String> {
     #[derive(Default)]
+    struct IncludeAliasAudit {
+        aliases: BTreeSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for IncludeAliasAudit {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let mut bindings = Vec::new();
+            pbf_1a_collect_use_bindings(&item.tree, &mut Vec::new(), &mut bindings);
+            for binding in bindings {
+                if !binding.glob
+                    && pbf_1a_path_is_std_include(&binding.target)
+                    && let Some(local) = binding.local
+                {
+                    self.aliases.insert(local);
+                }
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+    }
+
     struct IndirectionAudit {
         findings: Vec<String>,
+        include_aliases: BTreeSet<String>,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for IndirectionAudit {
@@ -46704,7 +46823,16 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            if mac.path.is_ident("include") {
+            let path = mac
+                .path
+                .segments
+                .iter()
+                .map(|segment| pbf_1a_ident_text(&segment.ident))
+                .collect::<Vec<_>>();
+            let is_bare_include = path.as_slice() == ["include"];
+            let is_qualified_std_include = pbf_1a_path_is_std_include(&path);
+            let is_import_alias = path.len() == 1 && self.include_aliases.contains(&path[0]);
+            if is_bare_include || is_qualified_std_include || is_import_alias {
                 self.findings.push("include! macro".to_string());
             }
             syn::visit::visit_macro(self, mac);
@@ -46724,7 +46852,12 @@ fn pbf_1a_source_indirection_violations(source_rel: &str, text: &str) -> Vec<Str
             "PBF-1A owner `{source_rel}` has cfg-dependent source ownership that cannot be proven"
         )];
     }
-    let mut audit = IndirectionAudit::default();
+    let mut aliases = IncludeAliasAudit::default();
+    syn::visit::Visit::visit_file(&mut aliases, &file);
+    let mut audit = IndirectionAudit {
+        findings: Vec::new(),
+        include_aliases: aliases.aliases,
+    };
     syn::visit::Visit::visit_file(&mut audit, &file);
     audit
         .findings
@@ -46755,8 +46888,88 @@ fn pbf_1a_read_source_inventory(
     (sources, violations)
 }
 
-fn pbf_1a_expected_vocabulary_owner_rel(name: &str) -> Option<String> {
-    pbf_1a_expected_vocabulary_owner(name).map(|owner| format!("src/{}.rs", owner[1..].join("/")))
+fn pbf_1a_declaration_contract_violations(
+    source_rel: &str,
+    source: &str,
+    expected: Pbf1aVocabularyEntry,
+) -> Vec<String> {
+    struct DeclarationAudit<'a> {
+        expected_name: &'a str,
+        declarations: Vec<(Pbf1aDeclarationKind, bool)>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for DeclarationAudit<'_> {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::Struct,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_struct(self, item);
+        }
+
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::Enum,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_enum(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if pbf_1a_ident_text(&item.ident) == self.expected_name {
+                self.declarations.push((
+                    Pbf1aDeclarationKind::TypeAlias,
+                    pbf_1a_visibility_is_pub_crate(&item.vis),
+                ));
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    let mut file = match syn::parse_file(source) {
+        Ok(file) => file,
+        Err(error) => {
+            return vec![format!(
+                "PBF-1A vocabulary `{}` source `{source_rel}` must parse for declaration audit: {error}",
+                expected.name
+            )];
+        }
+    };
+    if runtime_filter_filter_cfg_file(&mut file).is_err() {
+        return vec![format!(
+            "PBF-1A vocabulary `{}` source `{source_rel}` has cfg-dependent declarations that cannot be proven",
+            expected.name
+        )];
+    }
+
+    let mut audit = DeclarationAudit {
+        expected_name: expected.name,
+        declarations: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut audit, &file);
+
+    let mut violations = Vec::new();
+    for (kind, exact_pub_crate) in audit.declarations {
+        if kind != expected.kind {
+            violations.push(format!(
+                "PBF-1A vocabulary `{}` in `{source_rel}` must be declared as `{}`; found `{}`",
+                expected.name,
+                expected.kind.label(),
+                kind.label()
+            ));
+        }
+        if !exact_pub_crate {
+            violations.push(format!(
+                "PBF-1A vocabulary `{}` in `{source_rel}` must have exact `pub(crate)` visibility",
+                expected.name
+            ));
+        }
+    }
+    violations
 }
 
 fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) -> Vec<String> {
@@ -46764,7 +46977,8 @@ fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) 
     if production_sources.is_empty() {
         violations.push("PBF-1A production source inventory is empty".to_string());
     }
-    for name in PBF_1A_UNIQUE_VOCABULARY {
+    for expected in PBF_1A_VOCABULARY_LEDGER {
+        let name = expected.name;
         let declaration_counts = production_sources
             .iter()
             .map(|(source_rel, source)| {
@@ -46784,12 +46998,15 @@ fn pbf_1a_unique_vocabulary_violations(production_sources: &[(String, String)]) 
             ));
         }
 
-        let Some(expected_owner) = pbf_1a_expected_vocabulary_owner_rel(name) else {
-            violations.push(format!(
-                "PBF-1A vocabulary `{name}` has no expected production owner"
-            ));
-            continue;
-        };
+        for (source_rel, source) in production_sources {
+            if rust_named_type_declaration_count(source, name) > 0 {
+                violations.extend(pbf_1a_declaration_contract_violations(
+                    source_rel, source, expected,
+                ));
+            }
+        }
+
+        let expected_owner = expected.owner_rel;
         let expected_count = declaration_counts
             .iter()
             .find_map(|(source_rel, count)| (*source_rel == expected_owner).then_some(*count))
@@ -47107,6 +47324,37 @@ fn pbf_1a_unique_vocabulary_detector_rejects_a_declaration_moved_to_the_wrong_ow
 }
 
 #[test]
+fn pbf_1a_unique_vocabulary_detector_rejects_wrong_declaration_kind_and_visibility() {
+    for (declaration, expected_diagnostic) in [
+        (
+            "pub(crate) type FragmentLaunchError = String;",
+            "must be declared as `struct`",
+        ),
+        (
+            "pub(crate) enum FragmentLaunchError { Invalid }",
+            "must be declared as `struct`",
+        ),
+        (
+            "pub struct FragmentLaunchError;",
+            "exact `pub(crate)` visibility",
+        ),
+    ] {
+        let inventory = vec![(
+            "src/runtime/fragment/error.rs".to_string(),
+            declaration.to_string(),
+        )];
+        let violations = pbf_1a_unique_vocabulary_violations(&inventory);
+        assert!(
+            violations.iter().any(|violation| {
+                violation.contains("`FragmentLaunchError`")
+                    && violation.contains(expected_diagnostic)
+            }),
+            "the expected owner must not satisfy its ledger with `{declaration}`: {violations:?}"
+        );
+    }
+}
+
+#[test]
 fn pbf_1a_inventory_reader_fails_closed_on_unreadable_source() {
     let root = std::env::temp_dir().join(format!(
         "pbf_1a_inventory_{}_{}",
@@ -47146,6 +47394,9 @@ fn render() {
         "#[cfg_attr(unix, path = \"legacy.rs\")] mod error;",
         "include!(\"legacy.rs\");",
         "const _: () = { include![\"legacy.rs\"] };",
+        "std::include!(\"legacy.rs\");",
+        "::std::include!(\"legacy.rs\");",
+        "use std::include as load_owner; load_owner!(\"legacy.rs\");",
     ] {
         let violations =
             pbf_1a_source_indirection_violations("src/protocol/common/error.rs", invalid);
