@@ -27,6 +27,9 @@ use crate::runtime_filter::model::coverage::Coverage;
 
 use super::artifact::ConsumerArtifactProfile;
 use super::identity::{DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId};
+use super::routing::RuntimeFilterRoutingShard;
+#[cfg(test)]
+use super::routing::{RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterCoreBudget {
@@ -364,6 +367,93 @@ impl RuntimeFilterInstallView {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterParticipantInstall {
+    core_view: RuntimeFilterInstallView,
+    routing_shard: RuntimeFilterRoutingShard,
+}
+
+impl RuntimeFilterParticipantInstall {
+    pub(crate) fn new(
+        core_view: RuntimeFilterInstallView,
+        routing_shard: RuntimeFilterRoutingShard,
+    ) -> Self {
+        Self {
+            core_view,
+            routing_shard,
+        }
+    }
+
+    pub(crate) const fn epoch(&self) -> DeploymentEpoch {
+        self.core_view.epoch()
+    }
+
+    pub(crate) const fn local_participant_id(&self) -> RuntimeFilterParticipantId {
+        self.core_view.local_participant_id()
+    }
+
+    pub(crate) const fn core_view(&self) -> &RuntimeFilterInstallView {
+        &self.core_view
+    }
+
+    pub(crate) const fn routing_shard(&self) -> &RuntimeFilterRoutingShard {
+        &self.routing_shard
+    }
+
+    pub(crate) fn into_parts(self) -> (RuntimeFilterInstallView, RuntimeFilterRoutingShard) {
+        (self.core_view, self.routing_shard)
+    }
+}
+
+#[cfg(test)]
+/// Builds a local-only composite for Service unit tests.
+///
+/// This helper maps every expected producer instance to the view's local participant.
+/// It must not be used for aggregator or compiler-conformance tests, which require the
+/// compiler-produced remote-aware routing shard.
+pub(crate) fn local_participant_install_for_test(
+    core_view: RuntimeFilterInstallView,
+) -> RuntimeFilterParticipantInstall {
+    let participant = core_view.local_participant_id();
+    let mut channels = BTreeMap::new();
+    for (channel_id, deployment) in core_view.channels() {
+        let local_roles = deployment
+            .producers()
+            .keys()
+            .copied()
+            .map(RuntimeFilterRouteRole::Producer)
+            .chain(
+                deployment
+                    .consumers()
+                    .keys()
+                    .copied()
+                    .map(RuntimeFilterRouteRole::Consumer),
+            )
+            .collect();
+        let producer_instances = deployment
+            .producers()
+            .iter()
+            .flat_map(|(binding_id, producer)| {
+                producer.expected_fragment_instances().iter().copied().map(
+                    move |fragment_instance_id| ((*binding_id, fragment_instance_id), participant),
+                )
+            })
+            .collect();
+        let channel = RuntimeFilterChannelRoutingView::new(
+            *channel_id,
+            local_roles,
+            producer_instances,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test install view produces a valid routing channel");
+        channels.insert(*channel_id, channel);
+    }
+    let routing_shard = RuntimeFilterRoutingShard::new(core_view.epoch(), participant, channels)
+        .expect("test install view produces a valid routing shard");
+    RuntimeFilterParticipantInstall::new(core_view, routing_shard)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -374,8 +464,27 @@ mod tests {
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::port::identity::*;
+    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
     use super::*;
+
+    #[test]
+    fn participant_install_keeps_core_and_routing_authority_together() {
+        let epoch = DeploymentEpoch::new(6);
+        let participant = RuntimeFilterParticipantId::new(7);
+        let core_view = RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new());
+        let routing_shard =
+            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new()).unwrap();
+
+        let install =
+            RuntimeFilterParticipantInstall::new(core_view.clone(), routing_shard.clone());
+
+        assert_eq!(install.epoch(), epoch);
+        assert_eq!(install.local_participant_id(), participant);
+        assert_eq!(install.core_view(), &core_view);
+        assert_eq!(install.routing_shard(), &routing_shard);
+        assert_eq!(install.into_parts(), (core_view, routing_shard));
+    }
 
     #[test]
     fn install_view_keeps_expected_producer_and_consumer_instances() {

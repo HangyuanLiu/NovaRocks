@@ -119,7 +119,9 @@ mod tests {
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
     use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::RuntimeFilterInstallView;
+    use crate::runtime_filter::port::install::{
+        RuntimeFilterInstallView, local_participant_install_for_test,
+    };
     use crate::runtime_filter::port::producer::InstallOutcome;
     use crate::runtime_filter::port::support::RuntimeFilterMemoryAccount;
 
@@ -149,11 +151,11 @@ mod tests {
         let events = Arc::new(Events::default());
         let service =
             RuntimeFilterService::new_for_query(UniqueId { hi: 1, lo: 2 }, events.clone(), &parent);
-        let empty = RuntimeFilterInstallView::new(
-            DeploymentEpoch::new(0),
+        let empty = local_participant_install_for_test(RuntimeFilterInstallView::new(
+            DeploymentEpoch::new(1),
             RuntimeFilterParticipantId::new(0),
             BTreeMap::new(),
-        );
+        ));
         assert_eq!(
             service.install(empty).unwrap(),
             InstallOutcome::IgnoredEmpty

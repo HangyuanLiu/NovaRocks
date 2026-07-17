@@ -1535,7 +1535,8 @@ mod runtime_filter_service_lifecycle_tests {
     };
     use crate::runtime_filter::port::install::{
         ConsumerDeployment, ProducerDeployment, RuntimeFilterChannelDeployment,
-        RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+        local_participant_install_for_test,
     };
     use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
     use crate::runtime_filter::service::RuntimeFilterService;
@@ -1555,7 +1556,7 @@ mod runtime_filter_service_lifecycle_tests {
         UniqueId { hi: 70, lo }
     }
 
-    fn install_view() -> RuntimeFilterInstallView {
+    fn participant_install() -> RuntimeFilterParticipantInstall {
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(2);
         let deployment = RuntimeFilterChannelDeployment::new(
@@ -1595,11 +1596,11 @@ mod runtime_filter_service_lifecycle_tests {
                 ),
             )]),
         );
-        RuntimeFilterInstallView::new(
+        local_participant_install_for_test(RuntimeFilterInstallView::new(
             DeploymentEpoch::new(6),
             RuntimeFilterParticipantId::new(7),
             BTreeMap::from([(channel_id, deployment)]),
-        )
+        ))
     }
 
     fn register(manager: &QueryContextManager, query_id: QueryId) {
@@ -1683,7 +1684,9 @@ mod runtime_filter_service_lifecycle_tests {
             service
         };
         assert_eq!(
-            service.install(install_view()).expect("valid install"),
+            service
+                .install(participant_install())
+                .expect("valid install"),
             InstallOutcome::Installed
         );
         (service, receiver)
@@ -1727,7 +1730,7 @@ mod runtime_filter_service_lifecycle_tests {
         assert!(Arc::ptr_eq(&before, &service(&manager, query_id)));
         assert_eq!(
             before
-                .install(install_view())
+                .install(participant_install())
                 .expect("service remains open"),
             InstallOutcome::Installed
         );
@@ -1743,10 +1746,12 @@ mod runtime_filter_service_lifecycle_tests {
         let service = context.runtime_filter_service();
         assert_eq!(
             service
-                .install(RuntimeFilterInstallView::new(
-                    DeploymentEpoch::new(0),
-                    RuntimeFilterParticipantId::new(0),
-                    BTreeMap::new(),
+                .install(local_participant_install_for_test(
+                    RuntimeFilterInstallView::new(
+                        DeploymentEpoch::new(1),
+                        RuntimeFilterParticipantId::new(0),
+                        BTreeMap::new(),
+                    ),
                 ))
                 .expect("empty view"),
             InstallOutcome::IgnoredEmpty
@@ -1861,7 +1866,9 @@ mod runtime_filter_service_lifecycle_tests {
             ));
             context.runtime_filter_service = old_service.clone();
             assert_eq!(
-                old_service.install(install_view()).expect("valid install"),
+                old_service
+                    .install(participant_install())
+                    .expect("valid install"),
                 InstallOutcome::Installed
             );
 
@@ -1906,7 +1913,9 @@ mod runtime_filter_service_lifecycle_tests {
         manager.cancel_query(query_id, "cancelled".to_string());
         assert_terminal_probe(receiver);
 
-        let error = service.install(install_view()).expect_err("closed service");
+        let error = service
+            .install(participant_install())
+            .expect_err("closed service");
         assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
     }
 
@@ -1915,14 +1924,16 @@ mod runtime_filter_service_lifecycle_tests {
         let context = QueryContext::new(query_id(9), Duration::ZERO, Duration::ZERO);
         let service = context.runtime_filter_service();
         assert_eq!(
-            service.install(install_view()).expect("valid install"),
+            service
+                .install(participant_install())
+                .expect("valid install"),
             InstallOutcome::Installed
         );
 
         drop(context);
 
         let error = service
-            .install(install_view())
+            .install(participant_install())
             .expect_err("context drop must close retained service");
         assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
     }

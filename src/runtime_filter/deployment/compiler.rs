@@ -103,6 +103,11 @@ pub(crate) fn compile(
                 .ok_or(DeploymentError::MissingPlacement {
                     fragment: binding.location.fragment_id,
                 })?;
+        if placements.is_empty() {
+            return Err(DeploymentError::MissingPlacement {
+                fragment: binding.location.fragment_id,
+            });
+        }
         let mut participants: BTreeSet<RuntimeFilterParticipantId> = BTreeSet::new();
         for p in placements {
             if !known_backends.contains(&p.backend_idx) {
@@ -273,6 +278,7 @@ mod tests {
     use super::*;
     use crate::coordinator::scheduler::FragmentInstancePlacement;
     use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
     use crate::runtime_filter::deployment::role_graph::RouteKind;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
@@ -655,6 +661,64 @@ mod tests {
     }
 
     #[test]
+    fn compiler_all_of_aggregator_core_view_matches_routing_authority() {
+        let (graph, scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        let plan = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap();
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let aggregator = pid(2);
+        let remote_producer = pid(7);
+        let remote_consumer = pid(11);
+
+        let aggregator_channel = &plan.install_views[&aggregator].channels()[&channel_id];
+        let core_instances =
+            aggregator_channel.producers()[&producer_binding].expected_fragment_instances();
+        let routing_channel = plan.routing_shards[&aggregator]
+            .channel(channel_id)
+            .expect("aggregator routing channel");
+        let routing_instances = routing_channel
+            .producer_instances()
+            .keys()
+            .filter_map(|(binding, finst)| (*binding == producer_binding).then_some(*finst))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(core_instances, &routing_instances);
+        assert_eq!(
+            core_instances,
+            &BTreeSet::from([UniqueId { hi: 1, lo: 3 }, UniqueId { hi: 1, lo: 4 }])
+        );
+        assert!(aggregator_channel.consumers().is_empty());
+        assert!(!plan.install_views.contains_key(&remote_producer));
+        assert!(plan.routing_shards.contains_key(&remote_producer));
+        assert!(!plan.install_views.contains_key(&remote_consumer));
+        assert!(plan.routing_shards.contains_key(&remote_consumer));
+
+        let installs = RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .expect("every core view has a matching routing shard");
+        assert_eq!(installs.len(), plan.install_views.len());
+        assert_eq!(
+            installs
+                .iter()
+                .map(|(participant, _)| *participant)
+                .collect::<BTreeSet<_>>(),
+            plan.install_views.keys().copied().collect()
+        );
+        assert!(installs.iter().all(|(participant, install)| {
+            install.core_view() == &plan.install_views[participant]
+                && install.routing_shard() == &plan.routing_shards[participant]
+        }));
+    }
+
+    #[test]
     fn compiler_any_of_fanout_follows_replica_redundancy_without_hardcoded_three() {
         for redundancy in [1, 2, 4] {
             let (graph, scheduling, edges, backends, mut policy) =
@@ -718,6 +782,29 @@ mod tests {
             ),
             Err(DeploymentError::DuplicateBackend { backend_idx: 7 })
         ));
+    }
+
+    #[test]
+    fn compiler_rejects_fragment_with_empty_placements() {
+        let (graph, mut scheduling, edges, backends, policy) = all_of_compiler_fixture();
+        scheduling.by_fragment.insert(2, Vec::new());
+
+        let err = compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            DeploymentError::MissingPlacement {
+                fragment: PlanFragmentId::new(2)
+            }
+        );
     }
 
     #[test]

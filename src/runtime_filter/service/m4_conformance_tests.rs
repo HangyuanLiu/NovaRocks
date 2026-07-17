@@ -58,7 +58,7 @@ use crate::runtime_filter::port::identity::{
     RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
-    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
+    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
 };
 use crate::runtime_filter::port::ordered_bound::{
     COMPARATOR_ALGORITHM_VERSION, OrderedBoundUpdate, OrderedScalar, OrderedTuple,
@@ -419,19 +419,19 @@ fn fragment_edges(producers: &[ProducerFixture]) -> Vec<FragmentEdge> {
         .collect()
 }
 
-fn compile_install_view(
+fn compile_participant_install(
     graph: &RuntimeFilterGraph,
     scheduling: &SchedulingPlan,
     edges: &[FragmentEdge],
     participant: RuntimeFilterParticipantId,
-) -> RuntimeFilterInstallView {
+) -> RuntimeFilterParticipantInstall {
     let backends = LiveBackendSnapshot::from_endpoints(vec![fixture_endpoint()]);
     let policy = RuntimeFilterDeploymentPolicy {
         core_budget: RuntimeFilterCoreBudget::new(16 * 1024),
         replica_redundancy: backends.entries().len() as u32,
         materialization: MaterializationPolicy::for_test(),
     };
-    compiler::compile(
+    let mut plan = compiler::compile(
         graph,
         scheduling,
         edges,
@@ -439,21 +439,27 @@ fn compile_install_view(
         &policy,
         DeploymentEpoch::new(1),
     )
-    .expect("valid graph and live placement must compile")
-    .install_views
-    .remove(&participant)
-    .expect("compiler must project the colocated participant install view")
+    .expect("valid graph and live placement must compile");
+    let core_view = plan
+        .install_views
+        .remove(&participant)
+        .expect("compiler must project the colocated participant install view");
+    let routing_shard = plan
+        .routing_shards
+        .remove(&participant)
+        .expect("compiler must project the matching participant routing shard");
+    RuntimeFilterParticipantInstall::new(core_view, routing_shard)
 }
 
-fn install_service(view: RuntimeFilterInstallView) -> Arc<RuntimeFilterService> {
+fn install_service(install: RuntimeFilterParticipantInstall) -> Arc<RuntimeFilterService> {
     install_service_with_memory(
-        view,
+        install,
         MemTrackerMemoryAccount::new_root_for_test("m4-conformance"),
     )
 }
 
 fn install_service_with_memory(
-    view: RuntimeFilterInstallView,
+    install: RuntimeFilterParticipantInstall,
     memory: Arc<dyn RuntimeFilterMemoryAccount>,
 ) -> Arc<RuntimeFilterService> {
     let service = Arc::new(RuntimeFilterService::new_with_dependencies(
@@ -462,7 +468,7 @@ fn install_service_with_memory(
         Arc::new(RecordingEvents::default()),
         memory,
     ));
-    assert_eq!(service.install(view).unwrap(), InstallOutcome::Installed);
+    assert_eq!(service.install(install).unwrap(), InstallOutcome::Installed);
     service
 }
 
@@ -471,7 +477,7 @@ fn join_harness(coverage: Coverage) -> MembershipHarness {
     let graph = membership_graph(coverage, &producers, ConsumerActivation::BlockingSnapshot);
     let scheduling = scheduling_plan(&producers);
     let edges = fragment_edges(&producers);
-    let service = install_service(compile_install_view(
+    let service = install_service(compile_participant_install(
         &graph,
         &scheduling,
         &edges,
@@ -801,7 +807,7 @@ fn direct_topn_harness(contract: Arc<RuntimeOrderContract>) -> DirectTopNHarness
     let graph = ordered_graph(&contract, direct);
     let scheduling = scheduling_plan(std::slice::from_ref(direct));
     let edges = fragment_edges(std::slice::from_ref(direct));
-    let service = install_service(compile_install_view(
+    let service = install_service(compile_participant_install(
         &graph,
         &scheduling,
         &edges,
@@ -1338,7 +1344,7 @@ fn topk_allof_harness(k: u32) -> TopKSummaryHarness {
     let graph = topk_graph(plan, requirement, &producers);
     let scheduling = scheduling_plan(&producers);
     let edges = fragment_edges(&producers);
-    let service = install_service(compile_install_view(
+    let service = install_service(compile_participant_install(
         &graph,
         &scheduling,
         &edges,
@@ -1509,7 +1515,7 @@ fn aggregate_harness_with_memory(
     let scheduling = scheduling_plan(producers);
     let edges = fragment_edges(producers);
     let service = install_service_with_memory(
-        compile_install_view(&graph, &scheduling, &edges, PARTICIPANT),
+        compile_participant_install(&graph, &scheduling, &edges, PARTICIPANT),
         memory,
     );
     let mut opened = Vec::with_capacity(producers.len());
