@@ -16,9 +16,9 @@
 // under the License.
 
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::ffi::c_void;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -26,6 +26,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -47,6 +49,12 @@ const P_PID: i32 = 1;
 const WNOHANG: i32 = 0x00000001;
 #[cfg(unix)]
 const WEXITED: i32 = 0x00000004;
+#[cfg(unix)]
+const CLD_EXITED: i32 = 1;
+#[cfg(unix)]
+const CLD_KILLED: i32 = 2;
+#[cfg(unix)]
+const CLD_DUMPED: i32 = 3;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const WNOWAIT: i32 = 0x01000000;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -65,18 +73,153 @@ compile_error!(
     "ManagedProcess requires verified waitid WNOWAIT ABI constants for this Unix target"
 );
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "mips", target_arch = "mips64")
+))]
+compile_error!("ManagedProcess does not have a verified waitid siginfo_t layout for MIPS");
+
 #[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "kill"]
     fn send_signal(pid: i32, signal: i32) -> i32;
-    fn waitid(idtype: i32, id: u32, info: *mut c_void, options: i32) -> i32;
+    fn waitid(idtype: i32, id: u32, info: *mut WaitSiginfo, options: i32) -> i32;
+}
+
+// Darwin's siginfo_t layout is declared in <sys/signal.h>. The trailing
+// padding covers si_value, si_band, and the reserved words that follow them.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[repr(C)]
+struct WaitSiginfo {
+    signal: i32,
+    error: i32,
+    code: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+    address: *mut c_void,
+    remaining: [usize; 9],
+}
+
+// Linux siginfo_t is 128 bytes. Its union begins at a pointer-aligned offset
+// after the three common i32 fields; the SIGCHLD member starts with
+// pid/uid/status. MIPS swaps common fields and is rejected above.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(target_arch = "mips", target_arch = "mips64")),
+    target_pointer_width = "64"
+))]
+#[repr(C)]
+struct WaitSiginfo {
+    signal: i32,
+    error: i32,
+    code: i32,
+    union_alignment: [usize; 0],
+    pid: i32,
+    uid: u32,
+    status: i32,
+    remaining: [u8; 100],
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(target_arch = "mips", target_arch = "mips64")),
+    target_pointer_width = "32"
+))]
+#[repr(C)]
+struct WaitSiginfo {
+    signal: i32,
+    error: i32,
+    code: i32,
+    union_alignment: [usize; 0],
+    pid: i32,
+    uid: u32,
+    status: i32,
+    remaining: [u8; 104],
 }
 
 #[cfg(unix)]
-#[repr(C, align(16))]
-struct OpaqueSiginfo {
-    signal: i32,
-    remaining: [u8; 252],
+impl WaitSiginfo {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn zeroed() -> Self {
+        Self {
+            signal: 0,
+            error: 0,
+            code: 0,
+            pid: 0,
+            uid: 0,
+            status: 0,
+            address: std::ptr::null_mut(),
+            remaining: [0; 9],
+        }
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "mips", target_arch = "mips64")),
+        target_pointer_width = "64"
+    ))]
+    fn zeroed() -> Self {
+        Self {
+            signal: 0,
+            error: 0,
+            code: 0,
+            union_alignment: [],
+            pid: 0,
+            uid: 0,
+            status: 0,
+            remaining: [0; 100],
+        }
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "mips", target_arch = "mips64")),
+        target_pointer_width = "32"
+    ))]
+    fn zeroed() -> Self {
+        Self {
+            signal: 0,
+            error: 0,
+            code: 0,
+            union_alignment: [],
+            pid: 0,
+            uid: 0,
+            status: 0,
+            remaining: [0; 104],
+        }
+    }
+
+    fn observed_exit_status(&self) -> Result<Option<ObservedExitStatus>> {
+        if self.signal == 0 {
+            return Ok(None);
+        }
+        match self.code {
+            CLD_EXITED => Ok(Some(ObservedExitStatus::ExitCode(self.status))),
+            CLD_KILLED | CLD_DUMPED => Ok(Some(ObservedExitStatus::Signal(self.status))),
+            code => bail!(
+                "waitid returned unexpected SIGCHLD code {code} with status {}",
+                self.status
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedExitStatus {
+    ExitCode(i32),
+    Signal(i32),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for ObservedExitStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExitCode(code) => write!(formatter, "exit code {code}"),
+            Self::Signal(signal) => write!(formatter, "signal {signal}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -163,19 +306,78 @@ enum ReadinessBaseline {
 struct FileReadinessSnapshot {
     bytes: Vec<u8>,
     modified: Option<SystemTime>,
+    generation: FileGeneration,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileGeneration {
+    device: u64,
+    inode: u64,
+    change_seconds: i64,
+    change_nanoseconds: i64,
+    length: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileGeneration;
+
+impl FileGeneration {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            change_seconds: metadata.ctime(),
+            change_nanoseconds: metadata.ctime_nsec(),
+            length: metadata.len(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn from_metadata(_metadata: &fs::Metadata) -> Self {
+        Self
+    }
+
+    #[cfg(unix)]
+    fn same_file_as(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
+    #[cfg(not(unix))]
+    fn same_file_as(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 impl FileReadinessSnapshot {
     fn read(path: &std::path::Path) -> std::io::Result<Option<Self>> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
+        let mut file = match File::open(path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let modified = fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        Ok(Some(Self { bytes, modified }))
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let metadata = file.metadata()?;
+        if metadata.len() != bytes.len() as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "readiness file changed while reading: metadata length {} != bytes read {}",
+                    metadata.len(),
+                    bytes.len()
+                ),
+            ));
+        }
+        let modified = metadata.modified().ok();
+        let generation = FileGeneration::from_metadata(&metadata);
+        Ok(Some(Self {
+            bytes,
+            modified,
+            generation,
+        }))
     }
 }
 
@@ -187,6 +389,11 @@ impl ReadinessBaseline {
         let ReadyMarker::FileContains { path, .. } = marker else {
             return Ok(Self::Stdout);
         };
+        #[cfg(not(unix))]
+        bail!(
+            "FileContains readiness requires Unix file generation metadata; path={}",
+            path.display()
+        );
         let snapshot = FileReadinessSnapshot::read(path)
             .with_context(|| format!("capture readiness file baseline {}", path.display()))?;
         Ok(Self::File { snapshot })
@@ -198,15 +405,21 @@ impl ReadinessBaseline {
         };
         let fresh_bytes = match baseline {
             None => current.bytes.as_slice(),
-            Some(baseline)
-                if current.bytes == baseline.bytes && current.modified == baseline.modified =>
-            {
-                return false;
+            Some(baseline) if current.generation == baseline.generation => {
+                if current.bytes == baseline.bytes {
+                    return false;
+                }
+                current.bytes.as_slice()
             }
-            Some(baseline) if current.bytes == baseline.bytes => current.bytes.as_slice(),
-            Some(baseline) if current.bytes.starts_with(&baseline.bytes) => {
+            Some(baseline)
+                if current.generation.same_file_as(&baseline.generation)
+                    && current.bytes.len() > baseline.bytes.len()
+                    && current.bytes.starts_with(&baseline.bytes) =>
+            {
                 &current.bytes[baseline.bytes.len()..]
             }
+            // A replacement inode or an in-place rewrite is a new generation,
+            // so scan the full contents even when it preserves bytes or mtime.
             Some(_) => current.bytes.as_slice(),
         };
         String::from_utf8_lossy(fresh_bytes).contains(needle)
@@ -223,8 +436,8 @@ pub(crate) struct ManagedProcess {
     output_io_error: SharedOutputIoError,
     stdout_buffer: Arc<Mutex<String>>,
     stderr_buffer: Arc<Mutex<String>>,
-    stdout_thread: Option<thread::JoinHandle<()>>,
-    stderr_thread: Option<thread::JoinHandle<()>>,
+    stdout_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    stderr_thread: Mutex<Option<thread::JoinHandle<()>>>,
     stopped: bool,
 }
 
@@ -247,7 +460,7 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, None)
+        Self::spawn_impl(label, command, marker, timeout, log_path, None, false)
     }
 
     #[cfg(test)]
@@ -259,7 +472,26 @@ impl ManagedProcess {
         log_path: PathBuf,
         log_writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
-        Self::spawn_impl(label, command, marker, timeout, log_path, Some(log_writer))
+        Self::spawn_impl(
+            label,
+            command,
+            marker,
+            timeout,
+            log_path,
+            Some(log_writer),
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_with_poisoned_stdout_tail(
+        label: String,
+        command: Command,
+        marker: ReadyMarker,
+        timeout: Duration,
+        log_path: PathBuf,
+    ) -> Result<Self> {
+        Self::spawn_impl(label, command, marker, timeout, log_path, None, true)
     }
 
     fn spawn_impl(
@@ -269,6 +501,7 @@ impl ManagedProcess {
         timeout: Duration,
         log_path: PathBuf,
         log_writer: Option<Box<dyn Write + Send>>,
+        poison_stdout_tail: bool,
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
@@ -305,6 +538,12 @@ impl ManagedProcess {
 
         let stdout_buffer = Arc::new(Mutex::new(String::new()));
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        #[cfg(test)]
+        if poison_stdout_tail {
+            poison_mutex(Arc::clone(&stdout_buffer));
+        }
+        #[cfg(not(test))]
+        let _ = poison_stdout_tail;
         let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
         let stdout_marker = match &marker {
             ReadyMarker::StdoutContains(needle) => Some(needle.clone()),
@@ -339,8 +578,8 @@ impl ManagedProcess {
             output_io_error,
             stdout_buffer,
             stderr_buffer,
-            stdout_thread: Some(stdout_thread),
-            stderr_thread: Some(stderr_thread),
+            stdout_thread: Mutex::new(Some(stdout_thread)),
+            stderr_thread: Mutex::new(Some(stderr_thread)),
             stopped: false,
         };
         if let Err(error) =
@@ -503,22 +742,18 @@ impl ManagedProcess {
         self.ensure_output_io_ok("collect runtime diagnostics")?;
         let pid = self.pid();
         #[cfg(unix)]
-        let exited = self.leader_exit_observed().with_context(|| {
+        let exit_status = self.leader_exit_status_observed().with_context(|| {
             format!("inspect {label} pid={pid} endpoint={endpoint} process status")
         })?;
         #[cfg(not(unix))]
-        let exited = self
-            .child
-            .try_wait()
-            .with_context(|| {
-                format!("inspect {label} pid={pid} endpoint={endpoint} process status")
-            })?
-            .is_some();
+        bail!(
+            "non-reaping runtime diagnostics are unsupported on this platform for {label} pid={pid} endpoint={endpoint}"
+        );
         let stdout_tail = self.stdout_tail();
         let stderr_tail = self.stderr_tail();
-        if exited {
+        if let Some(exit_status) = exit_status {
             bail!(
-                "{label} exited pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
+                "{label} exited status={exit_status} pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
                 config_path.display()
             );
         }
@@ -569,6 +804,7 @@ impl ManagedProcess {
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.ensure_output_io_ok("confirm readiness")?;
                         #[cfg(unix)]
                         if self.leader_exit_observed()? {
                             let status = self.finish_group_with_signal(
@@ -631,16 +867,53 @@ impl ManagedProcess {
         }
     }
 
-    fn join_output_threads(&mut self) {
-        if let Some(stdout_thread) = self.stdout_thread.take() {
-            let _ = stdout_thread.join();
-        }
-        if let Some(stderr_thread) = self.stderr_thread.take() {
-            let _ = stderr_thread.join();
+    fn join_output_threads(&self) {
+        self.join_reader_thread(&self.stdout_thread, "stdout", true);
+        self.join_reader_thread(&self.stderr_thread, "stderr", true);
+    }
+
+    fn harvest_finished_output_threads(&self) {
+        self.join_reader_thread(&self.stdout_thread, "stdout", false);
+        self.join_reader_thread(&self.stderr_thread, "stderr", false);
+    }
+
+    fn join_reader_thread(
+        &self,
+        thread_slot: &Mutex<Option<thread::JoinHandle<()>>>,
+        stream_name: &str,
+        wait: bool,
+    ) {
+        let handle = match thread_slot.lock() {
+            Ok(mut slot) => {
+                let should_join = slot
+                    .as_ref()
+                    .is_some_and(|handle| wait || handle.is_finished());
+                should_join.then(|| slot.take()).flatten()
+            }
+            Err(_) => {
+                record_output_io_error(
+                    &self.output_io_error,
+                    format!("lock {stream_name} reader thread handle"),
+                );
+                None
+            }
+        };
+        if let Some(handle) = handle
+            && let Err(payload) = handle.join()
+        {
+            record_output_io_error(
+                &self.output_io_error,
+                format!(
+                    "{stream_name} reader thread panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ),
+            );
         }
     }
 
     fn ensure_output_io_ok(&self, operation: &str) -> Result<()> {
+        self.harvest_finished_output_threads();
+        self.record_tail_lock_errors();
         let error = self
             .output_io_error
             .lock()
@@ -656,6 +929,21 @@ impl ManagedProcess {
             );
         }
         Ok(())
+    }
+
+    fn record_tail_lock_errors(&self) {
+        if self.stdout_buffer.lock().is_err() {
+            record_output_io_error(
+                &self.output_io_error,
+                "stdout tail lock poisoned".to_string(),
+            );
+        }
+        if self.stderr_buffer.lock().is_err() {
+            record_output_io_error(
+                &self.output_io_error,
+                "stderr tail lock poisoned".to_string(),
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -687,27 +975,33 @@ impl ManagedProcess {
 
     #[cfg(unix)]
     fn leader_exit_observed(&self) -> Result<bool> {
+        Ok(self.leader_exit_status_observed()?.is_some())
+    }
+
+    #[cfg(unix)]
+    fn leader_exit_status_observed(&self) -> Result<Option<ObservedExitStatus>> {
         if self.stopped {
-            return Ok(true);
+            bail!(
+                "cannot observe {} process leader {} after it was reaped",
+                self.label,
+                self.child.id()
+            );
         }
 
-        let mut info = OpaqueSiginfo {
-            signal: 0,
-            remaining: [0; 252],
-        };
-        // SAFETY: `info` is deliberately over-sized and over-aligned for the
-        // supported Unix siginfo_t ABIs. WNOWAIT observes the direct child
-        // without reaping its process-group leader PID.
+        let mut info = WaitSiginfo::zeroed();
+        // SAFETY: WaitSiginfo has target-specific C layout assertions in the
+        // focused tests below. WNOWAIT observes the direct child without
+        // reaping its process-group leader PID.
         let result = unsafe {
             waitid(
                 P_PID,
                 self.child.id(),
-                (&mut info as *mut OpaqueSiginfo).cast::<c_void>(),
+                &mut info,
                 WEXITED | WNOHANG | WNOWAIT,
             )
         };
         if result == 0 {
-            return Ok(info.signal != 0);
+            return info.observed_exit_status();
         }
         let error = std::io::Error::last_os_error();
         Err(error).with_context(|| {
@@ -772,8 +1066,12 @@ fn spawn_reader<R: Read + Send + 'static>(
                 }
             };
             let chunk = &buffer[..count];
-            if let Ok(mut output) = tail.lock() {
-                push_bounded_log_chunk(&mut output, chunk, LOG_TAIL_BYTES);
+            match tail.lock() {
+                Ok(mut output) => push_bounded_log_chunk(&mut output, chunk, LOG_TAIL_BYTES),
+                Err(_) => record_output_io_error(
+                    &output_io_error,
+                    format!("{stream_name} tail lock poisoned"),
+                ),
             }
             match log_file.lock() {
                 Ok(mut log) => {
@@ -819,6 +1117,25 @@ fn record_output_io_error(errors: &SharedOutputIoError, error: String) {
     }
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
+#[cfg(test)]
+fn poison_mutex<T: Send + 'static>(mutex: Arc<Mutex<T>>) {
+    let _ = thread::spawn(move || {
+        let _guard = mutex.lock().expect("lock mutex before poisoning");
+        panic!("inject managed process mutex poison");
+    })
+    .join();
+}
+
 fn push_bounded_log_chunk(buffer: &mut String, chunk: &[u8], capacity: usize) {
     buffer.push_str(&String::from_utf8_lossy(chunk));
     truncate_front(buffer, capacity);
@@ -848,11 +1165,15 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ManagedProcess, ProcessGroupOwnership, ReadyMarker};
+    use super::{
+        FileReadinessSnapshot, ManagedProcess, ProcessGroupOwnership, ReadinessBaseline,
+        ReadyMarker, WaitSiginfo,
+    };
     use std::fs;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -908,6 +1229,23 @@ mod tests {
         }
     }
 
+    fn wait_for_runtime_error(
+        process: &mut ManagedProcess,
+        config_path: &Path,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match process.runtime_diagnostic("fixture", "local", config_path) {
+                Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(diagnostic) => {
+                    panic!("process was still running after {timeout:?}: {diagnostic}")
+                }
+                Err(error) => return format!("{error:#}"),
+            }
+        }
+    }
+
     fn pid_exists(pid: u32) -> bool {
         Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
@@ -915,6 +1253,26 @@ mod tests {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    fn copy_preserving_metadata(source: &Path, destination: &Path) {
+        let status = Command::new("/bin/cp")
+            .arg("-p")
+            .arg(source)
+            .arg(destination)
+            .status()
+            .expect("run cp -p");
+        assert!(status.success(), "cp -p failed with {status}");
+    }
+
+    fn restore_mtime(reference: &Path, target: &Path) {
+        let status = Command::new("/usr/bin/touch")
+            .arg("-r")
+            .arg(reference)
+            .arg(target)
+            .status()
+            .expect("run touch -r");
+        assert!(status.success(), "touch -r failed with {status}");
     }
 
     struct FailingLogWriter;
@@ -948,6 +1306,54 @@ mod tests {
         }
     }
 
+    struct PanicAfterFirstWrite {
+        writes: usize,
+        file: fs::File,
+    }
+
+    struct PanicOnFirstWrite;
+
+    impl Write for PanicOnFirstWrite {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            panic!("injected pre-readiness stdout reader panic");
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for PanicAfterFirstWrite {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                panic!("injected stdout reader panic");
+            }
+            self.file.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    fn spawn_reader_panic_fixture(temp: &TempDir) -> ManagedProcess {
+        let log_path = temp.path().join("fixture.log");
+        let log_file = fs::File::create(&log_path).expect("create injected durable log");
+        ManagedProcess::spawn_with_log_writer(
+            "reader panic fixture".to_string(),
+            shell("printf 'READY\n'; sleep 0.1; printf 'PANIC_OUTPUT\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            log_path,
+            Box::new(PanicAfterFirstWrite {
+                writes: 0,
+                file: log_file,
+            }),
+        )
+        .expect("spawn reader panic fixture")
+    }
+
     #[test]
     fn process_group_ownership_requires_final_signal_before_reap() {
         let mut ownership = ProcessGroupOwnership::new(42);
@@ -965,6 +1371,43 @@ mod tests {
 
         ownership.record_reaped().expect("record leader reap");
         assert!(ownership.group_id_for_signal().is_err());
+    }
+
+    #[test]
+    fn wait_siginfo_layout_matches_the_supported_platform_abi() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert_eq!(std::mem::size_of::<WaitSiginfo>(), 104);
+            assert_eq!(std::mem::align_of::<WaitSiginfo>(), 8);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, signal), 0);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, code), 8);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, pid), 12);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, status), 20);
+        }
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_pointer_width = "64"
+        ))]
+        {
+            assert_eq!(std::mem::size_of::<WaitSiginfo>(), 128);
+            assert_eq!(std::mem::align_of::<WaitSiginfo>(), 8);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, signal), 0);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, code), 8);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, pid), 16);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, status), 24);
+        }
+        #[cfg(all(
+            any(target_os = "linux", target_os = "android"),
+            target_pointer_width = "32"
+        ))]
+        {
+            assert_eq!(std::mem::size_of::<WaitSiginfo>(), 128);
+            assert_eq!(std::mem::align_of::<WaitSiginfo>(), 4);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, signal), 0);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, code), 8);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, pid), 12);
+            assert_eq!(std::mem::offset_of!(WaitSiginfo, status), 20);
+        }
     }
 
     #[test]
@@ -994,6 +1437,62 @@ mod tests {
         process
             .kill_now()
             .expect("cleanup after non-reaping runtime diagnostics");
+    }
+
+    #[test]
+    fn runtime_diagnostics_reports_real_exit_code_without_reaping() {
+        let temp = TempDir::new("diagnostic-exit-code");
+        let config_path = temp.path().join("fixture.toml");
+        fs::write(&config_path, "fixture = true\n").expect("write fixture config");
+        let mut process = ManagedProcess::spawn(
+            "diagnostic exit-code fixture".to_string(),
+            shell("printf 'READY\n'; sleep 0.2; exit 23"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn diagnostic fixture");
+
+        let diagnostic = wait_for_runtime_error(&mut process, &config_path, Duration::from_secs(2));
+        assert!(diagnostic.contains("status=exit code 23"), "{diagnostic}");
+        assert_eq!(
+            process
+                .process_group
+                .group_id_for_signal()
+                .expect("diagnostic must not reap the leader"),
+            process.pid()
+        );
+        process
+            .kill_now()
+            .expect("cleanup after non-reaping exit diagnostic");
+    }
+
+    #[test]
+    fn runtime_diagnostics_reports_real_signal_without_reaping() {
+        let temp = TempDir::new("diagnostic-signal");
+        let config_path = temp.path().join("fixture.toml");
+        fs::write(&config_path, "fixture = true\n").expect("write fixture config");
+        let mut process = ManagedProcess::spawn(
+            "diagnostic signal fixture".to_string(),
+            shell("printf 'READY\n'; sleep 0.2; kill -TERM $$"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn diagnostic fixture");
+
+        let diagnostic = wait_for_runtime_error(&mut process, &config_path, Duration::from_secs(2));
+        assert!(diagnostic.contains("status=signal 15"), "{diagnostic}");
+        assert_eq!(
+            process
+                .process_group
+                .group_id_for_signal()
+                .expect("diagnostic must not reap the leader"),
+            process.pid()
+        );
+        process
+            .kill_now()
+            .expect("cleanup after non-reaping signal diagnostic");
     }
 
     #[test]
@@ -1079,6 +1578,131 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("LATE_OUTPUT"), "{message}");
+    }
+
+    #[test]
+    fn managed_process_kill_surfaces_reader_thread_panic() {
+        let temp = TempDir::new("kill-reader-panic");
+        let mut process = spawn_reader_panic_fixture(&temp);
+        assert!(wait_until(Duration::from_secs(1), || process
+            .stdout_thread
+            .lock()
+            .expect("lock stdout thread")
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)));
+
+        let error = process
+            .kill_now()
+            .expect_err("kill must surface the reader JoinHandle panic");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("stdout reader thread panicked"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected stdout reader panic"),
+            "{message}"
+        );
+        assert!(message.contains("PANIC_OUTPUT"), "{message}");
+    }
+
+    #[test]
+    fn managed_process_readiness_surfaces_reader_thread_panic() {
+        let temp = TempDir::new("readiness-reader-panic");
+        let error = ManagedProcess::spawn_with_log_writer(
+            "readiness reader panic fixture".to_string(),
+            shell("printf 'OUTPUT_BEFORE_READY\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+            Box::new(PanicOnFirstWrite),
+        )
+        .expect_err("readiness must surface the stdout reader panic");
+        let message = format!("{error:#}");
+        assert!(message.contains("cannot confirm readiness"), "{message}");
+        assert!(
+            message.contains("stdout reader thread panicked"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected pre-readiness stdout reader panic"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn managed_process_log_assertion_surfaces_reader_thread_panic() {
+        let temp = TempDir::new("assert-reader-panic");
+        let mut process = spawn_reader_panic_fixture(&temp);
+        assert!(wait_until(Duration::from_secs(1), || process
+            .stdout_thread
+            .lock()
+            .expect("lock stdout thread")
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)));
+
+        let error = process
+            .assert_log_contains("READY")
+            .expect_err("log assertion must surface the reader JoinHandle panic");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("stdout reader thread panicked"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected stdout reader panic"),
+            "{message}"
+        );
+        assert!(message.contains("PANIC_OUTPUT"), "{message}");
+        process.kill_now().expect_err("cleanup retains first panic");
+    }
+
+    #[test]
+    fn managed_process_readiness_surfaces_stdout_tail_poison() {
+        let temp = TempDir::new("readiness-tail-poison");
+        let error = ManagedProcess::spawn_with_poisoned_stdout_tail(
+            "readiness tail poison fixture".to_string(),
+            shell("printf 'READY_AFTER_TAIL_POISON\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY_AFTER_TAIL_POISON".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect_err("readiness must surface the poisoned stdout tail");
+        let message = format!("{error:#}");
+        assert!(message.contains("stdout tail lock poisoned"), "{message}");
+        assert!(
+            fs::read_to_string(temp.path().join("fixture.log"))
+                .expect("read durable log after poison")
+                .contains("READY_AFTER_TAIL_POISON"),
+            "tail poison must not stop pipe draining or marker scanning"
+        );
+    }
+
+    #[test]
+    fn managed_process_stop_surfaces_stdout_tail_poison() {
+        let temp = TempDir::new("stop-tail-poison");
+        let mut process = ManagedProcess::spawn(
+            "stop tail poison fixture".to_string(),
+            shell("printf 'READY\n'; sleep 30"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(2),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn tail poison fixture");
+        let stdout_tail = Arc::clone(&process.stdout_buffer);
+        let _ = thread::spawn(move || {
+            let _guard = stdout_tail.lock().expect("lock stdout tail before poison");
+            panic!("inject stdout tail poison");
+        })
+        .join();
+
+        let error = process
+            .stop()
+            .expect_err("stop must surface the poisoned stdout tail");
+        assert!(
+            format!("{error:#}").contains("stdout tail lock poisoned"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1231,6 +1855,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_process_rejects_stale_file_marker_when_unrelated_bytes_are_appended() {
+        let temp = TempDir::new("stale-marker-unrelated-append");
+        let ready_path = temp.path().join("ready.txt");
+        fs::write(&ready_path, "STALE FILE_READY\n").expect("write stale file baseline");
+        let command = shell_with_arg(
+            "sleep 0.05; printf 'unrelated append\n' >> \"$1\"; sleep 30",
+            &ready_path,
+        );
+
+        let error = ManagedProcess::spawn(
+            "stale marker unrelated append fixture".to_string(),
+            command,
+            ReadyMarker::FileContains {
+                path: ready_path,
+                needle: "FILE_READY".to_string(),
+            },
+            Duration::from_millis(180),
+            temp.path().join("fixture.log"),
+        )
+        .expect_err("an unrelated append must not refresh a stale marker");
+        assert!(
+            format!("{error:#}").contains("timed out waiting for readiness marker"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn managed_process_accepts_file_marker_after_truncate() {
         let temp = TempDir::new("truncated-file-ready");
         let ready_path = temp.path().join("ready.txt");
@@ -1278,6 +1929,82 @@ mod tests {
         process
             .kill_now()
             .expect("kill same marker rewritten fixture");
+    }
+
+    #[test]
+    fn file_readiness_detects_same_bytes_rewrite_with_forced_same_mtime() {
+        let temp = TempDir::new("same-marker-same-mtime");
+        let ready_path = temp.path().join("ready.txt");
+        let mtime_reference = temp.path().join("mtime-reference.txt");
+        fs::write(&ready_path, "FILE_READY\n").expect("write stale marker generation");
+        copy_preserving_metadata(&ready_path, &mtime_reference);
+        let baseline = ReadinessBaseline::File {
+            snapshot: Some(
+                FileReadinessSnapshot::read(&ready_path)
+                    .expect("read baseline")
+                    .expect("baseline exists"),
+            ),
+        };
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&ready_path, "FILE_READY\n").expect("rewrite marker with the same bytes");
+        restore_mtime(&mtime_reference, &ready_path);
+        let current = FileReadinessSnapshot::read(&ready_path)
+            .expect("read current generation")
+            .expect("current file exists");
+        let ReadinessBaseline::File {
+            snapshot: Some(original),
+        } = &baseline
+        else {
+            panic!("file baseline expected");
+        };
+        assert_eq!(current.bytes, original.bytes, "test must preserve bytes");
+        assert_eq!(
+            current.modified, original.modified,
+            "test must force the original mtime"
+        );
+
+        assert!(
+            baseline.file_contains_fresh_marker(&current, "FILE_READY"),
+            "same bytes and mtime must still be fresh after an in-place rewrite"
+        );
+    }
+
+    #[test]
+    fn file_readiness_detects_rename_replacement_with_same_bytes_and_mtime() {
+        let temp = TempDir::new("rename-same-marker-same-mtime");
+        let ready_path = temp.path().join("ready.txt");
+        let replacement_path = temp.path().join("replacement.txt");
+        fs::write(&ready_path, "FILE_READY\n").expect("write stale marker generation");
+        let baseline = ReadinessBaseline::File {
+            snapshot: Some(
+                FileReadinessSnapshot::read(&ready_path)
+                    .expect("read baseline")
+                    .expect("baseline exists"),
+            ),
+        };
+
+        copy_preserving_metadata(&ready_path, &replacement_path);
+        fs::rename(&replacement_path, &ready_path).expect("replace readiness path by rename");
+        let current = FileReadinessSnapshot::read(&ready_path)
+            .expect("read replacement generation")
+            .expect("replacement exists");
+        let ReadinessBaseline::File {
+            snapshot: Some(original),
+        } = &baseline
+        else {
+            panic!("file baseline expected");
+        };
+        assert_eq!(current.bytes, original.bytes, "test must preserve bytes");
+        assert_eq!(
+            current.modified, original.modified,
+            "test must preserve mtime"
+        );
+
+        assert!(
+            baseline.file_contains_fresh_marker(&current, "FILE_READY"),
+            "a replacement inode must be a fresh file generation"
+        );
     }
 
     #[test]
