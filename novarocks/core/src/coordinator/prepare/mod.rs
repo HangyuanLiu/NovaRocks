@@ -17,6 +17,7 @@
 
 mod iceberg_delta;
 mod projection;
+pub(crate) mod runtime_filter_binding;
 pub(crate) mod scan;
 mod scan_preparation;
 
@@ -103,6 +104,11 @@ pub(crate) fn prepare_fragments(
     )?;
     let runtime_filter_projection =
         crate::sql::planner::distributed::runtime_filter::project_runtime_filters(plan)?;
+    let mut runtime_filter_binding_tables =
+        runtime_filter_binding::materialize_runtime_filter_binding_tables(
+            plan.runtime_filter_graph(),
+            plan.fragments(),
+        )?;
     let scan_bindings = prepare_scan_bindings(plan, connectors, resolver)?;
 
     let mut by_fragment = BTreeMap::new();
@@ -194,6 +200,9 @@ pub(crate) fn prepare_fragments(
             .unwrap_or_default();
         let prepared = projection::prepared_fragment(
             fragment.fragment_id,
+            runtime_filter_binding_tables
+                .remove(&fragment.fragment_id)
+                .expect("binding materialization creates one table per fragment"),
             scan_node_ids,
             execution_role,
             output_columns,
@@ -208,6 +217,7 @@ pub(crate) fn prepare_fragments(
             ));
         }
     }
+    debug_assert!(runtime_filter_binding_tables.is_empty());
 
     validate_binding_keys(
         "scan ranges",

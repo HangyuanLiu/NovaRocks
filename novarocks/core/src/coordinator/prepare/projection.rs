@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::datatypes::DataType;
 
+use super::runtime_filter_binding::RuntimeFilterBindingTable;
 use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::cte::CteId;
@@ -75,6 +76,7 @@ impl PreparedBoundaryProjection {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedFragment {
     fragment_id: FragmentId,
+    runtime_filter_bindings: RuntimeFilterBindingTable,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     boundary_projection: PreparedBoundaryProjection,
@@ -83,6 +85,10 @@ pub(crate) struct PreparedFragment {
 impl PreparedFragment {
     pub(crate) fn fragment_id(&self) -> FragmentId {
         self.fragment_id
+    }
+
+    pub(crate) fn runtime_filter_bindings(&self) -> &RuntimeFilterBindingTable {
+        &self.runtime_filter_bindings
     }
 
     pub(crate) fn scan_node_ids(&self) -> &[i32] {
@@ -112,6 +118,8 @@ struct PreparedPlanProjection {
 pub(crate) struct PreparedFragmentSet {
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
     scan_bindings: ScanExecutionBindings,
+    // transitional_until_task_5: legacy scheduler/encoder consumers still read this
+    // projection while the exact fragment-local binding table migrates additively.
     runtime_filter_projection: RuntimeFilterGraphProjection,
     projection: PreparedPlanProjection,
 }
@@ -213,6 +221,7 @@ impl<'a> FragmentSchedulingView<'a> {
 
 pub(super) fn prepared_fragment(
     fragment_id: FragmentId,
+    runtime_filter_bindings: RuntimeFilterBindingTable,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     output_columns: Vec<PreparedOutputColumn>,
@@ -222,6 +231,7 @@ pub(super) fn prepared_fragment(
 ) -> PreparedFragment {
     PreparedFragment {
         fragment_id,
+        runtime_filter_bindings,
         scan_node_ids,
         execution_role,
         boundary_projection: PreparedBoundaryProjection {
@@ -259,6 +269,7 @@ pub(crate) fn prepared_fragment_set_for_test(
             fragment_id,
             prepared_fragment(
                 fragment_id,
+                RuntimeFilterBindingTable::empty(fragment_id),
                 scan_node_ids,
                 role,
                 Vec::new(),
