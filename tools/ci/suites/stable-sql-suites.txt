@@ -11,9 +11,7 @@ set-op
 table-function
 runtime-filter
 low-cardinality
-complex-type-native
 complex-type
-function-native
 function
 aggregate
 # The default stable runner skips analytic's two exhaustive migrated window matrices;
