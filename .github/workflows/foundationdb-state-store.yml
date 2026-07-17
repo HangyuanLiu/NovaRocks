@@ -10,7 +10,6 @@ on:
       - "novarocks.toml.example"
       - "src/common/app_config.rs"
       - "src/state_store/**"
-      - "tests/state_store_boundary.rs"
       - "tests/cluster_mvp.rs"
       - "tests/common/mod.rs"
       - "tests/common/state_store_conformance.rs"

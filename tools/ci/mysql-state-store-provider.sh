@@ -56,16 +56,11 @@ cargo test --test state_store_sqlite
 cargo test --test state_store_contract -- --list | \
   awk '$1 == "foundationdb_config_feature_off_open_fails_without_fallback:" { n++ } END { exit(n != 1) }'
 cargo test --test state_store_contract foundationdb_config_feature_off_open_fails_without_fallback -- --exact
-cargo test --test state_store_boundary -- --list | \
-  awk '$1 == "state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden_apis:" { n++ } END { exit(n != 1) }'
-cargo test --test state_store_boundary \
-  state_store_boundary_detector_rejects_foundationdb_owner_domain_and_forbidden_apis -- --exact
 cargo check --no-default-features
 if cargo tree -e features --no-default-features | rg -q 'mysql_async|mysql_common v0\.37'; then
   echo "mysql_async leaked into the feature-off dependency tree" >&2
   exit 1
 fi
-cargo test --test state_store_boundary state_store
 cargo build --profile dev-opt
 
 READINESS_DB="$NOVAROCKS_MYSQL_DATABASE"

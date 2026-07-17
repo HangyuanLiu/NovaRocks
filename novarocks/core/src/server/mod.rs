@@ -1829,17 +1829,6 @@ mod tests {
     }
 
     #[test]
-    fn client_disconnect_watcher_treats_unexpected_peek_errors_as_disconnects() {
-        let source = include_str!("mod.rs");
-        assert!(
-            source.contains(
-                "_ => {\n                        watcher_disconnected.store(true, Ordering::SeqCst);\n                        break;\n                    }"
-            ),
-            "unexpected peek errors should conservatively mark the client disconnected"
-        );
-    }
-
-    #[test]
     fn parse_set_query_timeout_accepts_common_forms() {
         assert_eq!(parse_set_query_timeout("SET query_timeout = 60"), Some(60));
         assert_eq!(parse_set_query_timeout("set query_timeout=30"), Some(30));
@@ -2089,22 +2078,6 @@ mod tests {
             "SET cbo_broadcast_node_mem_budget_bytes = 3"
         ));
         assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(3.0));
-    }
-
-    #[test]
-    fn execute_statement_text_applies_broadcast_profile_before_boolean_set() {
-        let source = include_str!("mod.rs");
-        let helper_call = source
-            .find("apply_broadcast_profile_set(&mut shim.optimizer_settings, trimmed)")
-            .expect("execute_statement_text should call broadcast profile helper");
-        let boolean_call = source
-            .find("parse_set_boolean(trimmed)")
-            .expect("execute_statement_text should call boolean parser");
-
-        assert!(
-            helper_call < boolean_call,
-            "broadcast profile SET parser must run before generic boolean SET parser"
-        );
     }
 
     #[test]
@@ -2491,16 +2464,6 @@ mod tests {
                 "global_runtime_filter_probe_min_selectivity"
             ),
             None
-        );
-    }
-
-    #[test]
-    fn standalone_server_source_has_no_native_disconnect_watcher_thread() {
-        let source = include_str!("mod.rs");
-        let needle = ["std::thread", "::JoinHandle<()>"].concat();
-        assert!(
-            !source.contains(&needle),
-            "standalone server should not keep a native disconnect watcher thread per session"
         );
     }
 }

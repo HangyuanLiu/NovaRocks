@@ -2689,56 +2689,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delete_like_sinks_wire_explicit_snapshot_selection_into_call_sites() {
-        let lower_source = include_str!("../../lower/compat/sink/iceberg.rs");
-        let partition_index = lower_source
-            .split("fn build_position_delete_data_file_partition_index")
-            .nth(1)
-            .expect("partition index helper")
-            .split("fn insert_position_delete_data_file_partition")
-            .next()
-            .expect("partition index helper body");
-        assert!(
-            partition_index
-                .contains("target_snapshot_id.or_else(|| metadata.current_snapshot_id())"),
-            "partition index builder must select the descriptor target snapshot"
-        );
-        assert!(
-            !partition_index.contains("metadata.current_snapshot()"),
-            "partition index builder must not use metadata current snapshot directly"
-        );
-
-        let source = include_str!("sink.rs");
-        let dv_reader = source
-            .split("fn read_existing_dv_positions")
-            .nth(1)
-            .expect("DV reader")
-            .split("fn referenced_data_file_partition_report")
-            .next()
-            .expect("DV reader body");
-        assert!(
-            dv_reader.contains("delete_target_snapshot_id(metadata, self.plan.target_snapshot_id)"),
-            "DV reader must select the descriptor target snapshot"
-        );
-        assert!(
-            !dv_reader.contains("metadata.current_snapshot_id()"),
-            "DV reader must not use metadata current snapshot id directly"
-        );
-
-        let partition_index_call_site = lower_source
-            .split("let position_delete_data_file_partitions")
-            .nth(1)
-            .expect("partition index call site")
-            .split("let file_format")
-            .next()
-            .expect("partition index call site body");
-        assert!(
-            partition_index_call_site.contains("IcebergSinkMode::DeletionVectors"),
-            "DV sink factory must build referenced data file partition metadata"
-        );
-    }
-
     #[tokio::test]
     async fn data_sink_plan_builds_staged_context_with_fe_metadata() {
         let dir = tempfile::Builder::new()

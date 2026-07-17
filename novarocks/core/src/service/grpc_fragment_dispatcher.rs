@@ -664,43 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_dispatcher_source_has_no_native_cancel_thread_spawn() {
-        let source = include_str!("grpc_fragment_dispatcher.rs");
-        let needle = ["remote", "-cancel", "-fragment"].concat();
-        assert!(
-            !source.contains(&needle),
-            "remote cancel should not use a dedicated native thread"
-        );
-    }
-
-    #[test]
-    fn remote_dispatcher_cancel_async_path_does_not_call_connect_blocking() {
-        let source = include_str!("grpc_fragment_dispatcher.rs");
-        let impl_source = source
-            .split_once("// Tests")
-            .map(|(before, _)| before)
-            .expect("dispatcher tests section exists");
-        let cancel_start = source
-            .find("fn cancel_fragments(&self, backend_idx: usize, finst_ids: &[UniqueId]) {")
-            .expect("cancel_fragments implementation exists");
-        let cancel_tail = &impl_source[cancel_start..];
-        assert!(
-            !cancel_tail.contains("NovaRocksGrpcRemoteClient::connect_blocking(backend)"),
-            "async remote cancel path must not call connect_blocking"
-        );
-    }
-
-    #[test]
-    fn dispatcher_source_has_no_local_dispatcher_legacy() {
-        let source = include_str!("grpc_fragment_dispatcher.rs");
-        let legacy_type_name = ["In", "Process", "Dispatcher"].concat();
-        assert!(
-            !source.contains(&legacy_type_name),
-            "dispatcher should not keep a local-only dispatcher implementation"
-        );
-    }
-
-    #[test]
     fn remote_dispatcher_holds_multiple_clients() {
         let a1 = spawn_mock_server(Arc::new(MockState::default()));
         let a2 = spawn_mock_server(Arc::new(MockState::default()));

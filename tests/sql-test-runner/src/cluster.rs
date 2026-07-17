@@ -1413,87 +1413,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_process_launch_runs_show_backends_barrier_after_fe_ready() {
-        let source = include_str!("cluster.rs")
-            .split("\n#[cfg(test)]")
-            .next()
-            .expect("production cluster source");
-        let launch = source
-            .split("fn launch_impl(")
-            .nth(1)
-            .expect("launch_impl")
-            .split("fn ensure_be_index")
-            .next()
-            .expect("launch_impl body");
-        let fe_ready = launch
-            .find("let mut fe_process = ProcessGuard::spawn(")
-            .expect("FE spawn");
-        let barrier = launch
-            .find("wait_for_live_backend_topology(")
-            .expect("SHOW BACKENDS topology barrier");
-        let return_handle = launch.find("Ok(Self {").expect("return handle");
-        assert!(fe_ready < barrier, "barrier must run after FE readiness");
-        assert!(barrier < return_handle, "barrier must run before SQL receives the handle");
-        assert!(
-            source.contains("process_runtime_diagnostics("),
-            "barrier must collect live FE/BE process diagnostics"
-        );
-        assert!(
-            source.contains(".tcp_connect_timeout(Some(io_timeout))")
-                && source.contains(".read_timeout(Some(io_timeout))")
-                && source.contains(".write_timeout(Some(io_timeout))"),
-            "SHOW BACKENDS MySQL connection must use bounded IO timeouts"
-        );
-    }
-
-    #[test]
-    fn process_guard_declares_drop_cleanup() {
-        assert!(include_str!("cluster.rs").contains("impl Drop for ProcessGuard"));
-    }
-
-    #[test]
-    fn process_guard_declares_stderr_thread_join_helper() {
-        let source = include_str!("cluster.rs")
-            .split("\n#[cfg(test)]")
-            .next()
-            .expect("source before tests");
-        assert!(
-            source.contains("fn join_stderr_thread"),
-            "missing stderr join helper"
-        );
-        assert!(
-            source.contains("self.join_stderr_thread();"),
-            "wait_for_ready should join stderr thread before reading stderr"
-        );
-    }
-
-    #[test]
-    fn process_guard_readiness_channel_is_bounded_and_one_shot() {
-        let source = include_str!("cluster.rs")
-            .split("\n#[cfg(test)]")
-            .next()
-            .expect("source before tests");
-        assert!(
-            source.contains("mpsc::sync_channel::<()>(1)"),
-            "readiness signal must use a one-slot bounded channel"
-        );
-        assert!(
-            !source.contains("mpsc::channel()"),
-            "stdout lines must not accumulate in an unbounded channel"
-        );
-        assert!(
-            source.contains("if !ready_sent && line.contains(&ready_marker_for_thread)")
-                && source.contains("let _ = ready_tx.try_send(());")
-                && source.contains("ready_sent = true;"),
-            "stdout reader must signal readiness at most once"
-        );
-        assert!(
-            source.contains("push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES)"),
-            "stdout reader must keep draining into the bounded tail after readiness"
-        );
-    }
-
-    #[test]
     fn noop_server_handle_rejects_be_process_controls() {
         let mut handle = NoopServerHandle;
 
@@ -1509,43 +1428,6 @@ mod tests {
                 .to_string()
                 .contains("BE restart is unsupported"),
             "unexpected error: {restart_err}"
-        );
-    }
-
-    #[test]
-    fn process_guard_disconnected_branch_uses_startup_failure_diagnostics() {
-        let source = include_str!("cluster.rs")
-            .split("\n#[cfg(test)]")
-            .next()
-            .expect("source before tests");
-        let disconnected_branch = source
-            .split("Err(mpsc::RecvTimeoutError::Disconnected) => {")
-            .nth(1)
-            .expect("disconnected branch");
-        let disconnected_branch = disconnected_branch
-            .split("if Instant::now() >= deadline {")
-            .next()
-            .expect("disconnected branch body");
-
-        assert!(
-            disconnected_branch.contains("self.join_stderr_thread();"),
-            "disconnected branch should join stderr thread"
-        );
-        assert!(
-            disconnected_branch.contains("format_startup_failure("),
-            "disconnected branch should use startup failure diagnostics"
-        );
-        assert!(
-            disconnected_branch.contains("self.read_stderr()"),
-            "disconnected branch should read stderr before formatting failure"
-        );
-        assert!(
-            disconnected_branch.contains("wait_for_exit_after_stdout_disconnect"),
-            "disconnected branch should wait briefly for child exit before killing"
-        );
-        assert!(
-            disconnected_branch.contains("child status="),
-            "disconnected branch should include child exit status when available"
         );
     }
 

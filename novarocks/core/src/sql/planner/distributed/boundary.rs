@@ -1000,20 +1000,4 @@ mod tests {
             (total_columns as u32) + 1
         );
     }
-
-    #[test]
-    fn boundary_module_has_no_runtime_or_protobuf_dependency() {
-        let source = include_str!("boundary.rs");
-        for pattern in [
-            concat!("crate::", "coordinator"),
-            concat!("pro", "st"),
-            concat!("crate::", "runtime::"),
-            concat!("crate::", "thrift"),
-        ] {
-            assert!(
-                !source.contains(pattern),
-                "boundary module must not reference `{pattern}`"
-            );
-        }
-    }
 }

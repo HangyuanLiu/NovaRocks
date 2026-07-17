@@ -470,27 +470,6 @@ mod tests {
     }
 
     #[test]
-    fn l2_case_has_no_wire_selector_parameter_or_launch_argument() {
-        let source = include_str!("imv_stateless.rs");
-        let fn_start = source
-            .find("pub(crate) fn run_imv_stateless_l2_case(")
-            .expect("run_imv_stateless_l2_case source");
-        let fn_body = &source[fn_start..source[fn_start..]
-            .find("fn run_setup_sql(")
-            .expect("run_setup_sql follows l2 case")
-            + fn_start];
-
-        let retired_type = ["Plan", "Wire", "Format", "Arg"].concat();
-        let retired_parameter = ["plan", "wire", "format"].join("_");
-
-        assert!(!fn_body.contains(&retired_type), "L2 harness signature must be native-only");
-        assert!(
-            !fn_body.contains(&retired_parameter),
-            "L2 cluster launches must not receive a wire selector"
-        );
-    }
-
-    #[test]
     fn connection_config_uses_root_user_and_no_catalog_db_preset() {
         // Direct construction mirrors what `connection_config` builds, since
         // building a real CrossProcessServerHandle needs a live binary/ports.

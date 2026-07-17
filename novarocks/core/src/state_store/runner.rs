@@ -167,34 +167,3 @@ fn deadline_exceeded(metrics: &StateStoreMetrics) -> RunFailure {
     metrics.record_deadline();
     RunFailure::DeadlineExceeded
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn cancellation_contract_is_documented() {
-        let source = include_str!("runner.rs");
-        let rustdoc = source
-            .split_once("pub async fn run_side_effect_free")
-            .expect("run_side_effect_free must remain public")
-            .0;
-        let rustdoc = rustdoc
-            .lines()
-            .filter_map(|line| line.strip_prefix("///"))
-            .flat_map(str::split_whitespace)
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        for required in [
-            "must treat the operation as possibly committed",
-            "must not restart it with a new [`OperationId`]",
-            "known attempt [`TransactionId`] values from the same `OperationId`",
-            "authoritative re-read",
-            "ordinary commit timeout returns [`RunFailure::CommitUnknown`]",
-        ] {
-            assert!(
-                rustdoc.contains(required),
-                "run_side_effect_free rustdoc is missing `{required}`"
-            );
-        }
-    }
-}

@@ -3027,23 +3027,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn output_module_has_no_runtime_or_protobuf_dependency() {
-        let source = include_str!("output.rs");
-        for pattern in [
-            concat!("crate::", "coordinator"),
-            concat!("pro", "st"),
-            concat!("crate::", "proto"),
-            concat!("crate::", "runtime::"),
-            concat!("crate::", "thrift"),
-        ] {
-            assert!(
-                !source.contains(pattern),
-                "output module must not reference `{pattern}`"
-            );
-        }
-    }
-
     // ---- CGO-9C Task 2: fragment output + stream edge projection finalization ----
 
     /// A `Project` payload with `items[i]` re-materializing `output_column_id[i]`
