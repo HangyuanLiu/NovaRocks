@@ -2033,4 +2033,81 @@ mod tests {
         );
         FragmentSubmission::try_new(program, instance).expect("fetch child scan");
     }
+
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::runtime::exchange::snapshot_receiver_state;
+    use crate::runtime::query_context::query_context_manager;
+    use crate::runtime::query_state::in_flight_table;
+    use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+
+    static NEXT_TEST_ID: AtomicI64 = AtomicI64::new(8_500_000_000_000_000_000);
+
+    fn assert_runtime_state_absent(
+        query: QueryId,
+        finst: UniqueId,
+        exchange_key: ExchangeKey,
+        rf_key: QueryKey,
+    ) {
+        let manager = query_context_manager();
+        assert!(manager.query_mem_tracker(query).is_none());
+        assert!(manager.query_id_by_finst(finst).is_none());
+        assert!(in_flight_table().state(query).is_none());
+        let TryFetchResult::Error(error) = result_buffer::try_fetch(finst) else {
+            panic!("missing result buffer entry must return an error");
+        };
+        assert!(matches!(error.kind, FetchErrorKind::NotFound));
+        assert!(snapshot_receiver_state(exchange_key).is_none());
+        assert!(
+            RuntimeFilterLifecycleRegistry::global()
+                .snapshot(rf_key)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_submission_does_not_touch_runtime_state_or_retain_program_arc() {
+        let unique = NEXT_TEST_ID.fetch_add(10, Ordering::Relaxed);
+        let query = query_id(unique, unique + 1);
+        let finst = uid(unique, unique + 2);
+        let exchange_id = FragmentNodeId::new(41);
+        let exchange_key = ExchangeKey {
+            finst_id_hi: finst.hi,
+            finst_id_lo: finst.lo,
+            node_id: 41,
+        };
+        let rf_key = QueryKey::from_hi_lo(query.hi, query.lo);
+        let expected = schema(1, true);
+        let program = program_with(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: exchange_node(41, Arc::clone(&expected), finst),
+            },
+            result_sink(),
+            BTreeMap::new(),
+            BTreeMap::from([(exchange_id, expected)]),
+            BTreeSet::from([RuntimeFilterId::new(11)]),
+        );
+        let instance = instance_with(
+            FragmentContractVersion::CURRENT,
+            query,
+            finst,
+            BTreeMap::new(),
+            BTreeMap::from([(exchange_id, 1)]),
+            FragmentSinkAssignment::None,
+            BTreeMap::from([(13, vec![prober_destination()])]),
+            BTreeMap::new(),
+        );
+
+        assert_runtime_state_absent(query, finst, exchange_key, rf_key);
+        let before = Arc::strong_count(&program);
+        assert_error(
+            FragmentSubmission::try_new(Arc::clone(&program), instance),
+            FragmentBindingTarget::RuntimeFilter(13),
+            FragmentBindingErrorKind::RuntimeFilterMismatch,
+        );
+        assert_eq!(Arc::strong_count(&program), before);
+        assert_runtime_state_absent(query, finst, exchange_key, rf_key);
+    }
 }
