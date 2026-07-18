@@ -30,6 +30,8 @@ use crate::sql::planner::physical::{
 use arrow::datatypes::DataType;
 
 mod output;
+mod relational;
+mod runtime_filter;
 mod topology;
 
 fn empty_scan_bindings() -> &'static ScanExecutionBindings {

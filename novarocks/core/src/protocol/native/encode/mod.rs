@@ -1590,18 +1590,6 @@ mod tests {
     }
 
     #[test]
-    fn physical_plan_encoder_variant_guard_tracks_rust_enum_not_proto_arms() {
-        assert_eq!(
-            plan::encoded_physical_variant_names_for_test(),
-            crate::sql::planner::physical::PhysicalPlanKind::variant_names_for_test()
-        );
-        assert!(
-            !plan::encoded_physical_variant_names_for_test().contains(&"Decode"),
-            "Decode exists only as a proto arm; Rust PhysicalPlanKind is the source of truth"
-        );
-    }
-
-    #[test]
     fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
         use std::collections::BTreeMap;
 
