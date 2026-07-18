@@ -159,8 +159,8 @@ pub(crate) fn create_mv(
     // target has no inbound edges, while an existing target fails on existence
     // first). Kept as a safety net for future paths that bypass the existence
     // check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or racy
-    // metadata writes. Algorithm coverage lives in
-    // src/engine/mv/dependency.rs::tests.
+    // metadata writes. Canonical cycle algorithm coverage lives in
+    // crate::mv::dependency::graph::tests.
     crate::engine::mv::dependency::validate_no_create_cycle(
         state,
         &dependency_target,
