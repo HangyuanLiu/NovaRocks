@@ -226,6 +226,16 @@ pub enum ApplyKeySource {
     GroupRowId,
 }
 
+impl ApplyKeySource {
+    pub const fn table_property_value(self) -> &'static str {
+        match self {
+            Self::BaseRowId => "base._row_id",
+            Self::JoinRowKey => "JoinRowKey",
+            Self::GroupRowId => "GroupRowId",
+        }
+    }
+}
+
 /// Errors returned by `MvSchemaContract::ensure_self_consistent`.
 /// These indicate the contract was constructed incorrectly at CREATE
 /// time — they should never surface to end users in practice.
@@ -444,6 +454,10 @@ pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
 pub const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
 pub const GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str = "__row_id__";
 pub const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
+pub const APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
+pub const APPLY_KEY_SOURCE_PROPERTY: &str = "novarocks.mv.apply-key.source";
+pub const APPLY_KEY_FIELD_ID_PROPERTY: &str = "novarocks.mv.apply-key.field-id";
+pub const HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
 
 impl MvSchemaContract {
     fn effective_bases(&self) -> Vec<&BaseContract> {
@@ -679,6 +693,41 @@ fn qualified_field_known(bases: &[&BaseContract], field: &QualifiedFieldLineage)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_target_vocabulary_is_stable() {
+        let column_names = [
+            (HIDDEN_APPLY_KEY_COLUMN_NAME, "__nova_base_row_id"),
+            (JOIN_APPLY_KEY_COLUMN_NAME, "__nova_join_row_key"),
+            (GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, "__row_id__"),
+            (BRANCH_ID_COLUMN_NAME, "__branch_id__"),
+        ];
+        for (actual, expected) in column_names {
+            assert_eq!(actual, expected);
+        }
+
+        let properties = [
+            (APPLY_KEY_COLUMN_PROPERTY, "novarocks.mv.apply-key.column"),
+            (APPLY_KEY_SOURCE_PROPERTY, "novarocks.mv.apply-key.source"),
+            (
+                APPLY_KEY_FIELD_ID_PROPERTY,
+                "novarocks.mv.apply-key.field-id",
+            ),
+            (HIDDEN_COLUMNS_PROPERTY, "novarocks.mv.hidden-columns"),
+        ];
+        for (actual, expected) in properties {
+            assert_eq!(actual, expected);
+        }
+
+        let apply_key_sources = [
+            (ApplyKeySource::BaseRowId, "base._row_id"),
+            (ApplyKeySource::JoinRowKey, "JoinRowKey"),
+            (ApplyKeySource::GroupRowId, "GroupRowId"),
+        ];
+        for (source, expected) in apply_key_sources {
+            assert_eq!(source.table_property_value(), expected);
+        }
+    }
 
     fn sample_contract() -> MvSchemaContract {
         MvSchemaContract {
