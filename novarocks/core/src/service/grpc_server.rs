@@ -1703,6 +1703,34 @@ mod pr3_tests {
         UniqueId { hi, lo }
     }
 
+    fn empty_values_result_fragment(fragment_id: u32, root_node_id: i32) -> plan::PlanFragment {
+        plan::PlanFragment {
+            fragment_id,
+            root: Some(plan::DistributedNode {
+                node_id: root_node_id,
+                fragment_id,
+                limit: -1,
+                payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                    output_columns: Vec::new(),
+                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    })),
+                })),
+                ..Default::default()
+            }),
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Result(true)),
+            }),
+            output_columns: Vec::new(),
+            runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                fragment_id,
+                bindings: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn ok_report(query: UniqueId, finst: UniqueId) -> ExecStatusReport {
         ExecStatusReport {
             query_id: Some(ProtoUniqueId {
@@ -1929,42 +1957,54 @@ mod pr3_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_fragment_native_result_sink_precreates_fetch_buffer() {
         use crate::common::types::UniqueId;
+        use crate::runtime::fragment::native_execution::install_test_result_buffer_creation_gate;
         use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
 
         let finst = ProtoUniqueId { hi: 7101, lo: 7102 };
+        let finst_id = UniqueId {
+            hi: finst.hi,
+            lo: finst.lo,
+        };
+        let creation_gate = install_test_result_buffer_creation_gate(finst_id);
         let svc = GrpcService::default();
         let req = Request::new(SubmitFragmentRequest {
-            plan: Some(plan::PlanFragment {
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }),
+            plan: Some(empty_values_result_fragment(7, 41)),
             instance_params: Some(novarocks::InstanceParams {
                 query_id: Some(ProtoUniqueId { hi: 7001, lo: 7002 }),
                 fragment_instance_id: Some(finst.clone()),
-                backend_num: 0,
+                backend_num: 3,
                 query_options: Some(novarocks::QueryOptions {
                     batch_size: 1024,
+                    pipeline_dop: 1,
                     ..Default::default()
                 }),
                 ..Default::default()
             }),
         });
-        let resp = svc.submit_fragment(req).await.expect("RPC level success");
+        let mut submit = tokio::spawn(async move { svc.submit_fragment(req).await });
+        creation_gate.wait_until_worker_enters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut submit)
+                .await
+                .is_err(),
+            "submit RPC must wait until the runtime-owned result buffer is registered"
+        );
+        creation_gate.release();
+        let resp = submit
+            .await
+            .expect("submit task")
+            .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
 
-        let finst_id = UniqueId {
-            hi: finst.hi,
-            lo: finst.lo,
-        };
-        match result_buffer::wait_fetch(finst_id, 1000) {
+        match result_buffer::try_fetch(finst_id) {
             TryFetchResult::Error(err) if matches!(err.kind, FetchErrorKind::NotFound) => {
-                panic!("native result sink submit must precreate result buffer")
+                panic!(
+                    "successful native result submit must register its fetch buffer before returning"
+                )
             }
             _ => {}
         }

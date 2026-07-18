@@ -16,6 +16,8 @@
 // under the License.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver as ReadinessReceiver, SyncSender as ReadinessSender};
 use std::time::Duration;
 
 use crate::common::config::debug_exec_node_output;
@@ -38,9 +40,170 @@ use crate::runtime::profile::{
 };
 use crate::runtime::result_buffer;
 
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, SyncSender};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+struct TestResultBufferCreationGateWorker {
+    entered: SyncSender<()>,
+    release: Receiver<()>,
+}
+
+#[cfg(test)]
+fn test_result_buffer_creation_gates()
+-> &'static Mutex<HashMap<crate::common::types::UniqueId, TestResultBufferCreationGateWorker>> {
+    static GATES: OnceLock<
+        Mutex<HashMap<crate::common::types::UniqueId, TestResultBufferCreationGateWorker>>,
+    > = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn test_pre_ready_panics() -> &'static Mutex<HashSet<crate::common::types::UniqueId>> {
+    static PANICS: OnceLock<Mutex<HashSet<crate::common::types::UniqueId>>> = OnceLock::new();
+    PANICS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_pre_ready_panic(finst_id: crate::common::types::UniqueId) {
+    test_pre_ready_panics()
+        .lock()
+        .expect("pre-ready panic set lock")
+        .insert(finst_id);
+}
+
+#[cfg(test)]
+fn maybe_panic_before_ready(finst_id: crate::common::types::UniqueId) {
+    if test_pre_ready_panics()
+        .lock()
+        .expect("pre-ready panic set lock")
+        .remove(&finst_id)
+    {
+        panic!("injected native worker panic before readiness");
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestResultBufferCreationGate {
+    entered: Receiver<()>,
+    release: Option<SyncSender<()>>,
+}
+
+#[cfg(test)]
+impl TestResultBufferCreationGate {
+    pub(crate) fn wait_until_worker_enters(&self) {
+        self.entered
+            .recv()
+            .expect("native worker must reach result-buffer creation gate");
+    }
+
+    pub(crate) fn release(mut self) {
+        self.release
+            .take()
+            .expect("result-buffer creation gate released once")
+            .send(())
+            .expect("native worker must wait for result-buffer gate release");
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestResultBufferCreationGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_result_buffer_creation_gate(
+    finst_id: crate::common::types::UniqueId,
+) -> TestResultBufferCreationGate {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    test_result_buffer_creation_gates()
+        .lock()
+        .expect("result-buffer creation gate lock")
+        .insert(
+            finst_id,
+            TestResultBufferCreationGateWorker {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+    TestResultBufferCreationGate {
+        entered: entered_rx,
+        release: Some(release_tx),
+    }
+}
+
+#[cfg(test)]
+fn wait_at_test_result_buffer_creation_gate(finst_id: crate::common::types::UniqueId) {
+    let gate = test_result_buffer_creation_gates()
+        .lock()
+        .expect("result-buffer creation gate lock")
+        .remove(&finst_id);
+    if let Some(gate) = gate {
+        gate.entered
+            .send(())
+            .expect("result-buffer gate observer must remain alive");
+        gate.release
+            .recv()
+            .expect("result-buffer gate observer must release worker");
+    }
+}
+
 pub(crate) struct NativeExecutionContext {
     pub(crate) profiler: Option<Profiler>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
+    pub(crate) readiness: NativeExecutionReadiness,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeExecutionStart {
+    Ready,
+    Failed(FragmentExecutionError),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeExecutionReadiness {
+    sender: ReadinessSender<NativeExecutionStart>,
+    ready: Arc<AtomicBool>,
+}
+
+impl NativeExecutionReadiness {
+    pub(crate) fn signal_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+        let _ = self.sender.send(NativeExecutionStart::Ready);
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn fail_after_cleanup(&self, error: FragmentExecutionError) {
+        if !self.is_ready() {
+            let _ = self.sender.send(NativeExecutionStart::Failed(error));
+        }
+    }
+}
+
+pub(crate) fn native_execution_readiness_channel() -> (
+    NativeExecutionReadiness,
+    ReadinessReceiver<NativeExecutionStart>,
+) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    (
+        NativeExecutionReadiness {
+            sender,
+            ready: Arc::new(AtomicBool::new(false)),
+        },
+        receiver,
+    )
 }
 
 pub(crate) fn execute_native_submission(
@@ -78,11 +241,16 @@ pub(crate) fn execute_native_submission(
     .map_err(|error| FragmentExecutionError::new(FragmentExecutionErrorKind::Pipeline, error))?;
 
     if program.sink().kind() == FragmentSinkKind::Result {
+        #[cfg(test)]
+        wait_at_test_result_buffer_creation_gate(fragment_instance_id);
+        #[cfg(test)]
+        maybe_panic_before_ready(fragment_instance_id);
         prepare_result_buffer(
             fragment_instance_id,
             instance.runtime_options().typed_result_sink(),
             context.mem_tracker.as_ref(),
         );
+        context.readiness.signal_ready();
     }
     if let Some(profiler) = context.profiler.as_ref() {
         record_runtime_filter_dormancy(profiler, program.runtime_filters().dormancy_facts());
@@ -90,6 +258,9 @@ pub(crate) fn execute_native_submission(
     let sink = materialize_fragment_sink(program.sink(), instance).map_err(|error| {
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
     })?;
+    if program.sink().kind() != FragmentSinkKind::Result {
+        context.readiness.signal_ready();
+    }
 
     // PBF-2 launches each validated submission once. PBF-4 will materialize
     // instance-owned scan and exchange state instead of cloning bound nodes.
@@ -196,7 +367,8 @@ mod tests {
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
     use super::{
-        NativeExecutionContext, execute_native_submission, record_runtime_filter_dormancy,
+        NativeExecutionContext, execute_native_submission, native_execution_readiness_channel,
+        record_runtime_filter_dormancy,
     };
 
     fn noop_values_submission() -> FragmentSubmission {
@@ -235,11 +407,13 @@ mod tests {
     #[test]
     fn executes_noop_values_submission_without_wire_inputs() {
         let profiler = Profiler::new("native submission");
+        let (readiness, _receiver) = native_execution_readiness_channel();
         let output = execute_native_submission(
             noop_values_submission(),
             NativeExecutionContext {
                 profiler: Some(profiler.clone()),
                 mem_tracker: None,
+                readiness,
             },
         )
         .expect("noop submission executes");

@@ -30,7 +30,8 @@ use crate::runtime::fragment::error::{
     FragmentLaunchErrorKind, FragmentLaunchStage,
 };
 use crate::runtime::fragment::native_execution::{
-    NativeExecutionContext, execute_native_submission,
+    NativeExecutionContext, NativeExecutionStart, execute_native_submission,
+    native_execution_readiness_channel,
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
@@ -58,6 +59,17 @@ fn profile_report_interval_ns(
     })
 }
 
+fn profiler_for_native_program(
+    program: &crate::exec::fragment::program::FragmentProgram,
+) -> Profiler {
+    let root_plan_node_id = program.root_plan_node_id().get();
+    let profiler = Profiler::new(format!(
+        "execute_fragment_native (plan_node_id={root_plan_node_id})"
+    ));
+    profiler.set_metadata(i64::from(root_plan_node_id));
+    profiler
+}
+
 fn spawn_exec_fragment_native(
     submission: FragmentSubmission,
     uses_fetch_result_buffer: bool,
@@ -66,7 +78,9 @@ fn spawn_exec_fragment_native(
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     mgr: Arc<QueryContextManager>,
-) {
+) -> Result<(), FragmentLaunchError> {
+    let (readiness, readiness_receiver) = native_execution_readiness_channel();
+    let worker_readiness = readiness.clone();
     mgr.register_finst(finst_id, query_id);
     std::thread::spawn(move || {
         let wall_start = std::time::Instant::now();
@@ -77,6 +91,7 @@ fn spawn_exec_fragment_native(
                 NativeExecutionContext {
                     profiler,
                     mem_tracker,
+                    readiness,
                 },
             )
         }))
@@ -98,9 +113,14 @@ fn spawn_exec_fragment_native(
                 crate::runtime::profile::clamp_u128_to_i64(wall_start.elapsed().as_nanos());
             p.counter_set("QueryExecutionWallTime", ProfileUnit::TimeNs, elapsed_ns);
         }
+        let pre_ready_failure = out
+            .as_ref()
+            .err()
+            .filter(|_| !worker_readiness.is_ready())
+            .cloned();
         let mut report_error: Option<String> = None;
         if uses_fetch_result_buffer {
-            match out {
+            match &out {
                 Ok(out) => {
                     if let Some(json) = out.profile_json.as_deref() {
                         info!(
@@ -120,10 +140,12 @@ fn spawn_exec_fragment_native(
                         error = %e,
                         "exec_plan_fragment_native failed"
                     );
-                    result_buffer::close_error(finst_id, error);
+                    if worker_readiness.is_ready() {
+                        result_buffer::close_error(finst_id, error);
+                    }
                 }
             }
-        } else if let Err(e) = out {
+        } else if let Err(e) = &out {
             report_error = Some(e.to_string());
             error!(
                 target: "novarocks::exec",
@@ -135,7 +157,9 @@ fn spawn_exec_fragment_native(
         if let Some(ref err_msg) = report_error {
             let finsts = mgr.cancel_query(query_id, err_msg.clone());
             for id in finsts {
-                result_buffer::close_error(id, err_msg.clone());
+                if id != finst_id || worker_readiness.is_ready() {
+                    result_buffer::close_error(id, err_msg.clone());
+                }
                 exchange::cancel_fragment(id.hi, id.lo);
             }
         }
@@ -148,7 +172,39 @@ fn spawn_exec_fragment_native(
         exchange::remove_fragment(finst_id.hi, finst_id.lo);
         mgr.unregister_finst(finst_id);
         mgr.cleanup_after_fragment_report(query_id, report_decision);
+        if let Some(error) = pre_ready_failure {
+            worker_readiness.fail_after_cleanup(error);
+        }
     });
+
+    match readiness_receiver.recv() {
+        Ok(NativeExecutionStart::Ready) => Ok(()),
+        Ok(NativeExecutionStart::Failed(error)) => Err(pre_ready_launch_error(error)),
+        Err(_) => Err(FragmentLaunchError::new(
+            FragmentLaunchStage::Start,
+            FragmentLaunchErrorKind::ResourceUnavailable,
+            "native fragment worker terminated before readiness",
+        )),
+    }
+}
+
+fn pre_ready_launch_error(error: FragmentExecutionError) -> FragmentLaunchError {
+    let (stage, kind) = match error.kind() {
+        FragmentExecutionErrorKind::Pipeline => (
+            FragmentLaunchStage::BuildRuntimeState,
+            FragmentLaunchErrorKind::ResourceUnavailable,
+        ),
+        FragmentExecutionErrorKind::Sink
+        | FragmentExecutionErrorKind::Exchange
+        | FragmentExecutionErrorKind::RuntimeFilter => (
+            FragmentLaunchStage::Materialize,
+            FragmentLaunchErrorKind::Materialization,
+        ),
+        FragmentExecutionErrorKind::Cancelled | FragmentExecutionErrorKind::Panic => {
+            (FragmentLaunchStage::Start, FragmentLaunchErrorKind::Start)
+        }
+    };
+    FragmentLaunchError::new(stage, kind, error.to_string())
 }
 
 pub fn submit_exec_plan_fragment_native(
@@ -191,7 +247,7 @@ pub fn submit_exec_plan_fragment_native(
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let enable_profile = query_opts.enable_profile;
     let profiler = if enable_profile {
-        Some(Profiler::new("execute_native_submission"))
+        Some(profiler_for_native_program(submission.program()))
     } else {
         None
     };
@@ -230,8 +286,8 @@ pub fn submit_exec_plan_fragment_native(
         profiler,
         Some(fragment_mem_tracker),
         Arc::clone(&mgr),
-    );
-    Ok(())
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -308,6 +364,105 @@ mod tests {
             runtime_filter_params: Some(runtime_filter_params),
             ..Default::default()
         }
+    }
+
+    fn valid_values_result_fragment(
+        fragment_id: u32,
+        root_node_id: i32,
+    ) -> crate::proto::plan::PlanFragment {
+        crate::proto::plan::PlanFragment {
+            fragment_id,
+            root: Some(crate::proto::plan::DistributedNode {
+                node_id: root_node_id,
+                fragment_id,
+                limit: -1,
+                payload: Some(crate::proto::plan::distributed_node::Payload::Physical(
+                    crate::proto::plan::PlanNode {
+                        output_columns: Vec::new(),
+                        kind: Some(crate::proto::plan::plan_node::Kind::Values(
+                            crate::proto::plan::ValuesNode {
+                                rows: Vec::new(),
+                                columns: Vec::new(),
+                            },
+                        )),
+                    },
+                )),
+                ..Default::default()
+            }),
+            sink: Some(crate::proto::plan::DataSink {
+                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
+            }),
+            output_columns: Vec::new(),
+            runtime_filter_bindings: Some(crate::proto::plan::RuntimeFilterBindingTable {
+                fragment_id,
+                bindings: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn native_profiler_uses_true_program_root_plan_node_id() {
+        let query_id = QueryId {
+            hi: 73_901,
+            lo: 73_902,
+        };
+        let mut params = native_instance_params(
+            query_id,
+            crate::proto::novarocks::RuntimeFilterParams::default(),
+        );
+        params.runtime_filter_params = None;
+        let decoded = decode_fragment_submission(&valid_values_result_fragment(16, 99), &params)
+            .expect("valid native fragment");
+        let (submission, _) = decoded.into_parts();
+
+        let profiler = profiler_for_native_program(submission.program());
+
+        assert_eq!(profiler.name(), "execute_fragment_native (plan_node_id=99)");
+        assert_eq!(profiler.metadata(), 99);
+    }
+
+    #[test]
+    fn pre_ready_worker_panic_returns_synchronously_after_cleanup() {
+        let query_id = QueryId {
+            hi: 74_101,
+            lo: 74_102,
+        };
+        let finst_id = UniqueId {
+            hi: 74_103,
+            lo: 74_104,
+        };
+        crate::runtime::fragment::native_execution::install_test_pre_ready_panic(finst_id);
+        let params = crate::proto::novarocks::InstanceParams {
+            query_id: Some(crate::proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            query_options: Some(crate::proto::novarocks::QueryOptions {
+                pipeline_dop: 1,
+                ..Default::default()
+            }),
+            report_endpoint: Some("127.0.0.1:19030".to_string()),
+            ..Default::default()
+        };
+        let before = registration_snapshot(query_id, finst_id);
+
+        let error = submit_exec_plan_fragment_native(valid_values_result_fragment(17, 91), params)
+            .expect_err("pre-ready worker panic must fail submission synchronously");
+        let after = registration_snapshot(query_id, finst_id);
+
+        assert!(
+            error.contains("start") && error.contains("panic"),
+            "{error}"
+        );
+        assert_eq!(
+            after, before,
+            "pre-ready panic must finish rollback before return"
+        );
     }
 
     #[test]

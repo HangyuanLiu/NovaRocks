@@ -24,7 +24,7 @@ use crate::exec::fragment::error::{
     FragmentBindingTarget,
 };
 use crate::exec::fragment::sink::FragmentSinkProgram;
-use crate::exec::node::ExecPlan;
+use crate::exec::node::{ExecNodeKind, ExecPlan};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FragmentContractVersion(u16);
@@ -285,6 +285,7 @@ fn non_empty_group_count(
 
 #[derive(Debug)]
 pub(crate) struct FragmentProgram {
+    root_plan_node_id: FragmentNodeId,
     plan: ExecPlan,
     sink: FragmentSinkSpec,
     program_options: FragmentProgramOptions,
@@ -302,7 +303,9 @@ impl FragmentProgram {
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
         runtime_filters: RuntimeFilterContract,
     ) -> Self {
+        let root_plan_node_id = FragmentNodeId::new(root_plan_node_id(&plan));
         Self {
+            root_plan_node_id,
             plan,
             sink,
             program_options,
@@ -310,6 +313,10 @@ impl FragmentProgram {
             exchange_inputs,
             runtime_filters,
         }
+    }
+
+    pub(crate) const fn root_plan_node_id(&self) -> FragmentNodeId {
+        self.root_plan_node_id
     }
 
     pub(crate) fn plan(&self) -> &ExecPlan {
@@ -337,6 +344,33 @@ impl FragmentProgram {
     }
 }
 
+fn root_plan_node_id(plan: &ExecPlan) -> i32 {
+    match &plan.root.kind {
+        ExecNodeKind::AssertNumRows(node) => node.node_id,
+        ExecNodeKind::Values(node) => node.node_id,
+        ExecNodeKind::Project(node) => node.node_id,
+        ExecNodeKind::Filter(node) => node.node_id,
+        ExecNodeKind::Repeat(node) => node.node_id,
+        ExecNodeKind::ChangeEventExpand(node) => node.node_id,
+        ExecNodeKind::UnionAll(node) => node.node_id,
+        ExecNodeKind::Limit(node) => node.node_id,
+        ExecNodeKind::ExchangeSource(node) => node.key.node_id,
+        ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
+        ExecNodeKind::IcebergDeltaScan(node) => node.node_id,
+        #[cfg(feature = "compat")]
+        ExecNodeKind::Fetch(node) => node.node_id,
+        ExecNodeKind::LookUp(node) => node.node_id,
+        ExecNodeKind::Aggregate(node) => node.node_id,
+        ExecNodeKind::Join(node) => node.node_id,
+        ExecNodeKind::NestedLoopJoin(node) => node.node_id,
+        ExecNodeKind::Sort(node) => node.node_id,
+        ExecNodeKind::TableFunction(node) => node.node_id,
+        ExecNodeKind::Analytic(node) => node.node_id,
+        ExecNodeKind::SetOp(node) => node.node_id,
+        ExecNodeKind::NativeRuntimeFilterConsumer(node) => node.owner_node_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -344,11 +378,12 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram,
     };
+    use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::DataStreamPartitionType;
@@ -365,6 +400,38 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn root_not_minimum_node_id_plan() -> ExecPlan {
+        ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Filter(FilterNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: Chunk::default(),
+                            node_id: 3,
+                        }),
+                    }),
+                    node_id: 99,
+                    predicate: ExprId(0),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn program_preserves_root_plan_node_id_instead_of_minimum_operator_id() {
+        let program = FragmentProgram::new(
+            root_not_minimum_node_id_plan(),
+            FragmentSinkSpec::try_new(FragmentSinkProgram::Noop).expect("noop sink"),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::default(),
+        );
+
+        assert_eq!(program.root_plan_node_id(), FragmentNodeId::new(99));
     }
 
     #[test]
