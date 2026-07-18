@@ -89,11 +89,3 @@ pub(crate) fn clear_auto_increment_cache_for_table(table_id: i64) {
         guard.remove(&table_id);
     }
 }
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn clear_auto_increment_cache_for_test() {
-    if let Ok(mut guard) = interval_cache().lock() {
-        guard.clear();
-    }
-}

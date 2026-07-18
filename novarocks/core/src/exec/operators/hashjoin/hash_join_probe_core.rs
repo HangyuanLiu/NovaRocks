@@ -2004,37 +2004,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "compat")]
-    fn direct_compat_set_build_artifact_from_build_chunk(build: Chunk) -> JoinBuildArtifact {
-        let key_arrays = vec![build.column_by_slot_id(RIGHT_K_SLOT_ID).expect("build key")];
-        let batch = crate::exec::operators::hashjoin::join_hash_map::method::BuildKeyBatch::new(
-            key_arrays,
-            build.len(),
-        )
-        .expect("key batch");
-        let build_row_count = build.len();
-        let build_table =
-            crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMap::build_from_key_batches(
-                vec![DataType::Int32],
-                vec![false],
-                &[batch],
-                crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions {
-                    purpose: crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildPurpose::PresenceOnly,
-                    ..crate::exec::operators::hashjoin::join_hash_map::method::JoinHashMapBuildOptions::default()
-                },
-            )
-            .expect("direct set build table");
-        JoinBuildArtifact::new_compat(
-            required_build_components(JoinType::LeftSemi, false, true, true),
-            None,
-            Some(build_table),
-            build_row_count,
-            false,
-            None,
-            None,
-        )
-    }
-
     fn left_semi_probe_core() -> HashJoinProbeCore {
         let left_schema = schema_kv("lk", "lv");
         let right_schema = schema_kv("rk", "rw");
@@ -2042,34 +2011,6 @@ mod tests {
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
         HashJoinProbeCore::new_native(
-            Arc::new(arena),
-            JoinType::LeftSemi,
-            vec![probe_key],
-            None,
-            true,
-            true,
-            chunk_schema_of(&left_schema, &[LEFT_K_SLOT_ID, LEFT_V_SLOT_ID]),
-            chunk_schema_of(&right_schema, &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID]),
-            chunk_schema_of(
-                &join_scope_schema,
-                &[
-                    LEFT_K_SLOT_ID,
-                    LEFT_V_SLOT_ID,
-                    RIGHT_K_SLOT_ID,
-                    RIGHT_W_SLOT_ID,
-                ],
-            ),
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    fn left_semi_compat_probe_core() -> HashJoinProbeCore {
-        let left_schema = schema_kv("lk", "lv");
-        let right_schema = schema_kv("rk", "rw");
-        let join_scope_schema = join_schema(&left_schema, &right_schema);
-        let mut arena = ExprArena::default();
-        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
-        HashJoinProbeCore::new_compat(
             Arc::new(arena),
             JoinType::LeftSemi,
             vec![probe_key],

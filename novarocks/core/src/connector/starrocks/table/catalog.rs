@@ -542,12 +542,6 @@ pub(crate) fn repository_snapshot_for_runtime(
                 tablet_root_path: tablet.tablet_root_path,
             })
             .collect(),
-        #[cfg(test)]
-        txns: Vec::new(),
-        #[cfg(test)]
-        erase_jobs: Vec::new(),
-        #[cfg(test)]
-        materialized_views: Vec::new(),
     }
 }
 
@@ -571,14 +565,7 @@ pub(crate) fn snapshot_is_empty(snapshot: &StarRocksTableSnapshot) -> bool {
         && snapshot.partitions.is_empty()
         && snapshot.indexes.is_empty()
         && snapshot.tablets.is_empty();
-    #[cfg(test)]
-    {
-        base && snapshot.txns.is_empty() && snapshot.erase_jobs.is_empty()
-    }
-    #[cfg(not(test))]
-    {
-        base
-    }
+    base
 }
 
 pub(crate) fn runtime_registered(tablet_id: i64) -> bool {

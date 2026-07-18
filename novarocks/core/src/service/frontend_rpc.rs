@@ -602,13 +602,6 @@ pub fn init_frontend_rpc_manager() {
     let _ = FrontendRpcManager::shared();
 }
 
-#[cfg(test)]
-pub(crate) fn test_clear_shared_host_pools() {
-    if let Ok(mut guard) = FrontendRpcManager::shared().host_pools.lock() {
-        guard.clear();
-    }
-}
-
 struct FrontendRpcClient<'a> {
     manager: &'a FrontendRpcManager,
     rpc_kind: FrontendRpcKind,

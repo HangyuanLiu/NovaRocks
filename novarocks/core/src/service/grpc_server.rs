@@ -1293,12 +1293,6 @@ fn validate_compat_grpc_ports(
     Ok(())
 }
 
-#[cfg(test)]
-fn grpc_server_test_guard() -> &'static Mutex<()> {
-    static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_GUARD.get_or_init(|| Mutex::new(()))
-}
-
 /// Parse a gRPC bind address from a host string and port.
 ///
 /// Handles bare IPv6 addresses (`::`, `::1`), bracketed IPv6 (`[::]`, `[::1]`),
@@ -1489,8 +1483,6 @@ fn start_standalone_grpc_server(
 mod tests {
     use super::{ensure_bindable, parse_grpc_bind_addr, validate_grpc_ports};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, mpsc};
 
     #[test]
     fn grpc_stop_join_propagates_server_thread_panic() {

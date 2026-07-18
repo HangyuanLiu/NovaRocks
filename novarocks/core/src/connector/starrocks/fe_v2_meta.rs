@@ -103,13 +103,6 @@ pub(crate) fn find_cached_table_identity_names(
         .cloned()
 }
 
-#[cfg(test)]
-fn clear_table_identity_name_cache_for_test() {
-    if let Ok(mut guard) = table_identity_name_cache().lock() {
-        guard.clear();
-    }
-}
-
 pub(crate) fn resolve_tablet_paths_for_lake_scan(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,

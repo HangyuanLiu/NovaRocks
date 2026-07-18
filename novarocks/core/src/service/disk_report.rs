@@ -175,21 +175,7 @@ pub(crate) fn latest_fe_addr() -> Option<types::TNetworkAddress> {
     guard.fe_addr.clone()
 }
 
-#[cfg(test)]
-pub(crate) fn set_fe_addr_for_test(addr: Option<types::TNetworkAddress>) {
-    let mut guard = state().lock().expect("disk report state lock");
-    guard.fe_addr = addr;
-    guard.reported = false;
-    guard.in_flight = false;
-}
-
 pub(crate) fn latest_backend_host() -> Option<String> {
     let guard = state().lock().ok()?;
     guard.backend_host.clone()
-}
-
-#[cfg(test)]
-pub(crate) fn set_backend_host_for_test(host: Option<&str>) {
-    let mut guard = state().lock().expect("disk report state lock");
-    guard.backend_host = host.map(str::to_string);
 }

@@ -96,29 +96,6 @@ pub(crate) fn append_lake_txn_log_with_chunk_rowset(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn append_lake_txn_log_with_rowset(
-    ctx: &TabletWriteContext,
-    chunk: &Chunk,
-    txn_id: i64,
-    driver_id: i32,
-    file_seq: u64,
-    write_format: StarRocksWriteFormat,
-    partition_id: i64,
-    load_id: Option<&PUniqueId>,
-) -> Result<(), String> {
-    append_lake_txn_log_with_chunk_rowset(
-        ctx,
-        chunk,
-        txn_id,
-        driver_id,
-        file_seq,
-        write_format,
-        partition_id,
-        load_id,
-    )
-}
-
 fn append_lake_txn_log_with_rowset_impl(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
@@ -638,8 +615,6 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
 
 const LOAD_OP_COLUMN: &str = "__op";
 const OP_TYPE_UPSERT: i8 = 0;
-#[cfg(test)]
-const OP_TYPE_DELETE: i8 = 1;
 
 enum LakeBatchWriteRouting {
     Empty,
@@ -706,21 +681,6 @@ fn debug_batch_fields(batch: &RecordBatch, batch_slot_ids: &[Option<SlotId>]) ->
             format!("{}:{}(slot={})", idx, field.name(), slot)
         })
         .collect::<Vec<_>>()
-}
-
-#[cfg(test)]
-fn resolve_lake_batch_write_routing(
-    ctx: &TabletWriteContext,
-    chunk: &Chunk,
-    existing_txn_log: Option<&TxnLogPb>,
-) -> Result<LakeBatchWriteRouting, String> {
-    let slot_ids = slot_ids_from_chunk(chunk);
-    resolve_lake_batch_write_routing_with_slots(
-        ctx,
-        &chunk.batch,
-        Some(&slot_ids),
-        existing_txn_log,
-    )
 }
 
 fn resolve_lake_batch_write_routing_with_slots(

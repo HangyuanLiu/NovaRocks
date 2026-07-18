@@ -260,10 +260,6 @@ for expected in \
     exit 1
   fi
 done
-if grep -Eq 'cargo test compat|cargo test .*--features compat|--test-threads=1' <<<"$run_compat_gates_text"; then
-  echo "explicit compat gates must not include the retired compat Rust test gate" >&2
-  exit 1
-fi
 
 default_compat_output="$({
   WITH_COMPAT="false"

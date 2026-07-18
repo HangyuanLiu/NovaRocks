@@ -16,8 +16,6 @@
 // under the License.
 
 use std::collections::{BTreeMap, HashSet};
-#[cfg(test)]
-use std::sync::Mutex;
 use std::sync::{Arc, MutexGuard};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array};
@@ -37,8 +35,6 @@ use crate::connector::starrocks::table::mv_apply_policy::{MvApplyPolicy, apply_p
 use crate::connector::starrocks::table::mv_refresh_strategy::{
     FullRefreshReason, MvRefreshPolicy, choose_snapshot_refresh_policy, policy_from_change_error,
 };
-#[cfg(test)]
-use crate::engine::mv_flow::analyze_visible_output_types;
 use crate::engine::mv_flow::{
     analyze_visible_query, execute_query_for_mv_refresh, execute_query_for_mv_refresh_with_catalog,
 };
@@ -1346,19 +1342,6 @@ fn append_mv_op_column(batch: RecordBatch, op: i8) -> Result<RecordBatch, String
     columns.push(Arc::new(Int8Array::from(vec![op; row_count])) as ArrayRef);
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("append MV op column failed: {e}"))
-}
-
-#[cfg(test)]
-fn query_result_column_to_output_column(
-    column: &crate::runtime::query_result::QueryResultColumn,
-) -> Result<crate::sql::analysis::OutputColumn, String> {
-    Ok(crate::sql::analysis::OutputColumn {
-        column_id: crate::sql::column_id::ColumnId::UNSET,
-        name: column.name.clone(),
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-        is_internal: false,
-    })
 }
 
 fn bootstrap_mv_refresh_partition_for_tablets(

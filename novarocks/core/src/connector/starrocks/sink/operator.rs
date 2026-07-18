@@ -92,10 +92,6 @@ pub(crate) struct OlapTableSinkOperator {
     finished: bool,
     written_tablets: HashSet<i64>,
     dirty_partitions: HashSet<i64>,
-    #[cfg(test)]
-    append_call_count: usize,
-    #[cfg(test)]
-    fail_once_at_append_call: Option<usize>,
 }
 
 #[derive(Default)]
@@ -112,14 +108,6 @@ pub(crate) struct OlapSinkFinalizeSharedState {
 }
 
 impl OlapSinkFinalizeSharedState {
-    #[cfg(test)]
-    pub(crate) fn new_single_driver() -> Self {
-        let state = Self::default();
-        state.registered_drivers.store(1, Ordering::Release);
-        state.remaining_drivers.store(1, Ordering::Release);
-        state
-    }
-
     pub(crate) fn register_driver(&self) {
         self.registered_drivers.fetch_add(1, Ordering::AcqRel);
         self.remaining_drivers.fetch_add(1, Ordering::AcqRel);
@@ -909,16 +897,6 @@ impl OlapTableSinkOperator {
     const FLUSH_RETRY_MAX_BACKOFF_MS: u64 = 5_000;
     const FLUSH_PENDING_ROWS_THRESHOLD: usize = 4_096;
 
-    #[cfg(test)]
-    pub(crate) fn new(name: String, plan: Arc<OlapTableSinkPlan>, driver_id: i32) -> Self {
-        Self::new_with_shared(
-            name,
-            plan,
-            driver_id,
-            Arc::new(OlapSinkFinalizeSharedState::new_single_driver()),
-        )
-    }
-
     pub(crate) fn new_with_shared(
         name: String,
         plan: Arc<OlapTableSinkPlan>,
@@ -987,10 +965,6 @@ impl OlapTableSinkOperator {
             finished: false,
             written_tablets: HashSet::new(),
             dirty_partitions: HashSet::new(),
-            #[cfg(test)]
-            append_call_count: 0,
-            #[cfg(test)]
-            fail_once_at_append_call: None,
         }
     }
 
@@ -1045,18 +1019,6 @@ impl OlapTableSinkOperator {
     ) -> Result<(), String> {
         let file_seq = self.file_seq;
         self.file_seq = self.file_seq.saturating_add(1);
-
-        #[cfg(test)]
-        {
-            self.append_call_count = self.append_call_count.saturating_add(1);
-            if self.fail_once_at_append_call == Some(self.append_call_count) {
-                self.fail_once_at_append_call = None;
-                return Err(format!(
-                    "injected temporary append failure at call {}",
-                    self.append_call_count
-                ));
-            }
-        }
 
         append_lake_txn_log_with_chunk_rowset(
             context,
@@ -1928,11 +1890,6 @@ impl OlapTableSinkOperator {
 
         Ok(())
     }
-
-    #[cfg(test)]
-    fn inject_temporary_failure_once_at_append_call(&mut self, append_call: usize) {
-        self.fail_once_at_append_call = Some(append_call);
-    }
 }
 
 fn is_retryable_sink_write_error(err: &str) -> bool {
@@ -2573,13 +2530,4 @@ fn align_chunk_to_schema_slot_bindings(
         aligned_batch,
         Arc::new(ChunkSchema::try_new(aligned_slots)?),
     )
-}
-
-#[cfg(test)]
-fn align_batch_to_schema_slot_bindings(
-    chunk: &Chunk,
-    schema_slot_bindings: &[Option<SlotId>],
-    op_slot_id: Option<SlotId>,
-) -> Result<RecordBatch, String> {
-    Ok(align_chunk_to_schema_slot_bindings(chunk, schema_slot_bindings, op_slot_id)?.batch)
 }

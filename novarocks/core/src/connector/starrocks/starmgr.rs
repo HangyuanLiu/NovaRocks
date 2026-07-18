@@ -593,22 +593,3 @@ async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreC
 pub(crate) fn retrieve_s3_config_for_path(path: &str) -> Result<Option<S3StoreConfig>, String> {
     data_block_on(retrieve_s3_config_for_path_async(path))?
 }
-
-#[cfg(test)]
-pub(crate) fn clear_state_for_test() {
-    if let Ok(mut guard) = state().lock() {
-        *guard = StarMgrState::default();
-    }
-    if let Ok(mut guard) = channels().mu.lock() {
-        guard.clear();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
-    static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("lock starmgr test guard")
-}

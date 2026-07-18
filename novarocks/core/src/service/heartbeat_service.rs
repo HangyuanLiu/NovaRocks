@@ -72,15 +72,6 @@ struct HeartbeatServerState {
     active_connections: Option<Arc<Mutex<HashMap<u64, TcpStream>>>>,
 }
 
-#[cfg(test)]
-static HEARTBEAT_ACTIVE_WORKERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-fn heartbeat_active_worker_count() -> usize {
-    HEARTBEAT_ACTIVE_WORKERS.load(Ordering::SeqCst)
-}
-
 struct ActiveHeartbeatConnection {
     id: u64,
     connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
@@ -93,8 +84,6 @@ impl Drop for ActiveHeartbeatConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         connections.remove(&self.id);
-        #[cfg(test)]
-        HEARTBEAT_ACTIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -263,8 +252,6 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
                         }
                         connections.insert(connection_id, tracked_stream);
                         drop(connections);
-                        #[cfg(test)]
-                        HEARTBEAT_ACTIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
                         let processor = Arc::clone(&processor);
                         let active_connections = Arc::clone(&active_connections_for_thread);
                         worker_pool.execute(move || {

@@ -489,25 +489,3 @@ fn backoff_for_attempt(attempt: usize) -> Duration {
 fn format_addr(addr: &types::TNetworkAddress) -> String {
     format!("{}:{}", addr.hostname, addr.port)
 }
-
-#[cfg(test)]
-pub(crate) fn test_clear_shared_queues() {
-    let reporter = ExecStateReporter::shared();
-    if let Ok(mut normal) = reporter.normal.state.lock() {
-        normal.pending_by_fe.clear();
-        normal.total_pending = 0;
-    }
-    if let Ok(mut priority) = reporter.priority.state.lock() {
-        priority.clear();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_priority_queue_len() -> usize {
-    ExecStateReporter::shared()
-        .priority
-        .state
-        .lock()
-        .map(|guard| guard.len())
-        .unwrap_or(0)
-}

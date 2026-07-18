@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use crate::catalog::identifier::TableIdentity;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StarRocksTableSnapshot {
     pub global: StarRocksGlobalMeta,
@@ -28,12 +25,6 @@ pub(crate) struct StarRocksTableSnapshot {
     pub partitions: Vec<StoredStarRocksPartition>,
     pub indexes: Vec<StoredStarRocksIndex>,
     pub tablets: Vec<StoredStarRocksTablet>,
-    #[cfg(test)]
-    pub txns: Vec<StoredStarRocksTxn>,
-    #[cfg(test)]
-    pub erase_jobs: Vec<StoredStarRocksEraseJob>,
-    #[cfg(test)]
-    pub materialized_views: Vec<StoredMaterializedView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -70,36 +61,6 @@ pub(crate) enum StarRocksTableKind {
     #[default]
     Table,
     MaterializedView,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum StarRocksMvRefreshMode {
-    #[default]
-    DeferredManual,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredMaterializedView {
-    pub mv_id: i64,
-    pub select_sql: String,
-    pub refresh_mode: StarRocksMvRefreshMode,
-    pub base_table_refs: Vec<TableIdentity>,
-    pub last_refresh_ms: Option<i64>,
-    pub last_refresh_rows: Option<i64>,
-    pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,
-    pub last_refresh_table_uuids: std::collections::BTreeMap<String, String>,
-    pub primary_key_columns: Vec<String>,
-    pub created_at_ms: i64,
-    pub storage_engine: StarRocksMvStorageEngine,
-    pub iceberg_table_identifier: Option<String>,
-    pub target_catalog: Option<String>,
-    pub target_namespace: Option<String>,
-    pub target_table: Option<String>,
-    pub last_refreshed_iceberg_snapshot_id: Option<i64>,
-    pub refresh_in_progress: bool,
-    pub refresh_target_snapshots: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,33 +135,6 @@ pub(crate) struct StoredStarRocksTablet {
     pub tablet_root_path: String,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredStarRocksTxn {
-    pub txn_id: i64,
-    pub table_id: i64,
-    pub partition_id: i64,
-    pub base_version: i64,
-    pub commit_version: i64,
-    pub state: StarRocksTxnState,
-    pub retry_at_ms: Option<i64>,
-    pub updated_at_ms: i64,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredStarRocksEraseJob {
-    pub job_id: i64,
-    pub job_kind: StarRocksEraseJobKind,
-    pub table_id: i64,
-    pub partition_id: Option<i64>,
-    pub root_path: String,
-    pub state: StarRocksEraseJobState,
-    pub retry_at_ms: Option<i64>,
-    pub updated_at_ms: i64,
-    pub last_error: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum StarRocksTableState {
     Creating,
@@ -226,32 +160,4 @@ pub(crate) enum StarRocksIndexState {
     Active,
     Retired,
     Failed,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StarRocksEraseJobKind {
-    DropTable,
-    DropPartition,
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StarRocksEraseJobState {
-    Pending,
-    Running,
-    Failed,
-    Finished,
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum StarRocksTxnState {
-    #[default]
-    Prepared,
-    Written,
-    Visible,
-    Aborted,
 }

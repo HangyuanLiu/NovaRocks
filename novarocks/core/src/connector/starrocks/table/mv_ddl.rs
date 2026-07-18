@@ -31,8 +31,6 @@ use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::meta::MetaReadTxn;
-#[cfg(test)]
-use crate::meta::repository::mv::{BeginIcebergMvRefreshRequest, UpdateMvRefreshMetadataRequest};
 use crate::meta::repository::mv::{CreateMvDefinitionRequest, MvRefreshState};
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest,

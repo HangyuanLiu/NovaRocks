@@ -1740,8 +1740,6 @@ pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
 #[cfg(test)]
 mod legacy_runtime_filter_execution_claim_tests {
     use std::collections::BTreeMap;
-    #[cfg(feature = "compat")]
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1813,62 +1811,6 @@ mod legacy_runtime_filter_execution_claim_tests {
         assert!(
             mgr.with_context_mut(query_id, |ctx| ctx.drain_pending_runtime_filters())
                 .is_err()
-        );
-    }
-
-    #[cfg(feature = "compat")]
-    fn race_native_and_compat_claims(
-        mgr: Arc<QueryContextManager>,
-        query_id: QueryId,
-    ) -> (Result<(), String>, Result<(), String>) {
-        let barrier = Arc::new(Barrier::new(3));
-        let native = {
-            let mgr = Arc::clone(&mgr);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                mgr.get_or_register_native(
-                    query_id,
-                    false,
-                    Duration::from_secs(1),
-                    Duration::from_secs(5),
-                )
-            })
-        };
-        let compat = {
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                mgr.get_or_register_compat(
-                    query_id,
-                    false,
-                    Duration::from_secs(1),
-                    Duration::from_secs(5),
-                )
-            })
-        };
-        barrier.wait();
-        (
-            native.join().expect("native claim thread"),
-            compat.join().expect("compat claim thread"),
-        )
-    }
-
-    #[cfg(feature = "compat")]
-    fn assert_single_claim_winner(
-        mgr: &QueryContextManager,
-        query_id: QueryId,
-        results: &(Result<(), String>, Result<(), String>),
-        expected_fragments: usize,
-    ) {
-        assert_ne!(results.0.is_ok(), results.1.is_ok(), "results={results:?}");
-        let guard = mgr.inner.lock().expect("query ctx manager lock");
-        assert!(!guard.second_chance.contains_key(&query_id));
-        let context = guard.active.get(&query_id).expect("active query context");
-        assert_eq!(context.num_fragments, expected_fragments);
-        assert_ne!(
-            context.legacy_runtime_filter_execution_claim(),
-            LegacyRuntimeFilterExecutionClaim::Unclaimed
         );
     }
 }
