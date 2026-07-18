@@ -16,6 +16,7 @@
 // under the License.
 
 mod dispatch;
+mod iceberg;
 mod projection;
 
 use std::collections::{BTreeMap, HashMap};
@@ -290,4 +291,25 @@ fn resolved_files(files: Vec<IcebergDataFileInfo>) -> ResolvedScanExecution {
         cloud_properties: BTreeMap::new(),
         binding: IcebergDataFileBinding::ExplicitFiles,
     })
+}
+
+fn resolved_delta() -> ResolvedScanExecution {
+    ResolvedScanExecution::IcebergDelta(
+        crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
+            runtime_plan: crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
+                table_location: "s3://bucket/test_table".to_string(),
+                data_columns: Vec::new(),
+                cloud_properties: BTreeMap::new(),
+                change_files: Vec::new(),
+                delete_side: None,
+            },
+        },
+    )
+}
+
+fn replace_scan_source(root: &mut DistributedNode, source: ScanSource) {
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("test root must be a scan");
+    };
+    scan.table.source = source;
 }
