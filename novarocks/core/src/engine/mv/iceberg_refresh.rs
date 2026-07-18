@@ -60,7 +60,7 @@ use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
-use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+use crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
@@ -8284,7 +8284,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     table_uuids: BTreeMap<String, String>,
     physical_sql: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -8552,7 +8552,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     chunks: Vec<crate::exec::chunk::Chunk>,
     refresh_label: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -10871,7 +10871,7 @@ fn repartition_iceberg_join_mv_overwrite(
     partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -11109,7 +11109,7 @@ fn first_refresh_iceberg_join_mv(
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -11740,7 +11740,7 @@ fn refresh_explain_rewrite_disabled_rules(is_aggregate_refresh: bool) -> Vec<Str
 }
 
 fn validate_aggregate_refresh_rewrite_outcome(
-    ctx: &crate::engine::mv::refresh_context::IcebergMvRewriteContext,
+    ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
@@ -11749,7 +11749,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
     {
         return Err(format!(
             "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinDelta",
-            target_fqn_string(&ctx.target)
+            ctx.target.fqn()
         ));
     }
     if evidence == RewriteMergeRefreshEvidence::BranchUnionAggregate
@@ -11757,7 +11757,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
     {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {} incremental refresh rewrite did not apply RewriteBranchUnion",
-            target_fqn_string(&ctx.target)
+            ctx.target.fqn()
         ));
     }
     if evidence != RewriteMergeRefreshEvidence::BranchUnionAggregate
@@ -11769,7 +11769,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
         };
         return Err(format!(
             "iceberg {label} MV {} incremental refresh rewrite did not apply RewriteAggregateState",
-            target_fqn_string(&ctx.target)
+            ctx.target.fqn()
         ));
     }
     if !outcome.annotation.change_stream.has_aggregate() {
@@ -11780,7 +11780,7 @@ fn validate_aggregate_refresh_rewrite_outcome(
         };
         return Err(format!(
             "iceberg {label} MV {} incremental refresh rewrite plan does not contain aggregate state change stream",
-            target_fqn_string(&ctx.target)
+            ctx.target.fqn()
         ));
     }
     tracing::info!(
@@ -12040,7 +12040,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn aggregate_refresh_rejects_unchanged_rewrite_outcome() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome = outcome(empty_values_plan(), &[]);
 
         let err = validate_aggregate_refresh_rewrite_outcome(
@@ -12058,7 +12058,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn aggregate_refresh_rejects_missing_merge_plan_evidence() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome = outcome(empty_values_plan(), &["RewriteAggregateState"]);
 
         let err = validate_aggregate_refresh_rewrite_outcome(
@@ -12076,7 +12076,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn join_aggregate_refresh_rejects_missing_join_rewrite_evidence() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome =
             outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
 
@@ -12092,7 +12092,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn join_aggregate_refresh_missing_merge_plan_uses_join_label() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome = outcome(
             empty_values_plan(),
             &["RewriteJoinDelta", "RewriteAggregateState"],
@@ -12114,7 +12114,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn branch_union_aggregate_refresh_rejects_missing_branch_union_rewrite_evidence() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome =
             outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
 
@@ -12134,7 +12134,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn branch_union_aggregate_refresh_requires_state_merge_plan_evidence() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome = outcome(empty_values_plan(), &["RewriteBranchUnion"]);
 
         let err = validate_aggregate_refresh_rewrite_outcome(
@@ -12153,7 +12153,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn branch_union_aggregate_refresh_accepts_branch_rewrite_with_change_stream_plan() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome =
             outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteBranchUnion"]);
 
@@ -12169,7 +12169,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn aggregate_refresh_accepts_change_stream_descriptor_evidence() {
-        let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
+        let ctx = crate::mv::rewrite::context::tests_support::dummy_rewrite_context();
         let outcome =
             outcome_with_aggregate_descriptor(empty_values_plan(), &["RewriteAggregateState"]);
 
@@ -12520,7 +12520,7 @@ fn incremental_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     base_refs: &[TableIdentity],
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
     if base_refs.len() != 2 {
@@ -12710,7 +12710,7 @@ fn build_join_full_refresh_logical_plan(
     descriptor.validate().map_err(|e| {
         format!(
             "iceberg join MV {} full refresh descriptor is invalid: {e}",
-            target_fqn_string(&ctx.rewrite.target)
+            ctx.rewrite.target.fqn()
         )
     })?;
     let left_uuid = ctx
@@ -13222,13 +13222,13 @@ fn build_join_incremental_refresh_logical_plan(
                 .ok_or_else(|| {
                     format!(
                         "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
-                        target_fqn_string(&ctx.rewrite.target)
+                        ctx.rewrite.target.fqn()
                     )
                 })?;
             descriptor.validate().map_err(|e| {
                 format!(
                     "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
-                    target_fqn_string(&ctx.rewrite.target)
+                    ctx.rewrite.target.fqn()
                 )
             })?;
             change_stream = Some(join_refresh_change_stream_descriptor(descriptor.clone()));
@@ -13404,7 +13404,7 @@ fn execute_join_delta_branches_logical(
             .into());
     }
     let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -13715,7 +13715,7 @@ fn execute_append_only_join_delta_branches(
     base_query: &sqlparser::ast::Query,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -15281,7 +15281,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     pinned_full_select_sql: Option<&str>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.rewrite.target;
+    let target = &ctx.application_target;
     let target_entry = &*ctx.target_entry;
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;

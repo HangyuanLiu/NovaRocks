@@ -334,15 +334,15 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-    use crate::engine::mv::refresh_context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
-    };
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
         BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         QualifiedFieldLineage,
+    };
+    use crate::mv::rewrite::context::IcebergMvRewriteContext;
+    use crate::mv::rewrite::context::tests_support::{
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,

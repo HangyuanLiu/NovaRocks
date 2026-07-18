@@ -97,7 +97,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
+    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ValuesOp};

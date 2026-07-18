@@ -125,7 +125,7 @@ pub(crate) struct JoinRefreshTargetLocatorBinding {
 
 impl JoinRefreshTargetLocatorBinding {
     pub(crate) fn from_rewrite_context(
-        ctx: &crate::engine::mv::refresh_context::IcebergMvRewriteContext,
+        ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     ) -> Self {
         Self {
             target_table_uuid: ctx.target_table_uuid.clone(),
