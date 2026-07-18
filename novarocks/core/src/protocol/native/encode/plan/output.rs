@@ -175,7 +175,7 @@ pub(super) fn encode_output_columns(
     src.iter().map(encode_output_column).collect()
 }
 
-fn encode_output_column(
+pub(super) fn encode_output_column(
     src: &crate::sql::analysis::OutputColumn,
 ) -> Result<common::OutputColumn, String> {
     Ok(common::OutputColumn {

@@ -357,3 +357,118 @@ fn single_fragment_router_plan_for_test() -> DistributedPlan {
         edges: Vec::new(),
     }
 }
+
+#[test]
+fn stream_sink_derives_generate_series_source_schema() {
+    let plan = two_fragment_generate_series_stream_plan_for_test();
+
+    let encoded =
+        encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
+
+    let source = encoded
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == 1)
+        .expect("source fragment");
+    let Some(plan::data_sink::Kind::DataStream(sink)) =
+        source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+    else {
+        panic!("expected DataStream sink");
+    };
+    assert_eq!(sink.output_columns, vec![7]);
+
+    let target = encoded
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == 0)
+        .expect("target fragment");
+    let receiver = target.root.as_ref().expect("target root");
+    let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
+    else {
+        panic!("expected Exchange receiver");
+    };
+    assert_eq!(
+        exchange
+            .output_columns
+            .iter()
+            .map(|column| (column.column_id, column.name.as_str(), column.nullable))
+            .collect::<Vec<_>>(),
+        vec![(7, "generate_series", false)]
+    );
+}
+
+fn two_fragment_generate_series_stream_plan_for_test() -> DistributedPlan {
+    let output_columns = vec![output_column(7, "generate_series", DataType::Int64)];
+    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+        fragments: vec![
+            PlanFragment {
+                fragment_id: 1,
+                root: DistributedNode {
+                    node_id: 10,
+                    fragment_id: 1,
+                    tuple_ids: vec![10],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+                    children: Vec::new(),
+                    stats: stats(),
+                    payload: DistributedNodeKind::GenerateSeries(
+                        crate::sql::planner::payload::PlanGenerateSeriesNode {
+                            start: 1,
+                            end: 3,
+                            step: 1,
+                            column_name: "generate_series".to_string(),
+                            alias: None,
+                            output_column_id: ColumnId::new_for_test(7),
+                        },
+                    ),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Noop,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            },
+            PlanFragment {
+                fragment_id: 0,
+                root: DistributedNode {
+                    node_id: 20,
+                    fragment_id: 0,
+                    tuple_ids: vec![20],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+        runtime_filter_binding_ids: Vec::new(),
+                    children: Vec::new(),
+                    stats: stats(),
+                    payload: DistributedNodeKind::Exchange(ExchangeReceiver {
+                        partition: DataPartition::unpartitioned(),
+                        source_fragment_id: 1,
+                        output_columns,
+                        output_qualifier: None,
+                        flavor: ExchangeFlavor::Distribution,
+                    }),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            },
+        ],
+        root_fragment_id: 0,
+        runtime_filter_graph: RuntimeFilterGraph::default(),
+        edges: vec![FragmentEdge {
+            source_fragment_id: 1,
+            target_fragment_id: 0,
+            target_exchange_node_id: 20,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: vec![7],
+        }],
+    }
+}

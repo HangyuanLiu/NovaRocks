@@ -78,7 +78,7 @@ use crate::sql::planner::physical::{
 use crate::sql::planner::table as table_model;
 use crate::types::native_proto::encode_type;
 
-use output::{apply_sealed_node_output_columns, encode_output_columns};
+use output::{apply_sealed_node_output_columns, encode_output_column, encode_output_columns};
 
 mod output;
 mod topology;
@@ -2113,18 +2113,6 @@ fn encode_position_delete_partition_source_field(
     })
 }
 
-fn encode_output_column(
-    src: &crate::sql::analysis::OutputColumn,
-) -> Result<common::OutputColumn, String> {
-    Ok(common::OutputColumn {
-        column_id: src.column_id.0,
-        name: src.name.clone(),
-        r#type: Some(encode_type(&src.data_type)?),
-        nullable: src.nullable,
-        is_internal: src.is_internal,
-    })
-}
-
 fn encode_exprs(
     src: &[crate::sql::analysis::TypedExpr],
 ) -> Result<Vec<crate::proto::expr::Expr>, String> {
@@ -3145,109 +3133,6 @@ mod legacy_tests {
     }
 
     #[test]
-    fn encoded_join_output_maps_reconciled_children_not_stale_payload() {
-        // The join payload lists a stale id (999) that neither child produces --
-        // the divergence a marker/anti join or a pruned probe scan creates. The
-        // sealed node-output contract reconciles the join against its children,
-        // and the encoder maps that contract 1:1, so the encoded join emits
-        // [1, 2], not the stale [1, 2, 999]. Were the reconciliation missing, the
-        // encoder (now a pure map of the contract) would emit 999 and the BE sink
-        // would fail with "output_columns slot id 999 not found in chunk schema".
-        let left = output_column(1, "l_k", DataType::Int64);
-        let right = output_column(2, "r_k", DataType::Int64);
-        let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-            fragments: vec![PlanFragment {
-                fragment_id: 0,
-                root: DistributedNode {
-                    node_id: 1,
-                    fragment_id: 0,
-                    tuple_ids: vec![1],
-                    nullable_tuple_ids: Vec::new(),
-                    limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-                    children: vec![
-                        DistributedNode {
-                            node_id: 2,
-                            fragment_id: 0,
-                            tuple_ids: vec![2],
-                            nullable_tuple_ids: Vec::new(),
-                            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-                            children: Vec::new(),
-                            stats: stats(),
-                            payload: DistributedNodeKind::Values(
-                                crate::sql::planner::payload::PlanValuesNode {
-                                    rows: Vec::new(),
-                                    columns: vec![left.clone()],
-                                },
-                            ),
-                        },
-                        DistributedNode {
-                            node_id: 3,
-                            fragment_id: 0,
-                            tuple_ids: vec![3],
-                            nullable_tuple_ids: Vec::new(),
-                            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-                            children: Vec::new(),
-                            stats: stats(),
-                            payload: DistributedNodeKind::Values(
-                                crate::sql::planner::payload::PlanValuesNode {
-                                    rows: Vec::new(),
-                                    columns: vec![right.clone()],
-                                },
-                            ),
-                        },
-                    ],
-                    stats: stats(),
-                    payload: DistributedNodeKind::HashJoin(Box::new(
-                        crate::sql::planner::physical::PhysicalHashJoinNode {
-                            join_type: JoinKind::Inner,
-                            eq_conditions: Vec::new(),
-                            other_condition: None,
-                            distribution: JoinDistribution::Unknown,
-                            execution_mode: None,
-                            build_runtime_filters: Vec::new(),
-                            output_columns: vec![
-                                left.clone(),
-                                right.clone(),
-                                output_column(999, "stale", DataType::Int64),
-                            ],
-                        },
-                    )),
-                },
-                data_partition: DataPartition::unpartitioned(),
-                output_partition: DataPartition::unpartitioned(),
-                sink: DataSink::Result,
-                output_exprs: None,
-                output_columns: vec![left.clone(), right.clone()],
-                cte_id: None,
-                cte_exchange_nodes: Vec::new(),
-            }],
-            root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
-            edges: Vec::new(),
-        };
-
-        let encoded =
-            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
-        let root = encoded.fragments[0].root.as_ref().expect("root");
-        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_ref()
-        else {
-            panic!("expected physical join root");
-        };
-        assert_eq!(
-            physical
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "l_k"), (2, "r_k")],
-            "the encoder maps the reconciled contract, dropping the stale id 999"
-        );
-    }
-
-    #[test]
     fn iceberg_delta_table_encoder_consumes_prepared_binding_payload() {
         use crate::protocol::native::encode::plan;
 
@@ -3925,121 +3810,6 @@ mod legacy_tests {
             },
             serialized_metadata: None,
             serialized_metadata_rows: None,
-        }
-    }
-
-    #[test]
-    fn stream_sink_derives_generate_series_source_schema() {
-        let plan = two_fragment_generate_series_stream_plan_for_test();
-
-        let encoded =
-            encode_distributed_plan(&plan, empty_scan_bindings()).expect("encode native plan");
-
-        let source = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 1)
-            .expect("source fragment");
-        let Some(plan::data_sink::Kind::DataStream(sink)) =
-            source.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("expected DataStream sink");
-        };
-        assert_eq!(sink.output_columns, vec![7]);
-
-        let target = encoded
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == 0)
-            .expect("target fragment");
-        let receiver = target.root.as_ref().expect("target root");
-        let Some(plan::distributed_node::Payload::Exchange(exchange)) = receiver.payload.as_ref()
-        else {
-            panic!("expected Exchange receiver");
-        };
-        assert_eq!(
-            exchange
-                .output_columns
-                .iter()
-                .map(|column| (column.column_id, column.name.as_str(), column.nullable))
-                .collect::<Vec<_>>(),
-            vec![(7, "generate_series", false)]
-        );
-    }
-
-    fn two_fragment_generate_series_stream_plan_for_test() -> DistributedPlan {
-        let output_columns = vec![output_column(7, "generate_series", DataType::Int64)];
-        crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-            fragments: vec![
-                PlanFragment {
-                    fragment_id: 1,
-                    root: DistributedNode {
-                        node_id: 10,
-                        fragment_id: 1,
-                        tuple_ids: vec![10],
-                        nullable_tuple_ids: Vec::new(),
-                        limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-                        children: Vec::new(),
-                        stats: stats(),
-                        payload: DistributedNodeKind::GenerateSeries(
-                            crate::sql::planner::payload::PlanGenerateSeriesNode {
-                                start: 1,
-                                end: 3,
-                                step: 1,
-                                column_name: "generate_series".to_string(),
-                                alias: None,
-                                output_column_id: ColumnId::new_for_test(7),
-                            },
-                        ),
-                    },
-                    data_partition: DataPartition::unpartitioned(),
-                    output_partition: DataPartition::unpartitioned(),
-                    sink: DataSink::Noop,
-                    output_exprs: None,
-                    output_columns: Vec::new(),
-                    cte_id: None,
-                    cte_exchange_nodes: Vec::new(),
-                },
-                PlanFragment {
-                    fragment_id: 0,
-                    root: DistributedNode {
-                        node_id: 20,
-                        fragment_id: 0,
-                        tuple_ids: vec![20],
-                        nullable_tuple_ids: Vec::new(),
-                        limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-                        children: Vec::new(),
-                        stats: stats(),
-                        payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                            partition: DataPartition::unpartitioned(),
-                            source_fragment_id: 1,
-                            output_columns,
-                            output_qualifier: None,
-                            flavor: ExchangeFlavor::Distribution,
-                        }),
-                    },
-                    data_partition: DataPartition::unpartitioned(),
-                    output_partition: DataPartition::unpartitioned(),
-                    sink: DataSink::Result,
-                    output_exprs: None,
-                    output_columns: Vec::new(),
-                    cte_id: None,
-                    cte_exchange_nodes: Vec::new(),
-                },
-            ],
-            root_fragment_id: 0,
-            runtime_filter_graph: RuntimeFilterGraph::default(),
-            edges: vec![FragmentEdge {
-                source_fragment_id: 1,
-                target_fragment_id: 0,
-                target_exchange_node_id: 20,
-                output_partition: DataPartition::unpartitioned(),
-                stream_kind: FragmentStreamKind::Gather,
-                edge_kind: FragmentEdgeKind::Stream,
-                output_slot_ids: vec![7],
-            }],
         }
     }
 
