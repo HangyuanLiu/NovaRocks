@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod analysis;
+pub(crate) mod analysis_adapter;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;
 pub(crate) mod iceberg_backend;
@@ -28,15 +28,11 @@ pub(crate) mod iceberg_target_apply;
 pub(crate) mod lake_rebuild;
 pub(crate) mod lifecycle;
 pub(crate) mod partition;
-pub(crate) mod rebind;
 pub(crate) mod recovery;
 pub(crate) mod refresh_context;
 pub(crate) mod refresh_driver;
 pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin;
-pub(crate) mod refresh_property;
-#[cfg(test)]
-mod refresh_property_contract_tests;
 pub(crate) mod scan_binding;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;

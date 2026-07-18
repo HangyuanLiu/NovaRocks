@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
+
+use crate::catalog::identifier::normalize_identifier;
 use crate::catalog::schema::SqlType;
 use crate::sql::parser::ast::TableColumnDef;
 
@@ -42,5 +45,50 @@ pub(crate) fn starrocks_physical_column(
         },
         visible,
         is_key,
+    }
+}
+
+pub(crate) fn validate_unique_aggregate_physical_column_names(
+    physical_columns: &[StarRocksPhysicalColumn],
+) -> Result<(), String> {
+    let mut names = HashSet::with_capacity(physical_columns.len());
+    for column in physical_columns {
+        let normalized = normalize_identifier(&column.column.name)?;
+        if !names.insert(normalized.clone()) {
+            return Err(format!(
+                "aggregate MV physical column name collision: hidden column name collision or duplicate physical column `{normalized}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::schema::SqlType;
+
+    fn column(name: &str) -> StarRocksPhysicalColumn {
+        starrocks_physical_column(name.to_string(), SqlType::BigInt, false, true, false)
+    }
+
+    #[test]
+    fn aggregate_physical_column_names_accept_unique_normalized_names() {
+        validate_unique_aggregate_physical_column_names(&[column("Group_Key"), column("sum_v")])
+            .expect("unique names");
+    }
+
+    #[test]
+    fn aggregate_physical_column_names_reject_normalized_duplicates_with_exact_error() {
+        let error = validate_unique_aggregate_physical_column_names(&[
+            column("Visible_Output"),
+            column("`visible_output`"),
+        ])
+        .expect_err("normalized duplicate");
+
+        assert_eq!(
+            error,
+            "aggregate MV physical column name collision: hidden column name collision or duplicate physical column `visible_output`"
+        );
     }
 }

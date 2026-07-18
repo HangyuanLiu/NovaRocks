@@ -26,18 +26,11 @@
 //! contracts result in fail-fast errors that propagate to the user.
 
 use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
+use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
     ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
     JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RebindColumn {
-    pub(crate) base_table_fqn: String,
-    pub(crate) field_id: i32,
-    pub(crate) name_at_create: String,
-    pub(crate) current_name: String,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ContractDecision {

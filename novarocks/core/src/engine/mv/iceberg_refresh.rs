@@ -49,9 +49,8 @@ use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
-use crate::engine::mv::analysis::{
-    MvAnalysis, analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms,
-    output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
+use crate::engine::mv::analysis_adapter::{
+    analyze_mv_select, descriptor_from_loaded, now_ms, validate_ivm_primary_key,
 };
 use crate::engine::mv::iceberg_target_apply::{
     apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
@@ -60,15 +59,11 @@ use crate::engine::mv::iceberg_target_apply::{
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
-use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
-};
-use crate::engine::mv::refresh_property::{
-    RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
@@ -84,6 +79,15 @@ use crate::meta::repository::mv::{
     ReplaceMvPartitionStatesRequest, StoredMvRefresh, UpdateMvPartitionContractRequest,
 };
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
+use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
+use crate::mv::analysis::rebind::{RebindColumn, rewrite_select_sql_for_rebind};
+use crate::mv::analysis::refresh_property::{
+    RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
+};
+use crate::mv::analysis::{
+    MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
+    resolve_mv_name, validate_mv_partition_columns,
+};
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::descriptor::{
@@ -261,10 +265,8 @@ pub(crate) fn create_iceberg_mv(
     if let Some(pk_cols) = stmt.primary_key.as_deref() {
         match &property.identity {
             TargetIdentity::BaseRowId => {
-                let descriptor =
-                    crate::engine::mv::analysis::descriptor_from_loaded(&loaded_bases[0].1);
-                crate::engine::mv::analysis::validate_ivm_primary_key(pk_cols, &descriptor)
-                    .map_err(|e| e.to_string())?;
+                let descriptor = descriptor_from_loaded(&loaded_bases[0].1);
+                validate_ivm_primary_key(pk_cols, &descriptor).map_err(|e| e.to_string())?;
             }
             TargetIdentity::JoinRowKey(_, _) => {
                 return Err(
@@ -1330,9 +1332,7 @@ fn iceberg_aggregate_target_columns_from_resolved_query(
 fn iceberg_aggregate_target_columns_from_layout(
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    crate::engine::mv::analysis::validate_unique_aggregate_physical_column_names(
-        &layout.physical_columns,
-    )?;
+    validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
     Ok(layout
         .physical_columns
         .iter()
@@ -1402,7 +1402,7 @@ fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1472,7 +1472,7 @@ fn build_non_branch_schema_contract(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1518,7 +1518,7 @@ fn build_non_branch_contract_core(
     identity: &TargetIdentity,
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1730,7 +1730,7 @@ fn mixed_output_contract(
 fn build_aggregate_contract_core(
     query: &sqlparser::ast::Query,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -1952,7 +1952,7 @@ fn build_join_base_contracts_and_lineage(
 fn build_branch_union_schema_contract(
     inner: &TargetIdentity,
     canonical_query: &sqlparser::ast::Query,
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     loaded_bases: &[(
         TableIdentity,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
@@ -2306,7 +2306,7 @@ fn target_field_id_by_column(
 }
 
 fn target_contract(
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
     target: &IcebergMvTarget,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
@@ -10605,9 +10605,7 @@ fn validate_refresh_pin_table_uuids_for_operation(
 #[derive(Debug, PartialEq, Eq)]
 enum JoinSchemaContractDecision {
     CompatibleSafe,
-    CompatibleSafeWithRebind {
-        rebound_columns: Vec<crate::engine::mv::schema_contract::RebindColumn>,
-    },
+    CompatibleSafeWithRebind { rebound_columns: Vec<RebindColumn> },
 }
 
 impl JoinSchemaContractDecision {
@@ -10632,7 +10630,7 @@ fn validate_join_base_schema_contract_for_rebind(
     base_fqn: &str,
     base_contract: &mv_schema::BaseContract,
     current_schema: &iceberg::spec::Schema,
-) -> Result<Vec<crate::engine::mv::schema_contract::RebindColumn>, String> {
+) -> Result<Vec<RebindColumn>, String> {
     let current_schema = current_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &base_contract.schema_at_create.fields {
@@ -10659,7 +10657,7 @@ fn validate_join_base_schema_contract_for_rebind(
             ));
         }
         if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-            rebound.push(crate::engine::mv::schema_contract::RebindColumn {
+            rebound.push(RebindColumn {
                 base_table_fqn: base_fqn.to_string(),
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
@@ -16680,7 +16678,7 @@ mod tests {
 
     #[test]
     fn identity_gating_matches_legacy_strategy_gating() {
-        use crate::engine::mv::refresh_property::TargetIdentity;
+        use crate::mv::analysis::refresh_property::TargetIdentity;
 
         let base_row = TargetIdentity::BaseRowId;
         let join_row = TargetIdentity::JoinRowKey(

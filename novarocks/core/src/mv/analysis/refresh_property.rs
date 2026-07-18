@@ -23,7 +23,7 @@
 //! [`ImvRefreshContract`] via [`RefreshFragmentProperty::into_refresh_contract`].
 //! This is now the single source of contract derivation: the old flat
 //! classifier has been removed and `derive_imv_refresh_contract` now lives in
-//! this analysis adapter.
+//! this canonical analysis module.
 //!
 //! The synthesis MIRRORS the structural acceptance/rejection of the former flat
 //! classifier (unsupported join kinds, non-equi inner joins, non-UNION-ALL set
@@ -63,7 +63,7 @@ use crate::sql::analysis::{
 use crate::sql::planner::table::ScanSource;
 
 pub(crate) fn derive_imv_refresh_contract(
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
 ) -> Result<ImvRefreshContract, String> {
     derive_fragment_property(&analysis.resolved_query)?.into_refresh_contract()
 }

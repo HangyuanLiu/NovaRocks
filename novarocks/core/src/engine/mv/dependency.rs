@@ -21,11 +21,11 @@ use crate::catalog::identifier::TableIdentity;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
-use crate::engine::mv::analysis::ResolvedTableRef;
 use crate::meta::repository::mv::{
     CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
     MvDependencyStorageEngine,
 };
+use crate::mv::analysis::ResolvedTableRef;
 use crate::mv::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
 use crate::mv::persistence::definition::StoredMvRefreshPolicy;

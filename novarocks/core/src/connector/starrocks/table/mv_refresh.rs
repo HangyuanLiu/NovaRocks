@@ -41,8 +41,9 @@ use crate::engine::mv_flow::{
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
+use crate::mv::analysis::resolve_mv_name;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
-use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
+use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
@@ -1817,33 +1818,4 @@ fn refresh_starrocks_catalog(state: &Arc<StandaloneState>) -> Result<(), String>
         .expect("standalone StarRocks table write lock");
     *starrocks = rebuilt;
     Ok(())
-}
-
-fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String, String), String> {
-    match name.parts.as_slice() {
-        [table] => Ok((
-            crate::catalog::identifier::normalize_identifier(current_database)?,
-            crate::catalog::identifier::normalize_identifier(table)?,
-        )),
-        [database, table] => Ok((
-            crate::catalog::identifier::normalize_identifier(database)?,
-            crate::catalog::identifier::normalize_identifier(table)?,
-        )),
-        [catalog, database, table] => {
-            let catalog = crate::catalog::identifier::normalize_identifier(catalog)?;
-            if catalog != "default_catalog" {
-                return Err(format!(
-                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
-                ));
-            }
-            Ok((
-                crate::catalog::identifier::normalize_identifier(database)?,
-                crate::catalog::identifier::normalize_identifier(table)?,
-            ))
-        }
-        _ => Err(format!(
-            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
-            name.parts.join(".")
-        )),
-    }
 }
