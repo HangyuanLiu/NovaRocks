@@ -17,6 +17,7 @@
 
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
+pub(crate) mod rebind;
 pub(crate) mod refresh_property;
 #[cfg(test)]
 mod refresh_property_contract_tests;

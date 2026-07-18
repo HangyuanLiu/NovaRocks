@@ -29,7 +29,13 @@
 //! rebind set. Ambiguity is a fail-fast error rather than a best-effort
 //! rewrite.
 
-use crate::engine::mv::schema_contract::RebindColumn;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RebindColumn {
+    pub(crate) base_table_fqn: String,
+    pub(crate) field_id: i32,
+    pub(crate) name_at_create: String,
+    pub(crate) current_name: String,
+}
 
 pub(crate) fn rewrite_select_sql_for_rebind(
     stored_sql: &str,

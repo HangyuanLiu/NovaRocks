@@ -59,7 +59,6 @@ use crate::engine::mv::iceberg_target_apply::{
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
-use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_io::{
@@ -81,6 +80,7 @@ use crate::meta::repository::mv::{
 };
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
+use crate::mv::analysis::rebind::{RebindColumn, rewrite_select_sql_for_rebind};
 use crate::mv::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
@@ -10605,9 +10605,7 @@ fn validate_refresh_pin_table_uuids_for_operation(
 #[derive(Debug, PartialEq, Eq)]
 enum JoinSchemaContractDecision {
     CompatibleSafe,
-    CompatibleSafeWithRebind {
-        rebound_columns: Vec<crate::engine::mv::schema_contract::RebindColumn>,
-    },
+    CompatibleSafeWithRebind { rebound_columns: Vec<RebindColumn> },
 }
 
 impl JoinSchemaContractDecision {
@@ -10632,7 +10630,7 @@ fn validate_join_base_schema_contract_for_rebind(
     base_fqn: &str,
     base_contract: &mv_schema::BaseContract,
     current_schema: &iceberg::spec::Schema,
-) -> Result<Vec<crate::engine::mv::schema_contract::RebindColumn>, String> {
+) -> Result<Vec<RebindColumn>, String> {
     let current_schema = current_schema.as_struct();
     let mut rebound = Vec::new();
     for record in &base_contract.schema_at_create.fields {
@@ -10659,7 +10657,7 @@ fn validate_join_base_schema_contract_for_rebind(
             ));
         }
         if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-            rebound.push(crate::engine::mv::schema_contract::RebindColumn {
+            rebound.push(RebindColumn {
                 base_table_fqn: base_fqn.to_string(),
                 field_id: record.field_id,
                 name_at_create: record.name_at_create.clone(),
