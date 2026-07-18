@@ -28,7 +28,7 @@ use crate::mv::dependency::graph::{
 };
 use crate::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
-    iceberg_table_dependency_ref, starrocks_mv_dependency_ref,
+    iceberg_table_dependency_ref,
 };
 use crate::mv::dependency::refresh::{MvRefreshDependencyStep, refresh_step_for_dependency_object};
 use crate::mv::dependency::scope::{
@@ -37,6 +37,7 @@ use crate::mv::dependency::scope::{
 use crate::mv::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
 use crate::mv::persistence::definition::StoredMvRefreshPolicy;
+use crate::mv::persistence::dependency::stored_definition_dependency_ref;
 
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,
@@ -57,31 +58,6 @@ pub(crate) fn ensure_no_downstream_dependencies(
         .mv_repo
         .ensure_no_downstream_dependencies(read.as_ref(), upstream)
         .map_err(|e| e.to_string())
-}
-
-pub(crate) fn stored_definition_dependency_ref(
-    definition: &StoredMvDefinition,
-    starrocks_name: Option<(&str, &str)>,
-) -> Result<MvDependencyObjectRef, String> {
-    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        let catalog = definition
-            .target_catalog
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target catalog".to_string())?;
-        let namespace = definition
-            .target_namespace
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target namespace".to_string())?;
-        let table = definition
-            .target_table
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target table".to_string())?;
-        return Ok(iceberg_mv_dependency_ref(catalog, namespace, table));
-    }
-    let (database, table) = starrocks_name.ok_or_else(|| {
-        "StarRocks table MV definition requires database/table name for dependency ref".to_string()
-    })?;
-    Ok(starrocks_mv_dependency_ref(database, table))
 }
 
 fn iceberg_mv_target_ref_for_scope(

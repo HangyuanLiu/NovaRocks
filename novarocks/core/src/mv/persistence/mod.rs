@@ -16,5 +16,6 @@
 // under the License.
 
 pub mod definition;
+pub mod dependency;
 pub mod descriptor;
 pub mod schema;

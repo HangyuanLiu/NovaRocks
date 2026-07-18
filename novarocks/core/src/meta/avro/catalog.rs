@@ -24,6 +24,7 @@ use apache_avro::schema_compatibility::SchemaCompatibility;
 
 use crate::meta::repository::{RepositoryError, RepositoryResult};
 use crate::mv::persistence::definition::MV_DEFINITION_SUBJECT;
+use crate::mv::persistence::dependency::MV_DEPENDENCY_SUBJECT;
 
 static SCHEMA_CATALOG: LazyLock<Result<AvroSchemaCatalog, String>> = LazyLock::new(|| {
     AvroSchemaCatalog::from_sources(schema_sources()).map_err(|err| err.to_string())
@@ -296,9 +297,9 @@ fn schema_sources() -> &'static [SchemaSource] {
             raw_schema: include_str!("schemas/mv.partition_state/0001.avsc"),
         },
         SchemaSource {
-            subject: "mv.dependency",
+            subject: MV_DEPENDENCY_SUBJECT,
             id: 1,
-            raw_schema: include_str!("schemas/mv.dependency/0001.avsc"),
+            raw_schema: include_str!("../../mv/persistence/schemas/mv.dependency/0001.avsc"),
         },
         SchemaSource {
             subject: "test.evolution",

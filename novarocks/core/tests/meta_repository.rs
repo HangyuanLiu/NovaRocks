@@ -58,6 +58,7 @@ use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
+use novarocks::mv::persistence::dependency::StoredMvDependency;
 use novarocks::mv::persistence::schema::{
     ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
     ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
@@ -4281,7 +4282,8 @@ fn mv_repository_stores_dependency_indexes() -> Result<(), Box<dyn std::error::E
     }
 
     let read = provider.begin_read()?;
-    let by_downstream = repository.list_dependencies_by_downstream(read.as_ref(), downstream_id)?;
+    let by_downstream: Vec<StoredMvDependency> =
+        repository.list_dependencies_by_downstream(read.as_ref(), downstream_id)?;
     assert_eq!(
         by_downstream
             .iter()
