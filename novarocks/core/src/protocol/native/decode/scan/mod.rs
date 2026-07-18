@@ -91,15 +91,15 @@ pub(crate) fn lower_scan_node(
                 &output_columns,
                 &variant_path_plan,
             )?;
-            iceberg_data::lower_iceberg_data_files_scan(
-                node,
+            let read_plan = read_plan::scan_read_plan(
                 scan,
-                source,
+                table,
                 &output_columns,
-                ctx,
-                arena,
-            )
-            .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
+                path.clone(),
+                source_path.clone().field("iceberg_data_files"),
+            )?;
+            iceberg_data::lower_iceberg_data_files_scan(node, scan, source, read_plan, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
         }
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergMetadataTable")
@@ -187,8 +187,16 @@ pub(crate) fn scan_read_binding_for_test(
 ) -> Result<(Vec<String>, Vec<(u32, u32)>), NativeFragmentDecodeError> {
     let scan_path = FieldPath::root("scan");
     let output_columns = common::decode_scan_output_columns(scan, scan_path.clone())?;
-    let read_plan = read_plan::scan_read_plan(scan, table, &output_columns)
-        .map_err(|error| error.into_native(scan_path))?;
+    let read_plan = read_plan::scan_read_plan(
+        scan,
+        table,
+        &output_columns,
+        scan_path.clone(),
+        scan_path
+            .field("table")
+            .field("source")
+            .field("iceberg_data_files"),
+    )?;
     Ok((
         read_plan.read_columns,
         read_plan
@@ -906,6 +914,106 @@ mod tests {
         let mut invalid = output_column(2, "flag", DataType::Boolean);
         invalid.r#type = Some(common::TypeDesc::default());
         assert_scan_column_type_error(vec![preceding, invalid], vec!["flag".to_string()], 1);
+    }
+
+    fn iceberg_data_files_source() -> plan::scan_source::Kind {
+        plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+            table: Some(table_info()),
+            files: Vec::new(),
+            cloud_properties: HashMap::new(),
+            binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+        })
+    }
+
+    fn append_hidden_table_column(
+        node: &mut plan::DistributedNode,
+        name: &str,
+        data_type: Option<common::TypeDesc>,
+        logical_type: Option<common::TypeDesc>,
+    ) {
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            panic!("expected physical node");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() else {
+            panic!("expected scan node");
+        };
+        let table = scan.table.as_mut().expect("scan table");
+        table.columns.push(plan::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            write_default_json: None,
+            logical_type,
+        });
+        let Some(plan::scan_source::Kind::IcebergDataFiles(source)) = table
+            .source
+            .as_mut()
+            .and_then(|source| source.kind.as_mut())
+        else {
+            panic!("expected Iceberg data source");
+        };
+        source
+            .table
+            .as_mut()
+            .expect("Iceberg table")
+            .schema
+            .as_mut()
+            .expect("Iceberg schema")
+            .fields
+            .push(schema_field(12, name));
+    }
+
+    fn assert_hidden_table_column_type_error(node: &plan::DistributedNode, expected_field: &str) {
+        let error = decode_node(
+            node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid hidden table column type must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            format!("plan_fragment.root.payload.physical.scan.table.columns[2].{expected_field}")
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn required_hidden_table_column_type_uses_table_wire_path() {
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int64)],
+            Vec::new(),
+            vec!["id".to_string(), "hidden_required".to_string()],
+            iceberg_data_files_source(),
+        );
+        append_hidden_table_column(
+            &mut node,
+            "hidden_required",
+            Some(type_desc(&DataType::Int64)),
+            Some(common::TypeDesc::default()),
+        );
+        assert_hidden_table_column_type_error(&node, "logical_type");
+    }
+
+    #[test]
+    fn predicate_hidden_table_column_type_uses_table_wire_path() {
+        let mut node = scan_node_with(
+            vec![output_column(1, "id", DataType::Int64)],
+            vec![greater_than(
+                column_ref(3, "hidden_predicate", DataType::Int64),
+                int_literal(0),
+            )],
+            Vec::new(),
+            iceberg_data_files_source(),
+        );
+        append_hidden_table_column(
+            &mut node,
+            "hidden_predicate",
+            Some(common::TypeDesc::default()),
+            None,
+        );
+        assert_hidden_table_column_type_error(&node, "data_type");
     }
 
     #[test]

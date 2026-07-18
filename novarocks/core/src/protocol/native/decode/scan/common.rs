@@ -34,9 +34,87 @@ use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 #[derive(Clone, Debug)]
+pub(super) struct ProvenancedOutputColumn {
+    column: common::OutputColumn,
+    source_path: FieldPath,
+    name_path: FieldPath,
+    type_path: Option<FieldPath>,
+    slot_schema: ChunkSlotSchema,
+}
+
+impl ProvenancedOutputColumn {
+    pub(super) fn decode(
+        column: common::OutputColumn,
+        source_path: FieldPath,
+        name_path: FieldPath,
+        type_path: FieldPath,
+    ) -> Result<Self, NativeFragmentDecodeError> {
+        let type_desc = column.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                type_path.clone(),
+                format!("ScanNode column {} type missing", column.name),
+            )
+        })?;
+        let field = super::super::decode_field_type(&column.name, column.nullable, type_desc)
+            .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
+        let slot_schema = ChunkSlotSchema::from_field(SlotId::new(column.column_id), &field, None)
+            .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
+        Ok(Self {
+            column,
+            source_path,
+            name_path,
+            type_path: Some(type_path),
+            slot_schema,
+        })
+    }
+
+    pub(super) fn trusted_internal(
+        column: common::OutputColumn,
+        source_path: FieldPath,
+        name_path: FieldPath,
+    ) -> Self {
+        let type_desc = column
+            .r#type
+            .as_ref()
+            .expect("trusted internal scan column type");
+        let field = super::super::decode_field_type(&column.name, column.nullable, type_desc)
+            .expect("trusted internal scan column field");
+        let slot_schema = ChunkSlotSchema::from_field(SlotId::new(column.column_id), &field, None)
+            .expect("trusted internal scan column schema");
+        Self {
+            column,
+            source_path,
+            name_path,
+            type_path: None,
+            slot_schema,
+        }
+    }
+
+    pub(super) fn column(&self) -> &common::OutputColumn {
+        &self.column
+    }
+
+    pub(super) fn source_path(&self) -> FieldPath {
+        self.source_path.clone()
+    }
+
+    pub(super) fn type_path(&self) -> Option<FieldPath> {
+        self.type_path.clone()
+    }
+
+    pub(super) fn name_path(&self) -> FieldPath {
+        self.name_path.clone()
+    }
+
+    pub(super) fn slot_schema(&self) -> &ChunkSlotSchema {
+        &self.slot_schema
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct DecodedScanOutputColumns {
     columns: Vec<common::OutputColumn>,
-    source_paths: Vec<FieldPath>,
+    provenanced: Vec<ProvenancedOutputColumn>,
     layout: Layout,
     output_schema: ChunkSchemaRef,
 }
@@ -47,7 +125,11 @@ impl DecodedScanOutputColumns {
     }
 
     pub(super) fn source_path(&self, selected_index: usize) -> FieldPath {
-        self.source_paths[selected_index].clone()
+        self.provenanced[selected_index].source_path()
+    }
+
+    pub(super) fn provenanced(&self) -> &[ProvenancedOutputColumn] {
+        &self.provenanced
     }
 
     pub(super) fn layout(&self) -> Layout {
@@ -96,8 +178,7 @@ pub(super) fn decode_scan_output_columns(
     }
     let columns_path = scan_path.field("columns");
     let mut columns = Vec::with_capacity(selected.len());
-    let mut source_paths = Vec::with_capacity(selected.len());
-    let mut slot_schemas = Vec::with_capacity(selected.len());
+    let mut provenanced = Vec::with_capacity(selected.len());
     let mut seen = HashMap::with_capacity(selected.len());
     for (wire_index, column) in selected {
         let source_path = columns_path.clone().index(wire_index);
@@ -111,30 +192,26 @@ pub(super) fn decode_scan_output_columns(
                 ),
             ));
         }
-        let type_desc = column.r#type.as_ref().ok_or_else(|| {
-            NativeFragmentDecodeError::missing(
-                source_path.clone().field("type"),
-                format!("ScanNode column {} type missing", column.name),
-            )
-        })?;
-        let field = super::super::decode_field_type(&column.name, column.nullable, type_desc)
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(source_path.clone().field("type"), error)
-            })?;
-        let slot_schema = ChunkSlotSchema::from_field(slot_id, &field, None).map_err(|error| {
-            NativeFragmentDecodeError::invalid_value(source_path.clone().field("type"), error)
-        })?;
+        let decoded = ProvenancedOutputColumn::decode(
+            column.clone(),
+            source_path.clone(),
+            source_path.clone().field("name"),
+            source_path.field("type"),
+        )?;
         columns.push(column.clone());
-        source_paths.push(source_path);
-        slot_schemas.push(slot_schema);
+        provenanced.push(decoded);
     }
+    let slot_schemas = provenanced
+        .iter()
+        .map(|column| column.slot_schema().clone())
+        .collect::<Vec<_>>();
     let layout = Layout::for_slots(slot_schemas.iter().map(ChunkSlotSchema::slot_id));
     let output_schema = ChunkSchema::try_new(slot_schemas)
         .map(Arc::new)
         .map_err(|error| NativeFragmentDecodeError::inconsistent(columns_path.clone(), error))?;
     Ok(DecodedScanOutputColumns {
         columns,
-        source_paths,
+        provenanced,
         layout,
         output_schema,
     })

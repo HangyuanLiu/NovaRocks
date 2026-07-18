@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Schema;
 
-use super::common::DecodedScanOutputColumns;
+use super::common::{DecodedScanOutputColumns, ProvenancedOutputColumn};
 use super::variant_path::NativeVariantPathPlan;
 use super::virtual_columns::iceberg_virtual_projected_field;
 use crate::common::ids::SlotId;
@@ -51,6 +51,41 @@ pub(super) fn validate_decoded_iceberg_output_schema(
             .map_err(|error| error.into_native(output_columns.source_path(index)))?;
     }
     Ok(())
+}
+
+pub(super) fn iceberg_chunk_schema_from_provenanced_columns(
+    table: &plan::IcebergTableInfo,
+    source_path: crate::protocol::common::error::FieldPath,
+    columns: &[ProvenancedOutputColumn],
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
+    let descriptor =
+        iceberg_table_descriptor(table).map_err(|error| error.into_native(source_path.clone()))?;
+    let variant_output_fields = variant_path_plan
+        .specs
+        .iter()
+        .map(|spec| (spec.output_slot_id, spec.output_field.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut slot_ids = Vec::with_capacity(columns.len());
+    for column in columns {
+        let projected =
+            iceberg_projected_field(table, &descriptor, column.column(), &variant_output_fields);
+        let projected = match projected {
+            Ok(field) => field,
+            Err(error) => {
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    column.name_path(),
+                    error,
+                ));
+            }
+        };
+        fields.push(projected);
+        slot_ids.push(SlotId::new(column.column().column_id));
+    }
+    let arrow_schema = Schema::new(fields);
+    ChunkSchema::try_ref_from_schema_and_slot_ids(&arrow_schema, &slot_ids)
+        .map_err(|error| NativeFragmentDecodeError::inconsistent(source_path, error))
 }
 
 pub(super) fn iceberg_chunk_schema_from_output_columns(

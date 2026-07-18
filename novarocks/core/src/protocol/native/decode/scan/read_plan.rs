@@ -17,16 +17,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use arrow::datatypes::DataType;
-
-use super::super::layout::layout_from_output_columns;
 use super::super::node::DecodedNode;
-use super::common::DecodedScanOutputColumns;
-use super::common::output_column_data_type;
-use super::schema::{
-    iceberg_chunk_schema_from_output_columns,
-    iceberg_chunk_schema_from_output_columns_with_variants,
-};
+use super::common::{DecodedScanOutputColumns, ProvenancedOutputColumn};
+use super::schema::iceberg_chunk_schema_from_provenanced_columns;
 use super::variant_path::{NativeVariantPathPlan, parse_native_scan_variant_path_columns};
 use super::virtual_columns::{iceberg_virtual_count_column, record_iceberg_virtual_column};
 use crate::common::ids::SlotId;
@@ -37,7 +30,8 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 use crate::proto::{common, plan};
-use crate::protocol::common::error::ProtocolErrorKind;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 #[derive(Clone, Debug)]
@@ -60,24 +54,28 @@ struct PredicateColumnRef {
     name: Option<String>,
     r#type: Option<common::TypeDesc>,
     nullable: bool,
+    expression_path: FieldPath,
 }
 
 pub(super) fn scan_read_plan(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
     decoded_output_columns: &DecodedScanOutputColumns,
-) -> Result<ScanReadPlan, NativeFragmentLeafDecodeError> {
+    scan_path: FieldPath,
+    source_path: FieldPath,
+) -> Result<ScanReadPlan, NativeFragmentDecodeError> {
     let output_columns = decoded_output_columns.columns();
     let output_layout = decoded_output_columns.layout();
-    let mut variant_path_plan =
-        parse_native_scan_variant_path_columns(scan, table, output_columns)?;
-    let output_schema = iceberg_chunk_schema_from_output_columns_with_variants(
+    let mut variant_path_plan = parse_native_scan_variant_path_columns(scan, table, output_columns)
+        .map_err(|error| error.into_native(scan_path.clone()))?;
+    let output_schema = iceberg_chunk_schema_from_provenanced_columns(
         table,
-        output_columns,
+        source_path.clone(),
+        decoded_output_columns.provenanced(),
         &variant_path_plan,
     )?;
 
-    let mut scan_columns = output_columns.to_vec();
+    let mut scan_columns = decoded_output_columns.provenanced().to_vec();
     let mut scan_names = output_columns
         .iter()
         .map(|col| col.name.clone())
@@ -90,14 +88,17 @@ pub(super) fn scan_read_plan(
     let mut read_names = HashSet::new();
     let mut read_slots = HashSet::new();
     let mut iceberg_virtual = IcebergVirtualSpec::default();
-    for col in output_columns {
+    for col in decoded_output_columns.provenanced() {
+        let raw = col.column();
         if variant_path_plan
             .output_slot_ids
-            .contains(&SlotId::new(col.column_id))
+            .contains(&SlotId::new(raw.column_id))
         {
             continue;
         }
-        if record_iceberg_virtual_column(table, col, &mut iceberg_virtual)? {
+        if record_iceberg_virtual_column(table, raw, &mut iceberg_virtual)
+            .map_err(|error| error.into_native(col.source_path()))?
+        {
             continue;
         }
         push_physical_read_column(
@@ -114,7 +115,7 @@ pub(super) fn scan_read_plan(
         .unwrap_or(0)
         .saturating_add(1);
 
-    let predicate_refs = scan_predicate_column_refs(&scan.predicates)?;
+    let predicate_refs = scan_predicate_column_refs(&scan.predicates, scan_path.clone())?;
     let predicate_refs_by_name = predicate_refs
         .values()
         .filter_map(|col| col.name.as_ref().map(|name| (name.clone(), col)))
@@ -125,15 +126,31 @@ pub(super) fn scan_read_plan(
         .cloned()
         .collect::<HashSet<_>>();
 
-    for required in &scan.required_columns {
+    for (required_index, required) in scan.required_columns.iter().enumerate() {
         if scan_names.contains(required) || read_names.contains(required) {
             continue;
         }
-        let col = if let Some(pred_col) = predicate_refs_by_name.get(required) {
-            output_column_from_predicate_ref(pred_col)?
-        } else {
-            let hidden_id = allocate_hidden_column_id(&mut next_hidden_column_id, &scan_slots)?;
-            output_column_from_table_def(scan, required, hidden_id)?
+        let predicate = predicate_refs_by_name.get(required).copied();
+        let hidden_id = match predicate {
+            Some(predicate) => predicate.column_id,
+            None => allocate_hidden_column_id(&mut next_hidden_column_id, &scan_slots)
+                .map_err(|error| error.into_native(scan_path.clone()))?,
+        };
+        let col = match output_column_from_table_def(scan, required, hidden_id, scan_path.clone())?
+        {
+            Some(column) => column,
+            None if predicate.is_some() => {
+                output_column_from_predicate_ref(predicate.expect("checked predicate"))?
+            }
+            None => {
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    scan_path
+                        .clone()
+                        .field("required_columns")
+                        .index(required_index),
+                    format!("required column {required} is not in table column definitions"),
+                ));
+            }
         };
         push_scan_column(
             table,
@@ -153,9 +170,12 @@ pub(super) fn scan_read_plan(
             continue;
         }
         let name = pred_col.name.as_ref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::MissingField,
-                "predicates",
+            NativeFragmentDecodeError::missing(
+                pred_col
+                    .expression_path
+                    .clone()
+                    .field("column_ref")
+                    .field("column"),
                 format!(
                     "predicate column_id={} is not an output column and does not carry a column name",
                     pred_col.column_id
@@ -163,12 +183,15 @@ pub(super) fn scan_read_plan(
             )
         })?;
         if !required_names.is_empty() && !required_names.contains(name) {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "required_columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                scan_path.clone().field("required_columns"),
                 format!("predicate column {name} is not listed in required_columns"),
             ));
         }
+        let column =
+            output_column_from_table_def(scan, name, pred_col.column_id, scan_path.clone())?
+                .map(Ok)
+                .unwrap_or_else(|| output_column_from_predicate_ref(pred_col))?;
         push_scan_column(
             table,
             &mut scan_columns,
@@ -178,7 +201,7 @@ pub(super) fn scan_read_plan(
             &mut read_names,
             &mut read_slots,
             &mut iceberg_virtual,
-            output_column_from_predicate_ref(pred_col)?,
+            column,
         )?;
     }
 
@@ -190,6 +213,7 @@ pub(super) fn scan_read_plan(
         &mut read_slots,
         &mut scan_slots,
         &mut next_hidden_column_id,
+        scan_path.clone(),
     )?;
     ensure_virtual_only_scan_has_row_count_carrier(
         &mut scan_columns,
@@ -200,23 +224,38 @@ pub(super) fn scan_read_plan(
         &mut read_slots,
         &mut next_hidden_column_id,
         &iceberg_virtual,
+        decoded_output_columns
+            .provenanced()
+            .first()
+            .expect("scan output columns")
+            .source_path(),
     )?;
 
-    let read_layout = layout_from_output_columns(&scan_columns)?;
-    let read_schema = iceberg_chunk_schema_from_output_columns_with_variants(
+    let read_layout = super::super::layout::Layout::for_slots(
+        scan_columns
+            .iter()
+            .map(|column| SlotId::new(column.column().column_id)),
+    );
+    let read_schema = iceberg_chunk_schema_from_provenanced_columns(
         table,
+        source_path.clone(),
         &scan_columns,
         &variant_path_plan,
     )?;
-    let parquet_schema = iceberg_chunk_schema_from_output_columns(table, &physical_read_columns)?;
+    let parquet_schema = iceberg_chunk_schema_from_provenanced_columns(
+        table,
+        source_path,
+        &physical_read_columns,
+        &NativeVariantPathPlan::default(),
+    )?;
     let read_slot_ids = physical_read_columns
         .iter()
-        .map(|col| SlotId::new(col.column_id))
+        .map(|col| SlotId::new(col.column().column_id))
         .collect::<Vec<_>>();
     let slot_kinds = physical_read_columns
         .iter()
         .map(parquet_slot_kind_from_native_column)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     Ok(ScanReadPlan {
         output_layout,
         output_schema,
@@ -225,7 +264,7 @@ pub(super) fn scan_read_plan(
         parquet_schema,
         read_columns: physical_read_columns
             .into_iter()
-            .map(|col| col.name)
+            .map(|col| col.column().name.clone())
             .collect(),
         read_slot_ids,
         slot_kinds,
@@ -238,12 +277,13 @@ pub(super) fn scan_read_plan(
 fn ensure_native_variant_source_read_columns(
     scan: &plan::ScanNode,
     plan: &mut NativeVariantPathPlan,
-    physical_read_columns: &mut Vec<common::OutputColumn>,
+    physical_read_columns: &mut Vec<ProvenancedOutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
     scan_slots: &mut HashSet<u32>,
     next_hidden_column_id: &mut u32,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+    scan_path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
     if plan.specs.is_empty() {
         return Ok(());
     }
@@ -254,16 +294,28 @@ fn ensure_native_variant_source_read_columns(
 
     for spec in &mut plan.specs {
         if let Some(read_col) = physical_read_columns.iter().find(|col| {
-            SlotId::new(col.column_id) == spec.source_slot_id || col.name == spec.source_name
+            SlotId::new(col.column().column_id) == spec.source_slot_id
+                || col.column().name == spec.source_name
         }) {
-            spec.source_read_slot_id = SlotId::new(read_col.column_id);
+            spec.source_read_slot_id = SlotId::new(read_col.column().column_id);
             continue;
         }
 
-        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)?;
+        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)
+            .map_err(|error| error.into_native(scan_path.clone()))?;
         reserved_slots.insert(hidden_id);
         scan_slots.insert(hidden_id);
-        let source_col = output_column_from_table_def(scan, &spec.source_name, hidden_id)?;
+        let source_col =
+            output_column_from_table_def(scan, &spec.source_name, hidden_id, scan_path.clone())?
+                .ok_or_else(|| {
+                    NativeFragmentDecodeError::invalid_value(
+                        scan_path.clone().field("variant_columns"),
+                        format!(
+                            "variant source column {} is not in table column definitions",
+                            spec.source_name
+                        ),
+                    )
+                })?;
         push_physical_read_column(physical_read_columns, read_names, read_slots, source_col)?;
         spec.source_read_slot_id = SlotId::new(hidden_id);
     }
@@ -272,23 +324,22 @@ fn ensure_native_variant_source_read_columns(
 }
 
 fn push_physical_read_column(
-    read_columns: &mut Vec<common::OutputColumn>,
+    read_columns: &mut Vec<ProvenancedOutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
-    col: common::OutputColumn,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    if !read_slots.insert(col.column_id) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
-            format!("read columns contain duplicate column_id={}", col.column_id),
+    col: ProvenancedOutputColumn,
+) -> Result<(), NativeFragmentDecodeError> {
+    let raw = col.column();
+    if !read_slots.insert(raw.column_id) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            col.source_path(),
+            format!("read columns contain duplicate column_id={}", raw.column_id),
         ));
     }
-    if !read_names.insert(col.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
-            format!("read columns contain duplicate column name {}", col.name),
+    if !read_names.insert(raw.name.clone()) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            col.name_path(),
+            format!("read columns contain duplicate column name {}", raw.name),
         ));
     }
     read_columns.push(col);
@@ -298,33 +349,37 @@ fn push_physical_read_column(
 #[allow(clippy::too_many_arguments)]
 fn push_scan_column(
     table: &plan::IcebergTableInfo,
-    scan_columns: &mut Vec<common::OutputColumn>,
+    scan_columns: &mut Vec<ProvenancedOutputColumn>,
     scan_names: &mut HashSet<String>,
     scan_slots: &mut HashSet<u32>,
-    physical_read_columns: &mut Vec<common::OutputColumn>,
+    physical_read_columns: &mut Vec<ProvenancedOutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
     iceberg_virtual: &mut IcebergVirtualSpec,
-    col: common::OutputColumn,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    if !scan_names.insert(col.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
-            format!("duplicate read column name {}", col.name),
+    col: ProvenancedOutputColumn,
+) -> Result<(), NativeFragmentDecodeError> {
+    let raw = col.column();
+    if !scan_names.insert(raw.name.clone()) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            col.name_path(),
+            format!("duplicate read column name {}", raw.name),
         ));
     }
-    if !scan_slots.insert(col.column_id) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
+    if !scan_slots.insert(raw.column_id) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            col.source_path(),
             format!(
                 "duplicate read column id {} for {}",
-                col.column_id, col.name
+                raw.column_id, raw.name
             ),
         ));
     }
-    if !record_iceberg_virtual_column(table, &col, iceberg_virtual)? {
+    if !record_iceberg_virtual_column(table, raw, iceberg_virtual).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            col.type_path().unwrap_or_else(|| col.source_path()),
+            error,
+        )
+    })? {
         push_physical_read_column(physical_read_columns, read_names, read_slots, col.clone())?;
     }
     scan_columns.push(col);
@@ -333,34 +388,40 @@ fn push_scan_column(
 
 #[allow(clippy::too_many_arguments)]
 fn ensure_virtual_only_scan_has_row_count_carrier(
-    scan_columns: &mut Vec<common::OutputColumn>,
+    scan_columns: &mut Vec<ProvenancedOutputColumn>,
     scan_names: &mut HashSet<String>,
     scan_slots: &mut HashSet<u32>,
-    physical_read_columns: &mut Vec<common::OutputColumn>,
+    physical_read_columns: &mut Vec<ProvenancedOutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
     next_hidden_column_id: &mut u32,
     iceberg_virtual: &IcebergVirtualSpec,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+    source_path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
     if !physical_read_columns.is_empty() || iceberg_virtual.is_empty() {
         return Ok(());
     }
-    let column_id = allocate_hidden_column_id(next_hidden_column_id, scan_slots)?;
-    let column = iceberg_virtual_count_column(column_id);
-    if !scan_names.insert(column.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
-            format!("duplicate read column name {}", column.name),
+    let column_id = allocate_hidden_column_id(next_hidden_column_id, scan_slots)
+        .map_err(|error| error.into_native(source_path.clone()))?;
+    let raw_column = iceberg_virtual_count_column(column_id);
+    let column = ProvenancedOutputColumn::trusted_internal(
+        raw_column,
+        source_path.clone(),
+        source_path.field("name"),
+    );
+    if !scan_names.insert(column.column().name.clone()) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            column.name_path(),
+            format!("duplicate read column name {}", column.column().name),
         ));
     }
-    if !scan_slots.insert(column.column_id) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "columns",
+    if !scan_slots.insert(column.column().column_id) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            column.source_path(),
             format!(
                 "duplicate read column id {} for {}",
-                column.column_id, column.name
+                column.column().column_id,
+                column.column().name
             ),
         ));
     }
@@ -368,14 +429,14 @@ fn ensure_virtual_only_scan_has_row_count_carrier(
     push_physical_read_column(physical_read_columns, read_names, read_slots, column)
 }
 
-fn parquet_slot_kind_from_native_column(
-    column: &common::OutputColumn,
-) -> Result<ParquetSlotKind, NativeFragmentLeafDecodeError> {
-    let data_type = output_column_data_type(column)?;
-    if matches!(data_type, DataType::LargeBinary) {
-        Ok(ParquetSlotKind::Variant)
+fn parquet_slot_kind_from_native_column(column: &ProvenancedOutputColumn) -> ParquetSlotKind {
+    if matches!(
+        column.slot_schema().data_type(),
+        arrow::datatypes::DataType::LargeBinary
+    ) {
+        ParquetSlotKind::Variant
     } else {
-        Ok(ParquetSlotKind::Regular)
+        ParquetSlotKind::Regular
     }
 }
 
@@ -400,85 +461,131 @@ fn allocate_hidden_column_id(
 
 fn output_column_from_predicate_ref(
     col: &PredicateColumnRef,
-) -> Result<common::OutputColumn, NativeFragmentLeafDecodeError> {
+) -> Result<ProvenancedOutputColumn, NativeFragmentDecodeError> {
     let name = col.name.clone().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "predicates",
+        NativeFragmentDecodeError::missing(
+            col.expression_path
+                .clone()
+                .field("column_ref")
+                .field("column"),
             format!(
                 "predicate column_id={} requires a column name for hidden read binding",
                 col.column_id
             ),
         )
     })?;
-    Ok(common::OutputColumn {
+    let source_path = col.expression_path.clone().field("column_ref");
+    let column = common::OutputColumn {
         column_id: col.column_id,
         name,
         r#type: col.r#type.clone(),
         nullable: col.nullable,
         is_internal: false,
-    })
+    };
+    ProvenancedOutputColumn::decode(
+        column,
+        source_path.clone(),
+        source_path.field("column"),
+        col.expression_path.clone().field("type"),
+    )
 }
 
 fn output_column_from_table_def(
     scan: &plan::ScanNode,
     name: &str,
     column_id: u32,
-) -> Result<common::OutputColumn, NativeFragmentLeafDecodeError> {
+    scan_path: FieldPath,
+) -> Result<Option<ProvenancedOutputColumn>, NativeFragmentDecodeError> {
     let table = scan.table.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "table",
+        NativeFragmentDecodeError::missing(
+            scan_path.clone().field("table"),
             "ScanNode table missing",
         )
     })?;
-    let column = table
+    let located = table
         .columns
         .iter()
-        .chain(table.iceberg_row_lineage_metadata_columns.iter())
-        .find(|col| col.name == name)
-        .ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "required_columns",
-                format!("required column {name} is not in table column definitions"),
+        .enumerate()
+        .find(|(_, column)| column.name == name)
+        .map(|(index, column)| {
+            (
+                column,
+                scan_path
+                    .clone()
+                    .field("table")
+                    .field("columns")
+                    .index(index),
             )
-        })?;
-    let ty = column
-        .logical_type
-        .as_ref()
-        .or(column.data_type.as_ref())
-        .ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::MissingField,
-                "required_columns",
-                format!("required column {name} type missing"),
-            )
-        })?
-        .clone();
-    Ok(common::OutputColumn {
+        })
+        .or_else(|| {
+            table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| column.name == name)
+                .map(|(index, column)| {
+                    (
+                        column,
+                        scan_path
+                            .clone()
+                            .field("table")
+                            .field("iceberg_row_lineage_metadata_columns")
+                            .index(index),
+                    )
+                })
+        });
+    let Some((column, source_path)) = located else {
+        return Ok(None);
+    };
+    let (ty, type_path) = if let Some(logical_type) = column.logical_type.as_ref() {
+        (
+            logical_type.clone(),
+            source_path.clone().field("logical_type"),
+        )
+    } else if let Some(data_type) = column.data_type.as_ref() {
+        (data_type.clone(), source_path.clone().field("data_type"))
+    } else {
+        return Err(NativeFragmentDecodeError::missing(
+            source_path.clone().field("data_type"),
+            format!("required column {name} type missing"),
+        ));
+    };
+    let output = common::OutputColumn {
         column_id,
         name: column.name.clone(),
         r#type: Some(ty),
         nullable: column.nullable,
         is_internal: true,
-    })
+    };
+    ProvenancedOutputColumn::decode(
+        output,
+        source_path.clone(),
+        source_path.field("name"),
+        type_path,
+    )
+    .map(Some)
 }
 
 fn scan_predicate_column_refs(
     predicates: &[crate::proto::expr::Expr],
-) -> Result<BTreeMap<u32, PredicateColumnRef>, NativeFragmentLeafDecodeError> {
+    scan_path: FieldPath,
+) -> Result<BTreeMap<u32, PredicateColumnRef>, NativeFragmentDecodeError> {
     let mut refs = BTreeMap::new();
-    for predicate in predicates {
-        collect_predicate_column_refs(predicate, &mut refs)?;
+    for (index, predicate) in predicates.iter().enumerate() {
+        collect_predicate_column_refs(
+            predicate,
+            scan_path.clone().field("predicates").index(index),
+            &mut refs,
+        )?;
     }
     Ok(refs)
 }
 
 fn collect_predicate_column_refs(
     expr: &crate::proto::expr::Expr,
+    expression_path: FieldPath,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+) -> Result<(), NativeFragmentDecodeError> {
     use crate::proto::expr::expr::Kind;
 
     let Some(kind) = expr.kind.as_ref() else {
@@ -491,12 +598,12 @@ fn collect_predicate_column_refs(
                 name: col.column.clone(),
                 r#type: expr.r#type.clone(),
                 nullable: expr.nullable,
+                expression_path: expression_path.clone(),
             };
             if let Some(prev) = refs.insert(col.column_id, next.clone()) {
                 if prev.name != next.name {
-                    return Err(NativeFragmentLeafDecodeError::at_field(
-                        ProtocolErrorKind::InconsistentFields,
-                        "predicates",
+                    return Err(NativeFragmentDecodeError::inconsistent(
+                        expression_path.field("column_ref").field("column"),
                         format!(
                             "predicate column_id={} has inconsistent names {:?} and {:?}",
                             col.column_id, prev.name, next.name
@@ -507,86 +614,130 @@ fn collect_predicate_column_refs(
         }
         Kind::Literal(_) | Kind::LambdaParamRef(_) => {}
         Kind::BinaryOp(binary) => {
-            collect_optional_box_expr(&binary.left, refs)?;
-            collect_optional_box_expr(&binary.right, refs)?;
+            let path = expression_path.field("binary_op");
+            collect_optional_box_expr(&binary.left, path.clone().field("left"), refs)?;
+            collect_optional_box_expr(&binary.right, path.field("right"), refs)?;
         }
-        Kind::UnaryOp(unary) => collect_optional_box_expr(&unary.operand, refs)?,
-        Kind::FunctionCall(call) => collect_expr_list(&call.args, refs)?,
+        Kind::UnaryOp(unary) => collect_optional_box_expr(
+            &unary.operand,
+            expression_path.field("unary_op").field("operand"),
+            refs,
+        )?,
+        Kind::FunctionCall(call) => collect_expr_list(
+            &call.args,
+            expression_path.field("function_call").field("args"),
+            refs,
+        )?,
         Kind::AggregateCall(call) => {
-            collect_expr_list(&call.args, refs)?;
-            collect_sort_items(&call.order_by, refs)?;
+            let path = expression_path.field("aggregate_call");
+            collect_expr_list(&call.args, path.clone().field("args"), refs)?;
+            collect_sort_items(&call.order_by, path.field("order_by"), refs)?;
         }
         Kind::WindowCall(call) => {
-            collect_expr_list(&call.args, refs)?;
-            collect_expr_list(&call.partition_by, refs)?;
-            collect_sort_items(&call.order_by, refs)?;
+            let path = expression_path.field("window_call");
+            collect_expr_list(&call.args, path.clone().field("args"), refs)?;
+            collect_expr_list(&call.partition_by, path.clone().field("partition_by"), refs)?;
+            collect_sort_items(&call.order_by, path.field("order_by"), refs)?;
         }
-        Kind::Cast(cast) => collect_optional_box_expr(&cast.operand, refs)?,
-        Kind::IsNull(is_null) => collect_optional_box_expr(&is_null.operand, refs)?,
+        Kind::Cast(cast) => collect_optional_box_expr(
+            &cast.operand,
+            expression_path.field("cast").field("operand"),
+            refs,
+        )?,
+        Kind::IsNull(is_null) => collect_optional_box_expr(
+            &is_null.operand,
+            expression_path.field("is_null").field("operand"),
+            refs,
+        )?,
         Kind::InList(in_list) => {
-            collect_optional_box_expr(&in_list.operand, refs)?;
-            collect_expr_list(&in_list.list, refs)?;
+            let path = expression_path.field("in_list");
+            collect_optional_box_expr(&in_list.operand, path.clone().field("operand"), refs)?;
+            collect_expr_list(&in_list.list, path.field("list"), refs)?;
         }
         Kind::Between(between) => {
-            collect_optional_box_expr(&between.operand, refs)?;
-            collect_optional_box_expr(&between.low, refs)?;
-            collect_optional_box_expr(&between.high, refs)?;
+            let path = expression_path.field("between");
+            collect_optional_box_expr(&between.operand, path.clone().field("operand"), refs)?;
+            collect_optional_box_expr(&between.low, path.clone().field("low"), refs)?;
+            collect_optional_box_expr(&between.high, path.field("high"), refs)?;
         }
         Kind::Like(like) => {
-            collect_optional_box_expr(&like.operand, refs)?;
-            collect_optional_box_expr(&like.pattern, refs)?;
+            let path = expression_path.field("like");
+            collect_optional_box_expr(&like.operand, path.clone().field("operand"), refs)?;
+            collect_optional_box_expr(&like.pattern, path.field("pattern"), refs)?;
         }
         Kind::CaseExpr(case_expr) => {
-            collect_optional_box_expr(&case_expr.operand, refs)?;
-            for branch in &case_expr.when_then {
-                collect_optional_expr(&branch.when, refs)?;
-                collect_optional_expr(&branch.then, refs)?;
+            let path = expression_path.field("case_expr");
+            collect_optional_box_expr(&case_expr.operand, path.clone().field("operand"), refs)?;
+            for (index, branch) in case_expr.when_then.iter().enumerate() {
+                let branch_path = path.clone().field("when_then").index(index);
+                collect_optional_expr(&branch.when, branch_path.clone().field("when"), refs)?;
+                collect_optional_expr(&branch.then, branch_path.field("then"), refs)?;
             }
-            collect_optional_box_expr(&case_expr.else_expr, refs)?;
+            collect_optional_box_expr(&case_expr.else_expr, path.field("else_expr"), refs)?;
         }
-        Kind::IsTruth(is_truth) => collect_optional_box_expr(&is_truth.operand, refs)?,
-        Kind::Lambda(lambda) => collect_optional_box_expr(&lambda.body, refs)?,
-        Kind::Nested(nested) => collect_optional_box_expr(&nested.inner, refs)?,
+        Kind::IsTruth(is_truth) => collect_optional_box_expr(
+            &is_truth.operand,
+            expression_path.field("is_truth").field("operand"),
+            refs,
+        )?,
+        Kind::Lambda(lambda) => collect_optional_box_expr(
+            &lambda.body,
+            expression_path.field("lambda").field("body"),
+            refs,
+        )?,
+        Kind::Nested(nested) => collect_optional_box_expr(
+            &nested.inner,
+            expression_path.field("nested").field("inner"),
+            refs,
+        )?,
     }
     Ok(())
 }
 
 fn collect_optional_box_expr(
     expr: &Option<Box<crate::proto::expr::Expr>>,
+    expression_path: FieldPath,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+) -> Result<(), NativeFragmentDecodeError> {
     if let Some(expr) = expr.as_ref() {
-        collect_predicate_column_refs(expr, refs)?;
+        collect_predicate_column_refs(expr, expression_path, refs)?;
     }
     Ok(())
 }
 
 fn collect_optional_expr(
     expr: &Option<crate::proto::expr::Expr>,
+    expression_path: FieldPath,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+) -> Result<(), NativeFragmentDecodeError> {
     if let Some(expr) = expr.as_ref() {
-        collect_predicate_column_refs(expr, refs)?;
+        collect_predicate_column_refs(expr, expression_path, refs)?;
     }
     Ok(())
 }
 
 fn collect_expr_list(
     exprs: &[crate::proto::expr::Expr],
+    list_path: FieldPath,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    for expr in exprs {
-        collect_predicate_column_refs(expr, refs)?;
+) -> Result<(), NativeFragmentDecodeError> {
+    for (index, expr) in exprs.iter().enumerate() {
+        collect_predicate_column_refs(expr, list_path.clone().index(index), refs)?;
     }
     Ok(())
 }
 
 fn collect_sort_items(
     items: &[crate::proto::expr::SortItem],
+    list_path: FieldPath,
     refs: &mut BTreeMap<u32, PredicateColumnRef>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    for item in items {
-        collect_optional_expr(&item.expr, refs)?;
+) -> Result<(), NativeFragmentDecodeError> {
+    for (index, item) in items.iter().enumerate() {
+        collect_optional_expr(
+            &item.expr,
+            list_path.clone().index(index).field("expr"),
+            refs,
+        )?;
     }
     Ok(())
 }
