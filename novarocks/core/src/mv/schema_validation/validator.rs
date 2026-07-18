@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! IVM-A11 refresh-time schema contract validator.
+//! Refresh-time Iceberg MV schema contract validator.
 //!
 //! Single entry point: `validate_schema_contract`. Three-stage check:
 //!   1. identity guard (uuid + format-version + row-lineage)
@@ -25,199 +25,27 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
+use super::model::{ContractDecision, CurrentIcebergTableView, SchemaEvolutionError};
 use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
     ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
     JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
 };
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ContractDecision {
-    CompatibleSafe,
-    CompatibleSafeWithRebind { rebound_columns: Vec<RebindColumn> },
-    Incompatible(SchemaEvolutionError),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SchemaEvolutionError {
-    BaseTableIdentityChanged {
-        expected: String,
-        actual: String,
-    },
-    BaseRowLineageContractBroken {
-        reason: String,
-    },
-    BaseFieldDropped {
-        field_id: i32,
-        name_at_create: String,
-    },
-    BaseFieldTypeChanged {
-        field_id: i32,
-        name_at_create: String,
-        from: String,
-        to: String,
-    },
-    BaseFieldNullabilityChanged {
-        field_id: i32,
-        name_at_create: String,
-        from_required: bool,
-        to_required: bool,
-    },
-    TargetTableIdentityChanged {
-        expected: String,
-        actual: String,
-    },
-    TargetRowLineageContractBroken {
-        reason: String,
-    },
-    TargetVisibleFieldDropped {
-        output_name: String,
-        target_field_id: i32,
-    },
-    TargetVisibleFieldRenamed {
-        target_field_id: i32,
-        expected: String,
-        actual: String,
-    },
-    TargetVisibleFieldTypeChanged {
-        target_field_id: i32,
-        from: String,
-        to: String,
-    },
-    HiddenApplyKeyContractBroken {
-        reason: String,
-    },
-    TargetPartitionSpecChanged {
-        reason: String,
-    },
-    AggregateStateContractBroken {
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for SchemaEvolutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BaseTableIdentityChanged { expected, actual } => write!(
-                f,
-                "iceberg MV refresh blocked: base table identity changed (uuid expected={expected}, actual={actual}); run REFRESH FULL or recreate the MV"
-            ),
-            Self::BaseRowLineageContractBroken { reason } => write!(
-                f,
-                "iceberg MV refresh blocked: base table row-lineage contract broken ({reason}); run REFRESH FULL or recreate the MV"
-            ),
-            Self::BaseFieldDropped {
-                field_id,
-                name_at_create,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) was dropped from base table; run REFRESH FULL or recreate the MV"
-            ),
-            Self::BaseFieldTypeChanged {
-                field_id,
-                name_at_create,
-                from,
-                to,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed type from {from} to {to}; run REFRESH FULL or recreate the MV"
-            ),
-            Self::BaseFieldNullabilityChanged {
-                field_id,
-                name_at_create,
-                from_required,
-                to_required,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: base column \"{name_at_create}\" (field id {field_id}) changed nullability from required={from_required} to required={to_required}; run REFRESH FULL or recreate the MV"
-            ),
-            Self::TargetTableIdentityChanged { expected, actual } => write!(
-                f,
-                "iceberg MV refresh blocked: target table identity changed (uuid expected={expected}, actual={actual}); recreate the MV"
-            ),
-            Self::TargetRowLineageContractBroken { reason } => write!(
-                f,
-                "iceberg MV refresh blocked: target table row-lineage contract broken ({reason}); recreate the MV"
-            ),
-            Self::TargetVisibleFieldDropped {
-                output_name,
-                target_field_id,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: target visible column \"{output_name}\" (field id {target_field_id}) was dropped; recreate the MV"
-            ),
-            Self::TargetVisibleFieldRenamed {
-                target_field_id,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) renamed externally: expected \"{expected}\", actual \"{actual}\"; recreate the MV"
-            ),
-            Self::TargetVisibleFieldTypeChanged {
-                target_field_id,
-                from,
-                to,
-            } => write!(
-                f,
-                "iceberg MV refresh blocked: target visible column (field id {target_field_id}) changed type from {from} to {to}; recreate the MV"
-            ),
-            Self::HiddenApplyKeyContractBroken { reason } => write!(
-                f,
-                "iceberg MV refresh blocked: target hidden apply-key column contract broken ({reason}); recreate the MV"
-            ),
-            Self::TargetPartitionSpecChanged { reason } => write!(
-                f,
-                "iceberg MV refresh blocked: target partition spec changed externally ({reason}); recreate the MV"
-            ),
-            Self::AggregateStateContractBroken { reason } => write!(
-                f,
-                "iceberg MV refresh blocked: target aggregate state contract broken ({reason}); recreate the MV"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SchemaEvolutionError {}
-
-const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
-
 pub(crate) fn validate_schema_contract(
     contract: &MvSchemaContract,
-    current_base_table: &iceberg::table::Table,
-    current_target_table: &iceberg::table::Table,
-) -> ContractDecision {
-    validate_schema_contract_with_base_schema(
-        contract,
-        current_base_table,
-        current_base_table.metadata().current_schema(),
-        current_target_table,
-    )
-}
-
-pub(crate) fn validate_schema_contract_with_base_schema(
-    contract: &MvSchemaContract,
-    current_base_table: &iceberg::table::Table,
-    base_schema: &iceberg::spec::Schema,
-    current_target_table: &iceberg::table::Table,
+    current_base: &CurrentIcebergTableView<'_>,
+    current_target: &CurrentIcebergTableView<'_>,
 ) -> ContractDecision {
     // Stage 1: identity guard.
-    if let Some(err) = validate_identity_guards(contract, current_base_table, current_target_table)
+    if let Some(err) = validate_identity_guards(contract, current_base, current_target) {
+        return ContractDecision::Incompatible(err);
+    }
+    if let Some(err) = check_target_partition_spec(contract, current_target.default_partition_spec)
     {
         return ContractDecision::Incompatible(err);
     }
-    if let Some(err) = check_target_partition_spec(
-        contract,
-        current_target_table.metadata().default_partition_spec(),
-    ) {
-        return ContractDecision::Incompatible(err);
-    }
-    validate_schema_contract_after_identity(
-        contract,
-        base_schema,
-        current_target_table.metadata().current_schema(),
-    )
+    validate_schema_contract_after_identity(contract, current_base.schema, current_target.schema)
 }
 
 fn validate_schema_contract_after_identity(
@@ -256,46 +84,44 @@ fn validate_schema_contract_after_identity(
 
 fn validate_identity_guards(
     contract: &MvSchemaContract,
-    base: &iceberg::table::Table,
-    target: &iceberg::table::Table,
+    base: &CurrentIcebergTableView<'_>,
+    target: &CurrentIcebergTableView<'_>,
 ) -> Option<SchemaEvolutionError> {
-    let actual_base_uuid = base.metadata().uuid().to_string();
-    if actual_base_uuid != contract.base.table_uuid {
+    if base.table_uuid != contract.base.table_uuid {
         return Some(SchemaEvolutionError::BaseTableIdentityChanged {
             expected: contract.base.table_uuid.clone(),
-            actual: actual_base_uuid,
+            actual: base.table_uuid.clone(),
         });
     }
-    if base.metadata().format_version() != iceberg::spec::FormatVersion::V3 {
+    if base.format_version != iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
             reason: format!(
                 "base table must be Iceberg format v3, found {:?}",
-                base.metadata().format_version()
+                base.format_version
             ),
         });
     }
-    if !row_lineage_enabled(base.metadata().properties()) {
+    if !base.row_lineage_enabled {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
             reason: "base table property write.row-lineage must be true".to_string(),
         });
     }
 
-    let actual_target_uuid = target.metadata().uuid().to_string();
-    if actual_target_uuid != contract.target.table_uuid {
+    if target.table_uuid != contract.target.table_uuid {
         return Some(SchemaEvolutionError::TargetTableIdentityChanged {
             expected: contract.target.table_uuid.clone(),
-            actual: actual_target_uuid,
+            actual: target.table_uuid.clone(),
         });
     }
-    if target.metadata().format_version() != iceberg::spec::FormatVersion::V3 {
+    if target.format_version != iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
             reason: format!(
                 "target table must be Iceberg format v3, found {:?}",
-                target.metadata().format_version()
+                target.format_version
             ),
         });
     }
-    if !row_lineage_enabled(target.metadata().properties()) {
+    if !target.row_lineage_enabled {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
             reason: "target table property write.row-lineage must be true".to_string(),
         });
@@ -643,66 +469,6 @@ fn check_aggregate_state_schema(
     None
 }
 
-fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {
-    props
-        .get(ICEBERG_ROW_LINEAGE_PROP)
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Assert the lake descriptor's schema contract matches the store's contract.
-/// Fail-loud: the descriptor is the authoritative home (W2); a missing or
-/// drifted descriptor contract means a create/alter path failed to sync it.
-pub(crate) fn ensure_descriptor_schema_contract_matches(
-    descriptor_contract: Option<&MvSchemaContract>,
-    stored_contract: &MvSchemaContract,
-) -> Result<(), String> {
-    match descriptor_contract {
-        None => Err(
-            "MV descriptor is missing its schema_contract; expected a W2+ MV package \
-             (create/alter must sync the descriptor)"
-                .to_string(),
-        ),
-        Some(found) if found != stored_contract => Err(
-            "MV descriptor schema_contract drifted from the metadata store; \
-             a create/alter path failed to keep the descriptor in sync"
-                .to_string(),
-        ),
-        Some(_) => Ok(()),
-    }
-}
-
-/// Assert the provenance watermark (from the MV table's current snapshot
-/// summary) matches the metadata store's last_refresh_snapshots. Fail-loud on
-/// drift — the summary is the authoritative watermark home (W3a).
-pub(crate) fn ensure_summary_watermark_matches_store(
-    provenance_bases: &[ProvenanceBase],
-    store_last_refresh_snapshots: &std::collections::BTreeMap<String, i64>,
-) -> Result<(), String> {
-    for base in provenance_bases {
-        match store_last_refresh_snapshots.get(&base.table_fqn) {
-            None => {
-                return Err(format!(
-                    "MV refresh watermark drift: base table {} is present in the MV \
-                     table's snapshot-summary provenance (to_snapshot={}) but missing from \
-                     the metadata store's last_refresh_snapshots",
-                    base.table_fqn, base.to_snapshot
-                ));
-            }
-            Some(&stored_snapshot) if stored_snapshot != base.to_snapshot => {
-                return Err(format!(
-                    "MV refresh watermark drift for base table {}: snapshot-summary \
-                     provenance says to_snapshot={}, metadata store says \
-                     last_refresh_snapshots={}",
-                    base.table_fqn, base.to_snapshot, stored_snapshot
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,65 +494,66 @@ mod tests {
             .expect("test schema")
     }
 
-    fn identity_table(
+    #[derive(Clone)]
+    struct TestCurrentIcebergTable {
+        table_uuid: String,
         format_version: iceberg::spec::FormatVersion,
-        row_lineage: Option<&str>,
-    ) -> iceberg::table::Table {
-        use iceberg::spec::{PartitionSpec, PrimitiveType, SortOrder, TableMetadataBuilder, Type};
+        row_lineage_enabled: bool,
+        schema: iceberg::spec::Schema,
+        default_partition_spec: iceberg::spec::PartitionSpec,
+    }
 
-        let schema = test_schema(
-            1,
-            vec![
-                iceberg::spec::NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
-                iceberg::spec::NestedField::required(
-                    2,
-                    HIDDEN_APPLY_KEY_COLUMN_NAME,
-                    Type::Primitive(PrimitiveType::Long),
-                ),
-            ],
-        );
-        let properties = row_lineage
-            .map(|value| {
-                std::collections::HashMap::from([(
-                    ICEBERG_ROW_LINEAGE_PROP.to_string(),
-                    value.to_string(),
-                )])
-            })
-            .unwrap_or_default();
-        let metadata = TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "file:///tmp/ebd16b-schema-validation".to_string(),
+    impl TestCurrentIcebergTable {
+        fn view(&self) -> CurrentIcebergTableView<'_> {
+            CurrentIcebergTableView {
+                table_uuid: self.table_uuid.clone(),
+                format_version: self.format_version,
+                row_lineage_enabled: self.row_lineage_enabled,
+                schema: &self.schema,
+                default_partition_spec: &self.default_partition_spec,
+            }
+        }
+    }
+
+    fn identity_table(
+        table_uuid: &str,
+        format_version: iceberg::spec::FormatVersion,
+        row_lineage_enabled: bool,
+    ) -> TestCurrentIcebergTable {
+        use iceberg::spec::{PartitionSpec, PrimitiveType, Type};
+
+        TestCurrentIcebergTable {
+            table_uuid: table_uuid.to_string(),
             format_version,
-            properties,
-        )
-        .expect("table metadata builder")
-        .build()
-        .expect("table metadata")
-        .metadata;
-        iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "table"]).expect("table ident"))
-            .file_io(iceberg::io::FileIO::new_with_fs())
-            .metadata(metadata)
-            .build()
-            .expect("test table")
+            row_lineage_enabled,
+            schema: test_schema(
+                1,
+                vec![
+                    iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Int),
+                    ),
+                    iceberg::spec::NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        Type::Primitive(PrimitiveType::Long),
+                    ),
+                ],
+            ),
+            default_partition_spec: PartitionSpec::unpartition_spec(),
+        }
     }
 
     fn identity_contract(
-        base: &iceberg::table::Table,
-        target: &iceberg::table::Table,
+        base: &TestCurrentIcebergTable,
+        target: &TestCurrentIcebergTable,
     ) -> MvSchemaContract {
         let mut contract = minimal_base_row_id_contract();
-        contract.base.table_uuid = base.metadata().uuid().to_string();
-        contract.target.table_uuid = target.metadata().uuid().to_string();
+        contract.base.table_uuid = base.table_uuid.clone();
+        contract.target.table_uuid = target.table_uuid.clone();
         contract
     }
-
-    // NOTE: building real `iceberg::table::Table` instances is heavy.
-    // These tests cover the SchemaEvolutionError Display + the
-    // sanity-test pure-function checks would need iceberg fixtures.
-    // End-to-end tests run via the SQL integration suite in Task 13.
 
     #[test]
     fn schema_evolution_error_messages_are_action_oriented() {
@@ -900,14 +667,14 @@ mod tests {
             assert_eq!(error.to_string(), expected);
         }
 
-        let good_base = identity_table(iceberg::spec::FormatVersion::V3, Some("true"));
-        let good_target = identity_table(iceberg::spec::FormatVersion::V3, Some("true"));
-        let base_v2 = identity_table(iceberg::spec::FormatVersion::V2, Some("true"));
-        let base_missing = identity_table(iceberg::spec::FormatVersion::V3, None);
-        let base_false = identity_table(iceberg::spec::FormatVersion::V3, Some("false"));
-        let target_v2 = identity_table(iceberg::spec::FormatVersion::V2, Some("true"));
-        let target_missing = identity_table(iceberg::spec::FormatVersion::V3, None);
-        let target_false = identity_table(iceberg::spec::FormatVersion::V3, Some("false"));
+        let good_base = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, true);
+        let good_target = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, true);
+        let base_v2 = identity_table("base-uuid", iceberg::spec::FormatVersion::V2, true);
+        let base_missing = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, false);
+        let base_false = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, false);
+        let target_v2 = identity_table("target-uuid", iceberg::spec::FormatVersion::V2, true);
+        let target_missing = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, false);
+        let target_false = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, false);
         let identity_cases = [
             (
                 &base_v2,
@@ -942,10 +709,96 @@ mod tests {
         ];
         for (base, target, expected) in identity_cases {
             let contract = identity_contract(base, target);
-            let error = validate_identity_guards(&contract, base, target)
+            let error = validate_identity_guards(&contract, &base.view(), &target.view())
                 .expect("identity case must be incompatible");
             assert_eq!(error.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn identity_validation_preserves_first_error_order() {
+        let good_base = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, true);
+        let good_target = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, true);
+        let contract = identity_contract(&good_base, &good_target);
+
+        let mut base = good_base.clone();
+        let mut target = good_target.clone();
+        base.table_uuid = "BASE-UUID".to_string();
+        base.format_version = iceberg::spec::FormatVersion::V2;
+        base.row_lineage_enabled = false;
+        target.table_uuid = "other-target".to_string();
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::BaseTableIdentityChanged {
+                expected: "base-uuid".to_string(),
+                actual: "BASE-UUID".to_string(),
+            })
+        );
+
+        base.table_uuid = contract.base.table_uuid.clone();
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::BaseRowLineageContractBroken {
+                reason: "base table must be Iceberg format v3, found V2".to_string(),
+            })
+        );
+
+        base.format_version = iceberg::spec::FormatVersion::V3;
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::BaseRowLineageContractBroken {
+                reason: "base table property write.row-lineage must be true".to_string(),
+            })
+        );
+
+        base.row_lineage_enabled = true;
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::TargetTableIdentityChanged {
+                expected: "target-uuid".to_string(),
+                actual: "other-target".to_string(),
+            })
+        );
+
+        target.table_uuid = contract.target.table_uuid.clone();
+        target.format_version = iceberg::spec::FormatVersion::V2;
+        target.row_lineage_enabled = false;
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::TargetRowLineageContractBroken {
+                reason: "target table must be Iceberg format v3, found V2".to_string(),
+            })
+        );
+
+        target.format_version = iceberg::spec::FormatVersion::V3;
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::TargetRowLineageContractBroken {
+                reason: "target table property write.row-lineage must be true".to_string(),
+            })
+        );
+
+        target.row_lineage_enabled = true;
+        target.schema = test_schema(12, Vec::new());
+        let mut partition_contract = contract.clone();
+        partition_contract.target.partition = Some(MvPartitionContract {
+            target_spec_id: 1,
+            fields: Vec::new(),
+        });
+        assert_eq!(
+            validate_schema_contract(&partition_contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::TargetPartitionSpecChanged {
+                reason: "expected default spec id 1, got 0".to_string(),
+            })
+        );
+
+        assert_eq!(
+            validate_schema_contract(&contract, &base.view(), &target.view()),
+            ContractDecision::Incompatible(SchemaEvolutionError::TargetVisibleFieldDropped {
+                output_name: "id".to_string(),
+                target_field_id: 1,
+            })
+        );
     }
 
     #[test]
@@ -956,17 +809,6 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("recreate the MV"));
-    }
-
-    #[test]
-    fn row_lineage_enabled_recognizes_case_insensitive_true() {
-        let mut p = std::collections::HashMap::new();
-        p.insert("write.row-lineage".to_string(), "TRUE".to_string());
-        assert!(row_lineage_enabled(&p));
-        p.insert("write.row-lineage".to_string(), "false".to_string());
-        assert!(!row_lineage_enabled(&p));
-        p.clear();
-        assert!(!row_lineage_enabled(&p));
     }
 
     #[test]
@@ -2073,97 +1915,5 @@ mod tests {
                 partition: None,
             },
         }
-    }
-
-    #[test]
-    fn descriptor_contract_matching_store_is_ok() {
-        let stored = minimal_base_row_id_contract();
-        let descriptor = minimal_base_row_id_contract();
-        assert!(ensure_descriptor_schema_contract_matches(Some(&descriptor), &stored).is_ok());
-    }
-
-    #[test]
-    fn descriptor_contract_missing_is_fail_loud() {
-        let stored = minimal_base_row_id_contract();
-        let err = ensure_descriptor_schema_contract_matches(None, &stored)
-            .expect_err("missing descriptor contract must fail");
-        assert!(err.contains("missing"), "err={err}");
-    }
-
-    #[test]
-    fn descriptor_contract_drift_is_fail_loud() {
-        let stored = minimal_base_row_id_contract();
-        let mut descriptor = minimal_base_row_id_contract();
-        descriptor.contract_version += 1;
-        let err = ensure_descriptor_schema_contract_matches(Some(&descriptor), &stored)
-            .expect_err("drifted descriptor contract must fail");
-        assert!(err.contains("drifted"), "err={err}");
-    }
-
-    fn provenance_base(table_fqn: &str, to_snapshot: i64) -> ProvenanceBase {
-        ProvenanceBase {
-            table_fqn: table_fqn.to_string(),
-            uuid: format!("uuid-{table_fqn}"),
-            from_snapshot: None,
-            to_snapshot,
-        }
-    }
-
-    #[test]
-    fn summary_watermark_matching_store_is_ok() {
-        let bases = vec![
-            provenance_base("ice.sales.orders", 200),
-            provenance_base("ice.sales.customers", 50),
-        ];
-        let store: std::collections::BTreeMap<String, i64> = [
-            ("ice.sales.orders".to_string(), 200),
-            ("ice.sales.customers".to_string(), 50),
-        ]
-        .into_iter()
-        .collect();
-
-        assert!(ensure_summary_watermark_matches_store(&bases, &store).is_ok());
-    }
-
-    #[test]
-    fn summary_watermark_ignores_store_entries_not_in_provenance() {
-        // The store may carry extra bases beyond what this snapshot's
-        // provenance references (e.g. a base dropped from the definition);
-        // the check only compares the bases actually present in provenance.
-        let bases = vec![provenance_base("ice.sales.orders", 200)];
-        let store: std::collections::BTreeMap<String, i64> = [
-            ("ice.sales.orders".to_string(), 200),
-            ("ice.sales.stale_base".to_string(), 999),
-        ]
-        .into_iter()
-        .collect();
-
-        assert!(ensure_summary_watermark_matches_store(&bases, &store).is_ok());
-    }
-
-    #[test]
-    fn summary_watermark_mismatch_is_fail_loud() {
-        let bases = vec![provenance_base("ice.sales.orders", 200)];
-        let store: std::collections::BTreeMap<String, i64> =
-            [("ice.sales.orders".to_string(), 199)]
-                .into_iter()
-                .collect();
-
-        let err = ensure_summary_watermark_matches_store(&bases, &store)
-            .expect_err("watermark mismatch must fail");
-        assert!(err.contains("ice.sales.orders"), "err={err}");
-        assert!(err.contains("200"), "err={err}");
-        assert!(err.contains("199"), "err={err}");
-    }
-
-    #[test]
-    fn summary_watermark_base_missing_from_store_is_fail_loud() {
-        let bases = vec![provenance_base("ice.sales.orders", 200)];
-        let store: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-
-        let err = ensure_summary_watermark_matches_store(&bases, &store)
-            .expect_err("missing base in store must fail");
-        assert!(err.contains("ice.sales.orders"), "err={err}");
-        assert!(err.contains("missing"), "err={err}");
     }
 }

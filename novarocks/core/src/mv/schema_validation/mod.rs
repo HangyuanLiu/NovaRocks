@@ -15,25 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod analysis_adapter;
-pub(crate) mod dependency;
-pub(crate) mod iceberg_aggregate_state;
-pub(crate) mod iceberg_backend;
-pub(crate) mod iceberg_discovery;
-pub(crate) mod iceberg_guard;
-pub(crate) mod iceberg_join_branch;
-pub(crate) mod iceberg_join_coalesce;
-pub(crate) mod iceberg_refresh;
-pub(crate) mod iceberg_target_apply;
-pub(crate) mod lake_rebuild;
-pub(crate) mod lifecycle;
-pub(crate) mod metadata_consistency;
-pub(crate) mod partition;
-pub(crate) mod recovery;
-pub(crate) mod refresh_driver;
-pub(crate) mod refresh_execution_context;
-pub(crate) mod refresh_io;
-pub(crate) mod refresh_pin_adapter;
-pub(crate) mod scan_binding;
-pub(crate) mod schema_validation_adapter;
-pub(crate) mod stateless_rebuild;
+mod model;
+mod validator;
+
+pub(crate) use model::{ContractDecision, CurrentIcebergTableView};
+pub(crate) use validator::validate_schema_contract;

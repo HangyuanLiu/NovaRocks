@@ -66,6 +66,9 @@ use crate::engine::mv::refresh_io::{
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
 use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin;
+use crate::engine::mv::schema_validation_adapter::{
+    validate_current_schema_contract, validate_current_schema_contract_with_base_schema,
+};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
@@ -107,6 +110,7 @@ use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_o
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
 };
+use crate::mv::schema_validation::ContractDecision;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -660,18 +664,10 @@ fn validate_aggregate_schema_contract_for_base(
             base_ref.fqn()
         ));
     }
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(()),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Err(format!(
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(()),
+        ContractDecision::CompatibleSafeWithRebind { .. } => Err(format!(
             "iceberg aggregate-over-UNION-ALL MV requires schema rebind for base {}, which is not supported for fan-in aggregate refresh; rebuild or recreate the MV",
             base_ref.fqn()
         )),
@@ -907,18 +903,10 @@ fn validate_union_projection_schema_contract_for_base(
                 base_ref.fqn()
             )
         })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(()),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Err(format!(
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(()),
+        ContractDecision::CompatibleSafeWithRebind { .. } => Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} requires schema rebind, which is not supported for UNION ALL refresh; rebuild or recreate the MV",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         )),
@@ -3320,7 +3308,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         let descriptor =
             MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
         let descriptor_contract = descriptor.schema_contract_typed()?;
-        crate::engine::mv::schema_contract::ensure_descriptor_schema_contract_matches(
+        crate::engine::mv::metadata_consistency::ensure_descriptor_schema_contract_matches(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
@@ -3330,7 +3318,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         // skip.
         if let Some(current) = loaded.table.metadata().current_snapshot() {
             if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
-                crate::engine::mv::schema_contract::ensure_summary_watermark_matches_store(
+                crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
                     &prov.bases,
                     &mv_definition.last_refresh_snapshots,
                 )?;
@@ -3565,17 +3553,15 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // current snapshot id unchanged. validate_schema_contract subsumes the earlier
     // ensure_base_row_lineage_contract check (it already enforces v3 +
     // row-lineage).
-    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+    let effective_definition = match validate_current_schema_contract(
         schema_contract,
         &loaded.table,
         &target_loaded.table,
     ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+        ContractDecision::Incompatible(err) => {
             return Err(format!("{err}").into());
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -3587,9 +3573,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             def.select_sql = rewritten_sql;
             def
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-            mv_definition.clone()
-        }
+        ContractDecision::CompatibleSafe => mv_definition.clone(),
     };
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
@@ -4211,17 +4195,15 @@ fn refresh_single_aggregate_iceberg_mv(
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let mut rebind_happened = false;
-    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+    let effective_definition = match validate_current_schema_contract(
         schema_contract,
         &loaded.table,
         target_table,
     ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+        ContractDecision::Incompatible(err) => {
             return Err(format!("{err}").into());
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -4234,9 +4216,7 @@ fn refresh_single_aggregate_iceberg_mv(
             rebind_happened = true;
             def
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-            mv_definition.clone()
-        }
+        ContractDecision::CompatibleSafe => mv_definition.clone(),
     };
     let mv_definition = &effective_definition;
     // Canonicalize once; reused for both reclassification (rebind branch) and
@@ -5511,18 +5491,11 @@ pub(crate) fn plan_iceberg_mv_refresh(
 
     let current_snapshot_id = current_snapshot_id_before_pin;
     let loaded = pre_pin_loaded;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+    match validate_current_schema_contract(schema_contract, &loaded.table, &target_loaded.table) {
+        ContractDecision::Incompatible(err) => {
             return Err(RefreshError::user(format!("{err}")));
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        }
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
+        ContractDecision::CompatibleSafeWithRebind { .. } | ContractDecision::CompatibleSafe => {}
     }
 
     let refresh_decision = decide_refresh(
@@ -5976,18 +5949,12 @@ fn plan_iceberg_aggregate_mv_refresh(
             };
             let loaded =
                 load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-            match crate::engine::mv::schema_contract::validate_schema_contract(
-                schema_contract,
-                &loaded.table,
-                target_table,
-            ) {
-                crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            match validate_current_schema_contract(schema_contract, &loaded.table, target_table) {
+                ContractDecision::Incompatible(err) => {
                     return Err(RefreshError::user(format!("{err}")));
                 }
-                crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-                | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-                    ..
-                } => {}
+                ContractDecision::CompatibleSafe
+                | ContractDecision::CompatibleSafeWithRebind { .. } => {}
             }
             let current = expected_main_snapshot_id_from_table(&loaded.table);
             let previous = mv_definition
@@ -10079,18 +10046,10 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
         return Ok(None);
     };
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(None),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+    match validate_current_schema_contract(schema_contract, &loaded.table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(None),
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -10121,18 +10080,11 @@ fn ensure_schema_contract_compatible_for_refresh(
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
+    match validate_current_schema_contract(schema_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {
+            Ok(())
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Ok(()),
     }
 }
 
@@ -10254,18 +10206,11 @@ fn validate_repartition_base_schema_contract(
                 base_ref.fqn()
             )
         })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {
+            Ok(())
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Ok(()),
     }
 }
 
@@ -10713,19 +10658,16 @@ fn validate_join_schema_contract(
         )?);
     }
     let left_schema = bases[0].1.metadata().current_schema();
-    match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
+    match validate_current_schema_contract_with_base_schema(
         contract,
         bases[0].1,
         left_schema.as_ref(),
         target_table,
     ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+        ContractDecision::Incompatible(err) => {
             return Err(format!("{err}"));
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => {}
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {}
     }
     if rebound_columns.is_empty() {
         Ok(JoinSchemaContractDecision::CompatibleSafe)
