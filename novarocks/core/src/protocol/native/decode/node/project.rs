@@ -21,7 +21,6 @@ use std::sync::Arc;
 use super::super::expr::decode_expr_at;
 use super::super::layout::Layout;
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
@@ -35,13 +34,9 @@ pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
     path: FieldPath,
-    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    check_exact_arity("ProjectNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
-    })?;
     let child = children.pop().expect("child");
     let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
     let layout = project_outputs.layout.clone();

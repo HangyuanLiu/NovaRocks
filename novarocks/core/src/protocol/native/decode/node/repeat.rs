@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field};
 
 use super::super::layout::Layout;
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::node::repeat::RepeatNode;
@@ -35,12 +34,8 @@ pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,
     repeat: &plan::RepeatNode,
     path: FieldPath,
-    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    check_exact_arity("RepeatNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
-    })?;
     let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let repeat_times = repeat.grouping_ids.len();

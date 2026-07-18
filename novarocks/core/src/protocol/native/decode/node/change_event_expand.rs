@@ -23,7 +23,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::change_event_expand::{
@@ -43,10 +42,6 @@ pub(super) fn lower_change_event_expand_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("ChangeEventExpandNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     let (output_columns, output_columns_path) = if expand.output_columns.is_empty() {
         (&physical.output_columns, physical_output_path)

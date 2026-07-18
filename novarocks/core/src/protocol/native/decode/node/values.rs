@@ -26,7 +26,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::values::ValuesNode;
@@ -40,13 +39,9 @@ pub(super) fn lower_values_node(
     values: &plan::ValuesNode,
     path: FieldPath,
     physical_output_path: FieldPath,
-    children: Vec<DecodedNode>,
+    _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("ValuesNode", 0, children.len()),
-    )?;
     let columns = if values.columns.is_empty() {
         &physical.output_columns
     } else {

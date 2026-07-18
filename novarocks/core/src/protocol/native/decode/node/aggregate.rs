@@ -23,7 +23,7 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, layout_from_output_columns, slot_schemas_from_output_columns};
 use super::DecodedNode;
-use super::common::{build_slot_projection, check_exact_arity};
+use super::common::build_slot_projection;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -42,10 +42,6 @@ pub(super) fn lower_hash_aggregate_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("HashAggregateNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     if aggregate.is_merge.len() != aggregate.aggregates.len() {
         return Err(NativeFragmentDecodeError::inconsistent(

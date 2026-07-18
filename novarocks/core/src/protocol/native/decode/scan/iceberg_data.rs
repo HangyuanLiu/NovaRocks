@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{
-    lower_scan_predicate, parse_scan_limit, resolve_cloud_object_store_config, scan_batch_size,
-    scan_output_columns, table_location_map,
+    DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit,
+    resolve_cloud_object_store_config, scan_batch_size, table_location_map,
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{maybe_project_data_scan_output, scan_read_plan};
@@ -38,10 +38,10 @@ pub(super) fn lower_iceberg_data_files_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDataFiles,
+    output_columns: &DecodedScanOutputColumns,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
-    let output_columns = scan_output_columns(scan)?;
     let table = source.table.as_ref().ok_or_else(|| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::MissingField,
@@ -49,7 +49,7 @@ pub(super) fn lower_iceberg_data_files_scan(
             "IcebergDataFiles table missing",
         )
     })?;
-    let read_plan = scan_read_plan(scan, table, &output_columns)?;
+    let read_plan = scan_read_plan(scan, table, output_columns)?;
     let ranges = decode_file_scan_ranges(node.node_id, table, ctx.scan_ranges(node.node_id)?)?;
     let cache_options = CacheOptions::from_query_options(ctx.query_options()).map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(

@@ -432,6 +432,7 @@ fn decode_node_inner(
     ctx: &NativePlanDecodeContext,
     mut ledger: Option<&mut NativeRuntimeFilterDecodeLedger>,
 ) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    validate_distributed_node_children(node, path.clone())?;
     let mut children = Vec::with_capacity(node.children.len());
     for (index, child) in node.children.iter().enumerate() {
         children.push(decode_node_inner(
@@ -517,6 +518,86 @@ fn decode_node_inner(
             .map_err(|error| error.into_native(path))?;
     }
     Ok(lowered)
+}
+
+fn validate_distributed_node_children(
+    node: &plan::DistributedNode,
+    node_path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let actual = node.children.len();
+    let Some(payload) = node.payload.as_ref() else {
+        return Ok(());
+    };
+    match payload {
+        plan::distributed_node::Payload::Exchange(_) => {
+            require_exact_children(node_path, "ExchangeReceiver", 0, actual)
+        }
+        plan::distributed_node::Payload::Physical(physical) => {
+            let Some(kind) = physical.kind.as_ref() else {
+                return Ok(());
+            };
+            match kind {
+                plan::plan_node::Kind::Values(_) => {
+                    require_exact_children(node_path, "ValuesNode", 0, actual)
+                }
+                plan::plan_node::Kind::Project(_) => {
+                    require_exact_children(node_path, "ProjectNode", 1, actual)
+                }
+                plan::plan_node::Kind::Filter(_) => {
+                    require_exact_children(node_path, "FilterNode", 1, actual)
+                }
+                plan::plan_node::Kind::Limit(_) => {
+                    require_exact_children(node_path, "LimitNode", 1, actual)
+                }
+                plan::plan_node::Kind::Sort(_) => {
+                    require_exact_children(node_path, "SortNode", 1, actual)
+                }
+                plan::plan_node::Kind::Topn(_) => {
+                    require_exact_children(node_path, "TopNNode", 1, actual)
+                }
+                plan::plan_node::Kind::SetOp(_) => {
+                    require_min_children(node_path, "SetOpNode", 2, actual)
+                }
+                plan::plan_node::Kind::AssertOneRow(_) => {
+                    require_exact_children(node_path, "AssertOneRowNode", 1, actual)
+                }
+                plan::plan_node::Kind::Scan(_) => {
+                    require_exact_children(node_path, "ScanNode", 0, actual)
+                }
+                plan::plan_node::Kind::HashAggregate(_) => {
+                    require_exact_children(node_path, "HashAggregateNode", 1, actual)
+                }
+                plan::plan_node::Kind::HashJoin(_) => {
+                    require_exact_children(node_path, "HashJoinNode", 2, actual)
+                }
+                plan::plan_node::Kind::NestLoopJoin(_) => {
+                    require_exact_children(node_path, "NestLoopJoinNode", 2, actual)
+                }
+                plan::plan_node::Kind::Window(_) => {
+                    require_exact_children(node_path, "WindowNode", 1, actual)
+                }
+                plan::plan_node::Kind::Repeat(_) => {
+                    require_exact_children(node_path, "RepeatNode", 1, actual)
+                }
+                plan::plan_node::Kind::GenerateSeries(_) => {
+                    require_exact_children(node_path, "GenerateSeriesNode", 0, actual)
+                }
+                plan::plan_node::Kind::TableFunction(_) => {
+                    require_exact_children(node_path, "TableFunctionNode", 1, actual)
+                }
+                plan::plan_node::Kind::ChangeEventExpand(_) => {
+                    require_exact_children(node_path, "ChangeEventExpandNode", 1, actual)
+                }
+                plan::plan_node::Kind::Redistribute(_) => {
+                    require_exact_children(node_path, "RedistributeNode", 1, actual)
+                }
+                plan::plan_node::Kind::Decode(_)
+                | plan::plan_node::Kind::CteAnchor(_)
+                | plan::plan_node::Kind::CteProduce(_)
+                | plan::plan_node::Kind::CteConsume(_) => Ok(()),
+            }
+        }
+    }
 }
 
 fn children_are_absent(node: &plan::DistributedNode) -> bool {
@@ -832,14 +913,18 @@ fn attach_hash_join_producers(
                 ),
             ));
         }
-        let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-            condition.left.as_ref()
-        } else {
-            condition.right.as_ref()
-        }
-        .ok_or_else(|| {
+        let (raw_build, raw_build_path) =
+            if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+                (condition.left.as_ref(), join_key_path.clone().field("left"))
+            } else {
+                (
+                    condition.right.as_ref(),
+                    join_key_path.clone().field("right"),
+                )
+            };
+        let raw_build = raw_build.ok_or_else(|| {
             super::NativeFragmentDecodeError::missing(
-                join_key_path.clone(),
+                raw_build_path.clone(),
                 format!(
                     "native runtime-filter producer binding_id={} join key ordinal={build_key_index} missing build expression",
                     binding.binding_id
@@ -848,7 +933,7 @@ fn attach_hash_join_producers(
         })?;
         if raw_build != &binding.expression {
             return Err(super::NativeFragmentDecodeError::inconsistent(
-                join_key_path.clone(),
+                raw_build_path.clone(),
                 format!(
                     "native runtime-filter producer binding_id={} expression does not match join key ordinal={build_key_index}",
                     binding.binding_id
@@ -860,7 +945,7 @@ fn attach_hash_join_producers(
             raw_build,
             build_layout,
             build_schema,
-            join_key_path,
+            raw_build_path,
         )?;
         let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
         producers.push(NativeJoinRuntimeFilterProducerSpec {
@@ -1331,7 +1416,6 @@ fn lower_physical_node(
             node,
             project,
             path.clone().field("project"),
-            node_path,
             children,
             arena,
         ),
@@ -1370,7 +1454,6 @@ fn lower_physical_node(
             node,
             assert,
             path.clone().field("assert_one_row"),
-            node_path,
             children,
         ),
         plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
@@ -1419,13 +1502,9 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Repeat(repeat) => repeat::lower_repeat_node(
-            node,
-            repeat,
-            path.clone().field("repeat"),
-            node_path,
-            children,
-        ),
+        plan::plan_node::Kind::Repeat(repeat) => {
+            repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
+        }
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
             generate_series::lower_generate_series_node(
                 node,
@@ -1756,6 +1835,25 @@ mod tests {
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
     }
 
+    fn decode_error(node: &plan::DistributedNode) -> super::super::NativeFragmentDecodeError {
+        decode_node(
+            node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid node must fail")
+    }
+
+    fn assert_children_error(node: &plan::DistributedNode) {
+        let error = decode_error(node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
+        assert_eq!(
+            protocol.kind(),
+            crate::protocol::common::error::ProtocolErrorKind::InconsistentFields
+        );
+    }
+
     fn dormant_consumer(
         binding_id: u32,
         node_id: i32,
@@ -1974,6 +2072,124 @@ mod tests {
             protocol.kind(),
             crate::protocol::common::error::ProtocolErrorKind::InvalidValue
         );
+    }
+
+    #[test]
+    fn representative_node_arities_use_distributed_children_path_and_kind() {
+        let values_with_child = physical_node(
+            20,
+            plan::plan_node::Kind::Values(plan::ValuesNode::default()),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        assert_children_error(&values_with_child);
+
+        let sort_without_child = physical_node(
+            20,
+            plan::plan_node::Kind::Sort(plan::SortNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_children_error(&sort_without_child);
+
+        let join_with_one_child = physical_node(
+            20,
+            plan::plan_node::Kind::HashJoin(plan::HashJoinNode::default()),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        assert_children_error(&join_with_one_child);
+
+        let set_op_with_one_child = physical_node(
+            20,
+            plan::plan_node::Kind::SetOp(plan::SetOpNode::default()),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+        assert_children_error(&set_op_with_one_child);
+
+        let exchange_with_child = plan::DistributedNode {
+            node_id: 20,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: vec![one_col_values_node(10)],
+            payload: Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver::default(),
+            )),
+        };
+        assert_children_error(&exchange_with_child);
+    }
+
+    #[test]
+    fn producer_raw_build_mismatch_uses_join_expression_wire_path() {
+        for (join_kind, build_on_left, expected_side) in [
+            (plan::JoinKind::Inner, false, "right"),
+            (plan::JoinKind::RightSemi, true, "left"),
+        ] {
+            let mut raw_build = if build_on_left {
+                column_ref(1, DataType::Int64)
+            } else {
+                column_ref(2, DataType::Int64)
+            };
+            raw_build.nullable = false;
+            let left_expr = if build_on_left {
+                raw_build.clone()
+            } else {
+                column_ref(1, DataType::Int64)
+            };
+            let right_expr = if build_on_left {
+                column_ref(2, DataType::Int64)
+            } else {
+                raw_build.clone()
+            };
+            let mut wire = physical_node(
+                30,
+                plan::plan_node::Kind::HashJoin(plan::HashJoinNode {
+                    join_type: i32::from(join_kind),
+                    eq_conditions: vec![plan::HashJoinEqCondition {
+                        left: Some(left_expr),
+                        right: Some(right_expr),
+                        null_safe: false,
+                    }],
+                    other_condition: None,
+                    distribution: i32::from(plan::JoinDistribution::Broadcast),
+                    execution_mode: None,
+                }),
+                Vec::new(),
+                vec![
+                    one_col_values_node_with(10, 1, "lhs", 10),
+                    one_col_values_node_with(11, 2, "rhs", 20),
+                ],
+            );
+            wire.runtime_filter_binding_ids = vec![1];
+            let table = plan::RuntimeFilterBindingTable {
+                fragment_id: 1,
+                bindings: vec![membership_producer_wire(1, 30, raw_build, &DataType::Int64)],
+            };
+            let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
+                .expect("decode producer table");
+            let error = decode_node_with_runtime_filters(
+                &wire,
+                &mut ExprArena::default(),
+                &NativePlanDecodeContext::default(),
+                &mut ledger,
+            )
+            .expect_err("raw build nullability mismatch must fail");
+            let protocol = error.protocol().expect("protocol error");
+            assert_eq!(
+                protocol.path().to_string(),
+                format!(
+                    "plan_fragment.root.payload.physical.hash_join.eq_conditions[0].{expected_side}.column_ref"
+                )
+            );
+            assert_eq!(
+                protocol.kind(),
+                crate::protocol::common::error::ProtocolErrorKind::InconsistentFields
+            );
+        }
     }
 
     #[test]

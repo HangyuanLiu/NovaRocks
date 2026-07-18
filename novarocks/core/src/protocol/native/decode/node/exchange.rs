@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use super::super::NativeFragmentDecodeError;
-use super::common::{check_exact_arity, parse_optional_nonnegative_i64};
+use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::common::config::exchange_wait_ms;
 use crate::exec::expr::ExprArena;
@@ -36,14 +36,10 @@ pub(super) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
     path: FieldPath,
-    children: Vec<DecodedNode>,
+    _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("ExchangeReceiver", 0, children.len()),
-    )?;
     let flavor = exchange
         .flavor
         .as_ref()

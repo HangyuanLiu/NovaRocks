@@ -16,7 +16,7 @@
 // under the License.
 
 use super::DecodedNode;
-use super::common::{check_exact_arity, parse_optional_nonnegative_i64};
+use super::common::parse_optional_nonnegative_i64;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
@@ -27,12 +27,8 @@ pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
     assert: &plan::AssertOneRowNode,
     path: FieldPath,
-    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    check_exact_arity("AssertOneRowNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
-    })?;
     let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let desired_num_rows = parse_optional_nonnegative_i64(

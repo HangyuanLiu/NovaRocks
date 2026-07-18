@@ -19,7 +19,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
@@ -32,10 +31,6 @@ pub(super) fn lower_redistribute_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("RedistributeNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     let mode = redistribute
         .mode

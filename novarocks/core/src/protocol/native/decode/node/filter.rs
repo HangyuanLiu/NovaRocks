@@ -17,7 +17,6 @@
 
 use super::super::expr::decode_expr_at;
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -31,9 +30,6 @@ pub(super) fn lower_filter_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    check_exact_arity("FilterNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(path.clone(), error)
-    })?;
     let child = children.pop().expect("child");
     let predicate = filter.predicate.as_ref().ok_or_else(|| {
         super::super::NativeFragmentDecodeError::missing(

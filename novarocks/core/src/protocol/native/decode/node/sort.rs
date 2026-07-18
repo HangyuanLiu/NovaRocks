@@ -20,8 +20,7 @@ use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::{
-    build_slot_projection, check_exact_arity, parse_distributed_limit,
-    parse_optional_nonnegative_i64,
+    build_slot_projection, parse_distributed_limit, parse_optional_nonnegative_i64,
 };
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
@@ -38,10 +37,6 @@ pub(super) fn lower_sort_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("SortNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     let (output_columns, output_columns_path) = if sort.output_columns.is_empty() {
         (&physical.output_columns, physical_output_path)

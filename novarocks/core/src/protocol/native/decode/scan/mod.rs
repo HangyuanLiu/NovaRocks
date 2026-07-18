@@ -44,16 +44,6 @@ pub(crate) fn lower_scan_node(
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    if !node.children.is_empty() {
-        return Err(NativeFragmentDecodeError::inconsistent(
-            path.clone().field("children"),
-            format!(
-                "ScanNode node_id={} expected no children, got {}",
-                node.node_id,
-                node.children.len()
-            ),
-        ));
-    }
     if !scan.dict_columns.is_empty() {
         return Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("dict_columns"),
@@ -76,22 +66,65 @@ pub(crate) fn lower_scan_node(
         )
     })?;
     let source_path = path.clone().field("table").field("source");
+    let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     match source {
         plan::scan_source::Kind::IcebergDataFiles(source) => {
-            iceberg_data::lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
-                .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
+            let table_path = source_path
+                .clone()
+                .field("iceberg_data_files")
+                .field("table");
+            let table = source.table.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    table_path.clone(),
+                    "IcebergDataFiles table missing",
+                )
+            })?;
+            let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
+                scan,
+                table,
+                output_columns.columns(),
+            )
+            .map_err(|error| error.into_native(path.clone()))?;
+            schema::validate_decoded_iceberg_output_schema(
+                table,
+                source_path.clone().field("iceberg_data_files"),
+                &output_columns,
+                &variant_path_plan,
+            )?;
+            iceberg_data::lower_iceberg_data_files_scan(
+                node,
+                scan,
+                source,
+                &output_columns,
+                ctx,
+                arena,
+            )
+            .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
         }
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergMetadataTable")
                 .map_err(|error| error.into_native(path.clone()))?;
-            iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
-                .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
+            iceberg_metadata::lower_iceberg_metadata_scan(
+                node,
+                scan,
+                source,
+                &output_columns,
+                ctx,
+                arena,
+            )
+            .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
         }
         plan::scan_source::Kind::IcebergDeltaTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergDeltaTable")
                 .map_err(|error| error.into_native(path.clone()))?;
-            iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
-                .map_err(|error| error.into_native(source_path.field("iceberg_delta_table")))
+            iceberg_delta::lower_iceberg_delta_table_scan(
+                node,
+                scan,
+                source,
+                &output_columns,
+                arena,
+            )
+            .map_err(|error| error.into_native(source_path.field("iceberg_delta_table")))
         }
         plan::scan_source::Kind::IcebergVersionTable(_) => {
             Err(NativeFragmentDecodeError::unsupported(
@@ -116,7 +149,8 @@ pub(crate) fn lower_scan_node(
                 .map_err(|error| error.into_native(path.clone()))?;
             #[cfg(feature = "compat")]
             {
-                starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
+                starrocks::validate_starrocks_output_columns(&output_columns, source)?;
+                starrocks::lower_starrocks_scan(node, scan, source, &output_columns, ctx, arena)
                     .map_err(|error| error.into_native(source_path.field("starrocks_table")))
             }
             #[cfg(not(feature = "compat"))]
@@ -149,9 +183,12 @@ fn reject_variant_columns_for_source(
 pub(crate) fn scan_read_binding_for_test(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
-    output_columns: &[crate::proto::common::OutputColumn],
-) -> Result<(Vec<String>, Vec<(u32, u32)>), NativeFragmentLeafDecodeError> {
-    let read_plan = read_plan::scan_read_plan(scan, table, output_columns)?;
+    _output_columns: &[crate::proto::common::OutputColumn],
+) -> Result<(Vec<String>, Vec<(u32, u32)>), NativeFragmentDecodeError> {
+    let scan_path = FieldPath::root("scan");
+    let output_columns = common::decode_scan_output_columns(scan, scan_path.clone())?;
+    let read_plan = read_plan::scan_read_plan(scan, table, &output_columns)
+        .map_err(|error| error.into_native(scan_path))?;
     Ok((
         read_plan.read_columns,
         read_plan
@@ -300,6 +337,31 @@ mod tests {
                 })),
             })),
         }
+    }
+
+    fn assert_scan_column_type_error(
+        columns: Vec<common::OutputColumn>,
+        required_columns: Vec<String>,
+        expected_index: usize,
+    ) {
+        let node = scan_node_with(
+            columns,
+            Vec::new(),
+            required_columns,
+            iceberg_metadata_table_source(),
+        );
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid scan column type must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            format!("plan_fragment.root.payload.physical.scan.columns[{expected_index}].type")
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
     }
 
     fn variant_scan_node() -> plan::DistributedNode {
@@ -829,6 +891,71 @@ mod tests {
         };
         assert_eq!(scan.node_id(), Some(10));
         assert_eq!(scan.output_chunk_schema().slot_ids(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn iceberg_metadata_invalid_column_type_uses_scan_columns_wire_path() {
+        let mut invalid = output_column(1, "id", DataType::Int64);
+        invalid.r#type = Some(common::TypeDesc::default());
+        assert_scan_column_type_error(vec![invalid], Vec::new(), 0);
+    }
+
+    #[test]
+    fn required_column_filter_preserves_original_scan_column_index() {
+        let preceding = output_column(1, "id", DataType::Int64);
+        let mut invalid = output_column(2, "flag", DataType::Boolean);
+        invalid.r#type = Some(common::TypeDesc::default());
+        assert_scan_column_type_error(vec![preceding, invalid], vec!["flag".to_string()], 1);
+    }
+
+    #[test]
+    fn iceberg_projection_schema_error_uses_scan_column_wire_path() {
+        let node = scan_node_with(
+            vec![output_column(1, "missing", DataType::Int64)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::IcebergDataFiles(plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            }),
+        );
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("missing Iceberg projection field must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.columns[0].name"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn starrocks_storage_schema_error_uses_scan_column_wire_path() {
+        let node = scan_node_with(
+            vec![output_column(1, "missing", DataType::Int64)],
+            Vec::new(),
+            Vec::new(),
+            starrocks_source(),
+        );
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("missing StarRocks storage column must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.columns[0].name"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
     }
 
     #[test]

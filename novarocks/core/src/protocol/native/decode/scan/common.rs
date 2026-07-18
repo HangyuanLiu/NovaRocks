@@ -16,53 +16,128 @@
 // under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
 use super::super::expr::decode_expr;
+use super::super::layout::Layout;
+use crate::common::ids::SlotId;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defaults};
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::{common, plan};
+use crate::protocol::common::error::FieldPath;
 use crate::protocol::common::error::ProtocolErrorKind;
+use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
-pub(super) fn scan_output_columns(
+#[derive(Clone, Debug)]
+pub(super) struct DecodedScanOutputColumns {
+    columns: Vec<common::OutputColumn>,
+    source_paths: Vec<FieldPath>,
+    layout: Layout,
+    output_schema: ChunkSchemaRef,
+}
+
+impl DecodedScanOutputColumns {
+    pub(super) fn columns(&self) -> &[common::OutputColumn] {
+        &self.columns
+    }
+
+    pub(super) fn source_path(&self, selected_index: usize) -> FieldPath {
+        self.source_paths[selected_index].clone()
+    }
+
+    pub(super) fn layout(&self) -> Layout {
+        self.layout.clone()
+    }
+
+    pub(super) fn output_schema(&self) -> ChunkSchemaRef {
+        Arc::clone(&self.output_schema)
+    }
+}
+
+pub(super) fn decode_scan_output_columns(
     scan: &plan::ScanNode,
-) -> Result<Vec<common::OutputColumn>, NativeFragmentLeafDecodeError> {
+    scan_path: FieldPath,
+) -> Result<DecodedScanOutputColumns, NativeFragmentDecodeError> {
     if scan.columns.is_empty() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "columns",
+        return Err(NativeFragmentDecodeError::missing(
+            scan_path.field("columns"),
             "ScanNode columns are empty",
         ));
     }
-    if scan.required_columns.is_empty() {
-        return Ok(scan.columns.clone());
-    }
-
-    let required = scan
-        .required_columns
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    let output_columns = scan
+    let required = (!scan.required_columns.is_empty()).then(|| {
+        scan.required_columns
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+    });
+    let selected = scan
         .columns
         .iter()
-        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
-        .cloned()
+        .enumerate()
+        .filter(|(_, column)| {
+            required
+                .as_ref()
+                .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
+        })
         .collect::<Vec<_>>();
-    if output_columns.is_empty() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "required_columns",
+    if selected.is_empty() {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            scan_path.field("required_columns"),
             format!(
                 "ScanNode required_columns {:?} do not match any scan columns",
                 scan.required_columns
             ),
         ));
     }
-    Ok(output_columns)
+    let columns_path = scan_path.field("columns");
+    let mut columns = Vec::with_capacity(selected.len());
+    let mut source_paths = Vec::with_capacity(selected.len());
+    let mut slot_schemas = Vec::with_capacity(selected.len());
+    let mut seen = HashMap::with_capacity(selected.len());
+    for (wire_index, column) in selected {
+        let source_path = columns_path.clone().index(wire_index);
+        let slot_id = SlotId::new(column.column_id);
+        if let Some(first_wire_index) = seen.insert(slot_id, wire_index) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                source_path.field("column_id"),
+                format!(
+                    "duplicate ScanNode column_id {} at wire index {} (first seen at wire index {})",
+                    column.column_id, wire_index, first_wire_index
+                ),
+            ));
+        }
+        let type_desc = column.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                source_path.clone().field("type"),
+                format!("ScanNode column {} type missing", column.name),
+            )
+        })?;
+        let field = super::super::decode_field_type(&column.name, column.nullable, type_desc)
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(source_path.clone().field("type"), error)
+            })?;
+        let slot_schema = ChunkSlotSchema::from_field(slot_id, &field, None).map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(source_path.clone().field("type"), error)
+        })?;
+        columns.push(column.clone());
+        source_paths.push(source_path);
+        slot_schemas.push(slot_schema);
+    }
+    let layout = Layout::for_slots(slot_schemas.iter().map(ChunkSlotSchema::slot_id));
+    let output_schema = ChunkSchema::try_new(slot_schemas)
+        .map(Arc::new)
+        .map_err(|error| NativeFragmentDecodeError::inconsistent(columns_path.clone(), error))?;
+    Ok(DecodedScanOutputColumns {
+        columns,
+        source_paths,
+        layout,
+        output_schema,
+    })
 }
 
 pub(super) fn column_def_data_type(

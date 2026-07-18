@@ -65,25 +65,45 @@ pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
     }
 }
 
-pub(crate) fn check_arity(
+fn check_children_arity(
+    node_path: FieldPath,
     kind: &str,
     expected: &str,
     actual: usize,
     ok: bool,
-) -> Result<(), String> {
+) -> Result<(), NativeFragmentDecodeError> {
     if ok {
         Ok(())
     } else {
-        Err(format!("{kind} expected {expected} children, got {actual}"))
+        Err(NativeFragmentDecodeError::inconsistent(
+            node_path.field("children"),
+            format!("{kind} expected {expected} children, got {actual}"),
+        ))
     }
 }
 
-pub(crate) fn check_exact_arity(kind: &str, expected: usize, actual: usize) -> Result<(), String> {
-    check_arity(kind, &expected.to_string(), actual, actual == expected)
+pub(crate) fn require_exact_children(
+    node_path: FieldPath,
+    kind: &str,
+    expected: usize,
+    actual: usize,
+) -> Result<(), NativeFragmentDecodeError> {
+    check_children_arity(
+        node_path,
+        kind,
+        &expected.to_string(),
+        actual,
+        actual == expected,
+    )
 }
 
-pub(crate) fn check_min_arity(kind: &str, min: usize, actual: usize) -> Result<(), String> {
-    check_arity(kind, &format!(">={min}"), actual, actual >= min)
+pub(crate) fn require_min_children(
+    node_path: FieldPath,
+    kind: &str,
+    min: usize,
+    actual: usize,
+) -> Result<(), NativeFragmentDecodeError> {
+    check_children_arity(node_path, kind, &format!(">={min}"), actual, actual >= min)
 }
 
 pub(crate) fn slot_ids_from_columns(

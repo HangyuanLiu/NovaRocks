@@ -22,7 +22,6 @@ use arrow::datatypes::{DataType, Field};
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use super::values::materialize_values_chunk;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -37,13 +36,9 @@ pub(super) fn lower_generate_series_node(
     node: &plan::DistributedNode,
     generate_series: &plan::GenerateSeriesNode,
     path: FieldPath,
-    children: Vec<DecodedNode>,
+    _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("GenerateSeriesNode", 0, children.len()),
-    )?;
     if generate_series.step == 0 {
         return Err(NativeFragmentDecodeError::invalid_value(
             path.clone().field("step"),

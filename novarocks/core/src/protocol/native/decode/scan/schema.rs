@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Schema;
 
+use super::common::DecodedScanOutputColumns;
 use super::variant_path::NativeVariantPathPlan;
 use super::virtual_columns::iceberg_virtual_projected_field;
 use crate::common::ids::SlotId;
@@ -29,7 +30,28 @@ use crate::connector::iceberg::{
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::proto::{common, plan};
 use crate::protocol::common::error::ProtocolErrorKind;
+use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+
+pub(super) fn validate_decoded_iceberg_output_schema(
+    table: &plan::IcebergTableInfo,
+    source_path: crate::protocol::common::error::FieldPath,
+    output_columns: &DecodedScanOutputColumns,
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Result<(), NativeFragmentDecodeError> {
+    let descriptor =
+        iceberg_table_descriptor(table).map_err(|error| error.into_native(source_path))?;
+    let variant_output_fields = variant_path_plan
+        .specs
+        .iter()
+        .map(|spec| (spec.output_slot_id, spec.output_field.clone()))
+        .collect::<HashMap<_, _>>();
+    for (index, column) in output_columns.columns().iter().enumerate() {
+        iceberg_projected_field(table, &descriptor, column, &variant_output_fields)
+            .map_err(|error| error.into_native(output_columns.source_path(index)))?;
+    }
+    Ok(())
+}
 
 pub(super) fn iceberg_chunk_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
@@ -60,7 +82,7 @@ pub(super) fn iceberg_chunk_schema_from_output_columns_with_variants(
         |error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InconsistentFields,
-                "output_columns",
+                "columns",
                 error,
             )
         },
@@ -90,53 +112,59 @@ fn iceberg_arrow_schema_from_output_columns_with_variants(
         .map(|spec| (spec.output_slot_id, spec.output_field.clone()))
         .collect::<HashMap<_, _>>();
     let mut fields = Vec::with_capacity(output_columns.len());
-    for col in output_columns {
-        if let Some(field) = variant_output_fields.get(&SlotId::new(col.column_id)) {
-            fields.push(field.clone());
-            continue;
-        }
-        if let Some(field) = iceberg_virtual_projected_field(table, col)? {
-            fields.push(field);
-            continue;
-        }
-        let desc = col.r#type.as_ref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::MissingField,
-                "output_columns",
-                format!("output column {} type missing", col.name),
-            )
-        })?;
-        let projected = build_projected_output_schema(
-            &descriptor,
-            &[IcebergArrowColumn {
-                name: col.name.clone(),
-                data_type: super::super::decode_type(desc).map_err(|error| {
-                    NativeFragmentLeafDecodeError::at_field(
-                        ProtocolErrorKind::InvalidValue,
-                        "output_columns",
-                        error,
-                    )
-                })?,
-                nullable: col.nullable,
-            }],
-        )
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "output_columns",
-                error,
-            )
-        })?
-        .ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::MissingField,
-                "table",
-                "IcebergDataFiles table schema missing",
-            )
-        })?;
-        fields.push(projected.field(0).clone());
+    for (index, col) in output_columns.iter().enumerate() {
+        fields.push(
+            iceberg_projected_field(table, &descriptor, col, &variant_output_fields)
+                .map_err(|error| error.prepend_index(index).prepend_field("columns"))?,
+        );
     }
     Ok(std::sync::Arc::new(Schema::new(fields)))
+}
+
+fn iceberg_projected_field(
+    table: &plan::IcebergTableInfo,
+    descriptor: &IcebergTableDescriptor,
+    column: &common::OutputColumn,
+    variant_output_fields: &HashMap<SlotId, arrow::datatypes::Field>,
+) -> Result<arrow::datatypes::Field, NativeFragmentLeafDecodeError> {
+    if let Some(field) = variant_output_fields.get(&SlotId::new(column.column_id)) {
+        return Ok(field.clone());
+    }
+    if let Some(field) = iceberg_virtual_projected_field(table, column)? {
+        return Ok(field);
+    }
+    let desc = column.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "type",
+            format!("output column {} type missing", column.name),
+        )
+    })?;
+    let projected = build_projected_output_schema(
+        descriptor,
+        &[IcebergArrowColumn {
+            name: column.name.clone(),
+            data_type: super::super::decode_type(desc).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "type",
+                    error,
+                )
+            })?,
+            nullable: column.nullable,
+        }],
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "name", error)
+    })?
+    .ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "IcebergDataFiles table schema missing",
+        )
+    })?;
+    Ok(projected.field(0).clone())
 }
 
 fn iceberg_table_descriptor(

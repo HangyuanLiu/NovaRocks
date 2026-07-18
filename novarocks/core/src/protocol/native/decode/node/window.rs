@@ -23,7 +23,6 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
-use super::common::check_exact_arity;
 use super::{DecodedNode, sort};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -46,10 +45,6 @@ pub(super) fn lower_window_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("WindowNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     if window.window_exprs.is_empty() {
         return Err(NativeFragmentDecodeError::missing(

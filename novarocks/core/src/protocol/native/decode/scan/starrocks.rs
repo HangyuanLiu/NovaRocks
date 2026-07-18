@@ -18,28 +18,48 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Field;
-
-use super::super::layout::layout_from_output_columns;
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{
-    lower_scan_predicate, output_column_data_type, parse_scan_limit, scan_batch_size,
-    scan_output_columns,
+    DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit, scan_batch_size,
 };
 use super::native_starrocks::decode_starrocks_scan_preparation;
-use crate::common::ids::SlotId;
 use crate::connector::{ScanConfig, StarRocksScanConfig};
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common, plan};
+use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
+use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+
+pub(super) fn validate_starrocks_output_columns(
+    output_columns: &DecodedScanOutputColumns,
+    source: &plan::StarRocksTableSource,
+) -> Result<(), NativeFragmentDecodeError> {
+    let storage_names = source
+        .storage_columns
+        .iter()
+        .map(|column| column.name.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    for (index, column) in output_columns.columns().iter().enumerate() {
+        if !storage_names.contains(&column.name.to_ascii_lowercase()) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                output_columns.source_path(index).field("name"),
+                format!(
+                    "StarRocks native scan column {} is missing storage metadata",
+                    column.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn lower_starrocks_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::StarRocksTableSource,
+    output_columns: &DecodedScanOutputColumns,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
@@ -51,9 +71,8 @@ pub(super) fn lower_starrocks_scan(
             ctx.query_id(),
             ctx.scan_ranges(node.node_id)?,
         )?;
-        let output_columns = scan_output_columns(scan)?;
-        let layout = layout_from_output_columns(&output_columns)?;
-        let output_schema = starrocks_chunk_schema(&output_columns, source)?;
+        let layout = output_columns.layout();
+        let output_schema = starrocks_chunk_schema(output_columns, source)?;
         let limit = parse_scan_limit(node.limit)?;
         let batch_size = i32::try_from(scan_batch_size(ctx.query_options())?).map_err(|_| {
             NativeFragmentLeafDecodeError::at_field(
@@ -155,7 +174,7 @@ where
 }
 
 fn starrocks_chunk_schema(
-    columns: &[common::OutputColumn],
+    columns: &DecodedScanOutputColumns,
     source: &plan::StarRocksTableSource,
 ) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
@@ -164,9 +183,12 @@ fn starrocks_chunk_schema(
             .iter()
             .map(|column| (column.name.to_ascii_lowercase(), column))
             .collect::<HashMap<_, _>>();
+        let decoded_schema = columns.output_schema();
         let slots = columns
+            .columns()
             .iter()
-            .map(|column| {
+            .zip(decoded_schema.slots())
+            .map(|(column, slot)| {
                 let storage = storage_by_name
                     .get(&column.name.to_ascii_lowercase())
                     .ok_or_else(|| {
@@ -180,19 +202,15 @@ fn starrocks_chunk_schema(
                         )
                     })?;
                 ChunkSlotSchema::try_new_with_field(
-                    SlotId::new(column.column_id),
-                    Field::new(
-                        &column.name,
-                        output_column_data_type(column)?,
-                        column.nullable,
-                    ),
-                    None,
+                    slot.slot_id(),
+                    slot.field().clone(),
+                    Some(slot.field_schema().clone()),
                     Some(storage.unique_id),
                 )
                 .map_err(|error| {
                     NativeFragmentLeafDecodeError::at_field(
                         ProtocolErrorKind::InvalidValue,
-                        "output_columns",
+                        "storage_columns",
                         error,
                     )
                 })
@@ -201,7 +219,7 @@ fn starrocks_chunk_schema(
         ChunkSchema::try_new(slots).map(Arc::new).map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,
-                "output_columns",
+                "storage_columns",
                 error,
             )
         })

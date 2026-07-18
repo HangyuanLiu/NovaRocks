@@ -23,7 +23,7 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::chunk_schema_from_output_columns;
 use super::DecodedNode;
-use super::common::{check_exact_arity, concat_layouts, proto_join_type};
+use super::common::{concat_layouts, proto_join_type};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -45,10 +45,6 @@ pub(super) fn lower_hash_join_node(
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("HashJoinNode", 2, children.len()),
-    )?;
     let mut it = children.into_iter();
     let left = it.next().expect("left");
     let right = it.next().expect("right");

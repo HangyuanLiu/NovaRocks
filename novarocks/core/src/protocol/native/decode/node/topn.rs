@@ -17,9 +17,7 @@
 
 use super::super::NativeFragmentDecodeError;
 use super::DecodedNode;
-use super::common::{
-    check_exact_arity, merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64,
-};
+use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use super::sort::{lower_sort_items, parse_sort_topn_type};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortNode;
@@ -34,10 +32,6 @@ pub(super) fn lower_topn_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("TopNNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     let payload_limit = NativeFragmentDecodeError::map_invalid(
         path.clone().field("limit"),

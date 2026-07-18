@@ -21,7 +21,7 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns};
 use super::DecodedNode;
-use super::common::{check_exact_arity, concat_layouts};
+use super::common::concat_layouts;
 use super::hash_join;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
@@ -40,10 +40,6 @@ pub(super) fn lower_nest_loop_join_node(
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("NestLoopJoinNode", 2, children.len()),
-    )?;
     let mut it = children.into_iter();
     let mut left = it.next().expect("left");
     let mut right = it.next().expect("right");

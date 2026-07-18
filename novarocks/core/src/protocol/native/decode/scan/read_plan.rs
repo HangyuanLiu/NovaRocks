@@ -21,6 +21,7 @@ use arrow::datatypes::DataType;
 
 use super::super::layout::layout_from_output_columns;
 use super::super::node::DecodedNode;
+use super::common::DecodedScanOutputColumns;
 use super::common::output_column_data_type;
 use super::schema::{
     iceberg_chunk_schema_from_output_columns,
@@ -64,9 +65,10 @@ struct PredicateColumnRef {
 pub(super) fn scan_read_plan(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
-    output_columns: &[common::OutputColumn],
+    decoded_output_columns: &DecodedScanOutputColumns,
 ) -> Result<ScanReadPlan, NativeFragmentLeafDecodeError> {
-    let output_layout = layout_from_output_columns(output_columns)?;
+    let output_columns = decoded_output_columns.columns();
+    let output_layout = decoded_output_columns.layout();
     let mut variant_path_plan =
         parse_native_scan_variant_path_columns(scan, table, output_columns)?;
     let output_schema = iceberg_chunk_schema_from_output_columns_with_variants(
@@ -610,7 +612,7 @@ pub(super) fn maybe_project_data_scan_output(
             let slot = read_plan.read_schema.slot(*slot_id).ok_or_else(|| {
                 NativeFragmentLeafDecodeError::at_field(
                     ProtocolErrorKind::InconsistentFields,
-                    "output_columns",
+                    "columns",
                     format!("projection references missing read slot {slot_id}"),
                 )
             })?;

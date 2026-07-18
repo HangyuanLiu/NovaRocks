@@ -17,9 +17,10 @@
 
 use std::sync::Arc;
 
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::super::node::DecodedNode;
-use super::common::{lower_scan_predicate, resolve_cloud_object_store_config, scan_output_columns};
+use super::common::{
+    DecodedScanOutputColumns, lower_scan_predicate, resolve_cloud_object_store_config,
+};
 use super::delete_files::{
     lower_delta_delete_side_payload_from_native, lower_equality_delete_target_from_native,
     lower_position_delete_source_from_native, reject_native_delta_role_payload,
@@ -40,11 +41,11 @@ pub(super) fn lower_iceberg_delta_table_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDeltaTable,
+    output_columns: &DecodedScanOutputColumns,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
-    let output_columns = scan_output_columns(scan)?;
-    let layout = layout_from_output_columns(&output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
+    let layout = output_columns.layout();
+    let output_schema = output_columns.output_schema();
     let table = source.table.as_ref().ok_or_else(|| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::MissingField,

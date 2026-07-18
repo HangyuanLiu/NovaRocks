@@ -19,7 +19,7 @@ use super::super::NativeFragmentDecodeError;
 use super::super::layout::{
     chunk_schema_from_output_columns, layout_from_output_columns, slot_schemas_from_output_columns,
 };
-use super::common::{check_min_arity, slot_ids_from_columns};
+use super::common::slot_ids_from_columns;
 use super::{super::decode_type, DecodedNode};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
@@ -40,10 +40,6 @@ pub(super) fn lower_set_op_node(
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_min_arity("SetOpNode", 2, children.len()),
-    )?;
     let kind = plan::PlanSetOpKind::try_from(set_op.kind).map_err(|_| {
         NativeFragmentDecodeError::invalid_enum(
             path.clone().field("kind"),

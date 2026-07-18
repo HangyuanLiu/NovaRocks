@@ -24,7 +24,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, slot_schemas_from_output_columns};
 use super::DecodedNode;
-use super::common::check_exact_arity;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -41,10 +40,6 @@ pub(super) fn lower_table_function_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        check_exact_arity("TableFunctionNode", 1, children.len()),
-    )?;
     let child = children.pop().expect("child");
     validate_table_function_signature(table_function, path.clone())?;
 

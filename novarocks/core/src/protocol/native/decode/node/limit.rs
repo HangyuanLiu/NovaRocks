@@ -16,9 +16,7 @@
 // under the License.
 
 use super::DecodedNode;
-use super::common::{
-    check_exact_arity, merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64,
-};
+use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
@@ -32,12 +30,6 @@ pub(super) fn lower_limit_node(
     node_path: FieldPath,
     mut children: Vec<DecodedNode>,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    check_exact_arity("LimitNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(
-            node_path.clone().field("children"),
-            error,
-        )
-    })?;
     let child = children.pop().expect("child");
     let payload_limit = parse_optional_nonnegative_i64(limit_node.limit, "LimitNode.limit")
         .map_err(|error| {
