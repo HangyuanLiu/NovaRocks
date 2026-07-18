@@ -30,10 +30,13 @@
 #[cfg(test)]
 use crate::mv::model::TargetPartitionFilter;
 
+#[cfg(test)]
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+};
+use crate::mv::persistence::schema::{
+    BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
