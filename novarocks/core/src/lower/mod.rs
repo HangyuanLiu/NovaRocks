@@ -18,4 +18,3 @@
 pub(crate) mod common;
 #[cfg(feature = "compat")]
 pub(crate) mod compat;
-pub(crate) mod novarocks;
