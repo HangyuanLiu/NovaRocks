@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::type_mapping::{
+    encode_change_stream_branch_kind, encode_edge_partition_type, usize_to_u64,
+};
+use super::write::{encode_iceberg_write_input_binding, encode_iceberg_write_sink_spec};
 use super::*;
 
 pub(super) fn attach_stream_sinks(

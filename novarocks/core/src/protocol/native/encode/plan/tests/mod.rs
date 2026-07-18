@@ -24,6 +24,7 @@ use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::planner::distributed::write::change_stream::{
     IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
 };
+use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::physical::{
     JoinDistribution, PhysicalPlanStats, PlannerConfidence, TopNPhase,
 };
@@ -32,7 +33,9 @@ use arrow::datatypes::DataType;
 mod output;
 mod relational;
 mod runtime_filter;
+mod scan;
 mod topology;
+mod write;
 
 fn empty_scan_bindings() -> &'static ScanExecutionBindings {
     Box::leak(Box::new(ScanExecutionBindings::default()))

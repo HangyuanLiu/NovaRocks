@@ -17,12 +17,13 @@
 
 use super::super::expr::{encode_expr, encode_sort_items, encode_window_frame};
 use super::output::encode_output_columns;
-use super::{
-    NativePlanEncodeContext, encode_agg_mode, encode_change_stream_branch_kind, encode_exprs,
-    encode_join_distribution, encode_join_execution_mode, encode_join_kind,
-    encode_redistribute_mode, encode_scan_node, encode_set_op_kind, encode_sort_topn_type,
-    encode_topn_phase, usize_to_u64,
+use super::scan::encode_scan_node;
+use super::type_mapping::{
+    encode_agg_mode, encode_change_stream_branch_kind, encode_join_distribution,
+    encode_join_execution_mode, encode_join_kind, encode_redistribute_mode, encode_set_op_kind,
+    encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
+use super::{NativePlanEncodeContext, encode_exprs};
 use crate::proto::plan;
 use crate::sql::planner::payload::PlanRowCountAssertion;
 use crate::sql::planner::physical::PhysicalPlanKind;
