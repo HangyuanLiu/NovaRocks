@@ -32,12 +32,11 @@ use novarocks::meta::repository::job::{
 };
 use novarocks::meta::repository::mv::{
     BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, CreateMvDependencyRequest,
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine, MvMetaRepository,
-    MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup,
-    RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
-    RefreshCommitMarker, RefreshExternalOutcome, ReplaceMvPartitionStatesRequest,
-    UpdateMvPartitionContractRequest, UpdateMvRefreshMetadataRequest,
-    UpdateStarRocksMvRefreshSummaryRequest,
+    MvMetaRepository, MvPartitionRefreshStatus, MvRefreshFinalizeRequest, MvRefreshState,
+    MvTargetLookup, RecordFailedMvPartitionStatesRequest, RecordPublishCommitRequest,
+    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome,
+    ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
+    UpdateMvRefreshMetadataRequest, UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksDatabaseRequest,
@@ -54,6 +53,9 @@ use novarocks::meta::repository::{
 use novarocks::meta::{
     ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
     SqliteMetaStoreProvider,
+};
+use novarocks::mv::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::definition::StoredMvRefreshPolicy;
 use novarocks::mv::persistence::schema::{

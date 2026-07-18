@@ -27,6 +27,9 @@ use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
     MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
+use crate::mv::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
 use crate::mv::persistence::definition::{
     MV_DEFINITION_SUBJECT, StoredMvDefinition, StoredMvDefinitionAvro, StoredMvRefreshPolicy,
 };
@@ -112,43 +115,6 @@ pub struct RecordFailedMvPartitionStatesRequest {
     pub target_snapshot_id: Option<i64>,
     pub last_refresh_id: i64,
     pub max_entries: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvDependencyObjectType {
-    Table,
-    MaterializedView,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvDependencyStorageEngine {
-    StarRocks,
-    Iceberg,
-    ExternalTable,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct MvDependencyObjectRef {
-    pub catalog: Option<String>,
-    pub database_or_namespace: String,
-    pub name: String,
-    pub object_type: MvDependencyObjectType,
-    pub storage_engine: MvDependencyStorageEngine,
-}
-
-impl MvDependencyObjectRef {
-    pub fn display_name(&self) -> String {
-        let object = match self.catalog.as_deref() {
-            Some(catalog) => format!("{catalog}.{}.{}", self.database_or_namespace, self.name),
-            None => format!("{}.{}", self.database_or_namespace, self.name),
-        };
-        match self.object_type {
-            MvDependencyObjectType::Table => object,
-            MvDependencyObjectType::MaterializedView => format!("mv:{object}"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

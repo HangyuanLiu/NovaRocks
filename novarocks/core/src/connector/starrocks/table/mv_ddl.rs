@@ -153,7 +153,7 @@ pub(crate) fn create_mv(
         created_at_ms,
     )?;
     let dependency_target =
-        crate::engine::mv::dependency::starrocks_mv_dependency_ref(&db_name, &mv_name);
+        crate::mv::dependency::model::starrocks_mv_dependency_ref(&db_name, &mv_name);
     // Defensive: this check runs after the StarRocks table "already exists" guard
     // above, so user-facing CREATE statements can't reach it (a brand-new MV
     // target has no inbound edges, while an existing target fails on existence
@@ -965,7 +965,7 @@ pub(crate) fn drop_mv(
 
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(
         state,
-        &crate::engine::mv::dependency::starrocks_mv_dependency_ref(&db_name, &mv_name),
+        &crate::mv::dependency::model::starrocks_mv_dependency_ref(&db_name, &mv_name),
     )?;
 
     crate::connector::starrocks::table::ddl::drop_starrocks_table_with_metadata(
