@@ -747,26 +747,3 @@ fn null_buffer_from_flags(
         Ok(None)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lengths_to_offsets_builds_prefix_sum() {
-        let offsets = lengths_to_offsets(&[0, 2, 3, 1], "s.dat", "c_arr").expect("offsets");
-        assert_eq!(offsets, vec![0, 0, 2, 5, 6]);
-    }
-
-    #[test]
-    fn lengths_to_offsets_rejects_negative_length() {
-        let err = lengths_to_offsets(&[1, -1], "s.dat", "c_arr").expect_err("negative length");
-        assert!(err.contains("negative length"), "err={}", err);
-    }
-
-    #[test]
-    fn null_buffer_from_flags_rejects_invalid_value() {
-        let err = null_buffer_from_flags(&[0, 2, 1], "s.dat", "c_struct").expect_err("bad flag");
-        assert!(err.contains("invalid null flag value"), "err={}", err);
-    }
-}

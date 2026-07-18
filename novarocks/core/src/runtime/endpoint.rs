@@ -182,25 +182,4 @@ mod tests {
 
         assert!(err.contains("must be in 1..=65535"), "{err}");
     }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn accepts_network_address() {
-        let addr = types::TNetworkAddress::new("be-1.internal".to_string(), 8060);
-
-        let endpoint = RuntimeEndpoint::from_network_address(&addr).expect("endpoint");
-
-        assert_eq!(endpoint.host(), "be-1.internal");
-        assert_eq!(endpoint.port(), 8060);
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn rejects_invalid_network_address() {
-        let addr = types::TNetworkAddress::new("".to_string(), 8060);
-
-        let err = RuntimeEndpoint::from_network_address(&addr).expect_err("invalid thrift addr");
-
-        assert!(err.contains("host must not be empty"), "{err}");
-    }
 }

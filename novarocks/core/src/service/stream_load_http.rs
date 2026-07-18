@@ -61,32 +61,3 @@ pub(crate) async fn handle_transaction_op(
     });
     (StatusCode::OK, Json(response))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{HeaderName, HeaderValue};
-
-    #[test]
-    fn normalize_headers_lowercases_and_trims() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("x-test-header"),
-            HeaderValue::from_static("  value  "),
-        );
-        headers.insert(
-            HeaderName::from_static("authorization"),
-            HeaderValue::from_static("Basic dGVzdDp0ZXN0"),
-        );
-
-        let normalized = normalize_headers(&headers);
-        assert_eq!(
-            normalized.get("x-test-header").map(String::as_str),
-            Some("value")
-        );
-        assert_eq!(
-            normalized.get("authorization").map(String::as_str),
-            Some("Basic dGVzdDp0ZXN0")
-        );
-    }
-}

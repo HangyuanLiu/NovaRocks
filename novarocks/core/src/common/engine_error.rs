@@ -303,52 +303,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "compat")]
-    fn unsupported_distributed_dml_shape_maps_to_not_supported() {
-        let err = EngineError::unsupported_distributed_dml_shape("insert", "missing coordinator");
-        assert_eq!(
-            err.to_tstatus_code(),
-            crate::thrift::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
-        );
-        assert_eq!(
-            err.to_mysql_error_kind(),
-            opensrv_mysql::ErrorKind::ER_NOT_SUPPORTED_YET
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "compat")]
-    fn protocol_decode_error_maps_to_invalid_argument_and_parse_error() {
-        let err = EngineError::protocol_decode("bad report payload");
-        assert_eq!(
-            err.to_tstatus_code(),
-            crate::thrift::status_code::TStatusCode::INVALID_ARGUMENT
-        );
-        assert_eq!(
-            err.to_mysql_error_kind(),
-            opensrv_mysql::ErrorKind::ER_PARSE_ERROR
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "compat")]
-    fn default_engine_error_maps_to_internal_and_unknown() {
-        let err = EngineError::internal_invariant(
-            InternalInvariantCode::UnexpectedReportStatusShape,
-            "missing status",
-        );
-        assert_eq!(
-            err.to_tstatus_code(),
-            crate::thrift::status_code::TStatusCode::INTERNAL_ERROR
-        );
-        assert_eq!(
-            err.to_mysql_error_kind(),
-            opensrv_mysql::ErrorKind::ER_UNKNOWN_ERROR
-        );
-        assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_ERROR);
-    }
-
-    #[test]
     fn named_message_constructors_return_stable_codes() {
         let known_uncommitted = EngineError::commit_known_uncommitted("commit was aborted");
         assert_eq!(

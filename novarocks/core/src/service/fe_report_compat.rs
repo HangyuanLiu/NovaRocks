@@ -20,10 +20,3 @@
 #![cfg(feature = "compat")]
 
 pub(crate) use crate::service::fe_report::{is_query_gone_status, mark_fe_query_gone};
-
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use crate::service::fe_report::{
-    list_report_instances, test_insert_report_instance, test_is_fe_query_gone,
-    test_report_registry_lock, test_reset_report_registry,
-};

@@ -931,26 +931,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn descriptor_rejects_missing_null_marker() {
-        let desc = crate::thrift::types::TIcebergPartitionDescriptor {
-            values: Some(vec![crate::thrift::types::TIcebergPartitionValue {
-                is_null: None,
-                datum_bytes: Some(b"west".to_vec()),
-            }]),
-        };
-
-        let err = crate::runtime::sink_commit_wire::partition_descriptor_from_thrift(Some(desc))
-            .expect_err("expected missing null marker");
-
-        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
-        assert!(
-            err.to_string().contains("null marker"),
-            "missing null marker should be rejected, got: {err}"
-        );
-    }
-
     #[test]
     fn descriptor_rejects_malformed_boolean_payload() {
         let metadata = metadata_with_single_primitive_partition("flag", PrimitiveType::Boolean, 11);

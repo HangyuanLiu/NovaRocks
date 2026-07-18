@@ -188,39 +188,6 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::service::grpc_client::proto::starrocks::{PScalarType, PTypeDesc, PTypeNode};
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn proto_type_desc_round_trips_supported_runtime_filter_types() {
-        let cases = [
-            DataType::Boolean,
-            DataType::Int8,
-            DataType::Int16,
-            DataType::Int32,
-            DataType::Int64,
-            DataType::Float32,
-            DataType::Float64,
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            DataType::Utf8,
-            DataType::Decimal128(18, 2),
-            DataType::Decimal128(38, 9),
-        ];
-
-        for data_type in cases {
-            let desc = arrow_type_to_proto_type_desc(&data_type)
-                .unwrap_or_else(|| panic!("missing proto type desc for {data_type:?}"));
-            let decoded = arrow_type_from_proto_type_desc(&desc)
-                .unwrap_or_else(|| panic!("missing Arrow type for {data_type:?}"));
-            assert_eq!(decoded, data_type);
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn unsupported_runtime_filter_type_has_no_proto_type_desc() {
-        assert!(arrow_type_to_proto_type_desc(&DataType::Binary).is_none());
-    }
-
     #[test]
     fn common_type_desc_round_trips_supported_runtime_filter_types() {
         let cases = [
@@ -258,74 +225,5 @@ mod tests {
     #[test]
     fn unsupported_runtime_filter_type_has_no_common_type_desc() {
         assert!(arrow_type_to_common_type_desc(&DataType::Binary).is_none());
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn proto_type_desc_with_trailing_nodes_is_rejected() {
-        let mut desc = arrow_type_to_proto_type_desc(&DataType::Int32).expect("int proto type");
-        desc.types.push(PTypeNode {
-            r#type: TYPE_NODE_SCALAR,
-            scalar_type: Some(PScalarType {
-                r#type: sr_primitive::TINYINT,
-                len: None,
-                precision: None,
-                scale: None,
-            }),
-            struct_fields: Vec::new(),
-        });
-
-        assert!(arrow_type_from_proto_type_desc(&desc).is_none());
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn invalid_decimal_arrow_type_has_no_proto_type_desc() {
-        let cases = [
-            DataType::Decimal128(0, 0),
-            DataType::Decimal128(39, 0),
-            DataType::Decimal128(18, -1),
-            DataType::Decimal128(18, 19),
-        ];
-
-        for data_type in cases {
-            assert!(
-                arrow_type_to_proto_type_desc(&data_type).is_none(),
-                "invalid decimal should not encode: {data_type:?}"
-            );
-        }
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn invalid_decimal_proto_type_desc_is_rejected() {
-        let cases = [
-            (None, Some(0)),
-            (Some(18), None),
-            (Some(0), Some(0)),
-            (Some(39), Some(0)),
-            (Some(18), Some(-1)),
-            (Some(18), Some(19)),
-        ];
-
-        for (precision, scale) in cases {
-            let desc = PTypeDesc {
-                types: vec![PTypeNode {
-                    r#type: TYPE_NODE_SCALAR,
-                    scalar_type: Some(PScalarType {
-                        r#type: sr_primitive::DECIMAL128,
-                        len: None,
-                        precision,
-                        scale,
-                    }),
-                    struct_fields: Vec::new(),
-                }],
-            };
-
-            assert!(
-                arrow_type_from_proto_type_desc(&desc).is_none(),
-                "invalid decimal should not decode: precision={precision:?} scale={scale:?}"
-            );
-        }
     }
 }

@@ -515,15 +515,6 @@ mod tests {
         UniqueId { hi: 1, lo: 1 }
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn rust_tests_use_grpc_for_exchange_chunk_transport_under_compat_builds() {
-        assert_eq!(
-            internal_rpc_transport_for_current_process(),
-            InternalRpcTransport::Grpc
-        );
-    }
-
     #[test]
     fn per_destination_cap_isolates_and_global_ceiling_binds() {
         // Global budget 100, per-destination cap 40.

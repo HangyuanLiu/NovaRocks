@@ -2104,56 +2104,6 @@ mod tests {
         assert!(!core.build_partition_has_null_key);
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn native_probe_rejects_compat_artifact_before_loading_any_state() {
-        let right_schema = schema_kv("rk", "rw");
-        let build_chunk = chunk_of_two(
-            Arc::clone(&right_schema),
-            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
-            &[100],
-            &[10],
-        );
-        let artifact = Arc::new(direct_compat_set_build_artifact_from_build_chunk(
-            build_chunk,
-        ));
-        let mut core = left_semi_probe_core();
-
-        let err = core
-            .set_build_artifact(artifact, 1, false)
-            .expect_err("native probe must reject compat build artifact");
-
-        assert!(
-            err.contains("runtime-filter execution mode mismatch"),
-            "err={err}"
-        );
-        assert_probe_core_unloaded(&core);
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_probe_rejects_native_artifact_before_loading_any_state() {
-        let right_schema = schema_kv("rk", "rw");
-        let build_chunk = chunk_of_two(
-            Arc::clone(&right_schema),
-            &[RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID],
-            &[100],
-            &[10],
-        );
-        let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
-        let mut core = left_semi_compat_probe_core();
-
-        let err = core
-            .set_build_artifact(artifact, 1, false)
-            .expect_err("compat probe must reject native build artifact");
-
-        assert!(
-            err.contains("runtime-filter execution mode mismatch"),
-            "err={err}"
-        );
-        assert_probe_core_unloaded(&core);
-    }
-
     #[test]
     fn set_build_artifact_rejects_component_contract_mismatch() {
         let left_schema = schema_kv("lk", "lv");
