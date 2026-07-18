@@ -50,18 +50,18 @@ test -n "$NOVAROCKS_MYSQL_IMAGE"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-cargo test --lib state_store
-cargo test --test state_store_contract
-cargo test --test state_store_sqlite
-cargo test --test state_store_contract -- --list | \
+cargo test -p novarocks-state-store --lib
+cargo test -p novarocks-state-store --test state_store_contract
+cargo test -p novarocks-state-store --test state_store_sqlite
+cargo test -p novarocks --test state_store_app_config -- --list | \
   awk '$1 == "foundationdb_config_feature_off_open_fails_without_fallback:" { n++ } END { exit(n != 1) }'
-cargo test --test state_store_contract foundationdb_config_feature_off_open_fails_without_fallback -- --exact
-cargo check --no-default-features
-if cargo tree -e features --no-default-features | rg -q 'mysql_async|mysql_common v0\.37'; then
+cargo test -p novarocks --test state_store_app_config foundationdb_config_feature_off_open_fails_without_fallback -- --exact
+cargo check -p novarocks-state-store --no-default-features
+if cargo tree -p novarocks-state-store -e features --no-default-features | rg -q 'mysql_async|mysql_common v0\.37'; then
   echo "mysql_async leaked into the feature-off dependency tree" >&2
   exit 1
 fi
-cargo build --profile dev-opt
+cargo build -p novarocks-server --profile dev-opt
 
 READINESS_DB="$NOVAROCKS_MYSQL_DATABASE"
 PROBE_DB="$(docker/mysql-state-store/provision-test-database.sh create production-gate-probes)"
@@ -80,23 +80,23 @@ cleanup_probe_db
 export NOVAROCKS_MYSQL_DATABASE="$READINESS_DB"
 trap - EXIT
 
-cargo test --features mysql-state-store-provider --test state_store_mysql_runtime -- --nocapture --test-threads=1
-cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
+cargo test -p novarocks-state-store --features mysql-state-store-provider --test state_store_mysql_runtime -- --nocapture --test-threads=1
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
   awk '$1 == "mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io:" { n++ } END { exit(n != 1) }'
-cargo test --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
   --test state_store_mysql mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io \
   -- --exact --nocapture --test-threads=1
-cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql -- --list | \
   awk '$1 == "mysql_suite:" { n++ } END { exit(n != 1) }'
-cargo test --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
   --test state_store_mysql mysql_suite -- --exact --nocapture --test-threads=1
-cargo test --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_cross_process -- --list | \
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks --test state_store_mysql_cross_process -- --list | \
   awk '$1 == "mysql_cross_process_suite:" { n++ } END { exit(n != 1) }'
-cargo test --features mysql-state-store-provider,state-store-test-hooks \
+cargo test -p novarocks-state-store --features mysql-state-store-provider,state-store-test-hooks \
   --test state_store_mysql_cross_process mysql_cross_process_suite \
   -- --exact --nocapture --test-threads=1
-cargo build --profile dev-opt --features mysql-state-store-provider
-cargo test --test cluster_mvp -- --list | \
+cargo build -p novarocks-server --profile dev-opt --features mysql-state-store-provider
+cargo test -p novarocks-server --test cluster_mvp -- --list | \
   awk '$1 == "cross_process_three_be_state_store_baseline:" { n++ } END { exit(n != 1) }'
-cargo test --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture
+cargo test -p novarocks-server --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture
 git diff --check
