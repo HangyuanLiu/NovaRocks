@@ -17,10 +17,11 @@
 
 //! Refresh-time Iceberg MV schema contract validator.
 //!
-//! Single entry point: `validate_schema_contract`. Three-stage check:
-//!   1. identity guard (uuid + format-version + row-lineage)
-//!   2. schema-id fast path + base referenced-field exact match
-//!   3. target visible columns + hidden apply-key exact match
+//! Canonical entry points:
+//!   - `validate_schema_contract` validates single-base identity, partition, and schema contracts.
+//!   - `validate_join_schema_contract` validates two-base identity and rebind contracts before
+//!     applying the generic target and partition checks.
+//!   - `validate_branch_id_field` validates the live branch-id field contract.
 //!
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
