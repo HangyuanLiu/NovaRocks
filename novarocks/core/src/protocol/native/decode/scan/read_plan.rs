@@ -30,9 +30,8 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 use crate::proto::{common, plan};
-use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::decode::NativeFragmentDecodeError;
-use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 #[derive(Clone, Debug)]
 pub(super) struct ScanReadPlan {
@@ -55,6 +54,39 @@ struct PredicateColumnRef {
     r#type: Option<common::TypeDesc>,
     nullable: bool,
     expression_path: FieldPath,
+}
+
+#[derive(Clone, Debug)]
+struct HiddenColumnIdAllocator {
+    next: u32,
+    upper_bound_path: FieldPath,
+}
+
+impl HiddenColumnIdAllocator {
+    fn from_output_columns(columns: &[ProvenancedOutputColumn]) -> Option<Self> {
+        let max_column = columns
+            .iter()
+            .max_by_key(|column| column.column().column_id)?;
+        Some(Self {
+            next: max_column.column().column_id.saturating_add(1),
+            upper_bound_path: max_column.source_path().field("column_id"),
+        })
+    }
+
+    fn allocate(&mut self, used: &HashSet<u32>) -> Result<u32, NativeFragmentDecodeError> {
+        loop {
+            let id = self.next;
+            self.next = self.next.checked_add(1).ok_or_else(|| {
+                NativeFragmentDecodeError::out_of_range(
+                    self.upper_bound_path.clone(),
+                    "hidden read column id overflow",
+                )
+            })?;
+            if !used.contains(&id) {
+                return Ok(id);
+            }
+        }
+    }
 }
 
 pub(super) fn scan_read_plan(
@@ -96,9 +128,7 @@ pub(super) fn scan_read_plan(
         {
             continue;
         }
-        if record_iceberg_virtual_column(table, raw, &mut iceberg_virtual)
-            .map_err(|error| error.into_native(col.source_path()))?
-        {
+        if record_iceberg_virtual_column(table, col, &mut iceberg_virtual)? {
             continue;
         }
         push_physical_read_column(
@@ -108,12 +138,14 @@ pub(super) fn scan_read_plan(
             col.clone(),
         )?;
     }
-    let mut next_hidden_column_id = output_columns
-        .iter()
-        .map(|col| col.column_id)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
+    let mut hidden_column_ids =
+        HiddenColumnIdAllocator::from_output_columns(decoded_output_columns.provenanced())
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    scan_path.clone().field("columns"),
+                    "ScanNode columns missing",
+                )
+            })?;
 
     let predicate_refs = scan_predicate_column_refs(&scan.predicates, scan_path.clone())?;
     let predicate_refs_by_name = predicate_refs
@@ -133,8 +165,7 @@ pub(super) fn scan_read_plan(
         let predicate = predicate_refs_by_name.get(required).copied();
         let hidden_id = match predicate {
             Some(predicate) => predicate.column_id,
-            None => allocate_hidden_column_id(&mut next_hidden_column_id, &scan_slots)
-                .map_err(|error| error.into_native(scan_path.clone()))?,
+            None => hidden_column_ids.allocate(&scan_slots)?,
         };
         let col = match output_column_from_table_def(scan, required, hidden_id, scan_path.clone())?
         {
@@ -212,7 +243,7 @@ pub(super) fn scan_read_plan(
         &mut read_names,
         &mut read_slots,
         &mut scan_slots,
-        &mut next_hidden_column_id,
+        &mut hidden_column_ids,
         scan_path.clone(),
     )?;
     ensure_virtual_only_scan_has_row_count_carrier(
@@ -222,7 +253,7 @@ pub(super) fn scan_read_plan(
         &mut physical_read_columns,
         &mut read_names,
         &mut read_slots,
-        &mut next_hidden_column_id,
+        &mut hidden_column_ids,
         &iceberg_virtual,
         decoded_output_columns
             .provenanced()
@@ -281,7 +312,7 @@ fn ensure_native_variant_source_read_columns(
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
     scan_slots: &mut HashSet<u32>,
-    next_hidden_column_id: &mut u32,
+    hidden_column_ids: &mut HiddenColumnIdAllocator,
     scan_path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
     if plan.specs.is_empty() {
@@ -301,8 +332,7 @@ fn ensure_native_variant_source_read_columns(
             continue;
         }
 
-        let hidden_id = allocate_hidden_column_id(next_hidden_column_id, &reserved_slots)
-            .map_err(|error| error.into_native(scan_path.clone()))?;
+        let hidden_id = hidden_column_ids.allocate(&reserved_slots)?;
         reserved_slots.insert(hidden_id);
         scan_slots.insert(hidden_id);
         let source_col =
@@ -374,12 +404,7 @@ fn push_scan_column(
             ),
         ));
     }
-    if !record_iceberg_virtual_column(table, raw, iceberg_virtual).map_err(|error| {
-        NativeFragmentDecodeError::invalid_value(
-            col.type_path().unwrap_or_else(|| col.source_path()),
-            error,
-        )
-    })? {
+    if !record_iceberg_virtual_column(table, &col, iceberg_virtual)? {
         push_physical_read_column(physical_read_columns, read_names, read_slots, col.clone())?;
     }
     scan_columns.push(col);
@@ -394,15 +419,14 @@ fn ensure_virtual_only_scan_has_row_count_carrier(
     physical_read_columns: &mut Vec<ProvenancedOutputColumn>,
     read_names: &mut HashSet<String>,
     read_slots: &mut HashSet<u32>,
-    next_hidden_column_id: &mut u32,
+    hidden_column_ids: &mut HiddenColumnIdAllocator,
     iceberg_virtual: &IcebergVirtualSpec,
     source_path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
     if !physical_read_columns.is_empty() || iceberg_virtual.is_empty() {
         return Ok(());
     }
-    let column_id = allocate_hidden_column_id(next_hidden_column_id, scan_slots)
-        .map_err(|error| error.into_native(source_path.clone()))?;
+    let column_id = hidden_column_ids.allocate(scan_slots)?;
     let raw_column = iceberg_virtual_count_column(column_id);
     let column = ProvenancedOutputColumn::trusted_internal(
         raw_column,
@@ -437,25 +461,6 @@ fn parquet_slot_kind_from_native_column(column: &ProvenancedOutputColumn) -> Par
         ParquetSlotKind::Variant
     } else {
         ParquetSlotKind::Regular
-    }
-}
-
-fn allocate_hidden_column_id(
-    next: &mut u32,
-    used: &HashSet<u32>,
-) -> Result<u32, NativeFragmentLeafDecodeError> {
-    loop {
-        let id = *next;
-        *next = next.checked_add(1).ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::OutOfRange,
-                "columns",
-                "hidden read column id overflow",
-            )
-        })?;
-        if !used.contains(&id) {
-            return Ok(id);
-        }
     }
 }
 
@@ -747,30 +752,24 @@ pub(super) fn maybe_project_data_scan_output(
     scan_lowered: DecodedNode,
     read_plan: ScanReadPlan,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+) -> DecodedNode {
     if read_plan.read_layout.order() == read_plan.output_layout.order() {
-        return Ok(DecodedNode {
+        return DecodedNode {
             node: scan_lowered.node,
             layout: read_plan.output_layout,
             output_schema: read_plan.output_schema,
-        });
+        };
     }
     let exprs = read_plan
         .output_layout
         .order()
         .iter()
-        .map(|slot_id| {
-            let slot = read_plan.read_schema.slot(*slot_id).ok_or_else(|| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InconsistentFields,
-                    "columns",
-                    format!("projection references missing read slot {slot_id}"),
-                )
-            })?;
-            Ok(arena.push_typed(ExprNode::SlotId(*slot_id), slot.data_type().clone()))
+        .zip(read_plan.output_schema.slots())
+        .map(|(slot_id, slot)| {
+            arena.push_typed(ExprNode::SlotId(*slot_id), slot.data_type().clone())
         })
-        .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
-    Ok(DecodedNode {
+        .collect::<Vec<_>>();
+    DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {
                 input: Box::new(scan_lowered.node),
@@ -785,5 +784,5 @@ pub(super) fn maybe_project_data_scan_output(
         },
         layout: read_plan.output_layout,
         output_schema: read_plan.output_schema,
-    })
+    }
 }

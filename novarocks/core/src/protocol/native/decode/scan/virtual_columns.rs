@@ -20,10 +20,12 @@ use std::collections::HashMap;
 use arrow::datatypes::{DataType, Field};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use super::common::ProvenancedOutputColumn;
 use crate::common::ids::SlotId;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::proto::{common, plan};
 use crate::protocol::common::error::ProtocolErrorKind;
+use crate::protocol::native::decode::NativeFragmentDecodeError;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColumn {
@@ -46,62 +48,64 @@ pub(super) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColu
 
 pub(super) fn record_iceberg_virtual_column(
     table: &plan::IcebergTableInfo,
-    col: &common::OutputColumn,
+    col: &ProvenancedOutputColumn,
     spec: &mut IcebergVirtualSpec,
-) -> Result<bool, NativeFragmentLeafDecodeError> {
-    let Some(field) = iceberg_virtual_projected_field(table, col)? else {
+) -> Result<bool, NativeFragmentDecodeError> {
+    let raw = col.column();
+    let Some(field) = iceberg_virtual_projected_field(table, raw).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            col.type_path().unwrap_or_else(|| col.source_path()),
+            error,
+        )
+    })?
+    else {
         return Ok(false);
     };
-    let slot_id = SlotId::new(col.column_id);
-    if crate::exec::row_position::is_iceberg_file_path(&col.name) {
+    let slot_id = SlotId::new(raw.column_id);
+    if crate::exec::row_position::is_iceberg_file_path(&raw.name) {
         if spec.file_path_slot.replace(slot_id).is_some() {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                col.name_path(),
                 "ScanNode duplicate Iceberg _file virtual column",
             ));
         }
         spec.file_path_field = Some(field);
         return Ok(true);
     }
-    if crate::exec::row_position::is_iceberg_row_pos(&col.name) {
+    if crate::exec::row_position::is_iceberg_row_pos(&raw.name) {
         if spec.row_pos_slot.replace(slot_id).is_some() {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                col.name_path(),
                 "ScanNode duplicate Iceberg _pos virtual column",
             ));
         }
         spec.row_pos_field = Some(field);
         return Ok(true);
     }
-    if crate::exec::row_position::is_iceberg_row_id(&col.name) {
+    if crate::exec::row_position::is_iceberg_row_id(&raw.name) {
         if spec.row_id_slot.replace(slot_id).is_some() {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                col.name_path(),
                 "ScanNode duplicate Iceberg _row_id virtual column",
             ));
         }
         spec.row_id_field = Some(field);
         return Ok(true);
     }
-    if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&col.name) {
+    if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&raw.name) {
         if spec.last_updated_seq_slot.replace(slot_id).is_some() {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                col.name_path(),
                 "ScanNode duplicate Iceberg _last_updated_sequence_number virtual column",
             ));
         }
         spec.last_updated_seq_field = Some(field);
         return Ok(true);
     }
-    if crate::exec::row_position::is_change_op(&col.name) {
+    if crate::exec::row_position::is_change_op(&raw.name) {
         if spec.change_op_slot.replace(slot_id).is_some() {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "columns",
+            return Err(NativeFragmentDecodeError::inconsistent(
+                col.name_path(),
                 "ScanNode duplicate Iceberg __change_op virtual column",
             ));
         }

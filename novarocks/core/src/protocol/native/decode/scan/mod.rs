@@ -1592,6 +1592,54 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_iceberg_virtual_column_uses_conflicting_name_wire_path() {
+        let node = scan_node_with(
+            vec![
+                output_column(1, "id", DataType::Int64),
+                output_column(2, "_file", DataType::Utf8),
+                output_column(3, "_file", DataType::Utf8),
+            ],
+            Vec::new(),
+            Vec::new(),
+            iceberg_data_files_source(),
+        );
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("duplicate virtual column must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.columns[2].name"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn virtual_carrier_id_overflow_uses_max_column_id_wire_path() {
+        let node = scan_node_with(
+            vec![output_column(u32::MAX, "_row_id", DataType::Int64)],
+            Vec::new(),
+            Vec::new(),
+            iceberg_data_files_source(),
+        );
+        let error = decode_node(
+            &node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("virtual carrier column id overflow must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.columns[0].column_id"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
     fn iceberg_virtual_only_scan_reads_count_carrier_and_projects_outputs() {
         let node = scan_node_with(
             vec![output_column(4, "_row_id", DataType::Int64)],

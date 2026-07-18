@@ -123,7 +123,7 @@ pub(super) fn lower_iceberg_data_files_scan(
         scan_lowered,
         read_plan,
         arena,
-    )?)
+    ))
 }
 
 #[cfg(test)]
