@@ -22,12 +22,12 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::mv::agg_state::mv_agg_state::{
-    AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
-};
 use crate::engine::mv::refresh_context::MvRefreshPruningLimits;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use crate::exec::chunk::Chunk;
+use crate::mv::aggregate_state::mv_agg_state::{
+    AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
+};
 use crate::runtime::query_result::record_batch_to_chunk;
 
 pub(crate) struct IcebergAggregateMergeResult {
@@ -428,11 +428,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::catalog::schema::SqlType;
-    use crate::engine::mv::agg_state::mv_agg_state::{
+    use crate::mv::aggregate_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
-    use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
-    use crate::engine::mv::agg_state::state_codec::encode_count_state;
+    use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
+    use crate::mv::aggregate_state::state_codec::encode_count_state;
     use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {

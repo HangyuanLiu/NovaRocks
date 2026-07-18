@@ -49,7 +49,6 @@ use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
-use crate::engine::mv::agg_state::mv_shape::UnionBranchKind;
 use crate::engine::mv::analysis::{
     MvAnalysis, analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms,
     output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
@@ -84,6 +83,7 @@ use crate::meta::repository::mv::{
     RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
     ReplaceMvPartitionStatesRequest, StoredMvRefresh, UpdateMvPartitionContractRequest,
 };
+use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::descriptor::{
@@ -587,14 +587,14 @@ fn branch_union_refresh_first_branch_calls(
 ) -> Result<
     (
         usize,
-        crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     ),
     String,
 > {
     let branch_count = union_branch_count(canonical_query) as usize;
     let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
     let first_branch_calls =
-        crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
             &first_branch_ast,
         )?;
     Ok((branch_count, first_branch_calls))
@@ -981,7 +981,7 @@ fn representative_aggregate_layout(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
     analysis: &MvAnalysis,
-) -> Result<Option<crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout>, String> {
+) -> Result<Option<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout>, String> {
     match inner_row_identity(&property.identity) {
         TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _) => Ok(None),
         TargetIdentity::GroupRowId(_) => {
@@ -1016,7 +1016,7 @@ fn representative_aggregate_calls<'a>(
     analysis: &'a MvAnalysis,
 ) -> Result<
     (
-        crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
         &'a crate::sql::analysis::ResolvedQuery,
     ),
     String,
@@ -1024,14 +1024,14 @@ fn representative_aggregate_calls<'a>(
     if matches!(property.identity, TargetIdentity::BranchScoped(_)) {
         let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
         let aggregate_calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 &first_branch_ast,
             )?;
         let resolved_query = first_union_branch_resolved_query(&analysis.resolved_query)?;
         Ok((aggregate_calls, resolved_query))
     } else {
         let aggregate_calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 canonical_query,
             )?;
         Ok((aggregate_calls, &analysis.resolved_query))
@@ -1311,7 +1311,7 @@ fn base_snapshot_status_for_refresh(
 }
 
 fn iceberg_aggregate_target_columns(
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     analysis: &MvAnalysis,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
     let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
@@ -1319,7 +1319,7 @@ fn iceberg_aggregate_target_columns(
 }
 
 fn iceberg_aggregate_target_columns_from_resolved_query(
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     output_columns: &[crate::sql::analysis::OutputColumn],
     resolved_query: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
@@ -1328,7 +1328,7 @@ fn iceberg_aggregate_target_columns_from_resolved_query(
 }
 
 fn iceberg_aggregate_target_columns_from_layout(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
     crate::engine::mv::analysis::validate_unique_aggregate_physical_column_names(
         &layout.physical_columns,
@@ -1341,9 +1341,9 @@ fn iceberg_aggregate_target_columns_from_layout(
 }
 
 fn build_aggregate_layout_from_analysis(
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     analysis: &MvAnalysis,
-) -> Result<crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout, String> {
+) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     build_aggregate_layout_from_resolved_query(
         calls,
         &analysis.output_columns,
@@ -1352,16 +1352,16 @@ fn build_aggregate_layout_from_analysis(
 }
 
 fn build_aggregate_layout_from_resolved_query(
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     output_columns: &[crate::sql::analysis::OutputColumn],
     resolved_query: &crate::sql::analysis::ResolvedQuery,
-) -> Result<crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout, String> {
+) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let aggregate_input_types =
-        crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query(
+        crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
             calls,
             resolved_query,
         )?;
-    crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+    crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
         calls,
         output_columns,
         &aggregate_input_types,
@@ -1560,7 +1560,7 @@ fn build_non_branch_contract_core(
         // GroupRowId arm below.
         TargetIdentity::JoinRowKey(_, _) => {
             let join_aliases =
-                crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(
+                crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
                     query,
                 )?;
             let (left_contract, right_contract, join) =
@@ -1743,7 +1743,7 @@ fn build_aggregate_contract_core(
     // to the legacy `AggregateSqlCalls::from(&shape)` (both share
     // `classify_aggregate_select_outputs`).
     let aggregate_calls =
-        crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(query)?;
+        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(query)?;
     let layout = build_aggregate_layout_from_resolved_query(
         &aggregate_calls,
         &analysis.output_columns,
@@ -1760,7 +1760,7 @@ fn build_aggregate_contract_core(
     // only the (table FQN, qualifier) pairs.
     if from_clause_is_direct_inner_on_join(query) {
         let join_aliases =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(query)?;
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
         let (left_contract, right_contract, join) =
             build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
@@ -1882,7 +1882,7 @@ fn build_aggregate_contract_core(
 /// Shared by the JoinProjectionFilter and JoinAggregate cores and by a composed
 /// join-aggregate branch.
 fn build_join_base_contracts_and_lineage(
-    join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    join_aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     loaded_bases: &[(
         TableIdentity,
@@ -1995,7 +1995,7 @@ fn build_branch_union_schema_contract(
             // `ProjectionFilterMvShape.base_table`.
             let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
             let first_branch_base_table =
-                crate::engine::mv::agg_state::aggregate_sql_calls::extract_single_scan_table_fqn(
+                crate::mv::aggregate_state::aggregate_sql_calls::extract_single_scan_table_fqn(
                     &first_branch_ast,
                 )?;
             let (_, first_loaded_base) =
@@ -2124,7 +2124,7 @@ fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
 ///   * a fan-in UNION ALL subquery in FROM -> one FQN per union branch
 ///   * a single scan                       -> [the single FROM table]
 fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<String>, String> {
-    use crate::engine::mv::agg_state::aggregate_sql_calls;
+    use crate::mv::aggregate_state::aggregate_sql_calls;
 
     if let Ok(join_aliases) = aggregate_sql_calls::extract_join_aliases(branch_query) {
         return Ok(vec![join_aliases.left_table, join_aliases.right_table]);
@@ -2411,7 +2411,7 @@ fn mv_partition_transform_contract(
 }
 
 fn aggregate_contract(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
 ) -> Result<mv_schema::AggregateStateContract, String> {
     let fields = target_loaded
@@ -2804,9 +2804,9 @@ fn append_union_projection_hidden_columns_to_set_expr(
 
 fn iceberg_aggregate_first_refresh_select_sql(
     select_sql: &str,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<String, String> {
-    crate::engine::mv::agg_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)
+    crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)
 }
 
 /// Refresh an iceberg-backed materialized view.
@@ -2949,7 +2949,7 @@ pub(crate) fn repartition_iceberg_mv(
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&select_query, current_catalog, current_database);
     let join_repartition_aliases = if matches!(support, RepartitionSupport::JoinProjectionFilter) {
-        let aliases = crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(
+        let aliases = crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
             &canonical_select_query,
         )?;
         validate_join_aliases_base_refs(&aliases, &base_refs)?;
@@ -3353,7 +3353,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             // focused join-alias extractor. Composed branch-union takes the
             // BranchScoped arm below (also extractor-driven).
             let aggregate_calls =
-                crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+                crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                     &canonical_select_query,
                 )?;
             let all_bases_is_fan_in = matches!(
@@ -3368,7 +3368,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 BaseSnapshotPolicy::JoinPairPartialInitialSkip
             ) {
                 Some(
-                    crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(
+                    crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
                         &canonical_select_query,
                     )?,
                 )
@@ -4037,9 +4037,9 @@ fn refresh_iceberg_aggregate_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
-    aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     all_bases_is_fan_in: bool,
-    join_aliases: Option<&crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases>,
+    join_aliases: Option<&crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -4157,7 +4157,7 @@ fn refresh_single_aggregate_iceberg_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     schema_contract: &mv_schema::MvSchemaContract,
-    aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -4251,7 +4251,7 @@ fn refresh_single_aggregate_iceberg_mv(
     // signed-delta/full-state rewrites consistently use the current base column
     // names.
     let reextracted_aggregate_calls = if rebind_happened {
-        crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
             &canonical_select_query,
         )?
     } else {
@@ -4402,7 +4402,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// (`extract_aggregate_sql_calls`), not the legacy classifier.
     FanIn {
         schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        aggregate_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     },
     /// Aggregate over a composed multi-base relation, such as a nested join or
     /// a zero-key CROSS JOIN. The change stream still uses the aggregate
@@ -4410,7 +4410,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// proof is required.
     ComposedAggregate {
         schema_contract: &'a mv_schema::MvSchemaContract,
-        aggregate_calls: &'a crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        aggregate_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
@@ -4421,8 +4421,7 @@ enum AllBasesAggregateRefresh<'a> {
     /// representative of every branch under the CREATE-time homogeneity gate.
     BranchUnion {
         branch_count: usize,
-        first_branch_calls:
-            &'a crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        first_branch_calls: &'a crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     },
 }
 
@@ -4760,8 +4759,8 @@ fn refresh_join_aggregate_iceberg_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     schema_contract: &mv_schema::MvSchemaContract,
-    join_aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
-    aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    join_aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
+    aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     _apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -4860,7 +4859,7 @@ fn refresh_join_aggregate_iceberg_mv(
     // base-ref matching above already used the correct (carried-forward)
     // aliases.
     let reextracted_aggregate_calls = if rebind_happened {
-        crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
             &canonical_select_query,
         )?
     } else {
@@ -5291,7 +5290,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
         // aliases from the focused join-alias extractor (not the legacy
         // classifier); base-ref matching uses the `JoinAliases`-sourced
         // validators, mirroring the execute path.
-        let join_aliases = crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(
+        let join_aliases = crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
             &canonical_select_query,
         )
         .map_err(RefreshError::user)?;
@@ -6051,7 +6050,7 @@ fn plan_iceberg_aggregate_mv_refresh(
             // keys are never read by the plan path. Base-ref matching uses those
             // table FQNs against the analyzer-resolved base refs.
             let join_aliases =
-                crate::engine::mv::agg_state::aggregate_sql_calls::extract_join_aliases(
+                crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
                     canonical_select_query,
                 )
                 .map_err(RefreshError::user)?;
@@ -8476,7 +8475,7 @@ fn first_refresh_iceberg_aggregate_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    aggregate_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let current_catalog = ctx.rewrite.current_catalog.as_deref();
     let current_database = ctx.rewrite.current_database.as_str();
@@ -8512,7 +8511,7 @@ fn first_refresh_branch_union_aggregate_iceberg_mv(
     staging_branch: &str,
     refresh_id: i64,
     branch_count: usize,
-    first_branch_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    first_branch_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let current_catalog = ctx.rewrite.current_catalog.as_deref();
     let current_database = ctx.rewrite.current_database.as_str();
@@ -8701,7 +8700,7 @@ fn prepare_aggregate_first_refresh_chunks(
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     prepare_aggregate_first_refresh_chunks_for_select_sql(
@@ -8719,7 +8718,7 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     let state_sql = iceberg_aggregate_first_refresh_select_sql(select_sql, calls)?;
@@ -8740,7 +8739,7 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
     )?;
     let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
     let result = normalize_aggregate_state_result_column_names(result, &layout, calls)?;
-    crate::engine::mv::agg_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+    crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
 }
 
 fn build_aggregate_repartition_payload(
@@ -8751,7 +8750,7 @@ fn build_aggregate_repartition_payload(
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
     let select_query = parse_mv_select_query(select_sql)?;
-    let calls = crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+    let calls = crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
         &select_query,
     )?;
     let chunks = prepare_aggregate_first_refresh_chunks_for_select_sql(
@@ -8801,7 +8800,7 @@ fn prepare_branch_union_aggregate_first_refresh_chunks(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     branch_count: usize,
-    first_branch_calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    first_branch_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
 ) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
     // Flatten the stored UNION ALL SELECT into one full SELECT per branch. The
@@ -8821,7 +8820,7 @@ fn prepare_branch_union_aggregate_first_refresh_chunks(
         // rejected them). Under the homogeneity gate every branch shares the
         // first branch's aggregate layout; validate that arity here.
         let branch_calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 branch_query,
             )?;
         validate_branch_union_aggregate_branch_layout(first_branch_calls, &branch_calls)?;
@@ -8842,8 +8841,8 @@ fn prepare_branch_union_aggregate_first_refresh_chunks(
 }
 
 fn validate_branch_union_aggregate_branch_layout(
-    first: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    branch: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    first: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    branch: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<(), String> {
     if first.group_keys.len() != branch.group_keys.len()
         || first.aggregates.len() != branch.aggregates.len()
@@ -8980,8 +8979,8 @@ fn append_branch_id_to_first_refresh_chunk(
 
 fn normalize_aggregate_state_result_column_names(
     mut result: crate::runtime::query_result::QueryResult,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<crate::runtime::query_result::QueryResult, String> {
     let expected_names = aggregate_state_result_column_names(layout, calls)?;
     if result.columns.len() != expected_names.len() {
@@ -9061,8 +9060,8 @@ fn aggregate_state_result_chunk_name_permutation(
 }
 
 fn aggregate_state_result_column_names(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<Vec<String>, String> {
     let mut names = Vec::with_capacity(calls.visible_outputs.len() + layout.state_columns.len());
     for output in &calls.visible_outputs {
@@ -9248,8 +9247,8 @@ fn build_aggregate_layout_for_refresh_select_sql(
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout, String> {
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+) -> Result<crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout, String> {
     let visible_query = parse_mv_select_query(select_sql)?;
     let visible_analysis =
         analyze_mv_select(state, current_catalog, current_database, &visible_query)?;
@@ -10481,7 +10480,7 @@ fn refresh_iceberg_join_mv(
 }
 
 fn validate_join_aliases_base_refs(
-    aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     base_refs: &[TableIdentity],
 ) -> Result<(), String> {
     for name in [
@@ -10504,7 +10503,7 @@ fn validate_join_aliases_base_refs(
 /// `JoinAliases.{left_table,right_table}` (the `ObjectName.to_string()` FQN form)
 /// against `base.fqn()`.
 fn join_base_refs_for_aliases<'a>(
-    aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     base_refs: &'a [TableIdentity],
 ) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
     let left_name = aliases.left_table.as_str();
@@ -10799,7 +10798,7 @@ fn build_join_projection_repartition_context(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
-    aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
 ) -> Result<(IcebergMvRefreshContext, TableIdentity, TableIdentity), String> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV repartition requires exactly two base tables".to_string());
@@ -13715,7 +13714,7 @@ fn should_use_join_delta_append_only_fast_path(
 fn execute_append_only_join_delta_branches(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     base_query: &sqlparser::ast::Query,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -14006,7 +14005,7 @@ fn execute_join_delta_branches(
     expected_main_snapshot_id: Option<i64>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    aliases: &crate::engine::mv::agg_state::aggregate_sql_calls::JoinAliases,
+    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     pin: &crate::engine::mv::refresh_pin::RefreshSnapshotPin,
     ctx: &IcebergMvRefreshContext,
     affected_partitions: &crate::mv::model::AffectedTargetPartitions,
@@ -16981,7 +16980,7 @@ mod tests {
         let query =
             parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
         let calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
                 .expect("aggregate calls");
         let layout = aggregate_apply_test_helpers::count_layout("region");
         let schema = StdArc::new(ArrowSchema::new(vec![
@@ -17052,7 +17051,7 @@ mod tests {
         let query =
             parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
         let calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
                 .expect("aggregate calls");
         let layout = aggregate_apply_test_helpers::count_layout("region");
         let schema = StdArc::new(ArrowSchema::new(vec![
@@ -17105,7 +17104,7 @@ mod tests {
                    from ice.ns.fact group by region";
         let query = parse_select_query(sql);
         let calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
                 .expect("extract aggregate calls");
 
         let state_sql = iceberg_aggregate_first_refresh_select_sql(sql, &calls).expect("rewrite");
@@ -18129,14 +18128,14 @@ mod tests {
     fn analyze_aggregate_fact_query(
         sql: &str,
     ) -> (
-        crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+        crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
         MvAnalysis,
     ) {
         let env = open_test_state_with_iceberg_catalog("ice", "ns");
         create_aggregate_fact_table(&env.state, "ice", "ns", "fact");
         let query = parse_select_query(sql);
         let calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
                 .expect("extract aggregate calls");
         let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
             .expect("analyze aggregate query");
@@ -21512,7 +21511,7 @@ mod tests {
         assert!(
             field_names
                 .iter()
-                .any(|name| { name == crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN }),
+                .any(|name| { name == crate::mv::aggregate_state::mv_agg_state::ROW_ID_COLUMN }),
             "composed branch-union aggregate target must carry the row-id apply key, got {field_names:?}"
         );
 
@@ -22074,7 +22073,7 @@ mod tests {
         let first_branch_ast =
             first_union_branch_ast_query(&query).expect("first branch ast query");
         let first_branch_calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 &first_branch_ast,
             )
             .expect("first branch aggregate calls");
@@ -25729,10 +25728,10 @@ mod tests {
     }
     mod aggregate_apply_test_helpers {
         use crate::catalog::schema::SqlType;
-        use crate::engine::mv::agg_state::mv_agg_state::{
+        use crate::mv::aggregate_state::mv_agg_state::{
             AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
         };
-        use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
+        use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
         use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
         use arrow::datatypes::DataType;
 

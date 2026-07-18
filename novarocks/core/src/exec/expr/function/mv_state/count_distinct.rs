@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 
-use crate::engine::mv::agg_state::state_codec::{MultisetEntry, decode_multiset_self_describing};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::mv::aggregate_state::state_codec::{MultisetEntry, decode_multiset_self_describing};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
@@ -117,7 +117,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::engine::mv::agg_state::state_codec::encode_multiset;
+    use crate::mv::aggregate_state::state_codec::encode_multiset;
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
         let mut builder = BinaryBuilder::new();

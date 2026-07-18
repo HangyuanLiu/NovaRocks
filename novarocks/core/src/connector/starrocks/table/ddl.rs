@@ -40,12 +40,12 @@ use crate::connector::starrocks::table::config::StarRocksTableConfig;
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema, request_schema_from_runtime,
 };
-use crate::engine::mv::agg_state::physical_column::StarRocksPhysicalColumn;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::starrocks_table::{
     CreateStarRocksColumnRequest, CreateStarRocksTableLayoutRequest, StageStarRocksTruncateRequest,
     StagedStarRocksTruncate, StarRocksTableKind as RepoStarRocksTableKind,
 };
+use crate::mv::aggregate_state::physical_column::StarRocksPhysicalColumn;
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
 const DEFAULT_STARROCKS_BUCKET_COUNT: u32 = 1;

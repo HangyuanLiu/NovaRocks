@@ -177,9 +177,9 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field};
 
-    use crate::engine::mv::agg_state::state_codec::encode_sum_decimal128;
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::mv::aggregate_state::state_codec::encode_sum_decimal128;
 
     use super::super::super::{AggInputView, AggSpec, AggStatePtr, AggregateFunction};
     use super::super::sum::{SumDecimal128State, SumStateAgg, SumStateSignedAgg};

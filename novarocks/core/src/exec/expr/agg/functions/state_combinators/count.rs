@@ -22,9 +22,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, StructArray};
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
+use crate::mv::aggregate_state::state_codec::{decode_count_state, encode_count_state};
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
@@ -400,9 +400,9 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray, Int8Array, Int64Array, StructArray};
     use arrow::datatypes::{DataType, Field};
 
-    use crate::engine::mv::agg_state::state_codec::{decode_count_state, encode_count_state};
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::mv::aggregate_state::state_codec::{decode_count_state, encode_count_state};
 
     use super::super::super::{AggKind, AggSpec, AggStatePtr, AggregateFunction};
     use super::*;

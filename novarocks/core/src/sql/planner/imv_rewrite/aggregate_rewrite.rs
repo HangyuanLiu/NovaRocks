@@ -431,7 +431,7 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
 fn branch_scoped_old_input(
     old_scan: LogicalPlanNode,
     branch_scope: Option<crate::sql::planner::table::BranchScope>,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let Some(scope) = branch_scope else {
         return Ok(old_scan);
@@ -459,7 +459,7 @@ fn build_relational_aggregate_change_stream(
     signed_delta: LogicalPlanNode,
     branch_scope: Option<crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let old_outputs = plan_output_columns(&old_input)?;
     let delta_with_row_id = delta_state_with_row_id(signed_delta, layout, ctx)?;
@@ -629,7 +629,7 @@ fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
 
 fn delta_state_with_row_id(
     signed_delta: LogicalPlanNode,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     ctx: &RewriteContext,
 ) -> Result<LogicalPlanNode, String> {
     let delta_outputs = plan_output_columns(&signed_delta)?;
@@ -681,7 +681,7 @@ fn delta_state_with_row_id(
 }
 
 fn merged_state_expr(
-    state_column: &crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
     join_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
@@ -739,7 +739,7 @@ fn aggregate_change_stream_project(
     old_outputs: &[OutputColumn],
     output_columns: &[OutputColumn],
     branch_scope: Option<&crate::sql::planner::table::BranchScope>,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
     let mut items = Vec::with_capacity(output_columns.len());
@@ -811,7 +811,7 @@ fn aggregate_delete_expr_for_output(
     input_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<TypedExpr, String> {
     let row_id_name = &layout.row_id_column.column.name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
@@ -853,7 +853,7 @@ fn aggregate_insert_expr_for_output(
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<TypedExpr, String> {
     let row_id_name = &layout.row_id_column.column.name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
@@ -967,7 +967,7 @@ fn branch_case_requires_runtime_cast(target: &DataType) -> bool {
 }
 
 fn aggregate_change_stream_output_columns(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     branch_scope: Option<&crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
 ) -> Result<Vec<OutputColumn>, String> {
@@ -1095,9 +1095,9 @@ fn find_output_column_by_id(
 }
 
 fn single_state_column_for_visible(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     visible_index: usize,
-) -> Result<&crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn, String> {
+) -> Result<&crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn, String> {
     use crate::mv::model::AggregateStateRole;
 
     layout
@@ -1115,8 +1115,8 @@ fn single_state_column_for_visible(
 }
 
 fn retraction_count_state_column(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
-) -> Result<&crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn, String> {
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+) -> Result<&crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn, String> {
     use crate::mv::model::AggregateFunctionKind;
     use crate::mv::model::AggregateStateRole;
 
@@ -1176,9 +1176,9 @@ fn visible_state_function(
 }
 
 fn visible_state_args(
-    state_column: &crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
     merged_state: TypedExpr,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<TypedExpr>, String> {
     use crate::mv::model::AggregateFunctionKind;
 
@@ -1246,7 +1246,7 @@ fn branch_scope_predicate(
 }
 
 fn aggregate_old_state_passthrough_items(
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     outputs: &[OutputColumn],
 ) -> Result<Vec<ProjectItem>, String> {
     let mut names = Vec::with_capacity(
@@ -1355,7 +1355,7 @@ fn group_key_output_name(
 fn aggregate_state_names(
     ext: &ImvExtension,
     aggregate_node: &LogicalAggregateNode,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<String>, String> {
     let aggregate = ext
         .mv_ctx
@@ -1610,8 +1610,8 @@ fn signed_aggregate(
     aggregate_required_output_columns: Option<HashSet<ColumnId>>,
     action_column: ColumnId,
     ctx: &RewriteContext,
-    shape: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlanNode, String> {
     let input_columns = plan_output_columns(&aggregate_input)?;
     let mut signed_calls = aggregate
@@ -1899,8 +1899,8 @@ fn unique_input_column_by_name<'a>(
 
 fn signed_aggregate_output_columns(
     group_by: &[TypedExpr],
-    shape: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     ctx: &RewriteContext,
     signed_calls: &mut [AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
@@ -1953,8 +1953,8 @@ fn signed_aggregate_output_columns(
 
 fn signed_aggregate_project_items(
     group_by: &[TypedExpr],
-    shape: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     ctx: &RewriteContext,
     aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
@@ -2089,7 +2089,7 @@ fn signed_aggregate_project_items(
 
 fn signed_aggregate_child_output<'a>(
     aggregate_output_columns: &'a [OutputColumn],
-    state_column: &crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
 ) -> Result<&'a OutputColumn, String> {
     aggregate_output_columns
         .iter()
@@ -2103,7 +2103,7 @@ fn signed_aggregate_child_output<'a>(
 }
 
 fn state_shaped_state_data_type(
-    state_column: &crate::engine::mv::agg_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
 ) -> DataType {
     match state_column.state_role {
         crate::mv::model::AggregateStateRole::Single => DataType::Binary,
@@ -2443,7 +2443,7 @@ mod tests {
     fn aggregate_rewrite_test_context_with_factory() -> (
         RewriteContext,
         ImvExtension,
-        crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+        crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
     ) {
         let mut ctx = build_ctx();
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
@@ -2490,18 +2490,18 @@ mod tests {
 
     #[test]
     fn visible_state_args_threads_avg_decimal_input_scale() {
-        let shape = crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(
+        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
             &parse_query("select k, avg(d) as a from ice.db.b group by k"),
         )
         .expect("classify aggregate");
-        let crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::Aggregate(shape) = shape
+        let crate::mv::aggregate_state::mv_shape::IncrementalMvShape::Aggregate(shape) = shape
         else {
             panic!("expected aggregate shape");
         };
         let calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(&shape);
+            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(&shape);
         let layout =
-            crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+            crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
                 &calls,
                 &[
                     OutputColumn {

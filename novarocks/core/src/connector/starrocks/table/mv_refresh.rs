@@ -471,7 +471,7 @@ fn dispatch_mv_refresh_strategy<
     ProjectionIncremental,
     AggregateIncremental,
 >(
-    mv_shape: &crate::engine::mv::agg_state::mv_shape::IncrementalMvShape,
+    mv_shape: &crate::mv::aggregate_state::mv_shape::IncrementalMvShape,
     strategy: MvRefreshPolicy,
     projection_full: ProjectionFull,
     aggregate_full: AggregateFull,
@@ -482,37 +482,37 @@ fn dispatch_mv_refresh_strategy<
 where
     ProjectionFull: FnOnce() -> Result<StatementResult, String>,
     AggregateFull: FnOnce(
-        &crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+        &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
     ) -> Result<StatementResult, String>,
     NoOp: FnOnce(i64) -> Result<StatementResult, String>,
     ProjectionIncremental: FnOnce(i64, i64) -> Result<StatementResult, String>,
     AggregateIncremental: FnOnce(
-        &crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+        &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
         i64,
         i64,
     ) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
         (
-            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::JoinProjectionFilter(_),
+            crate::mv::aggregate_state::mv_shape::IncrementalMvShape::JoinProjectionFilter(_),
             _,
         ) => Err(
             "join projection/filter IMV refresh is not supported by legacy StarRocks MV refresh"
                 .to_string(),
         ),
-        (crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::JoinAggregate(_), _) => Err(
+        (crate::mv::aggregate_state::mv_shape::IncrementalMvShape::JoinAggregate(_), _) => Err(
             "join aggregate IMV refresh is not supported by legacy StarRocks MV refresh"
                 .to_string(),
         ),
-        (crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::UnionAll(_), _) => {
+        (crate::mv::aggregate_state::mv_shape::IncrementalMvShape::UnionAll(_), _) => {
             Err("UNION ALL IMV refresh is not supported by legacy StarRocks MV refresh".to_string())
         }
         (
-            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::ProjectionFilter(_),
+            crate::mv::aggregate_state::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::FullRefresh { .. },
         ) => projection_full(),
         (
-            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::Aggregate(shape),
+            crate::mv::aggregate_state::mv_shape::IncrementalMvShape::Aggregate(shape),
             MvRefreshPolicy::FullRefresh { .. },
         ) => aggregate_full(shape),
         (
@@ -522,14 +522,14 @@ where
             },
         ) => no_op(current_snapshot_id),
         (
-            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::ProjectionFilter(_),
+            crate::mv::aggregate_state::mv_shape::IncrementalMvShape::ProjectionFilter(_),
             MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
             },
         ) => projection_incremental(previous_snapshot_id, current_snapshot_id),
         (
-            crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::Aggregate(shape),
+            crate::mv::aggregate_state::mv_shape::IncrementalMvShape::Aggregate(shape),
             MvRefreshPolicy::Incremental {
                 previous_snapshot_id,
                 current_snapshot_id,
@@ -546,7 +546,7 @@ fn refresh_aggregate_mv_full(
     state: &Arc<StandaloneState>,
     database: &str,
     mv_name: &str,
-    shape: &crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+    shape: &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
 ) -> Result<StatementResult, String> {
     let shape = shape.clone();
     refresh_mv_full_with_executor(state, database, mv_name, move |ctx| {
@@ -558,7 +558,7 @@ fn refresh_aggregate_mv_full_with_pinned_metadata(
     state: &Arc<StandaloneState>,
     database: &str,
     mv_name: &str,
-    shape: &crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+    shape: &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
     pinned_select_sql: String,
     base_metadata: CurrentBaseMetadata,
 ) -> Result<StatementResult, String> {
@@ -575,7 +575,7 @@ fn refresh_aggregate_mv_full_with_pinned_metadata(
 
 fn execute_aggregate_mv_full_refresh(
     ctx: MvRefreshContext,
-    shape: &crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+    shape: &crate::mv::aggregate_state::mv_shape::AggregateMvShape,
 ) -> Result<Vec<Chunk>, String> {
     // Step 1: obtain visible-shaped output types by analyzing the refresh SELECT
     // without executing it. `build_aggregate_mv_layout` expects visible-shaped types
@@ -583,30 +583,30 @@ fn execute_aggregate_mv_full_refresh(
     // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
     let visible_analysis = analyze_visible_query(&ctx.state, &ctx.database, &ctx.select_sql)?;
     let aggregate_input_types =
-        crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query(
-            &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+        crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
+            &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
             &visible_analysis,
         )?;
     let visible_output_columns = visible_analysis.output_columns;
 
     // Step 2: build the layout from visible types.
     let layout =
-        crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-            &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+        crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+            &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
             &visible_output_columns,
             &aggregate_input_types,
         )?;
 
     // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
     // it to obtain the actual state-shaped data.
-    let state_sql = crate::engine::mv::agg_state::mv_shape::rewrite_select_sql_for_state(
+    let state_sql = crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(
         &ctx.select_sql,
-        &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+        &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
     )?;
     let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
 
     // Step 4: materialize state-shaped executor result using the visible-type layout.
-    crate::engine::mv::agg_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+    crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
 }
 
 fn rewrite_full_refresh_select_with_pin(
@@ -655,7 +655,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     table_id: i64,
     select_sql: &'a str,
     base_ref: &'a TableIdentity,
-    shape: &'a crate::engine::mv::agg_state::mv_shape::AggregateMvShape,
+    shape: &'a crate::mv::aggregate_state::mv_shape::AggregateMvShape,
     change_batch: crate::connector::iceberg::changes::IcebergChangeBatch,
     previous_refresh_rows: i64,
     previous_snapshot_id: i64,
@@ -673,7 +673,7 @@ fn refresh_aggregate_mv_incremental(
     let has_inserts = !ctx.change_batch.inserts.is_empty();
     let has_deletes = change_batch_has_deletes(&ctx.change_batch);
     let apply_policy = apply_policy_for_change(
-        &crate::engine::mv::agg_state::mv_shape::IncrementalMvShape::Aggregate(ctx.shape.clone()),
+        &crate::mv::aggregate_state::mv_shape::IncrementalMvShape::Aggregate(ctx.shape.clone()),
         has_inserts,
         has_deletes,
         false,
@@ -747,13 +747,13 @@ fn refresh_aggregate_mv_incremental(
     // avoids this mismatch before materializing state chunks.
     let visible_analysis = analyze_visible_query(ctx.state, ctx.database, ctx.select_sql)?;
     let aggregate_input_types =
-        crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query(
-            &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
+        crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
+            &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
             &visible_analysis,
         )?;
     let layout =
-        crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-            &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
+        crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+            &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
             &visible_analysis.output_columns,
             &aggregate_input_types,
         )?;
@@ -762,7 +762,7 @@ fn refresh_aggregate_mv_incremental(
     // aggregate, so any error from the rewriter is now a real error.
     let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
         ctx.select_sql,
-        &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
+        &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
     )?;
     let delta_result = execute_delta_source_query(
         IvmDeltaSourceInput {
@@ -775,7 +775,7 @@ fn refresh_aggregate_mv_incremental(
         source_files,
     )?;
     let delta_chunks =
-        crate::engine::mv::agg_state::mv_agg_state::materialize_aggregate_result_chunks(
+        crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(
             delta_result,
             &layout,
         )?;
@@ -1400,14 +1400,14 @@ fn bootstrap_mv_refresh_partition_for_tablets(
 
 fn validate_incremental_mv_select(
     select_sql: &str,
-) -> Result<crate::engine::mv::agg_state::mv_shape::IncrementalMvShape, String> {
+) -> Result<crate::mv::aggregate_state::mv_shape::IncrementalMvShape, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("sql parser error: {e}"))?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
     };
-    crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&query)
+    crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(&query)
 }
 
 fn validate_incremental_mv_base_ref(

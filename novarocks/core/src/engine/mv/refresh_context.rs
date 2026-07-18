@@ -322,8 +322,8 @@ impl IcebergMvRewriteContext {
         &self,
     ) -> Result<
         (
-            crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
-            crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout,
+            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+            crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
         ),
         String,
     > {
@@ -343,7 +343,7 @@ impl IcebergMvRewriteContext {
             query.clone()
         };
         let aggregate_calls =
-            crate::engine::mv::agg_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
                 &aggregate_query,
             )
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
@@ -376,7 +376,7 @@ impl IcebergMvRewriteContext {
         let aggregate_input_types =
             aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
         let layout =
-            crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+            crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
                 &aggregate_calls,
                 &output_columns,
                 &aggregate_input_types,
@@ -419,10 +419,10 @@ fn first_union_branch_query(
 }
 
 fn aggregate_input_types_from_schema_contract(
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
-    use crate::engine::mv::agg_state::mv_shape::AggregateInput;
+    use crate::mv::aggregate_state::mv_shape::AggregateInput;
     use crate::mv::model::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
@@ -458,9 +458,9 @@ fn aggregate_input_types_from_schema_contract(
 }
 
 fn aggregate_input_cast_type(
-    input: &crate::engine::mv::agg_state::mv_shape::AggregateInput,
+    input: &crate::mv::aggregate_state::mv_shape::AggregateInput,
 ) -> Result<Option<DataType>, String> {
-    let crate::engine::mv::agg_state::mv_shape::AggregateInput::Expr(expr) = input else {
+    let crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(expr) = input else {
         return Ok(None);
     };
     explicit_cast_type(expr)

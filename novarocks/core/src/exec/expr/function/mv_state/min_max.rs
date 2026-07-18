@@ -25,12 +25,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 
-use crate::engine::mv::agg_state::state_codec::{
+use crate::exec::chunk::Chunk;
+use crate::exec::expr::{ExprArena, ExprId};
+use crate::mv::aggregate_state::state_codec::{
     KeyValue, MultisetEntry, decode_multiset_self_describing, decode_multiset_with_key_type,
     encode_multiset, key_type_tag_for_data_type, read_key, union_multisets,
 };
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
@@ -377,7 +377,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryBuilder, Float64Array, Int64Array};
 
     use super::*;
-    use crate::engine::mv::agg_state::state_codec::{decode_multiset_with_key_type, write_key_at};
+    use crate::mv::aggregate_state::state_codec::{decode_multiset_with_key_type, write_key_at};
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
         let mut builder = BinaryBuilder::new();

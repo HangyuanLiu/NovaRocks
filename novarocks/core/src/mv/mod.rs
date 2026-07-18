@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod aggregate_state;
 pub(crate) mod model;
 pub mod persistence;
 pub(crate) mod refresh;

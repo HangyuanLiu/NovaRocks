@@ -25,12 +25,12 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::agg_state::state_codec::{
-    decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
-};
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::expr::function::mv_state::sum_state_union;
 use crate::exec::node::aggregate::AggFunction;
+use crate::mv::aggregate_state::state_codec::{
+    decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
+};
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
@@ -858,12 +858,12 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use arrow_buffer::NullBufferBuilder;
 
-    use crate::engine::mv::agg_state::state_codec::{
-        decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
-    };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::expr::function::mv_state::sum_state_union;
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::mv::aggregate_state::state_codec::{
+        decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
+    };
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
     use super::*;
