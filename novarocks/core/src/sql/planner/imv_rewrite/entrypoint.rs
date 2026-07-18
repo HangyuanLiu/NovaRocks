@@ -367,17 +367,15 @@ mod tests {
 
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::mv::iceberg_target_apply::{
-        ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-    };
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
-        BranchIdColumnContract, BranchUnionContract, JoinContract, JoinContractKind,
-        JoinPredicateLineage, MvSchemaContract, QualifiedFieldLineage,
+        BranchIdColumnContract, BranchUnionContract, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
+        MvSchemaContract, QualifiedFieldLineage,
     };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
@@ -870,7 +868,7 @@ mod tests {
         let mut contract = make_schema_contract();
         contract.target.visible_columns[0].output_name = "k".to_string();
         contract.target.visible_columns[1].output_name = "v".to_string();
-        contract.target.hidden_apply_key.column_name = ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string();
+        contract.target.hidden_apply_key.column_name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
         contract.target.hidden_apply_key.target_field_id = 999;
         contract.target.hidden_apply_key.source = ApplyKeySource::JoinRowKey;
         contract.bases = vec![
@@ -914,7 +912,7 @@ mod tests {
                     )),
                     Arc::new(NestedField::required(
                         999,
-                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        JOIN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::String),
                     )),
                 ])
@@ -1485,7 +1483,7 @@ mod tests {
                     default: None,
                 },
                 crate::sql::TableColumnDef {
-                    name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     data_type: crate::catalog::schema::SqlType::String,
                     nullable: false,
                     aggregation: None,
@@ -2359,9 +2357,10 @@ mod tests {
             panic!("expected root apply-key Project, got {:?}", outcome.plan);
         };
         assert!(
-            project.items.iter().any(|item| item
-                .output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            project
+                .items
+                .iter()
+                .any(|item| item.output_name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
             "root output must include branch id; items: {:?}",
             project_output_names(project)
         );
@@ -2376,7 +2375,7 @@ mod tests {
         assert!(
             project.items.iter().any(|item| item
                 .output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)),
+                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)),
             "root output must include apply key; items: {:?}",
             project_output_names(project)
         );
@@ -2389,9 +2388,10 @@ mod tests {
             );
         };
         assert!(
-            union.output_columns.iter().any(|column| column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
             "Union output must include branch id"
         );
         assert!(
@@ -2665,9 +2665,7 @@ mod tests {
         assert!(
             output_columns.iter().any(|column| {
                 column.column_id == descriptor.join_apply_key_column.column_id
-                    && column
-                        .name
-                        .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                    && column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
             }),
             "coalesce input must expose the recorded join apply-key column"
         );

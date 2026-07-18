@@ -2327,9 +2327,7 @@ mod tests {
             None,
             Some(BranchUnionContract {
                 branch_id_column: BranchIdColumnContract {
-                    column_name:
-                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
-                            .to_string(),
+                    column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
                     target_field_id: 998,
                 },
                 branch_count: 2,
@@ -3547,22 +3545,20 @@ mod tests {
         };
         let aggregate_input = aggregate_plan.unary_input().clone();
 
-        let merge =
-            build_aggregate_state_merge(
-                aggregate.clone(),
-                aggregate_input,
-                None,
-                None,
-                Some(crate::sql::planner::table::BranchScope {
-                    branch_id_column_name:
-                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
-                            .to_string(),
-                    branch_id: 1,
-                }),
-                &ctx,
-                &ext,
-            )
-            .expect("branch-scoped merge builds");
+        let merge = build_aggregate_state_merge(
+            aggregate.clone(),
+            aggregate_input,
+            None,
+            None,
+            Some(crate::sql::planner::table::BranchScope {
+                branch_id_column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME
+                    .to_string(),
+                branch_id: 1,
+            }),
+            &ctx,
+            &ext,
+        )
+        .expect("branch-scoped merge builds");
 
         let _ = aggregate_change_stream_project(&merge);
         let (project, filter, old_scan) = find_branch_scoped_old_input(&merge);
@@ -3629,9 +3625,8 @@ mod tests {
                 is_root: true,
                 action_column: None,
                 branch_scope: Some(crate::sql::planner::table::BranchScope {
-                    branch_id_column_name:
-                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
-                            .to_string(),
+                    branch_id_column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME
+                        .to_string(),
                     branch_id: 1,
                 }),
             }),

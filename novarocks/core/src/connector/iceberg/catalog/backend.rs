@@ -31,6 +31,7 @@ use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
+use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::table::{ScanSource, TableDef};
 
@@ -43,8 +44,6 @@ use super::registry::{
 };
 use super::views;
 
-const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
-const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
 pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
 
@@ -637,11 +636,11 @@ fn hide_novarocks_mv_internal_columns(
     hide_novarocks_mv_internal_columns_by_property(
         metadata
             .properties()
-            .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .get(APPLY_KEY_COLUMN_PROPERTY)
             .map(String::as_str),
         metadata
             .properties()
-            .get(NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY)
+            .get(HIDDEN_COLUMNS_PROPERTY)
             .map(String::as_str),
         columns,
     )
@@ -697,11 +696,11 @@ pub(crate) fn hidden_internal_column_names_from_metadata(
     hidden_internal_column_names(
         metadata
             .properties()
-            .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .get(APPLY_KEY_COLUMN_PROPERTY)
             .map(String::as_str),
         metadata
             .properties()
-            .get(NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY)
+            .get(HIDDEN_COLUMNS_PROPERTY)
             .map(String::as_str),
     )
 }

@@ -24,9 +24,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::engine::mv::iceberg_target_apply::{
-    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN,
-};
+use crate::mv::persistence::schema::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -108,18 +106,17 @@ fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
         return false;
     };
     is_supported_fan_in_delta_union(plan)
-        && node.output_columns.iter().any(|column| {
-            column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
-        })
+        && node
+            .output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
 }
 
 fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
             i.output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
         }),
         _ => false,
     }
@@ -169,7 +166,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             let apply_key_col =
                 crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column(
                     ctx,
-                    ICEBERG_MV_APPLY_KEY_COLUMN,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
                     row_id_type.clone(),
                     row_id_nullable,
                 )?;
@@ -183,7 +180,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                     data_type: row_id_type,
                     nullable: row_id_nullable,
                 },
-                output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                 output_column_id: apply_key_col,
             };
             let LogicalPlanNode {
@@ -262,7 +259,6 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
     use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
@@ -404,7 +400,7 @@ mod tests {
         };
         assert!(root.items.iter().any(|i| {
             i.output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
         }));
     }
 
@@ -424,7 +420,7 @@ mod tests {
                     data_type: DataType::Int64,
                     nullable: false,
                 },
-                output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                 output_column_id: ColumnId(200),
             });
         }

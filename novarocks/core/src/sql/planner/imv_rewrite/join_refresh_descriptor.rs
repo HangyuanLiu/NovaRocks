@@ -208,9 +208,11 @@ impl JoinRefreshDescriptor {
     }
 
     fn validate_join_apply_key_column(&self) -> Result<(), String> {
-        if !self.join_apply_key_column.name.eq_ignore_ascii_case(
-            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-        ) || self.join_apply_key_column.data_type != DataType::Utf8
+        if !self
+            .join_apply_key_column
+            .name
+            .eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+            || self.join_apply_key_column.data_type != DataType::Utf8
             || self.join_apply_key_column.nullable
             || !self.join_apply_key_column.is_internal
         {
@@ -453,7 +455,7 @@ mod tests {
             ),
             join_apply_key_column: out(
                 4,
-                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
                 DataType::Utf8,
                 false,
                 true,
@@ -481,7 +483,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         10,
-                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
                         DataType::Utf8,
                         false,
                         true,

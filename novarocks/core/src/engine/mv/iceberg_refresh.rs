@@ -55,14 +55,8 @@ use crate::engine::mv::analysis::{
     output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::engine::mv::iceberg_target_apply::{
-    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
-    ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID, ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
-    ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN, ICEBERG_MV_PROP_APPLY_KEY_COLUMN,
-    ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID, ICEBERG_MV_PROP_APPLY_KEY_SOURCE,
-    ICEBERG_MV_PROP_HIDDEN_COLUMNS, apply_key_table_column, branch_id_table_column,
-    ensure_base_row_lineage_contract, find_apply_key_field_id_by_column,
-    iceberg_mv_physical_select_sql, join_apply_key_table_column,
+    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
+    find_apply_key_field_id_by_column, iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
@@ -96,6 +90,11 @@ use crate::mv::persistence::descriptor::{
     DescriptorDependency, MV_DESCRIPTOR_VERSION, MvDescriptorV1,
 };
 use crate::mv::persistence::schema as mv_schema;
+use crate::mv::persistence::schema::{
+    APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
+    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    HIDDEN_APPLY_KEY_COLUMN_NAME, HIDDEN_COLUMNS_PROPERTY, JOIN_APPLY_KEY_COLUMN_NAME,
+};
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
@@ -306,14 +305,13 @@ pub(crate) fn create_iceberg_mv(
         ));
     }
     if identity_needs_branch_id_column(&property.identity)
-        && analysis.output_columns.iter().any(|column| {
-            column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
-        })
+        && analysis
+            .output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
     {
         return Err(format!(
-            "Iceberg MV output column name {ICEBERG_MV_BRANCH_ID_COLUMN} is reserved for internal branch id"
+            "Iceberg MV output column name {BRANCH_ID_COLUMN_NAME} is reserved for internal branch id"
         ));
     }
     let mut columns =
@@ -344,7 +342,7 @@ pub(crate) fn create_iceberg_mv(
         descriptor_hidden_columns.push(apply_key_column_name.to_string());
     }
     if identity_needs_branch_id_column(&property.identity) {
-        descriptor_hidden_columns.push(ICEBERG_MV_BRANCH_ID_COLUMN.to_string());
+        descriptor_hidden_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
     }
     descriptor_hidden_columns.extend(aggregate_state_hidden_columns.iter().cloned());
     let descriptor = MvDescriptorV1 {
@@ -370,21 +368,21 @@ pub(crate) fn create_iceberg_mv(
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
         (
-            ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
+            APPLY_KEY_COLUMN_PROPERTY.to_string(),
             apply_key_column_name.to_string(),
         ),
         (
-            ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
+            APPLY_KEY_SOURCE_PROPERTY.to_string(),
             apply_key_source_property.to_string(),
         ),
         (
-            ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
+            APPLY_KEY_FIELD_ID_PROPERTY.to_string(),
             expected_apply_key_field_id.to_string(),
         ),
     ];
     if !aggregate_state_hidden_columns.is_empty() {
         target_properties.push((
-            ICEBERG_MV_PROP_HIDDEN_COLUMNS.to_string(),
+            HIDDEN_COLUMNS_PROPERTY.to_string(),
             aggregate_state_hidden_columns.join(","),
         ));
     }
@@ -741,7 +739,7 @@ fn validate_branch_union_contract(
         })?;
     if !branch_field
         .name
-        .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        .eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
     {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column renamed externally to {}; recreate the MV",
@@ -864,7 +862,7 @@ fn validate_union_projection_schema_contract_for_base(
         })?;
     if !branch_field
         .name
-        .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        .eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
     {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column renamed externally to {}; recreate the MV",
@@ -1093,18 +1091,18 @@ fn load_base_with_row_lineage(
 
 fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static str {
     match apply_key.column_name {
-        ICEBERG_MV_APPLY_KEY_COLUMN => ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN => ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
-        ICEBERG_MV_GROUP_APPLY_KEY_COLUMN => ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID,
+        HIDDEN_APPLY_KEY_COLUMN_NAME => ApplyKeySource::BaseRowId.table_property_value(),
+        JOIN_APPLY_KEY_COLUMN_NAME => ApplyKeySource::JoinRowKey.table_property_value(),
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => ApplyKeySource::GroupRowId.table_property_value(),
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
     }
 }
 
 fn create_apply_key_contract_source(apply_key: &ApplyKeyContract) -> mv_schema::ApplyKeySource {
     match apply_key.column_name {
-        ICEBERG_MV_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::BaseRowId,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::JoinRowKey,
-        ICEBERG_MV_GROUP_APPLY_KEY_COLUMN => mv_schema::ApplyKeySource::GroupRowId,
+        HIDDEN_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::BaseRowId,
+        JOIN_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::JoinRowKey,
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::GroupRowId,
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
     }
 }
@@ -1292,8 +1290,8 @@ fn create_apply_key_table_column(
     apply_key: &ApplyKeyContract,
 ) -> Result<crate::sql::parser::ast::TableColumnDef, String> {
     match apply_key.column_name {
-        ICEBERG_MV_APPLY_KEY_COLUMN => Ok(apply_key_table_column()),
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN => Ok(join_apply_key_table_column()),
+        HIDDEN_APPLY_KEY_COLUMN_NAME => Ok(apply_key_table_column()),
+        JOIN_APPLY_KEY_COLUMN_NAME => Ok(join_apply_key_table_column()),
         other => Err(format!(
             "Iceberg MV refresh contract apply-key column {other} is not a physical target apply-key column"
         )),
@@ -1962,7 +1960,7 @@ fn build_branch_union_schema_contract(
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     target: mv_schema::TargetContract,
 ) -> Result<mv_schema::MvSchemaContract, String> {
-    let branch_id_field_id = target_field_id_by_column(target_loaded, ICEBERG_MV_BRANCH_ID_COLUMN)?;
+    let branch_id_field_id = target_field_id_by_column(target_loaded, BRANCH_ID_COLUMN_NAME)?;
     let branch_count = union_branch_count(canonical_query);
     let first_branch_resolved = first_union_branch_resolved_query(&analysis.resolved_query)?;
 
@@ -2782,7 +2780,7 @@ fn append_union_projection_hidden_columns_to_set_expr(
                 .projection
                 .push(sqlparser::ast::SelectItem::ExprWithAlias {
                     expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-                    alias: sqlparser::ast::Ident::new(ICEBERG_MV_APPLY_KEY_COLUMN),
+                    alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
                 });
             select
                 .projection
@@ -2796,7 +2794,7 @@ fn append_union_projection_hidden_columns_to_set_expr(
                         array: false,
                         format: None,
                     },
-                    alias: sqlparser::ast::Ident::new(ICEBERG_MV_BRANCH_ID_COLUMN),
+                    alias: sqlparser::ast::Ident::new(BRANCH_ID_COLUMN_NAME),
                 });
             Ok(())
         }
@@ -8961,7 +8959,7 @@ fn append_branch_id_to_first_refresh_chunk(
         .cloned()
         .collect::<Vec<_>>();
     fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
-        ICEBERG_MV_BRANCH_ID_COLUMN,
+        BRANCH_ID_COLUMN_NAME,
         arrow::datatypes::DataType::Int32,
         false,
     )));
@@ -12678,7 +12676,7 @@ fn build_join_full_refresh_logical_plan(
     reserve_factory_for_logical_plan(&mut factory, &input.plan)?;
     let join_apply_key_column_id = factory.create(
         None,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         DataType::Utf8,
         false,
     );
@@ -12690,7 +12688,7 @@ fn build_join_full_refresh_logical_plan(
     );
     let join_apply_key_column = join_full_refresh_output_column(
         join_apply_key_column_id,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        JOIN_APPLY_KEY_COLUMN_NAME,
         DataType::Utf8,
         false,
         true,
@@ -14433,7 +14431,7 @@ fn build_join_delta_target_locator_table_def(
     crate::engine::mv::iceberg_target_apply::expose_physical_apply_key_for_locator_registration(
         table_def,
         target_table,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        JOIN_APPLY_KEY_COLUMN_NAME,
     )
 }
 
@@ -16481,7 +16479,7 @@ mod tests {
                 schema_id_at_create: 1,
                 visible_columns: Vec::new(),
                 hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     target_field_id: 1,
                     source: ApplyKeySource::JoinRowKey,
                 },
@@ -16515,7 +16513,7 @@ mod tests {
         let column = crate::engine::mv::iceberg_target_apply::join_apply_key_table_column();
         assert_eq!(
             column.name,
-            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
         );
     }
 
@@ -16525,19 +16523,19 @@ mod tests {
 
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::projection_filter()),
-            ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID
+            ApplyKeySource::BaseRowId.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::join_projection_filter()),
-            ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY
+            ApplyKeySource::JoinRowKey.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::aggregate_group_row()),
-            ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID
+            ApplyKeySource::GroupRowId.table_property_value()
         );
         assert_eq!(
             create_apply_key_source_property(&ApplyKeyContract::join_aggregate_group_row()),
-            ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID
+            ApplyKeySource::GroupRowId.table_property_value()
         );
     }
 
@@ -16547,7 +16545,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: false,
             identity: RefreshIdentity::BaseRowId,
-            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Int64,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16560,7 +16558,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::SingleBase,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16576,7 +16574,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: false,
             identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16592,7 +16590,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16605,7 +16603,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::GroupRowId,
-            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16618,7 +16616,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: false,
             identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::BaseRowId)),
-            apply_key_column: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::BranchInt64,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16655,7 +16653,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: false,
             identity: RefreshIdentity::JoinRowKey,
-            apply_key_column: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::Utf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16670,7 +16668,7 @@ mod tests {
             snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
             has_agg_state: true,
             identity: RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
-            apply_key_column: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+            apply_key_column: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
             apply_key_value_type: ApplyKeyValueType::BranchUtf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
@@ -16812,7 +16810,7 @@ mod tests {
             locator
                 .columns
                 .iter()
-                .any(|column| column.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN),
+                .any(|column| column.name == JOIN_APPLY_KEY_COLUMN_NAME),
             "locator columns={:?}",
             locator.columns
         );
@@ -16890,7 +16888,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         for expected in [
             "net",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             "__pending_insert_count",
             "__pending_delete_count",
             crate::exec::row_position::ICEBERG_FILE_PATH_COL,
@@ -17837,8 +17835,8 @@ mod tests {
                 .select(vec![
                     "id".to_string(),
                     "name".to_string(),
-                    ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-                    ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                    HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    BRANCH_ID_COLUMN_NAME.to_string(),
                 ])
                 .build()
                 .expect("build UNION ALL target scan");
@@ -17924,14 +17922,14 @@ mod tests {
         );
         let join_apply_key = join_coalesce_factory_test_column(
             5,
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             DataType::Utf8,
             false,
             true,
         );
         let join_apply_key_output = join_coalesce_factory_test_column(
             90,
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             DataType::Utf8,
             false,
             true,
@@ -18080,8 +18078,7 @@ mod tests {
                     scan.columns
                         .iter()
                         .filter(|column| {
-                            column.column_id >= min_id
-                                && column.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+                            column.column_id >= min_id && column.name == JOIN_APPLY_KEY_COLUMN_NAME
                         })
                         .cloned(),
                 );
@@ -18097,7 +18094,7 @@ mod tests {
         matches!(
             name,
             "net"
-                | ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+                | JOIN_APPLY_KEY_COLUMN_NAME
                 | "__pending_insert_count"
                 | "__pending_delete_count"
         )
@@ -18823,7 +18820,7 @@ mod tests {
                 default: None,
             },
             crate::sql::TableColumnDef {
-                name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                 data_type: crate::catalog::schema::SqlType::String,
                 nullable: false,
                 aggregation: None,
@@ -18841,8 +18838,8 @@ mod tests {
                 ("format-version".to_string(), "3".to_string()),
                 ("write.row-lineage".to_string(), "true".to_string()),
                 (
-                    ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                    JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                 ),
             ],
         )
@@ -18954,7 +18951,11 @@ mod tests {
                 .as_struct()
                 .fields()
                 .iter()
-                .any(|field| field.name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN));
+                .any(|field| {
+                    field
+                        .name
+                        .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
+                });
         let rows = rows
             .iter()
             .enumerate()
@@ -19219,7 +19220,7 @@ mod tests {
         let arrow_schema = StdArc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
-            Field::new(ICEBERG_MV_APPLY_KEY_COLUMN, DataType::Int64, false),
+            Field::new(HIDDEN_APPLY_KEY_COLUMN_NAME, DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
@@ -19432,9 +19433,9 @@ mod tests {
                 .table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_APPLY_KEY_COLUMN)
+                .get(APPLY_KEY_COLUMN_PROPERTY)
                 .map(String::as_str),
-            Some(ICEBERG_MV_APPLY_KEY_COLUMN)
+            Some(HIDDEN_APPLY_KEY_COLUMN_NAME)
         );
         let fields = loaded
             .table
@@ -19444,7 +19445,7 @@ mod tests {
             .fields();
         let apply_key_field = fields
             .iter()
-            .find(|field| field.name == ICEBERG_MV_APPLY_KEY_COLUMN)
+            .find(|field| field.name == HIDDEN_APPLY_KEY_COLUMN_NAME)
             .expect("target apply-key field");
         assert_eq!(apply_key_field.id, 3);
         assert!(apply_key_field.required);
@@ -19498,7 +19499,7 @@ mod tests {
         );
         assert_eq!(
             descriptor.hidden_columns,
-            vec![ICEBERG_MV_APPLY_KEY_COLUMN.to_string()]
+            vec![HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()]
         );
         assert_eq!(
             descriptor.base_dependencies,
@@ -20517,7 +20518,7 @@ mod tests {
             .as_struct()
             .fields()
             .iter()
-            .find(|field| field.name == ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            .find(|field| field.name == JOIN_APPLY_KEY_COLUMN_NAME)
             .expect("join apply-key field remains in target schema");
         assert!(apply_key_field.required);
 
@@ -20537,7 +20538,7 @@ mod tests {
                 .target
                 .hidden_apply_key
                 .column_name,
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+            JOIN_APPLY_KEY_COLUMN_NAME
         );
     }
 
@@ -21330,7 +21331,7 @@ mod tests {
                 .table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_HIDDEN_COLUMNS)
+                .get(HIDDEN_COLUMNS_PROPERTY)
                 .map(String::as_str),
             Some("__agg_state_c,__agg_state_s")
         );
@@ -21503,9 +21504,7 @@ mod tests {
             .map(|field| field.name.clone())
             .collect::<Vec<_>>();
         assert!(
-            field_names
-                .iter()
-                .any(|name| name == ICEBERG_MV_BRANCH_ID_COLUMN),
+            field_names.iter().any(|name| name == BRANCH_ID_COLUMN_NAME),
             "composed branch-union target must carry the branch-id column, got {field_names:?}"
         );
         // The aggregate apply key is the synthetic row-id column (BranchUtf8
@@ -21616,13 +21615,13 @@ mod tests {
             vec![
                 "id",
                 "name",
-                ICEBERG_MV_APPLY_KEY_COLUMN,
-                ICEBERG_MV_BRANCH_ID_COLUMN
+                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                BRANCH_ID_COLUMN_NAME
             ]
         );
         let branch_field = fields
             .iter()
-            .find(|field| field.name == ICEBERG_MV_BRANCH_ID_COLUMN)
+            .find(|field| field.name == BRANCH_ID_COLUMN_NAME)
             .expect("branch id field");
 
         let contract =
@@ -21642,10 +21641,7 @@ mod tests {
             branch.inner_apply_key_source,
             mv_schema::ApplyKeySource::BaseRowId
         );
-        assert_eq!(
-            branch.branch_id_column.column_name,
-            ICEBERG_MV_BRANCH_ID_COLUMN
-        );
+        assert_eq!(branch.branch_id_column.column_name, BRANCH_ID_COLUMN_NAME);
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
     }
 
@@ -22031,7 +22027,7 @@ mod tests {
 
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect_err("UNION ALL branch id output alias should be rejected");
-        assert!(err.contains(ICEBERG_MV_BRANCH_ID_COLUMN), "err={err}");
+        assert!(err.contains(BRANCH_ID_COLUMN_NAME), "err={err}");
         assert!(err.contains("reserved"), "err={err}");
 
         let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
@@ -22110,15 +22106,17 @@ mod tests {
                 ("format-version".to_string(), "3".to_string()),
                 ("write.row-lineage".to_string(), "true".to_string()),
                 (
-                    ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                    ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
+                    APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                    GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
                 ),
                 (
-                    ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
-                    ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID.to_string(),
+                    APPLY_KEY_SOURCE_PROPERTY.to_string(),
+                    ApplyKeySource::GroupRowId
+                        .table_property_value()
+                        .to_string(),
                 ),
                 (
-                    ICEBERG_MV_PROP_HIDDEN_COLUMNS.to_string(),
+                    HIDDEN_COLUMNS_PROPERTY.to_string(),
                     "__agg_state_c,__agg_state_s".to_string(),
                 ),
             ],
@@ -22131,7 +22129,7 @@ mod tests {
         )
         .expect("load union aggregate target table");
         let actual_apply_key_field_id =
-            find_apply_key_field_id_by_column(&loaded.table, ICEBERG_MV_GROUP_APPLY_KEY_COLUMN)
+            find_apply_key_field_id_by_column(&loaded.table, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME)
                 .expect("apply-key field");
 
         let refresh_contract = derive_imv_refresh_contract(&analysis).expect("refresh contract");
@@ -22153,7 +22151,7 @@ mod tests {
                 .table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_HIDDEN_COLUMNS)
+                .get(HIDDEN_COLUMNS_PROPERTY)
                 .map(String::as_str),
             Some("__agg_state_c,__agg_state_s")
         );
@@ -22169,18 +22167,18 @@ mod tests {
             .collect::<Vec<_>>();
         let branch_field = fields
             .iter()
-            .find(|field| field.name == ICEBERG_MV_BRANCH_ID_COLUMN)
+            .find(|field| field.name == BRANCH_ID_COLUMN_NAME)
             .expect("branch id field");
         assert_eq!(
             field_names,
             vec![
-                ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
                 "region",
                 "c",
                 "s",
                 "__agg_state_c",
                 "__agg_state_s",
-                ICEBERG_MV_BRANCH_ID_COLUMN
+                BRANCH_ID_COLUMN_NAME
             ]
         );
 
@@ -22801,7 +22799,7 @@ mod tests {
         assert!(field_names.contains(&"id"), "{field_names:?}");
         assert!(field_names.contains(&"name"), "{field_names:?}");
         assert!(
-            field_names.contains(&ICEBERG_MV_APPLY_KEY_COLUMN),
+            field_names.contains(&HIDDEN_APPLY_KEY_COLUMN_NAME),
             "{field_names:?}"
         );
 
@@ -22815,7 +22813,7 @@ mod tests {
         );
         assert_eq!(
             descriptor.hidden_columns,
-            vec![ICEBERG_MV_APPLY_KEY_COLUMN.to_string()]
+            vec![HIDDEN_APPLY_KEY_COLUMN_NAME.to_string()]
         );
         for hidden in &descriptor.hidden_columns {
             assert!(

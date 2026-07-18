@@ -30,21 +30,18 @@
 #[cfg(test)]
 use crate::mv::model::TargetPartitionFilter;
 
-pub(crate) const ICEBERG_MV_APPLY_KEY_COLUMN: &str = "__nova_base_row_id";
-pub(crate) const ICEBERG_MV_JOIN_APPLY_KEY_COLUMN: &str = "__nova_join_row_key";
-pub(crate) const ICEBERG_MV_BRANCH_ID_COLUMN: &str = "__branch_id__";
-pub(crate) const ICEBERG_MV_GROUP_APPLY_KEY_COLUMN: &str = "__row_id__";
-pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID: &str = "base._row_id";
-pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY: &str = "JoinRowKey";
-pub(crate) const ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID: &str = "GroupRowId";
-pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_COLUMN: &str = "novarocks.mv.apply-key.column";
-pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_SOURCE: &str = "novarocks.mv.apply-key.source";
-pub(crate) const ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID: &str = "novarocks.mv.apply-key.field-id";
-pub(crate) const ICEBERG_MV_PROP_HIDDEN_COLUMNS: &str = "novarocks.mv.hidden-columns";
+#[cfg(test)]
+use crate::mv::persistence::schema::{
+    APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
+    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+};
+use crate::mv::persistence::schema::{
+    BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+};
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
-        name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+        name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
         data_type: crate::catalog::schema::SqlType::BigInt,
         nullable: false,
         aggregation: None,
@@ -54,7 +51,7 @@ pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDe
 
 pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
-        name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         data_type: crate::catalog::schema::SqlType::String,
         nullable: false,
         aggregation: None,
@@ -64,7 +61,7 @@ pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableCol
 
 pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
-        name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+        name: BRANCH_ID_COLUMN_NAME.to_string(),
         data_type: crate::catalog::schema::SqlType::Int,
         nullable: false,
         aggregation: None,
@@ -89,20 +86,20 @@ pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String,
             sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
                 if expr
                     .to_string()
-                    .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
                 {
                     return Err(format!(
-                        "Iceberg MV output column name {ICEBERG_MV_APPLY_KEY_COLUMN} is reserved for internal apply key"
+                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
                     ));
                 }
             }
             sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
                 if alias
                     .value
-                    .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
                 {
                     return Err(format!(
-                        "Iceberg MV output column name {ICEBERG_MV_APPLY_KEY_COLUMN} is reserved for internal apply key"
+                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
                     ));
                 }
             }
@@ -119,7 +116,7 @@ pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String,
         .projection
         .push(sqlparser::ast::SelectItem::ExprWithAlias {
             expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-            alias: sqlparser::ast::Ident::new(ICEBERG_MV_APPLY_KEY_COLUMN),
+            alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
         });
     Ok(stmt.to_string())
 }
@@ -238,7 +235,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
-        ICEBERG_MV_APPLY_KEY_COLUMN,
+        HIDDEN_APPLY_KEY_COLUMN_NAME,
         ApplyKeyRequest::Int64(base_row_ids),
         existing_deletes_by_file,
         referenced_data_file_partitions,
@@ -331,7 +328,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
         target_table,
-        ICEBERG_MV_APPLY_KEY_COLUMN,
+        HIDDEN_APPLY_KEY_COLUMN_NAME,
         ApplyKeyRequest::BranchInt64(requested_keys),
         existing_deletes_by_file,
         referenced_data_file_partitions,
@@ -624,11 +621,11 @@ fn process_branch_i64_apply_key_locator_batch(
     let pos_idx = schema
         .index_of("_pos")
         .map_err(|e| format!("iceberg MV target locator scan missing _pos: {e}"))?;
-    let branch_idx = schema.index_of(ICEBERG_MV_BRANCH_ID_COLUMN).map_err(|e| {
-        format!("iceberg MV target locator scan missing {ICEBERG_MV_BRANCH_ID_COLUMN}: {e}")
+    let branch_idx = schema.index_of(BRANCH_ID_COLUMN_NAME).map_err(|e| {
+        format!("iceberg MV target locator scan missing {BRANCH_ID_COLUMN_NAME}: {e}")
     })?;
-    let key_idx = schema.index_of(ICEBERG_MV_APPLY_KEY_COLUMN).map_err(|e| {
-        format!("iceberg MV target locator scan missing {ICEBERG_MV_APPLY_KEY_COLUMN}: {e}")
+    let key_idx = schema.index_of(HIDDEN_APPLY_KEY_COLUMN_NAME).map_err(|e| {
+        format!("iceberg MV target locator scan missing {HIDDEN_APPLY_KEY_COLUMN_NAME}: {e}")
     })?;
     let file_col = arrow::compute::cast(batch.column(file_idx), &arrow::datatypes::DataType::Utf8)
         .map_err(|e| format!("cast target _file to STRING failed: {e}"))?;
@@ -636,10 +633,10 @@ fn process_branch_i64_apply_key_locator_batch(
         .map_err(|e| format!("cast target _pos to BIGINT failed: {e}"))?;
     let branch_col =
         arrow::compute::cast(batch.column(branch_idx), &arrow::datatypes::DataType::Int32)
-            .map_err(|e| format!("cast target {ICEBERG_MV_BRANCH_ID_COLUMN} to INT failed: {e}"))?;
+            .map_err(|e| format!("cast target {BRANCH_ID_COLUMN_NAME} to INT failed: {e}"))?;
     let key_col = arrow::compute::cast(batch.column(key_idx), &arrow::datatypes::DataType::Int64)
         .map_err(|e| {
-        format!("cast target {ICEBERG_MV_APPLY_KEY_COLUMN} to BIGINT failed: {e}")
+        format!("cast target {HIDDEN_APPLY_KEY_COLUMN_NAME} to BIGINT failed: {e}")
     })?;
     let files = file_col
         .as_any()
@@ -652,11 +649,11 @@ fn process_branch_i64_apply_key_locator_batch(
     let branches = branch_col
         .as_any()
         .downcast_ref::<Int32Array>()
-        .ok_or_else(|| format!("target {ICEBERG_MV_BRANCH_ID_COLUMN} is not INT after cast"))?;
+        .ok_or_else(|| format!("target {BRANCH_ID_COLUMN_NAME} is not INT after cast"))?;
     let keys = key_col
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!("target {ICEBERG_MV_APPLY_KEY_COLUMN} is not BIGINT after cast"))?;
+        .ok_or_else(|| format!("target {HIDDEN_APPLY_KEY_COLUMN_NAME} is not BIGINT after cast"))?;
 
     for row in 0..batch.num_rows() {
         if files.is_null(row)
@@ -708,8 +705,8 @@ fn process_branch_utf8_apply_key_locator_batch(
     let pos_idx = schema
         .index_of("_pos")
         .map_err(|e| format!("iceberg MV target locator scan missing _pos: {e}"))?;
-    let branch_idx = schema.index_of(ICEBERG_MV_BRANCH_ID_COLUMN).map_err(|e| {
-        format!("iceberg MV target locator scan missing {ICEBERG_MV_BRANCH_ID_COLUMN}: {e}")
+    let branch_idx = schema.index_of(BRANCH_ID_COLUMN_NAME).map_err(|e| {
+        format!("iceberg MV target locator scan missing {BRANCH_ID_COLUMN_NAME}: {e}")
     })?;
     let key_idx = schema
         .index_of(apply_key_column)
@@ -720,7 +717,7 @@ fn process_branch_utf8_apply_key_locator_batch(
         .map_err(|e| format!("cast target _pos to BIGINT failed: {e}"))?;
     let branch_col =
         arrow::compute::cast(batch.column(branch_idx), &arrow::datatypes::DataType::Int32)
-            .map_err(|e| format!("cast target {ICEBERG_MV_BRANCH_ID_COLUMN} to INT failed: {e}"))?;
+            .map_err(|e| format!("cast target {BRANCH_ID_COLUMN_NAME} to INT failed: {e}"))?;
     let key_col = arrow::compute::cast(batch.column(key_idx), &arrow::datatypes::DataType::Utf8)
         .map_err(|e| format!("cast target {apply_key_column} to STRING failed: {e}"))?;
     let files = file_col
@@ -734,7 +731,7 @@ fn process_branch_utf8_apply_key_locator_batch(
     let branches = branch_col
         .as_any()
         .downcast_ref::<Int32Array>()
-        .ok_or_else(|| format!("target {ICEBERG_MV_BRANCH_ID_COLUMN} is not INT after cast"))?;
+        .ok_or_else(|| format!("target {BRANCH_ID_COLUMN_NAME} is not INT after cast"))?;
     let keys = key_col
         .as_any()
         .downcast_ref::<StringArray>()
@@ -1422,14 +1419,14 @@ fn framework_locator_select_sql(
         requested_keys,
         ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
     ) {
-        projections.push(quote_sql_identifier(ICEBERG_MV_BRANCH_ID_COLUMN));
+        projections.push(quote_sql_identifier(BRANCH_ID_COLUMN_NAME));
     }
     projections.push(apply_key.clone());
     let mut predicates = vec![format!("{apply_key} IN ({in_list})")];
     if let Some(branch_in_list) = framework_locator_branch_id_in_list(requested_keys) {
         predicates.push(format!(
             "{} IN ({})",
-            quote_sql_identifier(ICEBERG_MV_BRANCH_ID_COLUMN),
+            quote_sql_identifier(BRANCH_ID_COLUMN_NAME),
             branch_in_list
         ));
     }
@@ -1534,7 +1531,7 @@ async fn locate_target_rows_by_apply_key_impl(
         requested_keys,
         ApplyKeyRequest::BranchInt64(_) | ApplyKeyRequest::BranchUtf8(_)
     ) {
-        select_columns.push(ICEBERG_MV_BRANCH_ID_COLUMN.to_string());
+        select_columns.push(BRANCH_ID_COLUMN_NAME.to_string());
     }
     select_columns.push(apply_key_column.to_string());
     let scan = target_table
@@ -1684,7 +1681,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_string(
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     locate_target_rows_by_string_apply_key(
         target_table,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        JOIN_APPLY_KEY_COLUMN_NAME,
         join_row_keys,
         existing_deletes_by_file,
         referenced_data_file_partitions,
@@ -1706,7 +1703,7 @@ mod tests {
 
     /// Build a minimal local Hadoop-catalog iceberg table that can serve as
     /// the target for `locate_target_rows_by_apply_key` tests.  The table has
-    /// a single `i64` column named `ICEBERG_MV_APPLY_KEY_COLUMN` and no data
+    /// a single `i64` column named `HIDDEN_APPLY_KEY_COLUMN_NAME` and no data
     /// files.  The `_row_ids` slice is accepted for future extension but
     /// currently unused (no data is written; tests that exercise the no-request
     /// path need an empty target table).
@@ -1743,7 +1740,7 @@ mod tests {
                 .with_fields(vec![
                     NestedField::required(
                         1,
-                        ICEBERG_MV_APPLY_KEY_COLUMN,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::Long),
                     )
                     .into(),
@@ -1793,7 +1790,7 @@ mod tests {
     #[test]
     fn branch_id_table_column_is_required_int() {
         let col = branch_id_table_column();
-        assert_eq!(col.name, ICEBERG_MV_BRANCH_ID_COLUMN);
+        assert_eq!(col.name, BRANCH_ID_COLUMN_NAME);
         assert_eq!(col.name, "__branch_id__");
         assert!(!col.nullable);
         assert!(matches!(
@@ -1909,7 +1906,7 @@ mod tests {
 
         process_apply_key_locator_batch(
             &batch,
-            ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             false,
             &requested,
             &mut matches,
@@ -1984,7 +1981,7 @@ mod tests {
 
         process_apply_key_locator_batch(
             &batch,
-            ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             false,
             &requested,
             &mut matches,
@@ -2009,7 +2006,7 @@ mod tests {
 
         let err = process_apply_key_locator_batch(
             &batch,
-            ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             false,
             &requested,
             &mut matches,
@@ -2068,7 +2065,7 @@ mod tests {
 
         process_branch_utf8_apply_key_locator_batch(
             &batch,
-            ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
             &requested,
             &mut matches,
             &existing_deletes,
@@ -2130,7 +2127,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains(ICEBERG_MV_BRANCH_ID_COLUMN), "err={err}");
+        assert!(err.contains(BRANCH_ID_COLUMN_NAME), "err={err}");
         assert!(err.contains("missing"), "err={err}");
     }
 
@@ -2138,7 +2135,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int32, false),
-            Field::new(ICEBERG_MV_GROUP_APPLY_KEY_COLUMN, DataType::Utf8, false),
+            Field::new(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -2161,8 +2158,8 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int32, false),
-            Field::new(ICEBERG_MV_BRANCH_ID_COLUMN, DataType::Int32, false),
-            Field::new(ICEBERG_MV_APPLY_KEY_COLUMN, DataType::Int64, false),
+            Field::new(BRANCH_ID_COLUMN_NAME, DataType::Int32, false),
+            Field::new(HIDDEN_APPLY_KEY_COLUMN_NAME, DataType::Int64, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -2188,8 +2185,8 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int32, false),
-            Field::new(ICEBERG_MV_BRANCH_ID_COLUMN, DataType::Int32, false),
-            Field::new(ICEBERG_MV_GROUP_APPLY_KEY_COLUMN, DataType::Utf8, false),
+            Field::new(BRANCH_ID_COLUMN_NAME, DataType::Int32, false),
+            Field::new(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -2267,7 +2264,7 @@ mod tests {
     ///   region=a → apply_key = "key-a" at position 0
     ///   region=b → apply_key = "key-b" at position 0
     ///
-    /// Schema: `ICEBERG_MV_JOIN_APPLY_KEY_COLUMN` (Utf8 required, field_id=1),
+    /// Schema: `JOIN_APPLY_KEY_COLUMN_NAME` (Utf8 required, field_id=1),
     ///         `region` (Utf8 optional, field_id=2).
     /// Partition spec: identity(region), bound spec_id=0.
     ///
@@ -2320,7 +2317,7 @@ mod tests {
                 .with_fields(vec![
                     NestedField::required(
                         1,
-                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        JOIN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::String),
                     )
                     .into(),
@@ -2347,17 +2344,16 @@ mod tests {
                         .properties([
                             ("write.row-lineage".to_string(), "true".to_string()),
                             (
-                                ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                                APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                                JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                             ),
                             (
-                                ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
-                                ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY.to_string(),
+                                APPLY_KEY_SOURCE_PROPERTY.to_string(),
+                                ApplyKeySource::JoinRowKey
+                                    .table_property_value()
+                                    .to_string(),
                             ),
-                            (
-                                ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
-                                "1".to_string(),
-                            ),
+                            (APPLY_KEY_FIELD_ID_PROPERTY.to_string(), "1".to_string()),
                         ])
                         .format_version(FormatVersion::V3)
                         .build(),
@@ -2368,7 +2364,7 @@ mod tests {
             // Two batches: region=a and region=b, each with one apply_key row.
             let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    JOIN_APPLY_KEY_COLUMN_NAME,
                     arrow::datatypes::DataType::Utf8,
                     false,
                 ),
@@ -2479,19 +2475,19 @@ mod tests {
                 .with_fields(vec![
                     NestedField::required(
                         1,
-                        ICEBERG_MV_BRANCH_ID_COLUMN,
+                        BRANCH_ID_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::Int),
                     )
                     .into(),
                     NestedField::required(
                         2,
-                        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        JOIN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::String),
                     )
                     .into(),
                     NestedField::required(
                         3,
-                        ICEBERG_MV_APPLY_KEY_COLUMN,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::Long),
                     )
                     .into(),
@@ -2509,17 +2505,16 @@ mod tests {
                         .properties([
                             ("write.row-lineage".to_string(), "true".to_string()),
                             (
-                                ICEBERG_MV_PROP_APPLY_KEY_COLUMN.to_string(),
-                                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                                APPLY_KEY_COLUMN_PROPERTY.to_string(),
+                                JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                             ),
                             (
-                                ICEBERG_MV_PROP_APPLY_KEY_SOURCE.to_string(),
-                                ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY.to_string(),
+                                APPLY_KEY_SOURCE_PROPERTY.to_string(),
+                                ApplyKeySource::JoinRowKey
+                                    .table_property_value()
+                                    .to_string(),
                             ),
-                            (
-                                ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID.to_string(),
-                                "2".to_string(),
-                            ),
+                            (APPLY_KEY_FIELD_ID_PROPERTY.to_string(), "2".to_string()),
                         ])
                         .format_version(FormatVersion::V3)
                         .build(),
@@ -2529,17 +2524,17 @@ mod tests {
 
             let arrow_schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    ICEBERG_MV_BRANCH_ID_COLUMN,
+                    BRANCH_ID_COLUMN_NAME,
                     arrow::datatypes::DataType::Int32,
                     false,
                 ),
                 arrow::datatypes::Field::new(
-                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    JOIN_APPLY_KEY_COLUMN_NAME,
                     arrow::datatypes::DataType::Utf8,
                     false,
                 ),
                 arrow::datatypes::Field::new(
-                    ICEBERG_MV_APPLY_KEY_COLUMN,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
                     arrow::datatypes::DataType::Int64,
                     false,
                 ),
@@ -2706,7 +2701,7 @@ mod tests {
             table: target_table.clone(),
             columns: vec![
                 crate::catalog::schema::ColumnDef {
-                    name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                    name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                     data_type: arrow::datatypes::DataType::Utf8,
                     nullable: false,
                     write_default: None,
@@ -2731,9 +2726,10 @@ mod tests {
         table_def: &crate::sql::planner::table::TableDef,
     ) {
         assert!(
-            table_def.columns.iter().all(|column| !column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)),
+            table_def
+                .columns
+                .iter()
+                .all(|column| !column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)),
             "standard MV target registration must hide the physical apply-key column"
         );
         assert!(
@@ -2757,7 +2753,7 @@ mod tests {
         table_def.columns.insert(
             0,
             crate::catalog::schema::ColumnDef {
-                name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+                name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                 data_type: arrow::datatypes::DataType::Utf8,
                 nullable: false,
                 write_default: None,
@@ -2879,23 +2875,23 @@ mod tests {
             target_table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_APPLY_KEY_COLUMN)
+                .get(APPLY_KEY_COLUMN_PROPERTY)
                 .map(String::as_str),
-            Some(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            Some(JOIN_APPLY_KEY_COLUMN_NAME)
         );
         assert_eq!(
             target_table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_APPLY_KEY_SOURCE)
+                .get(APPLY_KEY_SOURCE_PROPERTY)
                 .map(String::as_str),
-            Some(ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY)
+            Some(ApplyKeySource::JoinRowKey.table_property_value())
         );
         assert_eq!(
             target_table
                 .metadata()
                 .properties()
-                .get(ICEBERG_MV_PROP_APPLY_KEY_FIELD_ID)
+                .get(APPLY_KEY_FIELD_ID_PROPERTY)
                 .map(String::as_str),
             Some("1")
         );
@@ -2945,9 +2941,10 @@ mod tests {
 
         let table_def = expose_physical_apply_key_for_locator_test_registration(standard_table_def);
         assert!(
-            table_def.columns.iter().any(|column| column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)),
+            table_def
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)),
             "locator/test registration must expose the physical apply-key column"
         );
         assert!(
@@ -2981,7 +2978,7 @@ mod tests {
             "SELECT _file, _pos, {apply_key} \
              FROM db.mv_target \
              WHERE {apply_key} IN ('key-a')",
-            apply_key = ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+            apply_key = JOIN_APPLY_KEY_COLUMN_NAME
         );
         let result = match session
             .execute_in_context(&sql, None, "db", None)
@@ -3109,7 +3106,7 @@ mod tests {
         let direct_groups = rt
             .block_on(super::locate_target_rows_by_string_apply_key(
                 &fixture.table,
-                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                JOIN_APPLY_KEY_COLUMN_NAME,
                 &requested,
                 &empty_deletes,
                 &referenced,
@@ -3123,7 +3120,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&requested),
             &referenced,
             &TargetPartitionFilter::None,
@@ -3214,7 +3211,7 @@ mod tests {
         let direct_live_groups = rt
             .block_on(super::locate_target_rows_by_string_apply_key(
                 &fixture.table,
-                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                JOIN_APPLY_KEY_COLUMN_NAME,
                 &live_key,
                 &existing_deletes_by_file,
                 &referenced_data_file_partitions,
@@ -3228,7 +3225,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&live_key),
             &referenced_data_file_partitions,
             &TargetPartitionFilter::None,
@@ -3239,7 +3236,7 @@ mod tests {
 
         let direct_result = rt.block_on(super::locate_target_rows_by_string_apply_key(
             &fixture.table,
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             &deleted_key,
             &existing_deletes_by_file,
             &referenced_data_file_partitions,
@@ -3256,7 +3253,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&deleted_key),
             &referenced_data_file_partitions,
             &TargetPartitionFilter::None,
@@ -3303,7 +3300,7 @@ mod tests {
             .block_on(
                 super::locate_target_rows_by_branch_string_apply_key_with_matches(
                     &fixture.table,
-                    ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                    JOIN_APPLY_KEY_COLUMN_NAME,
                     &branch_string_keys,
                     &empty_deletes,
                     &referenced,
@@ -3325,7 +3322,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::BranchUtf8(&branch_string_keys),
             &referenced,
             &TargetPartitionFilter::None,
@@ -3360,7 +3357,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_APPLY_KEY_COLUMN,
+            HIDDEN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::BranchInt64(&branch_i64_keys),
             &referenced,
             &TargetPartitionFilter::None,
@@ -3401,7 +3398,7 @@ mod tests {
         let direct_key_a = rt
             .block_on(super::locate_target_rows_by_string_apply_key_with_matches(
                 &fixture.table,
-                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                JOIN_APPLY_KEY_COLUMN_NAME,
                 &requested_key_a,
                 &empty_deletes,
                 &referenced,
@@ -3422,7 +3419,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&requested_key_a),
             &referenced,
             &filter,
@@ -3433,7 +3430,7 @@ mod tests {
         let requested_key_b = vec!["key-b".to_string()];
         let direct_key_b = rt.block_on(super::locate_target_rows_by_string_apply_key_with_matches(
             &fixture.table,
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             &requested_key_b,
             &empty_deletes,
             &referenced,
@@ -3445,7 +3442,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&requested_key_b),
             &referenced,
             &filter,
@@ -3513,7 +3510,7 @@ mod tests {
             "ice",
             "db",
             "mv_target",
-            ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            JOIN_APPLY_KEY_COLUMN_NAME,
             ApplyKeyRequest::Utf8(&requested),
             &referenced,
             &TargetPartitionFilter::None,
@@ -3663,7 +3660,7 @@ mod tests {
         let result = rt
             .block_on(super::locate_target_rows_by_string_apply_key_with_matches(
                 target_table,
-                ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                JOIN_APPLY_KEY_COLUMN_NAME,
                 &join_keys,
                 &existing,
                 &referenced,

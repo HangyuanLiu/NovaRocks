@@ -27,10 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::datatypes::DataType;
 
 use crate::catalog::schema::ColumnDef;
-use crate::engine::mv::iceberg_target_apply::{
-    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_BRANCH_ID_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+use crate::mv::persistence::schema::{
+    ApplyKeySource, BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
-use crate::mv::persistence::schema::ApplyKeySource;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
@@ -147,8 +146,8 @@ fn target_locator_join_input(
         return Ok(None);
     }
     let left_apply_key_name = match contract.target.hidden_apply_key.source {
-        ApplyKeySource::BaseRowId => ICEBERG_MV_APPLY_KEY_COLUMN,
-        ApplyKeySource::JoinRowKey => ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+        ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
         ApplyKeySource::GroupRowId => return Ok(None),
     };
     let Some(left_apply_key) = output
@@ -171,9 +170,7 @@ fn target_locator_join_input(
                 column
                     .name
                     .eq_ignore_ascii_case(&branch.branch_id_column.column_name)
-                    || column
-                        .name
-                        .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+                    || column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
             })?
             .clone();
         Some(LocatorBranchInput {
@@ -606,7 +603,7 @@ fn is_internal_output_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
         || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
-        || name.eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
-        || name.eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
-        || name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+        || name.eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
+        || name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
+        || name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
 }
