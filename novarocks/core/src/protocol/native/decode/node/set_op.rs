@@ -36,6 +36,7 @@ pub(super) fn lower_set_op_node(
     physical: &plan::PlanNode,
     set_op: &plan::SetOpNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -49,12 +50,11 @@ pub(super) fn lower_set_op_node(
             format!("SetOpNode unknown kind {}", set_op.kind),
         )
     })?;
-    let output_columns = if set_op.output_columns.is_empty() {
-        &physical.output_columns
+    let (output_columns, output_columns_path) = if set_op.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
     } else {
-        &set_op.output_columns
+        (&set_op.output_columns, path.clone().field("output_columns"))
     };
-    let output_columns_path = path.clone().field("output_columns");
     let layout = NativeFragmentDecodeError::map_invalid(
         output_columns_path.clone(),
         layout_from_output_columns(output_columns),
@@ -68,6 +68,7 @@ pub(super) fn lower_set_op_node(
         children,
         &set_op.child_output_columns,
         output_columns,
+        output_columns_path,
         output_schema.clone(),
         path.clone(),
         arena,
@@ -123,6 +124,7 @@ fn normalize_set_op_inputs(
     children: Vec<DecodedNode>,
     child_output_columns: &[plan::OutputColumnList],
     output_columns: &[proto_common::OutputColumn],
+    output_columns_path: FieldPath,
     output_schema: ChunkSchemaRef,
     path: FieldPath,
     arena: &mut ExprArena,
@@ -132,6 +134,7 @@ fn normalize_set_op_inputs(
             node_id,
             children,
             output_columns,
+            output_columns_path,
             output_schema,
             path,
             arena,
@@ -147,9 +150,9 @@ fn normalize_set_op_inputs(
             ),
         ));
     }
-    let output_slots = slot_ids_from_columns(output_columns, path.clone().field("output_columns"))?;
+    let output_slots = slot_ids_from_columns(output_columns, output_columns_path.clone())?;
     let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path,
         slot_schemas_from_output_columns(output_columns),
     )?;
     children
@@ -199,13 +202,14 @@ fn normalize_set_op_inputs_by_position(
     node_id: i32,
     children: Vec<DecodedNode>,
     output_columns: &[proto_common::OutputColumn],
+    output_columns_path: FieldPath,
     output_schema: ChunkSchemaRef,
     path: FieldPath,
     arena: &mut ExprArena,
 ) -> Result<Vec<ExecNode>, NativeFragmentDecodeError> {
-    let output_slots = slot_ids_from_columns(output_columns, path.clone().field("output_columns"))?;
+    let output_slots = slot_ids_from_columns(output_columns, output_columns_path.clone())?;
     let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path,
         slot_schemas_from_output_columns(output_columns),
     )?;
     children

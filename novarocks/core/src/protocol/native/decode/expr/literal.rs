@@ -22,177 +22,226 @@ use arrow_buffer::i256;
 
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::{common, expr};
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(crate) fn lower_literal(
     literal: &expr::LiteralExpr,
     data_type: &DataType,
 ) -> Result<LiteralValue, super::super::NativeFragmentDecodeError> {
-    lower_literal_at(literal, FieldPath::root("expr").field("literal"), data_type)
+    lower_literal_at(literal, data_type)
+        .map_err(|error| error.into_native(FieldPath::root("expr").field("literal")))
 }
 
 pub(super) fn lower_literal_at(
     literal: &expr::LiteralExpr,
-    path: FieldPath,
     data_type: &DataType,
-) -> Result<LiteralValue, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<LiteralValue, String> {
-        let value = literal
-            .value
-            .as_ref()
-            .ok_or_else(|| "LiteralExpr.value missing".to_string())?;
-        let value = value
-            .value
-            .as_ref()
-            .ok_or_else(|| "LiteralValue.value missing".to_string())?;
-        use common::literal_value::Value;
-        match value {
-            Value::NullValue(true) => Ok(LiteralValue::Null),
-            Value::NullValue(false) => Err("LiteralValue.null_value must be true".to_string()),
-            Value::BoolValue(value) => {
-                require_type(
-                    data_type,
-                    matches!(data_type, DataType::Boolean),
-                    "bool literal",
-                )?;
-                Ok(LiteralValue::Bool(*value))
-            }
-            Value::IntValue(value) => lower_int_literal(*value, data_type),
-            Value::LargeintValue(bytes) => {
-                require_type(
-                    data_type,
-                    crate::common::largeint::is_largeint_data_type(data_type),
-                    "largeint literal",
-                )?;
-                Ok(LiteralValue::LargeInt(
-                    crate::common::largeint::i128_from_be_bytes(bytes)?,
-                ))
-            }
-            Value::FloatValue(value) => match data_type {
-                DataType::Float32 => Ok(LiteralValue::Float32(*value as f32)),
-                DataType::Float64 => Ok(LiteralValue::Float64(*value)),
-                _ => Err(format!("float literal cannot be lowered as {data_type:?}")),
-            },
-            Value::StringValue(value) => {
-                require_type(
-                    data_type,
-                    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8),
-                    "string literal",
-                )?;
-                Ok(LiteralValue::Utf8(value.clone()))
-            }
-            Value::BinaryValue(value) => {
-                require_type(
-                    data_type,
-                    matches!(data_type, DataType::Binary | DataType::LargeBinary),
-                    "binary literal",
-                )?;
-                Ok(LiteralValue::Binary(value.clone()))
-            }
-            Value::Date32Value(value) => {
-                require_type(
-                    data_type,
-                    matches!(data_type, DataType::Date32),
-                    "date32 literal",
-                )?;
-                Ok(LiteralValue::Date32(*value))
-            }
-            Value::DecimalValue(decimal) => lower_decimal_literal(
-                decimal,
-                path.clone().field("value").field("decimal_value"),
+) -> Result<LiteralValue, NativeFragmentLeafDecodeError> {
+    let value = literal.value.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "value",
+            "LiteralExpr.value missing",
+        )
+    })?;
+    let value = value.value.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "value",
+            "LiteralValue.value missing",
+        )
+        .append_field("value")
+    })?;
+    use common::literal_value::Value;
+    match value {
+        Value::NullValue(true) => Ok(LiteralValue::Null),
+        Value::NullValue(false) => Err(literal_value_error(
+            ProtocolErrorKind::InvalidValue,
+            "null_value",
+            "LiteralValue.null_value must be true",
+        )),
+        Value::BoolValue(value) => {
+            require_literal_type(
                 data_type,
-            )
-            .map_err(|error| error.to_string()),
+                matches!(data_type, DataType::Boolean),
+                "bool_value",
+                "bool literal",
+            )?;
+            Ok(LiteralValue::Bool(*value))
         }
-    })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
-}
-
-fn require_type(data_type: &DataType, ok: bool, context: &str) -> Result<(), String> {
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("{context} cannot be lowered as {data_type:?}"))
+        Value::IntValue(value) => lower_int_literal(*value, data_type),
+        Value::LargeintValue(bytes) => {
+            require_literal_type(
+                data_type,
+                crate::common::largeint::is_largeint_data_type(data_type),
+                "largeint_value",
+                "largeint literal",
+            )?;
+            crate::common::largeint::i128_from_be_bytes(bytes)
+                .map(LiteralValue::LargeInt)
+                .map_err(|error| {
+                    literal_value_error(ProtocolErrorKind::InvalidValue, "largeint_value", error)
+                })
+        }
+        Value::FloatValue(value) => match data_type {
+            DataType::Float32 => Ok(LiteralValue::Float32(*value as f32)),
+            DataType::Float64 => Ok(LiteralValue::Float64(*value)),
+            _ => Err(literal_value_error(
+                ProtocolErrorKind::InvalidValue,
+                "float_value",
+                format!("float literal cannot be lowered as {data_type:?}"),
+            )),
+        },
+        Value::StringValue(value) => {
+            require_literal_type(
+                data_type,
+                matches!(data_type, DataType::Utf8 | DataType::LargeUtf8),
+                "string_value",
+                "string literal",
+            )?;
+            Ok(LiteralValue::Utf8(value.clone()))
+        }
+        Value::BinaryValue(value) => {
+            require_literal_type(
+                data_type,
+                matches!(data_type, DataType::Binary | DataType::LargeBinary),
+                "binary_value",
+                "binary literal",
+            )?;
+            Ok(LiteralValue::Binary(value.clone()))
+        }
+        Value::Date32Value(value) => {
+            require_literal_type(
+                data_type,
+                matches!(data_type, DataType::Date32),
+                "date32_value",
+                "date32 literal",
+            )?;
+            Ok(LiteralValue::Date32(*value))
+        }
+        Value::DecimalValue(decimal) => lower_decimal_literal(decimal, data_type)
+            .map_err(|error| error.prepend_field("decimal_value").prepend_field("value")),
     }
 }
 
-fn lower_int_literal(value: i64, data_type: &DataType) -> Result<LiteralValue, String> {
+fn literal_value_error(
+    kind: ProtocolErrorKind,
+    variant: &'static str,
+    detail: impl std::fmt::Display,
+) -> NativeFragmentLeafDecodeError {
+    NativeFragmentLeafDecodeError::at_field(kind, "value", detail).append_field(variant)
+}
+
+fn require_literal_type(
+    data_type: &DataType,
+    ok: bool,
+    variant: &'static str,
+    context: &str,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(literal_value_error(
+            ProtocolErrorKind::InvalidValue,
+            variant,
+            format!("{context} cannot be lowered as {data_type:?}"),
+        ))
+    }
+}
+
+fn lower_int_literal(
+    value: i64,
+    data_type: &DataType,
+) -> Result<LiteralValue, NativeFragmentLeafDecodeError> {
+    let out_of_range = || {
+        literal_value_error(
+            ProtocolErrorKind::OutOfRange,
+            "int_value",
+            format!("int literal {value} is outside {data_type:?} range"),
+        )
+    };
     match data_type {
         DataType::Int8 => i8::try_from(value)
             .map(LiteralValue::Int8)
-            .map_err(|_| format!("int literal {value} is outside Int8 range")),
+            .map_err(|_| out_of_range()),
         DataType::Int16 => i16::try_from(value)
             .map(LiteralValue::Int16)
-            .map_err(|_| format!("int literal {value} is outside Int16 range")),
+            .map_err(|_| out_of_range()),
         DataType::Int32 => i32::try_from(value)
             .map(LiteralValue::Int32)
-            .map_err(|_| format!("int literal {value} is outside Int32 range")),
+            .map_err(|_| out_of_range()),
         DataType::Int64 => Ok(LiteralValue::Int64(value)),
         DataType::Date32 => i32::try_from(value)
             .map(LiteralValue::Date32)
-            .map_err(|_| format!("date32 int literal {value} is outside i32 range")),
-        _ => Err(format!("int literal cannot be lowered as {data_type:?}")),
+            .map_err(|_| out_of_range()),
+        _ => Err(literal_value_error(
+            ProtocolErrorKind::InvalidValue,
+            "int_value",
+            format!("int literal cannot be lowered as {data_type:?}"),
+        )),
     }
 }
 
 fn lower_decimal_literal(
     decimal: &common::DecimalLiteral,
-    path: FieldPath,
     data_type: &DataType,
-) -> Result<LiteralValue, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<LiteralValue, String> {
-        let precision = u8::try_from(decimal.precision)
-            .map_err(|_| format!("invalid decimal precision {}", decimal.precision))?;
-        let scale = i8::try_from(decimal.scale)
-            .map_err(|_| format!("invalid decimal scale {}", decimal.scale))?;
-        validate_decimal_parts(precision, scale)?;
+) -> Result<LiteralValue, NativeFragmentLeafDecodeError> {
+    let precision = u8::try_from(decimal.precision).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "precision",
+            format!("invalid decimal precision {}", decimal.precision),
+        )
+    })?;
+    let scale = i8::try_from(decimal.scale).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "scale",
+            format!("invalid decimal scale {}", decimal.scale),
+        )
+    })?;
+    validate_decimal_parts(precision, scale)?;
 
-        match data_type {
-            DataType::Decimal128(expected_precision, expected_scale) => {
-                validate_decimal_type_match(
-                    precision,
-                    scale,
-                    *expected_precision,
-                    *expected_scale,
-                )?;
-                let bytes = decimal_bytes::<16>(&decimal.value, "Decimal128")?;
-                Ok(LiteralValue::Decimal128 {
-                    value: i128::from_be_bytes(bytes),
-                    precision,
-                    scale,
-                })
-            }
-            DataType::Decimal256(expected_precision, expected_scale) => {
-                validate_decimal_type_match(
-                    precision,
-                    scale,
-                    *expected_precision,
-                    *expected_scale,
-                )?;
-                let bytes = decimal_bytes::<32>(&decimal.value, "Decimal256")?;
-                Ok(LiteralValue::Decimal256 {
-                    value: i256::from_be_bytes(bytes),
-                    precision,
-                    scale,
-                })
-            }
-            _ => Err(format!(
-                "decimal literal requires Decimal128/Decimal256 type, got {data_type:?}"
-            )),
+    match data_type {
+        DataType::Decimal128(expected_precision, expected_scale) => {
+            validate_decimal_type_match(precision, scale, *expected_precision, *expected_scale)?;
+            let bytes = decimal_bytes::<16>(&decimal.value, "Decimal128")?;
+            Ok(LiteralValue::Decimal128 {
+                value: i128::from_be_bytes(bytes),
+                precision,
+                scale,
+            })
         }
-    })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+        DataType::Decimal256(expected_precision, expected_scale) => {
+            validate_decimal_type_match(precision, scale, *expected_precision, *expected_scale)?;
+            let bytes = decimal_bytes::<32>(&decimal.value, "Decimal256")?;
+            Ok(LiteralValue::Decimal256 {
+                value: i256::from_be_bytes(bytes),
+                precision,
+                scale,
+            })
+        }
+        _ => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "value",
+            format!("decimal literal requires Decimal128/Decimal256 type, got {data_type:?}"),
+        )),
+    }
 }
 
-fn validate_decimal_parts(precision: u8, scale: i8) -> Result<(), String> {
+fn validate_decimal_parts(precision: u8, scale: i8) -> Result<(), NativeFragmentLeafDecodeError> {
     if precision == 0 || precision > 76 {
-        return Err(format!(
-            "decimal precision {precision} must be between 1 and 76"
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "precision",
+            format!("decimal precision {precision} must be between 1 and 76"),
         ));
     }
     if scale < 0 || scale > precision as i8 {
-        return Err(format!(
-            "decimal scale {scale} must be between 0 and precision {precision}"
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "scale",
+            format!("decimal scale {scale} must be between 0 and precision {precision}"),
         ));
     }
     Ok(())
@@ -203,20 +252,39 @@ fn validate_decimal_type_match(
     scale: i8,
     expected_precision: u8,
     expected_scale: i8,
-) -> Result<(), String> {
-    if precision == expected_precision && scale == expected_scale {
-        Ok(())
-    } else {
-        Err(format!(
-            "decimal literal precision/scale ({precision},{scale}) does not match Expr.type ({expected_precision},{expected_scale})"
-        ))
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    if precision != expected_precision {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "precision",
+            format!(
+                "decimal literal precision {precision} does not match Expr.type precision {expected_precision}"
+            ),
+        ));
     }
+    if scale != expected_scale {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "scale",
+            format!(
+                "decimal literal scale {scale} does not match Expr.type scale {expected_scale}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
-fn decimal_bytes<const N: usize>(value: &[u8], label: &str) -> Result<[u8; N], String> {
-    value
-        .try_into()
-        .map_err(|_| format!("{label} literal requires {N} bytes, got {}", value.len()))
+fn decimal_bytes<const N: usize>(
+    value: &[u8],
+    label: &str,
+) -> Result<[u8; N], NativeFragmentLeafDecodeError> {
+    value.try_into().map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "value",
+            format!("{label} literal requires {N} bytes, got {}", value.len()),
+        )
+    })
 }
 
 pub(super) fn push_zero_literal(
@@ -255,8 +323,116 @@ mod tests {
     use super::super::tests::{bool_lit, int_lit, lower, scalar_expr, string_lit};
     use crate::exec::expr::{ExprNode, LiteralValue};
     use crate::proto::{common, expr};
+    use crate::protocol::common::error::ProtocolErrorKind;
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
+
+    fn literal_error(
+        literal: expr::LiteralExpr,
+        data_type: DataType,
+    ) -> super::super::super::NativeFragmentDecodeError {
+        super::lower_literal(&literal, &data_type).expect_err("invalid literal must fail")
+    }
+
+    fn assert_literal_error(
+        literal: expr::LiteralExpr,
+        data_type: DataType,
+        expected_path: &str,
+        expected_kind: ProtocolErrorKind,
+    ) {
+        let error = literal_error(literal, data_type);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), expected_path);
+        assert_eq!(protocol.kind(), expected_kind);
+    }
+
+    #[test]
+    fn false_null_marker_uses_exact_path_and_kind() {
+        assert_literal_error(
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::NullValue(false)),
+                }),
+            },
+            DataType::Int64,
+            "expr.literal.value.null_value",
+            ProtocolErrorKind::InvalidValue,
+        );
+    }
+
+    #[test]
+    fn literal_type_mismatch_uses_exact_value_variant_path_and_kind() {
+        assert_literal_error(
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::BoolValue(true)),
+                }),
+            },
+            DataType::Int64,
+            "expr.literal.value.bool_value",
+            ProtocolErrorKind::InvalidValue,
+        );
+    }
+
+    #[test]
+    fn decimal_precision_uses_exact_nested_path_and_kind() {
+        assert_literal_error(
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::DecimalValue(
+                        common::DecimalLiteral {
+                            value: 0i128.to_be_bytes().to_vec(),
+                            precision: 0,
+                            scale: 0,
+                        },
+                    )),
+                }),
+            },
+            DataType::Decimal128(10, 2),
+            "expr.literal.value.decimal_value.precision",
+            ProtocolErrorKind::OutOfRange,
+        );
+    }
+
+    #[test]
+    fn decimal_scale_uses_exact_nested_path_and_kind() {
+        assert_literal_error(
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::DecimalValue(
+                        common::DecimalLiteral {
+                            value: 0i128.to_be_bytes().to_vec(),
+                            precision: 10,
+                            scale: 11,
+                        },
+                    )),
+                }),
+            },
+            DataType::Decimal128(10, 2),
+            "expr.literal.value.decimal_value.scale",
+            ProtocolErrorKind::OutOfRange,
+        );
+    }
+
+    #[test]
+    fn decimal_value_uses_exact_nested_path_and_kind() {
+        assert_literal_error(
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::DecimalValue(
+                        common::DecimalLiteral {
+                            value: vec![1],
+                            precision: 10,
+                            scale: 2,
+                        },
+                    )),
+                }),
+            },
+            DataType::Decimal128(10, 2),
+            "expr.literal.value.decimal_value.value",
+            ProtocolErrorKind::InvalidValue,
+        );
+    }
 
     #[test]
     fn lowers_typed_literals() {

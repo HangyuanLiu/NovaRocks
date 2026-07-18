@@ -34,6 +34,7 @@ pub(super) fn lower_sort_node(
     physical: &plan::PlanNode,
     sort: &plan::SortNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -42,10 +43,10 @@ pub(super) fn lower_sort_node(
         check_exact_arity("SortNode", 1, children.len()),
     )?;
     let child = children.pop().expect("child");
-    let output_columns = if sort.output_columns.is_empty() {
-        &physical.output_columns
+    let (output_columns, output_columns_path) = if sort.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
     } else {
-        &sort.output_columns
+        (&sort.output_columns, path.clone().field("output_columns"))
     };
     let order_by = lower_sort_items(
         "SortNode",
@@ -120,7 +121,6 @@ pub(super) fn lower_sort_node(
         return Ok(sorted);
     }
 
-    let output_columns_path = path.clone().field("output_columns");
     let layout = NativeFragmentDecodeError::map_invalid(
         output_columns_path.clone(),
         layout_from_output_columns(output_columns),

@@ -50,7 +50,7 @@ pub(super) fn lower_exchange_receiver(
         .and_then(|flavor| flavor.kind.as_ref())
         .ok_or_else(|| {
             NativeFragmentDecodeError::missing(
-                path.clone().field("flavor.kind"),
+                path.clone().field("flavor").field("kind"),
                 "ExchangeReceiver flavor missing",
             )
         })?;
@@ -58,7 +58,7 @@ pub(super) fn lower_exchange_receiver(
         plan::exchange_flavor::Kind::Distribution(true) => {}
         plan::exchange_flavor::Kind::Distribution(false) => {
             return Err(NativeFragmentDecodeError::invalid_value(
-                path.clone().field("flavor.distribution"),
+                path.clone().field("flavor").field("distribution"),
                 "ExchangeReceiver distribution flavor must be true",
             ));
         }
@@ -98,7 +98,10 @@ pub(super) fn lower_exchange_receiver(
             )
             .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("flavor.limit_offset.limit"),
+                    path.clone()
+                        .field("flavor")
+                        .field("limit_offset")
+                        .field("limit"),
                     error,
                 )
             })?;
@@ -108,7 +111,10 @@ pub(super) fn lower_exchange_receiver(
             )
             .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("flavor.limit_offset.offset"),
+                    path.clone()
+                        .field("flavor")
+                        .field("limit_offset")
+                        .field("offset"),
                     error,
                 )
             })?
@@ -128,16 +134,25 @@ pub(super) fn lower_exchange_receiver(
             let order_by = sort::lower_sort_items(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
-                path.clone().field("flavor.topn_split.items"),
+                path.clone()
+                    .field("flavor")
+                    .field("topn_split")
+                    .field("items"),
                 arena,
                 &lowered.layout,
             )?;
             let limit = NativeFragmentDecodeError::map_invalid(
-                path.clone().field("flavor.topn_split.limit"),
+                path.clone()
+                    .field("flavor")
+                    .field("topn_split")
+                    .field("limit"),
                 parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit"),
             )?;
             let offset = NativeFragmentDecodeError::map_invalid(
-                path.clone().field("flavor.topn_split.offset"),
+                path.clone()
+                    .field("flavor")
+                    .field("topn_split")
+                    .field("offset"),
                 parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset"),
             )?
             .unwrap_or(0);

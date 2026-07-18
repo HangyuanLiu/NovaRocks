@@ -16,19 +16,18 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::super::expr::decode_expr_at;
-use super::super::layout::{
-    Layout, chunk_schema_from_output_columns, layout_from_output_columns,
-    slot_schemas_from_output_columns,
-};
+use super::super::layout::Layout;
 use super::DecodedNode;
 use super::common::check_exact_arity;
 use crate::common::ids::SlotId;
+use crate::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, expr, plan};
+use crate::proto::{expr, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
@@ -36,20 +35,18 @@ pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
     path: FieldPath,
+    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
     check_exact_arity("ProjectNode", 1, children.len()).map_err(|error| {
-        super::super::NativeFragmentDecodeError::inconsistent(path.clone(), error)
+        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
     })?;
     let child = children.pop().expect("child");
     let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
-    let layout = layout_from_output_columns(&project_outputs.output_columns)
-        .map_err(|error| error.into_native(path.clone().field("items")))?;
-    let output_schema = chunk_schema_from_output_columns(&project_outputs.output_columns)
-        .map_err(|error| error.into_native(path.clone().field("items")))?;
-    let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)
-        .map_err(|error| error.into_native(path.clone().field("items")))?;
+    let layout = project_outputs.layout.clone();
+    let output_schema = Arc::clone(&project_outputs.output_schema);
+    let expr_slot_schemas = project_outputs.computed_slot_schemas.clone();
 
     let exprs = project_outputs
         .computed_item_indices
@@ -75,11 +72,7 @@ pub(super) fn lower_project_node(
             )
         })
         .collect::<Result<Vec<_>, super::super::NativeFragmentDecodeError>>()?;
-    let expr_slot_ids = project_outputs
-        .computed_columns
-        .iter()
-        .map(|column| SlotId::new(column.column_id))
-        .collect();
+    let expr_slot_ids = project_outputs.computed_slot_ids;
 
     Ok(DecodedNode {
         node: ExecNode {
@@ -101,8 +94,10 @@ pub(super) fn lower_project_node(
 
 struct ProjectOutputPlan {
     computed_item_indices: Vec<usize>,
-    computed_columns: Vec<proto_common::OutputColumn>,
-    output_columns: Vec<proto_common::OutputColumn>,
+    computed_slot_ids: Vec<SlotId>,
+    computed_slot_schemas: Vec<ChunkSlotSchema>,
+    layout: Layout,
+    output_schema: ChunkSchemaRef,
     output_indices: Option<Vec<usize>>,
 }
 
@@ -138,8 +133,9 @@ fn project_output_plan(
             .saturating_add(1);
         let mut first_expr_index_by_column_id = HashMap::new();
         let mut computed_item_indices = Vec::new();
-        let mut computed_columns = Vec::new();
-        let mut output_columns = Vec::with_capacity(project.items.len());
+        let mut computed_slot_ids = Vec::new();
+        let mut computed_slot_schemas = Vec::new();
+        let mut output_slot_schemas = Vec::with_capacity(project.items.len());
         let mut output_indices = Vec::with_capacity(project.items.len());
         let mut needs_output_indices = false;
 
@@ -171,17 +167,18 @@ fn project_output_plan(
             {
                 (*computed_idx, true)
             } else {
-                let computed_idx = computed_columns.len();
+                let computed_idx = computed_slot_ids.len();
                 first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
                 used_compute_column_ids.insert(compute_column_id);
                 computed_item_indices.push(item.item_index);
-                computed_columns.push(proto_common::OutputColumn {
-                    column_id: compute_column_id,
-                    name: item.output_name.clone(),
-                    r#type: Some(item.r#type.clone()),
-                    nullable: item.nullable,
-                    is_internal: false,
-                });
+                let compute_slot_id = SlotId::new(compute_column_id);
+                computed_slot_ids.push(compute_slot_id);
+                computed_slot_schemas.push(ChunkSlotSchema::new_with_field(
+                    compute_slot_id,
+                    item.field.clone(),
+                    Some(item.field_schema.clone()),
+                    None,
+                ));
                 (computed_idx, false)
             };
 
@@ -195,13 +192,12 @@ fn project_output_plan(
                 )
                 .map_err(project_synthetic_id_error)?
             };
-            output_columns.push(proto_common::OutputColumn {
-                column_id: output_column_id,
-                name: item.output_name.clone(),
-                r#type: Some(item.r#type),
-                nullable: item.nullable,
-                is_internal: false,
-            });
+            output_slot_schemas.push(ChunkSlotSchema::new_with_field(
+                SlotId::new(output_column_id),
+                item.field,
+                Some(item.field_schema),
+                None,
+            ));
             if is_duplicate_compute
                 || computed_idx != output_indices.len()
                 || compute_column_id != output_column_id
@@ -211,10 +207,22 @@ fn project_output_plan(
             output_indices.push(computed_idx);
         }
 
+        let layout = Layout::for_slots(output_slot_schemas.iter().map(ChunkSlotSchema::slot_id));
+        let output_schema = ChunkSchema::try_new(output_slot_schemas)
+            .map(Arc::new)
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "items",
+                    error,
+                )
+            })?;
         Ok(ProjectOutputPlan {
             computed_item_indices,
-            computed_columns,
-            output_columns,
+            computed_slot_ids,
+            computed_slot_schemas,
+            layout,
+            output_schema,
             output_indices: needs_output_indices.then_some(output_indices),
         })
     })();
@@ -251,9 +259,8 @@ struct ProjectItemOutput {
     preferred_compute_column_id: u32,
     output_column_id: u32,
     can_reuse_input_slot: bool,
-    output_name: String,
-    r#type: proto_common::TypeDesc,
-    nullable: bool,
+    field: arrow::datatypes::Field,
+    field_schema: ChunkFieldSchema,
 }
 
 fn project_item_output(
@@ -278,6 +285,15 @@ fn project_item_output(
         .append_field("expr")
         .append_field("type")
     })?;
+    let type_error = |error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "items", error)
+            .append_index(idx)
+            .append_field("expr")
+            .append_field("type")
+    };
+    let field = super::super::decode_field_type(&item.output_name, expr.nullable, &r#type)
+        .map_err(type_error)?;
+    let field_schema = ChunkFieldSchema::from_field(&field).map_err(type_error)?;
     let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
         Some(expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
         _ => (item.output_column_id, false),
@@ -287,9 +303,8 @@ fn project_item_output(
         preferred_compute_column_id,
         output_column_id: item.output_column_id,
         can_reuse_input_slot,
-        output_name: item.output_name.clone(),
-        r#type,
-        nullable: expr.nullable,
+        field,
+        field_schema,
     })
 }
 
@@ -458,6 +473,49 @@ mod tests {
             "plan_fragment.root.payload.physical.project.items[0].expr.type"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn invalid_project_item_expr_type_uses_incoming_wire_path_and_kind() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(expr::Expr {
+                        r#type: Some(common::TypeDesc::default()),
+                        ..int_literal(1)
+                    }),
+                    output_name: "invalid_type".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = lower_error(&project);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.project.items[0].expr.type"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn project_arity_uses_distributed_node_children_path_and_kind() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode::default()),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let error = lower_error(&project);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
     }
 
     #[test]

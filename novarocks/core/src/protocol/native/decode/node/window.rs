@@ -42,6 +42,7 @@ pub(super) fn lower_window_node(
     physical: &plan::PlanNode,
     window: &plan::WindowNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -56,23 +57,26 @@ pub(super) fn lower_window_node(
             "WindowNode has no window expressions",
         ));
     }
-    let output_columns = if !window.output_columns.is_empty() {
-        window.output_columns.as_slice()
+    let (output_columns, output_columns_path) = if !window.output_columns.is_empty() {
+        (
+            window.output_columns.as_slice(),
+            path.clone().field("output_columns"),
+        )
     } else {
-        physical.output_columns.as_slice()
+        (physical.output_columns.as_slice(), physical_output_path)
     };
     if output_columns.is_empty() {
         return Err(NativeFragmentDecodeError::missing(
-            path.clone().field("output_columns"),
+            output_columns_path.clone(),
             "WindowNode output_columns missing",
         ));
     }
     let final_layout = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path.clone(),
         layout_from_output_columns(output_columns),
     )?;
     let final_output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path,
         chunk_schema_from_output_columns(output_columns),
     )?;
 

@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::Layout;
 use super::DecodedNode;
 use super::common::check_exact_arity;
 use super::values::materialize_values_chunk;
 use crate::common::ids::SlotId;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::values::ValuesNode;
@@ -57,9 +60,13 @@ pub(super) fn lower_generate_series_node(
         bigint_output_column(param_slots[1].as_u32(), "generate_series_end", false),
         bigint_output_column(param_slots[2].as_u32(), "generate_series_step", false),
     ];
-    let input_schema = NativeFragmentDecodeError::map_invalid(
+    let input_schema = int64_chunk_schema(
+        &[
+            (param_slots[0], "generate_series_start"),
+            (param_slots[1], "generate_series_end"),
+            (param_slots[2], "generate_series_step"),
+        ],
         path.clone().field("output_column_id"),
-        chunk_schema_from_output_columns(&param_columns),
     )?;
     let rows = vec![plan::ExprList {
         values: vec![
@@ -80,13 +87,11 @@ pub(super) fn lower_generate_series_node(
         },
         false,
     )];
-    let layout = NativeFragmentDecodeError::map_invalid(
+    let output_slot = SlotId::new(generate_series.output_column_id);
+    let layout = Layout::for_slots([output_slot]);
+    let output_schema = int64_chunk_schema(
+        &[(output_slot, output_columns[0].name.as_str())],
         path.clone().field("output_column_id"),
-        layout_from_output_columns(&output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_column_id"),
-        chunk_schema_from_output_columns(&output_columns),
     )?;
 
     Ok(DecodedNode {
@@ -114,6 +119,25 @@ pub(super) fn lower_generate_series_node(
         layout,
         output_schema,
     })
+}
+
+fn int64_chunk_schema(
+    slots: &[(SlotId, &str)],
+    source_path: FieldPath,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
+    let slots = slots
+        .iter()
+        .map(|(slot_id, name)| {
+            ChunkSlotSchema::try_new_with_field(
+                *slot_id,
+                Field::new(*name, DataType::Int64, false),
+                None,
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let slots = NativeFragmentDecodeError::map_invalid(source_path.clone(), slots)?;
+    NativeFragmentDecodeError::map_invalid(source_path, ChunkSchema::try_new(slots)).map(Arc::new)
 }
 
 fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {

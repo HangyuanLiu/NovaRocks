@@ -39,6 +39,7 @@ pub(super) fn lower_values_node(
     physical: &plan::PlanNode,
     values: &plan::ValuesNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -52,7 +53,7 @@ pub(super) fn lower_values_node(
         &values.columns
     };
     let columns_path = if values.columns.is_empty() {
-        path.clone().field("output_columns")
+        physical_output_path
     } else {
         path.clone().field("columns")
     };

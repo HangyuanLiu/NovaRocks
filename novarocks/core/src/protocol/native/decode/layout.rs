@@ -116,9 +116,8 @@ pub(crate) fn chunk_schema_from_output_columns(
 ) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
+        return Err(NativeFragmentLeafDecodeError::at_collection(
             ProtocolErrorKind::InconsistentFields,
-            "output_columns",
             format!(
                 "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
                 decoded.fields.len(),
@@ -133,18 +132,10 @@ pub(crate) fn chunk_schema_from_output_columns(
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "output_columns",
-                error,
-            )
+            NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
         })?;
     ChunkSchema::try_new(slots).map(Arc::new).map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "output_columns",
-            error,
-        )
+        NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
     })
 }
 
@@ -154,9 +145,8 @@ pub(crate) fn slot_schemas_from_output_columns(
 ) -> Result<Vec<ChunkSlotSchema>, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
+        return Err(NativeFragmentLeafDecodeError::at_collection(
             ProtocolErrorKind::InconsistentFields,
-            "output_columns",
             format!(
                 "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
                 decoded.fields.len(),
@@ -171,11 +161,7 @@ pub(crate) fn slot_schemas_from_output_columns(
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "output_columns",
-                error,
-            )
+            NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
         })
 }
 
@@ -215,8 +201,7 @@ fn decode_output_columns(
                     col.column_id, idx, first_idx
                 ),
             )
-            .prepend_index(idx)
-            .prepend_field("output_columns"));
+            .prepend_index(idx));
         }
         let type_desc = col.r#type.as_ref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
@@ -228,7 +213,6 @@ fn decode_output_columns(
                 ),
             )
             .prepend_index(idx)
-            .prepend_field("output_columns")
         })?;
         let field = decode_field_type(&col.name, col.nullable, type_desc).map_err(|err| {
             NativeFragmentLeafDecodeError::at_field(
@@ -240,7 +224,6 @@ fn decode_output_columns(
                 ),
             )
             .prepend_index(idx)
-            .prepend_field("output_columns")
         })?;
 
         slot_ids.push(slot_id);

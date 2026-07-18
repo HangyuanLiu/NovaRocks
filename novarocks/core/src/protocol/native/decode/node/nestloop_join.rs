@@ -35,6 +35,8 @@ pub(super) fn lower_nest_loop_join_node(
     physical: &plan::PlanNode,
     join: &plan::NestLoopJoinNode,
     path: FieldPath,
+    node_path: FieldPath,
+    physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -66,11 +68,11 @@ pub(super) fn lower_nest_loop_join_node(
         )?,
     };
     let join_layout = NativeFragmentDecodeError::map_invalid(
-        path.clone(),
+        node_path.clone().field("children"),
         concat_layouts(&left.layout, &right.layout),
     )?;
     let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        node_path.field("children"),
         ChunkSchema::concat(&[left.output_schema.clone(), right.output_schema.clone()]),
     )?);
     let is_semi_anti = matches!(
@@ -81,7 +83,7 @@ pub(super) fn lower_nest_loop_join_node(
     );
     let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
         NativeFragmentDecodeError::map_invalid(
-            path.clone().field("output_columns"),
+            physical_output_path.clone(),
             chunk_schema_from_output_columns(&physical.output_columns),
         )?
     } else {
@@ -89,7 +91,7 @@ pub(super) fn lower_nest_loop_join_node(
             physical,
             join_scope_chunk_schema.clone(),
             "NestLoopJoinNode",
-            path.clone().field("output_columns"),
+            physical_output_path,
         )?
     };
     let join_conjunct = join

@@ -563,13 +563,8 @@ fn attach_direct_input_consumers(
                 ),
             )
         })?;
-        let expr_id = lower_binding_expression(
-            binding,
-            &child.layout,
-            &child.output_schema,
-            arena,
-            path.clone(),
-        )?;
+        let expr_id =
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
         grouped
             .entry(index)
             .or_default()
@@ -622,13 +617,8 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id = lower_binding_expression(
-                binding,
-                &lowered.layout,
-                &lowered.output_schema,
-                arena,
-                path.clone(),
-            )?;
+            let expr_id =
+                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 super::NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -647,7 +637,7 @@ fn attach_leaf_consumers(
         plan::distributed_node::Payload::Exchange(_) => {
             let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
                 super::NativeFragmentDecodeError::inconsistent(
-                    path.clone().field("payload.exchange"),
+                    path.clone().field("payload").field("exchange"),
                     format!(
                         "native node_id={} exchange lowering lost ExchangeSource boundary",
                         wire_node.node_id
@@ -660,7 +650,10 @@ fn attach_leaf_consumers(
             Some(plan::plan_node::Kind::Scan(_)) => {
                 set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
                     super::NativeFragmentDecodeError::inconsistent(
-                        path.clone().field("payload.physical.scan"),
+                        path.clone()
+                            .field("payload")
+                            .field("physical")
+                            .field("scan"),
                         format!(
                             "native node_id={} scan lowering lost Scan boundary",
                             wire_node.node_id
@@ -786,7 +779,10 @@ fn attach_hash_join_producers(
     };
     let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
         return Err(super::NativeFragmentDecodeError::inconsistent(
-            path.clone().field("payload.physical.kind"),
+            path.clone()
+                .field("payload")
+                .field("physical")
+                .field("kind"),
             format!(
                 "native runtime-filter producer node_id={} is not HashJoin",
                 wire_node.node_id
@@ -812,7 +808,10 @@ fn attach_hash_join_producers(
         let build_key_index = *join_key_ordinal;
         let join_key_path = path
             .clone()
-            .field("physical.hash_join.eq_conditions")
+            .field("payload")
+            .field("physical")
+            .field("hash_join")
+            .field("eq_conditions")
             .index(build_key_index);
         let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
             super::NativeFragmentDecodeError::inconsistent(
@@ -863,8 +862,7 @@ fn attach_hash_join_producers(
             build_schema,
             join_key_path,
         )?;
-        let build_expr_id =
-            lower_binding_expression(binding, build_layout, build_schema, arena, path.clone())?;
+        let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
         producers.push(NativeJoinRuntimeFilterProducerSpec {
             binding_id: binding.binding_id,
             channel_id: binding.channel_id,
@@ -949,12 +947,8 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
-    path: FieldPath,
 ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
-    let expression_path = path
-        .field("bindings")
-        .map_key(binding.binding_id.to_string())
-        .field("expression");
+    let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
         binding.binding_id,
         &binding.expression,
@@ -1316,6 +1310,7 @@ fn lower_physical_node(
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    let physical_output_path = path.clone().field("output_columns");
     let kind = physical.kind.as_ref().ok_or_else(|| {
         super::NativeFragmentDecodeError::missing(
             path.clone().field("kind"),
@@ -1328,6 +1323,7 @@ fn lower_physical_node(
             physical,
             values,
             path.clone().field("values"),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1335,6 +1331,7 @@ fn lower_physical_node(
             node,
             project,
             path.clone().field("project"),
+            node_path,
             children,
             arena,
         ),
@@ -1353,6 +1350,7 @@ fn lower_physical_node(
             physical,
             sort,
             path.clone().field("sort"),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1364,6 +1362,7 @@ fn lower_physical_node(
             physical,
             set_op,
             path.clone().field("set_op"),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1387,6 +1386,7 @@ fn lower_physical_node(
             physical,
             aggregate,
             path.clone().field("hash_aggregate"),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1395,6 +1395,8 @@ fn lower_physical_node(
             physical,
             join,
             path.clone().field("hash_join"),
+            node_path.clone(),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1403,6 +1405,8 @@ fn lower_physical_node(
             physical,
             join,
             path.clone().field("nest_loop_join"),
+            node_path.clone(),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1411,6 +1415,7 @@ fn lower_physical_node(
             physical,
             window,
             path.clone().field("window"),
+            physical_output_path.clone(),
             children,
             arena,
         ),
@@ -1449,6 +1454,7 @@ fn lower_physical_node(
                 physical,
                 expand,
                 path.clone().field("change_event_expand"),
+                physical_output_path.clone(),
                 children,
                 arena,
             )
@@ -1469,6 +1475,7 @@ fn lower_physical_node(
             physical,
             redistribute,
             path.clone().field("redistribute"),
+            physical_output_path,
             children,
             arena,
         ),
@@ -1760,6 +1767,7 @@ mod tests {
             node_id,
             apply_point: super::super::runtime_filter::DecodedApplyPoint::NodeInput,
             expression: column_ref(column_id, DataType::Int64),
+            expression_path: FieldPath::root("test_runtime_filter_binding").field("expression"),
             role: DecodedBindingRole::Consumer {
                 capabilities: BTreeSet::from([
                     crate::runtime_filter::model::contract::ArtifactCapability::Membership,
@@ -1845,6 +1853,52 @@ mod tests {
         }
     }
 
+    fn membership_consumer_wire(
+        binding_id: u32,
+        node_id: i32,
+        expression: expr::Expr,
+        data_type: &DataType,
+    ) -> plan::RuntimeFilterBinding {
+        let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
+            data_type,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        plan::RuntimeFilterBinding {
+            binding_id,
+            channel_id: binding_id + 10,
+            node_id,
+            apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
+            expression: Some(expression),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                    plan::RuntimeFilterMembershipContract {
+                        canonical_schema: schema.canonical_bytes().to_vec(),
+                        schema_digest: schema.digest().bytes().to_vec(),
+                    },
+                )),
+            }),
+            reduction: Some(plan::RuntimeFilterReductionContract {
+                kind: Some(plan::runtime_filter_reduction_contract::Kind::SetUnion(
+                    true,
+                )),
+            }),
+            role: Some(plan::runtime_filter_binding::Role::Consumer(
+                plan::RuntimeFilterConsumerRole {
+                    capabilities: vec![
+                        i32::from(plan::RuntimeFilterArtifactCapability::Membership),
+                        i32::from(plan::RuntimeFilterArtifactCapability::EmptyDomain),
+                    ],
+                    activation: Some(plan::RuntimeFilterConsumerActivation {
+                        kind: Some(
+                            plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
+                        ),
+                    }),
+                },
+            )),
+        }
+    }
+
     fn cast_expr(operand: expr::Expr, data_type: DataType, nullable: bool) -> expr::Expr {
         expr::Expr {
             r#type: Some(type_desc(&data_type)),
@@ -1885,6 +1939,40 @@ mod tests {
         assert_eq!(
             protocol.kind(),
             crate::protocol::common::error::ProtocolErrorKind::MissingField
+        );
+    }
+
+    #[test]
+    fn consumer_expression_failure_uses_binding_table_wire_path() {
+        let mut wire = one_col_values_node(10);
+        wire.runtime_filter_binding_ids = vec![7];
+        let table = plan::RuntimeFilterBindingTable {
+            fragment_id: 1,
+            bindings: vec![membership_consumer_wire(
+                7,
+                10,
+                column_ref(999, DataType::Int64),
+                &DataType::Int64,
+            )],
+        };
+        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
+            .expect("decode consumer table");
+
+        let error = decode_node_with_runtime_filters(
+            &wire,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+            &mut ledger,
+        )
+        .expect_err("unknown consumer column must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].expression.column_ref.column_id"
+        );
+        assert_eq!(
+            protocol.kind(),
+            crate::protocol::common::error::ProtocolErrorKind::InvalidValue
         );
     }
 

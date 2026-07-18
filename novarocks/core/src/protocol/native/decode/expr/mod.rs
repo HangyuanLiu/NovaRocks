@@ -75,8 +75,9 @@ pub(super) fn decode_expr_at(
             Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
         }
         expr::expr::Kind::Literal(literal) => {
-            let value =
-                literal::lower_literal_at(literal, path.clone().field("literal"), &data_type)?;
+            let literal_path = path.clone().field("literal");
+            let value = literal::lower_literal_at(literal, &data_type)
+                .map_err(|error| error.into_native(literal_path))?;
             Ok(arena.push_typed(ExprNode::Literal(value), data_type))
         }
         expr::expr::Kind::BinaryOp(binary) => binary::lower_binary_op(

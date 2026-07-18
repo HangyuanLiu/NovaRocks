@@ -41,6 +41,7 @@ pub(crate) struct DecodedRuntimeFilterBinding {
     pub(crate) node_id: i32,
     pub(crate) apply_point: DecodedApplyPoint,
     pub(crate) expression: expr::Expr,
+    pub(crate) expression_path: FieldPath,
     pub(crate) role: DecodedBindingRole,
     pub(crate) contract: DecodedRuntimeFilterContract,
     pub(crate) reduction: DecodedRuntimeFilterReduction,
@@ -342,7 +343,10 @@ fn decode_binding(
     super::expr::validate_proto_expr_shape_at(&expression, expression_path.clone())?;
     let expression_type = super::decode_type(expression.r#type.as_ref().expect("checked"))
         .map_err(|error| {
-            super::NativeFragmentDecodeError::invalid_value(expression_path.field("type"), error)
+            super::NativeFragmentDecodeError::invalid_value(
+                expression_path.clone().field("type"),
+                error,
+            )
         })?;
     let contract = decode_contract(
         wire.binding_id,
@@ -391,6 +395,7 @@ fn decode_binding(
         node_id: wire.node_id,
         apply_point: decoded_apply_point,
         expression,
+        expression_path,
         role,
         contract,
         reduction,

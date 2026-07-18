@@ -39,6 +39,7 @@ pub(super) fn lower_change_event_expand_node(
     physical: &plan::PlanNode,
     expand: &plan::ChangeEventExpandNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -47,17 +48,17 @@ pub(super) fn lower_change_event_expand_node(
         check_exact_arity("ChangeEventExpandNode", 1, children.len()),
     )?;
     let child = children.pop().expect("child");
-    let output_columns = if expand.output_columns.is_empty() {
-        &physical.output_columns
+    let (output_columns, output_columns_path) = if expand.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
     } else {
-        &expand.output_columns
+        (&expand.output_columns, path.clone().field("output_columns"))
     };
     let layout = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path.clone(),
         layout_from_output_columns(output_columns),
     )?;
     let output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        output_columns_path,
         chunk_schema_from_output_columns(output_columns),
     )?;
     let output_slot_ids = layout.order().to_vec();

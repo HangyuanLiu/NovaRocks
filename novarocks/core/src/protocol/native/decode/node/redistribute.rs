@@ -28,6 +28,7 @@ pub(super) fn lower_redistribute_node(
     physical: &plan::PlanNode,
     redistribute: &plan::RedistributeNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -42,7 +43,7 @@ pub(super) fn lower_redistribute_node(
         .and_then(|mode| mode.mode.as_ref())
         .ok_or_else(|| {
             NativeFragmentDecodeError::missing(
-                path.clone().field("mode.mode"),
+                path.clone().field("mode").field("mode"),
                 "RedistributeNode mode missing",
             )
         })?;
@@ -52,13 +53,13 @@ pub(super) fn lower_redistribute_node(
         plan::redistribute_mode::Mode::Hash(hash) => {
             if hash.cols.is_empty() {
                 return Err(NativeFragmentDecodeError::missing(
-                    path.clone().field("mode.hash.cols"),
+                    path.clone().field("mode").field("hash").field("cols"),
                     "RedistributeNode hash mode requires cols",
                 ));
             }
             for col in &hash.cols {
                 NativeFragmentDecodeError::map_invalid(
-                    path.clone().field("mode.hash.cols"),
+                    path.clone().field("mode").field("hash").field("cols"),
                     child.layout.resolve_column_id(*col),
                 )?;
             }
@@ -79,15 +80,17 @@ pub(super) fn lower_redistribute_node(
             &child.layout,
         )?;
     }
-    let output_columns = if redistribute.output_columns.is_empty() {
-        &physical.output_columns
+    let (output_columns, output_path) = if redistribute.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
     } else {
-        &redistribute.output_columns
+        (
+            &redistribute.output_columns,
+            path.clone().field("output_columns"),
+        )
     };
     if output_columns.is_empty() {
         return Ok(child);
     }
-    let output_path = path.clone().field("output_columns");
     let layout = NativeFragmentDecodeError::map_invalid(
         output_path.clone(),
         layout_from_output_columns(output_columns),

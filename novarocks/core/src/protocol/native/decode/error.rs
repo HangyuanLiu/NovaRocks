@@ -32,6 +32,14 @@ pub(crate) struct NativeFragmentLeafDecodeError {
 }
 
 impl NativeFragmentLeafDecodeError {
+    pub(crate) fn at_collection(kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
+        Self {
+            kind,
+            relative_path: Vec::new(),
+            detail: detail.to_string(),
+        }
+    }
+
     pub(crate) fn at_field(
         kind: ProtocolErrorKind,
         field: &'static str,
@@ -86,6 +94,22 @@ impl fmt::Display for NativeFragmentLeafDecodeError {
 
 impl Error for NativeFragmentLeafDecodeError {}
 
+pub(crate) trait NativeFragmentErrorAtPath {
+    fn into_native_at(self, path: FieldPath) -> NativeFragmentDecodeError;
+}
+
+impl NativeFragmentErrorAtPath for NativeFragmentLeafDecodeError {
+    fn into_native_at(self, path: FieldPath) -> NativeFragmentDecodeError {
+        self.into_native(path)
+    }
+}
+
+impl NativeFragmentErrorAtPath for String {
+    fn into_native_at(self, path: FieldPath) -> NativeFragmentDecodeError {
+        NativeFragmentDecodeError::invalid_value(path, self)
+    }
+}
+
 #[cfg(test)]
 impl PartialEq<&str> for NativeFragmentLeafDecodeError {
     fn eq(&self, other: &&str) -> bool {
@@ -137,11 +161,11 @@ impl NativeFragmentDecodeError {
         Self::protocol_error(path, ProtocolErrorKind::Unsupported, detail)
     }
 
-    pub(crate) fn map_invalid<T, E: fmt::Display>(
+    pub(crate) fn map_invalid<T, E: NativeFragmentErrorAtPath>(
         path: FieldPath,
         result: Result<T, E>,
     ) -> Result<T, Self> {
-        result.map_err(|detail| Self::invalid_value(path, detail.to_string()))
+        result.map_err(|error| error.into_native_at(path))
     }
 
     fn protocol_error(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {

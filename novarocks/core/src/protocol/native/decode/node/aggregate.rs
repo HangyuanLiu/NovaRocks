@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::{Layout, layout_from_output_columns, slot_schemas_from_output_columns};
 use super::DecodedNode;
 use super::common::{build_slot_projection, check_exact_arity};
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, plan};
+use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
 use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
@@ -35,6 +38,7 @@ pub(super) fn lower_hash_aggregate_node(
     physical: &plan::PlanNode,
     aggregate: &plan::HashAggregateNode,
     path: FieldPath,
+    physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -71,28 +75,32 @@ pub(super) fn lower_hash_aggregate_node(
             "HashAggregateNode output_layout missing",
         )
     })?;
-    let aggregate_output_columns = aggregate_output_columns_from_layout(
-        output_layout.group_key_columns.as_slice(),
-        output_layout.aggregate_columns.as_slice(),
-    );
-    let visible_output_columns = if !aggregate.output_columns.is_empty() {
-        aggregate.output_columns.as_slice()
-    } else if !physical.output_columns.is_empty() {
-        physical.output_columns.as_slice()
-    } else {
-        aggregate_output_columns.as_slice()
-    };
-    let aggregate_layout = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_layout"),
-        layout_from_output_columns(&aggregate_output_columns),
+    let group_key_path = path
+        .clone()
+        .field("output_layout")
+        .field("group_key_columns");
+    let aggregate_columns_path = path
+        .clone()
+        .field("output_layout")
+        .field("aggregate_columns");
+    let mut aggregate_slot_schemas = NativeFragmentDecodeError::map_invalid(
+        group_key_path,
+        slot_schemas_from_output_columns(&output_layout.group_key_columns),
     )?;
-    let aggregate_output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_layout"),
-        chunk_schema_from_output_columns(&aggregate_output_columns),
-    )?;
+    aggregate_slot_schemas.extend(NativeFragmentDecodeError::map_invalid(
+        aggregate_columns_path,
+        slot_schemas_from_output_columns(&output_layout.aggregate_columns),
+    )?);
+    let aggregate_layout =
+        Layout::for_slots(aggregate_slot_schemas.iter().map(|slot| slot.slot_id()));
+    let aggregate_output_schema = Arc::new(ChunkSchema::try_new(aggregate_slot_schemas).map_err(
+        |error| NativeFragmentDecodeError::inconsistent(path.clone().field("output_layout"), error),
+    )?);
     if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
         return Err(NativeFragmentDecodeError::inconsistent(
-            path.clone().field("output_layout.aggregate_columns"),
+            path.clone()
+                .field("output_layout")
+                .field("aggregate_columns"),
             format!(
                 "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
                 output_layout.aggregate_columns.len(),
@@ -102,7 +110,9 @@ pub(super) fn lower_hash_aggregate_node(
     }
     if output_layout.group_key_columns.len() != aggregate.group_by.len() {
         return Err(NativeFragmentDecodeError::inconsistent(
-            path.clone().field("output_layout.group_key_columns"),
+            path.clone()
+                .field("output_layout")
+                .field("group_key_columns"),
             format!(
                 "HashAggregateNode output_layout group key mismatch: columns={} group_by={}",
                 output_layout.group_key_columns.len(),
@@ -142,7 +152,8 @@ pub(super) fn lower_hash_aggregate_node(
         let output_col = output_layout.aggregate_columns.get(idx).ok_or_else(|| {
             NativeFragmentDecodeError::missing(
                 path.clone()
-                    .field("output_layout.aggregate_columns")
+                    .field("output_layout")
+                    .field("aggregate_columns")
                     .index(idx),
                 format!("HashAggregateNode aggregate column {idx} missing"),
             )
@@ -233,7 +244,18 @@ pub(super) fn lower_hash_aggregate_node(
         layout: aggregate_layout,
         output_schema: aggregate_output_schema,
     };
-    let visible_path = path.clone().field("output_columns");
+    let Some((visible_output_columns, visible_path)) = (if !aggregate.output_columns.is_empty() {
+        Some((
+            aggregate.output_columns.as_slice(),
+            path.clone().field("output_columns"),
+        ))
+    } else if !physical.output_columns.is_empty() {
+        Some((physical.output_columns.as_slice(), physical_output_path))
+    } else {
+        None
+    }) else {
+        return Ok(aggregate_node);
+    };
     let visible_layout = NativeFragmentDecodeError::map_invalid(
         visible_path.clone(),
         layout_from_output_columns(visible_output_columns),
@@ -249,16 +271,6 @@ pub(super) fn lower_hash_aggregate_node(
         node.node_id,
         arena,
     )
-}
-
-fn aggregate_output_columns_from_layout(
-    group_key_columns: &[proto_common::OutputColumn],
-    aggregate_columns: &[proto_common::OutputColumn],
-) -> Vec<proto_common::OutputColumn> {
-    let mut columns = Vec::with_capacity(group_key_columns.len() + aggregate_columns.len());
-    columns.extend_from_slice(group_key_columns);
-    columns.extend_from_slice(aggregate_columns);
-    columns
 }
 
 fn aggregate_function_name(call: &plan::PlanAggregateCall) -> String {
@@ -297,12 +309,20 @@ fn aggregate_signature_arg_types(
         })?;
         let data_type = expr.r#type.as_ref().ok_or_else(|| {
             NativeFragmentDecodeError::missing(
-                path.clone().field("order_by").index(idx).field("expr.type"),
+                path.clone()
+                    .field("order_by")
+                    .index(idx)
+                    .field("expr")
+                    .field("type"),
                 format!("aggregate {} order_by[{idx}] type missing", call.name),
             )
         })?;
         let data_type = NativeFragmentDecodeError::map_invalid(
-            path.clone().field("order_by").index(idx).field("expr.type"),
+            path.clone()
+                .field("order_by")
+                .index(idx)
+                .field("expr")
+                .field("type"),
             super::super::decode_type(data_type),
         )?;
         types.push(data_type);

@@ -40,6 +40,8 @@ pub(super) fn lower_hash_join_node(
     physical: &plan::PlanNode,
     join: &plan::HashJoinNode,
     path: FieldPath,
+    node_path: FieldPath,
+    physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
@@ -62,18 +64,18 @@ pub(super) fn lower_hash_join_node(
     )?;
     let distribution_mode = hash_join_distribution_mode(join, path.clone())?;
     let join_layout = NativeFragmentDecodeError::map_invalid(
-        path.clone(),
+        node_path.clone().field("children"),
         concat_layouts(&left.layout, &right.layout),
     )?;
     let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
+        node_path.field("children"),
         ChunkSchema::concat(&[left.output_schema.clone(), right.output_schema.clone()]),
     )?);
     let output_schema = join_output_chunk_schema(
         physical,
         join_scope_chunk_schema.clone(),
         "HashJoinNode",
-        path.clone().field("output_columns"),
+        physical_output_path,
     )?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
