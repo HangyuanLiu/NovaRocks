@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::type_mapping::{
-    encode_change_stream_branch_kind, encode_edge_partition_type, usize_to_u64,
+use super::type_mapping::{encode_change_stream_branch_kind, encode_edge_partition_type};
+use super::write::{
+    encode_iceberg_change_stream_router_sink, encode_iceberg_write_input_binding,
+    encode_iceberg_write_sink_spec,
 };
-use super::write::{encode_iceberg_write_input_binding, encode_iceberg_write_sink_spec};
 use super::*;
 
 pub(super) fn attach_stream_sinks(
@@ -184,68 +185,11 @@ fn encode_data_sink(
                 spec: Some(encode_iceberg_write_sink_spec(&sink.spec, ctx)?),
                 input: Some(encode_iceberg_write_input_binding(&sink.input)),
             }),
-            DataSink::IcebergChangeStreamRouter(sink) => {
-                Kind::IcebergChangeStreamRouter(plan::IcebergChangeStreamRouterSink {
-                    group_id: sink.group_id,
-                    change_op_output_ordinal: usize_to_u64(sink.change_op_output_ordinal),
-                    data_route_output_ordinal: sink.data_route_output_ordinal.map(usize_to_u64),
-                    branches: sink
-                        .branches
-                        .iter()
-                        .map(|branch| {
-                            Ok(plan::IcebergChangeStreamBranchRoute {
-                                branch_id: branch.branch_id,
-                                branch_kind: encode_change_stream_branch_kind(branch.branch_kind),
-                                target_fragment_id: branch.target_fragment_id,
-                                target_exchange_node_id: branch.target_exchange_node_id,
-                                output_ordinals: branch
-                                    .output_ordinals
-                                    .iter()
-                                    .map(|value| usize_to_u64(*value))
-                                    .collect(),
-                                // The ordinals still travel on the wire 1:1, but
-                                // the runtime consumes `output_partition` below;
-                                // the encoder no longer reconstructs the partition
-                                // expression from them (CGO-9C Task 3).
-                                output_partition_ordinals: branch
-                                    .output_partition_ordinals
-                                    .iter()
-                                    .map(|value| usize_to_u64(*value))
-                                    .collect(),
-                                output_partition: Some(encode_finalized_router_branch_partition(
-                                    ctx,
-                                    fragment_id,
-                                    branch.branch_id,
-                                )?),
-                                destinations: None,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, String>>()?,
-                })
-            }
+            DataSink::IcebergChangeStreamRouter(sink) => Kind::IcebergChangeStreamRouter(
+                encode_iceberg_change_stream_router_sink(sink, fragment_id, ctx)?,
+            ),
         }),
     })
-}
-
-/// Map a change-stream router branch's finalized partition from the sealed write
-/// contract (CGO-9C Task 3). The planner already reconstructed the partition
-/// expression from the branch's ordinals against the router fragment's output
-/// columns at seal; the encoder maps the typed result 1:1.
-fn encode_finalized_router_branch_partition(
-    ctx: &NativePlanEncodeContext<'_>,
-    fragment_id: crate::sql::planner::distributed::FragmentId,
-    branch_id: i32,
-) -> Result<plan::DataPartition, String> {
-    let partition = required_context_ref(ctx.write_contracts, || {
-            format!("native change-stream router fragment {fragment_id} has no sealed write contract")
-        })?
-        .router_branch_partition(fragment_id, branch_id)
-        .ok_or_else(|| {
-            format!(
-                "native change-stream router fragment {fragment_id} branch {branch_id} is missing from the sealed write contract"
-            )
-        })?;
-    encode_data_partition(partition)
 }
 
 pub(super) fn encode_fragment_edge(src: &FragmentEdge) -> Result<plan::FragmentEdge, String> {

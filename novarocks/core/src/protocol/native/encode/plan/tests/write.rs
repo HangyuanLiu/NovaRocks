@@ -22,11 +22,17 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::scan::encode_column_def;
-use super::super::write::encode_iceberg_write_sink_spec;
+use super::super::write::{
+    encode_iceberg_change_stream_router_sink, encode_iceberg_write_sink_spec,
+};
 use super::*;
 use crate::catalog::schema::{ColumnDef, ColumnDefault};
 use crate::protocol::native::encode::plan;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::sql::common::ChangeStreamBranchKind;
+use crate::sql::planner::distributed::write::change_stream::{
+    IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+};
 
 fn encode_write_default_json_for_test(
     data_type: DataType,
@@ -49,6 +55,96 @@ fn field_with_iceberg_id(id: i32, name: &str, data_type: DataType, nullable: boo
             id.to_string(),
         )])),
     )
+}
+
+#[test]
+fn change_stream_router_encoder_materializes_partition_exprs() {
+    let plan = single_fragment_router_plan_for_test();
+    let fragment = plan.fragments().first().expect("router fragment");
+    let DataSink::IcebergChangeStreamRouter(sink) = &fragment.sink else {
+        panic!("expected Iceberg change-stream router sink");
+    };
+    let router = encode_iceberg_change_stream_router_sink(
+        sink,
+        fragment.fragment_id,
+        &NativePlanEncodeContext {
+            scan_bindings: None,
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: Some(plan.write_contracts()),
+            runtime_filter_bindings: None,
+        },
+    )
+    .expect("encode change-stream router sink");
+
+    let branch = router.branches.first().expect("router branch");
+    assert_eq!(branch.output_partition_ordinals, vec![2]);
+    let partition = branch
+        .output_partition
+        .as_ref()
+        .expect("branch output partition");
+    assert_eq!(
+        partition.kind,
+        crate::proto::plan::PartitionKind::Hash as i32
+    );
+    let [expr] = partition.exprs.as_slice() else {
+        panic!("expected one materialized partition expr");
+    };
+    let Some(crate::proto::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
+        panic!("expected partition expr to be a column ref");
+    };
+    assert_eq!(column_ref.column_id, 3);
+}
+
+fn single_fragment_router_plan_for_test() -> DistributedPlan {
+    let output_columns = vec![
+        output_column(1, "op", DataType::Int32),
+        output_column(2, "route", DataType::Int32),
+        output_column(3, "bucket", DataType::Int32),
+    ];
+    crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+        fragments: vec![PlanFragment {
+            fragment_id: 0,
+            root: DistributedNode {
+                node_id: 10,
+                fragment_id: 0,
+                tuple_ids: vec![10],
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                runtime_filter_binding_ids: Vec::new(),
+                children: Vec::new(),
+                stats: stats(),
+                payload: DistributedNodeKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: output_columns.clone(),
+                    },
+                ),
+            },
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::IcebergChangeStreamRouter(IcebergChangeStreamRouterSink {
+                group_id: 0,
+                change_op_output_ordinal: 0,
+                data_route_output_ordinal: Some(1),
+                branches: vec![IcebergChangeStreamBranchRoute {
+                    branch_id: 0,
+                    branch_kind: ChangeStreamBranchKind::DeleteDv,
+                    target_fragment_id: 1,
+                    target_exchange_node_id: 20,
+                    output_ordinals: vec![2],
+                    output_partition_ordinals: vec![2],
+                }],
+            }),
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }],
+        root_fragment_id: 0,
+        runtime_filter_graph: RuntimeFilterGraph::default(),
+        edges: Vec::new(),
+    }
 }
 
 #[test]

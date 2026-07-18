@@ -34,7 +34,6 @@ use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
-use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table as table_model;
 
 fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static PreparedFragmentSet {
@@ -710,26 +709,6 @@ fn iceberg_table_info_for_test() -> iceberg_scan_model::IcebergTableInfo {
         },
         serialized_metadata: None,
         serialized_metadata_rows: None,
-    }
-}
-
-fn output_column(id: u32, name: &str, data_type: DataType) -> OutputColumn {
-    OutputColumn {
-        column_id: ColumnId::new_for_test(id),
-        name: name.to_string(),
-        data_type,
-        nullable: false,
-        is_internal: false,
-    }
-}
-
-fn stats() -> PhysicalPlanStats {
-    PhysicalPlanStats {
-        output_row_count: 1.0,
-        row_count_confidence: PlannerConfidence::Exact,
-        column_statistics: Default::default(),
-        cost_estimate: None,
-        broadcast_decision: None,
     }
 }
 

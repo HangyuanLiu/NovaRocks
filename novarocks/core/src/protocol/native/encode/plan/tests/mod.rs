@@ -16,14 +16,10 @@
 // under the License.
 
 use super::*;
-use crate::proto::expr::expr;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::planner::distributed::write::change_stream::{
-    IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
-};
+use crate::sql::common::JoinKind;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::physical::{
     JoinDistribution, PhysicalPlanStats, PlannerConfidence, TopNPhase,
