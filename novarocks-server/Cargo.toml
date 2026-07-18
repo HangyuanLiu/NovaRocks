@@ -16,10 +16,9 @@ libc = "0.2"
 tracing = "0.1"
 
 [features]
-# Forward to the core crate's compat feature so the FE-compatible daemon
-# startup blocks (`#[cfg(feature = "compat")]` in main.rs) compile and the
-# compat-only services are exposed. Off by default (native build).
 compat = ["novarocks/compat"]
+foundationdb-provider = ["novarocks/foundationdb-provider"]
+mysql-state-store-provider = ["novarocks/mysql-state-store-provider"]
 
 [dev-dependencies]
 # E2E tests that spawn the `novarocks` binary and drive it over MySQL / HTTP.

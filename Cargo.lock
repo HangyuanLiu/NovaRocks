@@ -3200,8 +3200,6 @@ dependencies = [
  "csv",
  "ctrlc",
  "datasketches",
- "foundationdb",
- "fs2",
  "futures",
  "hashbrown 0.14.5",
  "hex",
@@ -3215,8 +3213,8 @@ dependencies = [
  "mockito",
  "moka",
  "mysql",
- "mysql_async",
  "mysql_common 0.32.4",
+ "novarocks-state-store",
  "novarocks-version",
  "num-traits",
  "num_cpus",
@@ -3235,7 +3233,6 @@ dependencies = [
  "reqwest",
  "roaring 0.10.12",
  "rusqlite",
- "rustls",
  "ryu",
  "serde",
  "serde_json",
@@ -3272,6 +3269,31 @@ dependencies = [
  "reqwest",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "novarocks-state-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "foundationdb",
+ "fs2",
+ "futures",
+ "hex",
+ "libc",
+ "mysql_async",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

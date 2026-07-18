@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use crate::state_store::config::{
+use novarocks_state_store::config::{
     FoundationDbClientConfig, StateStoreAppConfig, StateStoreProviderConfig,
 };
 
@@ -1592,7 +1592,7 @@ impl std::fmt::Debug for JdbcConfig {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::state_store::config::StateStoreProviderConfig;
+    use novarocks_state_store::config::StateStoreProviderConfig;
 
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, MetadataProviderConfig, NovaRocksConfig, RuntimeConfig,
