@@ -717,6 +717,72 @@ mod tests {
     };
     use std::sync::Arc;
 
+    fn test_schema(
+        schema_id: i32,
+        fields: Vec<iceberg::spec::NestedField>,
+    ) -> iceberg::spec::Schema {
+        iceberg::spec::Schema::builder()
+            .with_schema_id(schema_id)
+            .with_fields(fields.into_iter().map(Arc::new))
+            .build()
+            .expect("test schema")
+    }
+
+    fn identity_table(
+        format_version: iceberg::spec::FormatVersion,
+        row_lineage: Option<&str>,
+    ) -> iceberg::table::Table {
+        use iceberg::spec::{PartitionSpec, PrimitiveType, SortOrder, TableMetadataBuilder, Type};
+
+        let schema = test_schema(
+            1,
+            vec![
+                iceberg::spec::NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+                iceberg::spec::NestedField::required(
+                    2,
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    Type::Primitive(PrimitiveType::Long),
+                ),
+            ],
+        );
+        let properties = row_lineage
+            .map(|value| {
+                std::collections::HashMap::from([(
+                    ICEBERG_ROW_LINEAGE_PROP.to_string(),
+                    value.to_string(),
+                )])
+            })
+            .unwrap_or_default();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/ebd16b-schema-validation".to_string(),
+            format_version,
+            properties,
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .identifier(iceberg::TableIdent::from_strs(["db", "table"]).expect("table ident"))
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("test table")
+    }
+
+    fn identity_contract(
+        base: &iceberg::table::Table,
+        target: &iceberg::table::Table,
+    ) -> MvSchemaContract {
+        let mut contract = minimal_base_row_id_contract();
+        contract.base.table_uuid = base.metadata().uuid().to_string();
+        contract.target.table_uuid = target.metadata().uuid().to_string();
+        contract
+    }
+
     // NOTE: building real `iceberg::table::Table` instances is heavy.
     // These tests cover the SchemaEvolutionError Display + the
     // sanity-test pure-function checks would need iceberg fixtures.
@@ -732,6 +798,154 @@ mod tests {
         assert!(msg.contains("field id 5"));
         assert!(msg.contains("amount"));
         assert!(msg.contains("REFRESH FULL"));
+    }
+
+    #[test]
+    fn schema_evolution_error_messages_are_exact() {
+        let cases = vec![
+            (
+                SchemaEvolutionError::BaseTableIdentityChanged {
+                    expected: "base-a".to_string(),
+                    actual: "base-b".to_string(),
+                },
+                "iceberg MV refresh blocked: base table identity changed (uuid expected=base-a, actual=base-b); run REFRESH FULL or recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::BaseRowLineageContractBroken {
+                    reason: "base reason".to_string(),
+                },
+                "iceberg MV refresh blocked: base table row-lineage contract broken (base reason); run REFRESH FULL or recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::BaseFieldDropped {
+                    field_id: 7,
+                    name_at_create: "amount".to_string(),
+                },
+                "iceberg MV refresh blocked: base column \"amount\" (field id 7) was dropped from base table; run REFRESH FULL or recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::BaseFieldTypeChanged {
+                    field_id: 7,
+                    name_at_create: "amount".to_string(),
+                    from: "int".to_string(),
+                    to: "long".to_string(),
+                },
+                "iceberg MV refresh blocked: base column \"amount\" (field id 7) changed type from int to long; run REFRESH FULL or recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::BaseFieldNullabilityChanged {
+                    field_id: 7,
+                    name_at_create: "amount".to_string(),
+                    from_required: true,
+                    to_required: false,
+                },
+                "iceberg MV refresh blocked: base column \"amount\" (field id 7) changed nullability from required=true to required=false; run REFRESH FULL or recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetTableIdentityChanged {
+                    expected: "target-a".to_string(),
+                    actual: "target-b".to_string(),
+                },
+                "iceberg MV refresh blocked: target table identity changed (uuid expected=target-a, actual=target-b); recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetRowLineageContractBroken {
+                    reason: "target reason".to_string(),
+                },
+                "iceberg MV refresh blocked: target table row-lineage contract broken (target reason); recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetVisibleFieldDropped {
+                    output_name: "amount".to_string(),
+                    target_field_id: 8,
+                },
+                "iceberg MV refresh blocked: target visible column \"amount\" (field id 8) was dropped; recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetVisibleFieldRenamed {
+                    target_field_id: 8,
+                    expected: "amount".to_string(),
+                    actual: "renamed_amount".to_string(),
+                },
+                "iceberg MV refresh blocked: target visible column (field id 8) renamed externally: expected \"amount\", actual \"renamed_amount\"; recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetVisibleFieldTypeChanged {
+                    target_field_id: 8,
+                    from: "int".to_string(),
+                    to: "long".to_string(),
+                },
+                "iceberg MV refresh blocked: target visible column (field id 8) changed type from int to long; recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::HiddenApplyKeyContractBroken {
+                    reason: "hidden reason".to_string(),
+                },
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken (hidden reason); recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::TargetPartitionSpecChanged {
+                    reason: "partition reason".to_string(),
+                },
+                "iceberg MV refresh blocked: target partition spec changed externally (partition reason); recreate the MV",
+            ),
+            (
+                SchemaEvolutionError::AggregateStateContractBroken {
+                    reason: "aggregate reason".to_string(),
+                },
+                "iceberg MV refresh blocked: target aggregate state contract broken (aggregate reason); recreate the MV",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+
+        let good_base = identity_table(iceberg::spec::FormatVersion::V3, Some("true"));
+        let good_target = identity_table(iceberg::spec::FormatVersion::V3, Some("true"));
+        let base_v2 = identity_table(iceberg::spec::FormatVersion::V2, Some("true"));
+        let base_missing = identity_table(iceberg::spec::FormatVersion::V3, None);
+        let base_false = identity_table(iceberg::spec::FormatVersion::V3, Some("false"));
+        let target_v2 = identity_table(iceberg::spec::FormatVersion::V2, Some("true"));
+        let target_missing = identity_table(iceberg::spec::FormatVersion::V3, None);
+        let target_false = identity_table(iceberg::spec::FormatVersion::V3, Some("false"));
+        let identity_cases = [
+            (
+                &base_v2,
+                &good_target,
+                "iceberg MV refresh blocked: base table row-lineage contract broken (base table must be Iceberg format v3, found V2); run REFRESH FULL or recreate the MV",
+            ),
+            (
+                &base_missing,
+                &good_target,
+                "iceberg MV refresh blocked: base table row-lineage contract broken (base table property write.row-lineage must be true); run REFRESH FULL or recreate the MV",
+            ),
+            (
+                &base_false,
+                &good_target,
+                "iceberg MV refresh blocked: base table row-lineage contract broken (base table property write.row-lineage must be true); run REFRESH FULL or recreate the MV",
+            ),
+            (
+                &good_base,
+                &target_v2,
+                "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found V2); recreate the MV",
+            ),
+            (
+                &good_base,
+                &target_missing,
+                "iceberg MV refresh blocked: target table row-lineage contract broken (target table property write.row-lineage must be true); recreate the MV",
+            ),
+            (
+                &good_base,
+                &target_false,
+                "iceberg MV refresh blocked: target table row-lineage contract broken (target table property write.row-lineage must be true); recreate the MV",
+            ),
+        ];
+        for (base, target, expected) in identity_cases {
+            let contract = identity_contract(base, target);
+            let error = validate_identity_guards(&contract, base, target)
+                .expect("identity case must be incompatible");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
@@ -818,6 +1032,171 @@ mod tests {
             check_target_partition_spec(&contract, &changed_spec),
             Some(SchemaEvolutionError::TargetPartitionSpecChanged { .. })
         ));
+    }
+
+    #[test]
+    fn partition_compatibility_preserves_strict_field_order() {
+        use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
+
+        let schema = Arc::new(test_schema(
+            1,
+            vec![
+                NestedField::required(1, "identity_src", Type::Primitive(PrimitiveType::Int)),
+                NestedField::required(2, "year_src", Type::Primitive(PrimitiveType::Date)),
+                NestedField::required(3, "month_src", Type::Primitive(PrimitiveType::Date)),
+                NestedField::required(4, "day_src", Type::Primitive(PrimitiveType::Date)),
+                NestedField::required(5, "hour_src", Type::Primitive(PrimitiveType::Timestamp)),
+                NestedField::required(6, "bucket_src", Type::Primitive(PrimitiveType::Int)),
+                NestedField::required(7, "truncate_src", Type::Primitive(PrimitiveType::String)),
+                NestedField::required(8, "void_src", Type::Primitive(PrimitiveType::Int)),
+                NestedField::required(9, "unknown_src", Type::Primitive(PrimitiveType::Int)),
+            ],
+        ));
+        let supported_spec = PartitionSpec::builder(Arc::clone(&schema))
+            .with_spec_id(7)
+            .add_partition_field("identity_src", "p_identity", Transform::Identity)
+            .expect("identity partition")
+            .add_partition_field("year_src", "p_year", Transform::Year)
+            .expect("year partition")
+            .add_partition_field("month_src", "p_month", Transform::Month)
+            .expect("month partition")
+            .add_partition_field("day_src", "p_day", Transform::Day)
+            .expect("day partition")
+            .add_partition_field("hour_src", "p_hour", Transform::Hour)
+            .expect("hour partition")
+            .add_partition_field("bucket_src", "p_bucket", Transform::Bucket(16))
+            .expect("bucket partition")
+            .add_partition_field("truncate_src", "p_truncate", Transform::Truncate(4))
+            .expect("truncate partition")
+            .add_partition_field("void_src", "p_void", Transform::Void)
+            .expect("void partition")
+            .build()
+            .expect("supported partition spec");
+        let expected_transforms = [
+            MvPartitionTransformContract::Identity,
+            MvPartitionTransformContract::Year,
+            MvPartitionTransformContract::Month,
+            MvPartitionTransformContract::Day,
+            MvPartitionTransformContract::Hour,
+            MvPartitionTransformContract::Bucket { num_buckets: 16 },
+            MvPartitionTransformContract::Truncate { width: 4 },
+            MvPartitionTransformContract::Void,
+        ];
+        let expected_partition = MvPartitionContract {
+            target_spec_id: supported_spec.spec_id(),
+            fields: supported_spec
+                .fields()
+                .iter()
+                .zip(expected_transforms)
+                .map(|(field, transform)| MvPartitionFieldContract {
+                    partition_field_id: field.field_id,
+                    partition_field_name: field.name.clone(),
+                    source_target_field_id: field.source_id,
+                    source_column_name: format!("source_{}", field.source_id),
+                    transform,
+                })
+                .collect(),
+        };
+        let mut contract = minimal_base_row_id_contract();
+        contract.target.partition = Some(expected_partition.clone());
+        assert_eq!(
+            check_target_partition_spec(&contract, &supported_spec),
+            None,
+            "all supported transforms must preserve their exact contracts"
+        );
+
+        let unknown_spec = PartitionSpec::builder(schema)
+            .with_spec_id(7)
+            .add_partition_field("unknown_src", "p_unknown", Transform::Unknown)
+            .expect("unknown partition")
+            .build()
+            .expect("unknown partition spec");
+        let mut no_partition_contract = minimal_base_row_id_contract();
+        no_partition_contract.target.partition = None;
+        assert_eq!(
+            check_target_partition_spec(&no_partition_contract, &unknown_spec),
+            None,
+            "live partition state must be ignored when no partition contract was persisted"
+        );
+
+        let exact_error = |partition: MvPartitionContract,
+                           current: &iceberg::spec::PartitionSpec| {
+            let mut current_contract = minimal_base_row_id_contract();
+            current_contract.target.partition = Some(partition);
+            check_target_partition_spec(&current_contract, current)
+                .expect("partition mismatch")
+                .to_string()
+        };
+        let wrap = |reason: &str| {
+            format!(
+                "iceberg MV refresh blocked: target partition spec changed externally ({reason}); recreate the MV"
+            )
+        };
+
+        let mut spec_id_changed = expected_partition.clone();
+        spec_id_changed.target_spec_id = 8;
+        assert_eq!(
+            exact_error(spec_id_changed, &supported_spec),
+            wrap("expected default spec id 8, got 7")
+        );
+
+        let mut count_changed = expected_partition.clone();
+        count_changed.fields.pop();
+        assert_eq!(
+            exact_error(count_changed, &supported_spec),
+            wrap("expected 7 partition fields, got 8")
+        );
+
+        let mut id_changed = expected_partition.clone();
+        id_changed.fields[0].partition_field_id += 100;
+        assert_eq!(
+            exact_error(id_changed, &supported_spec),
+            wrap("partition field #0 id expected 1100, got 1000")
+        );
+
+        let mut source_changed = expected_partition.clone();
+        source_changed.fields[0].source_target_field_id = 99;
+        assert_eq!(
+            exact_error(source_changed, &supported_spec),
+            wrap("partition field p_identity source id expected 99, got 1")
+        );
+
+        let mut name_changed = expected_partition.clone();
+        name_changed.fields[0].partition_field_name = "P_IDENTITY".to_string();
+        assert_eq!(
+            exact_error(name_changed, &supported_spec),
+            wrap("partition field #0 name expected P_IDENTITY, got p_identity")
+        );
+
+        let mut reordered = expected_partition.clone();
+        reordered.fields.swap(0, 1);
+        assert_eq!(
+            exact_error(reordered, &supported_spec),
+            wrap("partition field #0 id expected 1001, got 1000")
+        );
+
+        let mut transform_changed = expected_partition;
+        transform_changed.fields[0].transform = MvPartitionTransformContract::Year;
+        assert_eq!(
+            exact_error(transform_changed, &supported_spec),
+            wrap("partition field p_identity transform expected Year, got Identity")
+        );
+
+        let unknown_field = &unknown_spec.fields()[0];
+        let unknown_contract = MvPartitionContract {
+            target_spec_id: unknown_spec.spec_id(),
+            fields: vec![MvPartitionFieldContract {
+                partition_field_id: unknown_field.field_id,
+                partition_field_name: unknown_field.name.clone(),
+                source_target_field_id: unknown_field.source_id,
+                source_column_name: "unknown_src".to_string(),
+                transform: MvPartitionTransformContract::Identity,
+            }],
+        };
+        assert_eq!(
+            exact_error(unknown_contract, &unknown_spec),
+            wrap("partition field p_unknown has unsupported transform Unknown")
+        );
     }
 
     #[test]
@@ -1008,6 +1387,217 @@ mod tests {
                     current_name: "renamed_id".to_string(),
                 }],
             }
+        );
+    }
+
+    #[test]
+    fn base_field_compatibility_preserves_tolerance_and_rebind_order() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        let int_type = Type::Primitive(PrimitiveType::Int);
+        let long_type = Type::Primitive(PrimitiveType::Long);
+        let mut contract = minimal_base_row_id_contract();
+        contract.base.schema_at_create.fields.push(BaseFieldRecord {
+            field_id: 2,
+            name_at_create: "amount".to_string(),
+            type_signature: int_type.to_string(),
+            required: false,
+        });
+
+        let dropped = test_schema(
+            2,
+            vec![NestedField::optional(2, "amount", int_type.clone())],
+        );
+        assert_eq!(
+            check_base_referenced_fields(&contract, &dropped)
+                .expect_err("referenced field drop must fail")
+                .to_string(),
+            "iceberg MV refresh blocked: base column \"id\" (field id 1) was dropped from base table; run REFRESH FULL or recreate the MV"
+        );
+
+        let type_changed = test_schema(
+            2,
+            vec![
+                NestedField::required(1, "id", long_type),
+                NestedField::optional(2, "amount", int_type.clone()),
+            ],
+        );
+        assert_eq!(
+            check_base_referenced_fields(&contract, &type_changed)
+                .expect_err("referenced field type change must fail")
+                .to_string(),
+            "iceberg MV refresh blocked: base column \"id\" (field id 1) changed type from int to long; run REFRESH FULL or recreate the MV"
+        );
+
+        let unrelated_reordered = test_schema(
+            2,
+            vec![
+                NestedField::optional(99, "unrelated", Type::Primitive(PrimitiveType::String)),
+                NestedField::optional(2, "amount", int_type.clone()),
+                NestedField::required(1, "id", int_type.clone()),
+            ],
+        );
+        assert_eq!(
+            check_base_referenced_fields(&contract, &unrelated_reordered),
+            Ok(Vec::new())
+        );
+
+        let case_only = test_schema(
+            2,
+            vec![
+                NestedField::required(1, "ID", int_type.clone()),
+                NestedField::optional(2, "AMOUNT", int_type.clone()),
+            ],
+        );
+        assert_eq!(
+            check_base_referenced_fields(&contract, &case_only),
+            Ok(Vec::new())
+        );
+
+        let renamed_in_physical_reverse_order = test_schema(
+            2,
+            vec![
+                NestedField::optional(2, "current_amount", int_type.clone()),
+                NestedField::required(1, "current_id", int_type),
+            ],
+        );
+        assert_eq!(
+            check_base_referenced_fields(&contract, &renamed_in_physical_reverse_order),
+            Ok(vec![
+                RebindColumn {
+                    base_table_fqn: "ice.db.orders".to_string(),
+                    field_id: 1,
+                    name_at_create: "id".to_string(),
+                    current_name: "current_id".to_string(),
+                },
+                RebindColumn {
+                    base_table_fqn: "ice.db.orders".to_string(),
+                    field_id: 2,
+                    name_at_create: "amount".to_string(),
+                    current_name: "current_amount".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn target_field_compatibility_preserves_nullable_tolerance_and_failures() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        let int_type = Type::Primitive(PrimitiveType::Int);
+        let long_type = Type::Primitive(PrimitiveType::Long);
+        let contract = minimal_base_row_id_contract();
+        let schema = |visible: Option<NestedField>, hidden: Option<NestedField>| {
+            test_schema(12, visible.into_iter().chain(hidden).collect())
+        };
+        let hidden = || {
+            NestedField::required(
+                2,
+                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                Type::Primitive(PrimitiveType::Long),
+            )
+        };
+
+        let visible_nullable = schema(
+            Some(NestedField::optional(1, "ID", int_type.clone())),
+            Some(hidden()),
+        );
+        assert_eq!(check_target_schema(&contract, &visible_nullable), None);
+
+        let cases = vec![
+            (
+                schema(None, Some(hidden())),
+                "iceberg MV refresh blocked: target visible column \"id\" (field id 1) was dropped; recreate the MV",
+            ),
+            (
+                schema(
+                    Some(NestedField::required(1, "renamed_id", int_type.clone())),
+                    Some(hidden()),
+                ),
+                "iceberg MV refresh blocked: target visible column (field id 1) renamed externally: expected \"id\", actual \"renamed_id\"; recreate the MV",
+            ),
+            (
+                schema(
+                    Some(NestedField::required(1, "id", long_type.clone())),
+                    Some(hidden()),
+                ),
+                "iceberg MV refresh blocked: target visible column (field id 1) changed type from int to long; recreate the MV",
+            ),
+            (
+                schema(Some(NestedField::required(1, "id", int_type.clone())), None),
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken (hidden apply-key field id 2 not found); recreate the MV",
+            ),
+            (
+                schema(
+                    Some(NestedField::required(1, "id", int_type.clone())),
+                    Some(NestedField::required(
+                        2,
+                        "renamed_key",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ),
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken (hidden apply-key column renamed to renamed_key); recreate the MV",
+            ),
+            (
+                schema(
+                    Some(NestedField::required(1, "id", int_type.clone())),
+                    Some(NestedField::optional(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                ),
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken (hidden apply-key column must be required); recreate the MV",
+            ),
+            (
+                schema(
+                    Some(NestedField::required(1, "id", int_type)),
+                    Some(NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ),
+                "iceberg MV refresh blocked: target hidden apply-key column contract broken (hidden apply-key column must be Long, got string); recreate the MV",
+            ),
+        ];
+        for (current_schema, expected) in cases {
+            let error = check_target_schema(&contract, &current_schema)
+                .expect("target compatibility case must fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn ordinary_schema_id_fast_path_preserves_target_tolerance() {
+        let ordinary_contract = minimal_base_row_id_contract();
+        let ordinary_base = test_schema(ordinary_contract.base.schema_id_at_create, Vec::new());
+        let ordinary_target = test_schema(ordinary_contract.target.schema_id_at_create, Vec::new());
+        assert_eq!(
+            validate_schema_contract_after_identity(
+                &ordinary_contract,
+                &ordinary_base,
+                &ordinary_target,
+            ),
+            ContractDecision::CompatibleSafe
+        );
+
+        let aggregate_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let mut aggregate_contract = aggregate_schema_contract(aggregate_type.to_string());
+        aggregate_contract.target.schema_id_at_create = 11;
+        let aggregate_base = test_schema(aggregate_contract.base.schema_id_at_create, Vec::new());
+        let aggregate_target =
+            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        assert_eq!(
+            validate_schema_contract_after_identity(
+                &aggregate_contract,
+                &aggregate_base,
+                &aggregate_target,
+            ),
+            ContractDecision::Incompatible(SchemaEvolutionError::AggregateStateContractBroken {
+                reason: "aggregate state column __agg_state_c field id 3 changed type from long to string"
+                    .to_string(),
+            })
         );
     }
 

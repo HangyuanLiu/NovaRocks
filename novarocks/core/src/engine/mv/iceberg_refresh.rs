@@ -16374,6 +16374,188 @@ mod tests {
         assert!(is_imv_change_op_output_column(&output));
     }
 
+    fn branch_field_test_contract(
+        source: mv_schema::ApplyKeySource,
+    ) -> mv_schema::MvSchemaContract {
+        let aggregate = (source == mv_schema::ApplyKeySource::GroupRowId).then(|| {
+            mv_schema::AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                state_columns: vec![mv_schema::AggregateStateColumnContract {
+                    column_name: "__agg_state_count".to_string(),
+                    target_field_id: 3,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                    role: mv_schema::AggregateStateRoleContract::Single,
+                }],
+            }
+        });
+        let hidden_name = match source {
+            mv_schema::ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+            mv_schema::ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+            mv_schema::ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+        };
+        mv_schema::MvSchemaContract {
+            contract_version: if aggregate.is_some() { 3 } else { 1 },
+            base: test_base_contract("ice.db.base"),
+            bases: vec![test_base_contract("ice.db.base")],
+            output: mv_schema::OutputContract {
+                columns: Vec::new(),
+                filter: None,
+            },
+            join: None,
+            aggregate,
+            branch: Some(mv_schema::BranchUnionContract {
+                branch_id_column: mv_schema::BranchIdColumnContract {
+                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                },
+                branch_count: 2,
+                inner_apply_key_source: source,
+            }),
+            target: mv_schema::TargetContract {
+                table_fqn: "ice.db.mv".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: Vec::new(),
+                hidden_apply_key: mv_schema::HiddenApplyKeyContract {
+                    column_name: hidden_name.to_string(),
+                    target_field_id: 10,
+                    source,
+                },
+                partition: None,
+            },
+        }
+    }
+
+    fn branch_field_test_table(
+        branch_field: Option<iceberg::spec::NestedField>,
+    ) -> iceberg::table::Table {
+        use iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type,
+        };
+
+        let mut fields = vec![StdArc::new(NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Int),
+        ))];
+        fields.extend(branch_field.map(StdArc::new));
+        let schema = Schema::builder()
+            .with_schema_id(2)
+            .with_fields(fields)
+            .build()
+            .expect("branch field test schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/ebd16b-branch-field".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::from([(
+                "write.row-lineage".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .expect("branch field table metadata builder")
+        .build()
+        .expect("branch field table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .identifier(
+                iceberg::TableIdent::from_strs(["db", "branch_target"])
+                    .expect("branch field table ident"),
+            )
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("branch field test table")
+    }
+
+    fn branch_field_cases() -> Vec<(iceberg::table::Table, &'static str)> {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        vec![
+            (branch_field_test_table(None), "missing"),
+            (
+                branch_field_test_table(Some(NestedField::required(
+                    2,
+                    "renamed_branch",
+                    Type::Primitive(PrimitiveType::Int),
+                ))),
+                "renamed",
+            ),
+            (
+                branch_field_test_table(Some(NestedField::optional(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    Type::Primitive(PrimitiveType::Int),
+                ))),
+                "not-required",
+            ),
+            (
+                branch_field_test_table(Some(NestedField::required(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    Type::Primitive(PrimitiveType::Long),
+                ))),
+                "wrong-type",
+            ),
+        ]
+    }
+
+    #[test]
+    fn branch_union_aggregate_branch_field_errors_preserve_exact_messages() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        };
+        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::GroupRowId);
+        let expected = [
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id field id 2 is missing from target schema",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be required",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be Int, got long",
+        ];
+
+        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
+            let error =
+                validate_branch_union_contract(&target, &contract, 2, &table).expect_err(label);
+            assert_eq!(error, expected, "case={label}");
+        }
+    }
+
+    #[test]
+    fn union_projection_branch_field_errors_preserve_exact_messages() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        };
+        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::BaseRowId);
+        let base_ref = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "base".to_string(),
+        };
+        let expected = [
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id field id 2 is missing from target schema",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be required",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be Int, got long",
+        ];
+
+        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
+            let error = validate_union_projection_schema_contract_for_base(
+                &target, &contract, 2, &base_ref, &table, &table,
+            )
+            .expect_err(label);
+            assert_eq!(error, expected, "case={label}");
+        }
+    }
+
     #[test]
     fn join_base_schema_contract_returns_rebind_for_rename() {
         let ty = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
