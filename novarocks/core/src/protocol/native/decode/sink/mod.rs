@@ -275,14 +275,7 @@ fn decode_data_stream_branch(
         } else {
             Vec::new()
         };
-        let output_columns =
-            decode_output_slot_ids(&stream.output_columns, context).map_err(|error| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "output_columns",
-                    error,
-                )
-            })?;
+        let output_columns = decode_output_slot_ids(&stream.output_columns, context)?;
         DataStreamSinkBranchProgram::try_new(
             stream.dest_node_id,
             Vec::new(),
@@ -302,17 +295,30 @@ fn decode_data_stream_branch(
     decoded
 }
 
-fn decode_output_slot_ids(raw_ids: &[i32], context: &str) -> Result<Vec<SlotId>, String> {
+fn decode_output_slot_ids(
+    raw_ids: &[i32],
+    context: &str,
+) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
     let mut seen = std::collections::HashSet::new();
     raw_ids
         .iter()
-        .map(|raw| {
-            let slot_id = SlotId::try_from(*raw)
-                .map_err(|error| format!("{context}: invalid output_columns slot id: {error}"))?;
+        .enumerate()
+        .map(|(index, raw)| {
+            let slot_id = SlotId::try_from(*raw).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "output_columns",
+                    format!("{context}: invalid output_columns slot id: {error}"),
+                )
+                .append_index(index)
+            })?;
             if !seen.insert(slot_id) {
-                return Err(format!(
-                    "{context}: duplicate output_columns slot id: {slot_id}"
-                ));
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "output_columns",
+                    format!("{context}: duplicate output_columns slot id: {slot_id}"),
+                )
+                .append_index(index));
             }
             Ok(slot_id)
         })
@@ -1041,6 +1047,60 @@ mod tests {
             protocol.kind(),
             crate::protocol::common::error::ProtocolErrorKind::MissingField
         );
+    }
+
+    #[test]
+    fn data_stream_invalid_output_column_uses_exact_indexed_path_and_kind() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        ..Default::default()
+                    }),
+                    output_columns: vec![1, -1],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("invalid output column must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.data_stream.output_columns[1]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn data_stream_duplicate_output_column_uses_exact_indexed_path_and_kind() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        ..Default::default()
+                    }),
+                    output_columns: vec![1, 1],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("duplicate output column must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.data_stream.output_columns[1]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
     }
 
     #[test]

@@ -20,29 +20,41 @@ use super::common::{check_exact_arity, parse_optional_nonnegative_i64};
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
     assert: &plan::AssertOneRowNode,
     path: FieldPath,
+    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<DecodedNode, String> {
-        check_exact_arity("AssertOneRowNode", 1, children.len())?;
+    check_exact_arity("AssertOneRowNode", 1, children.len()).map_err(|error| {
+        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
+    })?;
+    let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let desired_num_rows = parse_optional_nonnegative_i64(
             assert.desired_num_rows,
             "AssertOneRowNode.desired_num_rows",
-        )?
+        )
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::OutOfRange,
+                "desired_num_rows",
+                error,
+            )
+        })?
         .or(Some(1));
         let assertion = lower_row_count_assertion(assert.assertion)?;
         let mode = if assert.group_key_column_ids.is_empty() {
             if !assert.group_key_labels.is_empty() || assert.keyed_message_prefix.is_some() {
-                return Err(
-                "AssertOneRowNode group_key_column_ids is required when keyed metadata is present"
-                    .to_string(),
-            );
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "group_key_column_ids",
+                    "AssertOneRowNode group_key_column_ids is required when keyed metadata is present",
+                ));
             }
             AssertNumRowsMode::Global {
                 desired_num_rows,
@@ -50,29 +62,46 @@ pub(super) fn lower_assert_one_row_node(
                 subquery_string: Some(assert.subquery_text.clone()),
             }
         } else {
-            if desired_num_rows != Some(1) || !matches!(assertion, Assertion::Le) {
-                return Err(
-                    "AssertOneRowNode keyed assertions only support desired_num_rows <= 1"
-                        .to_string(),
-                );
+            if desired_num_rows != Some(1) {
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "desired_num_rows",
+                    "AssertOneRowNode keyed assertions only support desired_num_rows <= 1",
+                ));
+            }
+            if !matches!(assertion, Assertion::Le) {
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "assertion",
+                    "AssertOneRowNode keyed assertions only support desired_num_rows <= 1",
+                ));
             }
             if !assert.group_key_labels.is_empty()
                 && assert.group_key_labels.len() != assert.group_key_column_ids.len()
             {
-                return Err(format!(
-                    "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
-                    assert.group_key_column_ids.len(),
-                    assert.group_key_labels.len()
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "group_key_labels",
+                    format!(
+                        "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
+                        assert.group_key_column_ids.len(),
+                        assert.group_key_labels.len()
+                    ),
                 ));
             }
             let key_slots = assert
                 .group_key_column_ids
                 .iter()
-                .map(|column_id| {
-                    child
-                        .layout
-                        .resolve_column_id(*column_id)
-                        .map_err(|err| format!("AssertOneRowNode group key: {err}"))
+                .enumerate()
+                .map(|(index, column_id)| {
+                    child.layout.resolve_column_id(*column_id).map_err(|error| {
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "group_key_column_ids",
+                            format!("AssertOneRowNode group key: {error}"),
+                        )
+                        .append_index(index)
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let key_labels = if assert.group_key_labels.is_empty() {
@@ -105,10 +134,10 @@ pub(super) fn lower_assert_one_row_node(
             output_schema: child.output_schema,
         })
     })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+    decoded.map_err(|error| error.into_native(path))
 }
 
-fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
+fn lower_row_count_assertion(value: i32) -> Result<Assertion, NativeFragmentLeafDecodeError> {
     match value {
         value if value == plan::RowCountAssertion::Unspecified as i32 => Ok(Assertion::Le),
         value if value == plan::RowCountAssertion::Eq as i32 => Ok(Assertion::Eq),
@@ -117,8 +146,10 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
         value if value == plan::RowCountAssertion::Le as i32 => Ok(Assertion::Le),
         value if value == plan::RowCountAssertion::Gt as i32 => Ok(Assertion::Gt),
         value if value == plan::RowCountAssertion::Ge as i32 => Ok(Assertion::Ge),
-        other => Err(format!(
-            "AssertOneRowNode assertion {other} is not supported"
+        other => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "assertion",
+            format!("AssertOneRowNode assertion {other} is not supported"),
         )),
     }
 }
@@ -127,9 +158,23 @@ fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {
 mod tests {
     use super::super::tests::{lower, one_col_values_node, physical_node};
     use crate::common::ids::SlotId;
+    use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::AssertNumRowsMode;
     use crate::proto::plan;
+    use crate::protocol::common::error::ProtocolErrorKind;
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> super::super::super::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        super::super::decode_node(
+            node,
+            &mut arena,
+            &super::super::NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid AssertOneRow node must fail")
+    }
 
     #[test]
     fn lowers_keyed_assert_num_rows_from_native_proto() {
@@ -162,5 +207,70 @@ mod tests {
             }
             AssertNumRowsMode::Global { .. } => panic!("expected keyed assert"),
         }
+    }
+
+    #[test]
+    fn unknown_assertion_uses_exact_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                assertion: 999,
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.assertion"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+    }
+
+    #[test]
+    fn negative_desired_rows_uses_exact_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                desired_num_rows: Some(-1),
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.desired_num_rows"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn unknown_group_key_uses_exact_indexed_path_and_kind() {
+        let node = physical_node(
+            70,
+            plan::plan_node::Kind::AssertOneRow(plan::AssertOneRowNode {
+                desired_num_rows: Some(1),
+                assertion: plan::RowCountAssertion::Le as i32,
+                group_key_column_ids: vec![999],
+                ..Default::default()
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_error(&node);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.assert_one_row.group_key_column_ids[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
     }
 }

@@ -28,26 +28,38 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,
     repeat: &plan::RepeatNode,
     path: FieldPath,
+    node_path: FieldPath,
     mut children: Vec<DecodedNode>,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<DecodedNode, String> {
-        check_exact_arity("RepeatNode", 1, children.len())?;
+    check_exact_arity("RepeatNode", 1, children.len()).map_err(|error| {
+        super::super::NativeFragmentDecodeError::inconsistent(node_path.field("children"), error)
+    })?;
+    let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let repeat_times = repeat.grouping_ids.len();
         if repeat_times == 0 {
-            return Err("RepeatNode grouping_ids is empty".to_string());
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "grouping_ids",
+                "RepeatNode grouping_ids is empty",
+            ));
         }
         if repeat.repeat_column_ref_ids.len() != repeat_times {
-            return Err(format!(
-                "RepeatNode repeat_column_ref_ids size mismatch: expected {}, got {}",
-                repeat_times,
-                repeat.repeat_column_ref_ids.len()
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "repeat_column_ref_ids",
+                format!(
+                    "RepeatNode repeat_column_ref_ids size mismatch: expected {}, got {}",
+                    repeat_times,
+                    repeat.repeat_column_ref_ids.len()
+                ),
             ));
         }
         let all_slot_ids = repeat
@@ -68,12 +80,20 @@ pub(super) fn lower_repeat_node(
                     .copied()
                     .map(SlotId::new)
                     .collect::<HashSet<_>>();
-                for slot in &keep {
-                    if !all_slot_set.contains(slot) {
-                        return Err(format!(
-                            "RepeatNode keep set {idx} contains unknown rollup slot {}",
-                            slot
-                        ));
+                for (value_index, slot) in
+                    keep_ids.values.iter().copied().map(SlotId::new).enumerate()
+                {
+                    if !all_slot_set.contains(&slot) {
+                        return Err(NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "repeat_column_ref_ids",
+                            format!(
+                                "RepeatNode keep set {idx} contains unknown rollup slot {slot}"
+                            ),
+                        )
+                        .append_index(idx)
+                        .append_field("values")
+                        .append_index(value_index));
                     }
                 }
                 let mut nulls = all_slot_ids
@@ -84,21 +104,15 @@ pub(super) fn lower_repeat_node(
                 nulls.sort_by_key(|slot| slot.as_u32());
                 Ok(nulls)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
         let grouping_slot_ids = repeat
             .grouping_fn_ids
             .iter()
             .map(|entry| SlotId::new(entry.value))
             .collect::<Vec<_>>();
-        let grouping_list =
-            repeat_grouping_values(repeat, path.clone()).map_err(|error| error.to_string())?;
-        let (layout, output_schema) = repeat_output_layout_and_schema(
-            &child,
-            &repeat.grouping_fn_ids,
-            &grouping_slot_ids,
-            path.clone(),
-        )
-        .map_err(|error| error.to_string())?;
+        let grouping_list = repeat_grouping_values(repeat)?;
+        let (layout, output_schema) =
+            repeat_output_layout_and_schema(&child, &repeat.grouping_fn_ids, &grouping_slot_ids)?;
 
         Ok(DecodedNode {
             node: ExecNode {
@@ -115,96 +129,136 @@ pub(super) fn lower_repeat_node(
             output_schema,
         })
     })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+    decoded.map_err(|error| error.into_native(path))
 }
 
 fn repeat_output_layout_and_schema(
     child: &DecodedNode,
     grouping_fn_ids: &[plan::NamedUInt32],
     grouping_slot_ids: &[SlotId],
-    path: FieldPath,
-) -> Result<(Layout, ChunkSchemaRef), super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<(Layout, ChunkSchemaRef), String> {
-        let mut slots = child.output_schema.slots().to_vec();
-        let mut output_slot_ids = child.layout.order().to_vec();
-        for (idx, slot_id) in grouping_slot_ids.iter().copied().enumerate() {
-            if child.layout.contains_slot(slot_id) || output_slot_ids.contains(&slot_id) {
-                return Err(format!(
-                    "RepeatNode grouping slot {} duplicates input slot",
-                    slot_id
-                ));
-            }
-            let name = grouping_fn_ids
-                .get(idx)
-                .map(|entry| entry.name.as_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("__grouping_fn");
-            let field = Field::new(name, DataType::Int64, true);
-            slots.push(ChunkSlotSchema::new_with_field(slot_id, field, None, None));
-            output_slot_ids.push(slot_id);
+) -> Result<(Layout, ChunkSchemaRef), NativeFragmentLeafDecodeError> {
+    let mut slots = child.output_schema.slots().to_vec();
+    let mut output_slot_ids = child.layout.order().to_vec();
+    for (idx, slot_id) in grouping_slot_ids.iter().copied().enumerate() {
+        if child.layout.contains_slot(slot_id) || output_slot_ids.contains(&slot_id) {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::DuplicateField,
+                "grouping_fn_ids",
+                format!("RepeatNode grouping slot {slot_id} duplicates input slot"),
+            )
+            .append_index(idx)
+            .append_field("value"));
         }
-        let layout = Layout::for_slots(output_slot_ids);
-        let output_schema = Arc::new(ChunkSchema::try_new(slots)?);
-        Ok((layout, output_schema))
-    })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+        let name = grouping_fn_ids
+            .get(idx)
+            .map(|entry| entry.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("__grouping_fn");
+        let field = Field::new(name, DataType::Int64, true);
+        slots.push(ChunkSlotSchema::new_with_field(slot_id, field, None, None));
+        output_slot_ids.push(slot_id);
+    }
+    let layout = Layout::for_slots(output_slot_ids);
+    let output_schema = Arc::new(ChunkSchema::try_new(slots).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "grouping_fn_ids",
+            error,
+        )
+    })?);
+    Ok((layout, output_schema))
 }
 
 fn repeat_grouping_values(
     repeat: &plan::RepeatNode,
-    path: FieldPath,
-) -> Result<Vec<Vec<i64>>, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<Vec<Vec<i64>>, String> {
-        if repeat.grouping_fn_ids.len() != repeat.grouping_fn_arg_ids.len() {
-            return Err(format!(
+) -> Result<Vec<Vec<i64>>, NativeFragmentLeafDecodeError> {
+    if repeat.grouping_fn_ids.len() != repeat.grouping_fn_arg_ids.len() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "grouping_fn_arg_ids",
+            format!(
                 "RepeatNode grouping fn length mismatch: ids={} arg_ids={}",
                 repeat.grouping_fn_ids.len(),
                 repeat.grouping_fn_arg_ids.len()
-            ));
-        }
-        let repeat_times = repeat.grouping_ids.len();
-        let keep_sets = repeat
-            .repeat_column_ref_ids
-            .iter()
-            .map(|ids| ids.values.iter().copied().collect::<HashSet<_>>())
-            .collect::<Vec<_>>();
-        repeat
-            .grouping_fn_arg_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, args)| {
-                if args.values.len() > 63 {
-                    return Err(format!(
+            ),
+        ));
+    }
+    let repeat_times = repeat.grouping_ids.len();
+    let keep_sets = repeat
+        .repeat_column_ref_ids
+        .iter()
+        .map(|ids| ids.values.iter().copied().collect::<HashSet<_>>())
+        .collect::<Vec<_>>();
+    repeat
+        .grouping_fn_arg_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, args)| {
+            if args.values.len() > 63 {
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::OutOfRange,
+                    "grouping_fn_arg_ids",
+                    format!(
                         "RepeatNode grouping_fn_arg_ids[{idx}] has too many arguments: {}",
                         args.values.len()
-                    ));
-                }
-                let mut values = Vec::with_capacity(repeat_times);
-                for (repeat_idx, keep) in keep_sets.iter().enumerate() {
-                    let mut value = 0i64;
-                    for (arg_idx, column_id) in args.values.iter().enumerate() {
-                        if !keep.contains(column_id) {
-                            let reverse_bit_pos = args.values.len() - 1 - arg_idx;
-                            value |= 1i64 << reverse_bit_pos;
-                        }
+                    ),
+                )
+                .append_index(idx)
+                .append_field("values"));
+            }
+            let mut values = Vec::with_capacity(repeat_times);
+            for keep in &keep_sets {
+                let mut value = 0i64;
+                for (arg_idx, column_id) in args.values.iter().enumerate() {
+                    if !keep.contains(column_id) {
+                        let reverse_bit_pos = args.values.len() - 1 - arg_idx;
+                        value |= 1i64 << reverse_bit_pos;
                     }
-                    if repeat_idx >= repeat_times {
-                        return Err("RepeatNode internal repeat index overflow".to_string());
-                    }
-                    values.push(value);
                 }
-                Ok(values)
-            })
-            .collect()
-    })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::{lower, physical_node, two_col_values_node};
+    use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::proto::plan;
+    use crate::protocol::common::error::ProtocolErrorKind;
+
+    fn valid_repeat() -> plan::RepeatNode {
+        plan::RepeatNode {
+            repeat_column_ref_ids: vec![plan::UInt32List { values: vec![1] }],
+            grouping_ids: vec![0],
+            all_rollup_column_ids: vec![1, 2],
+            ..Default::default()
+        }
+    }
+
+    fn repeat_node(repeat: plan::RepeatNode) -> plan::DistributedNode {
+        physical_node(
+            20,
+            plan::plan_node::Kind::Repeat(repeat),
+            Vec::new(),
+            vec![two_col_values_node(10)],
+        )
+    }
+
+    fn decode_error(
+        node: &plan::DistributedNode,
+    ) -> super::super::super::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        super::super::decode_node(
+            node,
+            &mut arena,
+            &super::super::NativePlanDecodeContext::default(),
+        )
+        .expect_err("invalid Repeat node must fail")
+    }
 
     #[test]
     fn repeat_grouping_function_uses_sql_reverse_bit_order() {
@@ -238,5 +292,105 @@ mod tests {
             panic!("expected Repeat");
         };
         assert_eq!(repeat.grouping_list, vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn empty_grouping_ids_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_ids.clear();
+        repeat.repeat_column_ref_ids.clear();
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn repeat_set_count_mismatch_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.repeat_column_ref_ids.clear();
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.repeat_column_ref_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn unknown_keep_slot_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.repeat_column_ref_ids[0].values = vec![999];
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.repeat_column_ref_ids[0].values[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn grouping_function_count_mismatch_uses_exact_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 9,
+        });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_arg_ids"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn too_many_grouping_arguments_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 9,
+        });
+        repeat.grouping_fn_arg_ids.push(plan::UInt32List {
+            values: vec![1; 64],
+        });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_arg_ids[0].values"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn duplicate_grouping_slot_uses_exact_indexed_path_and_kind() {
+        let mut repeat = valid_repeat();
+        repeat.grouping_fn_ids.push(plan::NamedUInt32 {
+            name: "g".to_string(),
+            value: 1,
+        });
+        repeat
+            .grouping_fn_arg_ids
+            .push(plan::UInt32List { values: vec![1] });
+
+        let error = decode_error(&repeat_node(repeat));
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.repeat.grouping_fn_ids[0].value"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::DuplicateField);
     }
 }

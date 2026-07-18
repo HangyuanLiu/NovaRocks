@@ -615,7 +615,7 @@ fn decode_reduction(
 ) -> Result<DecodedRuntimeFilterReduction, super::NativeFragmentDecodeError> {
     let wire = wire.ok_or_else(|| {
         super::NativeFragmentDecodeError::missing(
-            path.clone().field("kind"),
+            path.clone(),
             format!("native runtime-filter binding_id={binding_id} missing reduction contract"),
         )
     })?;
@@ -853,18 +853,27 @@ fn decode_role(
                     ),
                 ));
             }
-            let activation_path = consumer_path.field("activation").field("kind");
-            let activation = match consumer.activation.as_ref().and_then(|activation| activation.kind.as_ref())
-                .ok_or_else(|| super::NativeFragmentDecodeError::missing(activation_path.clone(), format!("native runtime-filter binding_id={binding_id} missing consumer activation kind")))? {
+            let activation_path = consumer_path.field("activation");
+            let activation = consumer.activation.as_ref().ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    activation_path.clone(),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} missing consumer activation"
+                    ),
+                )
+            })?;
+            let activation_kind_path = activation_path.field("kind");
+            let activation = match activation.kind.as_ref()
+                .ok_or_else(|| super::NativeFragmentDecodeError::missing(activation_kind_path.clone(), format!("native runtime-filter binding_id={binding_id} missing consumer activation kind")))? {
                 plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => ConsumerActivation::BlockingSnapshot,
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => return Err(super::NativeFragmentDecodeError::invalid_value(activation_path.field("blocking_snapshot"), format!("native runtime-filter binding_id={binding_id} blocking activation marker must be true"))),
+                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => return Err(super::NativeFragmentDecodeError::invalid_value(activation_kind_path.field("blocking_snapshot"), format!("native runtime-filter binding_id={binding_id} blocking activation marker must be true"))),
                 plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => ConsumerActivation::NonBlockingLive { late_apply: match plan::RuntimeFilterLateApplyGranularity::try_from(*raw) {
                     Ok(plan::RuntimeFilterLateApplyGranularity::Row) => LateApplyGranularity::Row,
                     Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => LateApplyGranularity::Batch,
                     Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => LateApplyGranularity::RowGroup,
                     Ok(plan::RuntimeFilterLateApplyGranularity::Split) => LateApplyGranularity::Split,
                     Ok(plan::RuntimeFilterLateApplyGranularity::File) => LateApplyGranularity::File,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => return Err(super::NativeFragmentDecodeError::invalid_enum(activation_path.field("non_blocking_live"), format!("native runtime-filter binding_id={binding_id} invalid late-apply granularity={raw}"))),
+                    Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => return Err(super::NativeFragmentDecodeError::invalid_enum(activation_kind_path.field("non_blocking_live"), format!("native runtime-filter binding_id={binding_id} invalid late-apply granularity={raw}"))),
                 }},
             };
             let target_path = consumer_path.field("target");
@@ -1395,6 +1404,70 @@ mod tests {
             "plan_fragment.runtime_filter_bindings.bindings[0].reduction.kind.merge_topk_summary.k"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn missing_reduction_message_uses_message_path_and_kind() {
+        let mut binding = membership_binding(1, 11);
+        binding.reduction = None;
+
+        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
+        {
+            Ok(_) => panic!("missing reduction message must fail"),
+            Err(error) => error,
+        };
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].reduction"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn missing_activation_message_uses_message_path_and_kind() {
+        let mut binding = membership_binding(1, 11);
+        let plan::runtime_filter_binding::Role::Consumer(consumer) =
+            binding.role.as_mut().expect("consumer role")
+        else {
+            panic!("consumer role");
+        };
+        consumer.activation = None;
+
+        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
+        {
+            Ok(_) => panic!("missing activation message must fail"),
+            Err(error) => error,
+        };
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].role.consumer.activation"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn missing_activation_kind_uses_oneof_path_and_kind() {
+        let mut binding = membership_binding(1, 11);
+        let plan::runtime_filter_binding::Role::Consumer(consumer) =
+            binding.role.as_mut().expect("consumer role")
+        else {
+            panic!("consumer role");
+        };
+        consumer.activation = Some(plan::RuntimeFilterConsumerActivation::default());
+
+        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
+        {
+            Ok(_) => panic!("missing activation kind must fail"),
+            Err(error) => error,
+        };
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].role.consumer.activation.kind"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
     }
 
     #[test]

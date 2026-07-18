@@ -29,7 +29,8 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
@@ -110,7 +111,7 @@ fn project_output_plan(
     input_layout: &Layout,
     path: FieldPath,
 ) -> Result<ProjectOutputPlan, super::super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<ProjectOutputPlan, String> {
+    let decoded = (|| -> Result<ProjectOutputPlan, NativeFragmentLeafDecodeError> {
         let item_outputs = project
             .items
             .iter()
@@ -153,14 +154,16 @@ fn project_output_plan(
                     &mut next_synthetic_column_id,
                     &mut used_output_column_ids,
                     &mut used_compute_column_ids,
-                )?
+                )
+                .map_err(project_synthetic_id_error)?
             };
             if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
                 compute_column_id = allocate_project_synthetic_column_id(
                     &mut next_synthetic_column_id,
                     &mut used_output_column_ids,
                     &mut used_compute_column_ids,
-                )?;
+                )
+                .map_err(project_synthetic_id_error)?;
             }
 
             let (computed_idx, is_duplicate_compute) = if item.can_reuse_input_slot
@@ -189,7 +192,8 @@ fn project_output_plan(
                     &mut next_synthetic_column_id,
                     &mut used_output_column_ids,
                     &mut used_compute_column_ids,
-                )?
+                )
+                .map_err(project_synthetic_id_error)?
             };
             output_columns.push(proto_common::OutputColumn {
                 column_id: output_column_id,
@@ -214,7 +218,11 @@ fn project_output_plan(
             output_indices: needs_output_indices.then_some(output_indices),
         })
     })();
-    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
+    decoded.map_err(|error| error.into_native(path))
+}
+
+fn project_synthetic_id_error(error: String) -> NativeFragmentLeafDecodeError {
+    NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "items", error)
 }
 
 fn allocate_project_synthetic_column_id(
@@ -250,15 +258,26 @@ struct ProjectItemOutput {
 
 fn project_item_output(
     (idx, item): (usize, &plan::ProjectItem),
-) -> Result<ProjectItemOutput, String> {
-    let expr = item
-        .expr
-        .as_ref()
-        .ok_or_else(|| format!("ProjectNode item {idx} expr missing"))?;
-    let r#type = expr
-        .r#type
-        .clone()
-        .ok_or_else(|| format!("ProjectNode item {idx} expr type missing"))?;
+) -> Result<ProjectItemOutput, NativeFragmentLeafDecodeError> {
+    let expr = item.expr.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "items",
+            format!("ProjectNode item {idx} expr missing"),
+        )
+        .append_index(idx)
+        .append_field("expr")
+    })?;
+    let r#type = expr.r#type.clone().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "items",
+            format!("ProjectNode item {idx} expr type missing"),
+        )
+        .append_index(idx)
+        .append_field("expr")
+        .append_field("type")
+    })?;
     let (preferred_compute_column_id, can_reuse_input_slot) = match expr.kind.as_ref() {
         Some(expr::expr::Kind::ColumnRef(column)) => (column.column_id, true),
         _ => (item.output_column_id, false),
@@ -282,6 +301,7 @@ mod tests {
     use super::*;
     use crate::exec::expr::ExprArena;
     use crate::proto::{common, expr, plan};
+    use crate::protocol::common::error::ProtocolErrorKind;
     use crate::types::native_proto::encode_type;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
@@ -379,6 +399,65 @@ mod tests {
     fn lower(node: &plan::DistributedNode) -> DecodedNode {
         let mut arena = ExprArena::default();
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    fn lower_error(node: &plan::DistributedNode) -> super::super::super::NativeFragmentDecodeError {
+        let mut arena = ExprArena::default();
+        decode_node(node, &mut arena, &NativePlanDecodeContext::default())
+            .expect_err("invalid Project node must fail")
+    }
+
+    #[test]
+    fn missing_project_item_expr_uses_exact_indexed_path_and_kind() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: None,
+                    output_name: "missing".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = lower_error(&project);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.project.items[0].expr"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn missing_project_item_expr_type_uses_exact_indexed_path_and_kind() {
+        let project = physical_node(
+            20,
+            plan::plan_node::Kind::Project(plan::ProjectNode {
+                items: vec![plan::ProjectItem {
+                    expr: Some(expr::Expr {
+                        r#type: None,
+                        ..int_literal(1)
+                    }),
+                    output_name: "missing_type".to_string(),
+                    output_column_id: 7,
+                }],
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = lower_error(&project);
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.project.items[0].expr.type"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
     }
 
     #[test]

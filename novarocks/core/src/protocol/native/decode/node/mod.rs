@@ -483,6 +483,7 @@ fn decode_node_inner(
             node,
             physical,
             path.clone().field("payload").field("physical"),
+            path.clone(),
             children,
             arena,
             ctx,
@@ -598,78 +599,91 @@ fn attach_leaf_consumers(
     arena: &mut ExprArena,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<(), String> {
-        for binding in bindings {
-            let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
-                return Err(format!(
+    for binding in bindings {
+        let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
                     "native runtime-filter binding_id={} expected consumer role",
                     binding.binding_id
-                ));
-            };
-            if *target != DecodedConsumerBindingTarget::SourceBoundary {
-                return Err(format!(
+                ),
+            ));
+        };
+        if *target != DecodedConsumerBindingTarget::SourceBoundary {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
                     "native runtime-filter consumer binding_id={} on leaf node_id={} must target source boundary",
                     binding.binding_id, wire_node.node_id
-                ));
-            }
+                ),
+            ));
         }
-        let specs = bindings
-            .iter()
-            .map(|binding| {
-                let expr_id = lower_binding_expression(
-                    binding,
-                    &lowered.layout,
-                    &lowered.output_schema,
-                    arena,
-                    path.clone(),
+    }
+    let specs = bindings
+        .iter()
+        .map(|binding| {
+            let expr_id = lower_binding_expression(
+                binding,
+                &lowered.layout,
+                &lowered.output_schema,
+                arena,
+                path.clone(),
+            )?;
+            consumer_spec(binding, expr_id).map_err(|error| {
+                super::NativeFragmentDecodeError::inconsistent(
+                    path.clone().field("runtime_filter_binding_ids"),
+                    error,
                 )
-                .map_err(|error| error.to_string())?;
-                consumer_spec(binding, expr_id)
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        let payload = wire_node
-            .payload
-            .as_ref()
-            .ok_or_else(|| format!("native node_id={} payload missing", wire_node.node_id))?;
-        match payload {
-            plan::distributed_node::Payload::Exchange(_) => {
-                let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
+        })
+        .collect::<Result<Vec<_>, super::NativeFragmentDecodeError>>()?;
+    let payload = wire_node.payload.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("payload"),
+            format!("native node_id={} payload missing", wire_node.node_id),
+        )
+    })?;
+    match payload {
+        plan::distributed_node::Payload::Exchange(_) => {
+            let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
+                super::NativeFragmentDecodeError::inconsistent(
+                    path.clone().field("payload.exchange"),
                     format!(
                         "native node_id={} exchange lowering lost ExchangeSource boundary",
                         wire_node.node_id
-                    )
-                })?;
-                exchange.set_native_runtime_filter_specs(specs);
-            }
-            plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
-                Some(plan::plan_node::Kind::Scan(_)) => {
-                    set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                    ),
+                )
+            })?;
+            exchange.set_native_runtime_filter_specs(specs);
+        }
+        plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
+            Some(plan::plan_node::Kind::Scan(_)) => {
+                set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                    super::NativeFragmentDecodeError::inconsistent(
+                        path.clone().field("payload.physical.scan"),
                         format!(
                             "native node_id={} scan lowering lost Scan boundary",
                             wire_node.node_id
-                        )
-                    })?;
-                }
-                Some(plan::plan_node::Kind::Values(_))
-                | Some(plan::plan_node::Kind::GenerateSeries(_)) => {
-                    wrap_source_boundary(&mut lowered.node, wire_node.node_id, specs);
-                }
-                kind => {
-                    return Err(format!(
+                        ),
+                    )
+                })?;
+            }
+            Some(plan::plan_node::Kind::Values(_))
+            | Some(plan::plan_node::Kind::GenerateSeries(_)) => {
+                wrap_source_boundary(&mut lowered.node, wire_node.node_id, specs);
+            }
+            kind => {
+                return Err(super::NativeFragmentDecodeError::unsupported(
+                    path.field("runtime_filter_binding_ids"),
+                    format!(
                         "native runtime-filter consumer binding on leaf node_id={} has unsupported source capability: {kind:?}",
                         wire_node.node_id
-                    ));
-                }
-            },
-        }
-        Ok(())
-    })();
-    decoded.map_err(|error| {
-        super::NativeFragmentDecodeError::inconsistent(
-            path.field("runtime_filter_binding_ids"),
-            error,
-        )
-    })
+                    ),
+                ));
+            }
+        },
+    }
+    Ok(())
 }
 
 fn wrap_source_boundary(
@@ -727,122 +741,144 @@ fn attach_hash_join_producers(
     arena: &mut ExprArena,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<(), String> {
-        let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
-            return Err(format!(
+    let binding_path = path.clone().field("runtime_filter_binding_ids");
+    let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            binding_path,
+            format!(
                 "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
                 wire_node.node_id
-            ));
-        };
-        if direct_inputs.len() != 2 {
-            return Err(format!(
+            ),
+        ));
+    };
+    if direct_inputs.len() != 2 {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            binding_path,
+            format!(
                 "native HashJoin node_id={} missing two direct inputs",
                 wire_node.node_id
-            ));
-        }
-        let build_input_index = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-            0
-        } else {
-            1
-        };
-        let (build_layout, build_schema) = &direct_inputs[build_input_index];
-        let plan::distributed_node::Payload::Physical(physical) =
-            wire_node.payload.as_ref().ok_or_else(|| {
-                format!(
-                    "native HashJoin node_id={} payload missing",
-                    wire_node.node_id
-                )
-            })?
-        else {
-            return Err(format!(
+            ),
+        ));
+    }
+    let build_input_index = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+        0
+    } else {
+        1
+    };
+    let (build_layout, build_schema) = &direct_inputs[build_input_index];
+    let payload = wire_node.payload.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("payload"),
+            format!(
+                "native HashJoin node_id={} payload missing",
+                wire_node.node_id
+            ),
+        )
+    })?;
+    let plan::distributed_node::Payload::Physical(physical) = payload else {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            path.clone().field("payload"),
+            format!(
                 "native runtime-filter producer node_id={} is not physical HashJoin",
                 wire_node.node_id
-            ));
-        };
-        let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
-            return Err(format!(
+            ),
+        ));
+    };
+    let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
+        return Err(super::NativeFragmentDecodeError::inconsistent(
+            path.clone().field("payload.physical.kind"),
+            format!(
                 "native runtime-filter producer node_id={} is not HashJoin",
                 wire_node.node_id
-            ));
-        };
-        let mut producers = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let DecodedBindingRole::Producer {
-                contribution_kinds,
-                completion_requirement,
-                join_key_ordinal,
-            } = &binding.role
-            else {
-                return Err(format!(
+            ),
+        ));
+    };
+    let mut producers = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let DecodedBindingRole::Producer {
+            contribution_kinds,
+            completion_requirement,
+            join_key_ordinal,
+        } = &binding.role
+        else {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                format!(
                     "native runtime-filter binding_id={} expected producer role",
                     binding.binding_id
-                ));
-            };
-            let build_key_index = *join_key_ordinal;
-            let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
+                ),
+            ));
+        };
+        let build_key_index = *join_key_ordinal;
+        let join_key_path = path
+            .clone()
+            .field("physical.hash_join.eq_conditions")
+            .index(build_key_index);
+        let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
+            super::NativeFragmentDecodeError::inconsistent(
+                join_key_path.clone(),
                 format!(
                     "native runtime-filter producer binding_id={} targets missing join key ordinal={build_key_index}, key_count={}",
                     binding.binding_id,
                     wire_join.eq_conditions.len()
-                )
-            })?;
-            if condition.null_safe {
-                return Err(format!(
+                ),
+            )
+        })?;
+        if condition.null_safe {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                join_key_path.clone().field("null_safe"),
+                format!(
                     "native runtime-filter producer binding_id={} targets null-safe join key ordinal={build_key_index}",
                     binding.binding_id
-                ));
-            }
-            let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-                condition.left.as_ref()
-            } else {
-                condition.right.as_ref()
-            }
-            .ok_or_else(|| {
+                ),
+            ));
+        }
+        let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+            condition.left.as_ref()
+        } else {
+            condition.right.as_ref()
+        }
+        .ok_or_else(|| {
+            super::NativeFragmentDecodeError::missing(
+                join_key_path.clone(),
                 format!(
                     "native runtime-filter producer binding_id={} join key ordinal={build_key_index} missing build expression",
                     binding.binding_id
-                )
-            })?;
-            if raw_build != &binding.expression {
-                return Err(format!(
+                ),
+            )
+        })?;
+        if raw_build != &binding.expression {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                join_key_path.clone(),
+                format!(
                     "native runtime-filter producer binding_id={} expression does not match join key ordinal={build_key_index}",
                     binding.binding_id
-                ));
-            }
-            validate_column_refs_exact(
-                binding.binding_id,
-                raw_build,
-                build_layout,
-                build_schema,
-                path.clone()
-                    .field("physical.hash_join.eq_conditions")
-                    .index(build_key_index),
-            )
-            .map_err(|error| error.to_string())?;
-            let build_expr_id =
-                lower_binding_expression(binding, build_layout, build_schema, arena, path.clone())
-                    .map_err(|error| error.to_string())?;
-            producers.push(NativeJoinRuntimeFilterProducerSpec {
-                binding_id: binding.binding_id,
-                channel_id: binding.channel_id,
-                build_expr_id,
-                build_key_index,
-                contribution_kinds: contribution_kinds.clone(),
-                completion_requirement: *completion_requirement,
-                contract: native_contract(&binding.contract),
-                reduction: native_reduction(&binding.reduction),
-                availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
-            });
+                ),
+            ));
         }
-        join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
-        Ok(())
-    })();
-    decoded.map_err(|error| {
-        super::NativeFragmentDecodeError::inconsistent(
-            path.field("runtime_filter_binding_ids"),
-            error,
-        )
-    })
+        validate_column_refs_exact(
+            binding.binding_id,
+            raw_build,
+            build_layout,
+            build_schema,
+            join_key_path,
+        )?;
+        let build_expr_id =
+            lower_binding_expression(binding, build_layout, build_schema, arena, path.clone())?;
+        producers.push(NativeJoinRuntimeFilterProducerSpec {
+            binding_id: binding.binding_id,
+            channel_id: binding.channel_id,
+            build_expr_id,
+            build_key_index,
+            contribution_kinds: contribution_kinds.clone(),
+            completion_requirement: *completion_requirement,
+            contract: native_contract(&binding.contract),
+            reduction: native_reduction(&binding.reduction),
+            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+        });
+    }
+    join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
+    Ok(())
 }
 
 fn consumer_spec(
@@ -936,183 +972,310 @@ fn validate_column_refs_exact(
     schema: &ChunkSchemaRef,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<(), String> {
-        use crate::proto::expr::expr::Kind;
-        let kind = expression.kind.as_ref().ok_or_else(|| {
-            format!("native runtime-filter binding_id={binding_id} expression kind missing")
-        })?;
-        if let Kind::ColumnRef(column) = kind {
-            let slot_id = layout
-                .resolve_column_id(column.column_id)
-                .map_err(|error| {
-                    format!("native runtime-filter binding_id={binding_id}: {error}")
-                })?;
-            let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
-            format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} has no ChunkSchema field", column.column_id)
-        })?;
-            let type_desc = expression.r#type.as_ref().ok_or_else(|| {
-            format!(
-                "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type missing",
-                column.column_id
+    use crate::proto::expr::expr::Kind;
+
+    let kind = expression.kind.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("kind"),
+            format!("native runtime-filter binding_id={binding_id} expression kind missing"),
+        )
+    })?;
+    if let Kind::ColumnRef(column) = kind {
+        let column_path = path.clone().field("column_ref");
+        let slot_id = layout
+            .resolve_column_id(column.column_id)
+            .map_err(|error| {
+                super::NativeFragmentDecodeError::invalid_value(
+                    column_path.clone().field("column_id"),
+                    format!("native runtime-filter binding_id={binding_id}: {error}"),
+                )
+            })?;
+        let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
+            super::NativeFragmentDecodeError::inconsistent(
+                column_path.clone().field("column_id"),
+                format!(
+                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} has no ChunkSchema field",
+                    column.column_id
+                ),
             )
         })?;
-            let actual = super::decode_field_type("_runtime_filter_column", expression.nullable, type_desc)
-            .map_err(|error| format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}", column.column_id))?;
-            if expected.data_type() != actual.data_type()
-                || expected.is_nullable() != actual.is_nullable()
-                || crate::exec::chunk::ChunkFieldSchema::from_field(expected)?
-                    != crate::exec::chunk::ChunkFieldSchema::from_field(&actual)?
-            {
-                return Err(format!(
+        let type_desc = expression.r#type.as_ref().ok_or_else(|| {
+            super::NativeFragmentDecodeError::missing(
+                path.clone().field("type"),
+                format!(
+                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type missing",
+                    column.column_id
+                ),
+            )
+        })?;
+        let actual = super::decode_field_type(
+            "_runtime_filter_column",
+            expression.nullable,
+            type_desc,
+        )
+        .map_err(|error| {
+            super::NativeFragmentDecodeError::invalid_value(
+                path.clone().field("type"),
+                format!(
+                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}",
+                    column.column_id
+                ),
+            )
+        })?;
+        let expected_schema =
+            crate::exec::chunk::ChunkFieldSchema::from_field(expected).map_err(|error| {
+                super::NativeFragmentDecodeError::inconsistent(column_path.clone(), error)
+            })?;
+        let actual_schema =
+            crate::exec::chunk::ChunkFieldSchema::from_field(&actual).map_err(|error| {
+                super::NativeFragmentDecodeError::invalid_value(path.clone().field("type"), error)
+            })?;
+        if expected.data_type() != actual.data_type()
+            || expected.is_nullable() != actual.is_nullable()
+            || expected_schema != actual_schema
+        {
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                column_path,
+                format!(
                     "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
                     column.column_id
-                ));
-            }
+                ),
+            ));
         }
-        let mut visit = |child: &crate::proto::expr::Expr| {
-            validate_column_refs_exact(binding_id, child, layout, schema, path.clone())
-                .map_err(|error| error.to_string())
-        };
-        match kind {
-            Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
-            Kind::BinaryOp(binary) => {
-                visit(
-                    binary
-                        .left
-                        .as_ref()
-                        .ok_or_else(|| "BinaryOp.left missing".to_string())?,
-                )?;
-                visit(
-                    binary
-                        .right
-                        .as_ref()
-                        .ok_or_else(|| "BinaryOp.right missing".to_string())?,
-                )
-            }
-            Kind::UnaryOp(unary) => visit(
+    }
+
+    let visit = |child: &crate::proto::expr::Expr, child_path: FieldPath| {
+        validate_column_refs_exact(binding_id, child, layout, schema, child_path)
+    };
+    let missing = |child_path: FieldPath, detail: &'static str| {
+        super::NativeFragmentDecodeError::missing(child_path, detail)
+    };
+    match kind {
+        Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
+        Kind::BinaryOp(binary) => {
+            let binary_path = path.field("binary_op");
+            let left_path = binary_path.clone().field("left");
+            visit(
+                binary
+                    .left
+                    .as_ref()
+                    .ok_or_else(|| missing(left_path.clone(), "BinaryOp.left missing"))?,
+                left_path,
+            )?;
+            let right_path = binary_path.field("right");
+            visit(
+                binary
+                    .right
+                    .as_ref()
+                    .ok_or_else(|| missing(right_path.clone(), "BinaryOp.right missing"))?,
+                right_path,
+            )
+        }
+        Kind::UnaryOp(unary) => {
+            let operand_path = path.field("unary_op").field("operand");
+            visit(
                 unary
                     .operand
                     .as_ref()
-                    .ok_or_else(|| "UnaryOp.operand missing".to_string())?,
-            ),
-            Kind::FunctionCall(call) => call.args.iter().try_for_each(&mut visit),
-            Kind::AggregateCall(call) => {
-                call.args.iter().try_for_each(&mut visit)?;
-                call.order_by.iter().try_for_each(|item| {
+                    .ok_or_else(|| missing(operand_path.clone(), "UnaryOp.operand missing"))?,
+                operand_path,
+            )
+        }
+        Kind::FunctionCall(call) => call.args.iter().enumerate().try_for_each(|(index, child)| {
+            visit(
+                child,
+                path.clone()
+                    .field("function_call")
+                    .field("args")
+                    .index(index),
+            )
+        }),
+        Kind::AggregateCall(call) => {
+            let call_path = path.clone().field("aggregate_call");
+            call.args
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, child)| {
+                    visit(child, call_path.clone().field("args").index(index))
+                })?;
+            call.order_by
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, item)| {
+                    let expr_path = call_path
+                        .clone()
+                        .field("order_by")
+                        .index(index)
+                        .field("expr");
                     visit(
                         item.expr
                             .as_ref()
-                            .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                            .ok_or_else(|| missing(expr_path.clone(), "SortItem.expr missing"))?,
+                        expr_path,
                     )
                 })
-            }
-            Kind::WindowCall(call) => {
-                call.args.iter().try_for_each(&mut visit)?;
-                call.partition_by.iter().try_for_each(&mut visit)?;
-                call.order_by.iter().try_for_each(|item| {
+        }
+        Kind::WindowCall(call) => {
+            let call_path = path.clone().field("window_call");
+            call.args
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, child)| {
+                    visit(child, call_path.clone().field("args").index(index))
+                })?;
+            call.partition_by
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, child)| {
+                    visit(child, call_path.clone().field("partition_by").index(index))
+                })?;
+            call.order_by
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, item)| {
+                    let expr_path = call_path
+                        .clone()
+                        .field("order_by")
+                        .index(index)
+                        .field("expr");
                     visit(
                         item.expr
                             .as_ref()
-                            .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                            .ok_or_else(|| missing(expr_path.clone(), "SortItem.expr missing"))?,
+                        expr_path,
                     )
                 })
-            }
-            Kind::Cast(cast) => visit(
+        }
+        Kind::Cast(cast) => {
+            let operand_path = path.field("cast").field("operand");
+            visit(
                 cast.operand
                     .as_ref()
-                    .ok_or_else(|| "Cast.operand missing".to_string())?,
-            ),
-            Kind::IsNull(is_null) => visit(
+                    .ok_or_else(|| missing(operand_path.clone(), "Cast.operand missing"))?,
+                operand_path,
+            )
+        }
+        Kind::IsNull(is_null) => {
+            let operand_path = path.field("is_null").field("operand");
+            visit(
                 is_null
                     .operand
                     .as_ref()
-                    .ok_or_else(|| "IsNull.operand missing".to_string())?,
-            ),
-            Kind::InList(in_list) => {
+                    .ok_or_else(|| missing(operand_path.clone(), "IsNull.operand missing"))?,
+                operand_path,
+            )
+        }
+        Kind::InList(in_list) => {
+            let list_path = path.clone().field("in_list");
+            let operand_path = list_path.clone().field("operand");
+            visit(
+                in_list
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| missing(operand_path.clone(), "InList.operand missing"))?,
+                operand_path,
+            )?;
+            in_list
+                .list
+                .iter()
+                .enumerate()
+                .try_for_each(|(index, child)| {
+                    visit(child, list_path.clone().field("list").index(index))
+                })
+        }
+        Kind::Between(between) => {
+            let between_path = path.clone().field("between");
+            for (field, child, detail) in [
+                (
+                    "operand",
+                    between.operand.as_ref(),
+                    "Between.operand missing",
+                ),
+                ("low", between.low.as_ref(), "Between.low missing"),
+                ("high", between.high.as_ref(), "Between.high missing"),
+            ] {
+                let child_path = between_path.clone().field(field);
                 visit(
-                    in_list
-                        .operand
-                        .as_ref()
-                        .ok_or_else(|| "InList.operand missing".to_string())?,
+                    child.ok_or_else(|| missing(child_path.clone(), detail))?,
+                    child_path,
                 )?;
-                in_list.list.iter().try_for_each(&mut visit)
             }
-            Kind::Between(between) => {
+            Ok(())
+        }
+        Kind::Like(like) => {
+            let like_path = path.clone().field("like");
+            for (field, child, detail) in [
+                ("operand", like.operand.as_ref(), "Like.operand missing"),
+                ("pattern", like.pattern.as_ref(), "Like.pattern missing"),
+            ] {
+                let child_path = like_path.clone().field(field);
                 visit(
-                    between
-                        .operand
-                        .as_ref()
-                        .ok_or_else(|| "Between.operand missing".to_string())?,
+                    child.ok_or_else(|| missing(child_path.clone(), detail))?,
+                    child_path,
                 )?;
+            }
+            Ok(())
+        }
+        Kind::CaseExpr(case_expr) => {
+            let case_path = path.clone().field("case_expr");
+            if let Some(operand) = &case_expr.operand {
+                visit(operand, case_path.clone().field("operand"))?;
+            }
+            for (index, branch) in case_expr.when_then.iter().enumerate() {
+                let branch_path = case_path.clone().field("when_then").index(index);
+                let when_path = branch_path.clone().field("when");
                 visit(
-                    between
-                        .low
+                    branch
+                        .when
                         .as_ref()
-                        .ok_or_else(|| "Between.low missing".to_string())?,
+                        .ok_or_else(|| missing(when_path.clone(), "Case.when missing"))?,
+                    when_path,
                 )?;
+                let then_path = branch_path.field("then");
                 visit(
-                    between
-                        .high
+                    branch
+                        .then
                         .as_ref()
-                        .ok_or_else(|| "Between.high missing".to_string())?,
-                )
-            }
-            Kind::Like(like) => {
-                visit(
-                    like.operand
-                        .as_ref()
-                        .ok_or_else(|| "Like.operand missing".to_string())?,
+                        .ok_or_else(|| missing(then_path.clone(), "Case.then missing"))?,
+                    then_path,
                 )?;
-                visit(
-                    like.pattern
-                        .as_ref()
-                        .ok_or_else(|| "Like.pattern missing".to_string())?,
-                )
             }
-            Kind::CaseExpr(case_expr) => {
-                if let Some(operand) = &case_expr.operand {
-                    visit(operand)?;
-                }
-                for branch in &case_expr.when_then {
-                    visit(
-                        branch
-                            .when
-                            .as_ref()
-                            .ok_or_else(|| "Case.when missing".to_string())?,
-                    )?;
-                    visit(
-                        branch
-                            .then
-                            .as_ref()
-                            .ok_or_else(|| "Case.then missing".to_string())?,
-                    )?;
-                }
-                if let Some(else_expr) = &case_expr.else_expr {
-                    visit(else_expr)?;
-                }
-                Ok(())
+            if let Some(else_expr) = &case_expr.else_expr {
+                visit(else_expr, case_path.field("else_expr"))?;
             }
-            Kind::IsTruth(is_truth) => visit(
+            Ok(())
+        }
+        Kind::IsTruth(is_truth) => {
+            let operand_path = path.field("is_truth").field("operand");
+            visit(
                 is_truth
                     .operand
                     .as_ref()
-                    .ok_or_else(|| "IsTruth.operand missing".to_string())?,
-            ),
-            Kind::Lambda(lambda) => visit(
+                    .ok_or_else(|| missing(operand_path.clone(), "IsTruth.operand missing"))?,
+                operand_path,
+            )
+        }
+        Kind::Lambda(lambda) => {
+            let body_path = path.field("lambda").field("body");
+            visit(
                 lambda
                     .body
                     .as_ref()
-                    .ok_or_else(|| "Lambda.body missing".to_string())?,
-            ),
-            Kind::Nested(nested) => visit(
+                    .ok_or_else(|| missing(body_path.clone(), "Lambda.body missing"))?,
+                body_path,
+            )
+        }
+        Kind::Nested(nested) => {
+            let inner_path = path.field("nested").field("inner");
+            visit(
                 nested
                     .inner
                     .as_ref()
-                    .ok_or_else(|| "Nested.inner missing".to_string())?,
-            ),
+                    .ok_or_else(|| missing(inner_path.clone(), "Nested.inner missing"))?,
+                inner_path,
+            )
         }
-    })();
-    decoded.map_err(|error| super::NativeFragmentDecodeError::invalid_value(path, error))
+    }
 }
 
 fn apply_distributed_limit_if_needed(
@@ -1148,6 +1311,7 @@ fn lower_physical_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     path: FieldPath,
+    node_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
@@ -1177,9 +1341,13 @@ fn lower_physical_node(
         plan::plan_node::Kind::Filter(filter) => {
             filter::lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
         }
-        plan::plan_node::Kind::Limit(limit) => {
-            limit::lower_limit_node(node, limit, path.clone().field("limit"), children)
-        }
+        plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(
+            node,
+            limit,
+            path.clone().field("limit"),
+            node_path,
+            children,
+        ),
         plan::plan_node::Kind::Sort(sort) => sort::lower_sort_node(
             node,
             physical,
@@ -1203,6 +1371,7 @@ fn lower_physical_node(
             node,
             assert,
             path.clone().field("assert_one_row"),
+            node_path,
             children,
         ),
         plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
@@ -1245,9 +1414,13 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Repeat(repeat) => {
-            repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
-        }
+        plan::plan_node::Kind::Repeat(repeat) => repeat::lower_repeat_node(
+            node,
+            repeat,
+            path.clone().field("repeat"),
+            node_path,
+            children,
+        ),
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
             generate_series::lower_generate_series_node(
                 node,
@@ -1681,6 +1854,38 @@ mod tests {
                 target: Some(type_desc(&data_type)),
             }))),
         }
+    }
+
+    #[test]
+    fn runtime_filter_expression_missing_binary_left_uses_exact_path_and_kind() {
+        let expression = expr::Expr {
+            r#type: Some(type_desc(&DataType::Boolean)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                op: expr::BinaryOp::Eq as i32,
+                left: None,
+                right: Some(Box::new(column_ref(1, DataType::Int64))),
+            }))),
+        };
+        let lowered = lower(&one_col_values_node(10));
+
+        let error = validate_column_refs_exact(
+            1,
+            &expression,
+            &lowered.layout,
+            &lowered.output_schema,
+            FieldPath::root("runtime_filter_expression"),
+        )
+        .expect_err("missing binary left must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "runtime_filter_expression.binary_op.left"
+        );
+        assert_eq!(
+            protocol.kind(),
+            crate::protocol::common::error::ProtocolErrorKind::MissingField
+        );
     }
 
     #[test]
