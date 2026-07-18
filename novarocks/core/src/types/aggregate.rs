@@ -300,7 +300,7 @@ fn list_output_type(item_type: DataType) -> DataType {
 ///
 /// This is the single source of truth for the DISTINCT-mangling table, feeding
 /// both the planner-typed aggregate adapters (`sql::planner::physical`) and the
-/// proto-typed decode path (`lower::novarocks::node::aggregate`). It is pure
+/// proto-typed decode path (`protocol::native::decode::node::aggregate`). It is pure
 /// (`&str` in, `String` out) so this module stays a protobuf-free, planner-free
 /// leaf next to [`infer_agg_function_types`].
 pub(crate) fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
