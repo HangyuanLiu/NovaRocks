@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::expr::encode_expr;
 use crate::catalog::schema::SqlType;
 use crate::proto::{common, plan};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
@@ -100,6 +101,21 @@ pub(super) fn encode_edge_partition_type(src: &DataPartition) -> i32 {
         PartitionKind::Random => plan::PartitionType::Random as i32,
         PartitionKind::Hash => plan::PartitionType::Hash as i32,
     }
+}
+
+pub(super) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
+    Ok(plan::DataPartition {
+        kind: match src.kind {
+            PartitionKind::Unpartitioned => plan::PartitionKind::Unpartitioned as i32,
+            PartitionKind::Random => plan::PartitionKind::Random as i32,
+            PartitionKind::Hash => plan::PartitionKind::Hash as i32,
+        },
+        exprs: src
+            .exprs
+            .iter()
+            .map(encode_expr)
+            .collect::<Result<Vec<_>, String>>()?,
+    })
 }
 
 pub(super) fn encode_join_kind(src: JoinKind) -> i32 {

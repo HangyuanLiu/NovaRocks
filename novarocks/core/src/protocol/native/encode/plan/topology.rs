@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::type_mapping::{encode_change_stream_branch_kind, encode_edge_partition_type};
+use super::type_mapping::{
+    encode_change_stream_branch_kind, encode_data_partition, encode_edge_partition_type,
+};
 use super::write::{
     encode_iceberg_change_stream_router_sink, encode_iceberg_write_input_binding,
     encode_iceberg_write_sink_spec,
@@ -155,17 +157,6 @@ pub(super) fn encode_plan_fragment_with_context(
                 prepared_fragment.runtime_filter_bindings(),
             )?
         }),
-    })
-}
-
-pub(super) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
-    Ok(plan::DataPartition {
-        kind: match src.kind {
-            PartitionKind::Unpartitioned => plan::PartitionKind::Unpartitioned as i32,
-            PartitionKind::Random => plan::PartitionKind::Random as i32,
-            PartitionKind::Hash => plan::PartitionKind::Hash as i32,
-        },
-        exprs: encode_exprs(&src.exprs)?,
     })
 }
 

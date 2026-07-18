@@ -16,9 +16,9 @@
 // under the License.
 
 use super::scan::{encode_column_def, encode_iceberg_table_info, encode_table_def_with_context};
-use super::topology::encode_data_partition;
 use super::type_mapping::{
-    encode_change_stream_branch_kind, encode_iceberg_write_sink_mode, usize_to_u64,
+    encode_change_stream_branch_kind, encode_data_partition, encode_iceberg_write_sink_mode,
+    usize_to_u64,
 };
 use super::{NativePlanEncodeContext, required_context_ref};
 use crate::proto::plan;

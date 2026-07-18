@@ -25,7 +25,7 @@ use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, FragmentEdge,
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
-    NodeOutputCatalog, PartitionKind, PlanFragment, WriteContractCatalog,
+    NodeOutputCatalog, PlanFragment, WriteContractCatalog,
 };
 use crate::types::native_proto::encode_type;
 
@@ -195,7 +195,7 @@ fn encode_distributed_plan_with_context_inner(
 }
 
 pub(crate) fn encode_data_partition(src: &DataPartition) -> Result<plan::DataPartition, String> {
-    topology::encode_data_partition(src)
+    type_mapping::encode_data_partition(src)
 }
 
 #[cfg(test)]
