@@ -18,5 +18,10 @@
 mod model;
 mod validator;
 
-pub(crate) use model::{ContractDecision, CurrentIcebergTableView};
-pub(crate) use validator::validate_schema_contract;
+pub(crate) use model::{
+    BranchFieldValidationError, ContractDecision, CurrentIcebergTableView, JoinContractDecision,
+    JoinSchemaValidationError,
+};
+pub(crate) use validator::{
+    validate_branch_id_field, validate_join_schema_contract, validate_schema_contract,
+};

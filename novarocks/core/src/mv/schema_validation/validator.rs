@@ -25,11 +25,15 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
-use super::model::{ContractDecision, CurrentIcebergTableView, SchemaEvolutionError};
+use super::model::{
+    BranchFieldValidationError, ContractDecision, CurrentIcebergTableView, JoinContractDecision,
+    JoinSchemaValidationError, SchemaEvolutionError,
+};
 use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
-    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-    JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract, MvSchemaContract,
+    ApplyKeySource, BaseContract, BranchIdColumnContract, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract,
+    MvSchemaContract,
 };
 
 pub(crate) fn validate_schema_contract(
@@ -46,6 +50,148 @@ pub(crate) fn validate_schema_contract(
         return ContractDecision::Incompatible(err);
     }
     validate_schema_contract_after_identity(contract, current_base.schema, current_target.schema)
+}
+
+pub(crate) fn validate_join_schema_contract(
+    contract: &MvSchemaContract,
+    bases: &[(&str, CurrentIcebergTableView<'_>); 2],
+    current_target: &CurrentIcebergTableView<'_>,
+) -> Result<JoinContractDecision, JoinSchemaValidationError> {
+    contract.ensure_self_consistent().map_err(|error| {
+        JoinSchemaValidationError::SelfInconsistent {
+            reason: error.to_string(),
+        }
+    })?;
+    if contract.bases.len() != 2 {
+        return Err(JoinSchemaValidationError::BaseCount {
+            actual: contract.bases.len(),
+        });
+    }
+    if contract.target.table_uuid != current_target.table_uuid {
+        return Err(JoinSchemaValidationError::TargetIdentityChanged);
+    }
+
+    let mut rebound_columns = Vec::new();
+    for (base_fqn, current_base) in bases {
+        if current_base.format_version != iceberg::spec::FormatVersion::V3
+            || !current_base.row_lineage_enabled
+        {
+            return Err(JoinSchemaValidationError::BaseRowLineageContractBroken {
+                base_fqn: (*base_fqn).to_string(),
+            });
+        }
+        let base_contract = contract
+            .bases
+            .iter()
+            .find(|base| base.table_fqn.eq_ignore_ascii_case(base_fqn))
+            .ok_or_else(|| JoinSchemaValidationError::MissingBaseContract {
+                base_fqn: (*base_fqn).to_string(),
+            })?;
+        if base_contract.table_uuid != current_base.table_uuid {
+            return Err(JoinSchemaValidationError::BaseIdentityChanged {
+                base_fqn: (*base_fqn).to_string(),
+            });
+        }
+        rebound_columns.extend(validate_join_base_schema_contract_for_rebind(
+            base_fqn,
+            base_contract,
+            current_base.schema,
+        )?);
+    }
+
+    match validate_schema_contract(contract, &bases[0].1, current_target) {
+        ContractDecision::Incompatible(error) => {
+            return Err(JoinSchemaValidationError::TargetCompatibility(error));
+        }
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {}
+    }
+    if rebound_columns.is_empty() {
+        Ok(JoinContractDecision::CompatibleSafe)
+    } else {
+        Ok(JoinContractDecision::CompatibleSafeWithRebind { rebound_columns })
+    }
+}
+
+fn validate_join_base_schema_contract_for_rebind(
+    base_fqn: &str,
+    base_contract: &BaseContract,
+    current_schema: &iceberg::spec::Schema,
+) -> Result<Vec<RebindColumn>, JoinSchemaValidationError> {
+    let current_schema = current_schema.as_struct();
+    let mut rebound = Vec::new();
+    for record in &base_contract.schema_at_create.fields {
+        let Some(field) = current_schema
+            .fields()
+            .iter()
+            .find(|field| field.id == record.field_id)
+        else {
+            return Err(JoinSchemaValidationError::BaseFieldDropped {
+                base_fqn: base_fqn.to_string(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+            });
+        };
+        let current_type = field.field_type.to_string();
+        if current_type != record.type_signature {
+            return Err(JoinSchemaValidationError::BaseFieldTypeChanged {
+                base_fqn: base_fqn.to_string(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                from: record.type_signature.clone(),
+                to: current_type,
+            });
+        }
+        if field.required != record.required {
+            return Err(JoinSchemaValidationError::BaseFieldNullabilityChanged {
+                base_fqn: base_fqn.to_string(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                from_required: record.required,
+                to_required: field.required,
+            });
+        }
+        if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
+            rebound.push(RebindColumn {
+                base_table_fqn: base_fqn.to_string(),
+                field_id: record.field_id,
+                name_at_create: record.name_at_create.clone(),
+                current_name: field.name.clone(),
+            });
+        }
+    }
+    Ok(rebound)
+}
+
+pub(crate) fn validate_branch_id_field(
+    contract: &BranchIdColumnContract,
+    target_schema: &iceberg::spec::Schema,
+) -> Result<(), BranchFieldValidationError> {
+    let Some(field) = target_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .find(|field| field.id == contract.target_field_id)
+    else {
+        return Err(BranchFieldValidationError::Missing {
+            field_id: contract.target_field_id,
+        });
+    };
+    if !field.name.eq_ignore_ascii_case(&contract.column_name) {
+        return Err(BranchFieldValidationError::Renamed {
+            expected: contract.column_name.clone(),
+            actual: field.name.clone(),
+        });
+    }
+    if !field.required {
+        return Err(BranchFieldValidationError::NotRequired);
+    }
+    match field.field_type.as_ref() {
+        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int) => Ok(()),
+        other => Err(BranchFieldValidationError::WrongType {
+            expected: "Int".to_string(),
+            actual: other.to_string(),
+        }),
+    }
 }
 
 fn validate_schema_contract_after_identity(
@@ -474,12 +620,12 @@ mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
-        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
-        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-        OutputColumnLineage, OutputContract, QualifiedFieldLineage, TargetContract,
-        TargetVisibleColumn,
+        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
+        BranchIdColumnContract, ExpressionKind, ExpressionLineage,
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME,
+        JoinContract, JoinContractKind, JoinPredicateLineage, MvPartitionContract,
+        MvPartitionFieldContract, MvPartitionTransformContract, OutputColumnLineage,
+        OutputContract, QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
     };
     use std::sync::Arc;
 
@@ -1492,6 +1638,478 @@ mod tests {
                 },
                 partition: None,
             },
+        }
+    }
+
+    fn join_schema_contract() -> MvSchemaContract {
+        let int_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let left = BaseContract {
+            table_fqn: "ice.db.left".to_string(),
+            table_uuid: "left-uuid".to_string(),
+            alias_at_create: Some("l".to_string()),
+            schema_id_at_create: 1,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![BaseFieldRecord {
+                    field_id: 1,
+                    name_at_create: "left_id".to_string(),
+                    type_signature: int_type.to_string(),
+                    required: true,
+                }],
+            },
+        };
+        let right = BaseContract {
+            table_fqn: "ice.db.right".to_string(),
+            table_uuid: "right-uuid".to_string(),
+            alias_at_create: Some("r".to_string()),
+            schema_id_at_create: 1,
+            schema_at_create: BaseSchemaSnapshot {
+                fields: vec![BaseFieldRecord {
+                    field_id: 2,
+                    name_at_create: "right_id".to_string(),
+                    type_signature: int_type.to_string(),
+                    required: true,
+                }],
+            },
+        };
+        MvSchemaContract {
+            contract_version: 2,
+            base: left.clone(),
+            bases: vec![left, right],
+            output: OutputContract {
+                columns: vec![OutputColumnLineage {
+                    expression: ExpressionLineage {
+                        kind: ExpressionKind::Column,
+                        referenced_base_field_ids: Vec::new(),
+                        referenced_base_fields: vec![QualifiedFieldLineage {
+                            table_fqn: "ice.db.left".to_string(),
+                            qualifier_at_create: "l".to_string(),
+                            field_id: 1,
+                        }],
+                    },
+                }],
+                filter: None,
+            },
+            join: Some(JoinContract {
+                kind: JoinContractKind::InnerEquiJoin,
+                predicates: vec![JoinPredicateLineage {
+                    left: QualifiedFieldLineage {
+                        table_fqn: "ice.db.left".to_string(),
+                        qualifier_at_create: "l".to_string(),
+                        field_id: 1,
+                    },
+                    right: QualifiedFieldLineage {
+                        table_fqn: "ice.db.right".to_string(),
+                        qualifier_at_create: "r".to_string(),
+                        field_id: 2,
+                    },
+                }],
+            }),
+            aggregate: None,
+            branch: None,
+            target: TargetContract {
+                table_fqn: "ice.db.mv_join".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: vec![TargetVisibleColumn {
+                    output_name: "left_id".to_string(),
+                    target_field_id: 1,
+                    type_signature: int_type.to_string(),
+                    nullable: false,
+                }],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                    source: ApplyKeySource::JoinRowKey,
+                },
+                partition: None,
+            },
+        }
+    }
+
+    fn join_base_table(
+        table_uuid: &str,
+        field_id: i32,
+        field_name: &str,
+        field_type: iceberg::spec::Type,
+        required: bool,
+    ) -> TestCurrentIcebergTable {
+        let field = if required {
+            iceberg::spec::NestedField::required(field_id, field_name, field_type)
+        } else {
+            iceberg::spec::NestedField::optional(field_id, field_name, field_type)
+        };
+        TestCurrentIcebergTable {
+            table_uuid: table_uuid.to_string(),
+            format_version: iceberg::spec::FormatVersion::V3,
+            row_lineage_enabled: true,
+            schema: test_schema(2, vec![field]),
+            default_partition_spec: iceberg::spec::PartitionSpec::unpartition_spec(),
+        }
+    }
+
+    fn join_target_table() -> TestCurrentIcebergTable {
+        TestCurrentIcebergTable {
+            table_uuid: "target-uuid".to_string(),
+            format_version: iceberg::spec::FormatVersion::V3,
+            row_lineage_enabled: true,
+            schema: test_schema(
+                2,
+                vec![
+                    iceberg::spec::NestedField::required(
+                        1,
+                        "left_id",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                    ),
+                    iceberg::spec::NestedField::required(
+                        2,
+                        JOIN_APPLY_KEY_COLUMN_NAME,
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                    ),
+                ],
+            ),
+            default_partition_spec: iceberg::spec::PartitionSpec::unpartition_spec(),
+        }
+    }
+
+    fn validate_test_join(
+        contract: &MvSchemaContract,
+        left_fqn: &str,
+        left: &TestCurrentIcebergTable,
+        right_fqn: &str,
+        right: &TestCurrentIcebergTable,
+        target: &TestCurrentIcebergTable,
+    ) -> Result<JoinContractDecision, JoinSchemaValidationError> {
+        let bases = [(left_fqn, left.view()), (right_fqn, right.view())];
+        validate_join_schema_contract(contract, &bases, &target.view())
+    }
+
+    #[test]
+    fn join_base_schema_contract_returns_rebind_for_rename() {
+        let contract = join_schema_contract();
+        let left = join_base_table(
+            "left-uuid",
+            1,
+            "renamed_left_id",
+            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            true,
+        );
+        let right = join_base_table(
+            "right-uuid",
+            2,
+            "right_id",
+            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            true,
+        );
+        let target = join_target_table();
+
+        assert_eq!(
+            validate_test_join(
+                &contract,
+                "ice.db.left",
+                &left,
+                "ice.db.right",
+                &right,
+                &target,
+            ),
+            Ok(JoinContractDecision::CompatibleSafeWithRebind {
+                rebound_columns: vec![RebindColumn {
+                    base_table_fqn: "ice.db.left".to_string(),
+                    field_id: 1,
+                    name_at_create: "left_id".to_string(),
+                    current_name: "renamed_left_id".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn join_schema_validation_preserves_first_error_and_exact_messages() {
+        let int_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let long_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let mut contract = join_schema_contract();
+        let mut left = join_base_table("left-uuid", 1, "left_id", int_type.clone(), true);
+        let mut right = join_base_table("right-uuid", 2, "right_id", int_type.clone(), true);
+        let mut target = join_target_table();
+
+        contract.target.hidden_apply_key.column_name = "wrong".to_string();
+        contract.bases.push(contract.bases[0].clone());
+        target.table_uuid = "wrong-target".to_string();
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("self-consistency must win");
+        assert_eq!(
+            error.to_string(),
+            "Iceberg join MV schema contract is self-inconsistent: MV contract hidden apply-key column name expected __nova_join_row_key, got wrong"
+        );
+
+        contract = join_schema_contract();
+        contract.bases.push(contract.bases[0].clone());
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("base count must precede target identity");
+        assert_eq!(
+            error.to_string(),
+            "Iceberg join MV schema contract requires two base contracts, got 3"
+        );
+
+        contract = join_schema_contract();
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("target identity must precede base validation");
+        assert_eq!(
+            error.to_string(),
+            "iceberg join MV refresh blocked: target table identity changed; recreate the MV"
+        );
+        assert!(!error.to_string().contains("target-uuid"));
+        assert!(!error.to_string().contains("wrong-target"));
+
+        target.table_uuid = "target-uuid".to_string();
+        left.format_version = iceberg::spec::FormatVersion::V2;
+        let error = validate_test_join(
+            &contract,
+            "ice.db.missing",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("row-lineage must precede contract lookup");
+        assert_eq!(
+            error.to_string(),
+            "iceberg-backed materialized views require base table ice.db.missing to be Iceberg format-version=3 with write.row-lineage=true; upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+        );
+
+        left.format_version = iceberg::spec::FormatVersion::V3;
+        left.row_lineage_enabled = false;
+        let error = validate_test_join(
+            &contract,
+            "ice.db.missing",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("row-lineage property must share the combined error");
+        assert_eq!(
+            error.to_string(),
+            "iceberg-backed materialized views require base table ice.db.missing to be Iceberg format-version=3 with write.row-lineage=true; upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+        );
+
+        left.row_lineage_enabled = true;
+        let error = validate_test_join(
+            &contract,
+            "ice.db.missing",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("missing contract must precede identity");
+        assert_eq!(
+            error.to_string(),
+            "Iceberg join MV schema contract missing base ice.db.missing"
+        );
+
+        left.table_uuid = "wrong-left".to_string();
+        right.table_uuid = "wrong-right".to_string();
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("caller-provided base order must be preserved");
+        assert_eq!(
+            error.to_string(),
+            "iceberg join MV refresh blocked: base table identity changed for ice.db.left; recreate the MV"
+        );
+
+        left.table_uuid = "left-uuid".to_string();
+        right.table_uuid = "right-uuid".to_string();
+        left.schema = test_schema(2, Vec::new());
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("field existence must precede later base validation");
+        assert_eq!(
+            error.to_string(),
+            "iceberg join MV refresh blocked: base column \"left_id\" (field id 1) was dropped from ice.db.left; recreate the MV"
+        );
+
+        left.schema = test_schema(
+            2,
+            vec![iceberg::spec::NestedField::required(
+                1, "left_id", long_type,
+            )],
+        );
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("type drift must fail");
+        assert_eq!(
+            error,
+            JoinSchemaValidationError::BaseFieldTypeChanged {
+                base_fqn: "ice.db.left".to_string(),
+                field_id: 1,
+                name_at_create: "left_id".to_string(),
+                from: "int".to_string(),
+                to: "long".to_string(),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "iceberg join MV refresh blocked: base column \"left_id\" (field id 1) changed type from int to long; recreate the MV"
+        );
+
+        left.schema = test_schema(
+            2,
+            vec![iceberg::spec::NestedField::optional(
+                1,
+                "left_id",
+                int_type.clone(),
+            )],
+        );
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("nullability drift must fail");
+        assert_eq!(
+            error,
+            JoinSchemaValidationError::BaseFieldNullabilityChanged {
+                base_fqn: "ice.db.left".to_string(),
+                field_id: 1,
+                name_at_create: "left_id".to_string(),
+                from_required: true,
+                to_required: false,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "iceberg join MV refresh blocked: base column \"left_id\" (field id 1) changed nullability; recreate the MV"
+        );
+
+        left.schema = test_schema(
+            2,
+            vec![iceberg::spec::NestedField::required(1, "left_id", int_type)],
+        );
+        target.format_version = iceberg::spec::FormatVersion::V2;
+        contract.target.partition = Some(MvPartitionContract {
+            target_spec_id: 1,
+            fields: Vec::new(),
+        });
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("generic target identity guard must precede partition");
+        assert_eq!(
+            error.to_string(),
+            "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found V2); recreate the MV"
+        );
+
+        target.format_version = iceberg::spec::FormatVersion::V3;
+        target.schema = test_schema(2, Vec::new());
+        let error = validate_test_join(
+            &contract,
+            "ice.db.left",
+            &left,
+            "ice.db.right",
+            &right,
+            &target,
+        )
+        .expect_err("partition must precede target schema");
+        assert_eq!(
+            error.to_string(),
+            "iceberg MV refresh blocked: target partition spec changed externally (expected default spec id 1, got 0); recreate the MV"
+        );
+    }
+
+    #[test]
+    fn branch_id_field_validation_preserves_exact_failures() {
+        let contract = BranchIdColumnContract {
+            column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+            target_field_id: 2,
+        };
+        let schema =
+            |field: Option<iceberg::spec::NestedField>| test_schema(2, field.into_iter().collect());
+        let cases = vec![
+            (
+                schema(None),
+                BranchFieldValidationError::Missing { field_id: 2 },
+            ),
+            (
+                schema(Some(iceberg::spec::NestedField::required(
+                    2,
+                    "renamed_branch",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                ))),
+                BranchFieldValidationError::Renamed {
+                    expected: BRANCH_ID_COLUMN_NAME.to_string(),
+                    actual: "renamed_branch".to_string(),
+                },
+            ),
+            (
+                schema(Some(iceberg::spec::NestedField::optional(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                ))),
+                BranchFieldValidationError::NotRequired,
+            ),
+            (
+                schema(Some(iceberg::spec::NestedField::required(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                ))),
+                BranchFieldValidationError::WrongType {
+                    expected: "Int".to_string(),
+                    actual: "long".to_string(),
+                },
+            ),
+        ];
+
+        for (schema, expected) in cases {
+            assert_eq!(validate_branch_id_field(&contract, &schema), Err(expected));
         }
     }
 

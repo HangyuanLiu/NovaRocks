@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::catalog::identifier::TableIdentity;
 use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::schema_validation::{
-    ContractDecision, CurrentIcebergTableView, validate_schema_contract,
+    ContractDecision, CurrentIcebergTableView, JoinContractDecision, JoinSchemaValidationError,
+    validate_join_schema_contract, validate_schema_contract,
 };
 
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
@@ -64,6 +66,26 @@ pub(crate) fn validate_current_schema_contract_with_base_schema(
     let base_view = current_iceberg_table_view_with_schema(current_base_table, base_schema);
     let target_view = current_iceberg_table_view(current_target_table);
     validate_schema_contract(contract, &base_view, &target_view)
+}
+
+pub(crate) fn validate_current_join_schema_contract(
+    contract: &MvSchemaContract,
+    bases: &[(&TableIdentity, &iceberg::table::Table); 2],
+    current_target_table: &iceberg::table::Table,
+) -> Result<JoinContractDecision, JoinSchemaValidationError> {
+    let base_fqns = [bases[0].0.fqn(), bases[1].0.fqn()];
+    let base_views = [
+        (
+            base_fqns[0].as_str(),
+            current_iceberg_table_view(bases[0].1),
+        ),
+        (
+            base_fqns[1].as_str(),
+            current_iceberg_table_view(bases[1].1),
+        ),
+    ];
+    let target_view = current_iceberg_table_view(current_target_table);
+    validate_join_schema_contract(contract, &base_views, &target_view)
 }
 
 fn row_lineage_enabled(props: &std::collections::HashMap<String, String>) -> bool {
