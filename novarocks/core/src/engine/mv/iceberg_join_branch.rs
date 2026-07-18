@@ -208,7 +208,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
          SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) <= 1 \
          AND SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) <= 1, \
          'join delta multiple pending payloads for key'))",
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
     );
     let coalesced_cte = format!(
         "__nr_join_delta_coalesced AS (\
@@ -216,8 +216,8 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
          FROM __nr_join_delta_payload_coalesced pc \
          JOIN __nr_join_delta_key_shape ks \
          ON pc.{} = ks.{})",
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
     );
     let ctes = branch_ctes
         .into_iter()
@@ -229,7 +229,7 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    let key = crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
     let sql = format!(
         "WITH {ctes} \
          SELECT {final_select} \
@@ -298,7 +298,7 @@ fn wrap_join_apply_key_query(
         JOIN_LEFT_ROW_ID_COLUMN,
         sql_string_literal(right_uuid),
         JOIN_RIGHT_ROW_ID_COLUMN,
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
     ));
     items.push(format!(
         "CAST({} AS TINYINT) AS {}",
@@ -426,7 +426,7 @@ fn is_reserved_payload_projection_name(normalized: &str) -> bool {
     ) || normalized == crate::exec::change_op::CHANGE_OP_COLUMN
         || normalized == JOIN_LEFT_ROW_ID_COLUMN
         || normalized == JOIN_RIGHT_ROW_ID_COLUMN
-        || normalized == crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+        || normalized == crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
         || normalized.starts_with("__nr_join_delta_branch_")
 }
 
@@ -449,15 +449,14 @@ fn change_stream_select_list(
         JOIN_LEFT_ROW_ID_COLUMN,
         sql_string_literal(right_uuid),
         JOIN_RIGHT_ROW_ID_COLUMN,
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
     ));
     items.push(crate::exec::change_op::CHANGE_OP_COLUMN.to_string());
     items.join(", ")
 }
 
 fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
-    let mut items =
-        vec![crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string()];
+    let mut items = vec![crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.push(format!(
         "SUM({}) AS net",
@@ -467,15 +466,14 @@ fn payload_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> S
 }
 
 fn payload_group_by_list(payload_columns: &[sqlparser::ast::Ident]) -> String {
-    let mut items =
-        vec![crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string()];
+    let mut items = vec![crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME.to_string()];
     items.extend(payload_columns.iter().map(|ident| ident.to_string()));
     items.join(", ")
 }
 
 fn key_shape_select_list() -> String {
     [
-        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         "SUM(CASE WHEN net > 0 THEN 1 ELSE 0 END) AS pending_inserts".to_string(),
         "SUM(CASE WHEN net < 0 THEN 1 ELSE 0 END) AS pending_deletes".to_string(),
     ]
@@ -487,7 +485,7 @@ fn valid_payload_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Strin
         .iter()
         .map(|ident| format!("pc.{ident} AS {ident}"))
         .collect::<Vec<_>>();
-    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    let key = crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("pc.{key} AS {key}"));
     items.push("pc.net AS net".to_string());
     items.join(", ")
@@ -498,7 +496,7 @@ fn final_coalesced_select_list(payload_columns: &[sqlparser::ast::Ident]) -> Str
         .iter()
         .map(|ident| format!("coalesced.{ident} AS {ident}"))
         .collect::<Vec<_>>();
-    let key = crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+    let key = crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
     items.push(format!("coalesced.{key} AS {key}"));
     items.push(format!(
         "CAST(CASE WHEN coalesced.net > 0 THEN {} ELSE {} END AS TINYINT) AS {}",
@@ -912,7 +910,7 @@ mod tests {
         assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
         assert_sql_contains(
             &rendered,
-            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
         );
         assert_sql_contains(&rendered, "GROUP BY __nova_join_row_key");
         assert_sql_contains(&rendered, "SUM(__change_op)");

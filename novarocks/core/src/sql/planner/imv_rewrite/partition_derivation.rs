@@ -167,7 +167,7 @@ mod tests {
             ),
             join_apply_key_column: out(
                 4,
-                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
                 DataType::Utf8,
                 false,
                 true,
@@ -195,7 +195,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         10,
-                        crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+                        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
                         DataType::Utf8,
                         false,
                         true,

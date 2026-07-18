@@ -27,9 +27,7 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::catalog::schema::ColumnDef;
-use crate::engine::mv::iceberg_target_apply::{
-    ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-};
+use crate::mv::persistence::schema::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -181,14 +179,14 @@ fn validate_with_change_stream(
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             return Err(format!(
                 "join refresh plan above delta-bound scan {fqn} is missing join apply-key column \
-                 {ICEBERG_MV_JOIN_APPLY_KEY_COLUMN}"
+                 {JOIN_APPLY_KEY_COLUMN_NAME}"
             ));
         }
     } else if subtree_has_delta(plan) && !output_has_apply_key(plan) {
         let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
         return Err(format!(
             "plan above delta-bound scan {fqn} is missing apply key column \
-             {ICEBERG_MV_APPLY_KEY_COLUMN}"
+             {HIDDEN_APPLY_KEY_COLUMN_NAME}"
         ));
     }
     Ok(())
@@ -363,7 +361,7 @@ fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
             i.output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
         }),
         LogicalPlanKind::Filter(_) => output_has_apply_key(plan.unary_input()),
         _ => false,
@@ -374,12 +372,12 @@ fn output_has_join_apply_key(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         LogicalPlanKind::Project(p) => p.items.iter().any(|i| {
             i.output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
         }),
-        LogicalPlanKind::Union(u) => u.output_columns.iter().any(|c| {
-            c.name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
-        }),
+        LogicalPlanKind::Union(u) => u
+            .output_columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)),
         LogicalPlanKind::Filter(_) => output_has_join_apply_key(plan.unary_input()),
         _ => false,
     }
@@ -407,10 +405,10 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
                 && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
                 && !item
                     .output_name
-                    .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
+                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
                 && !item
                     .output_name
-                    .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                    .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
         }),
         LogicalPlanKind::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
         LogicalPlanKind::Join(_) => {
@@ -594,7 +592,7 @@ mod tests {
                             data_type: DataType::Int64,
                             nullable: false,
                         },
-                        output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                        output_name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
                         output_column_id: ColumnId(102),
                     },
                 ],
@@ -897,7 +895,7 @@ mod tests {
                         ImvRowIdColumn::NAME,
                         DataType::Int64,
                         false,
-                        ICEBERG_MV_APPLY_KEY_COLUMN,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
                         ColumnId(102),
                     ),
                 ],

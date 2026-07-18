@@ -17,7 +17,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
+use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -137,7 +137,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 // per-sub-problem here, so the post-branch plan intentionally holds one
                 // root delta per branch (not a single global root).
                 let scope = crate::sql::planner::table::BranchScope {
-                    branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                    branch_id_column_name: BRANCH_ID_COLUMN_NAME.to_string(),
                     branch_id,
                 };
                 let aggregate = LogicalPlanNode::new(
@@ -266,7 +266,7 @@ fn branch_union_aggregate_change_stream_output_columns(
     }
     columns.push(allocate_imv_output_column(
         ctx,
-        ICEBERG_MV_BRANCH_ID_COLUMN,
+        BRANCH_ID_COLUMN_NAME,
         DataType::Int32,
         false,
         true,
@@ -656,7 +656,7 @@ mod tests {
     fn assert_locator_columns_precede_action(output_names: &[&str]) {
         let branch_idx = output_names
             .iter()
-            .position(|name| name.eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN))
+            .position(|name| name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
             .expect("branch-union aggregate output must include branch id");
         let file_idx = output_names
             .iter()
@@ -866,8 +866,7 @@ mod tests {
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
         contract.branch = Some(BranchUnionContract {
             branch_id_column: BranchIdColumnContract {
-                column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
-                    .to_string(),
+                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
                 target_field_id: 998,
             },
             branch_count: 2,
@@ -1011,8 +1010,7 @@ mod tests {
         });
         contract.branch = Some(BranchUnionContract {
             branch_id_column: BranchIdColumnContract {
-                column_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
-                    .to_string(),
+                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
                 target_field_id: 998,
             },
             branch_count: 2,

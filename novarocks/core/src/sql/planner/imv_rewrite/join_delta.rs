@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN;
+use crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
 use crate::mv::persistence::schema::{
     BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
 };
@@ -281,7 +281,7 @@ fn is_join_refresh_union_without_apply_key(plan: &LogicalPlanNode) -> bool {
                 if !union
                     .output_columns
                     .iter()
-                    .any(|column| column.name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN))
+                    .any(|column| column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME))
         )
 }
 
@@ -293,7 +293,7 @@ fn is_join_refresh_union_with_apply_key(plan: &LogicalPlanNode) -> bool {
                 if union
                     .output_columns
                     .iter()
-                    .any(|column| column.name.eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN))
+                    .any(|column| column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME))
         )
 }
 
@@ -306,13 +306,8 @@ fn inject_join_apply_key(
         .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
     let branch_evidence = collect_join_delta_branch_evidence(&plan)?;
     validate_join_descriptor_contract(ext, &branch_evidence)?;
-    let join_apply_key_column = allocate_imv_output_column(
-        ctx,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
-        DataType::Utf8,
-        false,
-        true,
-    )?;
+    let join_apply_key_column =
+        allocate_imv_output_column(ctx, JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false, true)?;
 
     let LogicalPlanKind::Union(union) = &mut plan.kind else {
         return Ok(plan);
@@ -381,11 +376,9 @@ fn propagate_join_refresh_internal_outputs_through_project(
 
 fn join_refresh_internal_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
     let columns = plan_output_columns(plan).unwrap_or_default();
-    let join_apply_key = columns.iter().find(|column| {
-        column
-            .name
-            .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
-    });
+    let join_apply_key = columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME));
     let action = columns
         .iter()
         .find(|column| ImvActionColumn::matches(column));
@@ -406,13 +399,13 @@ fn inject_join_apply_key_into_branch(
     };
     if project.items.iter().any(|item| {
         item.output_name
-            .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+            .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
     }) {
         return Ok(());
     }
     project.items.push(ProjectItem {
         expr: join_row_key_expr(evidence),
-        output_name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+        output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
     Ok(())
@@ -513,7 +506,7 @@ fn collect_join_delta_union_evidence(
         find_unique_internal_column(&union.output_columns, ImvActionColumn::NAME, "action")?;
     let join_apply_key_column = find_unique_internal_column(
         &union.output_columns,
-        ICEBERG_MV_JOIN_APPLY_KEY_COLUMN,
+        JOIN_APPLY_KEY_COLUMN_NAME,
         "join apply-key",
     )?;
     let branches = branch_evidence
@@ -1453,7 +1446,7 @@ fn project_item_output_column(item: &ProjectItem) -> OutputColumn {
             || item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
             || item
                 .output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN),
+                .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME),
     }
 }
 
@@ -1878,7 +1871,7 @@ mod tests {
         };
         assert!(project.items.iter().any(|item| {
             item.output_name
-                .eq_ignore_ascii_case(ICEBERG_MV_JOIN_APPLY_KEY_COLUMN)
+                .eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
                 && item.output_column_id == ColumnId(21)
         }));
     }
@@ -2157,7 +2150,7 @@ mod tests {
         let action = ImvActionColumn::output_column(ColumnId(20));
         let join_apply_key = OutputColumn {
             column_id: ColumnId(21),
-            name: ICEBERG_MV_JOIN_APPLY_KEY_COLUMN.to_string(),
+            name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
             data_type: DataType::Utf8,
             nullable: false,
             is_internal: true,

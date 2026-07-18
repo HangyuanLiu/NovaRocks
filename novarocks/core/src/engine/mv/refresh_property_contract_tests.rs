@@ -486,7 +486,7 @@ mod tests {
 
         assert_eq!(
             contract.apply_key.column_name,
-            crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
+            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(contract.apply_key.value_type, ApplyKeyValueType::Utf8);
         assert!(!contract.apply_key.allow_full_rebuild_on_policy_full_refresh);

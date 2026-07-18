@@ -17,6 +17,8 @@
 
 use arrow::datatypes::DataType;
 
+use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
+use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -33,10 +35,6 @@ use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
 use crate::sql::planner::payload::PlanProjectNode;
-use crate::{
-    engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
-    sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr},
-};
 
 pub(crate) struct RewriteUnionAggregateDeltaRule;
 
@@ -291,7 +289,7 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
                 None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
             };
             let branch_id_column =
-                allocate_imv_column(ctx, ICEBERG_MV_BRANCH_ID_COLUMN, DataType::Int32, false)?;
+                allocate_imv_column(ctx, BRANCH_ID_COLUMN_NAME, DataType::Int32, false)?;
 
             let action_output = ImvActionColumn::output_column(action_column);
             let branch_output = branch_id_output_column(branch_id_column);
@@ -339,7 +337,7 @@ fn branch_id_output_column(
 ) -> crate::sql::analysis::OutputColumn {
     crate::sql::analysis::OutputColumn {
         column_id,
-        name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+        name: BRANCH_ID_COLUMN_NAME.to_string(),
         data_type: arrow::datatypes::DataType::Int32,
         nullable: false,
         is_internal: true,
@@ -644,9 +642,10 @@ mod tests {
             "rewritten union must expose action output"
         );
         assert!(
-            union.output_columns.iter().any(|column| column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)),
+            union
+                .output_columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)),
             "rewritten union must expose branch id output"
         );
     }
