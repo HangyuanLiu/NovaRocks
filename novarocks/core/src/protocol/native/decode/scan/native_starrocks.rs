@@ -23,12 +23,17 @@ use crate::connector::starrocks::scan::{
 };
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 
 fn invalid<T>(detail: String) -> Result<T, NativeFragmentLeafDecodeError> {
-    Err(NativeFragmentLeafDecodeError::invalid(detail))
+    Err(NativeFragmentLeafDecodeError::at_field(
+        ProtocolErrorKind::InvalidValue,
+        "source",
+        detail,
+    ))
 }
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
 
@@ -48,7 +53,13 @@ pub(super) fn decode_starrocks_scan_preparation(
 ) -> Result<DecodedStarRocksScanPreparation, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<DecodedStarRocksScanPreparation, NativeFragmentLeafDecodeError> {
         let native_tablet_schema = validate_source(node_id, source)?;
-        let ranges = decode_ranges(node_id, range_params)?;
+        let ranges = decode_ranges(node_id, range_params).map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "ranges",
+                error,
+            )
+        })?;
         let tablet_refs = ranges
             .iter()
             .map(|range| LakeScanTabletRef {
@@ -170,7 +181,11 @@ fn decode_native_tablet_schema(
 ) -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
         let schema = source.current_schema.as_ref().ok_or_else(|| {
-            format!("StarRocks ScanNode node_id={node_id} current_schema must be present")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "current_schema",
+                format!("StarRocks ScanNode node_id={node_id} current_schema must be present"),
+            )
         })?;
         if schema.schema_id != source.schema_id {
             return invalid(format!(
@@ -333,21 +348,33 @@ fn decode_native_column_schema(
             ));
         }
         let is_key = column.is_key.ok_or_else(|| {
-            format!(
-                "StarRocks ScanNode node_id={node_id} current schema column {} missing is_key",
-                name.as_deref().unwrap_or("<unnamed>")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "is_key",
+                format!(
+                    "StarRocks ScanNode node_id={node_id} current schema column {} missing is_key",
+                    name.as_deref().unwrap_or("<unnamed>")
+                ),
             )
         })?;
         let nullable = column.nullable.ok_or_else(|| {
-            format!(
-                "StarRocks ScanNode node_id={node_id} current schema column {} missing nullable",
-                name.as_deref().unwrap_or("<unnamed>")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "nullable",
+                format!(
+                    "StarRocks ScanNode node_id={node_id} current schema column {} missing nullable",
+                    name.as_deref().unwrap_or("<unnamed>")
+                ),
             )
         })?;
         let visible = column.visible.ok_or_else(|| {
-            format!(
-                "StarRocks ScanNode node_id={node_id} current schema column {} missing visible",
-                name.as_deref().unwrap_or("<unnamed>")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "visible",
+                format!(
+                    "StarRocks ScanNode node_id={node_id} current schema column {} missing visible",
+                    name.as_deref().unwrap_or("<unnamed>")
+                ),
             )
         })?;
         let aggregation = column
@@ -398,9 +425,13 @@ fn decode_native_column_schema(
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| {
-                    format!(
-                        "StarRocks ScanNode node_id={node_id} STRUCT column {} child name must not be empty",
-                        name.as_deref().unwrap_or("<unnamed>")
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::MissingField,
+                        "name",
+                        format!(
+                            "StarRocks ScanNode node_id={node_id} STRUCT column {} child name must not be empty",
+                            name.as_deref().unwrap_or("<unnamed>")
+                        ),
                     )
                 })?;
                 if !child_names.insert(child_name.to_ascii_lowercase()) {

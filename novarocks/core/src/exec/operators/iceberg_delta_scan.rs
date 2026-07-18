@@ -34,7 +34,8 @@ use arrow::record_batch::RecordBatch;
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
 use crate::exec::node::iceberg_delta_scan::{
-    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, IcebergDeltaScanNode,
+    DeltaScanDeleteSide, DeltaScanDeleteSidePayload, DeltaSourceFile, DeltaSourceRole,
+    EqualityDeleteTargetData, IcebergDeltaScanNode, IcebergResolvedRuntime,
     PositionDeleteSourceData,
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -449,19 +450,87 @@ fn open_scanner_for_role(
     node: &IcebergDeltaScanNode,
     file: DeltaSourceFile,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
+    let runtime = resolve_iceberg_runtime(node)?;
     match &file.role {
-        DeltaSourceRole::DataFile => open_data_file_scanner(node, &file),
+        DeltaSourceRole::DataFile => open_data_file_scanner(node, runtime.as_ref(), &file),
         DeltaSourceRole::PositionDelete { deletes } => {
-            open_position_delete_scanner(node, &file, deletes)
+            open_position_delete_scanner(node, runtime.as_ref(), &file, deletes)
         }
         DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets,
-        } => open_equality_delete_scanner(node, &file, equality_field_ids, targets),
+        } => {
+            open_equality_delete_scanner(node, runtime.as_ref(), &file, equality_field_ids, targets)
+        }
         DeltaSourceRole::DeletedDataFile {
             previous_data_file_visibility,
-        } => open_deleted_data_file_scanner(node, &file, previous_data_file_visibility),
+        } => open_deleted_data_file_scanner(
+            node,
+            runtime.as_ref(),
+            &file,
+            previous_data_file_visibility,
+        ),
     }
+}
+
+fn resolve_iceberg_runtime(
+    node: &IcebergDeltaScanNode,
+) -> Result<Arc<IcebergResolvedRuntime>, String> {
+    node.iceberg_runtime
+        .resolved
+        .get_or_init(|| build_iceberg_runtime(node))
+        .clone()
+}
+
+fn build_iceberg_runtime(
+    node: &IcebergDeltaScanNode,
+) -> Result<Arc<IcebergResolvedRuntime>, String> {
+    let object_store_factory = Arc::new(
+        crate::connector::iceberg::changes::build_factory_for_table_location(
+            &node.table_location,
+            node.object_store_config.as_ref(),
+        )?,
+    );
+    let delete_side = build_delta_delete_side_from_payload(
+        node.iceberg_runtime.delete_side_payload.clone(),
+        node.object_store_config.as_ref(),
+    )?;
+    Ok(Arc::new(IcebergResolvedRuntime {
+        object_store_factory,
+        delete_side,
+    }))
+}
+
+fn build_delta_delete_side_from_payload(
+    payload: Option<DeltaScanDeleteSidePayload>,
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+) -> Result<Option<DeltaScanDeleteSide>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let previously_deleted_positions_per_file = payload
+        .previously_deleted_positions_per_file
+        .into_iter()
+        .map(|(path, positions)| {
+            let mut bitmap = roaring::RoaringTreemap::new();
+            for position in positions {
+                bitmap.insert(position);
+            }
+            (path, bitmap)
+        })
+        .collect();
+    let previous_delete_visibility =
+        crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors(
+            &payload.previous_delete_visibility_data_files,
+            object_store_config,
+        )?;
+    Ok(Some(DeltaScanDeleteSide {
+        base_data_file_lineage: payload.base_data_file_lineage,
+        previous_delete_visibility,
+        previously_deleted_positions_per_file,
+        previous_data_file_lineage: payload.previous_data_file_lineage,
+        deleted_data_file_paths: payload.deleted_data_file_paths,
+    }))
 }
 
 fn expected_object_store_bucket(node: &IcebergDeltaScanNode) -> Result<Option<String>, String> {
@@ -551,13 +620,14 @@ impl DeltaFileScanner for DataFileScanner {
 
 fn open_data_file_scanner(
     node: &IcebergDeltaScanNode,
+    runtime: &IcebergResolvedRuntime,
     file: &DeltaSourceFile,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     let expected_bucket = expected_object_store_bucket(node)?;
     let batches = crate::connector::iceberg::changes::scan_one_added_data_file_with_factory(
         &file.path,
         file.size,
-        node.iceberg_runtime.object_store_factory.as_ref(),
+        runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
         expected_bucket.as_deref(),
     )?;
@@ -697,6 +767,7 @@ impl DeltaFileScanner for PositionDeleteScanner {
 
 fn open_position_delete_scanner(
     node: &IcebergDeltaScanNode,
+    runtime: &IcebergResolvedRuntime,
     file: &DeltaSourceFile,
     deletes: &[PositionDeleteSourceData],
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
@@ -723,7 +794,7 @@ fn open_position_delete_scanner(
             }
         })
         .collect::<Vec<_>>();
-    let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
+    let delete_side = runtime.delete_side.as_ref().ok_or_else(|| {
         format!(
             "ivm-a1 position-delete scanner: runtime.delete_side missing for {} (lower_plan \
              should have preloaded it when the change batch has DELETE-side roles)",
@@ -737,7 +808,7 @@ fn open_position_delete_scanner(
         &lineage,
         &delete_side.deleted_data_file_paths,
         &delete_side.previously_deleted_positions_per_file,
-        node.iceberg_runtime.object_store_factory.as_ref(),
+        runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
         expected_bucket.as_deref(),
     )?;
@@ -772,6 +843,7 @@ impl DeltaFileScanner for EqualityDeleteScanner {
 
 fn open_equality_delete_scanner(
     node: &IcebergDeltaScanNode,
+    runtime: &IcebergResolvedRuntime,
     file: &DeltaSourceFile,
     equality_field_ids: &[i32],
     targets: &[EqualityDeleteTargetData],
@@ -791,7 +863,7 @@ fn open_equality_delete_scanner(
         crate::connector::iceberg::changes::scan_equality_delete_rows_for_targets_with_v3_lineage(
             &delete,
             targets,
-            node.iceberg_runtime.object_store_factory.as_ref(),
+            runtime.object_store_factory.as_ref(),
             node.object_store_config.as_ref(),
             expected_bucket.as_deref(),
         )?;
@@ -816,13 +888,14 @@ impl DeltaFileScanner for DeletedDataFileScanner {
 
 fn open_deleted_data_file_scanner(
     node: &IcebergDeltaScanNode,
+    runtime: &IcebergResolvedRuntime,
     file: &DeltaSourceFile,
     _visibility: &Option<crate::exec::node::iceberg_delta_scan::DeletedFileVisibility>,
 ) -> Result<Box<dyn DeltaFileScanner>, String> {
     // Use the preloaded full-table visibility from runtime.delete_side; the
     // operator no longer rebuilds per-file visibility from
     // `DeletedFileVisibility::already_deleted_positions`.
-    let delete_side = node.iceberg_runtime.delete_side.as_ref().ok_or_else(|| {
+    let delete_side = runtime.delete_side.as_ref().ok_or_else(|| {
         format!(
             "ivm-a1 deleted-data-file scanner: runtime.delete_side missing for {} (lower_plan \
              should have preloaded it when the change batch has DELETE-side roles)",
@@ -879,7 +952,7 @@ fn open_deleted_data_file_scanner(
     };
     let rows = crate::connector::iceberg::changes::scan_one_deleted_data_file_with_factory(
         &deleted_file,
-        node.iceberg_runtime.object_store_factory.as_ref(),
+        runtime.object_store_factory.as_ref(),
         node.object_store_config.as_ref(),
         expected_object_store_bucket(node)?.as_deref(),
         &delete_side.previous_delete_visibility,
@@ -947,6 +1020,87 @@ mod tests {
     fn iceberg_delta_scan_factory_compiles_as_operator_factory() {
         fn assert_is_factory<T: OperatorFactory + ?Sized>() {}
         assert_is_factory::<IcebergDeltaScanFactory>();
+    }
+
+    #[test]
+    fn runtime_open_resolves_deferred_iceberg_handles_once() {
+        use crate::exec::node::iceberg_delta_scan::{
+            ApplyKeySource, BaseTableIdent, IcebergDeltaTablePayload, IcebergRuntimeHandles,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table_location = format!("file://{}", dir.path().display());
+        let data_path = format!("{table_location}/missing-data.parquet");
+        let delete_path = format!("{table_location}/missing-delete.parquet");
+        let delete_side_payload = DeltaScanDeleteSidePayload {
+            base_data_file_lineage: Default::default(),
+            previous_data_file_lineage: Default::default(),
+            previous_delete_visibility_data_files: vec![
+                crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor {
+                    path: data_path.clone(),
+                    size: 1,
+                    first_row_id: Some(0),
+                    data_sequence_number: Some(1),
+                    delete_files: vec![crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor {
+                        path: delete_path,
+                        file_format: crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet,
+                        file_content: crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position,
+                        length: Some(1),
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                    }],
+                },
+            ],
+            previously_deleted_positions_per_file: Default::default(),
+            deleted_data_file_paths: Default::default(),
+        };
+        let runtime = Arc::new(IcebergRuntimeHandles::new(
+            IcebergDeltaTablePayload {
+                table_location: table_location.clone(),
+                data_columns: Vec::new(),
+            },
+            Some(delete_side_payload),
+        ));
+        let node = IcebergDeltaScanNode {
+            base_table_ident: BaseTableIdent {
+                catalog: "test".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+            },
+            table_location,
+            from_snapshot_id: 1,
+            to_snapshot_id: 2,
+            output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+            apply_key_source: ApplyKeySource::BaseRowId,
+            change_files: Vec::new(),
+            object_store_config: None,
+            iceberg_runtime: Arc::clone(&runtime),
+            node_id: 7,
+            native_runtime_filter_specs: Vec::new(),
+        };
+        let file = DeltaSourceFile {
+            path: data_path,
+            size: 1,
+            role: DeltaSourceRole::DataFile,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: Some(0),
+            data_sequence_number: Some(1),
+            row_id_allow_list: None,
+        };
+
+        assert!(runtime.resolved.get().is_none());
+        let first = open_scanner_for_role(&node, file.clone())
+            .err()
+            .expect("runtime open must surface unreadable delete descriptor");
+        assert!(runtime.resolved.get().is_some());
+        let second = open_scanner_for_role(&node, file)
+            .err()
+            .expect("cached runtime resolution must remain failed");
+        assert_eq!(
+            first, second,
+            "the shared lazy cell must cache one resolution"
+        );
     }
 
     #[test]

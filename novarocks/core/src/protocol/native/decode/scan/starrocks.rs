@@ -33,6 +33,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, plan};
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_starrocks_scan(
@@ -55,9 +56,13 @@ pub(super) fn lower_starrocks_scan(
         let output_schema = starrocks_chunk_schema(&output_columns, source)?;
         let limit = parse_scan_limit(node.limit)?;
         let batch_size = i32::try_from(scan_batch_size(ctx.query_options())?).map_err(|_| {
-            format!(
-                "StarRocks ScanNode node_id={} batch_size exceeds i32",
-                node.node_id
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::OutOfRange,
+                "batch_size",
+                format!(
+                    "StarRocks ScanNode node_id={} batch_size exceeds i32",
+                    node.node_id
+                ),
             )
         })?;
         let query_timeout = positive_query_option(
@@ -99,7 +104,14 @@ pub(super) fn lower_starrocks_scan(
         };
         let scan_node = ctx
             .connectors()?
-            .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
+            .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "source",
+                    error,
+                )
+            })?
             .with_node_id(node.node_id)
             .with_output_chunk_schema(Arc::clone(&output_schema))
             .with_limit(limit)
@@ -122,17 +134,21 @@ pub(super) fn lower_starrocks_scan(
 
 fn positive_query_option<T>(
     node_id: i32,
-    field: &str,
+    field: &'static str,
     value: Option<T>,
-) -> Result<Option<T>, String>
+) -> Result<Option<T>, NativeFragmentLeafDecodeError>
 where
     T: Copy + PartialOrd + From<i32> + std::fmt::Display,
 {
     if let Some(value) = value
         && value <= T::from(0)
     {
-        return Err(format!(
-            "StarRocks ScanNode node_id={node_id} query option {field} must be positive, got {value}"
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            field,
+            format!(
+                "StarRocks ScanNode node_id={node_id} query option {field} must be positive, got {value}"
+            ),
         ));
     }
     Ok(value)
@@ -154,10 +170,14 @@ fn starrocks_chunk_schema(
                 let storage = storage_by_name
                     .get(&column.name.to_ascii_lowercase())
                     .ok_or_else(|| {
-                        NativeFragmentLeafDecodeError::invalid(format!(
-                            "StarRocks native scan output column {} is missing storage metadata",
-                            column.name
-                        ))
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::MissingField,
+                            "storage_columns",
+                            format!(
+                                "StarRocks native scan output column {} is missing storage metadata",
+                                column.name
+                            ),
+                        )
                     })?;
                 ChunkSlotSchema::try_new_with_field(
                     SlotId::new(column.column_id),
@@ -169,12 +189,22 @@ fn starrocks_chunk_schema(
                     None,
                     Some(storage.unique_id),
                 )
-                .map_err(NativeFragmentLeafDecodeError::invalid)
+                .map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "output_columns",
+                        error,
+                    )
+                })
             })
             .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
-        ChunkSchema::try_new(slots)
-            .map(Arc::new)
-            .map_err(NativeFragmentLeafDecodeError::invalid)
+        ChunkSchema::try_new(slots).map(Arc::new).map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "output_columns",
+                error,
+            )
+        })
     })();
     decoded
 }

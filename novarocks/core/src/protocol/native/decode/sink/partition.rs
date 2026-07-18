@@ -23,6 +23,7 @@ use iceberg::spec::TableMetadata;
 use crate::exec::expr::function::lookup_function;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 type PartitionMetadataInfo = (Vec<String>, Vec<String>, Vec<String>);
@@ -37,9 +38,9 @@ pub(crate) fn partition_info_from_metadata(
     let spec = metadata
         .partition_spec_by_id(target_partition_spec_id)
         .ok_or_else(|| {
-            format!(
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "target_partition_spec_id", format!(
                 "native Iceberg write sink target partition spec id {target_partition_spec_id} not found"
-            )
+            ))
         })?;
     let schema = metadata.current_schema();
     let mut source_names = Vec::with_capacity(spec.fields().len());
@@ -47,10 +48,15 @@ pub(crate) fn partition_info_from_metadata(
     let mut transforms = Vec::with_capacity(spec.fields().len());
     for field in spec.fields() {
         let source = schema.field_by_id(field.source_id).ok_or_else(|| {
-            format!(
-                "native Iceberg write sink partition source field id {} not found",
-                field.source_id
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "iceberg",
+                format!(
+                    "native Iceberg write sink partition source field id {} not found",
+                    field.source_id
+                ),
             )
+            .append_field("serialized_metadata")
         })?;
         source_names.push(source.name.clone());
         partition_names.push(field.name.clone());
@@ -67,20 +73,28 @@ pub(crate) fn build_partition_exprs_from_output_exprs(
     arena: &mut ExprArena,
 ) -> Result<Vec<ExprId>, NativeFragmentLeafDecodeError> {
     if partition_source_column_names.len() != transform_exprs.len() {
-        return Err(format!(
-            "native Iceberg write sink partition metadata mismatch: sources={} transforms={}",
-            partition_source_column_names.len(),
-            transform_exprs.len()
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "iceberg",
+            format!(
+                "native Iceberg write sink partition metadata mismatch: sources={} transforms={}",
+                partition_source_column_names.len(),
+                transform_exprs.len()
+            ),
         )
-        .into());
+        .append_field("serialized_metadata"));
     }
     if target_columns.len() != output_exprs.len() {
-        return Err(format!(
-            "native Iceberg write sink partition expr source mismatch: columns={} output_exprs={}",
-            target_columns.len(),
-            output_exprs.len()
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "target_table",
+            format!(
+                "native Iceberg write sink partition expr source mismatch: columns={} output_exprs={}",
+                target_columns.len(),
+                output_exprs.len()
+            ),
         )
-        .into());
+        .append_field("columns"));
     }
 
     let mut expr_by_column_name = HashMap::with_capacity(target_columns.len());
@@ -97,13 +111,13 @@ pub(crate) fn build_partition_exprs_from_output_exprs(
                 .get(&source_name.to_ascii_lowercase())
                 .copied()
                 .ok_or_else(|| {
-                    format!(
+                    NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "target_table", format!(
                         "native Iceberg write sink partition source column {} is not in target output columns",
                         source_name
-                    )
+                    )).append_field("columns")
                 })?;
             build_partition_expr_from_transform(transform, source_expr, arena)
-                .map_err(|err| NativeFragmentLeafDecodeError::new(format!("native Iceberg write sink partition expr[{idx}]: {err}")))
+                .map_err(|err| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "iceberg", format!("native Iceberg write sink partition expr[{idx}]: {err}")).append_field("serialized_metadata"))
         })
         .collect()
 }
@@ -220,9 +234,9 @@ pub(crate) fn partition_source_field_ids_from_metadata(
                 .field_by_name_case_insensitive(source_name)
                 .map(|field| field.id)
                 .ok_or_else(|| {
-                    NativeFragmentLeafDecodeError::new(format!(
+                    NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "iceberg", format!(
                         "native Iceberg sink partition source column {source_name} missing from target metadata schema"
-                    ))
+                    )).append_field("serialized_metadata")
                 })
         })
         .collect()

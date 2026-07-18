@@ -24,13 +24,18 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::fs::object_store::{ObjectStoreConfig, apply_object_store_runtime_defaults};
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::{common, plan};
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn scan_output_columns(
     scan: &plan::ScanNode,
 ) -> Result<Vec<common::OutputColumn>, NativeFragmentLeafDecodeError> {
     if scan.columns.is_empty() {
-        return Err("ScanNode columns are empty".into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "columns",
+            "ScanNode columns are empty",
+        ));
     }
     if scan.required_columns.is_empty() {
         return Ok(scan.columns.clone());
@@ -48,10 +53,14 @@ pub(super) fn scan_output_columns(
         .cloned()
         .collect::<Vec<_>>();
     if output_columns.is_empty() {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode required_columns {:?} do not match any scan columns",
-            scan.required_columns
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "required_columns",
+            format!(
+                "ScanNode required_columns {:?} do not match any scan columns",
+                scan.required_columns
+            ),
+        ));
     }
     Ok(output_columns)
 }
@@ -63,18 +72,31 @@ pub(super) fn column_def_data_type(
         .logical_type
         .as_ref()
         .or(column.data_type.as_ref())
-        .ok_or_else(|| format!("column {} type missing", column.name))?;
-    Ok(super::super::decode_type(desc)?)
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "data_type",
+                format!("column {} type missing", column.name),
+            )
+        })?;
+    super::super::decode_type(desc).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "data_type", error)
+    })
 }
 
 pub(super) fn output_column_data_type(
     column: &common::OutputColumn,
 ) -> Result<DataType, NativeFragmentLeafDecodeError> {
-    let desc = column
-        .r#type
-        .as_ref()
-        .ok_or_else(|| format!("output column {} type missing", column.name))?;
-    Ok(super::super::decode_type(desc)?)
+    let desc = column.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "type",
+            format!("output column {} type missing", column.name),
+        )
+    })?;
+    super::super::decode_type(desc).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "type", error)
+    })
 }
 
 pub(super) fn scan_batch_size(
@@ -84,10 +106,18 @@ pub(super) fn scan_batch_size(
         return Ok(4096);
     };
     let batch_size = usize::try_from(value).map_err(|_| {
-        format!("native ScanNode query_options.batch_size must be positive, got {value}")
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "batch_size",
+            format!("native ScanNode query_options.batch_size must be positive, got {value}"),
+        )
     })?;
     if batch_size == 0 {
-        return Err("native ScanNode query_options.batch_size must be positive".into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "batch_size",
+            "native ScanNode query_options.batch_size must be positive",
+        ));
     }
     Ok(batch_size)
 }
@@ -100,7 +130,12 @@ pub(super) fn lower_scan_predicate(
     let mut predicate = None;
     for (idx, expr) in scan.predicates.iter().enumerate() {
         let expr_id = decode_expr(expr, arena, layout).map_err(|err| {
-            NativeFragmentLeafDecodeError::new(format!("ScanNode predicate {idx}: {err}"))
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "predicates",
+                format!("ScanNode predicate {idx}: {err}"),
+            )
+            .append_index(idx)
         })?;
         predicate = Some(match predicate {
             Some(prev) => arena.push_typed(ExprNode::And(prev, expr_id), DataType::Boolean),
@@ -114,7 +149,11 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
     if limit == -1 {
         Ok(None)
     } else if limit < 0 {
-        Err(format!("ScanNode limit must be -1 or >= 0, got {limit}").into())
+        Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "limit",
+            format!("ScanNode limit must be -1 or >= 0, got {limit}"),
+        ))
     } else {
         Ok(Some(limit as usize))
     }
@@ -130,7 +169,14 @@ pub(super) fn resolve_cloud_object_store_config(
     let Some(credentials) = ObjectStoreCredentials::optional_from_aws_s3_properties(
         ObjectStoreCredentialsSource::AwsS3Properties,
         &props,
-    )?
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "cloud_properties",
+            error,
+        )
+    })?
     else {
         return Ok(None);
     };

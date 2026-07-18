@@ -28,6 +28,7 @@ use crate::connector::iceberg::{
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::proto::{common, plan};
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn iceberg_chunk_schema_from_output_columns(
@@ -55,10 +56,15 @@ pub(super) fn iceberg_chunk_schema_from_output_columns_with_variants(
         output_columns,
         variant_path_plan,
     )?;
-    Ok(ChunkSchema::try_ref_from_schema_and_slot_ids(
-        arrow_schema.as_ref(),
-        &slot_ids,
-    )?)
+    ChunkSchema::try_ref_from_schema_and_slot_ids(arrow_schema.as_ref(), &slot_ids).map_err(
+        |error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "output_columns",
+                error,
+            )
+        },
+    )
 }
 
 pub(super) fn iceberg_arrow_schema_from_output_columns(
@@ -93,19 +99,41 @@ fn iceberg_arrow_schema_from_output_columns_with_variants(
             fields.push(field);
             continue;
         }
-        let desc = col
-            .r#type
-            .as_ref()
-            .ok_or_else(|| format!("ScanNode output column {} type missing", col.name))?;
+        let desc = col.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "output_columns",
+                format!("output column {} type missing", col.name),
+            )
+        })?;
         let projected = build_projected_output_schema(
             &descriptor,
             &[IcebergArrowColumn {
                 name: col.name.clone(),
-                data_type: super::super::decode_type(desc)?,
+                data_type: super::super::decode_type(desc).map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "output_columns",
+                        error,
+                    )
+                })?,
                 nullable: col.nullable,
             }],
-        )?
-        .ok_or_else(|| "IcebergDataFiles table schema missing".to_string())?;
+        )
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "output_columns",
+                error,
+            )
+        })?
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "table",
+                "IcebergDataFiles table schema missing",
+            )
+        })?;
         fields.push(projected.field(0).clone());
     }
     Ok(std::sync::Arc::new(Schema::new(fields)))
@@ -114,10 +142,13 @@ fn iceberg_arrow_schema_from_output_columns_with_variants(
 fn iceberg_table_descriptor(
     table: &plan::IcebergTableInfo,
 ) -> Result<IcebergTableDescriptor, NativeFragmentLeafDecodeError> {
-    let schema = table
-        .schema
-        .as_ref()
-        .ok_or_else(|| "IcebergDataFiles table schema missing".to_string())?;
+    let schema = table.schema.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "IcebergDataFiles table schema missing",
+        )
+    })?;
     Ok(IcebergTableDescriptor {
         columns: Vec::new(),
         iceberg_schema: Some(IcebergSchemaDescriptor {

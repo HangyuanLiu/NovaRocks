@@ -18,17 +18,17 @@
 use std::collections::HashMap;
 
 use crate::exec::node::iceberg_delta_scan::{
-    BaseDataFileLineage, DeltaScanDeleteSide, DeltaScanDeleteSidePayload, EqualityDeleteTargetData,
+    BaseDataFileLineage, DeltaScanDeleteSidePayload, EqualityDeleteTargetData,
     PositionDeleteFileFormat, PositionDeleteSourceData,
 };
-use crate::fs::object_store::ObjectStoreConfig;
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn reject_native_delta_role_payload(
     file: &plan::IcebergDeltaSourceFile,
     role_name: &str,
-    fields: &[&str],
+    fields: &[&'static str],
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     for field in fields {
         let present = match *field {
@@ -39,11 +39,14 @@ pub(super) fn reject_native_delta_role_payload(
             _ => false,
         };
         if present {
-            return Err(format!(
-                "IcebergDeltaTable source file {} role {} must not carry {}",
-                file.path, role_name, field
-            )
-            .into());
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                field,
+                format!(
+                    "IcebergDeltaTable source file {} role {} must not carry {}",
+                    file.path, role_name, field
+                ),
+            ));
         }
     }
     Ok(())
@@ -64,12 +67,20 @@ pub(super) fn lower_position_delete_source_from_native(
 
 fn lower_position_delete_format_from_native(
     format: i32,
-) -> Result<PositionDeleteFileFormat, String> {
+) -> Result<PositionDeleteFileFormat, NativeFragmentLeafDecodeError> {
     match plan::IcebergDeltaPositionDeleteFileFormat::try_from(format).map_err(|_| {
-        format!("IcebergDeltaTable unsupported position-delete file format {format}")
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "file_format",
+            format!("IcebergDeltaTable unsupported position-delete file format {format}"),
+        )
     })? {
         plan::IcebergDeltaPositionDeleteFileFormat::Unspecified => {
-            Err("IcebergDeltaTable position-delete file format is unspecified".to_string())
+            Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidEnum,
+                "file_format",
+                "IcebergDeltaTable position-delete file format is unspecified",
+            ))
         }
         plan::IcebergDeltaPositionDeleteFileFormat::Parquet => {
             Ok(PositionDeleteFileFormat::Parquet)
@@ -103,7 +114,14 @@ pub(super) fn lower_delta_delete_side_payload_from_native(
         previous_delete_visibility_data_files: payload
             .previous_delete_visibility_data_files
             .iter()
-            .map(lower_novarocks_delete_visibility_data_file)
+            .enumerate()
+            .map(|(index, file)| {
+                lower_novarocks_delete_visibility_data_file(file).map_err(|error| {
+                    error
+                        .prepend_index(index)
+                        .prepend_field("previous_delete_visibility_data_files")
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?,
         previously_deleted_positions_per_file: payload
             .previously_deleted_positions_per_file
@@ -146,7 +164,11 @@ fn lower_novarocks_delete_visibility_data_file(
             delete_files: file
                 .delete_files
                 .iter()
-                .map(lower_novarocks_delete_visibility_delete_file)
+                .enumerate()
+                .map(|(index, delete)| {
+                    lower_novarocks_delete_visibility_delete_file(delete)
+                        .map_err(|error| error.prepend_index(index).prepend_field("delete_files"))
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         },
     )
@@ -172,12 +194,23 @@ fn lower_novarocks_delete_visibility_delete_file(
 
 fn lower_novarocks_delete_file_format(
     format: i32,
-) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat, String> {
-    match plan::IcebergDeltaDeleteFileFormat::try_from(format)
-        .map_err(|_| format!("IcebergDeltaTable unsupported delete file format {format}"))?
-    {
+) -> Result<
+    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat,
+    NativeFragmentLeafDecodeError,
+> {
+    match plan::IcebergDeltaDeleteFileFormat::try_from(format).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "file_format",
+            format!("IcebergDeltaTable unsupported delete file format {format}"),
+        )
+    })? {
         plan::IcebergDeltaDeleteFileFormat::Unspecified => {
-            Err("IcebergDeltaTable delete file format is unspecified".to_string())
+            Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidEnum,
+                "file_format",
+                "IcebergDeltaTable delete file format is unspecified",
+            ))
         }
         plan::IcebergDeltaDeleteFileFormat::Parquet => {
             Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet)
@@ -190,12 +223,23 @@ fn lower_novarocks_delete_file_format(
 
 fn lower_novarocks_delete_file_content(
     content: i32,
-) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent, String> {
-    match plan::IcebergDeltaDeleteFileContent::try_from(content)
-        .map_err(|_| format!("IcebergDeltaTable unsupported delete file content {content}"))?
-    {
+) -> Result<
+    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent,
+    NativeFragmentLeafDecodeError,
+> {
+    match plan::IcebergDeltaDeleteFileContent::try_from(content).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "file_content",
+            format!("IcebergDeltaTable unsupported delete file content {content}"),
+        )
+    })? {
         plan::IcebergDeltaDeleteFileContent::Unspecified => {
-            Err("IcebergDeltaTable delete file content is unspecified".to_string())
+            Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidEnum,
+                "file_content",
+                "IcebergDeltaTable delete file content is unspecified",
+            ))
         }
         plan::IcebergDeltaDeleteFileContent::Position => {
             Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position)
@@ -204,33 +248,4 @@ fn lower_novarocks_delete_file_content(
             Ok(crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality)
         }
     }
-}
-
-pub(super) fn build_delta_delete_side_from_payload(
-    payload: Option<DeltaScanDeleteSidePayload>,
-    object_store_config: Option<&ObjectStoreConfig>,
-) -> Result<Option<DeltaScanDeleteSide>, NativeFragmentLeafDecodeError> {
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let mut previously_deleted_positions_per_file = HashMap::new();
-    for (path, positions) in payload.previously_deleted_positions_per_file {
-        let mut bitmap = roaring::RoaringTreemap::new();
-        for pos in positions {
-            bitmap.insert(pos);
-        }
-        previously_deleted_positions_per_file.insert(path, bitmap);
-    }
-    let previous_delete_visibility =
-        crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors(
-            &payload.previous_delete_visibility_data_files,
-            object_store_config,
-        )?;
-    Ok(Some(DeltaScanDeleteSide {
-        base_data_file_lineage: payload.base_data_file_lineage,
-        previous_delete_visibility,
-        previously_deleted_positions_per_file,
-        previous_data_file_lineage: payload.previous_data_file_lineage,
-        deleted_data_file_paths: payload.deleted_data_file_paths,
-    }))
 }

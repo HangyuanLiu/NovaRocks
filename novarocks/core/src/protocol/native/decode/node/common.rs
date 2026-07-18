@@ -30,7 +30,7 @@ use crate::exec::node::join::JoinType;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(
@@ -113,9 +113,13 @@ pub(crate) fn proto_join_type(
     value: i32,
     node_kind: &str,
 ) -> Result<JoinType, NativeFragmentLeafDecodeError> {
-    match plan::JoinKind::try_from(value)
-        .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
-    {
+    match plan::JoinKind::try_from(value).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "join_type",
+            format!("{node_kind} unknown join_type {value}"),
+        )
+    })? {
         plan::JoinKind::Inner => Ok(JoinType::Inner),
         plan::JoinKind::LeftOuter => Ok(JoinType::LeftOuter),
         plan::JoinKind::RightOuter => Ok(JoinType::RightOuter),
@@ -125,10 +129,16 @@ pub(crate) fn proto_join_type(
         plan::JoinKind::LeftAnti => Ok(JoinType::LeftAnti),
         plan::JoinKind::RightAnti => Ok(JoinType::RightAnti),
         plan::JoinKind::NullAwareLeftAnti => Ok(JoinType::NullAwareLeftAnti),
-        plan::JoinKind::Cross => {
-            Err(format!("{node_kind} CROSS join requires NestLoopJoinNode").into())
-        }
-        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified").into()),
+        plan::JoinKind::Cross => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "join_type",
+            format!("{node_kind} CROSS join requires NestLoopJoinNode"),
+        )),
+        plan::JoinKind::Unspecified => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "join_type",
+            format!("{node_kind} join_type is unspecified"),
+        )),
     }
 }
 

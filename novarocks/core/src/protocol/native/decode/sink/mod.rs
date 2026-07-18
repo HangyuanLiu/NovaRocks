@@ -261,10 +261,14 @@ fn decode_data_stream_branch(
                 .enumerate()
                 .map(|(index, expression)| {
                     decode_expr(expression, partition_arena, layout).map_err(|error| {
-                        NativeFragmentLeafDecodeError::invalid(error)
-                            .prepend_index(index)
-                            .prepend_field("exprs")
-                            .prepend_field("output_partition")
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "expr",
+                            error,
+                        )
+                        .prepend_index(index)
+                        .prepend_field("exprs")
+                        .prepend_field("output_partition")
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -287,7 +291,13 @@ fn decode_data_stream_branch(
             output_columns,
             stream.limit,
         )
-        .map_err(NativeFragmentLeafDecodeError::invalid)
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "output_partition",
+                error,
+            )
+        })
     })();
     decoded
 }
@@ -320,22 +330,39 @@ fn decode_change_stream_router_program(
             let change_op_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
                 output_columns,
                 router.change_op_output_ordinal,
-                "change_op",
-            )?)?;
+                "change_op_output_ordinal",
+            )?)
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "change_op_output_ordinal",
+                    error,
+                )
+            })?;
             let data_route_slot_id = router
                 .data_route_output_ordinal
-                .map(|ordinal| output_slot_id_for_ordinal(output_columns, ordinal, "data_route"))
+                .map(|ordinal| {
+                    output_slot_id_for_ordinal(output_columns, ordinal, "data_route_output_ordinal")
+                })
                 .transpose()?
                 .map(SlotId::try_from)
-                .transpose()?;
+                .transpose()
+                .map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "data_route_output_ordinal",
+                        error,
+                    )
+                })?;
             let mut partition_arena = ExprArena::default();
             let branches = router
         .branches
         .iter()
         .enumerate()
         .map(|(index, branch)| {
-            let partition = branch_partition_from_native(branch, output_exprs)?;
-            let partition_type = decode_stream_partition_type(partition.kind)?;
+            let branch_path = |error: NativeFragmentLeafDecodeError| error.prepend_index(index).prepend_field("branches");
+            let partition = branch_partition_from_native(branch, output_exprs).map_err(branch_path)?;
+            let partition_type = decode_stream_partition_type(partition.kind).map_err(|error| branch_path(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "kind", error).prepend_field("output_partition")))?;
             let output_partition_exprs = if partition_type.requires_exprs() {
                 partition
                     .exprs
@@ -343,9 +370,9 @@ fn decode_change_stream_router_program(
                     .enumerate()
                     .map(|(expr_index, expression)| {
                         decode_expr(expression, &mut partition_arena, layout).map_err(|error| {
-                            format!(
+                            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "exprs", format!(
                                 "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] partition expr[{expr_index}]: {error}"
-                            )
+                            )).append_index(expr_index).prepend_field("output_partition").prepend_index(index).prepend_field("branches")
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -355,11 +382,11 @@ fn decode_change_stream_router_program(
             let branch_output_columns = decode_router_output_slots(
                 &branch.output_ordinals,
                 output_columns,
-                &format!("branch[{index}] output"),
-            )?;
+                "output_ordinals",
+            ).map_err(branch_path)?;
             Ok(IcebergChangeStreamRouterBranchProgram::new(
                 branch.branch_id,
-                decode_change_stream_branch_kind(branch.branch_kind)?,
+                decode_change_stream_branch_kind(branch.branch_kind).map_err(|error| branch_path(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "branch_kind", error)))?,
                 DataStreamSinkBranchProgram::try_new(
                     branch.target_exchange_node_id,
                     Vec::new(),
@@ -368,7 +395,7 @@ fn decode_change_stream_router_program(
                     branch_output_columns,
                     None,
                 )
-                .map_err(NativeFragmentLeafDecodeError::invalid)?,
+                .map_err(|error| branch_path(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "output_partition", error)))?,
             ))
         })
         .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
@@ -378,7 +405,13 @@ fn decode_change_stream_router_program(
                 branches,
                 partition_arena,
             )
-            .map_err(NativeFragmentLeafDecodeError::invalid)
+            .map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "branches",
+                    error,
+                )
+            })
         })();
     decoded
 }
@@ -387,78 +420,83 @@ fn branch_partition_from_native(
     branch: &plan::IcebergChangeStreamBranchRoute,
     output_exprs: &[expr::Expr],
 ) -> Result<plan::DataPartition, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<plan::DataPartition, String> {
-        if let Some(partition) = branch.output_partition.as_ref() {
-            return Ok(partition.clone());
-        }
-        let exprs = branch
+    if let Some(partition) = branch.output_partition.as_ref() {
+        return Ok(partition.clone());
+    }
+    let exprs = branch
         .output_partition_ordinals
         .iter()
-        .map(|ordinal| {
-            let index = usize::try_from(*ordinal).map_err(|_| {
-                format!(
+        .enumerate()
+        .map(|(ordinal_index, ordinal)| {
+            let output_index = usize::try_from(*ordinal).map_err(|_| {
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "output_partition_ordinals", format!(
                     "native ICEBERG_CHANGE_STREAM_ROUTER_SINK partition ordinal {ordinal} overflows usize"
-                )
+                )).append_index(ordinal_index)
             })?;
-            output_exprs.get(index).cloned().ok_or_else(|| {
-                format!(
+            output_exprs.get(output_index).cloned().ok_or_else(|| {
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "output_partition_ordinals", format!(
                     "native ICEBERG_CHANGE_STREAM_ROUTER_SINK partition ordinal {ordinal} is out of range"
-                )
+                )).append_index(ordinal_index)
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-        let kind = if exprs.is_empty() {
-            plan::PartitionKind::Unpartitioned
-        } else {
-            plan::PartitionKind::Hash
-        };
-        Ok(plan::DataPartition {
-            kind: kind as i32,
-            exprs,
-        })
-    })();
-    decoded.map_err(NativeFragmentLeafDecodeError::from)
+    let kind = if exprs.is_empty() {
+        plan::PartitionKind::Unpartitioned
+    } else {
+        plan::PartitionKind::Hash
+    };
+    Ok(plan::DataPartition {
+        kind: kind as i32,
+        exprs,
+    })
 }
 
 fn output_slot_id_for_ordinal(
     output_columns: &[common::OutputColumn],
     ordinal: u64,
-    label: &str,
+    field: &'static str,
 ) -> Result<i32, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<i32, String> {
-        let index = usize::try_from(ordinal).map_err(|_| {
-            format!("native router {label} output ordinal {ordinal} overflows usize")
-        })?;
-        let column = output_columns.get(index).ok_or_else(|| {
-            format!("native router {label} output ordinal {ordinal} is out of range")
-        })?;
-        i32::try_from(column.column_id).map_err(|_| {
+    let index = usize::try_from(ordinal).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            field,
+            format!("native router output ordinal {ordinal} overflows usize"),
+        )
+    })?;
+    let column = output_columns.get(index).ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            field,
+            format!("native router output ordinal {ordinal} is out of range"),
+        )
+    })?;
+    i32::try_from(column.column_id).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            field,
             format!(
-                "native router {label} output ordinal {ordinal} column id {} exceeds i32",
+                "native router output ordinal {ordinal} column id {} exceeds i32",
                 column.column_id
-            )
-        })
-    })();
-    decoded.map_err(NativeFragmentLeafDecodeError::from)
+            ),
+        )
+    })
 }
 
 fn decode_router_output_slots(
     ordinals: &[u64],
     output_columns: &[common::OutputColumn],
-    label: &str,
+    field: &'static str,
 ) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
         let mut seen = std::collections::HashSet::new();
         ordinals
         .iter()
-        .map(|ordinal| {
-            let raw_slot_id = output_slot_id_for_ordinal(output_columns, *ordinal, label)?;
-            let slot_id = SlotId::try_from(raw_slot_id)?;
+        .enumerate().map(|(index, ordinal)| {
+            let raw_slot_id = output_slot_id_for_ordinal(output_columns, *ordinal, field)
+                .map_err(|error| error.append_index(index))?;
+            let slot_id = SlotId::try_from(raw_slot_id).map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, field, error).append_index(index))?;
             if !seen.insert(slot_id) {
-                return Err(format!(
-                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK {label}: duplicate output slot id: {slot_id}"
-                )
-                .into());
+                return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, field, format!("native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: {slot_id}")).append_index(index));
             }
             Ok(slot_id)
         })
@@ -538,7 +576,8 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
                     "native Iceberg write sink missing spec",
                 )
             })?;
-        let mode = iceberg_sink_mode_from_native(spec.mode)?;
+        let mode = iceberg_sink_mode_from_native(spec.mode)
+            .map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidEnum, "mode", error).prepend_field("spec"))?;
 
         let mut arena = ExprArena::default();
         let lowered_output_exprs = if fragment_output_exprs.is_empty() {
@@ -554,45 +593,49 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
         let target_table = spec
             .target_table
             .as_ref()
-            .ok_or_else(|| "native Iceberg write sink missing target_table".to_string())?;
+            .ok_or_else(|| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "target_table", "native Iceberg write sink missing target_table").prepend_field("spec"))?;
         let writer_columns = if spec.target_columns.is_empty() {
             target_table.columns.as_slice()
         } else {
             spec.target_columns.as_slice()
         };
         if lowered_output_exprs.len() != writer_columns.len() {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "target_columns", format!(
                 "native Iceberg write sink input column count {} does not match target column count {}",
                 lowered_output_exprs.len(),
                 writer_columns.len()
-            )
-            .into());
+            )).prepend_field("spec"));
         }
 
         let iceberg_table = spec
             .iceberg
             .as_ref()
-            .ok_or_else(|| "native Iceberg write sink missing iceberg table info".to_string())?;
+            .ok_or_else(|| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "iceberg", "native Iceberg write sink missing iceberg table info").prepend_field("spec"))?;
         let iceberg_table =
-            iceberg_table_descriptor_from_native(iceberg_table, &target_table.columns, mode)?;
+            iceberg_table_descriptor_from_native(iceberg_table, &target_table.columns, mode)
+                .map_err(|error| error.prepend_field("spec"))?;
         let target_partition_spec_id = spec.target_partition_spec_id;
 
-        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)?;
+        let target_table_metadata = parse_target_table_metadata(&iceberg_table, mode)
+            .map_err(|error| error.prepend_field("iceberg").prepend_field("spec"))?;
         let (partition_source_column_names, partition_column_names, transform_exprs) =
-            partition_info_from_metadata(target_table_metadata.as_ref(), target_partition_spec_id)?;
+            partition_info_from_metadata(target_table_metadata.as_ref(), target_partition_spec_id)
+                .map_err(|error| error.prepend_field("spec"))?;
         let position_delete_binding = if matches!(
             mode,
             IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
         ) {
-            let target_schema = build_full_output_schema(&iceberg_table)?;
+            let target_schema = build_full_output_schema(&iceberg_table)
+                .map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "iceberg", error).prepend_field("spec"))?;
             let metadata = target_table_metadata.as_ref().ok_or_else(|| {
-                format!(
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "serialized_metadata", format!(
                     "native Iceberg {:?} sink requires serialized target table metadata",
                     mode
-                )
+                )).prepend_field("iceberg").prepend_field("spec")
             })?;
             let partition_source_field_ids =
-                partition_source_field_ids_from_metadata(metadata, &partition_source_column_names)?;
+                partition_source_field_ids_from_metadata(metadata, &partition_source_column_names)
+                    .map_err(|error| error.prepend_field("spec"))?;
             let expected = PositionDeleteExpectedBinding {
                 target_partition_spec_id,
                 partition_source_column_names: partition_source_column_names.clone(),
@@ -606,9 +649,7 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
                 expected,
             )
             .map_err(|error| {
-                error
-                    .prepend_field("position_delete_output_descriptor")
-                    .prepend_field("spec")
+                error.prepend_field("spec")
             })?;
             Some((target_schema, binding))
         } else {
@@ -617,14 +658,14 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
 
         let (output_schema, target_schema, equality_delete_columns) = match mode {
             IcebergSinkMode::Data => {
-                let target_schema = build_full_output_schema(&iceberg_table)?;
+                let target_schema = build_full_output_schema(&iceberg_table)
+                    .map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "iceberg", error).prepend_field("spec"))?;
                 if lowered_output_exprs.len() != target_schema.fields().len() {
-                    return Err(format!(
+                    return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "target_columns", format!(
                         "native Iceberg sink output expr count mismatch: exprs={} columns={}",
                         lowered_output_exprs.len(),
                         target_schema.fields().len()
-                    )
-                    .into());
+                    )).prepend_field("spec"));
                 }
                 (Arc::clone(&target_schema), target_schema, Vec::new())
             }
@@ -642,15 +683,15 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
                 validate_equality_delete_unpartitioned_target_metadata(
                     &iceberg_table,
                     target_partition_spec_id,
-                )?;
-                let (schema, columns) = build_equality_delete_output_schema(&iceberg_table)?;
+                ).map_err(|error| error.prepend_field("spec"))?;
+                let (schema, columns) = build_equality_delete_output_schema(&iceberg_table)
+                    .map_err(|error| error.prepend_field("spec"))?;
                 if lowered_output_exprs.len() != schema.fields().len() {
-                    return Err(format!(
+                    return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "target_columns", format!(
                         "native Iceberg equality-delete sink expects {} output exprs; got {}",
                         schema.fields().len(),
                         lowered_output_exprs.len()
-                    )
-                    .into());
+                    )).prepend_field("spec"));
                 }
                 (Arc::clone(&schema), schema, columns)
             }
@@ -662,13 +703,14 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
                 writer_columns,
                 &lowered_output_exprs,
                 &mut arena,
-            )?
+            ).map_err(|error| error.prepend_field("spec"))?
         } else {
             Vec::new()
         };
 
         let row_lineage_data = mode == IcebergSinkMode::Data
-            && schema_has_reserved_row_lineage_columns(&target_schema)?;
+            && schema_has_reserved_row_lineage_columns(&target_schema)
+                .map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "target_table", error).prepend_field("spec"))?;
         let table_location = if spec.table_location.is_empty() {
             iceberg_table_location(iceberg_table.serialized_metadata.as_deref()).unwrap_or_else(
                 || {
@@ -682,7 +724,7 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
             spec.table_location.clone()
         };
         if table_location.is_empty() {
-            return Err("native Iceberg write sink missing table location".into());
+            return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "table_location", "native Iceberg write sink missing table location").prepend_field("spec"));
         }
         let data_location = if spec.data_location.is_empty() {
             format!("{}/data", table_location.trim_end_matches('/'))
@@ -690,15 +732,18 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
             spec.data_location.clone()
         };
         let object_store_s3 =
-            resolve_native_sink_s3_config(&data_location, &spec.cloud_properties)?;
+            resolve_native_sink_s3_config(&data_location, &spec.cloud_properties)
+                .map_err(|error| error.prepend_field("spec"))?;
         let target_snapshot_id = iceberg_table.current_snapshot_id;
         let position_delete_data_file_partition_index_input = if matches!(
             mode,
             IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors
         ) {
-            let metadata = target_table_metadata.as_ref().ok_or_else(|| {
-                "native Iceberg delete sink missing target table metadata".to_string()
-            })?;
+            let metadata = target_table_metadata.as_ref().ok_or_else(|| NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "serialized_metadata",
+                "native Iceberg delete sink missing target table metadata",
+            ).prepend_field("iceberg").prepend_field("spec"))?;
             Some(DeferredPositionDeleteDataFilePartitionIndex::new(
                 metadata.clone(),
                 target_snapshot_id,
@@ -709,8 +754,10 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
             None
         };
         let (file_format, report_file_format) =
-            validate_iceberg_sink_file_format(&spec.file_format)?;
-        let compression = map_native_compression(spec.compression)?;
+            validate_iceberg_sink_file_format(&spec.file_format)
+                .map_err(|error| error.prepend_field("spec"))?;
+        let compression = map_native_compression(spec.compression)
+            .map_err(|error| error.prepend_field("spec"))?;
 
         let plan = IcebergSinkPlan {
             mode,
@@ -767,20 +814,27 @@ fn lower_output_exprs(
     arena: &mut ExprArena,
     layout: &super::layout::Layout,
 ) -> Result<Vec<ExprId>, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<Vec<ExprId>, String> {
-        if output_exprs.is_empty() {
-            return Err("native Iceberg sink missing output exprs".to_string());
-        }
-        output_exprs
-            .iter()
-            .enumerate()
-            .map(|(idx, expr)| {
-                decode_expr(expr, arena, layout)
-                    .map_err(|err| format!("native Iceberg sink output_exprs[{idx}]: {err}"))
+    if output_exprs.is_empty() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "output_exprs",
+            "native Iceberg sink missing output exprs",
+        ));
+    }
+    output_exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            decode_expr(expr, arena, layout).map_err(|err| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "output_exprs",
+                    format!("native Iceberg sink output_exprs[{idx}]: {err}"),
+                )
+                .append_index(idx)
             })
-            .collect()
-    })();
-    decoded.map_err(NativeFragmentLeafDecodeError::from)
+        })
+        .collect()
 }
 
 fn lower_output_columns_as_slot_refs(
@@ -788,56 +842,85 @@ fn lower_output_columns_as_slot_refs(
     input: Option<&plan::IcebergWriteInputBinding>,
     arena: &mut ExprArena,
 ) -> Result<Vec<ExprId>, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<Vec<ExprId>, String> {
-        let selected =
-            match input.and_then(|input| input.kind.as_ref()) {
-                Some(plan::iceberg_write_input_binding::Kind::RootOutputByOrdinal(true)) | None => {
-                    output_columns.iter().collect::<Vec<_>>()
-                }
-                Some(plan::iceberg_write_input_binding::Kind::RootOutputByOrdinal(false)) => {
-                    return Err(
-                        "native Iceberg write sink root_output_by_ordinal marker must be true"
-                            .to_string(),
-                    );
-                }
-                Some(plan::iceberg_write_input_binding::Kind::OutputOrdinals(ordinals)) => {
-                    ordinals
-                        .values
-                        .iter()
-                        .map(|ordinal| {
-                            let idx = usize::try_from(*ordinal).map_err(|_| {
-                    format!("native Iceberg write sink output ordinal {ordinal} overflows usize")
-                })?;
-                            output_columns.get(idx).ok_or_else(|| {
-                    format!("native Iceberg write sink output ordinal {ordinal} is out of range")
-                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                }
-            };
-        if selected.is_empty() {
-            return Err(
-                "native Iceberg write sink requires at least one output column".to_string(),
-            );
+    let selected = match input.and_then(|input| input.kind.as_ref()) {
+        Some(plan::iceberg_write_input_binding::Kind::RootOutputByOrdinal(true)) | None => {
+            output_columns.iter().collect::<Vec<_>>()
         }
-        selected
-            .into_iter()
-            .map(|column| {
-                let data_type = column
-                    .r#type
-                    .as_ref()
-                    .ok_or_else(|| {
+        Some(plan::iceberg_write_input_binding::Kind::RootOutputByOrdinal(false)) => {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "root_output_by_ordinal",
+                "native Iceberg write sink root_output_by_ordinal marker must be true",
+            )
+            .prepend_field("input"));
+        }
+        Some(plan::iceberg_write_input_binding::Kind::OutputOrdinals(ordinals)) => ordinals
+            .values
+            .iter()
+            .enumerate()
+            .map(|(index, ordinal)| {
+                let idx = usize::try_from(*ordinal).map_err(|_| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::OutOfRange,
+                        "values",
+                        format!(
+                            "native Iceberg write sink output ordinal {ordinal} overflows usize"
+                        ),
+                    )
+                    .append_index(index)
+                    .prepend_field("output_ordinals")
+                    .prepend_field("input")
+                })?;
+                output_columns.get(idx).ok_or_else(|| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::OutOfRange,
+                        "values",
+                        format!(
+                            "native Iceberg write sink output ordinal {ordinal} is out of range"
+                        ),
+                    )
+                    .append_index(index)
+                    .prepend_field("output_ordinals")
+                    .prepend_field("input")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if selected.is_empty() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "output_columns",
+            "native Iceberg write sink requires at least one output column",
+        ));
+    }
+    selected
+        .into_iter()
+        .map(|column| {
+            let data_type = column
+                .r#type
+                .as_ref()
+                .ok_or_else(|| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::MissingField,
+                        "type",
                         format!(
                             "native Iceberg write sink output column {} missing type",
                             column.name
+                        ),
+                    )
+                })
+                .and_then(|wire| {
+                    decode_type(wire).map_err(|error| {
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "type",
+                            error,
                         )
                     })
-                    .and_then(decode_type)?;
-                Ok(arena.push_typed(ExprNode::SlotId(SlotId::new(column.column_id)), data_type))
-            })
-            .collect()
-    })();
-    decoded.map_err(NativeFragmentLeafDecodeError::from)
+                })?;
+            Ok(arena.push_typed(ExprNode::SlotId(SlotId::new(column.column_id)), data_type))
+        })
+        .collect()
 }
 
 fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> {
@@ -858,7 +941,10 @@ fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> 
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
+
     use super::*;
+    use crate::types::native_proto::encode_type;
 
     fn plan_destination(id: i64) -> plan::StreamDestination {
         plan::StreamDestination {
@@ -983,6 +1069,233 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_write_missing_target_table_uses_exact_spec_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergWrite(
+                    plan::IcebergWriteFragmentSink {
+                        spec: Some(plan::IcebergWriteSinkSpec {
+                            mode: plan::IcebergWriteSinkMode::Data as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "value".to_string(),
+                r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("missing target table must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_write.spec.target_table"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn iceberg_write_missing_iceberg_schema_uses_exact_spec_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergWrite(
+                    plan::IcebergWriteFragmentSink {
+                        spec: Some(plan::IcebergWriteSinkSpec {
+                            mode: plan::IcebergWriteSinkMode::Data as i32,
+                            target_table: Some(plan::TableDef {
+                                columns: vec![plan::ColumnDef {
+                                    name: "value".to_string(),
+                                    data_type: Some(
+                                        encode_type(&DataType::Int32).expect("encode type"),
+                                    ),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                            iceberg: Some(plan::IcebergTableInfo::default()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "value".to_string(),
+                r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("missing Iceberg schema must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_write.spec.iceberg.schema"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn iceberg_write_missing_target_column_type_uses_exact_indexed_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergWrite(
+                    plan::IcebergWriteFragmentSink {
+                        spec: Some(plan::IcebergWriteSinkSpec {
+                            mode: plan::IcebergWriteSinkMode::Data as i32,
+                            target_table: Some(plan::TableDef {
+                                columns: vec![plan::ColumnDef {
+                                    name: "value".to_string(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                            iceberg: Some(plan::IcebergTableInfo {
+                                schema: Some(plan::IcebergSchemaDef::default()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "value".to_string(),
+                r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("missing target column data type must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_write.spec.target_table.columns[0].data_type"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn router_branch_kind_uses_exact_indexed_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    plan::IcebergChangeStreamRouterSink {
+                        branches: vec![plan::IcebergChangeStreamBranchRoute {
+                            branch_kind: plan::ChangeStreamBranchKind::Unspecified as i32,
+                            output_ordinals: vec![0],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "change_op".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("unspecified branch kind must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_change_stream_router.branches[0].branch_kind"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+    }
+
+    #[test]
+    fn router_output_ordinal_uses_exact_indexed_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    plan::IcebergChangeStreamRouterSink {
+                        branches: vec![plan::IcebergChangeStreamBranchRoute {
+                            branch_kind: plan::ChangeStreamBranchKind::FreshData as i32,
+                            output_ordinals: vec![1],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "change_op".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("out-of-range branch output ordinal must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_change_stream_router.branches[0].output_ordinals[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn router_partition_ordinal_uses_exact_indexed_path() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::IcebergChangeStreamRouter(
+                    plan::IcebergChangeStreamRouterSink {
+                        branches: vec![plan::IcebergChangeStreamBranchRoute {
+                            branch_kind: plan::ChangeStreamBranchKind::FreshData as i32,
+                            output_ordinals: vec![0],
+                            output_partition_ordinals: vec![1],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "change_op".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            decode_fragment_sink_program(&fragment, &super::super::layout::Layout::default())
+                .expect_err("out-of-range partition ordinal must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.iceberg_change_stream_router.branches[0].output_partition_ordinals[0]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
     fn router_assignment_ignores_redundant_flat_instance_destinations() {
         let sink = plan::DataSink {
             kind: Some(plan::data_sink::Kind::IcebergChangeStreamRouter(
@@ -1021,7 +1334,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[0] output: duplicate output slot id: 7"
+            "native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: 7"
         );
     }
 }

@@ -27,7 +27,7 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{expr, plan};
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 
 pub(super) fn lower_sort_node(
     node: &plan::DistributedNode,
@@ -181,9 +181,13 @@ pub(super) fn parse_sort_topn_type(
     let Some(value) = value else {
         return Ok(SortTopNType::RowNumber);
     };
-    match plan::SortTopNType::try_from(value)
-        .map_err(|_| format!("SortNode unknown topn_type {value}"))?
-    {
+    match plan::SortTopNType::try_from(value).map_err(|_| {
+        super::super::error::NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "topn_type",
+            format!("SortNode unknown topn_type {value}"),
+        )
+    })? {
         plan::SortTopNType::SortTopnTypeUnspecified | plan::SortTopNType::SortTopnTypeRowNumber => {
             Ok(SortTopNType::RowNumber)
         }

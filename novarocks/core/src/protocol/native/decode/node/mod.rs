@@ -268,9 +268,11 @@ impl NativePlanDecodeContext {
             .get(&FragmentNodeId::new(node_id))
             .map(|assignment| assignment.ranges())
             .ok_or_else(|| {
-                super::error::NativeFragmentLeafDecodeError::new(format!(
-                    "native ScanNode node_id={node_id} missing scan ranges"
-                ))
+                super::error::NativeFragmentLeafDecodeError::at_field(
+                    crate::protocol::common::error::ProtocolErrorKind::MissingField,
+                    "scan_ranges",
+                    format!("native ScanNode node_id={node_id} missing scan ranges"),
+                )
             })
     }
 
@@ -288,7 +290,9 @@ impl NativePlanDecodeContext {
     ) -> Result<&crate::connector::ConnectorRegistry, super::error::NativeFragmentLeafDecodeError>
     {
         self.connectors.as_deref().ok_or_else(|| {
-            super::error::NativeFragmentLeafDecodeError::new(
+            super::error::NativeFragmentLeafDecodeError::at_field(
+                crate::protocol::common::error::ProtocolErrorKind::MissingField,
+                "connector_registry",
                 "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
             )
         })
@@ -302,7 +306,11 @@ impl NativePlanDecodeContext {
             .exchange_inputs
             .get(&FragmentNodeId::new(node_id))
             .ok_or_else(|| {
-                format!("ExchangeReceiver missing sender count for node_id {node_id}")
+                super::error::NativeFragmentLeafDecodeError::at_field(
+                    crate::protocol::common::error::ProtocolErrorKind::MissingField,
+                    "exchange_inputs",
+                    format!("ExchangeReceiver missing sender count for node_id {node_id}"),
+                )
             })?;
         let fragment_instance_id = self.fragment_instance_id.get();
         Ok((
@@ -445,7 +453,7 @@ fn decode_node_inner(
             )
         })
         .transpose()
-        .map_err(|error| error.into_native(path.clone().field("runtime_filter_binding_ids")))?
+        .map_err(|error| error.into_native(path.clone()))?
         .unwrap_or_default();
     let direct_inputs = children
         .iter()
@@ -505,7 +513,7 @@ fn decode_node_inner(
     if let Some(ledger) = ledger {
         ledger
             .commit_consumed_many(&node.runtime_filter_binding_ids)
-            .map_err(|error| error.into_native(path.field("runtime_filter_binding_ids")))?;
+            .map_err(|error| error.into_native(path))?;
     }
     Ok(lowered)
 }

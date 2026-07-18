@@ -24,7 +24,7 @@
 //! `lower_iceberg_delta_scan` (in `src/lower/compat/node/iceberg_delta_scan.rs`)
 //! when the Thrift plan carries `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerSpec;
@@ -189,6 +189,25 @@ pub struct DeletedFileVisibility {
 #[derive(Debug)]
 pub struct IcebergRuntimeHandles {
     pub(crate) table: IcebergDeltaTablePayload,
+    pub(crate) delete_side_payload: Option<DeltaScanDeleteSidePayload>,
+    pub(crate) resolved: OnceLock<Result<Arc<IcebergResolvedRuntime>, String>>,
+}
+
+impl IcebergRuntimeHandles {
+    pub(crate) fn new(
+        table: IcebergDeltaTablePayload,
+        delete_side_payload: Option<DeltaScanDeleteSidePayload>,
+    ) -> Self {
+        Self {
+            table,
+            delete_side_payload,
+            resolved: OnceLock::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IcebergResolvedRuntime {
     pub(crate) object_store_factory: Arc<OpendalRangeReaderFactory>,
     pub(crate) delete_side: Option<DeltaScanDeleteSide>,
 }

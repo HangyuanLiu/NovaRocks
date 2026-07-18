@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crate::proto::{expr, plan};
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
     ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
@@ -175,26 +175,36 @@ impl NativeRuntimeFilterDecodeLedger {
         node_fragment_id: u32,
     ) -> Result<&DecodedRuntimeFilterBinding, NativeFragmentLeafDecodeError> {
         if node_fragment_id != self.fragment_id {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "native node_id={node_id} fragment_id={node_fragment_id} cannot reference runtime-filter binding table fragment_id={}",
-                self.fragment_id
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!(
+                    "native node_id={node_id} fragment_id={node_fragment_id} cannot reference runtime-filter binding table fragment_id={}",
+                    self.fragment_id
+                ),
+            ));
         }
         if self.consumed.contains_key(&binding_id) {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "native runtime-filter binding_id={binding_id} is attached more than once"
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!("native runtime-filter binding_id={binding_id} is attached more than once"),
+            ));
         }
         let record = self.records.get(&binding_id).ok_or_else(|| {
-            NativeFragmentLeafDecodeError::inconsistent(format!(
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "runtime_filter_binding_ids", format!(
                 "native node_id={node_id} references unknown runtime-filter binding_id={binding_id}"
             ))
         })?;
         if record.node_id != node_id {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "native runtime-filter binding_id={binding_id} belongs to node_id={}, not attachment node_id={node_id}",
-                record.node_id
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!(
+                    "native runtime-filter binding_id={binding_id} belongs to node_id={}, not attachment node_id={node_id}",
+                    record.node_id
+                ),
+            ));
         }
         Ok(record)
     }
@@ -208,7 +218,7 @@ impl NativeRuntimeFilterDecodeLedger {
         let mut seen = BTreeSet::new();
         binding_ids.iter().copied().map(|binding_id| {
             if !seen.insert(binding_id) {
-                return Err(NativeFragmentLeafDecodeError::inconsistent(format!("native node_id={node_id} has duplicate runtime-filter binding attachment id={binding_id}")));
+                return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, "runtime_filter_binding_ids", format!("native node_id={node_id} has duplicate runtime-filter binding attachment id={binding_id}")));
             }
             self.lookup_for_node(binding_id, node_id, node_fragment_id).cloned()
         }).collect()
@@ -216,14 +226,18 @@ impl NativeRuntimeFilterDecodeLedger {
 
     fn commit_consumed(&mut self, binding_id: u32) -> Result<(), NativeFragmentLeafDecodeError> {
         if !self.records.contains_key(&binding_id) {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "cannot consume unknown runtime-filter binding_id={binding_id}"
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!("cannot consume unknown runtime-filter binding_id={binding_id}"),
+            ));
         }
         if self.consumed.insert(binding_id, ()).is_some() {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "runtime-filter binding_id={binding_id} consumed more than once"
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "runtime_filter_binding_ids",
+                format!("runtime-filter binding_id={binding_id} consumed more than once"),
+            ));
         }
         Ok(())
     }
@@ -238,9 +252,11 @@ impl NativeRuntimeFilterDecodeLedger {
                 || !self.records.contains_key(binding_id)
                 || self.consumed.contains_key(binding_id)
             {
-                return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                    "cannot atomically consume runtime-filter binding_id={binding_id}"
-                )));
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "runtime_filter_binding_ids",
+                    format!("cannot atomically consume runtime-filter binding_id={binding_id}"),
+                ));
             }
         }
         for binding_id in unique {
@@ -265,10 +281,14 @@ impl NativeRuntimeFilterDecodeLedger {
             .keys()
             .find(|id| !self.consumed.contains_key(id))
         {
-            return Err(NativeFragmentLeafDecodeError::inconsistent(format!(
-                "native runtime-filter binding table fragment_id={} has unconsumed binding_id={binding_id}",
-                self.fragment_id
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "bindings",
+                format!(
+                    "native runtime-filter binding table fragment_id={} has unconsumed binding_id={binding_id}",
+                    self.fragment_id
+                ),
+            ));
         }
         Ok(self
             .records
@@ -593,65 +613,98 @@ fn decode_reduction(
     wire: Option<&plan::RuntimeFilterReductionContract>,
     path: FieldPath,
 ) -> Result<DecodedRuntimeFilterReduction, super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<DecodedRuntimeFilterReduction, String> {
-        let kind = wire.and_then(|wire| wire.kind.as_ref()).ok_or_else(|| {
-            format!("native runtime-filter binding_id={binding_id} missing reduction contract")
-        })?;
-        match kind {
-            plan::runtime_filter_reduction_contract::Kind::SetUnion(true) => {
-                Ok(DecodedRuntimeFilterReduction::SetUnion)
-            }
-            plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(true) => {
-                Ok(DecodedRuntimeFilterReduction::TightenOrderedBound)
-            }
-            plan::runtime_filter_reduction_contract::Kind::SetUnion(false)
-            | plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(false) => {
-                Err(format!(
-                    "native runtime-filter binding_id={binding_id} reduction marker must be true"
-                ))
-            }
-            plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(topk) => {
-                let k = NonZeroU32::new(topk.k).ok_or_else(|| {
-                    format!("native runtime-filter binding_id={binding_id} TopK K must be nonzero")
-                })?;
-                let digest = digest32(binding_id, "TopK contract_digest", &topk.contract_digest)?;
-                let DecodedRuntimeFilterContract::Ordered {
-                    keys,
-                    comparator_digest,
-                    ..
-                } = contract
-                else {
-                    return Err(format!(
-                        "native runtime-filter binding_id={binding_id} TopK reduction requires ordered contract"
-                    ));
-                };
-                let order = OrderContract {
-                    keys: keys
-                        .iter()
-                        .map(|key| OrderKeyContract {
-                            data_type: key.data_type().clone(),
-                            direction: key.direction(),
-                            null_order: key.null_order(),
-                        })
-                        .collect(),
-                    inclusive: true,
-                    comparator_digest: ComparatorDigest::new(*comparator_digest),
-                };
-                let expected = RuntimeTopKSummaryContract::try_from_plan(&order, TopKSummaryRequirement::try_new(k.get()).expect("nonzero"))
-                .map_err(|error| format!("native runtime-filter binding_id={binding_id} TopK contract is noncanonical: {error:?}"))?;
-                if expected.digest().bytes() != digest {
-                    return Err(format!(
-                        "native runtime-filter binding_id={binding_id} TopK contract digest mismatch"
-                    ));
-                }
-                Ok(DecodedRuntimeFilterReduction::MergeTopKSummary {
-                    k,
-                    contract_digest: digest,
-                })
-            }
+    let wire = wire.ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("kind"),
+            format!("native runtime-filter binding_id={binding_id} missing reduction contract"),
+        )
+    })?;
+    let kind = wire.kind.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("kind"),
+            format!("native runtime-filter binding_id={binding_id} missing reduction kind"),
+        )
+    })?;
+    match kind {
+        plan::runtime_filter_reduction_contract::Kind::SetUnion(true) => {
+            Ok(DecodedRuntimeFilterReduction::SetUnion)
         }
-    })();
-    decoded.map_err(|error| super::NativeFragmentDecodeError::invalid_value(path, error))
+        plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(true) => {
+            Ok(DecodedRuntimeFilterReduction::TightenOrderedBound)
+        }
+        plan::runtime_filter_reduction_contract::Kind::SetUnion(false)
+        | plan::runtime_filter_reduction_contract::Kind::TightenOrderedBound(false) => {
+            Err(super::NativeFragmentDecodeError::invalid_value(
+                path.field("kind"),
+                format!(
+                    "native runtime-filter binding_id={binding_id} reduction marker must be true"
+                ),
+            ))
+        }
+        plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(topk) => {
+            let topk_path = path.field("kind").field("merge_topk_summary");
+            let k = NonZeroU32::new(topk.k).ok_or_else(|| {
+                super::NativeFragmentDecodeError::invalid_value(
+                    topk_path.clone().field("k"),
+                    format!("native runtime-filter binding_id={binding_id} TopK K must be nonzero"),
+                )
+            })?;
+            let digest = digest32(binding_id, "TopK contract_digest", &topk.contract_digest)
+                .map_err(|error| {
+                    super::NativeFragmentDecodeError::invalid_value(
+                        topk_path.clone().field("contract_digest"),
+                        error,
+                    )
+                })?;
+            let DecodedRuntimeFilterContract::Ordered {
+                keys,
+                comparator_digest,
+                ..
+            } = contract
+            else {
+                return Err(super::NativeFragmentDecodeError::inconsistent(
+                    topk_path.clone(),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} TopK reduction requires ordered contract"
+                    ),
+                ));
+            };
+            let order = OrderContract {
+                keys: keys
+                    .iter()
+                    .map(|key| OrderKeyContract {
+                        data_type: key.data_type().clone(),
+                        direction: key.direction(),
+                        null_order: key.null_order(),
+                    })
+                    .collect(),
+                inclusive: true,
+                comparator_digest: ComparatorDigest::new(*comparator_digest),
+            };
+            let expected = RuntimeTopKSummaryContract::try_from_plan(
+                &order,
+                TopKSummaryRequirement::try_new(k.get()).expect("nonzero"),
+            )
+            .map_err(|error| {
+                super::NativeFragmentDecodeError::invalid_value(
+                    topk_path.clone(),
+                    format!("native runtime-filter binding_id={binding_id} TopK contract is noncanonical: {error:?}"),
+                )
+            })?;
+            if expected.digest().bytes() != digest {
+                return Err(super::NativeFragmentDecodeError::inconsistent(
+                    topk_path.field("contract_digest"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} TopK contract digest mismatch"
+                    ),
+                ));
+            }
+            Ok(DecodedRuntimeFilterReduction::MergeTopKSummary {
+                k,
+                contract_digest: digest,
+            })
+        }
+    }
 }
 
 fn decode_role(
@@ -659,128 +712,201 @@ fn decode_role(
     role: Option<&plan::runtime_filter_binding::Role>,
     path: FieldPath,
 ) -> Result<DecodedBindingRole, super::NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<DecodedBindingRole, String> {
-        match role
-            .ok_or_else(|| format!("native runtime-filter binding_id={binding_id} missing role"))?
-        {
-            plan::runtime_filter_binding::Role::Producer(producer) => {
-                let contribution_kinds = producer.contribution_kinds.iter().copied().map(|raw| {
-                match plan::RuntimeFilterContributionKind::try_from(raw).map_err(|_| format!("native runtime-filter binding_id={binding_id} unknown contribution kind={raw}"))? {
-                    plan::RuntimeFilterContributionKind::ValueDomainDelta => Ok(ContributionKind::ValueDomainDelta),
-                    plan::RuntimeFilterContributionKind::FinalDomainShard => Ok(ContributionKind::FinalDomainShard),
-                    plan::RuntimeFilterContributionKind::OrderedBoundUpdate => Ok(ContributionKind::OrderedBoundUpdate),
-                    plan::RuntimeFilterContributionKind::TopkSummary => Ok(ContributionKind::TopKSummary),
-                    plan::RuntimeFilterContributionKind::ProducerClosed => Ok(ContributionKind::ProducerClosed),
-                    plan::RuntimeFilterContributionKind::Unspecified => Err(format!("native runtime-filter binding_id={binding_id} unspecified contribution kind")),
-                }
-            }).collect::<Result<BTreeSet<_>, String>>()?;
-                if contribution_kinds.len() != producer.contribution_kinds.len()
-                    || contribution_kinds.is_empty()
-                {
-                    return Err(format!(
-                        "native runtime-filter binding_id={binding_id} producer contribution kinds must be unique and nonempty"
-                    ));
-                }
-                let completion_requirement = match plan::RuntimeFilterCompletionRequirement::try_from(producer.completion_requirement)
-                .map_err(|_| format!("native runtime-filter binding_id={binding_id} unknown completion requirement={}", producer.completion_requirement))? {
-                plan::RuntimeFilterCompletionRequirement::ProducerClosed => CompletionRequirement::ProducerClosed,
-                plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen => CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
-                plan::RuntimeFilterCompletionRequirement::Unspecified => return Err(format!("native runtime-filter binding_id={binding_id} unspecified completion requirement")),
-            };
-                let join_key_ordinal = usize::try_from(
-                    producer.join_key_ordinal.ok_or_else(|| {
-                        format!(
-                            "native runtime-filter producer binding_id={binding_id} missing join_key_ordinal"
-                        )
-                    })?,
-                )
-                .map_err(|_| {
-                    format!(
-                        "native runtime-filter producer binding_id={binding_id} join_key_ordinal does not fit usize"
-                    )
-                })?;
-                Ok(DecodedBindingRole::Producer {
-                    contribution_kinds,
-                    completion_requirement,
-                    join_key_ordinal,
-                })
-            }
-            plan::runtime_filter_binding::Role::Consumer(consumer) => {
-                let capabilities = consumer
-                    .capabilities
-                    .iter()
-                    .copied()
-                    .map(|raw| {
-                        match plan::RuntimeFilterArtifactCapability::try_from(raw).map_err(|_| {
-                        format!(
-                            "native runtime-filter binding_id={binding_id} unknown capability={raw}"
-                        )
-                    })? {
-                        plan::RuntimeFilterArtifactCapability::Membership => {
-                            Ok(ArtifactCapability::Membership)
-                        }
-                        plan::RuntimeFilterArtifactCapability::OrderedRange => {
-                            Ok(ArtifactCapability::OrderedRange)
-                        }
-                        plan::RuntimeFilterArtifactCapability::EmptyDomain => {
-                            Ok(ArtifactCapability::EmptyDomain)
-                        }
-                        plan::RuntimeFilterArtifactCapability::Unspecified => Err(format!(
-                            "native runtime-filter binding_id={binding_id} unspecified capability"
-                        )),
+    match role.ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone(),
+            format!("native runtime-filter binding_id={binding_id} missing role"),
+        )
+    })? {
+        plan::runtime_filter_binding::Role::Producer(producer) => {
+            let producer_path = path.field("producer");
+            let mut contribution_kinds = BTreeSet::new();
+            for (index, raw) in producer.contribution_kinds.iter().copied().enumerate() {
+                let item_path = producer_path
+                    .clone()
+                    .field("contribution_kinds")
+                    .index(index);
+                let kind = match plan::RuntimeFilterContributionKind::try_from(raw) {
+                    Ok(plan::RuntimeFilterContributionKind::ValueDomainDelta) => {
+                        ContributionKind::ValueDomainDelta
                     }
-                    })
-                    .collect::<Result<BTreeSet<_>, String>>()?;
-                if capabilities.len() != consumer.capabilities.len() || capabilities.is_empty() {
-                    return Err(format!(
-                        "native runtime-filter binding_id={binding_id} consumer capabilities must be unique and nonempty"
-                    ));
-                }
-                let activation = match consumer.activation.as_ref().and_then(|activation| activation.kind.as_ref())
-                .ok_or_else(|| format!("native runtime-filter binding_id={binding_id} missing consumer activation"))? {
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => ConsumerActivation::BlockingSnapshot,
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => return Err(format!("native runtime-filter binding_id={binding_id} blocking activation marker must be true")),
-                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => ConsumerActivation::NonBlockingLive { late_apply: match plan::RuntimeFilterLateApplyGranularity::try_from(*raw).map_err(|_| format!("native runtime-filter binding_id={binding_id} unknown late-apply granularity={raw}"))? {
-                    plan::RuntimeFilterLateApplyGranularity::Row => LateApplyGranularity::Row,
-                    plan::RuntimeFilterLateApplyGranularity::Batch => LateApplyGranularity::Batch,
-                    plan::RuntimeFilterLateApplyGranularity::RowGroup => LateApplyGranularity::RowGroup,
-                    plan::RuntimeFilterLateApplyGranularity::Split => LateApplyGranularity::Split,
-                    plan::RuntimeFilterLateApplyGranularity::File => LateApplyGranularity::File,
-                    plan::RuntimeFilterLateApplyGranularity::Unspecified => return Err(format!("native runtime-filter binding_id={binding_id} unspecified late-apply granularity")),
-                }},
-            };
-                let target = match consumer.target.as_ref().ok_or_else(|| {
-                    format!(
-                        "native runtime-filter consumer binding_id={binding_id} missing target"
-                    )
-                })? {
-                    plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(raw) => {
-                        DecodedConsumerBindingTarget::DirectInput {
-                            input_ordinal: usize::try_from(*raw).map_err(|_| {
-                                format!(
-                                    "native runtime-filter consumer binding_id={binding_id} input ordinal does not fit usize"
-                                )
-                            })?,
-                        }
+                    Ok(plan::RuntimeFilterContributionKind::FinalDomainShard) => {
+                        ContributionKind::FinalDomainShard
                     }
-                    plan::runtime_filter_consumer_role::Target::SourceBoundary(true) => {
-                        DecodedConsumerBindingTarget::SourceBoundary
+                    Ok(plan::RuntimeFilterContributionKind::OrderedBoundUpdate) => {
+                        ContributionKind::OrderedBoundUpdate
                     }
-                    plan::runtime_filter_consumer_role::Target::SourceBoundary(false) => {
-                        return Err(format!(
-                            "native runtime-filter consumer binding_id={binding_id} source boundary marker must be true"
+                    Ok(plan::RuntimeFilterContributionKind::TopkSummary) => {
+                        ContributionKind::TopKSummary
+                    }
+                    Ok(plan::RuntimeFilterContributionKind::ProducerClosed) => {
+                        ContributionKind::ProducerClosed
+                    }
+                    Ok(plan::RuntimeFilterContributionKind::Unspecified) | Err(_) => {
+                        return Err(super::NativeFragmentDecodeError::invalid_enum(
+                            item_path,
+                            format!(
+                                "native runtime-filter binding_id={binding_id} invalid contribution kind={raw}"
+                            ),
                         ));
                     }
                 };
-                Ok(DecodedBindingRole::Consumer {
-                    capabilities,
-                    activation,
-                    target,
-                })
+                if !contribution_kinds.insert(kind) {
+                    return Err(super::NativeFragmentDecodeError::inconsistent(
+                        item_path,
+                        format!(
+                            "native runtime-filter binding_id={binding_id} duplicate contribution kind={raw}"
+                        ),
+                    ));
+                }
             }
+            if contribution_kinds.is_empty() {
+                return Err(super::NativeFragmentDecodeError::invalid_value(
+                    producer_path.clone().field("contribution_kinds"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} producer contribution kinds must be nonempty"
+                    ),
+                ));
+            }
+            let completion_requirement = match plan::RuntimeFilterCompletionRequirement::try_from(
+                producer.completion_requirement,
+            ) {
+                Ok(plan::RuntimeFilterCompletionRequirement::ProducerClosed) => {
+                    CompletionRequirement::ProducerClosed
+                }
+                Ok(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen) => {
+                    CompletionRequirement::FencedFinalDomain(
+                        CompletionFenceKind::CommittedDomainFrozen,
+                    )
+                }
+                Ok(plan::RuntimeFilterCompletionRequirement::Unspecified) | Err(_) => {
+                    return Err(super::NativeFragmentDecodeError::invalid_enum(
+                        producer_path.field("completion_requirement"),
+                        format!(
+                            "native runtime-filter binding_id={binding_id} invalid completion requirement={}",
+                            producer.completion_requirement
+                        ),
+                    ));
+                }
+            };
+            let join_key_ordinal_path = producer_path.field("join_key_ordinal");
+            let join_key_ordinal = usize::try_from(producer.join_key_ordinal.ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    join_key_ordinal_path.clone(),
+                    format!(
+                        "native runtime-filter producer binding_id={binding_id} missing join_key_ordinal"
+                    ),
+                )
+            })?)
+            .map_err(|_| {
+                super::NativeFragmentDecodeError::invalid_value(
+                    join_key_ordinal_path,
+                    format!(
+                        "native runtime-filter producer binding_id={binding_id} join_key_ordinal does not fit usize"
+                    ),
+                )
+            })?;
+            Ok(DecodedBindingRole::Producer {
+                contribution_kinds,
+                completion_requirement,
+                join_key_ordinal,
+            })
         }
-    })();
-    decoded.map_err(|error| super::NativeFragmentDecodeError::invalid_value(path, error))
+        plan::runtime_filter_binding::Role::Consumer(consumer) => {
+            let consumer_path = path.field("consumer");
+            let mut capabilities = BTreeSet::new();
+            for (index, raw) in consumer.capabilities.iter().copied().enumerate() {
+                let item_path = consumer_path.clone().field("capabilities").index(index);
+                let capability = match plan::RuntimeFilterArtifactCapability::try_from(raw) {
+                    Ok(plan::RuntimeFilterArtifactCapability::Membership) => {
+                        ArtifactCapability::Membership
+                    }
+                    Ok(plan::RuntimeFilterArtifactCapability::OrderedRange) => {
+                        ArtifactCapability::OrderedRange
+                    }
+                    Ok(plan::RuntimeFilterArtifactCapability::EmptyDomain) => {
+                        ArtifactCapability::EmptyDomain
+                    }
+                    Ok(plan::RuntimeFilterArtifactCapability::Unspecified) | Err(_) => {
+                        return Err(super::NativeFragmentDecodeError::invalid_enum(
+                            item_path,
+                            format!(
+                                "native runtime-filter binding_id={binding_id} invalid capability={raw}"
+                            ),
+                        ));
+                    }
+                };
+                if !capabilities.insert(capability) {
+                    return Err(super::NativeFragmentDecodeError::inconsistent(
+                        item_path,
+                        format!(
+                            "native runtime-filter binding_id={binding_id} duplicate capability={raw}"
+                        ),
+                    ));
+                }
+            }
+            if capabilities.is_empty() {
+                return Err(super::NativeFragmentDecodeError::invalid_value(
+                    consumer_path.clone().field("capabilities"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id} consumer capabilities must be nonempty"
+                    ),
+                ));
+            }
+            let activation_path = consumer_path.field("activation").field("kind");
+            let activation = match consumer.activation.as_ref().and_then(|activation| activation.kind.as_ref())
+                .ok_or_else(|| super::NativeFragmentDecodeError::missing(activation_path.clone(), format!("native runtime-filter binding_id={binding_id} missing consumer activation kind")))? {
+                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => ConsumerActivation::BlockingSnapshot,
+                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => return Err(super::NativeFragmentDecodeError::invalid_value(activation_path.field("blocking_snapshot"), format!("native runtime-filter binding_id={binding_id} blocking activation marker must be true"))),
+                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => ConsumerActivation::NonBlockingLive { late_apply: match plan::RuntimeFilterLateApplyGranularity::try_from(*raw) {
+                    Ok(plan::RuntimeFilterLateApplyGranularity::Row) => LateApplyGranularity::Row,
+                    Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => LateApplyGranularity::Batch,
+                    Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => LateApplyGranularity::RowGroup,
+                    Ok(plan::RuntimeFilterLateApplyGranularity::Split) => LateApplyGranularity::Split,
+                    Ok(plan::RuntimeFilterLateApplyGranularity::File) => LateApplyGranularity::File,
+                    Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => return Err(super::NativeFragmentDecodeError::invalid_enum(activation_path.field("non_blocking_live"), format!("native runtime-filter binding_id={binding_id} invalid late-apply granularity={raw}"))),
+                }},
+            };
+            let target_path = consumer_path.field("target");
+            let target = match consumer.target.as_ref().ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    target_path.clone(),
+                    format!(
+                        "native runtime-filter consumer binding_id={binding_id} missing target"
+                    ),
+                )
+            })? {
+                plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(raw) => {
+                    DecodedConsumerBindingTarget::DirectInput {
+                        input_ordinal: usize::try_from(*raw).map_err(|_| {
+                            super::NativeFragmentDecodeError::invalid_value(
+                                target_path.clone().field("direct_input_ordinal"),
+                                format!(
+                                    "native runtime-filter consumer binding_id={binding_id} input ordinal does not fit usize"
+                                ),
+                            )
+                        })?,
+                    }
+                }
+                plan::runtime_filter_consumer_role::Target::SourceBoundary(true) => {
+                    DecodedConsumerBindingTarget::SourceBoundary
+                }
+                plan::runtime_filter_consumer_role::Target::SourceBoundary(false) => {
+                    return Err(super::NativeFragmentDecodeError::invalid_value(
+                        target_path.field("source_boundary"),
+                        format!(
+                            "native runtime-filter consumer binding_id={binding_id} source boundary marker must be true"
+                        ),
+                    ));
+                }
+            };
+            Ok(DecodedBindingRole::Consumer {
+                capabilities,
+                activation,
+                target,
+            })
+        }
+    }
 }
 
 fn validate_role_contract(
@@ -1241,6 +1367,56 @@ mod tests {
         assert_eq!(
             protocol.path().to_string(),
             "plan_fragment.runtime_filter_bindings.bindings[0].contract.ordered.keys[0].direction"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+    }
+
+    #[test]
+    fn topk_reduction_k_error_uses_exact_path_and_kind() {
+        let mut binding = ordered_topk_binding(1, 11);
+        let plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(topk) = binding
+            .reduction
+            .as_mut()
+            .and_then(|reduction| reduction.kind.as_mut())
+            .expect("topk reduction")
+        else {
+            panic!("topk reduction");
+        };
+        topk.k = 0;
+
+        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
+        {
+            Ok(_) => panic!("zero TopK K must fail"),
+            Err(error) => error,
+        };
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].reduction.kind.merge_topk_summary.k"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn producer_contribution_kind_error_uses_exact_path_and_kind() {
+        let mut binding = membership_binding(1, 11);
+        binding.role = Some(plan::runtime_filter_binding::Role::Producer(
+            plan::RuntimeFilterProducerRole {
+                contribution_kinds: vec![plan::RuntimeFilterContributionKind::Unspecified as i32],
+                completion_requirement: plan::RuntimeFilterCompletionRequirement::ProducerClosed
+                    as i32,
+            },
+        ));
+
+        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
+        {
+            Ok(_) => panic!("unspecified contribution kind must fail"),
+            Err(error) => error,
+        };
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.runtime_filter_bindings.bindings[0].role.producer.contribution_kinds[0]"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
     }

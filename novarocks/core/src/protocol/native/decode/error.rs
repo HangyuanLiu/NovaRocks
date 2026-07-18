@@ -32,26 +32,6 @@ pub(crate) struct NativeFragmentLeafDecodeError {
 }
 
 impl NativeFragmentLeafDecodeError {
-    pub(crate) fn new(detail: impl fmt::Display) -> Self {
-        Self::invalid(detail)
-    }
-
-    pub(crate) fn invalid(detail: impl fmt::Display) -> Self {
-        Self {
-            kind: ProtocolErrorKind::InvalidValue,
-            relative_path: Vec::new(),
-            detail: detail.to_string(),
-        }
-    }
-
-    pub(crate) fn inconsistent(detail: impl fmt::Display) -> Self {
-        Self {
-            kind: ProtocolErrorKind::InconsistentFields,
-            relative_path: Vec::new(),
-            detail: detail.to_string(),
-        }
-    }
-
     pub(crate) fn at_field(
         kind: ProtocolErrorKind,
         field: &'static str,
@@ -71,6 +51,16 @@ impl NativeFragmentLeafDecodeError {
 
     pub(crate) fn prepend_index(mut self, index: usize) -> Self {
         self.relative_path.insert(0, FieldPathSegment::Index(index));
+        self
+    }
+
+    pub(crate) fn append_field(mut self, field: &'static str) -> Self {
+        self.relative_path.push(FieldPathSegment::Field(field));
+        self
+    }
+
+    pub(crate) fn append_index(mut self, index: usize) -> Self {
+        self.relative_path.push(FieldPathSegment::Index(index));
         self
     }
 
@@ -95,21 +85,6 @@ impl fmt::Display for NativeFragmentLeafDecodeError {
 }
 
 impl Error for NativeFragmentLeafDecodeError {}
-
-// Domain helpers below the protobuf boundary still expose `String` errors.
-// Convert them immediately; the owning decoder attaches the protobuf path via
-// `into_native` before the error leaves the protocol layer.
-impl From<String> for NativeFragmentLeafDecodeError {
-    fn from(detail: String) -> Self {
-        Self::invalid(detail)
-    }
-}
-
-impl From<&str> for NativeFragmentLeafDecodeError {
-    fn from(detail: &str) -> Self {
-        Self::invalid(detail)
-    }
-}
 
 #[cfg(test)]
 impl PartialEq<&str> for NativeFragmentLeafDecodeError {

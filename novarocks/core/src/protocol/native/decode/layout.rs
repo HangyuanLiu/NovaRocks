@@ -27,6 +27,7 @@ use super::error::NativeFragmentLeafDecodeError;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::proto::common;
+use crate::protocol::common::error::ProtocolErrorKind;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Layout {
@@ -81,11 +82,14 @@ impl Layout {
         {
             Ok(slot)
         } else {
-            Err(format!(
-                "ColumnRef column_id={} not found in input layout",
-                column_id
-            )
-            .into())
+            Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "column_id",
+                format!(
+                    "ColumnRef column_id={} not found in input layout",
+                    column_id
+                ),
+            ))
         }
     }
 }
@@ -112,20 +116,36 @@ pub(crate) fn chunk_schema_from_output_columns(
 ) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
-        return Err(format!(
-            "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
-            decoded.fields.len(),
-            decoded.slot_ids.len()
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "output_columns",
+            format!(
+                "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
+                decoded.fields.len(),
+                decoded.slot_ids.len()
+            ),
+        ));
     }
     let slots = decoded
         .fields
         .iter()
         .zip(decoded.slot_ids.iter().copied())
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ChunkSchema::try_new(slots).map(Arc::new)?)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "output_columns",
+                error,
+            )
+        })?;
+    ChunkSchema::try_new(slots).map(Arc::new).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "output_columns",
+            error,
+        )
+    })
 }
 
 #[allow(dead_code)]
@@ -134,12 +154,15 @@ pub(crate) fn slot_schemas_from_output_columns(
 ) -> Result<Vec<ChunkSlotSchema>, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
-        return Err(format!(
-            "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
-            decoded.fields.len(),
-            decoded.slot_ids.len()
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "output_columns",
+            format!(
+                "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
+                decoded.fields.len(),
+                decoded.slot_ids.len()
+            ),
+        ));
     }
     decoded
         .fields
@@ -147,7 +170,13 @@ pub(crate) fn slot_schemas_from_output_columns(
         .zip(decoded.slot_ids.iter().copied())
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(NativeFragmentLeafDecodeError::from)
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "output_columns",
+                error,
+            )
+        })
 }
 
 #[allow(dead_code)]
@@ -178,23 +207,40 @@ fn decode_output_columns(
     for (idx, col) in cols.iter().enumerate() {
         let slot_id = SlotId::new(col.column_id);
         if let Some(first_idx) = seen.insert(slot_id, idx) {
-            return Err(format!(
-                "duplicate OutputColumn.column_id {} at index {} (first seen at index {})",
-                col.column_id, idx, first_idx
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "column_id",
+                format!(
+                    "duplicate OutputColumn.column_id {} at index {} (first seen at index {})",
+                    col.column_id, idx, first_idx
+                ),
             )
-            .into());
+            .prepend_index(idx)
+            .prepend_field("output_columns"));
         }
         let type_desc = col.r#type.as_ref().ok_or_else(|| {
-            format!(
-                "OutputColumn.type missing for column_id={} name='{}' at index {}",
-                col.column_id, col.name, idx
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "type",
+                format!(
+                    "OutputColumn.type missing for column_id={} name='{}' at index {}",
+                    col.column_id, col.name, idx
+                ),
             )
+            .prepend_index(idx)
+            .prepend_field("output_columns")
         })?;
         let field = decode_field_type(&col.name, col.nullable, type_desc).map_err(|err| {
-            format!(
-                "OutputColumn.type decode failed for column_id={} name='{}' at index {}: {}",
-                col.column_id, col.name, idx, err
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "type",
+                format!(
+                    "OutputColumn.type decode failed for column_id={} name='{}' at index {}: {}",
+                    col.column_id, col.name, idx, err
+                ),
             )
+            .prepend_index(idx)
+            .prepend_field("output_columns")
         })?;
 
         slot_ids.push(slot_id);

@@ -25,6 +25,7 @@ use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
 use crate::connector::iceberg::scan_model::IcebergColumnStats;
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use crate::runtime::scan_range::{
     DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue, FilePruningValueKind,
@@ -43,14 +44,16 @@ pub(super) fn decode_file_scan_ranges(
         .enumerate()
         .map(|(idx, range)| {
             if range.has_more.unwrap_or(false) {
-                return Err(NativeFragmentLeafDecodeError::new(format!(
+                return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "has_more", format!(
                     "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
-                )));
+                )).prepend_index(idx).prepend_field("ranges"));
             }
             if range.empty.unwrap_or(false) {
                 Ok(None)
             } else {
-                decode_file_scan_range(node_id, table, idx, range).map(Some)
+                decode_file_scan_range(node_id, table, idx, range)
+                    .map_err(|error| error.prepend_index(idx).prepend_field("ranges"))
+                    .map(Some)
             }
         })
         .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()
@@ -64,29 +67,43 @@ fn decode_file_scan_range(
     range: &ScanRangeParams,
 ) -> Result<FileScanRange, NativeFragmentLeafDecodeError> {
     if range.has_more.unwrap_or(false) {
-        return Err(format!(
-            "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "has_more",
+            format!(
+                "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
+            ),
+        ));
     }
     let ScanRange::File(file) = &range.range else {
-        return Err(format!("ScanNode node_id={node_id} range {idx} expected file range").into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "range",
+            format!("ScanNode node_id={node_id} range {idx} expected file range"),
+        ));
     };
     if file.file_format != FileFormat::Parquet {
-        return Err(format!(
-            "ScanNode node_id={node_id} range {idx} unsupported file_format {}; only PARQUET is supported",
-            file.file_format.as_native_name()
-        ).into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "file_format",
+            format!(
+                "ScanNode node_id={node_id} range {idx} unsupported file_format {}; only PARQUET is supported",
+                file.file_format.as_native_name()
+            ),
+        ));
     }
     let path = file_range_path(table, file)?;
     let file_len = nonnegative_u64(file.file_length, "file_length")?;
     let offset = nonnegative_u64(file.offset, "offset")?;
     if offset > file_len {
-        return Err(format!(
-            "ScanNode node_id={node_id} range {idx} offset {} exceeds file_length {}",
-            file.offset, file.file_length
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "offset",
+            format!(
+                "ScanNode node_id={node_id} range {idx} offset {} exceeds file_length {}",
+                file.offset, file.file_length
+            ),
+        ));
     }
     let length = if file.length > 0 {
         nonnegative_u64(file.length, "length")?
@@ -102,11 +119,22 @@ fn decode_file_scan_range(
         file_len,
         offset,
         length,
-        scan_range_id: i32::try_from(idx)
-            .map_err(|_| format!("ScanNode node_id={node_id} range index overflow"))?,
+        scan_range_id: i32::try_from(idx).map_err(|_| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::OutOfRange,
+                "range",
+                format!("ScanNode node_id={node_id} range index overflow"),
+            )
+        })?,
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
-        ivm_change_op: decode_change_op(node_id, idx, file.ivm_change_op)?,
+        ivm_change_op: decode_change_op(node_id, idx, file.ivm_change_op).map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "ivm_change_op",
+                error,
+            )
+        })?,
         included_positions: if file.included_positions.is_empty() {
             None
         } else {
@@ -147,17 +175,29 @@ fn file_pruning_metadata_from_assignment(
     let mut columns = HashMap::new();
     for (ordinal, value) in values {
         let ordinal_usize = usize::try_from(*ordinal).map_err(|_| {
-            format!(
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::OutOfRange, "file_pruning_min_max_values", format!(
                 "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} must be non-negative"
-            )
+            ))
         })?;
         let Some(field) = schema.fields.get(ordinal_usize) else {
-            return Err(format!(
-                "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} exceeds Iceberg schema field count {}",
-                schema.fields.len()
-            ).into());
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::OutOfRange,
+                "file_pruning_min_max_values",
+                format!(
+                    "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} exceeds Iceberg schema field count {}",
+                    schema.fields.len()
+                ),
+            ));
         };
-        let Some(stats) = column_stats_from_min_max_value(node_id, range_idx, value)? else {
+        let Some(stats) =
+            column_stats_from_min_max_value(node_id, range_idx, value).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "file_pruning_min_max_values",
+                    error,
+                )
+            })?
+        else {
             continue;
         };
         columns.insert(field.name.clone(), stats);
@@ -259,10 +299,18 @@ fn file_range_path(
         .as_deref()
         .filter(|path| !path.is_empty())
     else {
-        return Err("file range missing full_path/relative_path".into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "full_path",
+            "file range missing full_path/relative_path",
+        ));
     };
     if table.location.is_empty() {
-        return Err("HDFS relative_path requires Iceberg table location".into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "relative_path",
+            "HDFS relative_path requires Iceberg table location",
+        ));
     }
     Ok(format!(
         "{}/{}",
@@ -271,9 +319,14 @@ fn file_range_path(
     ))
 }
 
-fn nonnegative_u64(value: i64, field: &str) -> Result<u64, String> {
-    u64::try_from(value)
-        .map_err(|_| format!("file range {field} must be non-negative, got {value}"))
+fn nonnegative_u64(value: i64, field: &'static str) -> Result<u64, NativeFragmentLeafDecodeError> {
+    u64::try_from(value).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            field,
+            format!("file range {field} must be non-negative, got {value}"),
+        )
+    })
 }
 
 fn file_external_datacache(file: &RuntimeFileScanRange) -> Option<ExternalDataCacheRangeOptions> {
@@ -291,14 +344,16 @@ fn decode_delete_files(
     node_id: i32,
     range_idx: usize,
     delete_files: &[IcebergDeleteFile],
-) -> Result<Vec<IcebergDeleteFileSpec>, String> {
+) -> Result<Vec<IcebergDeleteFileSpec>, NativeFragmentLeafDecodeError> {
     delete_files
         .iter()
         .enumerate()
         .map(|(idx, file)| {
-            let path = file.full_path.clone().ok_or_else(|| {
-                format!("ScanNode node_id={node_id} range {range_idx} delete file {idx} full_path missing")
-            })?;
+            let path = file.full_path.clone().ok_or_else(|| NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "full_path",
+                format!("ScanNode node_id={node_id} range {range_idx} delete file {idx} full_path missing"),
+            ).prepend_index(idx).prepend_field("delete_files"))?;
             let file_format = match file.file_format {
                 RuntimeIcebergFileFormat::Parquet => IcebergFileFormat::Parquet,
             };
@@ -308,7 +363,7 @@ fn decode_delete_files(
             };
             let length = file
                 .length
-                .map(|value| nonnegative_u64(value, "delete_file.length"))
+                .map(|value| nonnegative_u64(value, "length").map_err(|error| error.prepend_index(idx).prepend_field("delete_files")))
                 .transpose()?;
             Ok(IcebergDeleteFileSpec {
                 path,
@@ -326,27 +381,27 @@ fn decode_deletion_vector_descriptor(
     node_id: i32,
     range_idx: usize,
     dv: &DeletionVectorDescriptor,
-) -> Result<IcebergDeleteFileSpec, String> {
+) -> Result<IcebergDeleteFileSpec, NativeFragmentLeafDecodeError> {
     let path = dv
         .path_or_inline_dv
         .as_deref()
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .ok_or_else(|| {
-            format!(
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "path_or_inline_dv", format!(
                 "ScanNode node_id={node_id} range {range_idx} deletion vector is missing path_or_inline_dv"
-            )
+            )).prepend_field("deletion_vector_descriptor")
         })?
         .to_string();
     let offset = dv.offset.ok_or_else(|| {
-        format!(
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "offset", format!(
             "ScanNode node_id={node_id} range {range_idx} deletion vector {path} is missing offset"
-        )
+        )).prepend_field("deletion_vector_descriptor")
     })?;
     let size = dv.size_in_bytes.ok_or_else(|| {
-        format!(
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::MissingField, "size_in_bytes", format!(
             "ScanNode node_id={node_id} range {range_idx} deletion vector {path} is missing size_in_bytes"
-        )
+        )).prepend_field("deletion_vector_descriptor")
     })?;
     Ok(IcebergDeleteFileSpec::puffin_position_delete(
         path, None, offset, size,

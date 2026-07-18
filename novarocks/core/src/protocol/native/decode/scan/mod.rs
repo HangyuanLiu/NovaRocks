@@ -34,7 +34,7 @@ use super::node::{DecodedNode, NativePlanDecodeContext};
 use super::{NativeFragmentDecodeError, error::NativeFragmentLeafDecodeError};
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
-use crate::protocol::common::error::FieldPath;
+use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -83,13 +83,13 @@ pub(crate) fn lower_scan_node(
         }
         plan::scan_source::Kind::IcebergMetadataTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergMetadataTable")
-                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+                .map_err(|error| error.into_native(path.clone()))?;
             iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
                 .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
         }
         plan::scan_source::Kind::IcebergDeltaTable(source) => {
             reject_variant_columns_for_source(scan, "IcebergDeltaTable")
-                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+                .map_err(|error| error.into_native(path.clone()))?;
             iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
                 .map_err(|error| error.into_native(source_path.field("iceberg_delta_table")))
         }
@@ -113,7 +113,7 @@ pub(crate) fn lower_scan_node(
         }
         plan::scan_source::Kind::StarrocksTable(source) => {
             reject_variant_columns_for_source(scan, "StarRocksTable")
-                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+                .map_err(|error| error.into_native(path.clone()))?;
             #[cfg(feature = "compat")]
             {
                 starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
@@ -138,7 +138,11 @@ fn reject_variant_columns_for_source(
     if scan.variant_columns.is_empty() {
         return Ok(());
     }
-    Err(format!("{source_name} native scan does not support variant_columns").into())
+    Err(NativeFragmentLeafDecodeError::at_field(
+        ProtocolErrorKind::Unsupported,
+        "variant_columns",
+        format!("{source_name} native scan does not support variant_columns"),
+    ))
 }
 
 #[cfg(test)]
@@ -189,6 +193,7 @@ mod tests {
     use crate::exec::node::scan::ScanMorsel;
     use crate::formats::FileFormatConfig;
     use crate::proto::{common, expr, novarocks, plan};
+    use crate::protocol::common::error::ProtocolErrorKind;
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
     use crate::types::native_proto::encode_type;
@@ -827,6 +832,73 @@ mod tests {
     }
 
     #[test]
+    fn file_range_offset_error_uses_exact_indexed_path() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let mut range = file_range();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        file.offset = -1;
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![range]);
+
+        let error = decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect_err("negative file offset must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.table.source.iceberg_data_files.ranges[0].offset"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn delete_file_error_uses_exact_indexed_descriptor_path() {
+        let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
+            plan::IcebergDataFiles {
+                table: Some(table_info()),
+                files: Vec::new(),
+                cloud_properties: HashMap::new(),
+                binding: plan::IcebergDataFileBinding::ExplicitFiles as i32,
+            },
+        ));
+        let mut range = file_range();
+        let Some(novarocks::scan_range::Kind::File(file)) =
+            range.range.as_mut().and_then(|range| range.kind.as_mut())
+        else {
+            panic!("expected file range");
+        };
+        file.delete_files.push(novarocks::IcebergDeleteFile {
+            full_path: None,
+            file_format: "PARQUET".to_string(),
+            file_content: "POSITION_DELETES".to_string(),
+            length: Some(1),
+        });
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(Arc::new(ConnectorRegistry::default()))
+            .with_scan_ranges(10, vec![range]);
+
+        let error = decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect_err("missing delete file path must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.table.source.iceberg_data_files.ranges[0].delete_files[0].full_path"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
     fn lowers_iceberg_data_file_scan_deletion_vector_to_puffin_delete_file() {
         let node = scan_node(plan::scan_source::Kind::IcebergDataFiles(
             plan::IcebergDataFiles {
@@ -1076,6 +1148,46 @@ mod tests {
             scan.change_files[0].role,
             DeltaSourceRole::DataFile
         ));
+    }
+
+    #[test]
+    fn lowering_iceberg_delta_table_scan_does_not_open_delete_files() {
+        let mut source = iceberg_delta_table_source();
+        let plan::scan_source::Kind::IcebergDeltaTable(delta_source) = &mut source else {
+            unreachable!();
+        };
+        delta_source.delta_plan.as_mut().unwrap().delete_side =
+            Some(plan::IcebergDeltaDeleteSidePlan {
+                base_data_file_lineage: HashMap::new(),
+                previous_data_file_lineage: HashMap::new(),
+                previous_delete_visibility_data_files: vec![
+                    plan::IcebergDeltaDeleteVisibilityDataFile {
+                        path: "file:///definitely-missing/data.parquet".to_string(),
+                        size: 1,
+                        first_row_id: Some(0),
+                        data_sequence_number: Some(1),
+                        delete_files: vec![plan::IcebergDeltaDeleteVisibilityDeleteFile {
+                            path: "file:///definitely-missing/delete.parquet".to_string(),
+                            file_format: plan::IcebergDeltaDeleteFileFormat::Parquet as i32,
+                            file_content: plan::IcebergDeltaDeleteFileContent::Position as i32,
+                            length: Some(1),
+                            content_offset: None,
+                            content_size_in_bytes: None,
+                        }],
+                    },
+                ],
+                previously_deleted_positions_per_file: HashMap::new(),
+                deleted_data_file_paths: Vec::new(),
+            });
+        let node = scan_node(source);
+        let ctx = NativePlanDecodeContext::default();
+        let mut arena = ExprArena::default();
+
+        let lowered = decode_node(&node, &mut arena, &ctx)
+            .expect("native fragment decoding must not touch Iceberg storage");
+        let ExecNodeKind::IcebergDeltaScan(_scan) = lowered.node.kind else {
+            panic!("expected IcebergDeltaScan");
+        };
     }
 
     #[test]

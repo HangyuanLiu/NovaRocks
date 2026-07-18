@@ -35,6 +35,7 @@ use crate::exec::row_position::{
 };
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(crate) fn iceberg_table_descriptor_from_native(
@@ -42,10 +43,14 @@ pub(crate) fn iceberg_table_descriptor_from_native(
     target_columns: &[plan::ColumnDef],
     mode: IcebergSinkMode,
 ) -> Result<IcebergTableDescriptor, NativeFragmentLeafDecodeError> {
-    let schema = table
-        .schema
-        .as_ref()
-        .ok_or_else(|| "native Iceberg write sink target schema missing".to_string())?;
+    let schema = table.schema.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "iceberg",
+            "native Iceberg write sink target schema missing",
+        )
+        .append_field("schema")
+    })?;
     let iceberg_schema = IcebergSchemaDescriptor {
         fields: schema
             .fields
@@ -55,7 +60,15 @@ pub(crate) fn iceberg_table_descriptor_from_native(
     };
     let columns = target_columns
         .iter()
-        .map(column_def_to_table_column)
+        .enumerate()
+        .map(|(index, column)| {
+            column_def_to_table_column(column).map_err(|error| {
+                error
+                    .prepend_index(index)
+                    .prepend_field("columns")
+                    .prepend_field("target_table")
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let equality_delete_schema =
         (mode == IcebergSinkMode::EqualityDeletes).then_some(IcebergSchemaDescriptor {
@@ -97,8 +110,22 @@ fn column_def_to_table_column(
     let data_type = column
         .data_type
         .as_ref()
-        .ok_or_else(|| format!("native Iceberg column {} missing data_type", column.name))
-        .and_then(decode_type)?;
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "data_type",
+                format!("native Iceberg column {} missing data_type", column.name),
+            )
+        })
+        .and_then(|wire| {
+            decode_type(wire).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "data_type",
+                    error,
+                )
+            })
+        })?;
     Ok(IcebergTableColumn {
         name: column.name.clone(),
         data_type,
@@ -113,9 +140,13 @@ pub(crate) fn parse_target_table_metadata(
     let serialized = match mode {
         IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
             Some(iceberg.serialized_metadata.as_ref().ok_or_else(|| {
-                format!(
-                    "native Iceberg {:?} sink requires serialized target table metadata",
-                    mode
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "serialized_metadata",
+                    format!(
+                        "native Iceberg {:?} sink requires serialized target table metadata",
+                        mode
+                    ),
                 )
             })?)
         }
@@ -129,10 +160,14 @@ pub(crate) fn parse_target_table_metadata(
     serde_json::from_str::<TableMetadata>(serialized)
         .map(Some)
         .map_err(|e| {
-            NativeFragmentLeafDecodeError::new(format!(
-                "parse native Iceberg {:?} target metadata failed: {e}",
-                mode
-            ))
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "serialized_metadata",
+                format!(
+                    "parse native Iceberg {:?} target metadata failed: {e}",
+                    mode
+                ),
+            )
         })
 }
 
@@ -150,16 +185,24 @@ pub(super) fn arrow_field_id(field: &Field) -> Result<i32, NativeFragmentLeafDec
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
         .ok_or_else(|| {
-            format!(
-                "native Iceberg sink field {} is missing parquet field id metadata",
-                field.name()
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "field_id",
+                format!(
+                    "native Iceberg sink field {} is missing parquet field id metadata",
+                    field.name()
+                ),
             )
         })?;
     raw.parse::<i32>().map_err(|e| {
-        NativeFragmentLeafDecodeError::new(format!(
-            "native Iceberg sink field {} has invalid parquet field id {raw}: {e}",
-            field.name()
-        ))
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "field_id",
+            format!(
+                "native Iceberg sink field {} has invalid parquet field id {raw}: {e}",
+                field.name()
+            ),
+        )
     })
 }
 
@@ -188,20 +231,33 @@ pub(crate) fn resolve_native_sink_s3_config(
     data_location: &str,
     cloud_properties: &HashMap<String, String>,
 ) -> Result<Option<IcebergSinkObjectStoreConfig>, NativeFragmentLeafDecodeError> {
-    if !crate::fs::access::is_object_store_location_parse_only(data_location)
-        .map_err(|e| format!("parse native Iceberg sink data_location {data_location}: {e}"))?
-    {
+    if !crate::fs::access::is_object_store_location_parse_only(data_location).map_err(|e| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "data_location",
+            format!("parse native Iceberg sink data_location {data_location}: {e}"),
+        )
+    })? {
         return Ok(None);
     }
     let (bucket, _data_root) = crate::fs::access::parse_object_store_path_parse_only(data_location)
         .map_err(|e| {
-            format!("parse native Iceberg sink object-store data_location {data_location}: {e}")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "data_location",
+                format!(
+                    "parse native Iceberg sink object-store data_location {data_location}: {e}"
+                ),
+            )
         })?;
     if cloud_properties.is_empty() {
-        return Err(format!(
-            "native Iceberg sink object-store path requires cloud_properties: data_location={data_location}"
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "cloud_properties",
+            format!(
+                "native Iceberg sink object-store path requires cloud_properties: data_location={data_location}"
+            ),
+        ));
     }
     let cloud_properties = cloud_properties
         .iter()
@@ -210,7 +266,14 @@ pub(crate) fn resolve_native_sink_s3_config(
     let credentials = ObjectStoreCredentials::from_aws_s3_properties(
         ObjectStoreCredentialsSource::IcebergSinkCloudProperties,
         &cloud_properties,
-    )?;
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "cloud_properties",
+            error,
+        )
+    })?;
     Ok(Some(IcebergSinkObjectStoreConfig::from_credentials(
         bucket,
         credentials,
@@ -221,10 +284,13 @@ pub(crate) fn validate_iceberg_sink_file_format(
     file_format: &str,
 ) -> Result<(IcebergFileFormat, String), NativeFragmentLeafDecodeError> {
     if !file_format.eq_ignore_ascii_case("parquet") {
-        return Err(format!(
-            "native Iceberg sink does not support {file_format} files; only Parquet is supported"
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::Unsupported,
+            "file_format",
+            format!(
+                "native Iceberg sink does not support {file_format} files; only Parquet is supported"
+            ),
+        ));
     }
     Ok((IcebergFileFormat::Parquet, file_format.to_string()))
 }
@@ -232,12 +298,21 @@ pub(crate) fn validate_iceberg_sink_file_format(
 pub(super) fn map_native_compression(
     value: i32,
 ) -> Result<Compression, NativeFragmentLeafDecodeError> {
-    let compression = plan::IcebergWriteFileCompression::try_from(value)
-        .map_err(|_| format!("unknown native IcebergWriteFileCompression value {value}"))?;
+    let compression = plan::IcebergWriteFileCompression::try_from(value).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "compression",
+            format!("unknown native IcebergWriteFileCompression value {value}"),
+        )
+    })?;
     match compression {
         plan::IcebergWriteFileCompression::Snappy => Ok(Compression::SNAPPY),
         plan::IcebergWriteFileCompression::Unspecified => {
-            Err("native Iceberg write file compression is unspecified".into())
+            Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidEnum,
+                "compression",
+                "native Iceberg write file compression is unspecified",
+            ))
         }
     }
 }

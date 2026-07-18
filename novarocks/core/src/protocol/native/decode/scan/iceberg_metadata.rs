@@ -29,6 +29,7 @@ use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{lower_scan_predicate, parse_scan_limit, scan_output_columns};
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_metadata_scan(
@@ -41,8 +42,16 @@ pub(super) fn lower_iceberg_metadata_scan(
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(&output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&output_columns)?;
-    let metadata_table_type = metadata_table_type(source.metadata_table_type)?;
-    let ranges = decode_metadata_scan_ranges(ctx.scan_ranges(node.node_id)?)?;
+    let metadata_table_type = metadata_table_type(source.metadata_table_type).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "metadata_table_type",
+            error,
+        )
+    })?;
+    let ranges = decode_metadata_scan_ranges(ctx.scan_ranges(node.node_id)?).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "ranges", error)
+    })?;
     let cfg = IcebergMetadataScanConfig {
         metadata_table_type,
         serialized_table: source.serialized_table.clone(),
@@ -56,7 +65,14 @@ pub(super) fn lower_iceberg_metadata_scan(
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
     let scan_node = ctx
         .connectors()?
-        .create_scan_node("iceberg", ScanConfig::IcebergMetadata(cfg))?
+        .create_scan_node("iceberg", ScanConfig::IcebergMetadata(cfg))
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "serialized_table",
+                error,
+            )
+        })?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)
@@ -105,13 +121,26 @@ fn metadata_output_columns(
 ) -> Result<Vec<IcebergMetadataOutputColumn>, NativeFragmentLeafDecodeError> {
     output_columns
         .iter()
-        .map(|col| {
-            let data_type = col
-                .r#type
-                .as_ref()
-                .ok_or_else(|| format!("metadata output column {} type missing", col.name))
-                .map_err(NativeFragmentLeafDecodeError::new)?;
-            let data_type = super::super::decode_type(data_type)?;
+        .enumerate()
+        .map(|(index, col)| {
+            let data_type = col.r#type.as_ref().ok_or_else(|| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "type",
+                    format!("metadata output column {} type missing", col.name),
+                )
+                .prepend_index(index)
+                .prepend_field("output_columns")
+            })?;
+            let data_type = super::super::decode_type(data_type).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "type",
+                    error,
+                )
+                .prepend_index(index)
+                .prepend_field("output_columns")
+            })?;
             Ok(IcebergMetadataOutputColumn {
                 name: col.name.clone(),
                 slot_id: SlotId::new(col.column_id),

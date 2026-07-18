@@ -21,9 +21,8 @@ use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_
 use super::super::node::DecodedNode;
 use super::common::{lower_scan_predicate, resolve_cloud_object_store_config, scan_output_columns};
 use super::delete_files::{
-    build_delta_delete_side_from_payload, lower_delta_delete_side_payload_from_native,
-    lower_equality_delete_target_from_native, lower_position_delete_source_from_native,
-    reject_native_delta_role_payload,
+    lower_delta_delete_side_payload_from_native, lower_equality_delete_target_from_native,
+    lower_position_delete_source_from_native, reject_native_delta_role_payload,
 };
 use crate::exec::expr::ExprArena;
 use crate::exec::node::filter::FilterNode;
@@ -34,6 +33,7 @@ use crate::exec::node::iceberg_delta_scan::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_delta_table_scan(
@@ -45,28 +45,40 @@ pub(super) fn lower_iceberg_delta_table_scan(
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(&output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&output_columns)?;
-    let table = source
-        .table
-        .as_ref()
-        .ok_or_else(|| "IcebergDeltaTable table missing".to_string())?;
-    if source.from_snapshot_id < 0 {
-        return Err(format!(
-            "IcebergDeltaTable node_id={} from_snapshot_id must be non-negative, got {}",
-            node.node_id, source.from_snapshot_id
+    let table = source.table.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "IcebergDeltaTable table missing",
         )
-        .into());
+    })?;
+    if source.from_snapshot_id < 0 {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "from_snapshot_id",
+            format!(
+                "IcebergDeltaTable node_id={} from_snapshot_id must be non-negative, got {}",
+                node.node_id, source.from_snapshot_id
+            ),
+        ));
     }
     if source.to_snapshot_id < 0 {
-        return Err(format!(
-            "IcebergDeltaTable node_id={} to_snapshot_id must be non-negative, got {}",
-            node.node_id, source.to_snapshot_id
-        )
-        .into());
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "to_snapshot_id",
+            format!(
+                "IcebergDeltaTable node_id={} to_snapshot_id must be non-negative, got {}",
+                node.node_id, source.to_snapshot_id
+            ),
+        ));
     }
-    let delta_plan = source
-        .delta_plan
-        .as_ref()
-        .ok_or_else(|| "IcebergDeltaTable delta_plan missing".to_string())?;
+    let delta_plan = source.delta_plan.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "delta_plan",
+            "IcebergDeltaTable delta_plan missing",
+        )
+    })?;
     let table_payload = IcebergDeltaTablePayload {
         table_location: delta_plan.table_location.clone(),
         data_columns: delta_plan
@@ -78,18 +90,13 @@ pub(super) fn lower_iceberg_delta_table_scan(
             })
             .collect(),
     };
-    let change_files = lower_delta_source_files_from_native(&delta_plan.change_files)?;
-    let object_store_config = resolve_cloud_object_store_config(&delta_plan.cloud_properties)?;
-    let object_store_factory = Arc::new(
-        crate::connector::iceberg::changes::build_factory_for_table_location(
-            &table_payload.table_location,
-            object_store_config.as_ref(),
-        )?,
-    );
+    let change_files = lower_delta_source_files_from_native(&delta_plan.change_files)
+        .map_err(|error| error.prepend_field("delta_plan"))?;
+    let object_store_config = resolve_cloud_object_store_config(&delta_plan.cloud_properties)
+        .map_err(|error| error.prepend_field("delta_plan"))?;
     let delete_side_payload =
-        lower_delta_delete_side_payload_from_native(delta_plan.delete_side.as_ref())?;
-    let delete_side =
-        build_delta_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
+        lower_delta_delete_side_payload_from_native(delta_plan.delete_side.as_ref())
+            .map_err(|error| error.prepend_field("delta_plan"))?;
 
     let mut exec_node = ExecNode {
         kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
@@ -105,11 +112,10 @@ pub(super) fn lower_iceberg_delta_table_scan(
             apply_key_source: ApplyKeySource::BaseRowId,
             change_files,
             object_store_config,
-            iceberg_runtime: Arc::new(IcebergRuntimeHandles {
-                table: table_payload,
-                object_store_factory,
-                delete_side,
-            }),
+            iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
+                table_payload,
+                delete_side_payload,
+            )),
             node_id: node.node_id,
             native_runtime_filter_specs: Vec::new(),
         }),
@@ -135,7 +141,11 @@ fn lower_delta_source_files_from_native(
 ) -> Result<Vec<DeltaSourceFile>, NativeFragmentLeafDecodeError> {
     files
         .iter()
-        .map(lower_delta_source_file_from_native)
+        .enumerate()
+        .map(|(index, file)| {
+            lower_delta_source_file_from_native(file)
+                .map_err(|error| error.prepend_index(index).prepend_field("change_files"))
+        })
         .collect()
 }
 
@@ -143,17 +153,24 @@ fn lower_delta_source_file_from_native(
     file: &plan::IcebergDeltaSourceFile,
 ) -> Result<DeltaSourceFile, NativeFragmentLeafDecodeError> {
     let role = match plan::IcebergDeltaSourceRole::try_from(file.role).map_err(|_| {
-        format!(
-            "IcebergDeltaTable source file {} has unknown delta role {}",
-            file.path, file.role
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "role",
+            format!(
+                "IcebergDeltaTable source file {} has unknown delta role {}",
+                file.path, file.role
+            ),
         )
     })? {
         plan::IcebergDeltaSourceRole::Unspecified => {
-            return Err(format!(
-                "IcebergDeltaTable source file {} has unspecified delta role",
-                file.path
-            )
-            .into());
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidEnum,
+                "role",
+                format!(
+                    "IcebergDeltaTable source file {} has unspecified delta role",
+                    file.path
+                ),
+            ));
         }
         plan::IcebergDeltaSourceRole::DataFile => {
             reject_native_delta_role_payload(
@@ -179,16 +196,25 @@ fn lower_delta_source_file_from_native(
                 ],
             )?;
             if file.position_deletes.is_empty() {
-                return Err(format!(
-                    "IcebergDeltaTable source file {} role POSITION_DELETE requires position_deletes",
-                    file.path
-                ).into());
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "position_deletes",
+                    format!(
+                        "IcebergDeltaTable source file {} role POSITION_DELETE requires position_deletes",
+                        file.path
+                    ),
+                ));
             }
             DeltaSourceRole::PositionDelete {
                 deletes: file
                     .position_deletes
                     .iter()
-                    .map(lower_position_delete_source_from_native)
+                    .enumerate()
+                    .map(|(index, delete)| {
+                        lower_position_delete_source_from_native(delete).map_err(|error| {
+                            error.prepend_index(index).prepend_field("position_deletes")
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
@@ -199,16 +225,24 @@ fn lower_delta_source_file_from_native(
                 &["position_deletes", "deleted_file_visibility"],
             )?;
             if file.equality_field_ids.is_empty() {
-                return Err(format!(
-                    "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_field_ids",
-                    file.path
-                ).into());
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "equality_field_ids",
+                    format!(
+                        "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_field_ids",
+                        file.path
+                    ),
+                ));
             }
             if file.equality_targets.is_empty() {
-                return Err(format!(
-                    "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_targets",
-                    file.path
-                ).into());
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::MissingField,
+                    "equality_targets",
+                    format!(
+                        "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_targets",
+                        file.path
+                    ),
+                ));
             }
             DeltaSourceRole::EqualityDelete {
                 equality_field_ids: file.equality_field_ids.clone(),

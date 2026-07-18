@@ -27,7 +27,9 @@ fn position_delete_descriptor_from_native(
     desc: Option<&plan::PositionDeleteDescriptorInput>,
 ) -> Result<PositionDeleteDescriptorInput, NativeFragmentLeafDecodeError> {
     let desc = desc.ok_or_else(|| {
-        NativeFragmentLeafDecodeError::invalid(
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "position_delete_output_descriptor",
             "native position delete output descriptor is missing",
         )
     })?;
@@ -73,9 +75,22 @@ pub(crate) fn bind_position_delete_descriptor_from_native(
     crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding,
     NativeFragmentLeafDecodeError,
 > {
-    let desc = position_delete_descriptor_from_native(desc)?;
-    Ok(bind_position_delete_descriptor(&desc, &expected)
-        .map_err(|err| err.to_bracketed_user_message())?)
+    let desc = desc.ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "position_delete_output_descriptor",
+            "native position delete output descriptor is missing",
+        )
+    })?;
+    let desc = position_delete_descriptor_from_native(Some(desc))
+        .map_err(|error| error.prepend_field("position_delete_output_descriptor"))?;
+    bind_position_delete_descriptor(&desc, &expected).map_err(|err| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "position_delete_output_descriptor",
+            err.to_bracketed_user_message(),
+        )
+    })
 }
 
 fn position_delete_output_field_from_native(

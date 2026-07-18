@@ -24,13 +24,14 @@ use super::common::{
 };
 use super::file_range::decode_file_scan_ranges;
 use super::read_plan::{maybe_project_data_scan_output, scan_read_plan};
-use crate::cache::{CacheOptions, DataCacheManager};
+use crate::cache::{CacheOptions, DataCacheContext};
 use crate::connector::{HdfsIcebergRuntimePruningConfig, HdfsScanConfig, ScanConfig};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig};
 use crate::proto::plan;
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_data_files_scan(
@@ -41,13 +42,22 @@ pub(super) fn lower_iceberg_data_files_scan(
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     let output_columns = scan_output_columns(scan)?;
-    let table = source
-        .table
-        .as_ref()
-        .ok_or_else(|| "IcebergDataFiles table missing".to_string())?;
+    let table = source.table.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "IcebergDataFiles table missing",
+        )
+    })?;
     let read_plan = scan_read_plan(scan, table, &output_columns)?;
     let ranges = decode_file_scan_ranges(node.node_id, table, ctx.scan_ranges(node.node_id)?)?;
-    let cache_options = CacheOptions::from_query_options(ctx.query_options())?;
+    let cache_options = CacheOptions::from_query_options(ctx.query_options()).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "query_options",
+            error,
+        )
+    })?;
     let batch_size = scan_batch_size(ctx.query_options())?;
     let parquet_cfg = ParquetScanConfig {
         columns: read_plan.read_columns.clone(),
@@ -59,7 +69,7 @@ pub(super) fn lower_iceberg_data_files_scan(
         runtime_min_max_filter_columns: HashMap::new(),
         variant_path_predicates: Vec::new(),
         batch_size: Some(batch_size),
-        datacache: DataCacheManager::instance().external_context(cache_options),
+        datacache: DataCacheContext::external(cache_options),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
         iceberg_output_schema: Some(read_plan.parquet_schema.arrow_schema_ref()),
@@ -92,7 +102,10 @@ pub(super) fn lower_iceberg_data_files_scan(
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
     let scan_node = ctx
         .connectors()?
-        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))?
+        .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
+        })?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(read_plan.read_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)
@@ -112,4 +125,17 @@ pub(super) fn lower_iceberg_data_files_scan(
         read_plan,
         arena,
     )?)
+}
+
+#[cfg(test)]
+mod purity_tests {
+    #[test]
+    fn native_iceberg_data_decoder_does_not_access_cache_singleton() {
+        let source = include_str!("iceberg_data.rs");
+        let singleton_call = concat!("DataCache", "Manager::instance()");
+        assert!(
+            !source.contains(singleton_call),
+            "native Iceberg data decoding must construct DataCacheContext as a pure value"
+        );
+    }
 }

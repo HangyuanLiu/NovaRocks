@@ -36,6 +36,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 use crate::proto::{common, plan};
+use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 #[derive(Clone, Debug)]
@@ -150,16 +151,21 @@ pub(super) fn scan_read_plan(
             continue;
         }
         let name = pred_col.name.as_ref().ok_or_else(|| {
-            format!(
-                "ScanNode predicate column_id={} is not an output column and does not carry a column name",
-                pred_col.column_id
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "predicates",
+                format!(
+                    "predicate column_id={} is not an output column and does not carry a column name",
+                    pred_col.column_id
+                ),
             )
         })?;
         if !required_names.is_empty() && !required_names.contains(name) {
-            return Err(NativeFragmentLeafDecodeError::new(format!(
-                "ScanNode predicate column {} is not listed in required_columns",
-                name
-            )));
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "required_columns",
+                format!("predicate column {name} is not listed in required_columns"),
+            ));
         }
         push_scan_column(
             table,
@@ -270,16 +276,18 @@ fn push_physical_read_column(
     col: common::OutputColumn,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     if !read_slots.insert(col.column_id) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode read columns contain duplicate column_id={}",
-            col.column_id
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!("read columns contain duplicate column_id={}", col.column_id),
+        ));
     }
     if !read_names.insert(col.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode read columns contain duplicate column name {}",
-            col.name
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!("read columns contain duplicate column name {}", col.name),
+        ));
     }
     read_columns.push(col);
     Ok(())
@@ -298,16 +306,21 @@ fn push_scan_column(
     col: common::OutputColumn,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     if !scan_names.insert(col.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode duplicate read column name {}",
-            col.name
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!("duplicate read column name {}", col.name),
+        ));
     }
     if !scan_slots.insert(col.column_id) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode duplicate read column id {} for {}",
-            col.column_id, col.name
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!(
+                "duplicate read column id {} for {}",
+                col.column_id, col.name
+            ),
+        ));
     }
     if !record_iceberg_virtual_column(table, &col, iceberg_virtual)? {
         push_physical_read_column(physical_read_columns, read_names, read_slots, col.clone())?;
@@ -333,16 +346,21 @@ fn ensure_virtual_only_scan_has_row_count_carrier(
     let column_id = allocate_hidden_column_id(next_hidden_column_id, scan_slots)?;
     let column = iceberg_virtual_count_column(column_id);
     if !scan_names.insert(column.name.clone()) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode duplicate read column name {}",
-            column.name
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!("duplicate read column name {}", column.name),
+        ));
     }
     if !scan_slots.insert(column.column_id) {
-        return Err(NativeFragmentLeafDecodeError::new(format!(
-            "ScanNode duplicate read column id {} for {}",
-            column.column_id, column.name
-        )));
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "columns",
+            format!(
+                "duplicate read column id {} for {}",
+                column.column_id, column.name
+            ),
+        ));
     }
     scan_columns.push(column.clone());
     push_physical_read_column(physical_read_columns, read_names, read_slots, column)
@@ -359,12 +377,19 @@ fn parquet_slot_kind_from_native_column(
     }
 }
 
-fn allocate_hidden_column_id(next: &mut u32, used: &HashSet<u32>) -> Result<u32, String> {
+fn allocate_hidden_column_id(
+    next: &mut u32,
+    used: &HashSet<u32>,
+) -> Result<u32, NativeFragmentLeafDecodeError> {
     loop {
         let id = *next;
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| "ScanNode hidden read column id overflow".to_string())?;
+        *next = next.checked_add(1).ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::OutOfRange,
+                "columns",
+                "hidden read column id overflow",
+            )
+        })?;
         if !used.contains(&id) {
             return Ok(id);
         }
@@ -375,9 +400,13 @@ fn output_column_from_predicate_ref(
     col: &PredicateColumnRef,
 ) -> Result<common::OutputColumn, NativeFragmentLeafDecodeError> {
     let name = col.name.clone().ok_or_else(|| {
-        format!(
-            "ScanNode predicate column_id={} requires a column name for hidden read binding",
-            col.column_id
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "predicates",
+            format!(
+                "predicate column_id={} requires a column name for hidden read binding",
+                col.column_id
+            ),
         )
     })?;
     Ok(common::OutputColumn {
@@ -394,23 +423,36 @@ fn output_column_from_table_def(
     name: &str,
     column_id: u32,
 ) -> Result<common::OutputColumn, NativeFragmentLeafDecodeError> {
-    let table = scan
-        .table
-        .as_ref()
-        .ok_or_else(|| "ScanNode table missing".to_string())?;
+    let table = scan.table.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "table",
+            "ScanNode table missing",
+        )
+    })?;
     let column = table
         .columns
         .iter()
         .chain(table.iceberg_row_lineage_metadata_columns.iter())
         .find(|col| col.name == name)
         .ok_or_else(|| {
-            format!("ScanNode required column {name} is not in table column definitions")
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "required_columns",
+                format!("required column {name} is not in table column definitions"),
+            )
         })?;
     let ty = column
         .logical_type
         .as_ref()
         .or(column.data_type.as_ref())
-        .ok_or_else(|| format!("ScanNode required column {name} type missing"))?
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "required_columns",
+                format!("required column {name} type missing"),
+            )
+        })?
         .clone();
     Ok(common::OutputColumn {
         column_id,
@@ -450,10 +492,14 @@ fn collect_predicate_column_refs(
             };
             if let Some(prev) = refs.insert(col.column_id, next.clone()) {
                 if prev.name != next.name {
-                    return Err(NativeFragmentLeafDecodeError::new(format!(
-                        "ScanNode predicate column_id={} has inconsistent names {:?} and {:?}",
-                        col.column_id, prev.name, next.name
-                    )));
+                    return Err(NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "predicates",
+                        format!(
+                            "predicate column_id={} has inconsistent names {:?} and {:?}",
+                            col.column_id, prev.name, next.name
+                        ),
+                    ));
                 }
             }
         }
@@ -562,9 +608,11 @@ pub(super) fn maybe_project_data_scan_output(
         .iter()
         .map(|slot_id| {
             let slot = read_plan.read_schema.slot(*slot_id).ok_or_else(|| {
-                NativeFragmentLeafDecodeError::new(format!(
-                    "ScanNode projection references missing read slot {slot_id}"
-                ))
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    "output_columns",
+                    format!("projection references missing read slot {slot_id}"),
+                )
             })?;
             Ok(arena.push_typed(ExprNode::SlotId(*slot_id), slot.data_type().clone()))
         })
