@@ -21,6 +21,8 @@
 ))]
 
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
