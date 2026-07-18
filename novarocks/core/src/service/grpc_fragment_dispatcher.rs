@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, FragmentSubmission};
+use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
@@ -128,7 +128,7 @@ impl FragmentDispatcher for RemoteDispatcher {
     fn submit_fragment(
         &self,
         backend_idx: usize,
-        submission: FragmentSubmission,
+        submission: NativeFragmentEnvelope,
     ) -> Result<(), String> {
         let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
@@ -302,8 +302,8 @@ mod tests {
         UniqueId { hi, lo }
     }
 
-    fn make_submission(hi: i64, lo: i64) -> FragmentSubmission {
-        FragmentSubmission::new(
+    fn make_submission(hi: i64, lo: i64) -> NativeFragmentEnvelope {
+        NativeFragmentEnvelope::new(
             crate::proto::plan::PlanFragment::default(),
             crate::proto::novarocks::InstanceParams {
                 query_id: Some(ProtoUniqueId { hi, lo: 99 }),

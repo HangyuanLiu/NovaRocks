@@ -16,8 +16,12 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use crate::exec::chunk::ChunkSchemaRef;
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
 use crate::exec::node::ExecPlan;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -154,7 +158,7 @@ pub(crate) enum FragmentSinkKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FragmentSinkAssignmentKind {
     StreamDestinations,
-    DestinationGroups,
+    DestinationGroups(NonZeroUsize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,24 +174,61 @@ pub(crate) struct FragmentSinkSpec {
 }
 
 impl FragmentSinkSpec {
-    pub(crate) const fn for_kind(kind: FragmentSinkKind) -> Self {
+    pub(crate) fn try_for_kind(
+        kind: FragmentSinkKind,
+        destination_group_count: Option<NonZeroUsize>,
+    ) -> Result<Self, FragmentBindingError> {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
 
         let assignment_requirement = match kind {
-            FragmentSinkKind::Result | FragmentSinkKind::Noop | FragmentSinkKind::SchemaTable => {
-                None
-            }
-            FragmentSinkKind::DataStream => Required(StreamDestinations),
             FragmentSinkKind::MultiCastDataStream
             | FragmentSinkKind::SplitDataStream
-            | FragmentSinkKind::IcebergChangeStreamRouter => Required(DestinationGroups),
-            FragmentSinkKind::IcebergTable | FragmentSinkKind::OlapTable => None,
+            | FragmentSinkKind::IcebergChangeStreamRouter => {
+                let count = destination_group_count.ok_or_else(|| {
+                    FragmentBindingError::new(
+                        FragmentBindingTarget::Sink,
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!("sink {kind:?} requires a destination group count"),
+                    )
+                })?;
+                Required(DestinationGroups(count))
+            }
+            FragmentSinkKind::DataStream => {
+                if let Some(count) = destination_group_count {
+                    return Err(FragmentBindingError::new(
+                        FragmentBindingTarget::Sink,
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!(
+                            "sink {kind:?} does not accept destination group count {}",
+                            count.get()
+                        ),
+                    ));
+                }
+                Required(StreamDestinations)
+            }
+            FragmentSinkKind::Result
+            | FragmentSinkKind::Noop
+            | FragmentSinkKind::SchemaTable
+            | FragmentSinkKind::IcebergTable
+            | FragmentSinkKind::OlapTable => {
+                if let Some(count) = destination_group_count {
+                    return Err(FragmentBindingError::new(
+                        FragmentBindingTarget::Sink,
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!(
+                            "sink {kind:?} does not accept destination group count {}",
+                            count.get()
+                        ),
+                    ));
+                }
+                None
+            }
         };
-        Self {
+        Ok(Self {
             kind,
             assignment_requirement,
-        }
+        })
     }
 
     pub(crate) const fn kind(&self) -> FragmentSinkKind {
@@ -256,6 +297,7 @@ impl FragmentProgram {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -302,32 +344,45 @@ mod tests {
             OlapTable, Result, SchemaTable, SplitDataStream,
         };
 
-        for kind in [Result, Noop, SchemaTable] {
-            assert_eq!(
-                FragmentSinkSpec::for_kind(kind).assignment_requirement(),
-                None
-            );
-        }
+        let two = NonZeroUsize::new(2).expect("non-zero group count");
         assert_eq!(
-            FragmentSinkSpec::for_kind(DataStream).assignment_requirement(),
+            FragmentSinkSpec::try_for_kind(DataStream, Option::<NonZeroUsize>::None)
+                .expect("data stream sink")
+                .assignment_requirement(),
             Required(StreamDestinations)
         );
+        for kind in [Result, Noop, SchemaTable, IcebergTable, OlapTable] {
+            assert_eq!(
+                FragmentSinkSpec::try_for_kind(kind, Option::<NonZeroUsize>::None)
+                    .expect("non-grouped sink")
+                    .assignment_requirement(),
+                None
+            );
+            let error = FragmentSinkSpec::try_for_kind(kind, Some(two))
+                .expect_err("non-grouped sink rejects group count");
+            assert_eq!(error.target(), FragmentBindingTarget::Sink);
+            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        }
         for kind in [
             MultiCastDataStream,
             SplitDataStream,
             IcebergChangeStreamRouter,
         ] {
             assert_eq!(
-                FragmentSinkSpec::for_kind(kind).assignment_requirement(),
-                Required(DestinationGroups)
+                FragmentSinkSpec::try_for_kind(kind, Some(two))
+                    .expect("grouped sink")
+                    .assignment_requirement(),
+                Required(DestinationGroups(two))
             );
+            let error = FragmentSinkSpec::try_for_kind(kind, Option::<NonZeroUsize>::None)
+                .expect_err("grouped sink requires group count");
+            assert_eq!(error.target(), FragmentBindingTarget::Sink);
+            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
         }
-        for kind in [IcebergTable, OlapTable] {
-            assert_eq!(
-                FragmentSinkSpec::for_kind(kind).assignment_requirement(),
-                None
-            );
-        }
+        let error = FragmentSinkSpec::try_for_kind(DataStream, Some(two))
+            .expect_err("data stream rejects group count");
+        assert_eq!(error.target(), FragmentBindingTarget::Sink);
+        assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
     }
 
     #[test]
@@ -348,7 +403,7 @@ mod tests {
         let options = FragmentProgramOptions::new(FragmentContractVersion::CURRENT);
         let program = FragmentProgram::new(
             values_plan(),
-            FragmentSinkSpec::for_kind(FragmentSinkKind::Result),
+            FragmentSinkSpec::try_for_kind(FragmentSinkKind::Result, None).expect("result sink"),
             options,
             scan_sources,
             exchange_inputs,
