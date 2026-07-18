@@ -675,6 +675,90 @@ mod tests {
     }
 
     #[test]
+    fn refresh_step_maps_materialized_view_storage_engines() {
+        let starrocks = starrocks_mv_dependency_ref("sales", "orders_mv");
+        let iceberg = iceberg_mv_dependency_ref("ice", "analytics", "orders_mv");
+
+        assert_eq!(
+            refresh_step_for_dependency_object(&starrocks).expect("StarRocks MV refresh step"),
+            MvRefreshDependencyStep {
+                object: starrocks,
+                target: crate::mv::model::MvTarget {
+                    catalog: None,
+                    database: "sales".to_string(),
+                    name: "orders_mv".to_string(),
+                },
+                storage_engine: crate::mv::model::MvStorageEngine::StarRocks,
+            }
+        );
+        assert_eq!(
+            refresh_step_for_dependency_object(&iceberg).expect("Iceberg MV refresh step"),
+            MvRefreshDependencyStep {
+                object: iceberg,
+                target: crate::mv::model::MvTarget {
+                    catalog: Some("ice".to_string()),
+                    database: "analytics".to_string(),
+                    name: "orders_mv".to_string(),
+                },
+                storage_engine: crate::mv::model::MvStorageEngine::Iceberg,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_step_rejects_table_object() {
+        let table = iceberg_table_object_ref("ice", "analytics", "orders");
+
+        assert_eq!(
+            refresh_step_for_dependency_object(&table).expect_err("table must not be refreshed"),
+            "refresh dependency object is not a materialized view: ice.analytics.orders"
+        );
+    }
+
+    #[test]
+    fn refresh_step_rejects_external_table_materialized_view() {
+        let external_mv = MvDependencyObjectRef {
+            catalog: Some("external".to_string()),
+            database_or_namespace: "analytics".to_string(),
+            name: "orders_mv".to_string(),
+            object_type: MvDependencyObjectType::MaterializedView,
+            storage_engine: MvDependencyStorageEngine::ExternalTable,
+        };
+
+        assert_eq!(
+            refresh_step_for_dependency_object(&external_mv)
+                .expect_err("external table must not be refreshed as an MV"),
+            "external table cannot be refreshed as materialized view: mv:external.analytics.orders_mv"
+        );
+    }
+
+    #[test]
+    fn iceberg_mv_target_projection_tolerates_legacy_definitions() {
+        let definitions = [
+            stored_mv_definition(
+                "starrocks",
+                Some("Catalog"),
+                Some("Namespace"),
+                Some("Table"),
+            ),
+            stored_mv_definition("iceberg", None, Some("Namespace"), Some("Table")),
+            stored_mv_definition("iceberg", Some("Catalog"), None, Some("Table")),
+            stored_mv_definition("iceberg", Some("Catalog"), Some("Namespace"), None),
+            stored_mv_definition("Iceberg", Some("Catalog"), Some("Namespace"), Some("Table")),
+        ];
+
+        let projected = definitions
+            .iter()
+            .filter_map(|definition| {
+                iceberg_mv_target_in_scope(definition, "catalog", Some("namespace"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(projected, vec!["Catalog.Namespace.Table"]);
+        assert!(!projected[0].contains("mv:"));
+    }
+
+    #[test]
     fn iceberg_mv_targets_scope_rejects_namespace_scope() {
         let definitions = vec![stored_mv_definition(
             "iceberg",
