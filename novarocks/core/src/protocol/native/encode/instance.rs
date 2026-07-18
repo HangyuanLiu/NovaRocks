@@ -31,7 +31,7 @@ use crate::runtime::scan_range;
 pub(crate) fn encode_instance_params(
     query_id: &UniqueId,
     placement: &FragmentInstancePlacement,
-    query_options: Option<&QueryOptions>,
+    query_options: &QueryOptions,
     backend_num: i32,
     report_endpoint: Option<&RuntimeEndpoint>,
     typed_result_sink: bool,
@@ -66,7 +66,7 @@ pub(crate) fn encode_instance_params(
             .map(encode_destination)
             .collect::<Result<Vec<_>, _>>()?,
         runtime_filter_params: None,
-        query_options: query_options.map(encode_query_options),
+        query_options: Some(encode_query_options(query_options)),
         report_endpoint: report_endpoint.map(RuntimeEndpoint::as_host_port),
         typed_result_sink,
     })

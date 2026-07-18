@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Native coordinator-to-runtime wire encoders.
+
 #[cfg(test)]
 mod boundary_schema;
 #[cfg(test)]

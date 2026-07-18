@@ -32,7 +32,6 @@ pub(crate) use instance::{
     NativeSubmissionMetadata, decode_destinations, decode_endpoint, decode_query_options,
     decode_runtime_filter_params, decode_scan_range_params,
 };
-pub(crate) use layout::Layout;
 #[allow(unused_imports)]
 pub(crate) use node::{
     DecodedNode, NativePlanDecodeContext, decode_node, decode_node_with_runtime_filters,

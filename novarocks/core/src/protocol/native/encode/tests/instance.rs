@@ -108,7 +108,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     let encoded = instance::encode_instance_params(
         &crate::common::types::UniqueId { hi: 100, lo: 200 },
         &placement,
-        Some(&query_options),
+        &query_options,
         5,
         Some(
             &crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
@@ -197,10 +197,14 @@ fn instance_params_encoder_maps_starrocks_tablet_range() {
         per_exch_num_senders: BTreeMap::new(),
     };
 
+    let query_options = crate::runtime::query_options::QueryOptions {
+        pipeline_dop: Some(1),
+        ..Default::default()
+    };
     let encoded = instance::encode_instance_params(
         &crate::common::types::UniqueId { hi: 100, lo: 200 },
         &placement,
-        None,
+        &query_options,
         0,
         None,
         false,

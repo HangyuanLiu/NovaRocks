@@ -87,6 +87,11 @@ impl NativeFragmentEnvelope {
         &self.plan
     }
 
+    #[cfg(test)]
+    pub(crate) fn instance_params_for_test(&self) -> &crate::proto::novarocks::InstanceParams {
+        &self.instance_params
+    }
+
     pub(crate) fn fragment_id(&self) -> u32 {
         self.plan.fragment_id
     }
