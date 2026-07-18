@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use crate::engine::mv::partition::PartitionDerivationSpec;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::mv::partition::derivation::PartitionDerivationSpec;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 
 /// IMV-pipeline-level plan annotations, populated by rewrite rules and

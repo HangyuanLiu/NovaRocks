@@ -23,7 +23,7 @@
 //! flows from plan-time manifest derivation, so this rule never changes the
 //! plan and never fails the rewrite.
 
-use crate::engine::mv::partition::resolve_partition_derivation_spec;
+use crate::mv::partition::derivation::resolve_partition_derivation_spec;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
