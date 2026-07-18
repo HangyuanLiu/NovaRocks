@@ -3098,7 +3098,7 @@ fn rfd5b_old_runtime_filter_messages_are_unreachable_tombstones() {
         "old runtime-filter messages remain reachable from active fields: {reachable:?}"
     );
 
-    let proto = fs::read_to_string(Path::new(manifest_dir()).join("idl/novarocks/plan.proto"))
+    let proto = fs::read_to_string(workspace_root().join("idl/novarocks/plan.proto"))
         .expect("read native plan schema");
     assert!(
         proto.contains("schema tombstone"),
