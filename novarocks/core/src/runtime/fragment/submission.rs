@@ -541,6 +541,10 @@ mod tests {
     #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
+    use crate::exec::node::iceberg_delta_scan::{
+        ApplyKeySource, BaseTableIdent, IcebergDeltaScanNode, IcebergDeltaTablePayload,
+        IcebergRuntimeHandles,
+    };
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
@@ -553,8 +557,6 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::DataStreamPartitionType;
-    use crate::proto::{common, plan};
-    use crate::protocol::native::decode::{NativePlanDecodeContext, decode_node};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::endpoint::RuntimeFilterProberDestination;
     use crate::runtime::exchange::ExchangeKey;
@@ -567,7 +569,6 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::types::logical::{LogicalType, field_with_logical_type};
-    use crate::types::native_proto::encode_type;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
 
     use super::*;
@@ -680,97 +681,34 @@ mod tests {
         )
     }
 
-    fn native_type(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("native type")
-    }
-
     fn native_delta_scan_plan(node_id: i32) -> ExecPlan {
-        let output = common::OutputColumn {
-            column_id: 1,
-            name: "id".to_string(),
-            r#type: Some(native_type(&DataType::Int64)),
-            nullable: true,
-            is_internal: false,
-        };
-        let table = plan::IcebergTableInfo {
-            catalog: "rest".to_string(),
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            table_uuid: None,
-            current_snapshot_id: Some(2),
-            schema_id: 7,
-            location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
-            schema: Some(plan::IcebergSchemaDef {
-                fields: vec![plan::IcebergSchemaFieldDef {
-                    field_id: 10,
-                    name: "id".to_string(),
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                }],
-            }),
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
-        let node = plan::DistributedNode {
-            node_id,
-            fragment_id: 0,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children: Vec::new(),
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: vec![output.clone()],
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    database: "db".to_string(),
-                    table: Some(plan::TableDef {
-                        name: "t".to_string(),
-                        columns: vec![plan::ColumnDef {
-                            name: "id".to_string(),
-                            data_type: Some(native_type(&DataType::Int64)),
-                            nullable: true,
-                            write_default_json: None,
-                            logical_type: None,
-                        }],
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: Some(plan::ScanSource {
-                            kind: Some(plan::scan_source::Kind::IcebergDeltaTable(
-                                plan::IcebergDeltaTable {
-                                    table: Some(table),
-                                    from_snapshot_id: 1,
-                                    to_snapshot_id: 2,
-                                    delta_plan: Some(plan::IcebergDeltaScanPlan {
-                                        table_location: "file:///tmp/novarocks-pbf1c-delta"
-                                            .to_string(),
-                                        data_columns: vec![plan::IcebergDeltaDataColumn {
-                                            name: "id".to_string(),
-                                            field_id: 10,
-                                        }],
-                                        cloud_properties: HashMap::new(),
-                                        change_files: Vec::new(),
-                                        delete_side: None,
-                                    }),
-                                },
-                            )),
-                        }),
-                    }),
-                    alias: None,
-                    columns: vec![output],
-                    predicates: Vec::new(),
-                    required_columns: Vec::new(),
-                    dict_columns: Vec::new(),
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                })),
-            })),
-        };
-        let mut arena = ExprArena::default();
-        let lowered = decode_node(&node, &mut arena, &NativePlanDecodeContext::default())
-            .expect("lower native Iceberg delta scan");
         ExecPlan {
-            arena,
-            root: lowered.node,
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
+                    base_table_ident: BaseTableIdent {
+                        catalog: "rest".to_string(),
+                        namespace: "db".to_string(),
+                        table: "t".to_string(),
+                    },
+                    table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
+                    from_snapshot_id: 1,
+                    to_snapshot_id: 2,
+                    output_chunk_schema: Arc::new(ChunkSchema::empty()),
+                    apply_key_source: ApplyKeySource::BaseRowId,
+                    change_files: Vec::new(),
+                    object_store_config: None,
+                    iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
+                        IcebergDeltaTablePayload {
+                            table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
+                            data_columns: Vec::new(),
+                        },
+                        None,
+                    )),
+                    node_id,
+                    native_runtime_filter_specs: Vec::new(),
+                }),
+            },
         }
     }
 

@@ -18,5 +18,7 @@
 pub(crate) mod error;
 pub(crate) mod instance;
 pub(crate) mod launch_context;
+pub(crate) mod native_execution;
+pub(crate) mod runtime_state;
 pub(crate) mod sink;
 pub(crate) mod submission;

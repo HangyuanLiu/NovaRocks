@@ -21,95 +21,24 @@ use std::sync::Arc;
 use crate::cache::CacheOptions;
 use crate::common::app_config;
 use crate::common::types::UniqueId;
-use crate::lower::novarocks::execute_fragment_native;
+use crate::exec::fragment::program::FragmentSinkKind;
 use crate::novarocks_logging::{error, info, warn};
-use crate::protocol::native::decode::{decode_endpoint, decode_query_options};
+use crate::protocol::native::decode::decode_fragment_submission;
 use crate::runtime::exchange;
+use crate::runtime::fragment::error::{
+    FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
+    FragmentLaunchErrorKind, FragmentLaunchStage,
+};
+use crate::runtime::fragment::native_execution::{
+    NativeExecutionContext, execute_native_submission,
+};
+use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::result_buffer;
 use crate::service::fe_report;
-
-fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {
-    UniqueId {
-        hi: src.hi,
-        lo: src.lo,
-    }
-}
-
-fn query_id_from_native(src: &crate::proto::common::UniqueId) -> QueryId {
-    QueryId {
-        hi: src.hi,
-        lo: src.lo,
-    }
-}
-
-fn profile_name_for_native_fragment(fragment: &crate::proto::plan::PlanFragment) -> String {
-    let plan_node_id = fragment
-        .root
-        .as_ref()
-        .map(|root| root.node_id)
-        .unwrap_or(-1);
-    if plan_node_id >= 0 {
-        format!("execute_fragment_native (plan_node_id={plan_node_id})")
-    } else {
-        "execute_fragment_native".to_string()
-    }
-}
-
-fn native_exchange_sender_counts(
-    instance_params: &crate::proto::novarocks::InstanceParams,
-) -> Result<HashMap<i32, usize>, String> {
-    instance_params
-        .per_exch_num_senders
-        .iter()
-        .map(|(node_id, count)| {
-            if *count <= 0 {
-                return Err(format!(
-                    "native InstanceParams per_exch_num_senders node_id={} must be positive, got {}",
-                    node_id, count
-                ));
-            }
-            let count = usize::try_from(*count).map_err(|_| {
-                format!(
-                    "native InstanceParams per_exch_num_senders node_id={} cannot convert {} to usize",
-                    node_id, count
-                )
-            })?;
-            Ok((*node_id, count))
-        })
-        .collect()
-}
-
-fn native_fragment_uses_fetch_result_buffer(fragment: &crate::proto::plan::PlanFragment) -> bool {
-    matches!(
-        fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref()),
-        Some(crate::proto::plan::data_sink::Kind::Result(true))
-    )
-}
-
-fn prepare_native_result_buffer_if_needed(
-    fragment: &crate::proto::plan::PlanFragment,
-    finst_id: UniqueId,
-    typed_result_sink: bool,
-    mem_tracker: Option<&Arc<MemTracker>>,
-) {
-    if !native_fragment_uses_fetch_result_buffer(fragment) {
-        return;
-    }
-    if typed_result_sink {
-        result_buffer::create_typed_sender(finst_id);
-    } else {
-        result_buffer::create_sender(finst_id);
-    }
-    if let Some(root) = mem_tracker {
-        let label = format!("ResultBuffer: finst={}", finst_id);
-        let tracker = MemTracker::new_child(label, root);
-        result_buffer::set_mem_tracker(finst_id, tracker);
-    }
-}
 
 fn profile_report_interval_ns(
     enable_profile: bool,
@@ -130,37 +59,25 @@ fn profile_report_interval_ns(
 }
 
 fn spawn_exec_fragment_native(
-    fragment: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
-    pipeline_dop: i32,
+    submission: FragmentSubmission,
+    uses_fetch_result_buffer: bool,
     finst_id: UniqueId,
     query_id: QueryId,
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     mgr: Arc<QueryContextManager>,
 ) {
-    let uses_fetch_result_buffer = native_fragment_uses_fetch_result_buffer(&fragment);
-    if uses_fetch_result_buffer {
-        prepare_native_result_buffer_if_needed(
-            &fragment,
-            finst_id,
-            instance_params.typed_result_sink,
-            mem_tracker.as_ref(),
-        );
-    }
     mgr.register_finst(finst_id, query_id);
     std::thread::spawn(move || {
         let wall_start = std::time::Instant::now();
         let profiler_for_wall = profiler.clone();
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_fragment_native(
-                &fragment,
-                &instance_params,
-                None,
-                pipeline_dop,
-                None,
-                profiler,
-                mem_tracker,
+            execute_native_submission(
+                submission,
+                NativeExecutionContext {
+                    profiler,
+                    mem_tracker,
+                },
             )
         }))
         .unwrap_or_else(|payload| {
@@ -171,7 +88,10 @@ fn spawn_exec_fragment_native(
             } else {
                 "unknown panic payload".to_string()
             };
-            Err(format!("panic in native fragment execution: {msg}"))
+            Err(FragmentExecutionError::new(
+                FragmentExecutionErrorKind::Panic,
+                format!("panic in native fragment execution: {msg}"),
+            ))
         });
         if let Some(p) = profiler_for_wall.as_ref() {
             let elapsed_ns =
@@ -192,18 +112,19 @@ fn spawn_exec_fragment_native(
                     }
                 }
                 Err(e) => {
-                    report_error = Some(e.clone());
+                    let error = e.to_string();
+                    report_error = Some(error.clone());
                     error!(
                         target: "novarocks::exec",
                         finst_id = %finst_id,
                         error = %e,
                         "exec_plan_fragment_native failed"
                     );
-                    result_buffer::close_error(finst_id, e);
+                    result_buffer::close_error(finst_id, error);
                 }
             }
         } else if let Err(e) = out {
-            report_error = Some(e.clone());
+            report_error = Some(e.to_string());
             error!(
                 target: "novarocks::exec",
                 finst_id = %finst_id,
@@ -234,35 +155,31 @@ pub fn submit_exec_plan_fragment_native(
     fragment: crate::proto::plan::PlanFragment,
     instance_params: crate::proto::novarocks::InstanceParams,
 ) -> Result<(), String> {
-    let query_id = instance_params
-        .query_id
-        .as_ref()
-        .ok_or_else(|| "native InstanceParams missing query_id".to_string())
-        .map(query_id_from_native)?;
-    let finst_id = instance_params
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
-        .map(unique_id_from_native)?;
-    let query_opts = instance_params
-        .query_options
-        .as_ref()
-        .map(decode_query_options)
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let (delivery_expire, query_expire) = query_expire_durations(query_opts.as_ref());
+    let decoded = decode_fragment_submission(&fragment, &instance_params).map_err(|error| {
+        FragmentLaunchError::new(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            error.to_string(),
+        )
+        .to_string()
+    })?;
+    let (submission, metadata) = decoded.into_parts();
+    let instance = submission.instance();
+    let query_id = instance.query_id();
+    let finst_id = instance.fragment_instance_id().get();
+    let query_opts = instance.runtime_options().query_options().clone();
+    let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts));
     let mgr = query_context_manager();
     mgr.ensure_native_context(query_id, false, delivery_expire, query_expire)?;
-    if instance_params.runtime_filter_params.is_some() {
-        return Err(format!(
-            "native fragment query_id={query_id} contains legacy runtime-filter params"
-        ));
-    }
     mgr.get_or_register_native(query_id, false, delivery_expire, query_expire)?;
-    let cache_options = CacheOptions::from_query_options(query_opts.as_ref())?;
+    let cache_options = CacheOptions::from_query_options(Some(&query_opts))?;
     mgr.set_cache_options(query_id, cache_options)?;
 
-    let sender_counts = native_exchange_sender_counts(&instance_params)?;
+    let sender_counts = instance
+        .exchange_inputs()
+        .iter()
+        .map(|(node_id, assignment)| (node_id.get(), assignment.sender_count().get()))
+        .collect::<HashMap<_, _>>();
     if !sender_counts.is_empty() {
         mgr.update_exchange_sender_counts(query_id, sender_counts)?;
     }
@@ -272,29 +189,19 @@ pub fn submit_exec_plan_fragment_native(
         .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
     let fragment_label = format!("fragment_{:x}_{:x}", finst_id.hi, finst_id.lo);
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
-    let enable_profile = query_opts
-        .as_ref()
-        .map(|opts| opts.enable_profile)
-        .unwrap_or(false);
+    let enable_profile = query_opts.enable_profile;
     let profiler = if enable_profile {
-        Some(Profiler::new(profile_name_for_native_fragment(&fragment)))
+        Some(Profiler::new("execute_native_submission"))
     } else {
         None
     };
-    let report_interval_ns = profile_report_interval_ns(enable_profile, query_opts.as_ref());
-    if let Some(report_endpoint) = instance_params
-        .report_endpoint
-        .as_deref()
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(decode_endpoint)
-        .transpose()
-        .map_err(|error| error.to_string())?
-    {
+    let report_interval_ns = profile_report_interval_ns(enable_profile, Some(&query_opts));
+    if let Some(report_endpoint) = metadata.report_endpoint().cloned() {
         fe_report::register_novarocks_instance(
             finst_id,
             query_id,
             report_endpoint,
-            instance_params.backend_num,
+            instance.backend_num().get(),
             enable_profile,
             profiler.clone(),
             Some(Arc::clone(&fragment_mem_tracker)),
@@ -309,16 +216,15 @@ pub fn submit_exec_plan_fragment_native(
         );
     }
 
-    let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(
-        query_opts
-            .as_ref()
-            .and_then(|opts| opts.pipeline_dop)
-            .unwrap_or(0),
+    debug_assert_eq!(
+        metadata.typed_result_sink(),
+        instance.runtime_options().typed_result_sink()
     );
+    debug_assert_eq!(metadata.backend_num(), instance.backend_num().get());
+    let uses_fetch_result_buffer = submission.program().sink().kind() == FragmentSinkKind::Result;
     spawn_exec_fragment_native(
-        fragment,
-        instance_params,
-        pipeline_dop,
+        submission,
+        uses_fetch_result_buffer,
         finst_id,
         query_id,
         profiler,
@@ -330,29 +236,55 @@ pub fn submit_exec_plan_fragment_native(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::exec::pipeline::dependency::DependencyManager;
-    use crate::runtime::query_context::LegacyRuntimeFilterExecutionClaim;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
-    fn context_submission_state(
-        query_id: QueryId,
-        exchange_node_id: i32,
-    ) -> Option<(usize, usize, Option<CacheOptions>, Option<usize>)> {
-        query_context_manager()
-            .with_context_mut(query_id, |ctx| {
-                Ok((
-                    ctx.num_fragments,
-                    ctx.num_active_fragments,
-                    ctx.cache_options(),
-                    ctx.exchange_sender_count(exchange_node_id),
-                ))
-            })
-            .ok()
+    #[derive(Debug, Eq, PartialEq)]
+    struct RuntimeRegistrationSnapshot {
+        query_context: bool,
+        finst_mapping: Option<QueryId>,
+        result_buffer: &'static str,
+        exchange_receiver: bool,
+        reporter: bool,
+        runtime_filter_lifecycle: bool,
+    }
+
+    fn registration_snapshot(query_id: QueryId, finst_id: UniqueId) -> RuntimeRegistrationSnapshot {
+        let exchange_key = crate::runtime::exchange::ExchangeKey {
+            finst_id_hi: finst_id.hi,
+            finst_id_lo: finst_id.lo,
+            node_id: 404,
+        };
+        let result_buffer = match result_buffer::try_fetch(finst_id) {
+            result_buffer::TryFetchResult::Ready(_) => "ready",
+            result_buffer::TryFetchResult::NotReady => "registered",
+            result_buffer::TryFetchResult::Error(error) => match error.kind {
+                result_buffer::FetchErrorKind::NotFound => "missing",
+                result_buffer::FetchErrorKind::Cancelled => "cancelled",
+                result_buffer::FetchErrorKind::Failed => "failed",
+            },
+        };
+        let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
+            query_id.hi,
+            query_id.lo,
+        );
+
+        RuntimeRegistrationSnapshot {
+            query_context: query_context_manager()
+                .with_context_mut(query_id, |_| Ok(()))
+                .is_ok(),
+            finst_mapping: query_context_manager().query_id_by_finst(finst_id),
+            result_buffer,
+            exchange_receiver: crate::runtime::exchange::snapshot_receiver_state(exchange_key)
+                .is_some(),
+            reporter: fe_report::list_report_instances()
+                .iter()
+                .any(|(registered, _)| *registered == finst_id),
+            runtime_filter_lifecycle:
+                crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global()
+                    .snapshot(query_key)
+                    .is_some(),
+        }
     }
 
     fn native_instance_params(
@@ -368,9 +300,66 @@ mod tests {
                 hi: query_id.hi + 1,
                 lo: query_id.lo + 1,
             }),
+            query_options: Some(crate::proto::novarocks::QueryOptions {
+                pipeline_dop: 1,
+                ..Default::default()
+            }),
+            report_endpoint: Some("127.0.0.1:19030".to_string()),
             runtime_filter_params: Some(runtime_filter_params),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn malformed_fragment_fails_before_runtime_registration() {
+        let query_id = QueryId {
+            hi: 74_001,
+            lo: 74_002,
+        };
+        let finst_id = UniqueId {
+            hi: 74_003,
+            lo: 74_004,
+        };
+        let fragment = crate::proto::plan::PlanFragment {
+            root: None,
+            sink: Some(crate::proto::plan::DataSink {
+                kind: Some(crate::proto::plan::data_sink::Kind::Result(true)),
+            }),
+            runtime_filter_bindings: Some(crate::proto::plan::RuntimeFilterBindingTable {
+                fragment_id: 0,
+                bindings: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let params = crate::proto::novarocks::InstanceParams {
+            query_id: Some(crate::proto::common::UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            fragment_instance_id: Some(crate::proto::common::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            query_options: Some(crate::proto::novarocks::QueryOptions {
+                pipeline_dop: 1,
+                ..Default::default()
+            }),
+            report_endpoint: Some("127.0.0.1:19030".to_string()),
+            ..Default::default()
+        };
+        let before = registration_snapshot(query_id, finst_id);
+
+        let result = submit_exec_plan_fragment_native(fragment, params);
+        let after = registration_snapshot(query_id, finst_id);
+
+        assert!(
+            result.is_err(),
+            "malformed fragment must fail synchronously; before={before:?} after={after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "decode failure must not mutate runtime state"
+        );
     }
 
     #[test]
@@ -389,138 +378,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_filter_rejection_claims_native_without_fragment_side_effects() {
+    fn legacy_runtime_filter_rejection_has_zero_runtime_side_effects() {
         let query_id = QueryId {
             hi: 73_001,
             lo: 73_002,
         };
-        let exchange_node_id = 91;
-        let mut invalid = native_instance_params(
-            query_id,
-            crate::proto::novarocks::RuntimeFilterParams {
-                runtime_filter_builder_number: HashMap::from([(7, 1)]),
-                ..Default::default()
-            },
-        );
-        invalid.per_exch_num_senders.insert(exchange_node_id, 3);
-
-        let error =
-            submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), invalid)
-                .expect_err("native fragment must reject non-empty legacy runtime-filter params");
-        assert!(
-            error.contains("contains legacy runtime-filter params"),
-            "{error}"
-        );
-        assert_eq!(
-            context_submission_state(query_id, exchange_node_id),
-            Some((0, 0, None, None))
-        );
-
-        let manager = query_context_manager();
-        manager
-            .with_context_mut(query_id, |ctx| {
-                assert_eq!(
-                    ctx.legacy_runtime_filter_execution_claim(),
-                    LegacyRuntimeFilterExecutionClaim::NativeDisabled
-                );
-                Ok(())
-            })
-            .expect("inspect retained NativeDisabled claim");
-        let params_set_error = manager
-            .set_runtime_filter_params(
-                query_id,
-                RuntimeFilterParams::new(BTreeMap::new(), BTreeMap::new(), None),
-            )
-            .expect_err("NativeDisabled claim must reject legacy params creation");
-        assert!(
-            params_set_error.contains("NativeDisabled"),
-            "{params_set_error}"
-        );
-        let params_error = manager
-            .get_runtime_filter_params(query_id)
-            .expect_err("NativeDisabled claim must reject legacy params access");
-        assert!(params_error.contains("NativeDisabled"), "{params_error}");
-        let pending_error = manager
-            .enqueue_pending_runtime_filter(query_id, 7, 0, vec![1], None)
-            .expect_err("NativeDisabled claim must reject pending payload creation");
-        assert!(pending_error.contains("NativeDisabled"), "{pending_error}");
-        let pending_access_error = manager
-            .with_context_mut(query_id, |ctx| ctx.drain_pending_runtime_filters())
-            .expect_err("NativeDisabled claim must reject pending payload access");
-        assert!(
-            pending_access_error.contains("NativeDisabled"),
-            "{pending_access_error}"
-        );
-        let hub_set_error = manager
-            .set_runtime_filter_hub(
-                query_id,
-                Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
-            )
-            .expect_err("NativeDisabled claim must reject legacy hub creation");
-        assert!(hub_set_error.contains("NativeDisabled"), "{hub_set_error}");
-        let hub_error = match manager.get_runtime_filter_hub(query_id) {
-            Ok(_) => panic!("NativeDisabled claim must reject legacy hub access"),
-            Err(error) => error,
+        let finst_id = UniqueId {
+            hi: query_id.hi + 1,
+            lo: query_id.lo + 1,
         };
-        assert!(hub_error.contains("NativeDisabled"), "{hub_error}");
-        let worker_error = match manager.get_or_create_runtime_filter_worker(query_id) {
-            Ok(_) => panic!("NativeDisabled claim must reject legacy worker creation"),
-            Err(error) => error,
-        };
-        assert!(worker_error.contains("NativeDisabled"), "{worker_error}");
-        let worker_access_error = match manager.get_runtime_filter_worker(query_id) {
-            Ok(_) => panic!("NativeDisabled claim must reject legacy worker access"),
-            Err(error) => error,
-        };
-        assert!(
-            worker_access_error.contains("NativeDisabled"),
-            "{worker_access_error}"
-        );
-
-        #[cfg(feature = "compat")]
-        {
-            let compat_error = manager
-                .get_or_register_compat(
-                    query_id,
-                    false,
-                    std::time::Duration::from_secs(60),
-                    std::time::Duration::from_secs(60),
-                )
-                .expect_err("Compat fragment must conflict with the retained NativeDisabled claim");
-            assert!(compat_error.contains("NativeDisabled"), "{compat_error}");
-            assert_eq!(
-                context_submission_state(query_id, exchange_node_id),
-                Some((0, 0, None, None))
-            );
-        }
-
-        manager
-            .get_or_register_native(
-                query_id,
-                false,
-                std::time::Duration::from_secs(60),
-                std::time::Duration::from_secs(60),
-            )
-            .expect("legal Native fragment retry must register successfully");
-        assert_eq!(
-            context_submission_state(query_id, exchange_node_id),
-            Some((1, 1, None, None))
-        );
-    }
-
-    #[test]
-    fn rejected_native_fragment_claim_only_context_expires() {
-        let query_id = QueryId {
-            hi: 73_101,
-            lo: 73_102,
-        };
-        let query_key = crate::runtime::runtime_filter_observability::QueryKey::from_hi_lo(
-            query_id.hi,
-            query_id.lo,
-        );
-        let registry =
-            crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
         let invalid = native_instance_params(
             query_id,
             crate::proto::novarocks::RuntimeFilterParams {
@@ -528,79 +394,18 @@ mod tests {
                 ..Default::default()
             },
         );
-
-        let error =
-            submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), invalid)
-                .expect_err("native fragment must reject legacy runtime-filter params");
-        assert!(
-            error.contains("contains legacy runtime-filter params"),
-            "{error}"
-        );
-
-        let manager = query_context_manager();
-        assert!(registry.snapshot(query_key).is_some());
-        manager
-            .with_context_mut(query_id, |context| {
-                assert_eq!(context.num_active_fragments, 0);
-                context.query_deadline =
-                    std::time::Instant::now() - std::time::Duration::from_millis(1);
-                Ok(())
-            })
-            .expect("claim-only active context");
-
-        manager.clean_expired_for_test();
-
-        assert!(manager.query_mem_tracker(query_id).is_none());
-        assert!(registry.snapshot(query_key).is_none());
-    }
-
-    #[test]
-    fn legacy_runtime_filter_rejection_preserves_existing_context_state() {
-        let query_id = QueryId {
-            hi: 73_003,
-            lo: 73_004,
-        };
-        let exchange_node_id = 92;
-        let manager = query_context_manager();
-        manager
-            .get_or_register_native(
-                query_id,
-                false,
-                std::time::Duration::from_secs(60),
-                std::time::Duration::from_secs(60),
-            )
-            .expect("register existing native context");
-        manager
-            .set_cache_options(
-                query_id,
-                CacheOptions::from_query_options(None).expect("default cache options"),
-            )
-            .expect("set existing cache options");
-        manager
-            .update_exchange_sender_counts(query_id, HashMap::from([(exchange_node_id, 2)]))
-            .expect("set existing sender count");
-        let before = context_submission_state(query_id, exchange_node_id);
-
-        let mut invalid = native_instance_params(
-            query_id,
-            crate::proto::novarocks::RuntimeFilterParams {
-                runtime_filter_builder_number: HashMap::from([(8, 1)]),
-                ..Default::default()
-            },
-        );
-        invalid.query_options = Some(crate::proto::novarocks::QueryOptions {
-            enable_scan_datacache: true,
-            ..Default::default()
-        });
-        invalid.per_exch_num_senders.insert(exchange_node_id, 9);
+        let before = registration_snapshot(query_id, finst_id);
 
         let error =
             submit_exec_plan_fragment_native(crate::proto::plan::PlanFragment::default(), invalid)
                 .expect_err("native fragment must reject non-empty legacy runtime-filter params");
+        let after = registration_snapshot(query_id, finst_id);
+
         assert!(
-            error.contains("contains legacy runtime-filter params"),
+            error.contains("instance_params.runtime_filter_params")
+                && error.contains("unsupported"),
             "{error}"
         );
-        assert_eq!(context_submission_state(query_id, exchange_node_id), before);
+        assert_eq!(after, before, "legacy RF decode failure must be pure");
     }
 }

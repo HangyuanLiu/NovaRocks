@@ -41,9 +41,6 @@ use crate::exec::operators::{
 use crate::exec::pipeline::executor::{
     execute_compat_plan_with_pipeline, execute_compat_plan_with_pipeline_with_root_sink_dop,
 };
-use crate::lower::common::fragment_runtime::{
-    RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
-};
 use crate::lower::compat::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
 };
@@ -52,6 +49,9 @@ use crate::lower::compat::type_lowering::{
     native_primitive_type_from_desc, render_schema_from_type_desc,
 };
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::fragment::runtime_state::{
+    RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
+};
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};

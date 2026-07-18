@@ -15,5 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod fragment_runtime;
 pub(crate) mod type_mapping;

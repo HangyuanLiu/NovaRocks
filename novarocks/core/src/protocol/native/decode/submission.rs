@@ -23,8 +23,8 @@ use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
-    ScanSourceContract,
+    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterApplyPoint, RuntimeFilterContract,
+    RuntimeFilterDormancyFact, RuntimeFilterDormancyRole, RuntimeFilterId, ScanSourceContract,
 };
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
@@ -130,7 +130,7 @@ pub(crate) fn decode_fragment_submission(
     )?;
     let decoded_root =
         decode_node_with_runtime_filters(root, &mut arena, &context, &mut runtime_filter_ledger)?;
-    runtime_filter_ledger.finish()?;
+    let dormancy_facts = runtime_filter_ledger.finish()?;
     let plan = ExecPlan {
         arena,
         root: decoded_root.node,
@@ -139,7 +139,7 @@ pub(crate) fn decode_fragment_submission(
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
-    let runtime_filters = decode_runtime_filter_contract(fragment)?;
+    let runtime_filters = decode_runtime_filter_contract(fragment, &dormancy_facts)?;
     let program = FragmentProgram::new(
         plan,
         sink_spec,
@@ -433,6 +433,7 @@ fn decode_exchange_contracts(
 
 fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
+    dormancy_facts: &[super::NativeRuntimeFilterDormancyFact],
 ) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {
     let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
     let table = fragment.runtime_filter_bindings.as_ref().ok_or_else(|| {
@@ -465,7 +466,30 @@ fn decode_runtime_filter_contract(
             }
         }
     }
-    Ok(RuntimeFilterContract::new(build_filters, probe_filters))
+    let dormancy_facts = dormancy_facts
+        .iter()
+        .map(|fact| RuntimeFilterDormancyFact {
+            binding_id: fact.binding_id,
+            channel_id: fact.channel_id,
+            node_id: fact.node_id,
+            apply_point: match fact.apply_point {
+                super::DecodedApplyPoint::NodeInput => RuntimeFilterApplyPoint::NodeInput,
+                super::DecodedApplyPoint::NodeOutput => RuntimeFilterApplyPoint::NodeOutput,
+            },
+            role: match fact.role {
+                super::NativeRuntimeFilterDormancyRole::Producer => {
+                    RuntimeFilterDormancyRole::Producer
+                }
+                super::NativeRuntimeFilterDormancyRole::Consumer => {
+                    RuntimeFilterDormancyRole::Consumer
+                }
+            },
+        })
+        .collect();
+    Ok(
+        RuntimeFilterContract::new(build_filters, probe_filters)
+            .with_dormancy_facts(dormancy_facts),
+    )
 }
 
 fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {

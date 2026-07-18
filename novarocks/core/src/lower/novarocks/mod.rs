@@ -16,7 +16,3 @@
 // under the License.
 
 //! Native fragment execution orchestration.
-
-mod fragment;
-
-pub(crate) use fragment::execute_fragment_native;
