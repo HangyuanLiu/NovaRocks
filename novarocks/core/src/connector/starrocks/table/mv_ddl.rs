@@ -39,11 +39,9 @@ use crate::meta::repository::starrocks_table::{
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
-use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, IcebergPartitionFieldExpr,
-    MaterializedViewDistribution, ObjectName, ShowMaterializedViewsStmt, TableColumnDef,
-    TableKeyDesc, TableKeyKind,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution,
+    ShowMaterializedViewsStmt, TableKeyDesc, TableKeyKind,
 };
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -69,25 +67,16 @@ use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::aggregate_state::mv_shape::{AggregateMvShape, IncrementalMvShape};
 use crate::mv::aggregate_state::physical_column::{
     StarRocksPhysicalColumn, starrocks_physical_column,
+    validate_unique_aggregate_physical_column_names,
 };
 use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
+use crate::mv::analysis::{
+    MvAnalysis, ResolvedTableRef, analyze_mv_select_with, output_column_to_table_column,
+    resolve_mv_name, validate_aggregate_distribution_columns, validate_distribution_columns,
+    validate_starrocks_mv_partition_columns,
+};
 use crate::mv::model::{AggregateFunctionKind, MvStorageEngine, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-
-/// Resolved base-table reference as the MV analyzer stage returns it.
-/// Only the `Iceberg` variant is allowed; anything else fails validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolvedTableRef {
-    Iceberg {
-        catalog: String,
-        namespace: String,
-        table: String,
-    },
-    StarRocks {
-        database: String,
-        table: String,
-    },
-}
 
 pub(crate) fn resolve_mv_storage_engine(
     properties: &[(String, String)],
@@ -158,30 +147,9 @@ pub(crate) fn create_mv(
         &analysis.output_columns,
     )?;
     let created_at_ms = now_ms();
-    let dependency_refs: Vec<crate::engine::mv::analysis::ResolvedTableRef> = analysis
-        .resolved_refs
-        .iter()
-        .map(|table_ref| match table_ref {
-            ResolvedTableRef::Iceberg {
-                catalog,
-                namespace,
-                table,
-            } => crate::engine::mv::analysis::ResolvedTableRef::Iceberg {
-                catalog: catalog.clone(),
-                namespace: namespace.clone(),
-                table: table.clone(),
-            },
-            ResolvedTableRef::StarRocks { database, table } => {
-                crate::engine::mv::analysis::ResolvedTableRef::StarRocks {
-                    database: database.clone(),
-                    table: table.clone(),
-                }
-            }
-        })
-        .collect();
     let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
         state,
-        &dependency_refs,
+        &analysis.resolved_refs,
         created_at_ms,
     )?;
     let dependency_target =
@@ -822,21 +790,6 @@ fn count_distinct_key_type_allowed(input_type: &DataType) -> bool {
     )
 }
 
-pub(crate) fn validate_unique_aggregate_physical_column_names(
-    physical_columns: &[StarRocksPhysicalColumn],
-) -> Result<(), String> {
-    let mut names = HashSet::with_capacity(physical_columns.len());
-    for column in physical_columns {
-        let normalized = normalize_identifier(&column.column.name)?;
-        if !names.insert(normalized.clone()) {
-            return Err(format!(
-                "aggregate MV physical column name collision: hidden column name collision or duplicate physical column `{normalized}`"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
 /// from the loaded iceberg table; passing this struct keeps validation
@@ -1236,359 +1189,29 @@ fn dependency_display_for_mv(
         .join(", "))
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MvAnalysis {
-    pub resolved_refs: Vec<ResolvedTableRef>,
-    pub output_columns: Vec<OutputColumn>,
-    pub resolved_query: ResolvedQuery,
-}
-
 pub(crate) fn analyze_mv_select(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<MvAnalysis, String> {
-    validate_mv_select_raw_query_clauses(query)?;
-    let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
-    let mut analyzed_query = query.clone();
-    register_iceberg_tables_for_mv_analysis(state, &resolved_refs)?;
-    if has_three_part_refs(&resolved_refs) {
-        crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
-    }
-    let catalog = state
-        .catalog_service
-        .local()
-        .read()
-        .expect("standalone catalog read lock");
-    let (resolved, _, _factory) =
-        crate::sql::analyzer::analyze(&analyzed_query, &*catalog, current_database)?;
-    drop(catalog);
-
-    let mut output_columns = resolved.output_columns.clone();
-    if output_columns.is_empty() {
-        output_columns = resolved_output_columns_from_body(&resolved);
-    }
-
-    Ok(MvAnalysis {
-        resolved_refs,
-        output_columns,
-        resolved_query: resolved,
-    })
-}
-
-fn validate_mv_select_raw_query_clauses(query: &sqlparser::ast::Query) -> Result<(), String> {
-    if query.with.is_some() {
-        return Err(unsupported_mv_query_clause("WITH"));
-    }
-    if query.order_by.is_some() {
-        return Err(unsupported_mv_query_clause("ORDER BY"));
-    }
-    if query.limit_clause.is_some() {
-        return Err(unsupported_mv_query_clause("LIMIT or OFFSET"));
-    }
-    if query.fetch.is_some() {
-        return Err(unsupported_mv_query_clause("FETCH"));
-    }
-    if !query.locks.is_empty() {
-        return Err(unsupported_mv_query_clause("locking clauses"));
-    }
-    if query.for_clause.is_some() {
-        return Err(unsupported_mv_query_clause("FOR clauses"));
-    }
-    if query.settings.is_some() {
-        return Err(unsupported_mv_query_clause("SETTINGS"));
-    }
-    if query.format_clause.is_some() {
-        return Err(unsupported_mv_query_clause("FORMAT"));
-    }
-    if !query.pipe_operators.is_empty() {
-        return Err(unsupported_mv_query_clause("pipe operators"));
-    }
-    validate_mv_select_raw_clauses_in_set_expr(query.body.as_ref())
-}
-
-fn validate_mv_select_raw_clauses_in_set_expr(
-    expr: &sqlparser::ast::SetExpr,
-) -> Result<(), String> {
-    match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
-            validate_mv_select_raw_select_clauses(select)?;
-            for from in &select.from {
-                validate_mv_select_raw_clauses_in_table_with_joins(from)?;
-            }
-            Ok(())
-        }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            validate_mv_select_raw_clauses_in_set_expr(left.as_ref())?;
-            validate_mv_select_raw_clauses_in_set_expr(right.as_ref())
-        }
-        sqlparser::ast::SetExpr::Query(query) => validate_mv_select_raw_query_clauses(query),
-        sqlparser::ast::SetExpr::Values(_)
-        | sqlparser::ast::SetExpr::Insert(_)
-        | sqlparser::ast::SetExpr::Update(_)
-        | sqlparser::ast::SetExpr::Delete(_)
-        | sqlparser::ast::SetExpr::Merge(_)
-        | sqlparser::ast::SetExpr::Table(_) => Ok(()),
-    }
-}
-
-fn validate_mv_select_raw_select_clauses(select: &sqlparser::ast::Select) -> Result<(), String> {
-    if select.select_modifiers.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT modifiers"));
-    }
-    if select.top.is_some() {
-        return Err(unsupported_mv_select_clause("TOP"));
-    }
-    if select.exclude.is_some() {
-        return Err(unsupported_mv_select_clause("EXCLUDE"));
-    }
-    if select.into.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT INTO"));
-    }
-    if !select.lateral_views.is_empty() {
-        return Err(unsupported_mv_select_clause("LATERAL VIEW"));
-    }
-    if select.prewhere.is_some() {
-        return Err(unsupported_mv_select_clause("PREWHERE"));
-    }
-    if !select.connect_by.is_empty() {
-        return Err(unsupported_mv_select_clause("CONNECT BY"));
-    }
-    if !select.cluster_by.is_empty() {
-        return Err(unsupported_mv_select_clause("CLUSTER BY"));
-    }
-    if !select.distribute_by.is_empty() {
-        return Err(unsupported_mv_select_clause("DISTRIBUTE BY"));
-    }
-    if !select.sort_by.is_empty() {
-        return Err(unsupported_mv_select_clause("SORT BY"));
-    }
-    if !select.named_window.is_empty() {
-        return Err(unsupported_mv_select_clause("named WINDOW clauses"));
-    }
-    if select.qualify.is_some() {
-        return Err(unsupported_mv_select_clause("QUALIFY"));
-    }
-    if select.value_table_mode.is_some() {
-        return Err(unsupported_mv_select_clause("SELECT AS VALUE or STRUCT"));
-    }
-    Ok(())
-}
-
-fn validate_mv_select_raw_clauses_in_table_with_joins(
-    table: &sqlparser::ast::TableWithJoins,
-) -> Result<(), String> {
-    validate_mv_select_raw_clauses_in_factor(&table.relation)?;
-    for join in &table.joins {
-        validate_mv_select_raw_clauses_in_factor(&join.relation)?;
-    }
-    Ok(())
-}
-
-fn validate_mv_select_raw_clauses_in_factor(
-    factor: &sqlparser::ast::TableFactor,
-) -> Result<(), String> {
-    match factor {
-        sqlparser::ast::TableFactor::Table {
-            args,
-            with_hints,
-            version,
-            with_ordinality,
-            partitions,
-            json_path,
-            sample,
-            index_hints,
-            ..
-        } => {
-            if args.is_some() {
-                return Err(unsupported_mv_from_clause("table function arguments"));
-            }
-            if !with_hints.is_empty() {
-                return Err(unsupported_mv_from_clause("table hints"));
-            }
-            if version.is_some() {
-                return Err(unsupported_mv_from_clause("table version qualifiers"));
-            }
-            if *with_ordinality {
-                return Err(unsupported_mv_from_clause("WITH ORDINALITY"));
-            }
-            if !partitions.is_empty() {
-                return Err(unsupported_mv_from_clause("partition selection"));
-            }
-            if json_path.is_some() {
-                return Err(unsupported_mv_from_clause("JSON path table access"));
-            }
-            if sample.is_some() {
-                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
-            }
-            if !index_hints.is_empty() {
-                return Err(unsupported_mv_from_clause("index hints"));
-            }
-            Ok(())
-        }
-        sqlparser::ast::TableFactor::Derived {
-            lateral,
-            subquery,
-            sample,
-            ..
-        } => {
-            if *lateral {
-                return Err(unsupported_mv_from_clause("LATERAL derived tables"));
-            }
-            if sample.is_some() {
-                return Err(unsupported_mv_from_clause("TABLESAMPLE"));
-            }
-            validate_mv_select_raw_query_clauses(subquery)
-        }
-        sqlparser::ast::TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => validate_mv_select_raw_clauses_in_table_with_joins(table_with_joins),
-        sqlparser::ast::TableFactor::Pivot { table, .. }
-        | sqlparser::ast::TableFactor::Unpivot { table, .. }
-        | sqlparser::ast::TableFactor::MatchRecognize { table, .. } => {
-            validate_mv_select_raw_clauses_in_factor(table)
-        }
-        sqlparser::ast::TableFactor::TableFunction { .. }
-        | sqlparser::ast::TableFactor::Function { .. }
-        | sqlparser::ast::TableFactor::UNNEST { .. }
-        | sqlparser::ast::TableFactor::JsonTable { .. }
-        | sqlparser::ast::TableFactor::OpenJsonTable { .. }
-        | sqlparser::ast::TableFactor::XmlTable { .. }
-        | sqlparser::ast::TableFactor::SemanticView { .. } => {
-            Err(unsupported_mv_from_clause("table functions"))
-        }
-    }
-}
-
-fn unsupported_mv_query_clause(clause: &str) -> String {
-    format!("materialized view SELECT does not support {clause}")
-}
-
-fn unsupported_mv_select_clause(clause: &str) -> String {
-    format!("materialized view SELECT does not support {clause}")
-}
-
-fn unsupported_mv_from_clause(clause: &str) -> String {
-    format!("materialized view SELECT does not support {clause} in FROM")
-}
-
-pub(crate) fn canonicalize_iceberg_mv_select_query(
-    query: &sqlparser::ast::Query,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> sqlparser::ast::Query {
-    let mut query = query.clone();
-    let Some(catalog) = current_catalog else {
-        return query;
-    };
-    qualify_current_catalog_refs_in_query(
-        &mut query,
-        &catalog.to_ascii_lowercase(),
-        &current_database.to_ascii_lowercase(),
-    );
-    query
-}
-
-fn qualify_current_catalog_refs_in_query(
-    query: &mut sqlparser::ast::Query,
-    catalog: &str,
-    current_database: &str,
-) {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
-            qualify_current_catalog_refs_in_set_expr(
-                cte.query.body.as_mut(),
-                catalog,
-                current_database,
-            );
-        }
-    }
-    qualify_current_catalog_refs_in_set_expr(query.body.as_mut(), catalog, current_database);
-}
-
-fn qualify_current_catalog_refs_in_set_expr(
-    expr: &mut sqlparser::ast::SetExpr,
-    catalog: &str,
-    current_database: &str,
-) {
-    match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
-            for from in &mut select.from {
-                qualify_current_catalog_refs_in_factor(
-                    &mut from.relation,
-                    catalog,
-                    current_database,
-                );
-                for join in &mut from.joins {
-                    qualify_current_catalog_refs_in_factor(
-                        &mut join.relation,
-                        catalog,
-                        current_database,
-                    );
-                }
-            }
-        }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            qualify_current_catalog_refs_in_set_expr(left.as_mut(), catalog, current_database);
-            qualify_current_catalog_refs_in_set_expr(right.as_mut(), catalog, current_database);
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            qualify_current_catalog_refs_in_set_expr(
-                query.body.as_mut(),
-                catalog,
-                current_database,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn qualify_current_catalog_refs_in_factor(
-    factor: &mut sqlparser::ast::TableFactor,
-    catalog: &str,
-    current_database: &str,
-) {
-    match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
-            let parts = name
-                .0
-                .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let qualified = match parts.as_slice() {
-                [table] => Some((
-                    catalog.to_string(),
-                    current_database.to_string(),
-                    table.clone(),
-                )),
-                [namespace, table] => Some((catalog.to_string(), namespace.clone(), table.clone())),
-                _ => None,
-            };
-            if let Some((catalog, namespace, table)) = qualified {
-                name.0 = vec![
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(catalog)),
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                        namespace,
-                    )),
-                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(table)),
-                ];
-            }
-        }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            qualify_current_catalog_refs_in_set_expr(
-                subquery.body.as_mut(),
-                catalog,
-                current_database,
-            );
-        }
-        _ => {}
-    }
+    analyze_mv_select_with(
+        query,
+        current_catalog,
+        current_database,
+        |resolved_refs| register_iceberg_tables_for_mv_analysis(state, resolved_refs),
+        |query_for_analysis| {
+            let catalog = state
+                .catalog_service
+                .local()
+                .read()
+                .expect("standalone catalog read lock");
+            let (resolved, _, _factory) =
+                crate::sql::analyzer::analyze(query_for_analysis, &*catalog, current_database)?;
+            drop(catalog);
+            Ok(resolved)
+        },
+    )
 }
 
 fn register_iceberg_tables_for_mv_analysis(
@@ -1632,309 +1255,6 @@ fn register_iceberg_tables_for_mv_analysis(
         local_catalog.register(namespace, table_def)?;
     }
     Ok(())
-}
-
-fn resolved_output_columns_from_body(resolved: &ResolvedQuery) -> Vec<OutputColumn> {
-    match &resolved.body {
-        QueryBody::Select(select) => select
-            .projection
-            .iter()
-            .map(|item| OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            })
-            .collect(),
-        _ => resolved.output_columns.clone(),
-    }
-}
-
-fn validate_distribution_columns(
-    distribution: &MaterializedViewDistribution,
-    output_columns: &[OutputColumn],
-) -> Result<(), String> {
-    for column in &distribution.hash_columns {
-        let exists = output_columns
-            .iter()
-            .any(|output| output.name.eq_ignore_ascii_case(column));
-        if !exists {
-            return Err(format!(
-                "DISTRIBUTED BY column `{column}` not in MV output schema"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_aggregate_distribution_columns(
-    distribution: &MaterializedViewDistribution,
-    shape: &AggregateMvShape,
-) -> Result<(), String> {
-    let group_key_outputs = shape
-        .group_keys
-        .iter()
-        .map(|group_key| normalize_identifier(&group_key.output_name))
-        .collect::<Result<HashSet<_>, _>>()?;
-    for column in &distribution.hash_columns {
-        let normalized = normalize_identifier(column)?;
-        if !group_key_outputs.contains(&normalized) {
-            return Err(format!(
-                "aggregate MV distribution column `{column}` must be a GROUP BY key output column; DISTRIBUTED BY HASH for aggregate MV can only reference GROUP BY keys"
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn resolve_mv_name(
-    name: &ObjectName,
-    current_database: &str,
-) -> Result<(String, String), String> {
-    match name.parts.as_slice() {
-        [table] => Ok((
-            normalize_identifier(current_database)?,
-            normalize_identifier(table)?,
-        )),
-        [database, table] => Ok((
-            normalize_identifier(database)?,
-            normalize_identifier(table)?,
-        )),
-        [catalog, database, table] => {
-            let catalog = normalize_identifier(catalog)?;
-            if catalog != "default_catalog" {
-                return Err(format!(
-                    "materialized view name catalog must be `default_catalog`, got `{catalog}`"
-                ));
-            }
-            Ok((
-                normalize_identifier(database)?,
-                normalize_identifier(table)?,
-            ))
-        }
-        _ => Err(format!(
-            "materialized view name must be `<name>`, `<db>.<name>`, or `default_catalog.<db>.<name>`; got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-pub(crate) fn validate_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[OutputColumn],
-) -> Result<(), String> {
-    let Some(partition_by) = partition_by else {
-        return Ok(());
-    };
-    let output_names = output_columns
-        .iter()
-        .map(|column| normalize_identifier(&column.name))
-        .collect::<Result<HashSet<_>, _>>()?;
-    for field in partition_by {
-        let column = mv_partition_source_column(field);
-        let normalized = normalize_identifier(column)?;
-        if !output_names.contains(&normalized) {
-            return Err(format!(
-                "materialized view PARTITION BY column `{column}` must be an output column"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_starrocks_mv_partition_columns(
-    partition_by: Option<&[IcebergPartitionFieldExpr]>,
-    output_columns: &[OutputColumn],
-) -> Result<(), String> {
-    if let Some(fields) = partition_by {
-        for field in fields {
-            if !matches!(field, IcebergPartitionFieldExpr::Identity { .. }) {
-                return Err(
-                    "StarRocks table materialized view PARTITION BY only supports identity columns"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    validate_mv_partition_columns(partition_by, output_columns)
-}
-
-fn mv_partition_source_column(field: &IcebergPartitionFieldExpr) -> &str {
-    match field {
-        IcebergPartitionFieldExpr::Identity { column }
-        | IcebergPartitionFieldExpr::Year { column }
-        | IcebergPartitionFieldExpr::Month { column }
-        | IcebergPartitionFieldExpr::Day { column }
-        | IcebergPartitionFieldExpr::Hour { column }
-        | IcebergPartitionFieldExpr::Bucket { column, .. }
-        | IcebergPartitionFieldExpr::Truncate { column, .. }
-        | IcebergPartitionFieldExpr::Void { column } => column,
-    }
-}
-
-fn collect_table_refs_from_query(
-    query: &sqlparser::ast::Query,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Vec<ResolvedTableRef> {
-    let mut refs = Vec::new();
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            collect_table_refs_from_set_expr(
-                cte.query.body.as_ref(),
-                current_catalog,
-                current_database,
-                &mut refs,
-            );
-        }
-    }
-    collect_table_refs_from_set_expr(
-        query.body.as_ref(),
-        current_catalog,
-        current_database,
-        &mut refs,
-    );
-    refs
-}
-
-fn collect_table_refs_from_set_expr(
-    expr: &sqlparser::ast::SetExpr,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    refs: &mut Vec<ResolvedTableRef>,
-) {
-    match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
-            for from in &select.from {
-                collect_table_refs_from_factor(
-                    &from.relation,
-                    current_catalog,
-                    current_database,
-                    refs,
-                );
-                for join in &from.joins {
-                    collect_table_refs_from_factor(
-                        &join.relation,
-                        current_catalog,
-                        current_database,
-                        refs,
-                    );
-                }
-            }
-        }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            collect_table_refs_from_set_expr(left, current_catalog, current_database, refs);
-            collect_table_refs_from_set_expr(right, current_catalog, current_database, refs);
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            collect_table_refs_from_set_expr(
-                query.body.as_ref(),
-                current_catalog,
-                current_database,
-                refs,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_refs_from_factor(
-    factor: &sqlparser::ast::TableFactor,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    refs: &mut Vec<ResolvedTableRef>,
-) {
-    match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
-            let parts: Vec<String> = name
-                .0
-                .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_ascii_lowercase())
-                    }
-                    _ => None,
-                })
-                .collect();
-            let resolved = match parts.as_slice() {
-                [catalog, namespace, table] => ResolvedTableRef::Iceberg {
-                    catalog: catalog.clone(),
-                    namespace: namespace.clone(),
-                    table: table.clone(),
-                },
-                [table] => match current_catalog {
-                    Some(catalog) => ResolvedTableRef::Iceberg {
-                        catalog: catalog.to_ascii_lowercase(),
-                        namespace: current_database.to_ascii_lowercase(),
-                        table: table.clone(),
-                    },
-                    None => ResolvedTableRef::StarRocks {
-                        database: current_database.to_ascii_lowercase(),
-                        table: table.clone(),
-                    },
-                },
-                [database, table] => match current_catalog {
-                    Some(catalog) => ResolvedTableRef::Iceberg {
-                        catalog: catalog.to_ascii_lowercase(),
-                        namespace: database.clone(),
-                        table: table.clone(),
-                    },
-                    None => ResolvedTableRef::StarRocks {
-                        database: database.clone(),
-                        table: table.clone(),
-                    },
-                },
-                _ => {
-                    let rendered = parts.join(".");
-                    ResolvedTableRef::StarRocks {
-                        database: current_database.to_ascii_lowercase(),
-                        table: rendered,
-                    }
-                }
-            };
-            if !refs.contains(&resolved) {
-                refs.push(resolved);
-            }
-        }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            if let Some(with) = &subquery.with {
-                for cte in &with.cte_tables {
-                    collect_table_refs_from_set_expr(
-                        cte.query.body.as_ref(),
-                        current_catalog,
-                        current_database,
-                        refs,
-                    );
-                }
-            }
-            collect_table_refs_from_set_expr(
-                subquery.body.as_ref(),
-                current_catalog,
-                current_database,
-                refs,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn has_three_part_refs(resolved_refs: &[ResolvedTableRef]) -> bool {
-    resolved_refs
-        .iter()
-        .any(|table_ref| matches!(table_ref, ResolvedTableRef::Iceberg { .. }))
-}
-
-pub(crate) fn output_column_to_table_column(
-    column: &OutputColumn,
-) -> Result<TableColumnDef, String> {
-    Ok(TableColumnDef {
-        name: column.name.clone(),
-        data_type: arrow_data_type_to_sql_type(&column.data_type)?,
-        nullable: column.nullable,
-        aggregation: None,
-        default: None,
-    })
 }
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {

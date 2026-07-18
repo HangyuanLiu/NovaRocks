@@ -686,7 +686,7 @@ pub(crate) fn list_mvs(
             .then(left.name.cmp(&right.name))
     });
     Ok(StatementResult::Query(
-        crate::engine::mv::analysis::build_mv_rows_result(&rows)?,
+        crate::engine::mv::analysis_adapter::build_mv_rows_result(&rows)?,
     ))
 }
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod analysis;
+pub(crate) mod analysis_adapter;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;
 pub(crate) mod iceberg_backend;

@@ -63,7 +63,7 @@ use crate::sql::analysis::{
 use crate::sql::planner::table::ScanSource;
 
 pub(crate) fn derive_imv_refresh_contract(
-    analysis: &crate::engine::mv::analysis::MvAnalysis,
+    analysis: &crate::mv::analysis::MvAnalysis,
 ) -> Result<ImvRefreshContract, String> {
     derive_fragment_property(&analysis.resolved_query)?.into_refresh_contract()
 }

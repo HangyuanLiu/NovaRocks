@@ -21,8 +21,8 @@ mod tests {
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
     };
-    use crate::engine::mv::analysis::{MvAnalysis, ResolvedTableRef};
     use crate::engine::mv::refresh_property::derive_imv_refresh_contract;
+    use crate::mv::analysis::{MvAnalysis, ResolvedTableRef};
     use crate::mv::refresh::apply_key::{ApplyKeyContract, ApplyKeyValueType, RewriteEvidence};
     use crate::mv::refresh::contract::{
         AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
