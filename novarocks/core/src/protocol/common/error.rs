@@ -66,6 +66,14 @@ impl FieldPath {
     pub(crate) fn segments(&self) -> &[FieldPathSegment] {
         &self.0
     }
+
+    pub(crate) fn append_segments(
+        mut self,
+        segments: impl IntoIterator<Item = FieldPathSegment>,
+    ) -> Self {
+        self.0.extend(segments);
+        self
+    }
 }
 
 impl fmt::Display for FieldPath {

@@ -396,12 +396,11 @@ fn decode_exchange_contracts(
         if let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_ref() {
             let schema = super::layout::chunk_schema_from_output_columns(&exchange.output_columns)
                 .map_err(|error| {
-                    NativeFragmentDecodeError::invalid_value(
+                    error.into_native(
                         path.clone()
                             .field("payload")
                             .field("exchange")
                             .field("output_columns"),
-                        error,
                     )
                 })?;
             if contracts
@@ -724,6 +723,88 @@ mod tests {
             "plan_fragment.root.payload.physical.values.rows[0].values[0].type"
         );
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn binary_expression_error_includes_oneof_segment() {
+        let mut fragment = values_noop_fragment();
+        let root = fragment.root.as_mut().expect("root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_mut()
+        else {
+            panic!("physical root");
+        };
+        let Some(plan::plan_node::Kind::Values(values)) = physical.kind.as_mut() else {
+            panic!("values root");
+        };
+        values.rows.push(plan::ExprList {
+            values: vec![crate::proto::expr::Expr {
+                r#type: Some(encode_type(&DataType::Boolean).expect("encode type")),
+                nullable: false,
+                kind: Some(crate::proto::expr::expr::Kind::BinaryOp(Box::new(
+                    crate::proto::expr::BinaryOpExpr {
+                        op: crate::proto::expr::BinaryOp::Eq as i32,
+                        left: None,
+                        right: None,
+                    },
+                ))),
+            }],
+        });
+
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 211, lo: 212 }, UniqueId { hi: 221, lo: 222 }),
+        )
+        .expect_err("missing binary left operand must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.values.rows[0].values[0].binary_op.left"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn scan_missing_table_uses_exact_typed_path() {
+        let mut fragment = values_noop_fragment();
+        let root = fragment.root.as_mut().expect("root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_mut()
+        else {
+            panic!("physical root");
+        };
+        physical.kind = Some(plan::plan_node::Kind::Scan(plan::ScanNode {
+            database: "db".to_string(),
+            table: None,
+            ..Default::default()
+        }));
+
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 231, lo: 232 }, UniqueId { hi: 241, lo: 242 }),
+        )
+        .expect_err("missing scan table must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.scan.table"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn false_noop_marker_uses_sink_oneof_path() {
+        let mut fragment = values_noop_fragment();
+        fragment.sink = Some(plan::DataSink {
+            kind: Some(plan::data_sink::Kind::Noop(false)),
+        });
+
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 251, lo: 252 }, UniqueId { hi: 261, lo: 262 }),
+        )
+        .expect_err("false noop marker must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.sink.noop");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
     }
 
     #[test]

@@ -175,7 +175,9 @@ pub(super) fn lower_sort_items(
         .collect()
 }
 
-pub(super) fn parse_sort_topn_type(value: Option<i32>) -> Result<SortTopNType, String> {
+pub(super) fn parse_sort_topn_type(
+    value: Option<i32>,
+) -> Result<SortTopNType, super::super::error::NativeFragmentLeafDecodeError> {
     let Some(value) = value else {
         return Ok(SortTopNType::RowNumber);
     };

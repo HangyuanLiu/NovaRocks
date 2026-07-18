@@ -43,23 +43,12 @@ pub(super) fn lower_project_node(
     })?;
     let child = children.pop().expect("child");
     let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
-    let layout = layout_from_output_columns(&project_outputs.output_columns).map_err(|error| {
-        super::super::NativeFragmentDecodeError::invalid_value(path.clone().field("items"), error)
-    })?;
-    let output_schema =
-        chunk_schema_from_output_columns(&project_outputs.output_columns).map_err(|error| {
-            super::super::NativeFragmentDecodeError::invalid_value(
-                path.clone().field("items"),
-                error,
-            )
-        })?;
+    let layout = layout_from_output_columns(&project_outputs.output_columns)
+        .map_err(|error| error.into_native(path.clone().field("items")))?;
+    let output_schema = chunk_schema_from_output_columns(&project_outputs.output_columns)
+        .map_err(|error| error.into_native(path.clone().field("items")))?;
     let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)
-        .map_err(|error| {
-            super::super::NativeFragmentDecodeError::invalid_value(
-                path.clone().field("items"),
-                error,
-            )
-        })?;
+        .map_err(|error| error.into_native(path.clone().field("items")))?;
 
     let exprs = project_outputs
         .computed_item_indices

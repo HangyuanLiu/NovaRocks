@@ -79,7 +79,7 @@ pub(super) fn output_column_data_type(
 
 pub(super) fn scan_batch_size(
     query_options: Option<&crate::runtime::query_options::QueryOptions>,
-) -> Result<usize, String> {
+) -> Result<usize, NativeFragmentLeafDecodeError> {
     let Some(value) = query_options.and_then(|opts| opts.batch_size) else {
         return Ok(4096);
     };
@@ -87,7 +87,7 @@ pub(super) fn scan_batch_size(
         format!("native ScanNode query_options.batch_size must be positive, got {value}")
     })?;
     if batch_size == 0 {
-        return Err("native ScanNode query_options.batch_size must be positive".to_string());
+        return Err("native ScanNode query_options.batch_size must be positive".into());
     }
     Ok(batch_size)
 }
@@ -110,11 +110,11 @@ pub(super) fn lower_scan_predicate(
     Ok(predicate)
 }
 
-pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
+pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragmentLeafDecodeError> {
     if limit == -1 {
         Ok(None)
     } else if limit < 0 {
-        Err(format!("ScanNode limit must be -1 or >= 0, got {limit}"))
+        Err(format!("ScanNode limit must be -1 or >= 0, got {limit}").into())
     } else {
         Ok(Some(limit as usize))
     }
@@ -122,7 +122,7 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, String> {
 
 pub(super) fn resolve_cloud_object_store_config(
     cloud_properties: &HashMap<String, String>,
-) -> Result<Option<ObjectStoreConfig>, String> {
+) -> Result<Option<ObjectStoreConfig>, NativeFragmentLeafDecodeError> {
     let props = cloud_properties
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))

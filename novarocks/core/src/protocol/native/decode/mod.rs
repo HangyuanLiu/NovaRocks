@@ -44,7 +44,8 @@ pub(crate) use runtime_filter::{
 #[cfg(test)]
 pub(crate) use scan::scan_read_binding_for_test;
 pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
-pub(crate) use submission::{DecodedNativeFragment, decode_fragment_submission};
+#[allow(unused_imports)]
+pub(crate) use submission::decode_fragment_submission;
 
 #[cfg(test)]
 mod tests {

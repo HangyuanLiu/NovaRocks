@@ -209,7 +209,7 @@ fn lower_novarocks_delete_file_content(
 pub(super) fn build_delta_delete_side_from_payload(
     payload: Option<DeltaScanDeleteSidePayload>,
     object_store_config: Option<&ObjectStoreConfig>,
-) -> Result<Option<DeltaScanDeleteSide>, String> {
+) -> Result<Option<DeltaScanDeleteSide>, NativeFragmentLeafDecodeError> {
     let Some(payload) = payload else {
         return Ok(None);
     };

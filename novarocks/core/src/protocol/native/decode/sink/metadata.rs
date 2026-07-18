@@ -109,7 +109,7 @@ fn column_def_to_table_column(
 pub(crate) fn parse_target_table_metadata(
     iceberg: &IcebergTableDescriptor,
     mode: IcebergSinkMode,
-) -> Result<Option<TableMetadata>, String> {
+) -> Result<Option<TableMetadata>, NativeFragmentLeafDecodeError> {
     let serialized = match mode {
         IcebergSinkMode::PositionDeletes | IcebergSinkMode::DeletionVectors => {
             Some(iceberg.serialized_metadata.as_ref().ok_or_else(|| {
@@ -129,10 +129,10 @@ pub(crate) fn parse_target_table_metadata(
     serde_json::from_str::<TableMetadata>(serialized)
         .map(Some)
         .map_err(|e| {
-            format!(
+            NativeFragmentLeafDecodeError::new(format!(
                 "parse native Iceberg {:?} target metadata failed: {e}",
                 mode
-            )
+            ))
         })
 }
 
@@ -145,7 +145,7 @@ pub(crate) fn iceberg_table_location(serialized_metadata: Option<&str>) -> Optio
         .map(ToString::to_string)
 }
 
-pub(super) fn arrow_field_id(field: &Field) -> Result<i32, String> {
+pub(super) fn arrow_field_id(field: &Field) -> Result<i32, NativeFragmentLeafDecodeError> {
     let raw = field
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
@@ -156,14 +156,16 @@ pub(super) fn arrow_field_id(field: &Field) -> Result<i32, String> {
             )
         })?;
     raw.parse::<i32>().map_err(|e| {
-        format!(
+        NativeFragmentLeafDecodeError::new(format!(
             "native Iceberg sink field {} has invalid parquet field id {raw}: {e}",
             field.name()
-        )
+        ))
     })
 }
 
-pub(super) fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
+pub(super) fn schema_has_reserved_row_lineage_columns(
+    schema: &Schema,
+) -> Result<bool, NativeFragmentLeafDecodeError> {
     let mut has_row_id = false;
     let mut has_last_updated = false;
     for field in schema.fields() {
@@ -185,7 +187,7 @@ pub(super) fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result
 pub(crate) fn resolve_native_sink_s3_config(
     data_location: &str,
     cloud_properties: &HashMap<String, String>,
-) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
+) -> Result<Option<IcebergSinkObjectStoreConfig>, NativeFragmentLeafDecodeError> {
     if !crate::fs::access::is_object_store_location_parse_only(data_location)
         .map_err(|e| format!("parse native Iceberg sink data_location {data_location}: {e}"))?
     {
@@ -198,7 +200,8 @@ pub(crate) fn resolve_native_sink_s3_config(
     if cloud_properties.is_empty() {
         return Err(format!(
             "native Iceberg sink object-store path requires cloud_properties: data_location={data_location}"
-        ));
+        )
+        .into());
     }
     let cloud_properties = cloud_properties
         .iter()
@@ -216,22 +219,25 @@ pub(crate) fn resolve_native_sink_s3_config(
 
 pub(crate) fn validate_iceberg_sink_file_format(
     file_format: &str,
-) -> Result<(IcebergFileFormat, String), String> {
+) -> Result<(IcebergFileFormat, String), NativeFragmentLeafDecodeError> {
     if !file_format.eq_ignore_ascii_case("parquet") {
         return Err(format!(
             "native Iceberg sink does not support {file_format} files; only Parquet is supported"
-        ));
+        )
+        .into());
     }
     Ok((IcebergFileFormat::Parquet, file_format.to_string()))
 }
 
-pub(super) fn map_native_compression(value: i32) -> Result<Compression, String> {
+pub(super) fn map_native_compression(
+    value: i32,
+) -> Result<Compression, NativeFragmentLeafDecodeError> {
     let compression = plan::IcebergWriteFileCompression::try_from(value)
         .map_err(|_| format!("unknown native IcebergWriteFileCompression value {value}"))?;
     match compression {
         plan::IcebergWriteFileCompression::Snappy => Ok(Compression::SNAPPY),
         plan::IcebergWriteFileCompression::Unspecified => {
-            Err("native Iceberg write file compression is unspecified".to_string())
+            Err("native Iceberg write file compression is unspecified".into())
         }
     }
 }

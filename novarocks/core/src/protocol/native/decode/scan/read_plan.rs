@@ -548,7 +548,7 @@ pub(super) fn maybe_project_data_scan_output(
     scan_lowered: DecodedNode,
     read_plan: ScanReadPlan,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     if read_plan.read_layout.order() == read_plan.output_layout.order() {
         return Ok(DecodedNode {
             node: scan_lowered.node,
@@ -562,11 +562,13 @@ pub(super) fn maybe_project_data_scan_output(
         .iter()
         .map(|slot_id| {
             let slot = read_plan.read_schema.slot(*slot_id).ok_or_else(|| {
-                format!("ScanNode projection references missing read slot {slot_id}")
+                NativeFragmentLeafDecodeError::new(format!(
+                    "ScanNode projection references missing read slot {slot_id}"
+                ))
             })?;
             Ok(arena.push_typed(ExprNode::SlotId(*slot_id), slot.data_type().clone()))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Project(ProjectNode {

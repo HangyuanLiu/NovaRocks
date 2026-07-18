@@ -18,6 +18,7 @@
 use std::collections::HashSet;
 
 use super::super::NativeFragmentDecodeError;
+use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::layout::{
     Layout, chunk_schema_from_output_columns, layout_from_output_columns,
     slot_schemas_from_output_columns,
@@ -108,7 +109,10 @@ pub(crate) fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, St
     Ok(Layout::for_slots(slots))
 }
 
-pub(crate) fn proto_join_type(value: i32, node_kind: &str) -> Result<JoinType, String> {
+pub(crate) fn proto_join_type(
+    value: i32,
+    node_kind: &str,
+) -> Result<JoinType, NativeFragmentLeafDecodeError> {
     match plan::JoinKind::try_from(value)
         .map_err(|_| format!("{node_kind} unknown join_type {value}"))?
     {
@@ -121,8 +125,10 @@ pub(crate) fn proto_join_type(value: i32, node_kind: &str) -> Result<JoinType, S
         plan::JoinKind::LeftAnti => Ok(JoinType::LeftAnti),
         plan::JoinKind::RightAnti => Ok(JoinType::RightAnti),
         plan::JoinKind::NullAwareLeftAnti => Ok(JoinType::NullAwareLeftAnti),
-        plan::JoinKind::Cross => Err(format!("{node_kind} CROSS join requires NestLoopJoinNode")),
-        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified")),
+        plan::JoinKind::Cross => {
+            Err(format!("{node_kind} CROSS join requires NestLoopJoinNode").into())
+        }
+        plan::JoinKind::Unspecified => Err(format!("{node_kind} join_type is unspecified").into()),
     }
 }
 

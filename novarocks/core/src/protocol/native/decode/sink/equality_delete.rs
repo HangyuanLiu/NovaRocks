@@ -23,11 +23,12 @@ use iceberg::spec::TableMetadata;
 use super::metadata::arrow_field_id;
 use crate::connector::iceberg::commit::EqualityDeleteColumn;
 use crate::connector::iceberg::schema::{IcebergTableDescriptor, apply_field_id_recursive};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(crate) fn validate_equality_delete_unpartitioned_target_metadata(
     iceberg: &IcebergTableDescriptor,
     target_partition_spec_id: i32,
-) -> Result<(), String> {
+) -> Result<(), NativeFragmentLeafDecodeError> {
     let Some(serialized) = iceberg.serialized_metadata.as_ref() else {
         return Ok(());
     };
@@ -45,17 +46,18 @@ pub(crate) fn validate_equality_delete_unpartitioned_target_metadata(
             "native Iceberg equality-delete sink currently supports only unpartitioned tables; \
             target partition spec id {target_partition_spec_id} has {} fields",
             spec.fields().len()
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
 pub(crate) fn build_equality_delete_output_schema(
     iceberg: &IcebergTableDescriptor,
-) -> Result<(SchemaRef, Vec<EqualityDeleteColumn>), String> {
+) -> Result<(SchemaRef, Vec<EqualityDeleteColumn>), NativeFragmentLeafDecodeError> {
     let columns = &iceberg.columns;
     if columns.is_empty() {
-        return Err("native Iceberg equality-delete sink requires equality columns".to_string());
+        return Err("native Iceberg equality-delete sink requires equality columns".into());
     }
     let key_fields = iceberg
         .equality_delete_schema
@@ -66,7 +68,7 @@ pub(crate) fn build_equality_delete_output_schema(
         .fields
         .as_slice();
     if key_fields.is_empty() {
-        return Err("native Iceberg equality-delete sink requires equality columns".to_string());
+        return Err("native Iceberg equality-delete sink requires equality columns".into());
     }
     let mut fields = Vec::with_capacity(key_fields.len());
     let mut equality_columns = Vec::with_capacity(key_fields.len());

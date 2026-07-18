@@ -566,6 +566,7 @@ pub(crate) fn execute_lake_lookup_request(
                 profile_label: Some(format!("lake_glm_lookup_rss_id={}", rss_id)),
                 min_max_predicates: Vec::new(),
                 lake_schema_meta: lake_info.lake_schema_meta.clone(),
+                deferred_lake_resolution: None,
                 topn_filter_column_map: std::collections::HashMap::new(),
             };
 

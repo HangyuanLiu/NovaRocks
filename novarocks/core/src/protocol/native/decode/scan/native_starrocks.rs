@@ -17,23 +17,26 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::connector::starrocks::fe_v2_meta::{
-    LakeScanTabletRef, LakeTableIdentity, lake_scan_execution_properties,
-};
+use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
 use crate::connector::starrocks::scan::{
-    LakeScanSchemaMeta, StarRocksScanRange, StarRocksSchemaColumnHint,
+    DeferredLakeScanResolution, LakeScanSchemaMeta, StarRocksScanRange, StarRocksSchemaColumnHint,
 };
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::proto::plan;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
+
+fn invalid<T>(detail: String) -> Result<T, NativeFragmentLeafDecodeError> {
+    Err(NativeFragmentLeafDecodeError::invalid(detail))
+}
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
 
 pub(super) struct DecodedStarRocksScanPreparation {
     pub(crate) properties: BTreeMap<String, String>,
     pub(crate) ranges: Vec<StarRocksScanRange>,
     pub(crate) lake_schema_meta: LakeScanSchemaMeta,
+    pub(crate) deferred_lake_resolution: DeferredLakeScanResolution,
 }
 
 pub(super) fn decode_starrocks_scan_preparation(
@@ -43,7 +46,7 @@ pub(super) fn decode_starrocks_scan_preparation(
     query_id: Option<QueryId>,
     range_params: &[ScanRangeParams],
 ) -> Result<DecodedStarRocksScanPreparation, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<DecodedStarRocksScanPreparation, String> {
+    let decoded = (|| -> Result<DecodedStarRocksScanPreparation, NativeFragmentLeafDecodeError> {
         let native_tablet_schema = validate_source(node_id, source)?;
         let ranges = decode_ranges(node_id, range_params)?;
         let tablet_refs = ranges
@@ -54,9 +57,9 @@ pub(super) fn decode_starrocks_scan_preparation(
                 version: range.version.expect("validated version"),
             })
             .collect::<Vec<_>>();
-        let properties = lake_scan_execution_properties(
+        let deferred_lake_resolution = DeferredLakeScanResolution::new(
             query_id,
-            &LakeTableIdentity {
+            LakeTableIdentity {
                 catalog: source.catalog_name.clone(),
                 db_name: scan.database.clone(),
                 table_name: scan
@@ -68,13 +71,10 @@ pub(super) fn decode_starrocks_scan_preparation(
                 table_id: source.table_id,
                 schema_id: source.schema_id,
             },
-            &tablet_refs,
-        )
-        .map_err(|err| {
-            format!("StarRocks ScanNode node_id={node_id} resolve tablet paths failed: {err}")
-        })?;
+            tablet_refs,
+        );
         Ok(DecodedStarRocksScanPreparation {
-            properties,
+            properties: BTreeMap::new(),
             ranges,
             lake_schema_meta: LakeScanSchemaMeta::with_embedded_schema(
                 source.db_id,
@@ -94,23 +94,24 @@ pub(super) fn decode_starrocks_scan_preparation(
                     })
                     .collect(),
             ),
+            deferred_lake_resolution,
         })
     })();
-    decoded.map_err(Into::into)
+    decoded
 }
 
 fn validate_source(
     node_id: i32,
     source: &plan::StarRocksTableSource,
 ) -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<TabletSchemaPb, String> {
+    let decoded = (|| -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
         if source.catalog_name.trim().is_empty() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} catalog_name must not be empty"
             ));
         }
         if source.catalog_name != INTERNAL_CATALOG_NAME {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} catalog_name must be {INTERNAL_CATALOG_NAME}, got {}",
                 source.catalog_name
             ));
@@ -121,13 +122,13 @@ fn validate_source(
             ("schema_id", source.schema_id),
         ] {
             if value <= 0 {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} {field} must be positive, got {value}"
                 ));
             }
         }
         if source.storage_columns.is_empty() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} storage_columns must not be empty"
             ));
         }
@@ -136,23 +137,23 @@ fn validate_source(
         for column in &source.storage_columns {
             let name = column.name.trim();
             if name.is_empty() {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} storage column name must not be empty"
                 ));
             }
             if column.unique_id < 0 {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} storage column {name} unique_id must be non-negative, got {}",
                     column.unique_id
                 ));
             }
             if !names.insert(name.to_ascii_lowercase()) {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} storage columns contain duplicate name {name}"
                 ));
             }
             if !unique_ids.insert(column.unique_id) {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} storage columns contain duplicate unique_id {}",
                     column.unique_id
                 ));
@@ -160,19 +161,19 @@ fn validate_source(
         }
         Ok(decode_native_tablet_schema(node_id, source)?)
     })();
-    decoded.map_err(Into::into)
+    decoded
 }
 
 fn decode_native_tablet_schema(
     node_id: i32,
     source: &plan::StarRocksTableSource,
 ) -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<TabletSchemaPb, String> {
+    let decoded = (|| -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
         let schema = source.current_schema.as_ref().ok_or_else(|| {
             format!("StarRocks ScanNode node_id={node_id} current_schema must be present")
         })?;
         if schema.schema_id != source.schema_id {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema id mismatch: source_schema_id={} current_schema_id={}",
                 source.schema_id, schema.schema_id
             ));
@@ -183,14 +184,14 @@ fn decode_native_tablet_schema(
             Some(plan::StarRocksKeysType::StarrocksKeysTypeAggregate) => KeysType::AggKeys,
             Some(plan::StarRocksKeysType::StarrocksKeysTypePrimary) => KeysType::PrimaryKeys,
             _ => {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} current schema keys_type is missing or unknown: {}",
                     schema.keys_type
                 ));
             }
         };
         if schema.columns.is_empty() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema columns must not be empty"
             ));
         }
@@ -204,12 +205,12 @@ fn decode_native_tablet_schema(
         for column in &columns {
             let name = column.name.as_deref().expect("top-level name validated");
             if !names.insert(name.to_ascii_lowercase()) {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} current schema contains duplicate column name {name}"
                 ));
             }
             if !unique_ids.insert(column.unique_id) {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} current schema contains duplicate unique_id {}",
                     column.unique_id
                 ));
@@ -218,7 +219,7 @@ fn decode_native_tablet_schema(
         if let Some(count) = schema.num_short_key_columns
             && (count < 0 || count as usize > columns.len())
         {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema num_short_key_columns out of range: {count}"
             ));
         }
@@ -227,13 +228,13 @@ fn decode_native_tablet_schema(
             .iter()
             .any(|index| *index as usize >= columns.len())
         {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema sort_key_idxes contains out-of-range index"
             ));
         }
         for unique_id in &schema.sort_key_unique_ids {
             if !unique_ids.contains(&(*unique_id as i32)) {
-                return Err(format!(
+                return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} current schema sort_key_unique_ids references unknown unique_id {unique_id}"
                 ));
             }
@@ -249,7 +250,7 @@ fn decode_native_tablet_schema(
                         columns[*index as usize].unique_id != *unique_id as i32
                     }))
         {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema sort key indexes and unique ids are inconsistent"
             ));
         }
@@ -283,7 +284,7 @@ fn decode_native_tablet_schema(
             })
             .collect::<Vec<_>>();
         if visible_columns != storage_columns {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} storage_columns do not match current schema visible columns"
             ));
         }
@@ -297,7 +298,7 @@ fn decode_native_tablet_schema(
             ..Default::default()
         })
     })();
-    decoded.map_err(Into::into)
+    decoded
 }
 
 fn decode_native_column_schema(
@@ -305,7 +306,7 @@ fn decode_native_column_schema(
     column: &plan::StarRocksColumnSchema,
     top_level: bool,
 ) -> Result<ColumnPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<ColumnPb, String> {
+    let decoded = (|| -> Result<ColumnPb, NativeFragmentLeafDecodeError> {
         let name = column
             .name
             .as_deref()
@@ -313,12 +314,12 @@ fn decode_native_column_schema(
             .filter(|name| !name.is_empty())
             .map(str::to_string);
         if top_level && name.is_none() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema top-level column name must not be empty"
             ));
         }
         if top_level && column.unique_id < 0 {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema column {} unique_id must be non-negative, got {}",
                 name.as_deref().unwrap_or("<unnamed>"),
                 column.unique_id
@@ -326,7 +327,7 @@ fn decode_native_column_schema(
         }
         let physical_type = column.physical_type.trim().to_ascii_uppercase();
         if physical_type.is_empty() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema column {} physical_type must not be empty",
                 name.as_deref().unwrap_or("<unnamed>")
             ));
@@ -356,7 +357,7 @@ fn decode_native_column_schema(
             .filter(|value| !value.is_empty())
             .map(str::to_ascii_uppercase);
         if column.aggregation.is_some() && aggregation.is_none() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema column {} aggregation must not be empty when present",
                 name.as_deref().unwrap_or("<unnamed>")
             ));
@@ -375,14 +376,14 @@ fn decode_native_column_schema(
         if let Some(expected) = expected_children
             && children.len() != expected
         {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema column {} type {physical_type} requires {expected} children, got {}",
                 name.as_deref().unwrap_or("<unnamed>"),
                 children.len()
             ));
         }
         if physical_type == "STRUCT" && children.is_empty() {
-            return Err(format!(
+            return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} current schema column {} STRUCT requires at least one child",
                 name.as_deref().unwrap_or("<unnamed>")
             ));
@@ -403,13 +404,13 @@ fn decode_native_column_schema(
                     )
                 })?;
                 if !child_names.insert(child_name.to_ascii_lowercase()) {
-                    return Err(format!(
+                    return invalid(format!(
                         "StarRocks ScanNode node_id={node_id} STRUCT column {} contains duplicate child name {child_name}",
                         name.as_deref().unwrap_or("<unnamed>")
                     ));
                 }
                 if child.unique_id >= 0 && !positive_child_ids.insert(child.unique_id) {
-                    return Err(format!(
+                    return invalid(format!(
                         "StarRocks ScanNode node_id={node_id} STRUCT column {} contains duplicate positive child unique_id {}",
                         name.as_deref().unwrap_or("<unnamed>"),
                         child.unique_id
@@ -435,7 +436,7 @@ fn decode_native_column_schema(
             ..Default::default()
         })
     })();
-    decoded.map_err(Into::into)
+    decoded
 }
 
 fn decode_ranges(

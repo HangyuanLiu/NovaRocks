@@ -130,73 +130,74 @@ impl NativePlanDecodeContext {
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
     ) -> Result<Self, super::NativeFragmentDecodeError> {
-        let decoded = (|| -> Result<Self, String> {
-            let scan_kinds =
-                collect_scan_assignment_kinds(root, FieldPath::root("plan_fragment").field("root"))
-                    .map_err(|error| error.to_string())?;
-            let mut scan_assignments = BTreeMap::new();
-            let mut scan_keys = instance_params
-                .per_node_scan_ranges
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            scan_keys.sort_unstable();
-            for raw_node_id in scan_keys {
-                let wire_ranges = &instance_params.per_node_scan_ranges[&raw_node_id];
-                let node_id = FragmentNodeId::new(raw_node_id);
-                let kind = scan_kinds.get(&node_id).copied().ok_or_else(|| {
+        let scan_kinds =
+            collect_scan_assignment_kinds(root, FieldPath::root("plan_fragment").field("root"))?;
+        let scan_path = FieldPath::root("instance_params").field("per_node_scan_ranges");
+        let mut scan_assignments = BTreeMap::new();
+        let mut scan_keys = instance_params
+            .per_node_scan_ranges
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        scan_keys.sort_unstable();
+        for raw_node_id in scan_keys {
+            let wire_ranges = &instance_params.per_node_scan_ranges[&raw_node_id];
+            let node_path = scan_path.clone().map_key(raw_node_id.to_string());
+            let node_id = FragmentNodeId::new(raw_node_id);
+            let kind = scan_kinds.get(&node_id).copied().ok_or_else(|| {
+                super::NativeFragmentDecodeError::inconsistent(
+                    node_path.clone(),
                     format!(
                         "native InstanceParams assigns scan ranges to unknown scan node_id={raw_node_id}"
-                    )
-                })?;
-                let ranges = wire_ranges
-                    .ranges
-                    .iter()
-                    .map(super::decode_scan_range_params)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                scan_assignments.insert(node_id, (kind, ranges));
+                    ),
+                )
+            })?;
+            let mut ranges = Vec::with_capacity(wire_ranges.ranges.len());
+            for (index, wire_range) in wire_ranges.ranges.iter().enumerate() {
+                ranges.push(super::instance::decode_scan_range_params_at(
+                    wire_range,
+                    node_path.clone().field("ranges").index(index),
+                )?);
             }
-            let scan_assignments =
-                ScanAssignments::try_new(scan_assignments).map_err(|error| error.to_string())?;
+            scan_assignments.insert(node_id, (kind, ranges));
+        }
+        let scan_assignments = ScanAssignments::try_new(scan_assignments)
+            .map_err(|error| super::NativeFragmentDecodeError::inconsistent(scan_path, error))?;
 
-            let mut exchange_inputs = BTreeMap::new();
-            let mut exchange_keys = instance_params
-                .per_exch_num_senders
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            exchange_keys.sort_unstable();
-            for raw_node_id in exchange_keys {
-                let raw_sender_count = instance_params.per_exch_num_senders[&raw_node_id];
-                let sender_count = usize::try_from(raw_sender_count)
-                    .ok()
-                    .and_then(NonZeroUsize::new)
-                    .ok_or_else(|| {
+        let exchange_path = FieldPath::root("instance_params").field("per_exch_num_senders");
+        let mut exchange_inputs = BTreeMap::new();
+        let mut exchange_keys = instance_params
+            .per_exch_num_senders
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        exchange_keys.sort_unstable();
+        for raw_node_id in exchange_keys {
+            let raw_sender_count = instance_params.per_exch_num_senders[&raw_node_id];
+            let sender_count = usize::try_from(raw_sender_count)
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .ok_or_else(|| {
+                    super::NativeFragmentDecodeError::out_of_range(
+                        exchange_path.clone().map_key(raw_node_id.to_string()),
                         format!(
                             "native InstanceParams per_exch_num_senders node_id={raw_node_id} must be positive, got {raw_sender_count}"
-                        )
-                    })?;
-                exchange_inputs.insert(
-                    FragmentNodeId::new(raw_node_id),
-                    ExchangeInputAssignment::new(sender_count),
-                );
-            }
+                        ),
+                    )
+                })?;
+            exchange_inputs.insert(
+                FragmentNodeId::new(raw_node_id),
+                ExchangeInputAssignment::new(sender_count),
+            );
+        }
 
-            Ok(Self {
-                exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-                scan_assignments,
-                query_options,
-                connectors: Some(connectors),
-                query_id: Some(query_id),
-                fragment_instance_id,
-            })
-        })();
-        decoded.map_err(|error| {
-            super::NativeFragmentDecodeError::invalid_value(
-                FieldPath::root("instance_params"),
-                error,
-            )
+        Ok(Self {
+            exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
+            scan_assignments,
+            query_options,
+            connectors: Some(connectors),
+            query_id: Some(query_id),
+            fragment_instance_id,
         })
     }
 
@@ -259,11 +260,18 @@ impl NativePlanDecodeContext {
         self
     }
 
-    pub(crate) fn scan_ranges(&self, node_id: i32) -> Result<&[ScanRangeParams], String> {
+    pub(crate) fn scan_ranges(
+        &self,
+        node_id: i32,
+    ) -> Result<&[ScanRangeParams], super::error::NativeFragmentLeafDecodeError> {
         self.scan_assignments
             .get(&FragmentNodeId::new(node_id))
             .map(|assignment| assignment.ranges())
-            .ok_or_else(|| format!("native ScanNode node_id={node_id} missing scan ranges"))
+            .ok_or_else(|| {
+                super::error::NativeFragmentLeafDecodeError::new(format!(
+                    "native ScanNode node_id={node_id} missing scan ranges"
+                ))
+            })
     }
 
     pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
@@ -275,13 +283,21 @@ impl NativePlanDecodeContext {
         self.query_id
     }
 
-    pub(crate) fn connectors(&self) -> Result<&crate::connector::ConnectorRegistry, String> {
+    pub(crate) fn connectors(
+        &self,
+    ) -> Result<&crate::connector::ConnectorRegistry, super::error::NativeFragmentLeafDecodeError>
+    {
         self.connectors.as_deref().ok_or_else(|| {
-            "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext".to_string()
+            super::error::NativeFragmentLeafDecodeError::new(
+                "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
+            )
         })
     }
 
-    fn exchange_input(&self, node_id: i32) -> Result<(ExchangeKey, usize), String> {
+    fn exchange_input(
+        &self,
+        node_id: i32,
+    ) -> Result<(ExchangeKey, usize), super::error::NativeFragmentLeafDecodeError> {
         let assignment = self
             .exchange_inputs
             .get(&FragmentNodeId::new(node_id))
@@ -312,23 +328,36 @@ pub(super) fn collect_scan_assignment_kinds(
         if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
             && let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref()
         {
-            let source = scan
-                .table
-                .as_ref()
-                .and_then(|table| table.source.as_ref())
-                .and_then(|source| source.kind.as_ref())
-                .ok_or_else(|| {
-                    super::NativeFragmentDecodeError::missing(
-                        path.clone()
-                            .field("payload")
-                            .field("physical")
-                            .field("scan")
-                            .field("table")
-                            .field("source")
-                            .field("kind"),
-                        format!("native ScanNode node_id={} requires source", node.node_id),
-                    )
-                })?;
+            let scan_path = path
+                .clone()
+                .field("payload")
+                .field("physical")
+                .field("scan");
+            let table = scan.table.as_ref().ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    scan_path.clone().field("table"),
+                    format!("native ScanNode node_id={} requires table", node.node_id),
+                )
+            })?;
+            let source = table.source.as_ref().ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    scan_path.clone().field("table").field("source"),
+                    format!("native ScanNode node_id={} requires source", node.node_id),
+                )
+            })?;
+            let source = source.kind.as_ref().ok_or_else(|| {
+                super::NativeFragmentDecodeError::missing(
+                    scan_path
+                        .clone()
+                        .field("table")
+                        .field("source")
+                        .field("kind"),
+                    format!(
+                        "native ScanNode node_id={} requires source kind",
+                        node.node_id
+                    ),
+                )
+            })?;
             let kind = match source {
                 plan::scan_source::Kind::StarrocksTable(_) => ScanAssignmentKind::StarRocksTablet,
                 _ => ScanAssignmentKind::File,
@@ -416,12 +445,7 @@ fn decode_node_inner(
             )
         })
         .transpose()
-        .map_err(|error| {
-            super::NativeFragmentDecodeError::inconsistent(
-                path.clone().field("runtime_filter_binding_ids"),
-                error,
-            )
-        })?
+        .map_err(|error| error.into_native(path.clone().field("runtime_filter_binding_ids")))?
         .unwrap_or_default();
     let direct_inputs = children
         .iter()
@@ -450,7 +474,7 @@ fn decode_node_inner(
         plan::distributed_node::Payload::Physical(physical) => lower_physical_node(
             node,
             physical,
-            path.clone().field("physical"),
+            path.clone().field("payload").field("physical"),
             children,
             arena,
             ctx,
@@ -458,7 +482,7 @@ fn decode_node_inner(
         plan::distributed_node::Payload::Exchange(exchange) => exchange::lower_exchange_receiver(
             node,
             exchange,
-            path.clone().field("exchange"),
+            path.clone().field("payload").field("exchange"),
             children,
             arena,
             ctx,
@@ -481,12 +505,7 @@ fn decode_node_inner(
     if let Some(ledger) = ledger {
         ledger
             .commit_consumed_many(&node.runtime_filter_binding_ids)
-            .map_err(|error| {
-                super::NativeFragmentDecodeError::inconsistent(
-                    path.field("runtime_filter_binding_ids"),
-                    error,
-                )
-            })?;
+            .map_err(|error| error.into_native(path.field("runtime_filter_binding_ids")))?;
     }
     Ok(lowered)
 }

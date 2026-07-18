@@ -222,10 +222,11 @@ pub(super) fn validate_proto_expr_shape_at(
         )
     })?;
 
-    let required_boxed = |child: &Option<Box<expr::Expr>>,
+    let required_boxed = |owner_path: FieldPath,
+                          child: &Option<Box<expr::Expr>>,
                           field: &'static str|
      -> Result<(), super::NativeFragmentDecodeError> {
-        let child_path = path.clone().field(field);
+        let child_path = owner_path.field(field);
         let child = child.as_deref().ok_or_else(|| {
             super::NativeFragmentDecodeError::missing(
                 child_path.clone(),
@@ -234,17 +235,19 @@ pub(super) fn validate_proto_expr_shape_at(
         })?;
         validate_proto_expr_shape_at(child, child_path)
     };
-    let list = |values: &[expr::Expr],
+    let list = |owner_path: FieldPath,
+                values: &[expr::Expr],
                 field: &'static str|
      -> Result<(), super::NativeFragmentDecodeError> {
         for (index, value) in values.iter().enumerate() {
-            validate_proto_expr_shape_at(value, path.clone().field(field).index(index))?;
+            validate_proto_expr_shape_at(value, owner_path.clone().field(field).index(index))?;
         }
         Ok(())
     };
 
     match kind {
         expr::expr::Kind::BinaryOp(binary) => {
+            let path = path.clone().field("binary_op");
             let op = expr::BinaryOp::try_from(binary.op).map_err(|_| {
                 super::NativeFragmentDecodeError::invalid_enum(
                     path.clone().field("op"),
@@ -257,10 +260,11 @@ pub(super) fn validate_proto_expr_shape_at(
                     "BinaryOp.op is unspecified",
                 ));
             }
-            required_boxed(&binary.left, "left")?;
-            required_boxed(&binary.right, "right")?;
+            required_boxed(path.clone(), &binary.left, "left")?;
+            required_boxed(path, &binary.right, "right")?;
         }
         expr::expr::Kind::UnaryOp(unary) => {
+            let path = path.clone().field("unary_op");
             let op = expr::UnaryOp::try_from(unary.op).map_err(|_| {
                 super::NativeFragmentDecodeError::invalid_enum(
                     path.clone().field("op"),
@@ -273,28 +277,32 @@ pub(super) fn validate_proto_expr_shape_at(
                     "UnaryOp.op is unspecified",
                 ));
             }
-            required_boxed(&unary.operand, "operand")?;
+            required_boxed(path, &unary.operand, "operand")?;
         }
         expr::expr::Kind::FunctionCall(call) => {
+            let path = path.clone().field("function_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(&call.args, "args")?;
+            list(path, &call.args, "args")?;
         }
         expr::expr::Kind::AggregateCall(call) => {
+            let path = path.clone().field("aggregate_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(&call.args, "args")?;
+            list(path.clone(), &call.args, "args")?;
             validate_sort_items_at(&call.order_by, path.clone().field("order_by"))?;
         }
         expr::expr::Kind::WindowCall(call) => {
+            let path = path.clone().field("window_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(&call.args, "args")?;
-            list(&call.partition_by, "partition_by")?;
+            list(path.clone(), &call.args, "args")?;
+            list(path.clone(), &call.partition_by, "partition_by")?;
             validate_sort_items_at(&call.order_by, path.clone().field("order_by"))?;
             if let Some(frame) = &call.frame {
                 validate_window_frame_at(frame, path.clone().field("frame"))?;
             }
         }
         expr::expr::Kind::Cast(cast) => {
-            required_boxed(&cast.operand, "operand")?;
+            let path = path.clone().field("cast");
+            required_boxed(path.clone(), &cast.operand, "operand")?;
             let target = cast.target.as_ref().ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(
                     path.clone().field("target"),
@@ -305,27 +313,33 @@ pub(super) fn validate_proto_expr_shape_at(
                 super::NativeFragmentDecodeError::invalid_value(path.clone().field("target"), error)
             })?;
         }
-        expr::expr::Kind::IsNull(is_null) => required_boxed(&is_null.operand, "operand")?,
+        expr::expr::Kind::IsNull(is_null) => {
+            required_boxed(path.clone().field("is_null"), &is_null.operand, "operand")?
+        }
         expr::expr::Kind::InList(in_list) => {
-            required_boxed(&in_list.operand, "operand")?;
+            let path = path.clone().field("in_list");
+            required_boxed(path.clone(), &in_list.operand, "operand")?;
             if in_list.list.is_empty() {
                 return Err(super::NativeFragmentDecodeError::invalid_value(
                     path.clone().field("list"),
                     "InList.list is empty",
                 ));
             }
-            list(&in_list.list, "list")?;
+            list(path, &in_list.list, "list")?;
         }
         expr::expr::Kind::Between(between) => {
-            required_boxed(&between.operand, "operand")?;
-            required_boxed(&between.low, "low")?;
-            required_boxed(&between.high, "high")?;
+            let path = path.clone().field("between");
+            required_boxed(path.clone(), &between.operand, "operand")?;
+            required_boxed(path.clone(), &between.low, "low")?;
+            required_boxed(path, &between.high, "high")?;
         }
         expr::expr::Kind::Like(like) => {
-            required_boxed(&like.operand, "operand")?;
-            required_boxed(&like.pattern, "pattern")?;
+            let path = path.clone().field("like");
+            required_boxed(path.clone(), &like.operand, "operand")?;
+            required_boxed(path, &like.pattern, "pattern")?;
         }
         expr::expr::Kind::CaseExpr(case_expr) => {
+            let path = path.clone().field("case_expr");
             if let Some(operand) = &case_expr.operand {
                 validate_proto_expr_shape_at(operand, path.clone().field("operand"))?;
             }
@@ -356,8 +370,11 @@ pub(super) fn validate_proto_expr_shape_at(
                 validate_proto_expr_shape_at(else_expr, path.clone().field("else_expr"))?;
             }
         }
-        expr::expr::Kind::IsTruth(is_truth) => required_boxed(&is_truth.operand, "operand")?,
+        expr::expr::Kind::IsTruth(is_truth) => {
+            required_boxed(path.clone().field("is_truth"), &is_truth.operand, "operand")?
+        }
         expr::expr::Kind::Lambda(lambda) => {
+            let path = path.clone().field("lambda");
             if lambda.params.is_empty() {
                 return Err(super::NativeFragmentDecodeError::invalid_value(
                     path.clone().field("params"),
@@ -389,10 +406,13 @@ pub(super) fn validate_proto_expr_shape_at(
                     super::NativeFragmentDecodeError::invalid_value(param_path.field("type"), error)
                 })?;
             }
-            required_boxed(&lambda.body, "body")?;
+            required_boxed(path, &lambda.body, "body")?;
         }
-        expr::expr::Kind::Nested(nested) => required_boxed(&nested.inner, "inner")?,
+        expr::expr::Kind::Nested(nested) => {
+            required_boxed(path.clone().field("nested"), &nested.inner, "inner")?
+        }
         expr::expr::Kind::ColumnRef(column) => {
+            let path = path.clone().field("column_ref");
             if column.column_id == 0 {
                 return Err(super::NativeFragmentDecodeError::out_of_range(
                     path.clone().field("column_id"),
@@ -401,6 +421,7 @@ pub(super) fn validate_proto_expr_shape_at(
             }
         }
         expr::expr::Kind::Literal(literal) => {
+            let path = path.clone().field("literal");
             let value = literal.value.as_ref().ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(
                     path.clone().field("value"),
@@ -415,6 +436,7 @@ pub(super) fn validate_proto_expr_shape_at(
             }
         }
         expr::expr::Kind::LambdaParamRef(param) => {
+            let path = path.clone().field("lambda_param_ref");
             if param.slot_id <= 0 {
                 return Err(super::NativeFragmentDecodeError::out_of_range(
                     path.clone().field("slot_id"),

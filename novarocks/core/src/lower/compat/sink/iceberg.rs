@@ -233,6 +233,7 @@ pub(crate) fn lower_iceberg_sink_factory_input(
         target_table_metadata,
         target_snapshot_id,
         position_delete_data_file_partitions,
+        position_delete_data_file_partition_index_input: None,
         object_store_s3,
         file_format,
         report_file_format,

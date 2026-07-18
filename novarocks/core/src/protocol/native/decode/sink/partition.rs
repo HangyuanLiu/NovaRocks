@@ -30,7 +30,7 @@ type PartitionMetadataInfo = (Vec<String>, Vec<String>, Vec<String>);
 pub(crate) fn partition_info_from_metadata(
     metadata: Option<&TableMetadata>,
     target_partition_spec_id: i32,
-) -> Result<PartitionMetadataInfo, String> {
+) -> Result<PartitionMetadataInfo, NativeFragmentLeafDecodeError> {
     let Some(metadata) = metadata else {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
@@ -211,7 +211,7 @@ fn push_partition_transform_call(
 pub(crate) fn partition_source_field_ids_from_metadata(
     metadata: &TableMetadata,
     source_column_names: &[String],
-) -> Result<Vec<i32>, String> {
+) -> Result<Vec<i32>, NativeFragmentLeafDecodeError> {
     let target_schema = metadata.current_schema();
     source_column_names
         .iter()
@@ -220,9 +220,9 @@ pub(crate) fn partition_source_field_ids_from_metadata(
                 .field_by_name_case_insensitive(source_name)
                 .map(|field| field.id)
                 .ok_or_else(|| {
-                    format!(
+                    NativeFragmentLeafDecodeError::new(format!(
                         "native Iceberg sink partition source column {source_name} missing from target metadata schema"
-                    )
+                    ))
                 })
         })
         .collect()

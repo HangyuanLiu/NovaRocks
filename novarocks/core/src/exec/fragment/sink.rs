@@ -485,6 +485,7 @@ mod tests {
                 target_table_metadata: None,
                 target_snapshot_id: None,
                 position_delete_data_file_partitions: HashMap::new(),
+                position_delete_data_file_partition_index_input: None,
                 object_store_s3: None,
                 file_format: IcebergFileFormat::Parquet,
                 report_file_format: "parquet".to_string(),

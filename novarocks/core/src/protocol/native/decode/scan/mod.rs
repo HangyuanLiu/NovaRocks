@@ -44,66 +44,91 @@ pub(crate) fn lower_scan_node(
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
-        if !node.children.is_empty() {
-            return Err(format!(
+    if !node.children.is_empty() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("children"),
+            format!(
                 "ScanNode node_id={} expected no children, got {}",
                 node.node_id,
                 node.children.len()
-            )
-            .into());
+            ),
+        ));
+    }
+    if !scan.dict_columns.is_empty() {
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("dict_columns"),
+            "ScanNode dict_columns are not supported by native lowering yet",
+        ));
+    }
+    let table = scan.table.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone().field("table"), "ScanNode table missing")
+    })?;
+    let source = table.source.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("table").field("source"),
+            "ScanNode table source missing",
+        )
+    })?;
+    let source = source.kind.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("table").field("source").field("kind"),
+            "ScanNode table source kind missing",
+        )
+    })?;
+    let source_path = path.clone().field("table").field("source");
+    match source {
+        plan::scan_source::Kind::IcebergDataFiles(source) => {
+            iceberg_data::lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("iceberg_data_files")))
         }
-        if !scan.dict_columns.is_empty() {
-            return Err("ScanNode dict_columns are not supported by native lowering yet".into());
+        plan::scan_source::Kind::IcebergMetadataTable(source) => {
+            reject_variant_columns_for_source(scan, "IcebergMetadataTable")
+                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+            iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("iceberg_metadata_table")))
         }
-        let table = scan
-            .table
-            .as_ref()
-            .ok_or_else(|| "ScanNode table missing".to_string())?;
-        let source = table
-            .source
-            .as_ref()
-            .and_then(|source| source.kind.as_ref())
-            .ok_or_else(|| "ScanNode table source missing".to_string())?;
-        match source {
-            plan::scan_source::Kind::IcebergDataFiles(source) => {
-                iceberg_data::lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
+        plan::scan_source::Kind::IcebergDeltaTable(source) => {
+            reject_variant_columns_for_source(scan, "IcebergDeltaTable")
+                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+            iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
+                .map_err(|error| error.into_native(source_path.field("iceberg_delta_table")))
+        }
+        plan::scan_source::Kind::IcebergVersionTable(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("iceberg_version_table"),
+                "IcebergVersionTable native scan source is not implemented",
+            ))
+        }
+        plan::scan_source::Kind::IcebergMvTargetState(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("iceberg_mv_target_state"),
+                "IcebergMvTargetState native scan source is not implemented",
+            ))
+        }
+        plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("iceberg_mv_target_locator"),
+                "IcebergMvTargetLocator native scan source is not implemented",
+            ))
+        }
+        plan::scan_source::Kind::StarrocksTable(source) => {
+            reject_variant_columns_for_source(scan, "StarRocksTable")
+                .map_err(|error| error.into_native(path.clone().field("variant_columns")))?;
+            #[cfg(feature = "compat")]
+            {
+                starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
+                    .map_err(|error| error.into_native(source_path.field("starrocks_table")))
             }
-            plan::scan_source::Kind::IcebergMetadataTable(source) => {
-                reject_variant_columns_for_source(scan, "IcebergMetadataTable")?;
-                iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
-            }
-            plan::scan_source::Kind::IcebergDeltaTable(source) => {
-                reject_variant_columns_for_source(scan, "IcebergDeltaTable")?;
-                iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
-            }
-            plan::scan_source::Kind::IcebergVersionTable(_) => {
-                reject_variant_columns_for_source(scan, "IcebergVersionTable")?;
-                unsupported_scan_source("IcebergVersionTable")
-            }
-            plan::scan_source::Kind::IcebergMvTargetState(_) => {
-                reject_variant_columns_for_source(scan, "IcebergMvTargetState")?;
-                unsupported_scan_source("IcebergMvTargetState")
-            }
-            plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
-                reject_variant_columns_for_source(scan, "IcebergMvTargetLocator")?;
-                unsupported_scan_source("IcebergMvTargetLocator")
-            }
-            plan::scan_source::Kind::StarrocksTable(source) => {
-                reject_variant_columns_for_source(scan, "StarRocksTable")?;
-                #[cfg(feature = "compat")]
-                {
-                    starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
-                }
-                #[cfg(not(feature = "compat"))]
-                {
-                    let _ = (node, scan, source, ctx, arena);
-                    Err("StarRocks native scan requires feature compat".into())
-                }
+            #[cfg(not(feature = "compat"))]
+            {
+                let _ = (node, scan, source, ctx, arena);
+                Err(NativeFragmentDecodeError::unsupported(
+                    source_path.field("starrocks_table"),
+                    "StarRocks native scan requires feature compat",
+                ))
             }
         }
-    })();
-    decoded.map_err(|error| error.into_native(path))
+    }
 }
 
 fn reject_variant_columns_for_source(
@@ -114,10 +139,6 @@ fn reject_variant_columns_for_source(
         return Ok(());
     }
     Err(format!("{source_name} native scan does not support variant_columns").into())
-}
-
-fn unsupported_scan_source(source: &str) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
-    Err(format!("{source} native scan source is not implemented").into())
 }
 
 #[cfg(test)]
@@ -621,6 +642,37 @@ mod tests {
         let err = decode_node(&node, &mut arena, &ctx)
             .expect_err("StarRocks native scan requires compat connector support");
         assert_eq!(err, "StarRocks native scan requires feature compat");
+    }
+
+    #[cfg(feature = "compat")]
+    #[test]
+    fn native_starrocks_scan_decode_defers_tablet_resolution_without_registry_mutation() {
+        let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();
+        let tablet_id = 8_700_000_000_000_001;
+        let query_id = crate::runtime::query_context::QueryId {
+            hi: 8_700_000_000_000_002,
+            lo: 8_700_000_000_000_003,
+        };
+        let node = scan_node(starrocks_source());
+        let (connectors, captured) = capturing_starrocks_registry();
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_registry(connectors)
+            .with_query_id(query_id)
+            .with_scan_ranges(10, vec![starrocks_range(tablet_id, 100, 7)]);
+        let mut arena = ExprArena::default();
+        assert!(crate::runtime::starlet_shard_registry::select_paths(&[tablet_id]).is_empty());
+
+        decode_node(&node, &mut arena, &ctx)
+            .expect("valid StarRocks scan decode must defer tablet-path resolution");
+
+        let cfg = captured
+            .lock()
+            .expect("captured StarRocks config lock")
+            .clone()
+            .expect("StarRocks connector config");
+        assert!(!cfg.properties.contains_key("partition_storage_paths"));
+        assert!(cfg.deferred_lake_resolution.is_some());
+        assert!(crate::runtime::starlet_shard_registry::select_paths(&[tablet_id]).is_empty());
     }
 
     fn int_literal(value: i64) -> expr::Expr {

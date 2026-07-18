@@ -42,7 +42,7 @@ pub(super) fn lower_starrocks_scan(
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<DecodedNode, String> {
+    let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let prepared = decode_starrocks_scan_preparation(
             node.node_id,
             scan,
@@ -94,6 +94,7 @@ pub(super) fn lower_starrocks_scan(
             profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
             min_max_predicates,
             lake_schema_meta: Some(prepared.lake_schema_meta),
+            deferred_lake_resolution: Some(prepared.deferred_lake_resolution),
             topn_filter_column_map: HashMap::new(),
         };
         let scan_node = ctx
@@ -116,7 +117,7 @@ pub(super) fn lower_starrocks_scan(
             output_schema,
         })
     })();
-    decoded.map_err(Into::into)
+    decoded
 }
 
 fn positive_query_option<T>(
@@ -141,7 +142,7 @@ fn starrocks_chunk_schema(
     columns: &[common::OutputColumn],
     source: &plan::StarRocksTableSource,
 ) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<ChunkSchemaRef, String> {
+    let decoded = (|| -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
         let storage_by_name = source
             .storage_columns
             .iter()
@@ -153,10 +154,10 @@ fn starrocks_chunk_schema(
                 let storage = storage_by_name
                     .get(&column.name.to_ascii_lowercase())
                     .ok_or_else(|| {
-                        format!(
+                        NativeFragmentLeafDecodeError::invalid(format!(
                             "StarRocks native scan output column {} is missing storage metadata",
                             column.name
-                        )
+                        ))
                     })?;
                 ChunkSlotSchema::try_new_with_field(
                     SlotId::new(column.column_id),
@@ -168,9 +169,12 @@ fn starrocks_chunk_schema(
                     None,
                     Some(storage.unique_id),
                 )
+                .map_err(NativeFragmentLeafDecodeError::invalid)
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        ChunkSchema::try_new(slots).map(Arc::new)
+            .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()?;
+        ChunkSchema::try_new(slots)
+            .map(Arc::new)
+            .map_err(NativeFragmentLeafDecodeError::invalid)
     })();
-    decoded.map_err(Into::into)
+    decoded
 }

@@ -70,7 +70,10 @@ impl Layout {
         self.index_of_slot(SlotId::new(column_id))
     }
 
-    pub(crate) fn resolve_column_id(&self, column_id: u32) -> Result<SlotId, String> {
+    pub(crate) fn resolve_column_id(
+        &self,
+        column_id: u32,
+    ) -> Result<SlotId, NativeFragmentLeafDecodeError> {
         let slot = SlotId::new(column_id);
         if self.contains_slot(slot)
             && let Some(index) = self.index.get(&slot)
@@ -81,7 +84,8 @@ impl Layout {
             Err(format!(
                 "ColumnRef column_id={} not found in input layout",
                 column_id
-            ))
+            )
+            .into())
         }
     }
 }
@@ -143,7 +147,7 @@ pub(crate) fn slot_schemas_from_output_columns(
         .zip(decoded.slot_ids.iter().copied())
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .map_err(NativeFragmentLeafDecodeError::from)
 }
 
 #[allow(dead_code)]
@@ -247,7 +251,10 @@ mod tests {
         assert_eq!(layout.index_of_slot(SlotId::new(7)), Some(0));
         assert_eq!(layout.index_of_slot(SlotId::new(3)), Some(1));
         assert_eq!(layout.index_of_column_id(3), Some(1));
-        assert_eq!(layout.resolve_column_id(7), Ok(SlotId::new(7)));
+        assert_eq!(
+            layout.resolve_column_id(7).expect("resolve slot"),
+            SlotId::new(7)
+        );
 
         let schema = schema_from_output_columns(&cols).expect("arrow schema");
         assert_eq!(schema.fields().len(), 2);
