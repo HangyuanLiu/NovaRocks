@@ -30,8 +30,8 @@ use crate::exec::operators::{
     ResultBufferSinkFactory,
 };
 use crate::proto;
+use crate::protocol::native::decode;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::result_buffer;
 use crate::service::result_batch_wire::ResultSinkConfig;
 
@@ -105,8 +105,8 @@ pub(super) fn sink_factory_from_native(
                 layout,
                 |idx| format!("native DATA_STREAM_SINK partition expr[{idx}]"),
             )?;
-            let destinations =
-                native_wire::destinations_from_native(&instance_params.destinations)?;
+            let destinations = decode::decode_destinations(&instance_params.destinations)
+                .map_err(|error| error.to_string())?;
             let sink_input = data_stream_input_from_native(stream, destinations, partition_exprs)?;
             let fragment_instance_id = fragment_instance_id_from_native_params(instance_params)?;
             let root_plan_node_id = fragment

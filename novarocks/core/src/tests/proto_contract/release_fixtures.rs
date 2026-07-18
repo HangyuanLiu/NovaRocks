@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use prost::Message;
 
 use crate::proto::{common, expr, filter, novarocks, plan};
-use crate::runtime::native_fragment_wire::{
-    destinations_from_native, exec_params_from_native, query_options_from_native,
-    runtime_filter_params_from_native,
+use crate::protocol::native::decode::{
+    decode_destinations, decode_query_options, decode_runtime_filter_params,
+    decode_scan_range_params,
 };
 
 const SUBMIT_FRAGMENT_REQUEST_FIXTURE_HEX: &str = "0a96040801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a02080512a0030a0408011002120408031004180922c801080b12c3010ac0010ab7010ab4010a0750415251554554121873333a2f2f6275636b65742f646174612e706172717565741a0c646174612e7061727175657420632808301038800142390a1a73333a2f2f6275636b65742f64656c6574652e706172717565741207504152515545541a10504f534954494f4e5f44454c45544553204050e807582c60c0c4076a040801100372030305087a0b7b2273706c6974223a317d8001018801ffffffffffffffffff0192010c0801120808021001200a2814100d180020002a04080c100332150a0408031004120d31302e302e302e383a383036303a270a1b084d12170a150a0408051006120d31302e302e302e393a393036301204084d100218808040426d08802010ac0218012008288080808002300438dc0b40b817480150808004580162240802119a9999999999e93f1880804020808080202801300138808080044080808008480368017001780180010188010190014b980102a001901ca8010ab0011eb80107c00101c8018080404a0e31302e302e302e31303a393037305001";
@@ -678,7 +678,7 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
         "SubmitFragmentRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
-    let query_options = query_options_from_native(
+    let query_options = decode_query_options(
         params
             .query_options
             .as_ref()
@@ -690,7 +690,7 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
     assert_eq!(query_options.runtime_filter_scan_wait_time_ms, Some(1500));
     assert_eq!(query_options.runtime_filter_wait_timeout_ms, Some(3000));
 
-    let rf_params = runtime_filter_params_from_native(
+    let rf_params = decode_runtime_filter_params(
         params
             .runtime_filter_params
             .as_ref()
@@ -710,39 +710,22 @@ fn release_submit_fragment_request_fixture_decodes_through_native_boundaries() {
         .expect("SubmitFragmentRequest fixture runtime filter prober");
     assert_eq!(prober.endpoint().as_host_port(), "10.0.0.9:9060");
 
-    let destinations = destinations_from_native(&params.destinations)
+    let destinations = decode_destinations(&params.destinations)
         .expect("SubmitFragmentRequest fixture destinations boundary");
     assert_eq!(destinations.len(), 1);
     assert_eq!(destinations[0].endpoint().as_host_port(), "10.0.0.8:8060");
 
-    let exec_params = exec_params_from_native(params, destinations)
-        .expect("SubmitFragmentRequest fixture exec params boundary");
-    assert_eq!(
-        exec_params.query_id().hi,
-        1,
-        "SubmitFragmentRequest fixture exec_params.query_id.hi"
-    );
-    assert_eq!(
-        exec_params.query_id().lo,
-        2,
-        "SubmitFragmentRequest fixture exec_params.query_id.lo"
-    );
-    assert_eq!(
-        exec_params.fragment_instance_id().hi,
-        3,
-        "SubmitFragmentRequest fixture exec_params.fragment_instance_id.hi"
-    );
-    assert_eq!(
-        exec_params.fragment_instance_id().lo,
-        4,
-        "SubmitFragmentRequest fixture exec_params.fragment_instance_id.lo"
-    );
-    assert_eq!(exec_params.per_exch_num_senders().get(&12), Some(&3));
-    assert_eq!(
-        exec_params.destinations().len(),
-        1,
-        "SubmitFragmentRequest fixture exec destinations"
-    );
+    let decoded_scan_range = decode_scan_range_params(
+        params.per_node_scan_ranges[&11]
+            .ranges
+            .first()
+            .expect("SubmitFragmentRequest fixture per_node_scan_ranges[11].ranges[0]"),
+    )
+    .expect("SubmitFragmentRequest fixture scan range boundary");
+    assert!(matches!(
+        decoded_scan_range.range,
+        crate::runtime::scan_range::ScanRange::File(_)
+    ));
 }
 
 #[test]

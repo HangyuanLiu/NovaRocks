@@ -15,5 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod decode;
-pub(crate) mod encode;
+mod error;
+mod instance;
+
+pub(crate) use error::NativeFragmentDecodeError;
+#[allow(unused_imports)]
+pub(crate) use instance::{
+    NativeSubmissionMetadata, decode_destinations, decode_endpoint, decode_query_options,
+    decode_runtime_filter_params, decode_scan_range_params,
+};

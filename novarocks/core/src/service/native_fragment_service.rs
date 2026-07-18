@@ -23,9 +23,9 @@ use crate::common::app_config;
 use crate::common::types::UniqueId;
 use crate::lower::novarocks::execute_fragment_native;
 use crate::novarocks_logging::{error, info, warn};
+use crate::protocol::native::decode::{decode_endpoint, decode_query_options};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::native_fragment_wire::{endpoint_from_native, query_options_from_native};
 use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
@@ -247,8 +247,9 @@ pub fn submit_exec_plan_fragment_native(
     let query_opts = instance_params
         .query_options
         .as_ref()
-        .map(query_options_from_native)
-        .transpose()?;
+        .map(decode_query_options)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let (delivery_expire, query_expire) = query_expire_durations(query_opts.as_ref());
     let mgr = query_context_manager();
     mgr.ensure_native_context(query_id, false, delivery_expire, query_expire)?;
@@ -285,8 +286,9 @@ pub fn submit_exec_plan_fragment_native(
         .report_endpoint
         .as_deref()
         .filter(|endpoint| !endpoint.is_empty())
-        .map(endpoint_from_native)
-        .transpose()?
+        .map(decode_endpoint)
+        .transpose()
+        .map_err(|error| error.to_string())?
     {
         fe_report::register_novarocks_instance(
             finst_id,

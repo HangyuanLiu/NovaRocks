@@ -32,7 +32,6 @@ pub mod io;
 pub mod load_tracking;
 pub mod lookup;
 pub mod mem_tracker;
-pub(crate) mod native_fragment_wire;
 pub mod profile;
 pub(crate) mod query_cancel;
 pub mod query_context;

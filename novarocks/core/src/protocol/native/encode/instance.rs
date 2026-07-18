@@ -21,9 +21,11 @@ use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
 use crate::coordinator::scheduler::FragmentInstancePlacement;
+use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::{common, novarocks};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::scan_range;
 
 pub(crate) fn encode_instance_params(
@@ -207,6 +209,95 @@ fn encode_destination(src: &FragmentDestination) -> Result<novarocks::Destinatio
     })
 }
 
-fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOptions {
-    src.to_native()
+pub(crate) fn encode_query_options(src: &QueryOptions) -> novarocks::QueryOptions {
+    novarocks::QueryOptions {
+        batch_size: src.batch_size.unwrap_or_default(),
+        query_timeout: src.query_timeout.unwrap_or_default(),
+        enable_profile: src.enable_profile,
+        pipeline_dop: src.pipeline_dop.unwrap_or_default(),
+        query_mem_limit: src.exec_mem_limit.unwrap_or_default(),
+        connector_io_tasks_per_scan_operator: src
+            .connector_io_tasks_per_scan_operator
+            .unwrap_or_default(),
+        runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
+        runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
+        allow_throw_exception: src.allow_throw_exception,
+        group_concat_max_len: src.group_concat_max_len,
+        enable_spill: src.spill.is_some(),
+        spill_options: src.spill.as_ref().map(encode_spill_config),
+        enable_scan_datacache: src.cache.enable_scan_datacache,
+        enable_populate_datacache: src.cache.enable_populate_datacache,
+        enable_datacache_async_populate_mode: src.cache.enable_datacache_async_populate_mode,
+        enable_datacache_io_adaptor: src.cache.enable_datacache_io_adaptor,
+        enable_cache_select: src.cache.enable_cache_select,
+        datacache_evict_probability: src.cache.datacache_evict_probability,
+        datacache_priority: src.cache.datacache_priority.unwrap_or_default(),
+        datacache_ttl_seconds: src.cache.datacache_ttl_seconds.unwrap_or_default(),
+        datacache_sharing_work_period: src.cache.datacache_sharing_work_period.unwrap_or_default(),
+        query_delivery_timeout: src.query_delivery_timeout.unwrap_or_default(),
+        runtime_profile_report_interval: src.runtime_profile_report_interval.unwrap_or_default(),
+        enable_join_runtime_bitset_filter: src.enable_join_runtime_bitset_filter,
+        global_runtime_filter_build_max_size: src
+            .global_runtime_filter_build_max_size
+            .unwrap_or_default(),
+    }
+}
+
+pub(crate) fn encode_runtime_filter_params(
+    src: &RuntimeFilterParams,
+) -> novarocks::RuntimeFilterParams {
+    novarocks::RuntimeFilterParams {
+        id_to_prober_params: src
+            .id_to_prober_params()
+            .iter()
+            .map(|(filter_id, params)| {
+                (
+                    *filter_id,
+                    novarocks::ProberParamsList {
+                        params: params.iter().map(encode_runtime_filter_prober).collect(),
+                    },
+                )
+            })
+            .collect(),
+        runtime_filter_builder_number: src
+            .runtime_filter_builder_number()
+            .iter()
+            .map(|(filter_id, count)| (*filter_id, *count))
+            .collect(),
+        runtime_filter_max_size: src.runtime_filter_max_size().unwrap_or_default(),
+    }
+}
+
+fn encode_spill_config(src: &SpillConfig) -> novarocks::SpillOptions {
+    novarocks::SpillOptions {
+        spill_mode: match src.spill_mode {
+            SpillMode::Auto => 0,
+            SpillMode::Force => 1,
+            SpillMode::None => 2,
+            SpillMode::Random => 3,
+        },
+        spill_mem_limit_threshold: src.spill_mem_limit_threshold.unwrap_or_default(),
+        spill_operator_min_bytes: src.spill_operator_min_bytes.unwrap_or_default(),
+        spill_operator_max_bytes: src.spill_operator_max_bytes.unwrap_or_default(),
+        spill_encode_level: src.spill_encode_level.unwrap_or_default(),
+        enable_spill_buffer_read: src.enable_spill_buffer_read.unwrap_or(false),
+        max_spill_read_buffer_bytes_per_driver: src
+            .max_spill_read_buffer_bytes_per_driver
+            .unwrap_or_default(),
+        spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
+        spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
+    }
+}
+
+fn encode_runtime_filter_prober(
+    src: &crate::runtime::endpoint::RuntimeFilterProberDestination,
+) -> novarocks::ProberParams {
+    let fragment_instance_id = src.fragment_instance_id();
+    novarocks::ProberParams {
+        fragment_instance_id: Some(common::UniqueId {
+            hi: fragment_instance_id.hi,
+            lo: fragment_instance_id.lo,
+        }),
+        endpoint: src.endpoint().as_host_port(),
+    }
 }

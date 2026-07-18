@@ -39,9 +39,9 @@ use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
+use crate::protocol::native::decode;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::native_fragment_wire as native_wire;
 use crate::runtime::profile::{
     NATIVE_RUNTIME_FILTER_BINDING_COUNT, NATIVE_RUNTIME_FILTER_DEPLOYMENT_NOT_INSTALLED,
     NATIVE_RUNTIME_FILTER_DORMANCY_PROFILE, NATIVE_RUNTIME_FILTER_VALIDATED_LOOKUP,
@@ -67,8 +67,9 @@ pub(crate) fn execute_fragment_native(
     let query_options = instance_params
         .query_options
         .as_ref()
-        .map(native_wire::query_options_from_native)
-        .transpose()?;
+        .map(decode::decode_query_options)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let query_options = apply_query_option_overrides(query_options);
     let query_id = instance_params
         .query_id
@@ -496,7 +497,7 @@ mod tests {
 
     #[test]
     fn converts_native_query_options_consumed_subset() {
-        let opts = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
+        let opts = decode::decode_query_options(&proto::novarocks::QueryOptions {
             batch_size: 8192,
             enable_profile: true,
             query_mem_limit: 1 << 20,
@@ -530,34 +531,32 @@ mod tests {
 
     #[test]
     fn rejects_native_spill_without_spill_options() {
-        let err = native_wire::query_options_from_native(&proto::novarocks::QueryOptions {
+        let err = decode::decode_query_options(&proto::novarocks::QueryOptions {
             enable_spill: true,
             ..Default::default()
         })
         .expect_err("spill options are required");
 
-        assert!(err.contains("spill_options"), "{err}");
+        assert!(err.to_string().contains("spill_options"), "{err}");
     }
 
     #[test]
     fn converts_runtime_filter_params_and_addresses() {
-        let rf = native_wire::runtime_filter_params_from_native(
-            &proto::novarocks::RuntimeFilterParams {
-                id_to_prober_params: [(
-                    3,
-                    proto::novarocks::ProberParamsList {
-                        params: vec![proto::novarocks::ProberParams {
-                            fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                            endpoint: "127.0.0.1:9050".to_string(),
-                        }],
-                    },
-                )]
-                .into_iter()
-                .collect(),
-                runtime_filter_builder_number: [(3, 2)].into_iter().collect(),
-                runtime_filter_max_size: 4096,
-            },
-        )
+        let rf = decode::decode_runtime_filter_params(&proto::novarocks::RuntimeFilterParams {
+            id_to_prober_params: [(
+                3,
+                proto::novarocks::ProberParamsList {
+                    params: vec![proto::novarocks::ProberParams {
+                        fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
+                        endpoint: "127.0.0.1:9050".to_string(),
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            runtime_filter_builder_number: [(3, 2)].into_iter().collect(),
+            runtime_filter_max_size: 4096,
+        })
         .expect("runtime filter params");
 
         assert_eq!(rf.runtime_filter_max_size(), Some(4096));

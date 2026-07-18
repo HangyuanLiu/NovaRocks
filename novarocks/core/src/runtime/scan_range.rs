@@ -67,7 +67,7 @@ pub(crate) struct StarRocksTabletScanRange {
 
 impl StarRocksTabletScanRange {
     #[cfg_attr(not(feature = "compat"), allow(dead_code))]
-    fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
+    pub(crate) fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
         for (field, value) in [
             ("tablet_id", tablet_id),
             ("partition_id", partition_id),
