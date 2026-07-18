@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks::state_store::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
-use novarocks::state_store::{
+use novarocks_state_store::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
+use novarocks_state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Direction,
     FeDeploymentView, Key, KeyRange, Precondition, RangeRequest, StateStore, StateStoreConfig,
     StateStoreErrorKind, StateStoreLimitOverrides, StateStoreOperation, StateStoreOutcome,
@@ -55,15 +55,15 @@ fn transaction_id() -> TransactionId {
 }
 
 fn operation_total(
-    snapshot: &novarocks::state_store::StateStoreMetricsSnapshot,
+    snapshot: &novarocks_state_store::StateStoreMetricsSnapshot,
     operation: StateStoreOperation,
 ) -> u64 {
     snapshot.operation_outcomes[operation as usize].iter().sum()
 }
 
 fn assert_failed_operation_observed(
-    before: &novarocks::state_store::StateStoreMetricsSnapshot,
-    after: &novarocks::state_store::StateStoreMetricsSnapshot,
+    before: &novarocks_state_store::StateStoreMetricsSnapshot,
+    after: &novarocks_state_store::StateStoreMetricsSnapshot,
     operation: StateStoreOperation,
 ) {
     assert_eq!(
@@ -112,7 +112,7 @@ async fn open_store_with_limits(
 async fn read_state_record(
     store: &Arc<dyn StateStore>,
     item: &Key,
-) -> Option<novarocks::state_store::StateRecord> {
+) -> Option<novarocks_state_store::StateRecord> {
     let mut reader = store.begin_read().await.expect("begin state record read");
     let record = reader.get(item).await.expect("read state record");
     reader.abort().await.expect("abort state record read");

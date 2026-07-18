@@ -24,8 +24,8 @@ use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks::state_store::limits::MAX_KEY_BYTES;
-use novarocks::state_store::{
+use novarocks_state_store::limits::MAX_KEY_BYTES;
+use novarocks_state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     Direction, Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
