@@ -35,12 +35,13 @@ use crate::exec::row_position::{
 };
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(crate) fn iceberg_table_descriptor_from_native(
     table: &plan::IcebergTableInfo,
     target_columns: &[plan::ColumnDef],
     mode: IcebergSinkMode,
-) -> Result<IcebergTableDescriptor, String> {
+) -> Result<IcebergTableDescriptor, NativeFragmentLeafDecodeError> {
     let schema = table
         .schema
         .as_ref()
@@ -90,7 +91,9 @@ fn iceberg_schema_field_descriptor_from_native(
     }
 }
 
-fn column_def_to_table_column(column: &plan::ColumnDef) -> Result<IcebergTableColumn, String> {
+fn column_def_to_table_column(
+    column: &plan::ColumnDef,
+) -> Result<IcebergTableColumn, NativeFragmentLeafDecodeError> {
     let data_type = column
         .data_type
         .as_ref()
@@ -142,7 +145,7 @@ pub(crate) fn iceberg_table_location(serialized_metadata: Option<&str>) -> Optio
         .map(ToString::to_string)
 }
 
-pub(crate) fn arrow_field_id(field: &Field) -> Result<i32, String> {
+pub(super) fn arrow_field_id(field: &Field) -> Result<i32, String> {
     let raw = field
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
@@ -160,7 +163,7 @@ pub(crate) fn arrow_field_id(field: &Field) -> Result<i32, String> {
     })
 }
 
-pub(crate) fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
+pub(super) fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
     let mut has_row_id = false;
     let mut has_last_updated = false;
     for field in schema.fields() {
@@ -222,7 +225,7 @@ pub(crate) fn validate_iceberg_sink_file_format(
     Ok((IcebergFileFormat::Parquet, file_format.to_string()))
 }
 
-pub(crate) fn map_native_compression(value: i32) -> Result<Compression, String> {
+pub(super) fn map_native_compression(value: i32) -> Result<Compression, String> {
     let compression = plan::IcebergWriteFileCompression::try_from(value)
         .map_err(|_| format!("unknown native IcebergWriteFileCompression value {value}"))?;
     match compression {

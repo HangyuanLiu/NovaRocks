@@ -17,7 +17,8 @@
 
 use std::sync::Arc;
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns};
 use super::DecodedNode;
 use super::common::{check_exact_arity, concat_layouts};
@@ -27,20 +28,29 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     join: &plan::NestLoopJoinNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("NestLoopJoinNode", 2, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("NestLoopJoinNode", 2, children.len()),
+    )?;
     let mut it = children.into_iter();
     let mut left = it.next().expect("left");
     let mut right = it.next().expect("right");
-    let join_kind = plan::JoinKind::try_from(join.join_type)
-        .map_err(|_| format!("NestLoopJoinNode unknown join_type {}", join.join_type))?;
+    let join_kind = plan::JoinKind::try_from(join.join_type).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("join_type"),
+            format!("NestLoopJoinNode unknown join_type {}", join.join_type),
+        )
+    })?;
     let join_type = match join_kind {
         plan::JoinKind::RightSemi => {
             std::mem::swap(&mut left, &mut right);
@@ -50,13 +60,19 @@ pub(super) fn lower_nest_loop_join_node(
             std::mem::swap(&mut left, &mut right);
             NestedLoopJoinType::LeftAnti
         }
-        _ => proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode")?,
+        _ => NativeFragmentDecodeError::map_invalid(
+            path.clone().field("join_type"),
+            proto_nested_loop_join_type(join.join_type, "NestLoopJoinNode"),
+        )?,
     };
-    let join_layout = concat_layouts(&left.layout, &right.layout)?;
-    let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
-        left.output_schema.clone(),
-        right.output_schema.clone(),
-    ])?);
+    let join_layout = NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        concat_layouts(&left.layout, &right.layout),
+    )?;
+    let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        ChunkSchema::concat(&[left.output_schema.clone(), right.output_schema.clone()]),
+    )?);
     let is_semi_anti = matches!(
         join_type,
         NestedLoopJoinType::LeftSemi
@@ -64,21 +80,23 @@ pub(super) fn lower_nest_loop_join_node(
             | NestedLoopJoinType::NullAwareLeftAnti
     );
     let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
-        chunk_schema_from_output_columns(&physical.output_columns)
-            .map_err(|err| format!("NestLoopJoinNode output_columns: {err}"))?
+        NativeFragmentDecodeError::map_invalid(
+            path.clone().field("output_columns"),
+            chunk_schema_from_output_columns(&physical.output_columns),
+        )?
     } else {
         hash_join::join_output_chunk_schema(
             physical,
             join_scope_chunk_schema.clone(),
             "NestLoopJoinNode",
+            path.clone().field("output_columns"),
         )?
     };
     let join_conjunct = join
         .condition
         .as_ref()
-        .map(|expr| decode_expr(expr, arena, &join_layout))
-        .transpose()
-        .map_err(|err| format!("NestLoopJoinNode condition: {err}"))?;
+        .map(|expr| decode_expr_at(expr, path.clone().field("condition"), arena, &join_layout))
+        .transpose()?;
     let output_layout = if is_semi_anti {
         Layout::for_slots(output_schema.slot_ids().iter().copied())
     } else {

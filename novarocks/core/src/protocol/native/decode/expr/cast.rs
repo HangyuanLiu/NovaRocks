@@ -19,41 +19,55 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr, decode_type, nested};
+use super::{decode_expr_at, decode_type, nested};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::{common, expr};
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_cast(
     cast: &expr::CastExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let operand = cast
-        .operand
-        .as_ref()
-        .ok_or_else(|| "Cast.operand missing".to_string())?;
-    let child = decode_expr(operand, arena, input_layout)?;
-    let target = cast
-        .target
-        .as_ref()
-        .ok_or_else(|| "Cast.target missing".to_string())?;
-    let target_type =
-        decode_type(target).map_err(|err| format!("Cast.target decode failed: {err}"))?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let operand = cast.operand.as_ref().ok_or_else(|| {
+        super::super::NativeFragmentDecodeError::missing(
+            path.clone().field("operand"),
+            "native Cast requires operand",
+        )
+    })?;
+    let child = decode_expr_at(operand, path.clone().field("operand"), arena, input_layout)?;
+    let target = cast.target.as_ref().ok_or_else(|| {
+        super::super::NativeFragmentDecodeError::missing(
+            path.clone().field("target"),
+            "native Cast requires target",
+        )
+    })?;
+    let target_type = decode_type(target).map_err(|error| {
+        super::super::NativeFragmentDecodeError::invalid_value(path.clone().field("target"), error)
+    })?;
     if target_type != data_type {
-        return Err(format!(
-            "Cast target type {target_type:?} does not match Expr.type {data_type:?}"
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone().field("target"),
+            format!("Cast target type {target_type:?} does not match Expr.type {data_type:?}"),
         ));
     }
 
     if matches!(data_type, DataType::LargeBinary) {
-        let child_type = arena
-            .data_type(child)
-            .ok_or_else(|| "CAST child missing data type".to_string())?;
+        let child_type = arena.data_type(child).ok_or_else(|| {
+            super::super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("operand"),
+                "CAST child missing data type",
+            )
+        })?;
         if !nested::is_encoded_variant_payload_source(child_type) {
-            return Err("CAST to VARIANT is not supported".to_string());
+            return Err(super::super::NativeFragmentDecodeError::unsupported(
+                path.clone().field("target"),
+                "CAST to VARIANT is not supported",
+            ));
         }
     }
     if let Some(child_type) = arena.data_type(child)
@@ -74,15 +88,20 @@ pub(crate) fn lower_cast(
                 | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         );
         if !supported {
-            return Err("CAST from VARIANT is not supported".to_string());
+            return Err(super::super::NativeFragmentDecodeError::unsupported(
+                path.clone().field("target"),
+                "CAST from VARIANT is not supported",
+            ));
         }
     }
 
-    let target_primitive = scalar_primitive_from_type_desc(target, "Cast.target")?;
+    let target_primitive = scalar_primitive_from_type_desc(target, path.clone().field("target"))?;
     let source_primitive = operand
         .r#type
         .as_ref()
-        .map(|desc| scalar_primitive_from_type_desc(desc, "Cast.operand"))
+        .map(|desc| {
+            scalar_primitive_from_type_desc(desc, path.clone().field("operand").field("type"))
+        })
         .transpose()?
         .flatten();
     let node = if target_primitive == Some(common::PrimitiveType::Time) {
@@ -99,15 +118,22 @@ pub(crate) fn lower_cast(
 
 fn scalar_primitive_from_type_desc(
     desc: &common::TypeDesc,
-    context: &str,
-) -> Result<Option<common::PrimitiveType>, String> {
+    path: FieldPath,
+) -> Result<Option<common::PrimitiveType>, super::super::NativeFragmentDecodeError> {
     let Some(common::type_desc::Kind::Scalar(scalar)) = desc.kind.as_ref() else {
         return Ok(None);
     };
-    let primitive = common::PrimitiveType::try_from(scalar.r#type)
-        .map_err(|_| format!("{context} has unknown primitive type {}", scalar.r#type))?;
+    let primitive = common::PrimitiveType::try_from(scalar.r#type).map_err(|_| {
+        super::super::NativeFragmentDecodeError::invalid_enum(
+            path.clone(),
+            format!("unknown primitive type {}", scalar.r#type),
+        )
+    })?;
     if primitive == common::PrimitiveType::Unspecified {
-        return Err(format!("{context} primitive type is unspecified"));
+        return Err(super::super::NativeFragmentDecodeError::invalid_enum(
+            path,
+            "primitive type is unspecified",
+        ));
     }
     Ok(Some(primitive))
 }

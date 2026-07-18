@@ -34,13 +34,14 @@ use crate::exec::node::iceberg_delta_scan::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_delta_table_scan(
     node: &plan::DistributedNode,
     scan: &plan::ScanNode,
     source: &plan::IcebergDeltaTable,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(&output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&output_columns)?;
@@ -52,13 +53,15 @@ pub(super) fn lower_iceberg_delta_table_scan(
         return Err(format!(
             "IcebergDeltaTable node_id={} from_snapshot_id must be non-negative, got {}",
             node.node_id, source.from_snapshot_id
-        ));
+        )
+        .into());
     }
     if source.to_snapshot_id < 0 {
         return Err(format!(
             "IcebergDeltaTable node_id={} to_snapshot_id must be non-negative, got {}",
             node.node_id, source.to_snapshot_id
-        ));
+        )
+        .into());
     }
     let delta_plan = source
         .delta_plan
@@ -129,7 +132,7 @@ pub(super) fn lower_iceberg_delta_table_scan(
 
 fn lower_delta_source_files_from_native(
     files: &[plan::IcebergDeltaSourceFile],
-) -> Result<Vec<DeltaSourceFile>, String> {
+) -> Result<Vec<DeltaSourceFile>, NativeFragmentLeafDecodeError> {
     files
         .iter()
         .map(lower_delta_source_file_from_native)
@@ -138,7 +141,7 @@ fn lower_delta_source_files_from_native(
 
 fn lower_delta_source_file_from_native(
     file: &plan::IcebergDeltaSourceFile,
-) -> Result<DeltaSourceFile, String> {
+) -> Result<DeltaSourceFile, NativeFragmentLeafDecodeError> {
     let role = match plan::IcebergDeltaSourceRole::try_from(file.role).map_err(|_| {
         format!(
             "IcebergDeltaTable source file {} has unknown delta role {}",
@@ -149,7 +152,8 @@ fn lower_delta_source_file_from_native(
             return Err(format!(
                 "IcebergDeltaTable source file {} has unspecified delta role",
                 file.path
-            ));
+            )
+            .into());
         }
         plan::IcebergDeltaSourceRole::DataFile => {
             reject_native_delta_role_payload(
@@ -178,7 +182,7 @@ fn lower_delta_source_file_from_native(
                 return Err(format!(
                     "IcebergDeltaTable source file {} role POSITION_DELETE requires position_deletes",
                     file.path
-                ));
+                ).into());
             }
             DeltaSourceRole::PositionDelete {
                 deletes: file
@@ -198,13 +202,13 @@ fn lower_delta_source_file_from_native(
                 return Err(format!(
                     "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_field_ids",
                     file.path
-                ));
+                ).into());
             }
             if file.equality_targets.is_empty() {
                 return Err(format!(
                     "IcebergDeltaTable source file {} role EQUALITY_DELETE requires equality_targets",
                     file.path
-                ));
+                ).into());
             }
             DeltaSourceRole::EqualityDelete {
                 equality_field_ids: file.equality_field_ids.clone(),

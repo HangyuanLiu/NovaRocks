@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::chunk_schema_from_output_columns;
 use super::DecodedNode;
 use super::common::{check_exact_arity, concat_layouts, proto_join_type};
@@ -31,49 +32,75 @@ use crate::exec::node::join::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 use crate::types::wider_type;
 
 pub(super) fn lower_hash_join_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     join: &plan::HashJoinNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("HashJoinNode", 2, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("HashJoinNode", 2, children.len()),
+    )?;
     let mut it = children.into_iter();
     let left = it.next().expect("left");
     let right = it.next().expect("right");
     if join.eq_conditions.is_empty() {
-        return Err("HashJoinNode requires non-empty eq_conditions".to_string());
+        return Err(NativeFragmentDecodeError::missing(
+            path.clone().field("eq_conditions"),
+            "HashJoinNode requires non-empty eq_conditions",
+        ));
     }
-    let join_type = proto_join_type(join.join_type, "HashJoinNode")?;
-    let distribution_mode = hash_join_distribution_mode(join)?;
-    let join_layout = concat_layouts(&left.layout, &right.layout)?;
-    let join_scope_chunk_schema = Arc::new(ChunkSchema::concat(&[
-        left.output_schema.clone(),
-        right.output_schema.clone(),
-    ])?);
-    let output_schema =
-        join_output_chunk_schema(physical, join_scope_chunk_schema.clone(), "HashJoinNode")?;
+    let join_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("join_type"),
+        proto_join_type(join.join_type, "HashJoinNode"),
+    )?;
+    let distribution_mode = hash_join_distribution_mode(join, path.clone())?;
+    let join_layout = NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        concat_layouts(&left.layout, &right.layout),
+    )?;
+    let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        ChunkSchema::concat(&[left.output_schema.clone(), right.output_schema.clone()]),
+    )?);
+    let output_schema = join_output_chunk_schema(
+        physical,
+        join_scope_chunk_schema.clone(),
+        "HashJoinNode",
+        path.clone().field("output_columns"),
+    )?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut eq_null_safe = Vec::with_capacity(join.eq_conditions.len());
     let right_semi_physical_right_probe = join_type == JoinType::RightSemi;
     for (idx, cond) in join.eq_conditions.iter().enumerate() {
-        let left_expr = cond
-            .left
-            .as_ref()
-            .ok_or_else(|| format!("HashJoinNode eq_conditions[{idx}] left missing"))?;
-        let right_expr = cond
-            .right
-            .as_ref()
-            .ok_or_else(|| format!("HashJoinNode eq_conditions[{idx}] right missing"))?;
-        let probe_key = decode_expr(left_expr, arena, &left.layout)
-            .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] left: {err}"))?;
-        let build_key = decode_expr(right_expr, arena, &right.layout)
-            .map_err(|err| format!("HashJoinNode eq_conditions[{idx}] right: {err}"))?;
+        let cond_path = path.clone().field("eq_conditions").index(idx);
+        let left_expr = cond.left.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                cond_path.clone().field("left"),
+                format!("HashJoinNode eq_conditions[{idx}] left missing"),
+            )
+        })?;
+        let right_expr = cond.right.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                cond_path.clone().field("right"),
+                format!("HashJoinNode eq_conditions[{idx}] right missing"),
+            )
+        })?;
+        let probe_key = decode_expr_at(
+            left_expr,
+            cond_path.clone().field("left"),
+            arena,
+            &left.layout,
+        )?;
+        let build_key = decode_expr_at(right_expr, cond_path.field("right"), arena, &right.layout)?;
         if right_semi_physical_right_probe {
             probe_keys.push(build_key);
             build_keys.push(probe_key);
@@ -83,21 +110,33 @@ pub(super) fn lower_hash_join_node(
         }
         eq_null_safe.push(cond.null_safe);
     }
-    coerce_join_key_types(&mut probe_keys, &mut build_keys, arena)?;
+    NativeFragmentDecodeError::map_invalid(
+        path.clone().field("eq_conditions"),
+        coerce_join_key_types(&mut probe_keys, &mut build_keys, arena),
+    )?;
     for key in probe_keys.iter().chain(build_keys.iter()) {
         if let Some(dt) = arena.data_type(*key)
             && matches!(dt, DataType::LargeBinary)
         {
-            return Err("VARIANT is not supported in HASH_JOIN keys".to_string());
+            return Err(NativeFragmentDecodeError::unsupported(
+                path.clone().field("eq_conditions"),
+                "VARIANT is not supported in HASH_JOIN keys",
+            ));
         }
     }
 
     let residual_predicate = join
         .other_condition
         .as_ref()
-        .map(|expr| decode_expr(expr, arena, &join_layout))
-        .transpose()
-        .map_err(|err| format!("HashJoinNode other_condition: {err}"))?;
+        .map(|expr| {
+            decode_expr_at(
+                expr,
+                path.clone().field("other_condition"),
+                arena,
+                &join_layout,
+            )
+        })
+        .transpose()?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Join(JoinNode {
@@ -126,46 +165,60 @@ pub(super) fn lower_hash_join_node(
 pub(super) fn join_output_chunk_schema(
     physical: &plan::PlanNode,
     fallback: ChunkSchemaRef,
-    node_kind: &str,
-) -> Result<ChunkSchemaRef, String> {
+    _node_kind: &str,
+    path: FieldPath,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
     if physical.output_columns.is_empty() {
         return Ok(fallback);
     }
-    let output_schema = chunk_schema_from_output_columns(&physical.output_columns)
-        .map_err(|err| format!("{node_kind} output_columns: {err}"))?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        path,
+        chunk_schema_from_output_columns(&physical.output_columns),
+    )?;
     if output_schema.slot_ids() == fallback.slot_ids() {
         return Ok(output_schema);
     }
     Ok(fallback)
 }
 
-fn hash_join_distribution_mode(join: &plan::HashJoinNode) -> Result<JoinDistributionMode, String> {
+fn hash_join_distribution_mode(
+    join: &plan::HashJoinNode,
+    path: FieldPath,
+) -> Result<JoinDistributionMode, NativeFragmentDecodeError> {
     if let Some(mode) = join.execution_mode {
-        return match plan::JoinExecutionMode::try_from(mode)
-            .map_err(|_| format!("HashJoinNode unknown execution_mode {mode}"))?
-        {
+        return match plan::JoinExecutionMode::try_from(mode).map_err(|_| {
+            NativeFragmentDecodeError::invalid_enum(
+                path.clone().field("execution_mode"),
+                format!("HashJoinNode unknown execution_mode {mode}"),
+            )
+        })? {
             plan::JoinExecutionMode::Broadcast => Ok(JoinDistributionMode::Broadcast),
             plan::JoinExecutionMode::Partitioned | plan::JoinExecutionMode::Colocate => {
                 Ok(JoinDistributionMode::Partitioned)
             }
-            plan::JoinExecutionMode::Unspecified => {
-                Err("HashJoinNode execution_mode is unspecified".to_string())
-            }
+            plan::JoinExecutionMode::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
+                path.field("execution_mode"),
+                "HashJoinNode execution_mode is unspecified",
+            )),
         };
     }
 
-    match plan::JoinDistribution::try_from(join.distribution)
-        .map_err(|_| format!("HashJoinNode unknown distribution {}", join.distribution))?
-    {
+    match plan::JoinDistribution::try_from(join.distribution).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("distribution"),
+            format!("HashJoinNode unknown distribution {}", join.distribution),
+        )
+    })? {
         plan::JoinDistribution::Broadcast | plan::JoinDistribution::Unknown => {
             Ok(JoinDistributionMode::Broadcast)
         }
         plan::JoinDistribution::Shuffle | plan::JoinDistribution::Colocate => {
             Ok(JoinDistributionMode::Partitioned)
         }
-        plan::JoinDistribution::Unspecified => {
-            Err("HashJoinNode distribution is unspecified".to_string())
-        }
+        plan::JoinDistribution::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
+            path.field("distribution"),
+            "HashJoinNode distribution is unspecified",
+        )),
     }
 }
 

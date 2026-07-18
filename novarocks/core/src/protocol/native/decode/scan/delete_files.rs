@@ -23,12 +23,13 @@ use crate::exec::node::iceberg_delta_scan::{
 };
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn reject_native_delta_role_payload(
     file: &plan::IcebergDeltaSourceFile,
     role_name: &str,
     fields: &[&str],
-) -> Result<(), String> {
+) -> Result<(), NativeFragmentLeafDecodeError> {
     for field in fields {
         let present = match *field {
             "position_deletes" => !file.position_deletes.is_empty(),
@@ -41,7 +42,8 @@ pub(super) fn reject_native_delta_role_payload(
             return Err(format!(
                 "IcebergDeltaTable source file {} role {} must not carry {}",
                 file.path, role_name, field
-            ));
+            )
+            .into());
         }
     }
     Ok(())
@@ -49,7 +51,7 @@ pub(super) fn reject_native_delta_role_payload(
 
 pub(super) fn lower_position_delete_source_from_native(
     delete: &plan::IcebergDeltaPositionDeleteSource,
-) -> Result<PositionDeleteSourceData, String> {
+) -> Result<PositionDeleteSourceData, NativeFragmentLeafDecodeError> {
     Ok(PositionDeleteSourceData {
         delete_file_path: delete.delete_file_path.clone(),
         delete_file_size: delete.delete_file_size,
@@ -89,7 +91,7 @@ pub(super) fn lower_equality_delete_target_from_native(
 
 pub(super) fn lower_delta_delete_side_payload_from_native(
     payload: Option<&plan::IcebergDeltaDeleteSidePlan>,
-) -> Result<Option<DeltaScanDeleteSidePayload>, String> {
+) -> Result<Option<DeltaScanDeleteSidePayload>, NativeFragmentLeafDecodeError> {
     let Some(payload) = payload else {
         return Ok(None);
     };
@@ -131,7 +133,10 @@ fn lower_novarocks_base_lineage_map(
 
 fn lower_novarocks_delete_visibility_data_file(
     file: &plan::IcebergDeltaDeleteVisibilityDataFile,
-) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor, String> {
+) -> Result<
+    crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor,
+    NativeFragmentLeafDecodeError,
+> {
     Ok(
         crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor {
             path: file.path.clone(),
@@ -149,7 +154,10 @@ fn lower_novarocks_delete_visibility_data_file(
 
 fn lower_novarocks_delete_visibility_delete_file(
     file: &plan::IcebergDeltaDeleteVisibilityDeleteFile,
-) -> Result<crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor, String> {
+) -> Result<
+    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor,
+    NativeFragmentLeafDecodeError,
+> {
     Ok(
         crate::connector::iceberg::changes::DeleteVisibilityDeleteFileDescriptor {
             path: file.path.clone(),

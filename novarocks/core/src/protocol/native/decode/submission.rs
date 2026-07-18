@@ -1,0 +1,783 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use crate::common::types::UniqueId;
+use crate::exec::expr::ExprArena;
+use crate::exec::fragment::program::{
+    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
+    FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
+    ScanSourceContract,
+};
+use crate::exec::node::ExecPlan;
+use crate::proto::{novarocks, plan};
+use crate::protocol::common::error::FieldPath;
+use crate::runtime::fragment::instance::{
+    BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
+    FragmentInstanceSpec, FragmentRuntimeOptions, ScanAssignments,
+};
+use crate::runtime::fragment::submission::FragmentSubmission;
+use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+
+use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
+use super::{
+    NativeFragmentDecodeError, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
+    decode_fragment_sink_assignment, decode_fragment_sink_program,
+    decode_node_with_runtime_filters, decode_query_options,
+};
+
+#[derive(Debug)]
+pub(crate) struct DecodedNativeFragment {
+    submission: FragmentSubmission,
+    metadata: NativeSubmissionMetadata,
+}
+
+impl DecodedNativeFragment {
+    fn new(submission: FragmentSubmission, metadata: NativeSubmissionMetadata) -> Self {
+        Self {
+            submission,
+            metadata,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (FragmentSubmission, NativeSubmissionMetadata) {
+        (self.submission, self.metadata)
+    }
+}
+
+struct DecodedNativeInstanceParts {
+    query_id: QueryId,
+    fragment_instance_id: FragmentInstanceId,
+    backend_num: BackendNum,
+    query_options: crate::runtime::query_options::QueryOptions,
+    pipeline_dop: NonZeroUsize,
+    raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    exchange_inputs: ExchangeInputAssignments,
+    runtime_filter_params: RuntimeFilterParams,
+    report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint>,
+    typed_result_sink: bool,
+}
+
+pub(crate) fn decode_fragment_submission(
+    fragment: &plan::PlanFragment,
+    instance_params: &novarocks::InstanceParams,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    let instance_parts = decode_instance_parts(instance_params)?;
+    let root_path = FieldPath::root("plan_fragment").field("root");
+    let root = fragment.root.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(root_path.clone(), "native PlanFragment requires root")
+    })?;
+    validate_node_required_fields(root, root_path.clone())?;
+    let sink_path = FieldPath::root("plan_fragment").field("sink");
+    let sink = fragment.sink.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(sink_path.clone(), "native PlanFragment requires sink")
+    })?;
+    if sink.kind.is_none() {
+        return Err(NativeFragmentDecodeError::missing(
+            sink_path.clone().field("kind"),
+            "native DataSink requires kind",
+        ));
+    }
+    for (index, expression) in fragment.output_exprs.iter().enumerate() {
+        super::expr::validate_proto_expr_shape_at(
+            expression,
+            FieldPath::root("plan_fragment")
+                .field("output_exprs")
+                .index(index),
+        )?;
+    }
+    validate_runtime_filter_binding_expressions(fragment)?;
+
+    let scan_sources = decode_scan_source_contracts(root, root_path.clone())?;
+    let scan_assignments = bind_scan_assignments(
+        &scan_sources,
+        instance_parts.raw_scan_ranges,
+        FieldPath::root("instance_params").field("per_node_scan_ranges"),
+    )?;
+    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)?;
+
+    let mut arena = ExprArena::default();
+    arena.set_allow_throw_exception(instance_parts.query_options.allow_throw_exception);
+    let context = NativePlanDecodeContext::from_parts(
+        instance_parts.exchange_inputs.clone(),
+        scan_assignments.clone(),
+        instance_parts.query_options.clone(),
+        Arc::new(crate::connector::ConnectorRegistry::default()),
+        instance_parts.query_id,
+        instance_parts.fragment_instance_id,
+    );
+    let mut runtime_filter_ledger = NativeRuntimeFilterDecodeLedger::decode(
+        fragment.fragment_id,
+        fragment.runtime_filter_bindings.as_ref(),
+    )?;
+    let decoded_root =
+        decode_node_with_runtime_filters(root, &mut arena, &context, &mut runtime_filter_ledger)?;
+    runtime_filter_ledger.finish()?;
+    let plan = ExecPlan {
+        arena,
+        root: decoded_root.node,
+    };
+    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
+    let sink_spec =
+        FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
+    let exchange_inputs = decode_exchange_contracts(root, root_path)?;
+    let runtime_filters = decode_runtime_filter_contract(fragment)?;
+    let program = FragmentProgram::new(
+        plan,
+        sink_spec,
+        FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+        scan_sources,
+        exchange_inputs,
+        runtime_filters,
+    );
+    let metadata = NativeSubmissionMetadata::new(
+        instance_parts.backend_num.get(),
+        instance_parts.report_endpoint.clone(),
+        instance_parts.typed_result_sink,
+    );
+    let instance = FragmentInstanceSpec::new(
+        FragmentContractVersion::CURRENT,
+        instance_parts.query_id,
+        instance_parts.fragment_instance_id,
+        scan_assignments,
+        instance_parts.exchange_inputs,
+        sink_assignment,
+        instance_parts.runtime_filter_params,
+        FragmentRuntimeOptions::new(
+            instance_parts.query_options,
+            None,
+            instance_parts.typed_result_sink,
+        ),
+        instance_parts.pipeline_dop,
+        instance_parts.backend_num,
+    );
+    let submission = FragmentSubmission::try_new(Arc::new(program), instance)
+        .map_err(NativeFragmentDecodeError::Binding)?;
+    Ok(DecodedNativeFragment::new(submission, metadata))
+}
+
+fn validate_node_required_fields(
+    node: &plan::DistributedNode,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    let payload = node.payload.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("payload"),
+            format!("native DistributedNode {} requires payload", node.node_id),
+        )
+    })?;
+    if let plan::distributed_node::Payload::Physical(physical) = payload {
+        let kind = physical.kind.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone()
+                    .field("payload")
+                    .field("physical")
+                    .field("kind"),
+                format!("native PlanNode {} requires kind", node.node_id),
+            )
+        })?;
+        if let plan::plan_node::Kind::Values(values) = kind {
+            for (row_index, row) in values.rows.iter().enumerate() {
+                for (value_index, value) in row.values.iter().enumerate() {
+                    super::expr::validate_proto_expr_shape_at(
+                        value,
+                        path.clone()
+                            .field("payload")
+                            .field("physical")
+                            .field("values")
+                            .field("rows")
+                            .index(row_index)
+                            .field("values")
+                            .index(value_index),
+                    )?;
+                }
+            }
+        }
+    }
+    for (index, child) in node.children.iter().enumerate() {
+        validate_node_required_fields(child, path.clone().field("children").index(index))?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_filter_binding_expressions(
+    fragment: &plan::PlanFragment,
+) -> Result<(), NativeFragmentDecodeError> {
+    let Some(table) = fragment.runtime_filter_bindings.as_ref() else {
+        return Ok(());
+    };
+    for (index, binding) in table.bindings.iter().enumerate() {
+        let path = FieldPath::root("plan_fragment")
+            .field("runtime_filter_bindings")
+            .field("bindings")
+            .index(index)
+            .field("expression");
+        let expression = binding.expression.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone(),
+                "native runtime-filter binding requires expression",
+            )
+        })?;
+        super::expr::validate_proto_expr_shape_at(expression, path)?;
+    }
+    Ok(())
+}
+
+fn decode_instance_parts(
+    src: &novarocks::InstanceParams,
+) -> Result<DecodedNativeInstanceParts, NativeFragmentDecodeError> {
+    let path = FieldPath::root("instance_params");
+    let query_id = src.query_id.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("query_id"),
+            "native InstanceParams requires query_id",
+        )
+    })?;
+    let fragment_instance_id = src.fragment_instance_id.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("fragment_instance_id"),
+            "native InstanceParams requires fragment_instance_id",
+        )
+    })?;
+    if src.backend_num < 0 {
+        return Err(NativeFragmentDecodeError::out_of_range(
+            path.clone().field("backend_num"),
+            format!("backend_num must be non-negative, got {}", src.backend_num),
+        ));
+    }
+    let backend_num =
+        BackendNum::try_new(src.backend_num).map_err(NativeFragmentDecodeError::Binding)?;
+    let wire_query_options = src.query_options.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("query_options"),
+            "native InstanceParams requires query_options with explicit pipeline_dop",
+        )
+    })?;
+    let query_options = decode_query_options(wire_query_options)?;
+    let pipeline_dop = usize::try_from(wire_query_options.pipeline_dop)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone().field("query_options").field("pipeline_dop"),
+                format!(
+                    "pipeline_dop must be explicitly positive, got {}",
+                    wire_query_options.pipeline_dop
+                ),
+            )
+        })?;
+    if src.runtime_filter_params.is_some() {
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("runtime_filter_params"),
+            "legacy runtime_filter_params are unsupported with native runtime-filter bindings",
+        ));
+    }
+
+    let mut scan_keys = src.per_node_scan_ranges.keys().copied().collect::<Vec<_>>();
+    scan_keys.sort_unstable();
+    let mut raw_scan_ranges = BTreeMap::new();
+    for raw_node_id in scan_keys {
+        let list_path = path
+            .clone()
+            .field("per_node_scan_ranges")
+            .map_key(raw_node_id.to_string());
+        let wire_ranges = &src.per_node_scan_ranges[&raw_node_id];
+        let mut ranges = Vec::with_capacity(wire_ranges.ranges.len());
+        for (index, range) in wire_ranges.ranges.iter().enumerate() {
+            ranges.push(decode_scan_range_params_at(
+                range,
+                list_path.clone().field("ranges").index(index),
+            )?);
+        }
+        raw_scan_ranges.insert(FragmentNodeId::new(raw_node_id), ranges);
+    }
+
+    let mut exchange_keys = src.per_exch_num_senders.keys().copied().collect::<Vec<_>>();
+    exchange_keys.sort_unstable();
+    let mut exchange_inputs = BTreeMap::new();
+    for raw_node_id in exchange_keys {
+        let sender_count = src.per_exch_num_senders[&raw_node_id];
+        let count = usize::try_from(sender_count)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::out_of_range(
+                    path.clone()
+                        .field("per_exch_num_senders")
+                        .map_key(raw_node_id.to_string()),
+                    format!("sender count must be positive, got {sender_count}"),
+                )
+            })?;
+        exchange_inputs.insert(
+            FragmentNodeId::new(raw_node_id),
+            ExchangeInputAssignment::new(count),
+        );
+    }
+    let report_endpoint = src
+        .report_endpoint
+        .as_deref()
+        .map(super::decode_endpoint)
+        .transpose()?;
+
+    Ok(DecodedNativeInstanceParts {
+        query_id: query_id_from_native(query_id),
+        fragment_instance_id: FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
+        backend_num,
+        query_options,
+        pipeline_dop,
+        raw_scan_ranges,
+        exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
+        runtime_filter_params: RuntimeFilterParams::default(),
+        report_endpoint,
+        typed_result_sink: src.typed_result_sink,
+    })
+}
+
+fn bind_scan_assignments(
+    contracts: &BTreeMap<FragmentNodeId, ScanSourceContract>,
+    raw_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
+    path: FieldPath,
+) -> Result<ScanAssignments, NativeFragmentDecodeError> {
+    let mut assignments = BTreeMap::new();
+    for (node_id, ranges) in raw_ranges {
+        let contract = contracts.get(&node_id).ok_or_else(|| {
+            NativeFragmentDecodeError::inconsistent(
+                path.clone().map_key(node_id.get().to_string()),
+                format!(
+                    "scan ranges assigned to unknown scan node {}",
+                    node_id.get()
+                ),
+            )
+        })?;
+        assignments.insert(node_id, (contract.assignment_kind(), ranges));
+    }
+    ScanAssignments::try_new(assignments).map_err(NativeFragmentDecodeError::Binding)
+}
+
+fn decode_scan_source_contracts(
+    root: &plan::DistributedNode,
+    path: FieldPath,
+) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, NativeFragmentDecodeError> {
+    super::node::collect_scan_assignment_kinds(root, path).map(|kinds| {
+        kinds
+            .into_iter()
+            .map(|(node_id, kind)| (node_id, ScanSourceContract::new(kind)))
+            .collect()
+    })
+}
+
+fn decode_exchange_contracts(
+    root: &plan::DistributedNode,
+    path: FieldPath,
+) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, NativeFragmentDecodeError> {
+    fn visit(
+        node: &plan::DistributedNode,
+        path: FieldPath,
+        contracts: &mut BTreeMap<FragmentNodeId, ExchangeInputContract>,
+    ) -> Result<(), NativeFragmentDecodeError> {
+        if let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_ref() {
+            let schema = super::layout::chunk_schema_from_output_columns(&exchange.output_columns)
+                .map_err(|error| {
+                    NativeFragmentDecodeError::invalid_value(
+                        path.clone()
+                            .field("payload")
+                            .field("exchange")
+                            .field("output_columns"),
+                        error,
+                    )
+                })?;
+            if contracts
+                .insert(
+                    FragmentNodeId::new(node.node_id),
+                    ExchangeInputContract::new(schema),
+                )
+                .is_some()
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone().field("node_id"),
+                    format!("duplicate exchange node_id={}", node.node_id),
+                ));
+            }
+        }
+        for (index, child) in node.children.iter().enumerate() {
+            visit(
+                child,
+                path.clone().field("children").index(index),
+                contracts,
+            )?;
+        }
+        Ok(())
+    }
+
+    let mut contracts = BTreeMap::new();
+    visit(root, path, &mut contracts)?;
+    Ok(contracts)
+}
+
+fn decode_runtime_filter_contract(
+    fragment: &plan::PlanFragment,
+) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {
+    let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
+    let table = fragment.runtime_filter_bindings.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone(), "runtime_filter_bindings are required")
+    })?;
+    let mut build_filters = BTreeSet::new();
+    let mut probe_filters = BTreeSet::new();
+    for (index, binding) in table.bindings.iter().enumerate() {
+        let raw_id = i32::try_from(binding.channel_id).map_err(|_| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone()
+                    .field("bindings")
+                    .index(index)
+                    .field("channel_id"),
+                format!("channel_id {} exceeds i32 range", binding.channel_id),
+            )
+        })?;
+        match binding.role.as_ref() {
+            Some(plan::runtime_filter_binding::Role::Producer(_)) => {
+                build_filters.insert(RuntimeFilterId::new(raw_id));
+            }
+            Some(plan::runtime_filter_binding::Role::Consumer(_)) => {
+                probe_filters.insert(RuntimeFilterId::new(raw_id));
+            }
+            None => {
+                return Err(NativeFragmentDecodeError::missing(
+                    path.clone().field("bindings").index(index).field("role"),
+                    "runtime-filter binding role is required",
+                ));
+            }
+        }
+    }
+    Ok(RuntimeFilterContract::new(build_filters, probe_filters))
+}
+
+fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {
+    UniqueId {
+        hi: src.hi,
+        lo: src.lo,
+    }
+}
+
+fn query_id_from_native(src: &crate::proto::common::UniqueId) -> QueryId {
+    QueryId {
+        hi: src.hi,
+        lo: src.lo,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::common::types::UniqueId;
+    use crate::exec::fragment::program::FragmentSinkKind;
+    use crate::exec::node::ExecNodeKind;
+    use crate::proto::{common, novarocks, plan};
+    use crate::protocol::common::error::ProtocolErrorKind;
+    use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
+    use crate::runtime::query_context::{QueryId, query_context_manager};
+    use crate::runtime::query_state::in_flight_table;
+    use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
+    use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+    use crate::types::native_proto::encode_type;
+
+    static NEXT_TEST_ID: AtomicI64 = AtomicI64::new(8_600_000_000_000_000_000);
+
+    fn output_column(column_id: u32) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: "value".to_string(),
+            r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn values_noop_fragment() -> plan::PlanFragment {
+        let columns = vec![output_column(1)];
+        plan::PlanFragment {
+            fragment_id: 7,
+            root: Some(plan::DistributedNode {
+                node_id: 11,
+                fragment_id: 7,
+                limit: -1,
+                payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                    output_columns: columns.clone(),
+                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                        rows: Vec::new(),
+                        columns: columns.clone(),
+                    })),
+                })),
+                ..Default::default()
+            }),
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Noop(true)),
+            }),
+            output_columns: columns,
+            runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                fragment_id: 7,
+                bindings: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn instance_params(query: UniqueId, finst: UniqueId) -> novarocks::InstanceParams {
+        novarocks::InstanceParams {
+            query_id: Some(common::UniqueId {
+                hi: query.hi,
+                lo: query.lo,
+            }),
+            fragment_instance_id: Some(common::UniqueId {
+                hi: finst.hi,
+                lo: finst.lo,
+            }),
+            backend_num: 3,
+            query_options: Some(novarocks::QueryOptions {
+                pipeline_dop: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn assert_runtime_state_absent(
+        query: QueryId,
+        finst: UniqueId,
+        exchange_key: ExchangeKey,
+        rf_key: QueryKey,
+    ) {
+        let manager = query_context_manager();
+        assert!(manager.query_mem_tracker(query).is_none());
+        assert!(manager.query_id_by_finst(finst).is_none());
+        assert!(in_flight_table().state(query).is_none());
+        let TryFetchResult::Error(error) = result_buffer::try_fetch(finst) else {
+            panic!("missing result buffer entry must return an error");
+        };
+        assert!(matches!(error.kind, FetchErrorKind::NotFound));
+        assert!(snapshot_receiver_state(exchange_key).is_none());
+        assert!(
+            RuntimeFilterLifecycleRegistry::global()
+                .snapshot(rf_key)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn values_noop_decodes_to_validated_submission() {
+        let query = UniqueId { hi: 11, lo: 12 };
+        let finst = UniqueId { hi: 21, lo: 22 };
+
+        let decoded =
+            decode_fragment_submission(&values_noop_fragment(), &instance_params(query, finst))
+                .expect("decode values/noop submission");
+        let (submission, metadata) = decoded.into_parts();
+
+        assert_eq!(submission.instance().query_id(), QueryId { hi: 11, lo: 12 });
+        assert_eq!(submission.instance().fragment_instance_id().get(), finst);
+        assert_eq!(submission.instance().backend_num().get(), 3);
+        assert_eq!(metadata.backend_num(), 3);
+        assert_eq!(submission.program().sink().kind(), FragmentSinkKind::Noop);
+        assert!(matches!(
+            submission.program().plan().root.kind,
+            ExecNodeKind::Values(_)
+        ));
+    }
+
+    #[test]
+    fn missing_root_fails_before_missing_sink() {
+        let fragment = plan::PlanFragment {
+            root: None,
+            sink: None,
+            ..Default::default()
+        };
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 41, lo: 42 }),
+        )
+        .expect_err("missing root must fail");
+
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn invalid_exchange_maps_are_checked_in_sorted_key_order() {
+        let mut params = instance_params(UniqueId { hi: 51, lo: 52 }, UniqueId { hi: 61, lo: 62 });
+        params.per_exch_num_senders.insert(9, 0);
+        params.per_exch_num_senders.insert(3, -1);
+
+        let error = decode_fragment_submission(&values_noop_fragment(), &params)
+            .expect_err("invalid sender count must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "instance_params.per_exch_num_senders[\"3\"]"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::OutOfRange);
+    }
+
+    #[test]
+    fn scan_range_errors_include_sorted_map_key_and_range_index() {
+        let mut params =
+            instance_params(UniqueId { hi: 131, lo: 132 }, UniqueId { hi: 141, lo: 142 });
+        params.per_node_scan_ranges.insert(
+            11,
+            novarocks::ScanRangeList {
+                ranges: vec![novarocks::ScanRangeParams::default()],
+            },
+        );
+
+        let error = decode_fragment_submission(&values_noop_fragment(), &params)
+            .expect_err("missing scan range must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "instance_params.per_node_scan_ranges[\"11\"].ranges[0].range"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn legacy_runtime_filter_params_are_rejected_at_typed_path() {
+        let mut params = instance_params(UniqueId { hi: 71, lo: 72 }, UniqueId { hi: 81, lo: 82 });
+        params.runtime_filter_params = Some(novarocks::RuntimeFilterParams::default());
+
+        let error = decode_fragment_submission(&values_noop_fragment(), &params)
+            .expect_err("legacy runtime-filter params must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "instance_params.runtime_filter_params"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn missing_child_payload_reports_recursive_node_path() {
+        let mut fragment = values_noop_fragment();
+        fragment
+            .root
+            .as_mut()
+            .expect("root")
+            .children
+            .push(plan::DistributedNode::default());
+
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 91, lo: 92 }, UniqueId { hi: 101, lo: 102 }),
+        )
+        .expect_err("missing child payload must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.children[0].payload"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn malformed_values_expression_reports_recursive_expr_path() {
+        let mut fragment = values_noop_fragment();
+        let root = fragment.root.as_mut().expect("root");
+        let Some(plan::distributed_node::Payload::Physical(physical)) = root.payload.as_mut()
+        else {
+            panic!("physical root");
+        };
+        let Some(plan::plan_node::Kind::Values(values)) = physical.kind.as_mut() else {
+            panic!("values root");
+        };
+        values.rows.push(plan::ExprList {
+            values: vec![crate::proto::expr::Expr::default()],
+        });
+
+        let error = decode_fragment_submission(
+            &fragment,
+            &instance_params(UniqueId { hi: 111, lo: 112 }, UniqueId { hi: 121, lo: 122 }),
+        )
+        .expect_err("missing expression type must fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.values.rows[0].values[0].type"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+    }
+
+    #[test]
+    fn submission_binding_errors_keep_binding_stage_identity() {
+        let mut params =
+            instance_params(UniqueId { hi: 151, lo: 152 }, UniqueId { hi: 161, lo: 162 });
+        params.per_exch_num_senders.insert(99, 1);
+
+        let error = decode_fragment_submission(&values_noop_fragment(), &params)
+            .expect_err("unknown exchange assignment must fail binding");
+        let NativeFragmentDecodeError::Binding(binding) = error else {
+            panic!("expected binding error stage");
+        };
+        assert_eq!(
+            binding.target(),
+            crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(99)
+        );
+    }
+
+    #[test]
+    fn malformed_submission_has_zero_runtime_side_effects() {
+        let unique = NEXT_TEST_ID.fetch_add(10, Ordering::Relaxed);
+        let query = UniqueId {
+            hi: unique,
+            lo: unique + 1,
+        };
+        let finst = UniqueId {
+            hi: unique + 2,
+            lo: unique + 3,
+        };
+        let query_id = QueryId {
+            hi: query.hi,
+            lo: query.lo,
+        };
+        let exchange_key = ExchangeKey {
+            finst_id_hi: finst.hi,
+            finst_id_lo: finst.lo,
+            node_id: 77,
+        };
+        let rf_key = QueryKey::from_hi_lo(query.hi, query.lo);
+        assert_runtime_state_absent(query_id, finst, exchange_key, rf_key);
+
+        let malformed = plan::PlanFragment {
+            root: None,
+            sink: None,
+            ..Default::default()
+        };
+        let error = decode_fragment_submission(&malformed, &instance_params(query, finst))
+            .expect_err("malformed submission must fail");
+        assert_eq!(
+            error.protocol().expect("protocol error").path().to_string(),
+            "plan_fragment.root"
+        );
+
+        assert_runtime_state_absent(query_id, finst, exchange_key, rf_key);
+    }
+}

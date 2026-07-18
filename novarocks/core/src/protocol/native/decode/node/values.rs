@@ -22,7 +22,8 @@ use arrow::compute::concat;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::check_exact_arity;
@@ -31,23 +32,45 @@ use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_values_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     values: &plan::ValuesNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("ValuesNode", 0, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("ValuesNode", 0, children.len()),
+    )?;
     let columns = if values.columns.is_empty() {
         &physical.output_columns
     } else {
         &values.columns
     };
-    let layout = layout_from_output_columns(columns)?;
-    let output_schema = chunk_schema_from_output_columns(columns)?;
-    let chunk = materialize_values_chunk(&values.rows, columns, output_schema.clone(), arena)?;
+    let columns_path = if values.columns.is_empty() {
+        path.clone().field("output_columns")
+    } else {
+        path.clone().field("columns")
+    };
+    let layout = NativeFragmentDecodeError::map_invalid(
+        columns_path.clone(),
+        layout_from_output_columns(columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        columns_path,
+        chunk_schema_from_output_columns(columns),
+    )?;
+    let chunk = materialize_values_chunk(
+        &values.rows,
+        columns,
+        output_schema.clone(),
+        arena,
+        path.clone(),
+    )?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Values(ValuesNode {
@@ -65,20 +88,30 @@ pub(super) fn materialize_values_chunk(
     columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
-) -> Result<Chunk, String> {
+    path: FieldPath,
+) -> Result<Chunk, NativeFragmentDecodeError> {
     if columns.is_empty() {
-        return empty_chunk_with_row_count(rows.len().max(1));
+        return NativeFragmentDecodeError::map_invalid(
+            path.field("rows"),
+            empty_chunk_with_row_count(rows.len().max(1)),
+        );
     }
     if rows.is_empty() {
         let batch = RecordBatch::new_empty(output_schema.arrow_schema_ref());
-        return Chunk::try_new_with_chunk_schema(batch, output_schema);
+        return NativeFragmentDecodeError::map_invalid(
+            path.field("rows"),
+            Chunk::try_new_with_chunk_schema(batch, output_schema),
+        );
     }
     let column_count = columns.len();
     if output_schema.slots().len() != column_count {
-        return Err(format!(
-            "ValuesNode output schema width mismatch: columns={}, schema_slots={}",
-            column_count,
-            output_schema.slots().len()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("columns"),
+            format!(
+                "ValuesNode output schema width mismatch: columns={}, schema_slots={}",
+                column_count,
+                output_schema.slots().len()
+            ),
         ));
     }
     let target_types = output_schema
@@ -88,28 +121,45 @@ pub(super) fn materialize_values_chunk(
         .collect::<Vec<_>>();
     let mut arrays_by_column = vec![Vec::<ArrayRef>::with_capacity(rows.len()); column_count];
     let input_layout = Layout::default();
-    let one_row = empty_chunk_with_row_count(1)?;
+    let one_row = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("rows"),
+        empty_chunk_with_row_count(1),
+    )?;
 
     for (row_idx, row) in rows.iter().enumerate() {
         if row.values.len() != column_count {
-            return Err(format!(
-                "ValuesNode row {row_idx} width mismatch: expected {column_count}, got {}",
-                row.values.len()
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().field("rows").index(row_idx).field("values"),
+                format!(
+                    "ValuesNode row {row_idx} width mismatch: expected {column_count}, got {}",
+                    row.values.len()
+                ),
             ));
         }
         for (col_idx, expr) in row.values.iter().enumerate() {
-            let expr_id = decode_expr(expr, arena, &input_layout)
-                .map_err(|err| format!("ValuesNode row {row_idx} column {col_idx}: {err}"))?;
+            let expr_path = path
+                .clone()
+                .field("rows")
+                .index(row_idx)
+                .field("values")
+                .index(col_idx);
+            let expr_id = decode_expr_at(expr, expr_path.clone(), arena, &input_layout)?;
             let array = arena
                 .eval(expr_id, &one_row)
-                .map_err(|err| format!("ValuesNode row {row_idx} column {col_idx}: {err}"))?;
+                .map_err(|err| NativeFragmentDecodeError::invalid_value(expr_path.clone(), err))?;
             if array.len() != 1 {
-                return Err(format!(
-                    "ValuesNode row {row_idx} column {col_idx} evaluated to {} rows, expected 1",
-                    array.len()
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    expr_path.clone(),
+                    format!(
+                        "ValuesNode row {row_idx} column {col_idx} evaluated to {} rows, expected 1",
+                        array.len()
+                    ),
                 ));
             }
-            let array = normalize_values_array(row_idx, col_idx, array, &target_types[col_idx])?;
+            let array = NativeFragmentDecodeError::map_invalid(
+                expr_path,
+                normalize_values_array(row_idx, col_idx, array, &target_types[col_idx]),
+            )?;
             arrays_by_column[col_idx].push(array);
         }
     }
@@ -124,8 +174,12 @@ pub(super) fn materialize_values_chunk(
                 .collect::<Vec<_>>();
             concat(&refs).map_err(|err| format!("ValuesNode column {col_idx} concat failed: {err}"))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Chunk::try_new_with_columns(output_schema, columns)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| NativeFragmentDecodeError::invalid_value(path.clone().field("rows"), err))?;
+    NativeFragmentDecodeError::map_invalid(
+        path.field("rows"),
+        Chunk::try_new_with_columns(output_schema, columns),
+    )
 }
 
 fn normalize_values_array(

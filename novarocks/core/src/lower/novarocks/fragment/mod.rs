@@ -60,7 +60,8 @@ pub(crate) fn execute_fragment_native(
     let mut runtime_filter_bindings = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let query_options = instance_params
         .query_options
         .as_ref()
@@ -120,12 +121,16 @@ pub(crate) fn execute_fragment_native(
         Arc::new(connector::ConnectorRegistry::default()),
         query_id,
         FragmentInstanceId::new(fragment_instance_id),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let (lowered, dormancy_facts) = {
         let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
         let lowered =
-            decode_node_with_runtime_filters(root, &mut arena, &ctx, &mut runtime_filter_bindings)?;
-        let dormancy_facts = runtime_filter_bindings.finish()?;
+            decode_node_with_runtime_filters(root, &mut arena, &ctx, &mut runtime_filter_bindings)
+                .map_err(|error| error.to_string())?;
+        let dormancy_facts = runtime_filter_bindings
+            .finish()
+            .map_err(|error| error.to_string())?;
         (lowered, dormancy_facts)
     };
     if let Some(profiler) = profiler.as_ref() {

@@ -19,53 +19,67 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr, lower_expr_list};
+use super::{decode_expr_at, lower_expr_list};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_array_literal(
     call: &expr::FunctionCall,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
     if !matches!(data_type, DataType::List(_)) {
-        return Err(format!(
-            "ARRAY literal expects List type, got {data_type:?}"
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            format!("ARRAY literal expects List type, got {data_type:?}"),
         ));
     }
-    let elements = lower_expr_list(&call.args, arena, input_layout)?;
+    let elements = lower_expr_list(&call.args, path.field("args"), arena, input_layout)?;
     Ok(arena.push_typed(ExprNode::ArrayExpr { elements }, data_type))
 }
 
 pub(crate) fn lower_map_constructor(
     call: &expr::FunctionCall,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
     if !call.args.len().is_multiple_of(2) {
-        return Err(format!(
-            "MAP constructor expects an even number of arguments, got {}",
-            call.args.len()
+        return Err(super::super::NativeFragmentDecodeError::invalid_value(
+            path.clone().field("args"),
+            format!(
+                "MAP constructor expects an even number of arguments, got {}",
+                call.args.len()
+            ),
         ));
     }
 
     let DataType::Map(entry_field, _) = &data_type else {
-        return Err(format!(
-            "MAP constructor expects MAP output type, got {data_type:?}"
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            format!("MAP constructor expects MAP output type, got {data_type:?}"),
         ));
     };
     let DataType::Struct(entry_fields) = entry_field.data_type() else {
-        return Err("MAP constructor entries type must be Struct".to_string());
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            "MAP constructor entries type must be Struct",
+        ));
     };
     if entry_fields.len() != 2 {
-        return Err(format!(
-            "MAP constructor entries type must have 2 fields, got {}",
-            entry_fields.len()
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            format!(
+                "MAP constructor entries type must have 2 fields, got {}",
+                entry_fields.len()
+            ),
         ));
     }
 
@@ -75,23 +89,32 @@ pub(crate) fn lower_map_constructor(
     let mut value_elements = Vec::with_capacity(call.args.len() / 2);
 
     for (idx, arg) in call.args.iter().enumerate() {
-        let child = decode_expr(arg, arena, input_layout)?;
+        let child = decode_expr_at(
+            arg,
+            path.clone().field("args").index(idx),
+            arena,
+            input_layout,
+        )?;
         if idx % 2 == 0 {
-            key_elements.push(coerce_map_constructor_child(
-                arena,
-                child,
-                &expected_key_type,
-                idx,
-                "key",
-            )?);
+            key_elements.push(
+                coerce_map_constructor_child(arena, child, &expected_key_type, idx, "key")
+                    .map_err(|error| {
+                        super::super::NativeFragmentDecodeError::invalid_value(
+                            path.clone().field("args").index(idx),
+                            error,
+                        )
+                    })?,
+            );
         } else {
-            value_elements.push(coerce_map_constructor_child(
-                arena,
-                child,
-                &expected_value_type,
-                idx,
-                "value",
-            )?);
+            value_elements.push(
+                coerce_map_constructor_child(arena, child, &expected_value_type, idx, "value")
+                    .map_err(|error| {
+                        super::super::NativeFragmentDecodeError::invalid_value(
+                            path.clone().field("args").index(idx),
+                            error,
+                        )
+                    })?,
+            );
         }
     }
 

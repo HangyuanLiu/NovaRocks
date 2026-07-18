@@ -205,7 +205,7 @@ fn lower_stream_partition_exprs(
 ) -> Result<Vec<crate::exec::expr::ExprId>, String> {
     let partition_type =
         DataStreamSinkFactoryInput::partition_type_from_compat(stream.output_partition.type_)?;
-    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
+    if !partition_type.requires_exprs() {
         return Ok(Vec::new());
     }
     stream

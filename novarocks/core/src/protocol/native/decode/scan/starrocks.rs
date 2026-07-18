@@ -33,6 +33,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common, plan};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_starrocks_scan(
     node: &plan::DistributedNode,
@@ -40,79 +41,82 @@ pub(super) fn lower_starrocks_scan(
     source: &plan::StarRocksTableSource,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    let prepared = decode_starrocks_scan_preparation(
-        node.node_id,
-        scan,
-        source,
-        ctx.query_id(),
-        ctx.scan_ranges(node.node_id)?,
-    )?;
-    let output_columns = scan_output_columns(scan)?;
-    let layout = layout_from_output_columns(&output_columns)?;
-    let output_schema = starrocks_chunk_schema(&output_columns, source)?;
-    let limit = parse_scan_limit(node.limit)?;
-    let batch_size = i32::try_from(scan_batch_size(ctx.query_options())?).map_err(|_| {
-        format!(
-            "StarRocks ScanNode node_id={} batch_size exceeds i32",
-            node.node_id
-        )
-    })?;
-    let query_timeout = positive_query_option(
-        node.node_id,
-        "query_timeout",
-        ctx.query_options()
-            .and_then(|options| options.query_timeout),
-    )?;
-    let mem_limit = positive_query_option(
-        node.node_id,
-        "exec_mem_limit",
-        ctx.query_options()
-            .and_then(|options| options.exec_mem_limit),
-    )?;
-    let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let min_max_predicates = predicate
-        .map(|root| {
-            super::super::expr::extract_min_max_predicates(arena, root, output_schema.as_ref())
-        })
-        .unwrap_or_default();
-    let cfg = StarRocksScanConfig {
-        db_name: Some(scan.database.clone()),
-        table_name: scan.table.as_ref().map(|table| table.name.clone()),
-        properties: prepared.properties,
-        ranges: prepared.ranges,
-        has_more: false,
-        required_chunk_schema: Arc::clone(&output_schema),
-        output_chunk_schema: Arc::clone(&output_schema),
-        query_global_dicts: Default::default(),
-        limit,
-        batch_size: Some(batch_size),
-        query_timeout,
-        mem_limit,
-        profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
-        min_max_predicates,
-        lake_schema_meta: Some(prepared.lake_schema_meta),
-        topn_filter_column_map: HashMap::new(),
-    };
-    let scan_node = ctx
-        .connectors()?
-        .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
-        .with_node_id(node.node_id)
-        .with_output_chunk_schema(Arc::clone(&output_schema))
-        .with_limit(limit)
-        .with_conjunct_predicate(predicate)
-        .with_connector_io_tasks_per_scan_operator(
+) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+    let decoded = (|| -> Result<DecodedNode, String> {
+        let prepared = decode_starrocks_scan_preparation(
+            node.node_id,
+            scan,
+            source,
+            ctx.query_id(),
+            ctx.scan_ranges(node.node_id)?,
+        )?;
+        let output_columns = scan_output_columns(scan)?;
+        let layout = layout_from_output_columns(&output_columns)?;
+        let output_schema = starrocks_chunk_schema(&output_columns, source)?;
+        let limit = parse_scan_limit(node.limit)?;
+        let batch_size = i32::try_from(scan_batch_size(ctx.query_options())?).map_err(|_| {
+            format!(
+                "StarRocks ScanNode node_id={} batch_size exceeds i32",
+                node.node_id
+            )
+        })?;
+        let query_timeout = positive_query_option(
+            node.node_id,
+            "query_timeout",
             ctx.query_options()
-                .and_then(|options| options.connector_io_tasks_per_scan_operator),
-        )
-        .with_accept_empty_scan_ranges(true);
-    Ok(DecodedNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Scan(scan_node),
-        },
-        layout,
-        output_schema,
-    })
+                .and_then(|options| options.query_timeout),
+        )?;
+        let mem_limit = positive_query_option(
+            node.node_id,
+            "exec_mem_limit",
+            ctx.query_options()
+                .and_then(|options| options.exec_mem_limit),
+        )?;
+        let predicate = lower_scan_predicate(scan, arena, &layout)?;
+        let min_max_predicates = predicate
+            .map(|root| {
+                super::super::expr::extract_min_max_predicates(arena, root, output_schema.as_ref())
+            })
+            .unwrap_or_default();
+        let cfg = StarRocksScanConfig {
+            db_name: Some(scan.database.clone()),
+            table_name: scan.table.as_ref().map(|table| table.name.clone()),
+            properties: prepared.properties,
+            ranges: prepared.ranges,
+            has_more: false,
+            required_chunk_schema: Arc::clone(&output_schema),
+            output_chunk_schema: Arc::clone(&output_schema),
+            query_global_dicts: Default::default(),
+            limit,
+            batch_size: Some(batch_size),
+            query_timeout,
+            mem_limit,
+            profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
+            min_max_predicates,
+            lake_schema_meta: Some(prepared.lake_schema_meta),
+            topn_filter_column_map: HashMap::new(),
+        };
+        let scan_node = ctx
+            .connectors()?
+            .create_scan_node("starrocks", ScanConfig::StarRocks(Box::new(cfg)))?
+            .with_node_id(node.node_id)
+            .with_output_chunk_schema(Arc::clone(&output_schema))
+            .with_limit(limit)
+            .with_conjunct_predicate(predicate)
+            .with_connector_io_tasks_per_scan_operator(
+                ctx.query_options()
+                    .and_then(|options| options.connector_io_tasks_per_scan_operator),
+            )
+            .with_accept_empty_scan_ranges(true);
+        Ok(DecodedNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(scan_node),
+            },
+            layout,
+            output_schema,
+        })
+    })();
+    decoded.map_err(Into::into)
 }
 
 fn positive_query_option<T>(
@@ -136,34 +140,37 @@ where
 fn starrocks_chunk_schema(
     columns: &[common::OutputColumn],
     source: &plan::StarRocksTableSource,
-) -> Result<ChunkSchemaRef, String> {
-    let storage_by_name = source
-        .storage_columns
-        .iter()
-        .map(|column| (column.name.to_ascii_lowercase(), column))
-        .collect::<HashMap<_, _>>();
-    let slots = columns
-        .iter()
-        .map(|column| {
-            let storage = storage_by_name
-                .get(&column.name.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    format!(
-                        "StarRocks native scan output column {} is missing storage metadata",
-                        column.name
-                    )
-                })?;
-            ChunkSlotSchema::try_new_with_field(
-                SlotId::new(column.column_id),
-                Field::new(
-                    &column.name,
-                    output_column_data_type(column)?,
-                    column.nullable,
-                ),
-                None,
-                Some(storage.unique_id),
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    ChunkSchema::try_new(slots).map(Arc::new)
+) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
+    let decoded = (|| -> Result<ChunkSchemaRef, String> {
+        let storage_by_name = source
+            .storage_columns
+            .iter()
+            .map(|column| (column.name.to_ascii_lowercase(), column))
+            .collect::<HashMap<_, _>>();
+        let slots = columns
+            .iter()
+            .map(|column| {
+                let storage = storage_by_name
+                    .get(&column.name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        format!(
+                            "StarRocks native scan output column {} is missing storage metadata",
+                            column.name
+                        )
+                    })?;
+                ChunkSlotSchema::try_new_with_field(
+                    SlotId::new(column.column_id),
+                    Field::new(
+                        &column.name,
+                        output_column_data_type(column)?,
+                        column.nullable,
+                    ),
+                    None,
+                    Some(storage.unique_id),
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        ChunkSchema::try_new(slots).map(Arc::new)
+    })();
+    decoded.map_err(Into::into)
 }

@@ -58,9 +58,11 @@ pub(super) fn sink_factory_from_native(
     typed_result_sink: bool,
     layout: &decode::Layout,
 ) -> Result<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>, String> {
-    let program = decode::decode_fragment_sink_program(fragment, layout)?;
+    let program = decode::decode_fragment_sink_program(fragment, layout)
+        .map_err(|error| error.to_string())?;
     let program = FragmentSinkSpec::try_new(program).map_err(|error| error.to_string())?;
-    let assignment = decode::decode_fragment_sink_assignment(sink, instance_params)?;
+    let assignment = decode::decode_fragment_sink_assignment(sink, instance_params)
+        .map_err(|error| error.to_string())?;
     let fragment_instance_id = instance_params
         .fragment_instance_id
         .as_ref()

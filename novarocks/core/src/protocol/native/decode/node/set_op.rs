@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::NativeFragmentDecodeError;
 use super::super::layout::{
     chunk_schema_from_output_columns, layout_from_output_columns, slot_schemas_from_output_columns,
 };
-use super::common::{check_min_arity, slot_ids_from_columns, unsupported};
+use super::common::{check_min_arity, slot_ids_from_columns};
 use super::{super::decode_type, DecodedNode};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
@@ -28,30 +29,47 @@ use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     set_op: &plan::SetOpNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_min_arity("SetOpNode", 2, children.len())?;
-    let kind = plan::PlanSetOpKind::try_from(set_op.kind)
-        .map_err(|_| format!("SetOpNode unknown kind {}", set_op.kind))?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_min_arity("SetOpNode", 2, children.len()),
+    )?;
+    let kind = plan::PlanSetOpKind::try_from(set_op.kind).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("kind"),
+            format!("SetOpNode unknown kind {}", set_op.kind),
+        )
+    })?;
     let output_columns = if set_op.output_columns.is_empty() {
         &physical.output_columns
     } else {
         &set_op.output_columns
     };
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let output_columns_path = path.clone().field("output_columns");
+    let layout = NativeFragmentDecodeError::map_invalid(
+        output_columns_path.clone(),
+        layout_from_output_columns(output_columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        output_columns_path.clone(),
+        chunk_schema_from_output_columns(output_columns),
+    )?;
     let inputs = normalize_set_op_inputs(
         node.node_id,
         children,
         &set_op.child_output_columns,
         output_columns,
         output_schema.clone(),
+        path.clone(),
         arena,
     )?;
     match kind {
@@ -89,8 +107,14 @@ pub(super) fn lower_set_op_node(
             layout,
             output_schema,
         }),
-        plan::PlanSetOpKind::UnionDistinct => unsupported("UnionDistinct"),
-        plan::PlanSetOpKind::Unspecified => Err("SetOpNode kind is unspecified".to_string()),
+        plan::PlanSetOpKind::UnionDistinct => Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("kind"),
+            "UnionDistinct native proto node lowering is not implemented",
+        )),
+        plan::PlanSetOpKind::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
+            path.field("kind"),
+            "SetOpNode kind is unspecified",
+        )),
     }
 }
 
@@ -100,64 +124,61 @@ fn normalize_set_op_inputs(
     child_output_columns: &[plan::OutputColumnList],
     output_columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
+    path: FieldPath,
     arena: &mut ExprArena,
-) -> Result<Vec<ExecNode>, String> {
+) -> Result<Vec<ExecNode>, NativeFragmentDecodeError> {
     if child_output_columns.is_empty() {
         return normalize_set_op_inputs_by_position(
             node_id,
             children,
             output_columns,
             output_schema,
+            path,
             arena,
         );
     }
     if child_output_columns.len() != children.len() {
-        return Err(format!(
-            "SetOpNode child_output_columns size mismatch: expected {}, got {}",
-            children.len(),
-            child_output_columns.len()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("child_output_columns"),
+            format!(
+                "SetOpNode child_output_columns size mismatch: expected {}, got {}",
+                children.len(),
+                child_output_columns.len()
+            ),
         ));
     }
-    let output_slots = slot_ids_from_columns(output_columns)?;
-    let output_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+    let output_slots = slot_ids_from_columns(output_columns, path.clone().field("output_columns"))?;
+    let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        slot_schemas_from_output_columns(output_columns),
+    )?;
     children
         .into_iter()
         .zip(child_output_columns.iter())
         .enumerate()
         .map(|(idx, (child, child_columns))| {
+            let child_path = path.clone().field("child_output_columns").index(idx).field("columns");
             if child_columns.columns.len() != output_columns.len() {
-                return Err(format!(
-                    "SetOpNode child {idx} output width mismatch: expected {}, got {}",
-                    output_columns.len(),
-                    child_columns.columns.len()
-                ));
+                return Err(NativeFragmentDecodeError::inconsistent(child_path.clone(), format!("SetOpNode child {idx} output width mismatch: expected {}, got {}", output_columns.len(), child_columns.columns.len())));
             }
-            let expected_child_layout = layout_from_output_columns(&child_columns.columns)?;
+            let expected_child_layout = NativeFragmentDecodeError::map_invalid(child_path.clone(), layout_from_output_columns(&child_columns.columns))?;
             if expected_child_layout.order() != child.layout.order() {
-                return Err(format!(
-                    "SetOpNode child {idx} output columns do not match child layout: columns={:?} layout={:?}",
-                    expected_child_layout.order(),
-                    child.layout.order()
-                ));
+                return Err(NativeFragmentDecodeError::inconsistent(child_path.clone(), format!("SetOpNode child {idx} output columns do not match child layout: columns={:?} layout={:?}", expected_child_layout.order(), child.layout.order())));
             }
             let exprs = child_columns
                 .columns
                 .iter()
-                .map(|col| {
+                .enumerate()
+                .map(|(col_idx, col)| {
                     let slot = SlotId::new(col.column_id);
                     let data_type = col
                         .r#type
                         .as_ref()
-                        .ok_or_else(|| {
-                            format!(
-                                "SetOpNode child {idx} column {} type missing",
-                                col.column_id
-                            )
-                        })
-                        .and_then(decode_type)?;
+                        .ok_or_else(|| NativeFragmentDecodeError::missing(child_path.clone().index(col_idx).field("type"), format!("SetOpNode child {idx} column {} type missing", col.column_id)))?;
+                    let data_type = NativeFragmentDecodeError::map_invalid(child_path.clone().index(col_idx).field("type"), decode_type(data_type))?;
                     Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
             Ok(ExecNode {
                 kind: ExecNodeKind::Project(ProjectNode {
                     input: Box::new(child.node),
@@ -179,20 +200,20 @@ fn normalize_set_op_inputs_by_position(
     children: Vec<DecodedNode>,
     output_columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,
+    path: FieldPath,
     arena: &mut ExprArena,
-) -> Result<Vec<ExecNode>, String> {
-    let output_slots = slot_ids_from_columns(output_columns)?;
-    let output_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+) -> Result<Vec<ExecNode>, NativeFragmentDecodeError> {
+    let output_slots = slot_ids_from_columns(output_columns, path.clone().field("output_columns"))?;
+    let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        slot_schemas_from_output_columns(output_columns),
+    )?;
     children
         .into_iter()
         .enumerate()
         .map(|(idx, child)| {
             if child.layout.order().len() != output_slots.len() {
-                return Err(format!(
-                    "SetOpNode child {idx} width mismatch without child_output_columns: expected {}, got {}",
-                    output_slots.len(),
-                    child.layout.order().len()
-                ));
+                return Err(NativeFragmentDecodeError::inconsistent(path.clone().field("child_output_columns").index(idx), format!("SetOpNode child {idx} width mismatch without child_output_columns: expected {}, got {}", output_slots.len(), child.layout.order().len())));
             }
             if child.layout.order() == output_slots.as_slice() {
                 return Ok(child.node);
@@ -206,17 +227,12 @@ fn normalize_set_op_inputs_by_position(
                     let data_type = child
                         .output_schema
                         .slot(slot)
-                        .ok_or_else(|| {
-                            format!(
-                                "SetOpNode child {idx} slot {} missing from child output schema",
-                                slot
-                            )
-                        })?
+                        .ok_or_else(|| NativeFragmentDecodeError::inconsistent(path.clone().field("child_output_columns").index(idx), format!("SetOpNode child {idx} slot {} missing from child output schema", slot)))?
                         .data_type()
                         .clone();
                     Ok(arena.push_typed(ExprNode::SlotId(slot), data_type))
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
             Ok(ExecNode {
                 kind: ExecNodeKind::Project(ProjectNode {
                     input: Box::new(child.node),

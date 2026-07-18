@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use super::common::check_exact_arity;
 use super::{DecodedNode, sort};
@@ -34,18 +35,26 @@ use crate::exec::node::analytic::{
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{expr, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     window: &plan::WindowNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("WindowNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("WindowNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
     if window.window_exprs.is_empty() {
-        return Err("WindowNode has no window expressions".to_string());
+        return Err(NativeFragmentDecodeError::missing(
+            path.clone().field("window_exprs"),
+            "WindowNode has no window expressions",
+        ));
     }
     let output_columns = if !window.output_columns.is_empty() {
         window.output_columns.as_slice()
@@ -53,38 +62,69 @@ pub(super) fn lower_window_node(
         physical.output_columns.as_slice()
     };
     if output_columns.is_empty() {
-        return Err("WindowNode output_columns missing".to_string());
+        return Err(NativeFragmentDecodeError::missing(
+            path.clone().field("output_columns"),
+            "WindowNode output_columns missing",
+        ));
     }
-    let final_layout = layout_from_output_columns(output_columns)?;
-    let final_output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let final_layout = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        layout_from_output_columns(output_columns),
+    )?;
+    let final_output_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        chunk_schema_from_output_columns(output_columns),
+    )?;
 
     let groups = group_window_exprs_by_spec(&window.window_exprs);
     if groups.is_empty() {
-        return Err("WindowNode produced no window expression groups".to_string());
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("window_exprs"),
+            "WindowNode produced no window expression groups",
+        ));
     }
 
     let mut current = child;
     let mut next_node_id = node.node_id;
     for (group_idx, group_indices) in groups.iter().enumerate() {
-        let first_idx = group_indices
-            .first()
-            .copied()
-            .ok_or_else(|| format!("WindowNode group {group_idx} is empty"))?;
+        let first_idx = group_indices.first().copied().ok_or_else(|| {
+            NativeFragmentDecodeError::invalid_value(
+                path.clone().field("window_exprs"),
+                format!("WindowNode group {group_idx} is empty"),
+            )
+        })?;
         let first = &window.window_exprs[first_idx];
         let is_last = group_idx + 1 == groups.len();
 
         if group_idx > 0 && window_expr_has_sort_keys(first) {
-            current = sort_window_group_input(next_node_id, group_idx, first, current, arena)?;
+            current = sort_window_group_input(
+                next_node_id,
+                group_idx,
+                first,
+                path.clone().field("window_exprs").index(first_idx),
+                current,
+                arena,
+            )?;
             next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
-                format!("WindowNode node_id {next_node_id} overflows after sort group {group_idx}")
+                NativeFragmentDecodeError::out_of_range(
+                    path.clone(),
+                    format!(
+                        "WindowNode node_id {next_node_id} overflows after sort group {group_idx}"
+                    ),
+                )
             })?;
         }
 
         let (layout, output_schema) = if is_last {
             (final_layout.clone(), final_output_schema.clone())
         } else {
-            intermediate_window_output(&current, group_indices, window, &final_output_schema)
-                .map_err(|err| format!("WindowNode group {group_idx}: {err}"))?
+            intermediate_window_output(
+                &current,
+                group_indices,
+                window,
+                &final_output_schema,
+                path.clone(),
+            )?
         };
 
         let partition_exprs = first
@@ -92,38 +132,68 @@ pub(super) fn lower_window_node(
             .iter()
             .enumerate()
             .map(|(idx, expr)| {
-                decode_expr(expr, arena, &current.layout).map_err(|err| {
-                    format!("WindowNode group {group_idx} partition_by[{idx}]: {err}")
-                })
+                decode_expr_at(
+                    expr,
+                    path.clone()
+                        .field("window_exprs")
+                        .index(first_idx)
+                        .field("partition_by")
+                        .index(idx),
+                    arena,
+                    &current.layout,
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let order_by_exprs = first
             .order_by
             .iter()
             .enumerate()
             .map(|(idx, item)| {
+                let item_path = path
+                    .clone()
+                    .field("window_exprs")
+                    .index(first_idx)
+                    .field("order_by")
+                    .index(idx);
                 let expr = item.expr.as_ref().ok_or_else(|| {
-                    format!("WindowNode group {group_idx} order_by[{idx}] expr missing")
+                    NativeFragmentDecodeError::missing(
+                        item_path.clone().field("expr"),
+                        format!("WindowNode group {group_idx} order_by[{idx}] expr missing"),
+                    )
                 })?;
-                decode_expr(expr, arena, &current.layout)
-                    .map_err(|err| format!("WindowNode group {group_idx} order_by[{idx}]: {err}"))
+                decode_expr_at(expr, item_path.field("expr"), arena, &current.layout)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let frame = first
             .window_frame
             .as_ref()
-            .map(lower_window_frame)
+            .map(|frame| {
+                lower_window_frame(
+                    frame,
+                    path.clone()
+                        .field("window_exprs")
+                        .index(first_idx)
+                        .field("window_frame"),
+                )
+            })
             .transpose()?;
-        validate_window_frame(&frame, order_by_exprs.is_empty())?;
+        NativeFragmentDecodeError::map_invalid(
+            path.clone()
+                .field("window_exprs")
+                .index(first_idx)
+                .field("window_frame"),
+            validate_window_frame(&frame, order_by_exprs.is_empty()),
+        )?;
 
         let mut functions = Vec::with_capacity(group_indices.len());
-        for (local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
+        for (_local_idx, expr_idx) in group_indices.iter().copied().enumerate() {
             let expr = &window.window_exprs[expr_idx];
-            functions.push(
-                lower_window_function(expr, arena, &current.layout).map_err(|err| {
-                    format!("WindowNode group {group_idx} function[{local_idx}]: {err}")
-                })?,
-            );
+            functions.push(lower_window_function(
+                expr,
+                path.clone().field("window_exprs").index(expr_idx),
+                arena,
+                &current.layout,
+            )?);
         }
 
         let mut function_by_slot = HashMap::with_capacity(group_indices.len());
@@ -131,17 +201,30 @@ pub(super) fn lower_window_node(
             let expr = &window.window_exprs[expr_idx];
             let slot = SlotId::new(expr.output_column_id);
             if function_by_slot.insert(slot, local_idx).is_some() {
-                return Err(format!(
-                    "WindowNode duplicate output_column_id {}",
-                    expr.output_column_id
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone()
+                        .field("window_exprs")
+                        .index(expr_idx)
+                        .field("output_column_id"),
+                    format!(
+                        "WindowNode duplicate output_column_id {}",
+                        expr.output_column_id
+                    ),
                 ));
             }
         }
-        let analytic_output_columns =
-            window_analytic_output_columns(&layout, &current.layout, &function_by_slot, group_idx)?;
+        let analytic_output_columns = NativeFragmentDecodeError::map_invalid(
+            path.clone().field("window_exprs"),
+            window_analytic_output_columns(&layout, &current.layout, &function_by_slot, group_idx),
+        )?;
         let group_node_id = next_node_id;
         next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
-            format!("WindowNode node_id {next_node_id} overflows after analytic group {group_idx}")
+            NativeFragmentDecodeError::out_of_range(
+                path.clone(),
+                format!(
+                    "WindowNode node_id {next_node_id} overflows after analytic group {group_idx}"
+                ),
+            )
         })?;
 
         current = DecodedNode {
@@ -173,14 +256,18 @@ fn sort_window_group_input(
     node_id: i32,
     group_idx: usize,
     first: &plan::WindowExpr,
+    path: FieldPath,
     input: DecodedNode,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
     for (idx, expr) in first.partition_by.iter().enumerate() {
-        let expr = decode_expr(expr, arena, &input.layout).map_err(|err| {
-            format!("WindowNode group {group_idx} sort partition_by[{idx}]: {err}")
-        })?;
+        let expr = decode_expr_at(
+            expr,
+            path.clone().field("partition_by").index(idx),
+            arena,
+            &input.layout,
+        )?;
         order_by.push(SortExpression {
             expr,
             asc: true,
@@ -190,6 +277,7 @@ fn sort_window_group_input(
     order_by.extend(sort::lower_sort_items(
         &format!("WindowNode group {group_idx} sort"),
         &first.order_by,
+        path.field("order_by"),
         arena,
         &input.layout,
     )?);
@@ -235,54 +323,68 @@ fn intermediate_window_output(
     group_indices: &[usize],
     window: &plan::WindowNode,
     final_output_schema: &ChunkSchema,
-) -> Result<(Layout, ChunkSchemaRef), String> {
+    path: FieldPath,
+) -> Result<(Layout, ChunkSchemaRef), NativeFragmentDecodeError> {
     let mut slot_ids = current.layout.order().to_vec();
     let mut slots = Vec::with_capacity(slot_ids.len() + group_indices.len());
     for slot_id in current.layout.order() {
-        let slot = current.output_schema.slot(*slot_id).cloned().ok_or_else(|| {
-            format!(
-                "current output schema missing input slot {} for intermediate WindowNode output",
-                slot_id
-            )
-        })?;
+        let slot = current.output_schema.slot(*slot_id).cloned().ok_or_else(|| NativeFragmentDecodeError::inconsistent(path.clone().field("output_columns"), format!("current output schema missing input slot {} for intermediate WindowNode output", slot_id)))?;
         slots.push(slot);
     }
 
     for expr_idx in group_indices {
-        let expr = window
-            .window_exprs
-            .get(*expr_idx)
-            .ok_or_else(|| format!("window expression index {expr_idx} is out of bounds"))?;
+        let expr = window.window_exprs.get(*expr_idx).ok_or_else(|| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone().field("window_exprs").index(*expr_idx),
+                format!("window expression index {expr_idx} is out of bounds"),
+            )
+        })?;
         let slot_id = SlotId::new(expr.output_column_id);
         if slot_ids.contains(&slot_id) {
             continue;
         }
         slot_ids.push(slot_id);
-        slots.push(window_expr_slot_schema(expr, final_output_schema)?);
+        slots.push(window_expr_slot_schema(
+            expr,
+            final_output_schema,
+            path.clone().field("window_exprs").index(*expr_idx),
+        )?);
     }
 
     Ok((
         Layout::for_slots(slot_ids),
-        Arc::new(ChunkSchema::try_new(slots)?),
+        Arc::new(NativeFragmentDecodeError::map_invalid(
+            path.field("output_columns"),
+            ChunkSchema::try_new(slots),
+        )?),
     ))
 }
 
 fn window_expr_slot_schema(
     expr: &plan::WindowExpr,
     final_output_schema: &ChunkSchema,
-) -> Result<ChunkSlotSchema, String> {
+    path: FieldPath,
+) -> Result<ChunkSlotSchema, NativeFragmentDecodeError> {
     let slot_id = SlotId::new(expr.output_column_id);
     if let Some(slot) = final_output_schema.slot(slot_id) {
         return Ok(slot.clone());
     }
 
-    let type_desc = expr
-        .result_type
-        .as_ref()
-        .ok_or_else(|| format!("window function {} result_type missing", expr.name))?;
-    let data_type = super::super::decode_type(type_desc)?;
+    let type_desc = expr.result_type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("result_type"),
+            format!("window function {} result_type missing", expr.name),
+        )
+    })?;
+    let data_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("result_type"),
+        super::super::decode_type(type_desc),
+    )?;
     let field = Field::new(&expr.output_name, data_type, true);
-    ChunkSchema::slot_schema_from_arrow_field(slot_id, &field)
+    NativeFragmentDecodeError::map_invalid(
+        path.field("output_column_id"),
+        ChunkSchema::slot_schema_from_arrow_field(slot_id, &field),
+    )
 }
 
 fn window_analytic_output_columns(
@@ -317,25 +419,38 @@ fn same_window_spec(left: &plan::WindowExpr, right: &plan::WindowExpr) -> bool {
 
 fn lower_window_function(
     expr: &plan::WindowExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
-) -> Result<WindowFunctionSpec, String> {
+) -> Result<WindowFunctionSpec, NativeFragmentDecodeError> {
     let name = expr.name.to_ascii_lowercase();
-    let kind = window_function_kind(&name, expr.distinct, expr.ignore_nulls)?;
-    let return_type = expr
-        .result_type
-        .as_ref()
-        .ok_or_else(|| format!("window function {} result_type missing", expr.name))
-        .and_then(super::super::decode_type)?;
+    let kind = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("name"),
+        window_function_kind(&name, expr.distinct, expr.ignore_nulls),
+    )?;
+    let return_type = expr.result_type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("result_type"),
+            format!("window function {} result_type missing", expr.name),
+        )
+    })?;
+    let return_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("result_type"),
+        super::super::decode_type(return_type),
+    )?;
     let mut args = expr
         .args
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            decode_expr(arg, arena, input_layout)
-                .map_err(|err| format!("window function {} arg {idx}: {err}", expr.name))
+            decode_expr_at(
+                arg,
+                path.clone().field("args").index(idx),
+                arena,
+                input_layout,
+            )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     if matches!(
         kind,
         WindowFunctionKind::ArrayAgg { .. }
@@ -344,9 +459,15 @@ fn lower_window_function(
             | WindowFunctionKind::MinBy
             | WindowFunctionKind::MinByV2
     ) {
-        args = pack_window_function_inputs(args, arena)?;
+        args = NativeFragmentDecodeError::map_invalid(
+            path.clone().field("args"),
+            pack_window_function_inputs(args, arena),
+        )?;
     }
-    validate_window_function_signature(&kind, &args, &return_type, arena)?;
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        validate_window_function_signature(&kind, &args, &return_type, arena),
+    )?;
     Ok(WindowFunctionSpec {
         kind,
         args,
@@ -402,22 +523,31 @@ fn window_function_kind(
     }
 }
 
-fn lower_window_frame(frame: &expr::WindowFrame) -> Result<WindowFrame, String> {
-    let window_type = match expr::WindowFrameType::try_from(frame.frame_type)
-        .map_err(|_| format!("WindowNode unknown frame type {}", frame.frame_type))?
-    {
+fn lower_window_frame(
+    frame: &expr::WindowFrame,
+    path: FieldPath,
+) -> Result<WindowFrame, NativeFragmentDecodeError> {
+    let window_type = match expr::WindowFrameType::try_from(frame.frame_type).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("frame_type"),
+            format!("WindowNode unknown frame type {}", frame.frame_type),
+        )
+    })? {
         expr::WindowFrameType::Rows => WindowType::Rows,
         expr::WindowFrameType::Range => WindowType::Range,
         expr::WindowFrameType::Unspecified => {
-            return Err("WindowNode frame type is unspecified".to_string());
+            return Err(NativeFragmentDecodeError::invalid_enum(
+                path.clone().field("frame_type"),
+                "WindowNode frame type is unspecified",
+            ));
         }
     };
     let start = match frame.start.as_ref() {
-        Some(bound) => lower_window_bound(bound, true, &window_type)?,
+        Some(bound) => lower_window_bound(bound, true, &window_type, path.clone().field("start"))?,
         None => None,
     };
     let end = match frame.end.as_ref() {
-        Some(bound) => lower_window_bound(bound, false, &window_type)?,
+        Some(bound) => lower_window_bound(bound, false, &window_type, path.clone().field("end"))?,
         None => None,
     };
     Ok(WindowFrame {
@@ -431,41 +561,53 @@ fn lower_window_bound(
     bound: &expr::WindowBound,
     is_start: bool,
     window_type: &WindowType,
-) -> Result<Option<WindowBoundary>, String> {
+    path: FieldPath,
+) -> Result<Option<WindowBoundary>, NativeFragmentDecodeError> {
     use expr::window_bound::Bound;
 
     let label = if is_start { "start" } else { "end" };
-    let bound = bound
-        .bound
-        .as_ref()
-        .ok_or_else(|| format!("WindowNode {label} bound missing"))?;
+    let bound = bound.bound.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("bound"),
+            format!("WindowNode {label} bound missing"),
+        )
+    })?;
     match bound {
         Bound::UnboundedPreceding(true) if is_start => Ok(None),
         Bound::UnboundedFollowing(true) if !is_start => Ok(None),
         Bound::CurrentRow(true) => Ok(Some(WindowBoundary::CurrentRow)),
         Bound::Preceding(value) => {
             if !matches!(window_type, WindowType::Rows) {
-                return Err("RANGE window boundary PRECEDING not supported".to_string());
+                return Err(NativeFragmentDecodeError::unsupported(
+                    path.clone().field("preceding"),
+                    "RANGE window boundary PRECEDING not supported",
+                ));
             }
             Ok(Some(WindowBoundary::Preceding(*value)))
         }
         Bound::Following(value) => {
             if !matches!(window_type, WindowType::Rows) {
-                return Err("RANGE window boundary FOLLOWING not supported".to_string());
+                return Err(NativeFragmentDecodeError::unsupported(
+                    path.clone().field("following"),
+                    "RANGE window boundary FOLLOWING not supported",
+                ));
             }
             Ok(Some(WindowBoundary::Following(*value)))
         }
         Bound::UnboundedPreceding(false)
         | Bound::UnboundedFollowing(false)
-        | Bound::CurrentRow(false) => Err(format!(
-            "WindowNode {label} boolean bound marker must be true"
+        | Bound::CurrentRow(false) => Err(NativeFragmentDecodeError::invalid_value(
+            path.clone(),
+            format!("WindowNode {label} boolean bound marker must be true"),
         )),
-        Bound::UnboundedPreceding(true) => {
-            Err(format!("WindowNode {label} cannot be UNBOUNDED PRECEDING"))
-        }
-        Bound::UnboundedFollowing(true) => {
-            Err(format!("WindowNode {label} cannot be UNBOUNDED FOLLOWING"))
-        }
+        Bound::UnboundedPreceding(true) => Err(NativeFragmentDecodeError::invalid_value(
+            path.clone(),
+            format!("WindowNode {label} cannot be UNBOUNDED PRECEDING"),
+        )),
+        Bound::UnboundedFollowing(true) => Err(NativeFragmentDecodeError::invalid_value(
+            path,
+            format!("WindowNode {label} cannot be UNBOUNDED FOLLOWING"),
+        )),
     }
 }
 

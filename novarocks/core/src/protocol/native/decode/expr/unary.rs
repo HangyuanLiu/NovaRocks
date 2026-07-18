@@ -23,33 +23,55 @@ use super::{function_call, literal, lower_required_child};
 use crate::exec::expr::function::lookup_function;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_unary_op(
     unary: &expr::UnaryOpExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let op =
-        expr::UnaryOp::try_from(unary.op).map_err(|_| format!("unknown UnaryOp {}", unary.op))?;
-    let operand = lower_required_child(&unary.operand, "UnaryOp.operand", arena, input_layout)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let op = expr::UnaryOp::try_from(unary.op).map_err(|_| {
+        super::super::NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("op"),
+            format!("unknown UnaryOp {}", unary.op),
+        )
+    })?;
+    let operand = lower_required_child(
+        &unary.operand,
+        path.clone().field("operand"),
+        arena,
+        input_layout,
+    )?;
     match op {
-        expr::UnaryOp::Unspecified => Err("UnaryOp.op is unspecified".to_string()),
+        expr::UnaryOp::Unspecified => Err(super::super::NativeFragmentDecodeError::invalid_enum(
+            path.field("op"),
+            "UnaryOp.op is unspecified",
+        )),
         expr::UnaryOp::Not => Ok(arena.push_typed(ExprNode::Not(operand), data_type)),
         expr::UnaryOp::Negate => {
             let zero_type = arena
                 .data_type(operand)
                 .cloned()
                 .unwrap_or_else(|| data_type.clone());
-            let zero = literal::push_zero_literal(arena, &zero_type)?;
+            let zero = literal::push_zero_literal(arena, &zero_type).map_err(|error| {
+                super::super::NativeFragmentDecodeError::invalid_value(path.clone(), error)
+            })?;
             Ok(arena.push_typed(ExprNode::Sub(zero, operand), data_type))
         }
         expr::UnaryOp::BitwiseNot => {
-            let kind = lookup_function("bitnot")
-                .ok_or_else(|| "BITWISE_NOT requires bitnot function support".to_string())?;
-            function_call::validate_function_arity("bitnot", kind, 1)?;
+            let kind = lookup_function("bitnot").ok_or_else(|| {
+                super::super::NativeFragmentDecodeError::unsupported(
+                    path.clone(),
+                    "BITWISE_NOT requires bitnot function support",
+                )
+            })?;
+            function_call::validate_function_arity("bitnot", kind, 1).map_err(|error| {
+                super::super::NativeFragmentDecodeError::invalid_value(path.clone(), error)
+            })?;
             Ok(arena.push_typed(
                 ExprNode::FunctionCall {
                     kind,

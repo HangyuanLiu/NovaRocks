@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::NativeFragmentDecodeError;
 use super::DecodedNode;
 use super::common::{
     check_exact_arity, merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64,
@@ -24,34 +25,72 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_topn_node(
     node: &plan::DistributedNode,
     topn: &plan::TopNNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("TopNNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("TopNNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
-    let payload_limit = parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit")?;
-    let outer_limit = parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit")?;
-    let limit = merge_limits("TopNNode", payload_limit, outer_limit)?;
+    let payload_limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit"),
+    )?;
+    let outer_limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit"),
+    )?;
+    let limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        merge_limits("TopNNode", payload_limit, outer_limit),
+    )?;
     if limit.is_none() {
-        return Err("TopNNode requires a non-negative limit".to_string());
+        return Err(NativeFragmentDecodeError::missing(
+            path.clone().field("limit"),
+            "TopNNode requires a non-negative limit",
+        ));
     }
-    let offset = parse_optional_nonnegative_i64(topn.offset, "TopNNode.offset")?.unwrap_or(0);
-    let phase = plan::TopNPhase::try_from(topn.phase)
-        .map_err(|_| format!("TopNNode unknown phase {}", topn.phase))?;
+    let offset = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("offset"),
+        parse_optional_nonnegative_i64(topn.offset, "TopNNode.offset"),
+    )?
+    .unwrap_or(0);
+    let phase = plan::TopNPhase::try_from(topn.phase).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("phase"),
+            format!("TopNNode unknown phase {}", topn.phase),
+        )
+    })?;
     if phase == plan::TopNPhase::TopnPhaseUnspecified {
-        return Err("TopNNode phase is unspecified".to_string());
+        return Err(NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("phase"),
+            "TopNNode phase is unspecified",
+        ));
     }
     if topn.is_split && phase == plan::TopNPhase::TopnPhaseFinal {
-        return Err(
-            "TopNNode final split must be represented as ExchangeReceiver TopNSplit".to_string(),
-        );
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("is_split"),
+            "TopNNode final split must be represented as ExchangeReceiver TopNSplit",
+        ));
     }
-    let order_by = lower_sort_items("TopNNode", &topn.items, arena, &child.layout)?;
-    let topn_type = parse_sort_topn_type(None)?;
+    let order_by = lower_sort_items(
+        "TopNNode",
+        &topn.items,
+        path.clone().field("items"),
+        arena,
+        &child.layout,
+    )?;
+    let topn_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("topn_type"),
+        parse_sort_topn_type(None),
+    )?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Sort(SortNode {

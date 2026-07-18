@@ -23,35 +23,45 @@ use super::{collection, lower_expr_list};
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_function_call(
     call: &expr::FunctionCall,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
     if call.distinct {
-        return Err(format!(
-            "native scalar expr lowering does not support DISTINCT FunctionCall '{}'",
-            call.function_name
+        return Err(super::super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("distinct"),
+            format!(
+                "DISTINCT scalar FunctionCall '{}' is unsupported",
+                call.function_name
+            ),
         ));
     }
     if call.function_name == "__array_literal" {
-        return collection::lower_array_literal(call, arena, input_layout, data_type);
+        return collection::lower_array_literal(call, path, arena, input_layout, data_type);
     }
     if call.function_name.eq_ignore_ascii_case("map") {
-        return collection::lower_map_constructor(call, arena, input_layout, data_type);
+        return collection::lower_map_constructor(call, path, arena, input_layout, data_type);
     }
     let kind = lookup_function(&call.function_name).ok_or_else(|| {
-        format!(
-            "unsupported native scalar function '{}'",
-            call.function_name
+        super::super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("function_name"),
+            format!(
+                "unsupported native scalar function '{}'",
+                call.function_name
+            ),
         )
     })?;
-    let args = lower_expr_list(&call.args, arena, input_layout)?;
-    validate_function_arity(&call.function_name, kind, args.len())?;
+    let args = lower_expr_list(&call.args, path.clone().field("args"), arena, input_layout)?;
+    validate_function_arity(&call.function_name, kind, args.len()).map_err(|error| {
+        super::super::NativeFragmentDecodeError::invalid_value(path.field("args"), error)
+    })?;
     Ok(arena.push_typed(ExprNode::FunctionCall { kind, args }, data_type))
 }
 

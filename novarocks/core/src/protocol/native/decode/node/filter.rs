@@ -15,28 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::expr::decode_expr;
+use super::super::expr::decode_expr_at;
 use super::DecodedNode;
 use super::common::check_exact_arity;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_filter_node(
     node: &plan::DistributedNode,
     filter: &plan::FilterNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("FilterNode", 1, children.len())?;
+) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
+    check_exact_arity("FilterNode", 1, children.len()).map_err(|error| {
+        super::super::NativeFragmentDecodeError::inconsistent(path.clone(), error)
+    })?;
     let child = children.pop().expect("child");
-    let predicate = filter
-        .predicate
-        .as_ref()
-        .ok_or_else(|| "FilterNode predicate missing".to_string())?;
-    let predicate = decode_expr(predicate, arena, &child.layout)
-        .map_err(|err| format!("FilterNode predicate: {err}"))?;
+    let predicate = filter.predicate.as_ref().ok_or_else(|| {
+        super::super::NativeFragmentDecodeError::missing(
+            path.clone().field("predicate"),
+            "native FilterNode requires predicate",
+        )
+    })?;
+    let predicate = decode_expr_at(predicate, path.field("predicate"), arena, &child.layout)?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Filter(FilterNode {

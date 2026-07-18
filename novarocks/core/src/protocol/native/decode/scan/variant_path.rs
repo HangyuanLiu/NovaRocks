@@ -23,6 +23,7 @@ use super::common::{column_def_data_type, output_column_data_type};
 use crate::common::ids::SlotId;
 use crate::formats::parquet::VariantPathSpec;
 use crate::proto::{common, plan};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct NativeVariantPathPlan {
@@ -34,7 +35,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
-) -> Result<NativeVariantPathPlan, String> {
+) -> Result<NativeVariantPathPlan, NativeFragmentLeafDecodeError> {
     if scan.variant_columns.is_empty() {
         return Ok(NativeVariantPathPlan::default());
     }
@@ -59,7 +60,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
         if source_slot_id == output_slot_id {
             return Err(format!(
                 "ScanNode variant_columns[{idx}] source_column_id must differ from synthetic_column_id"
-            ));
+            ).into());
         }
 
         let source_name =
@@ -79,7 +80,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
             return Err(format!(
                 "ScanNode variant_columns[{idx}] source_column={source_name:?} does not match source_column_id={source_slot_id} name {:?}",
                 source_scan_column.name
-            ));
+            ).into());
         }
         let source_table_column = table_def
             .columns
@@ -99,7 +100,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
             return Err(format!(
                 "ScanNode variant_columns[{idx}] source_column={source_name:?} expects VARIANT/LargeBinary, got {:?}",
                 source_type
-            ));
+            ).into());
         }
         let source_field_id = iceberg_schema_field_id(table, &source_name).ok_or_else(|| {
             format!(
@@ -116,7 +117,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
             return Err(format!(
                 "ScanNode variant_columns[{idx}] synthetic_column={output_name:?} does not match synthetic_column_id={output_slot_id} name {:?}",
                 output_column.name
-            ));
+            ).into());
         }
         let output_type = output_column_data_type(output_column).map_err(|err| {
             format!(
@@ -134,18 +135,19 @@ pub(super) fn parse_native_scan_variant_path_columns(
             return Err(format!(
                 "ScanNode variant_columns[{idx}] unsupported requested_type {:?} for synthetic_column_id={output_slot_id}",
                 requested_type
-            ));
+            ).into());
         }
         if requested_type != output_type {
             return Err(format!(
                 "ScanNode variant_columns[{idx}] requested_type {:?} does not match synthetic_column_id={output_slot_id} type {:?}",
                 requested_type, output_type
-            ));
+            ).into());
         }
         if !plan.output_slot_ids.insert(output_slot_id) {
             return Err(format!(
                 "ScanNode duplicate variant_columns synthetic_column_id={output_slot_id}"
-            ));
+            )
+            .into());
         }
 
         plan.specs.push(VariantPathSpec {
@@ -170,25 +172,25 @@ fn required_native_variant_path_string(
     idx: usize,
     field_name: &str,
     value: &str,
-) -> Result<String, String> {
+) -> Result<String, NativeFragmentLeafDecodeError> {
     value
         .trim()
         .is_empty()
         .then(|| format!("ScanNode variant_columns[{idx}] missing {field_name}"))
-        .map_or_else(|| Ok(value.trim().to_string()), Err)
+        .map_or_else(|| Ok(value.trim().to_string()), |error| Err(error.into()))
 }
 
 fn validate_native_variant_path_column_path(
     idx: usize,
     canonical_path: &str,
-) -> Result<(), String> {
+) -> Result<(), NativeFragmentLeafDecodeError> {
     let parsed = crate::exec::variant::parse_variant_path(canonical_path).map_err(|err| {
         format!("ScanNode variant_columns[{idx}] invalid canonical_path={canonical_path:?}: {err}")
     })?;
     if parsed.segments.is_empty() {
         return Err(format!(
             "ScanNode variant_columns[{idx}] canonical_path={canonical_path:?} must reference at least one object key"
-        ));
+        ).into());
     }
     if parsed.segments.iter().any(|segment| {
         !matches!(
@@ -198,7 +200,7 @@ fn validate_native_variant_path_column_path(
     }) {
         return Err(format!(
             "ScanNode variant_columns[{idx}] canonical_path={canonical_path:?} only supports object-key path segments"
-        ));
+        ).into());
     }
     Ok(())
 }

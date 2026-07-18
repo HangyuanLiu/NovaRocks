@@ -17,6 +17,7 @@
 
 use arrow::datatypes::DataType;
 
+use super::super::NativeFragmentDecodeError;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::check_exact_arity;
@@ -27,25 +28,39 @@ use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSl
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_generate_series_node(
     node: &plan::DistributedNode,
     generate_series: &plan::GenerateSeriesNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("GenerateSeriesNode", 0, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("GenerateSeriesNode", 0, children.len()),
+    )?;
     if generate_series.step == 0 {
-        return Err("GenerateSeriesNode step must not be zero".to_string());
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("step"),
+            "GenerateSeriesNode step must not be zero",
+        ));
     }
 
-    let param_slots = generate_series_param_slots(generate_series.output_column_id)?;
+    let param_slots = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_column_id"),
+        generate_series_param_slots(generate_series.output_column_id),
+    )?;
     let param_columns = vec![
         bigint_output_column(param_slots[0].as_u32(), "generate_series_start", false),
         bigint_output_column(param_slots[1].as_u32(), "generate_series_end", false),
         bigint_output_column(param_slots[2].as_u32(), "generate_series_step", false),
     ];
-    let input_schema = chunk_schema_from_output_columns(&param_columns)?;
+    let input_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_column_id"),
+        chunk_schema_from_output_columns(&param_columns),
+    )?;
     let rows = vec![plan::ExprList {
         values: vec![
             int64_literal_expr(generate_series.start),
@@ -53,7 +68,8 @@ pub(super) fn lower_generate_series_node(
             int64_literal_expr(generate_series.step),
         ],
     }];
-    let input_chunk = materialize_values_chunk(&rows, &param_columns, input_schema, arena)?;
+    let input_chunk =
+        materialize_values_chunk(&rows, &param_columns, input_schema, arena, path.clone())?;
 
     let output_columns = vec![bigint_output_column(
         generate_series.output_column_id,
@@ -64,8 +80,14 @@ pub(super) fn lower_generate_series_node(
         },
         false,
     )];
-    let layout = layout_from_output_columns(&output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&output_columns)?;
+    let layout = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_column_id"),
+        layout_from_output_columns(&output_columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_column_id"),
+        chunk_schema_from_output_columns(&output_columns),
+    )?;
 
     Ok(DecodedNode {
         node: ExecNode {

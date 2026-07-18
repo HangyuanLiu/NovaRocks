@@ -111,28 +111,25 @@ pub(crate) fn decode_runtime_filter_params(
     src: &novarocks::RuntimeFilterParams,
 ) -> Result<RuntimeFilterParams, NativeFragmentDecodeError> {
     let path = FieldPath::root("instance_params").field("runtime_filter_params");
-    let id_to_prober_params = src
-        .id_to_prober_params
-        .iter()
-        .map(|(filter_id, list)| {
-            let list_path = path
-                .clone()
-                .field("id_to_prober_params")
-                .map_key(filter_id.to_string());
-            let params = list
-                .params
-                .iter()
-                .enumerate()
-                .map(|(index, params)| {
-                    decode_runtime_filter_prober(
-                        params,
-                        list_path.clone().field("params").index(index),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, NativeFragmentDecodeError>((*filter_id, params))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut filter_ids = src.id_to_prober_params.keys().copied().collect::<Vec<_>>();
+    filter_ids.sort_unstable();
+    let mut id_to_prober_params = BTreeMap::new();
+    for filter_id in filter_ids {
+        let list = &src.id_to_prober_params[&filter_id];
+        let list_path = path
+            .clone()
+            .field("id_to_prober_params")
+            .map_key(filter_id.to_string());
+        let params = list
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, params)| {
+                decode_runtime_filter_prober(params, list_path.clone().field("params").index(index))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        id_to_prober_params.insert(filter_id, params);
+    }
     let runtime_filter_builder_number = src
         .runtime_filter_builder_number
         .iter()
@@ -256,7 +253,7 @@ fn decode_endpoint_at(
         .map_err(|detail| NativeFragmentDecodeError::invalid_value(path, detail))
 }
 
-fn decode_scan_range_params_at(
+pub(super) fn decode_scan_range_params_at(
     src: &novarocks::ScanRangeParams,
     path: FieldPath,
 ) -> Result<ScanRangeParams, NativeFragmentDecodeError> {
@@ -324,22 +321,23 @@ fn decode_file_scan_range(
     let file_pruning_min_max_values = if src.file_pruning_min_max_values.is_empty() {
         None
     } else {
-        Some(
-            src.file_pruning_min_max_values
-                .iter()
-                .map(|(ordinal, value)| {
-                    Ok((
-                        *ordinal,
-                        decode_file_pruning_value(
-                            value,
-                            path.clone()
-                                .field("file_pruning_min_max_values")
-                                .map_key(ordinal.to_string()),
-                        )?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, NativeFragmentDecodeError>>()?,
-        )
+        let mut ordinals = src
+            .file_pruning_min_max_values
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        let mut values = BTreeMap::new();
+        for ordinal in ordinals {
+            let value = decode_file_pruning_value(
+                &src.file_pruning_min_max_values[&ordinal],
+                path.clone()
+                    .field("file_pruning_min_max_values")
+                    .map_key(ordinal.to_string()),
+            )?;
+            values.insert(ordinal, value);
+        }
+        Some(values)
     };
     let ivm_change_op = src
         .change_op

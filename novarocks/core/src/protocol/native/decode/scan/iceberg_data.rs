@@ -31,6 +31,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::FileFormatConfig;
 use crate::formats::parquet::{ParquetReadCachePolicy, ParquetScanConfig};
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_data_files_scan(
     node: &plan::DistributedNode,
@@ -38,7 +39,7 @@ pub(super) fn lower_iceberg_data_files_scan(
     source: &plan::IcebergDataFiles,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     let output_columns = scan_output_columns(scan)?;
     let table = source
         .table
@@ -105,5 +106,10 @@ pub(super) fn lower_iceberg_data_files_scan(
         layout: read_plan.read_layout.clone(),
         output_schema: read_plan.read_schema.clone(),
     };
-    maybe_project_data_scan_output(node.node_id, scan_lowered, read_plan, arena)
+    Ok(maybe_project_data_scan_output(
+        node.node_id,
+        scan_lowered,
+        read_plan,
+        arena,
+    )?)
 }

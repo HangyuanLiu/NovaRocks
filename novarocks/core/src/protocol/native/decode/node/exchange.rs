@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use super::super::NativeFragmentDecodeError;
 use super::common::{check_exact_arity, parse_optional_nonnegative_i64};
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::common::config::exchange_wait_ms;
@@ -26,6 +27,7 @@ use crate::exec::node::limit::LimitNode;
 use crate::exec::node::sort::{SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::decode::layout::{
     chunk_schema_from_output_columns, layout_from_output_columns,
 };
@@ -33,29 +35,48 @@ use crate::protocol::native::decode::layout::{
 pub(super) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("ExchangeReceiver", 0, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("ExchangeReceiver", 0, children.len()),
+    )?;
     let flavor = exchange
         .flavor
         .as_ref()
         .and_then(|flavor| flavor.kind.as_ref())
-        .ok_or_else(|| "ExchangeReceiver flavor missing".to_string())?;
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("flavor.kind"),
+                "ExchangeReceiver flavor missing",
+            )
+        })?;
     match flavor {
         plan::exchange_flavor::Kind::Distribution(true) => {}
         plan::exchange_flavor::Kind::Distribution(false) => {
-            return Err("ExchangeReceiver distribution flavor must be true".to_string());
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("flavor.distribution"),
+                "ExchangeReceiver distribution flavor must be true",
+            ));
         }
         plan::exchange_flavor::Kind::LimitOffset(_) => {}
         plan::exchange_flavor::Kind::TopnSplit(_) => {}
         plan::exchange_flavor::Kind::CteMulticast(_) => {}
     }
 
-    let (key, expected_senders) = ctx.exchange_input(node.node_id)?;
-    let layout = layout_from_output_columns(&exchange.output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&exchange.output_columns)?;
+    let (key, expected_senders) =
+        NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
+    let layout = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        layout_from_output_columns(&exchange.output_columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        chunk_schema_from_output_columns(&exchange.output_columns),
+    )?;
     let mut lowered = DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
@@ -74,11 +95,23 @@ pub(super) fn lower_exchange_receiver(
             let limit = parse_optional_nonnegative_i64(
                 limit_offset.limit,
                 "ExchangeReceiver LimitOffset.limit",
-            )?;
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("flavor.limit_offset.limit"),
+                    error,
+                )
+            })?;
             let offset = parse_optional_nonnegative_i64(
                 limit_offset.offset,
                 "ExchangeReceiver LimitOffset.offset",
-            )?
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("flavor.limit_offset.offset"),
+                    error,
+                )
+            })?
             .unwrap_or(0);
             if limit.is_some() || offset > 0 {
                 lowered.node = ExecNode {
@@ -95,14 +128,19 @@ pub(super) fn lower_exchange_receiver(
             let order_by = sort::lower_sort_items(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
+                path.clone().field("flavor.topn_split.items"),
                 arena,
                 &lowered.layout,
             )?;
-            let limit =
-                parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit")?;
-            let offset =
-                parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset")?
-                    .unwrap_or(0);
+            let limit = NativeFragmentDecodeError::map_invalid(
+                path.clone().field("flavor.topn_split.limit"),
+                parse_optional_nonnegative_i64(topn.limit, "ExchangeReceiver TopNSplit.limit"),
+            )?;
+            let offset = NativeFragmentDecodeError::map_invalid(
+                path.clone().field("flavor.topn_split.offset"),
+                parse_optional_nonnegative_i64(topn.offset, "ExchangeReceiver TopNSplit.offset"),
+            )?
+            .unwrap_or(0);
             lowered.node = ExecNode {
                 kind: ExecNodeKind::Sort(SortNode {
                     input: Box::new(lowered.node),

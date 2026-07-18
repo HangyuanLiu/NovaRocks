@@ -25,6 +25,7 @@ use crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata;
 use crate::connector::iceberg::scan_model::IcebergColumnStats;
 use crate::fs::scan_context::FileScanRange;
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use crate::runtime::scan_range::{
     DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue, FilePruningValueKind,
     FileScanRange as RuntimeFileScanRange, IcebergDeleteFile,
@@ -36,15 +37,15 @@ pub(super) fn decode_file_scan_ranges(
     node_id: i32,
     table: &plan::IcebergTableInfo,
     ranges: &[ScanRangeParams],
-) -> Result<Vec<FileScanRange>, String> {
-    ranges
+) -> Result<Vec<FileScanRange>, NativeFragmentLeafDecodeError> {
+    Ok(ranges
         .iter()
         .enumerate()
         .map(|(idx, range)| {
             if range.has_more.unwrap_or(false) {
-                return Err(format!(
+                return Err(NativeFragmentLeafDecodeError::new(format!(
                     "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
-                ));
+                )));
             }
             if range.empty.unwrap_or(false) {
                 Ok(None)
@@ -52,8 +53,8 @@ pub(super) fn decode_file_scan_ranges(
                 decode_file_scan_range(node_id, table, idx, range).map(Some)
             }
         })
-        .collect::<Result<Vec<_>, String>>()
-        .map(|ranges| ranges.into_iter().flatten().collect())
+        .collect::<Result<Vec<_>, NativeFragmentLeafDecodeError>>()
+        .map(|ranges| ranges.into_iter().flatten().collect())?)
 }
 
 fn decode_file_scan_range(
@@ -61,22 +62,21 @@ fn decode_file_scan_range(
     table: &plan::IcebergTableInfo,
     idx: usize,
     range: &ScanRangeParams,
-) -> Result<FileScanRange, String> {
+) -> Result<FileScanRange, NativeFragmentLeafDecodeError> {
     if range.has_more.unwrap_or(false) {
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} has_more is not supported by native lowering"
-        ));
+        )
+        .into());
     }
     let ScanRange::File(file) = &range.range else {
-        return Err(format!(
-            "ScanNode node_id={node_id} range {idx} expected file range"
-        ));
+        return Err(format!("ScanNode node_id={node_id} range {idx} expected file range").into());
     };
     if file.file_format != FileFormat::Parquet {
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} unsupported file_format {}; only PARQUET is supported",
             file.file_format.as_native_name()
-        ));
+        ).into());
     }
     let path = file_range_path(table, file)?;
     let file_len = nonnegative_u64(file.file_length, "file_length")?;
@@ -85,7 +85,8 @@ fn decode_file_scan_range(
         return Err(format!(
             "ScanNode node_id={node_id} range {idx} offset {} exceeds file_length {}",
             file.offset, file.file_length
-        ));
+        )
+        .into());
     }
     let length = if file.length > 0 {
         nonnegative_u64(file.length, "length")?
@@ -136,7 +137,7 @@ fn file_pruning_metadata_from_assignment(
     range_idx: usize,
     table: &plan::IcebergTableInfo,
     values: Option<&BTreeMap<i32, FilePruningMinMaxValue>>,
-) -> Result<Option<IcebergFilePruningMetadata>, String> {
+) -> Result<Option<IcebergFilePruningMetadata>, NativeFragmentLeafDecodeError> {
     let Some(values) = values else {
         return Ok(None);
     };
@@ -154,7 +155,7 @@ fn file_pruning_metadata_from_assignment(
             return Err(format!(
                 "ScanNode node_id={node_id} range {range_idx} file pruning ordinal {ordinal} exceeds Iceberg schema field count {}",
                 schema.fields.len()
-            ));
+            ).into());
         };
         let Some(stats) = column_stats_from_min_max_value(node_id, range_idx, value)? else {
             continue;
@@ -247,7 +248,7 @@ fn bool_bound_to_byte(value: i64) -> Result<u8, String> {
 fn file_range_path(
     table: &plan::IcebergTableInfo,
     file: &RuntimeFileScanRange,
-) -> Result<String, String> {
+) -> Result<String, NativeFragmentLeafDecodeError> {
     if let Some(path) = file.full_path.as_deref()
         && !path.is_empty()
     {
@@ -258,10 +259,10 @@ fn file_range_path(
         .as_deref()
         .filter(|path| !path.is_empty())
     else {
-        return Err("file range missing full_path/relative_path".to_string());
+        return Err("file range missing full_path/relative_path".into());
     };
     if table.location.is_empty() {
-        return Err("HDFS relative_path requires Iceberg table location".to_string());
+        return Err("HDFS relative_path requires Iceberg table location".into());
     }
     Ok(format!(
         "{}/{}",

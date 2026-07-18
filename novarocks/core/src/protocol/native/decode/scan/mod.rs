@@ -31,88 +31,93 @@ mod variant_path;
 mod virtual_columns;
 
 use super::node::{DecodedNode, NativePlanDecodeContext};
+use super::{NativeFragmentDecodeError, error::NativeFragmentLeafDecodeError};
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
     _physical: &plan::PlanNode,
     scan: &plan::ScanNode,
+    path: FieldPath,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    if !node.children.is_empty() {
-        return Err(format!(
-            "ScanNode node_id={} expected no children, got {}",
-            node.node_id,
-            node.children.len()
-        ));
-    }
-    if !scan.dict_columns.is_empty() {
-        return Err("ScanNode dict_columns are not supported by native lowering yet".to_string());
-    }
-    let table = scan
-        .table
-        .as_ref()
-        .ok_or_else(|| "ScanNode table missing".to_string())?;
-    let source = table
-        .source
-        .as_ref()
-        .and_then(|source| source.kind.as_ref())
-        .ok_or_else(|| "ScanNode table source missing".to_string())?;
-    match source {
-        plan::scan_source::Kind::IcebergDataFiles(source) => {
-            iceberg_data::lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "ScanNode node_id={} expected no children, got {}",
+                node.node_id,
+                node.children.len()
+            )
+            .into());
         }
-        plan::scan_source::Kind::IcebergMetadataTable(source) => {
-            reject_variant_columns_for_source(scan, "IcebergMetadataTable")?;
-            iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
+        if !scan.dict_columns.is_empty() {
+            return Err("ScanNode dict_columns are not supported by native lowering yet".into());
         }
-        plan::scan_source::Kind::IcebergDeltaTable(source) => {
-            reject_variant_columns_for_source(scan, "IcebergDeltaTable")?;
-            iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
-        }
-        plan::scan_source::Kind::IcebergVersionTable(_) => {
-            reject_variant_columns_for_source(scan, "IcebergVersionTable")?;
-            unsupported_scan_source("IcebergVersionTable")
-        }
-        plan::scan_source::Kind::IcebergMvTargetState(_) => {
-            reject_variant_columns_for_source(scan, "IcebergMvTargetState")?;
-            unsupported_scan_source("IcebergMvTargetState")
-        }
-        plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
-            reject_variant_columns_for_source(scan, "IcebergMvTargetLocator")?;
-            unsupported_scan_source("IcebergMvTargetLocator")
-        }
-        plan::scan_source::Kind::StarrocksTable(source) => {
-            reject_variant_columns_for_source(scan, "StarRocksTable")?;
-            #[cfg(feature = "compat")]
-            {
-                starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
+        let table = scan
+            .table
+            .as_ref()
+            .ok_or_else(|| "ScanNode table missing".to_string())?;
+        let source = table
+            .source
+            .as_ref()
+            .and_then(|source| source.kind.as_ref())
+            .ok_or_else(|| "ScanNode table source missing".to_string())?;
+        match source {
+            plan::scan_source::Kind::IcebergDataFiles(source) => {
+                iceberg_data::lower_iceberg_data_files_scan(node, scan, source, ctx, arena)
             }
-            #[cfg(not(feature = "compat"))]
-            {
-                let _ = (node, scan, source, ctx, arena);
-                Err("StarRocks native scan requires feature compat".to_string())
+            plan::scan_source::Kind::IcebergMetadataTable(source) => {
+                reject_variant_columns_for_source(scan, "IcebergMetadataTable")?;
+                iceberg_metadata::lower_iceberg_metadata_scan(node, scan, source, ctx, arena)
+            }
+            plan::scan_source::Kind::IcebergDeltaTable(source) => {
+                reject_variant_columns_for_source(scan, "IcebergDeltaTable")?;
+                iceberg_delta::lower_iceberg_delta_table_scan(node, scan, source, arena)
+            }
+            plan::scan_source::Kind::IcebergVersionTable(_) => {
+                reject_variant_columns_for_source(scan, "IcebergVersionTable")?;
+                unsupported_scan_source("IcebergVersionTable")
+            }
+            plan::scan_source::Kind::IcebergMvTargetState(_) => {
+                reject_variant_columns_for_source(scan, "IcebergMvTargetState")?;
+                unsupported_scan_source("IcebergMvTargetState")
+            }
+            plan::scan_source::Kind::IcebergMvTargetLocator(_) => {
+                reject_variant_columns_for_source(scan, "IcebergMvTargetLocator")?;
+                unsupported_scan_source("IcebergMvTargetLocator")
+            }
+            plan::scan_source::Kind::StarrocksTable(source) => {
+                reject_variant_columns_for_source(scan, "StarRocksTable")?;
+                #[cfg(feature = "compat")]
+                {
+                    starrocks::lower_starrocks_scan(node, scan, source, ctx, arena)
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    let _ = (node, scan, source, ctx, arena);
+                    Err("StarRocks native scan requires feature compat".into())
+                }
             }
         }
-    }
+    })();
+    decoded.map_err(|error| error.into_native(path))
 }
 
 fn reject_variant_columns_for_source(
     scan: &plan::ScanNode,
     source_name: &str,
-) -> Result<(), String> {
+) -> Result<(), NativeFragmentLeafDecodeError> {
     if scan.variant_columns.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "{source_name} native scan does not support variant_columns"
-    ))
+    Err(format!("{source_name} native scan does not support variant_columns").into())
 }
 
-fn unsupported_scan_source(source: &str) -> Result<DecodedNode, String> {
-    Err(format!("{source} native scan source is not implemented"))
+fn unsupported_scan_source(source: &str) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
+    Err(format!("{source} native scan source is not implemented").into())
 }
 
 #[cfg(test)]
@@ -120,7 +125,7 @@ pub(crate) fn scan_read_binding_for_test(
     scan: &plan::ScanNode,
     table: &plan::IcebergTableInfo,
     output_columns: &[crate::proto::common::OutputColumn],
-) -> Result<(Vec<String>, Vec<(u32, u32)>), String> {
+) -> Result<(Vec<String>, Vec<(u32, u32)>), NativeFragmentLeafDecodeError> {
     let read_plan = read_plan::scan_read_plan(scan, table, output_columns)?;
     Ok((
         read_plan.read_columns,

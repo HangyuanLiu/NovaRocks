@@ -17,7 +17,8 @@
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::{build_slot_projection, check_exact_arity};
@@ -26,33 +27,50 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
+use crate::protocol::common::error::FieldPath;
 use crate::types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     aggregate: &plan::HashAggregateNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("HashAggregateNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("HashAggregateNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
     if aggregate.is_merge.len() != aggregate.aggregates.len() {
-        return Err(format!(
-            "HashAggregateNode is_merge length mismatch: is_merge={} aggregates={}",
-            aggregate.is_merge.len(),
-            aggregate.aggregates.len()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("is_merge"),
+            format!(
+                "HashAggregateNode is_merge length mismatch: is_merge={} aggregates={}",
+                aggregate.is_merge.len(),
+                aggregate.aggregates.len()
+            ),
         ));
     }
-    let mode = plan::AggMode::try_from(aggregate.mode)
-        .map_err(|_| format!("HashAggregateNode unknown mode {}", aggregate.mode))?;
+    let mode = plan::AggMode::try_from(aggregate.mode).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("mode"),
+            format!("HashAggregateNode unknown mode {}", aggregate.mode),
+        )
+    })?;
     if mode == plan::AggMode::Unspecified {
-        return Err("HashAggregateNode mode is unspecified".to_string());
+        return Err(NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("mode"),
+            "HashAggregateNode mode is unspecified",
+        ));
     }
-    let output_layout = aggregate
-        .output_layout
-        .as_ref()
-        .ok_or_else(|| "HashAggregateNode output_layout missing".to_string())?;
+    let output_layout = aggregate.output_layout.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("output_layout"),
+            "HashAggregateNode output_layout missing",
+        )
+    })?;
     let aggregate_output_columns = aggregate_output_columns_from_layout(
         output_layout.group_key_columns.as_slice(),
         output_layout.aggregate_columns.as_slice(),
@@ -64,20 +82,32 @@ pub(super) fn lower_hash_aggregate_node(
     } else {
         aggregate_output_columns.as_slice()
     };
-    let aggregate_layout = layout_from_output_columns(&aggregate_output_columns)?;
-    let aggregate_output_schema = chunk_schema_from_output_columns(&aggregate_output_columns)?;
+    let aggregate_layout = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_layout"),
+        layout_from_output_columns(&aggregate_output_columns),
+    )?;
+    let aggregate_output_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_layout"),
+        chunk_schema_from_output_columns(&aggregate_output_columns),
+    )?;
     if output_layout.aggregate_columns.len() != aggregate.aggregates.len() {
-        return Err(format!(
-            "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
-            output_layout.aggregate_columns.len(),
-            aggregate.aggregates.len()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("output_layout.aggregate_columns"),
+            format!(
+                "HashAggregateNode output_layout aggregate column mismatch: columns={} aggregates={}",
+                output_layout.aggregate_columns.len(),
+                aggregate.aggregates.len()
+            ),
         ));
     }
     if output_layout.group_key_columns.len() != aggregate.group_by.len() {
-        return Err(format!(
-            "HashAggregateNode output_layout group key mismatch: columns={} group_by={}",
-            output_layout.group_key_columns.len(),
-            aggregate.group_by.len()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("output_layout.group_key_columns"),
+            format!(
+                "HashAggregateNode output_layout group key mismatch: columns={} group_by={}",
+                output_layout.group_key_columns.len(),
+                aggregate.group_by.len()
+            ),
         ));
     }
 
@@ -86,20 +116,22 @@ pub(super) fn lower_hash_aggregate_node(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            decode_expr(expr, arena, &child.layout).map_err(|err| {
-                format!(
-                    "HashAggregateNode group_by[{idx}]: {err}; child_kind={} child_slots={:?}",
-                    super::exec_node_kind_label(&child.node.kind),
-                    child.layout.order()
-                )
-            })
+            decode_expr_at(
+                expr,
+                path.clone().field("group_by").index(idx),
+                arena,
+                &child.layout,
+            )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     for expr_id in &group_by {
         if let Some(dt) = arena.data_type(*expr_id)
             && matches!(dt, DataType::LargeBinary)
         {
-            return Err("VARIANT is not supported in GROUP BY".to_string());
+            return Err(NativeFragmentDecodeError::unsupported(
+                path.clone().field("group_by"),
+                "VARIANT is not supported in GROUP BY",
+            ));
         }
     }
 
@@ -107,20 +139,41 @@ pub(super) fn lower_hash_aggregate_node(
     let mut functions = Vec::with_capacity(aggregate.aggregates.len());
     for (idx, call) in aggregate.aggregates.iter().enumerate() {
         let is_merge = aggregate.is_merge[idx];
-        let output_col = output_layout
-            .aggregate_columns
-            .get(idx)
-            .ok_or_else(|| format!("HashAggregateNode aggregate column {idx} missing"))?;
-        let result_type = call
-            .result_type
-            .as_ref()
-            .ok_or_else(|| format!("HashAggregateNode aggregate {idx} result_type missing"))
-            .and_then(super::super::decode_type)?;
-        let function_name = aggregate_function_name(call)?;
-        let signature_arg_types = aggregate_signature_arg_types(call)?;
+        let output_col = output_layout.aggregate_columns.get(idx).ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone()
+                    .field("output_layout.aggregate_columns")
+                    .index(idx),
+                format!("HashAggregateNode aggregate column {idx} missing"),
+            )
+        })?;
+        let result_type = call.result_type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone()
+                    .field("aggregates")
+                    .index(idx)
+                    .field("result_type"),
+                format!("HashAggregateNode aggregate {idx} result_type missing"),
+            )
+        })?;
+        let result_type = NativeFragmentDecodeError::map_invalid(
+            path.clone()
+                .field("aggregates")
+                .index(idx)
+                .field("result_type"),
+            super::super::decode_type(result_type),
+        )?;
+        let function_name = aggregate_function_name(call);
+        let signature_arg_types =
+            aggregate_signature_arg_types(call, path.clone().field("aggregates").index(idx))?;
         let (semantic_output_type, intermediate_type) =
             infer_agg_function_types(&function_name, &signature_arg_types, call.distinct).map_err(
-                |err| format!("HashAggregateNode aggregate {idx} type inference: {err}"),
+                |err| {
+                    NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("aggregates").index(idx),
+                        format!("HashAggregateNode aggregate {idx} type inference: {err}"),
+                    )
+                },
             )?;
         let signature_input_arg_type = signature_arg_types.first().cloned();
         let signature_output_type = if need_finalize {
@@ -131,18 +184,24 @@ pub(super) fn lower_hash_aggregate_node(
 
         let raw_args = if is_merge {
             let slot = SlotId::new(output_col.column_id);
-            let data_type = intermediate_type.clone().ok_or_else(|| {
-                format!(
+            let data_type = intermediate_type.clone().ok_or_else(|| NativeFragmentDecodeError::invalid_value(path.clone().field("aggregates").index(idx), format!(
                     "HashAggregateNode merge aggregate {idx} requires a known intermediate type for {}",
                     function_name
-                )
-            })?;
+                )))?;
             vec![arena.push_typed(ExprNode::SlotId(slot), data_type)]
         } else {
-            lower_aggregate_update_inputs(call, idx, &child, arena)?
+            lower_aggregate_update_inputs(
+                call,
+                idx,
+                path.clone().field("aggregates").index(idx),
+                &child,
+                arena,
+            )?
         };
-        let inputs =
-            select_aggregate_inputs(&call.name.to_ascii_lowercase(), is_merge, raw_args, arena)?;
+        let inputs = NativeFragmentDecodeError::map_invalid(
+            path.clone().field("aggregates").index(idx),
+            select_aggregate_inputs(&call.name.to_ascii_lowercase(), is_merge, raw_args, arena),
+        )?;
         functions.push(AggFunction {
             name: function_name,
             inputs,
@@ -174,7 +233,11 @@ pub(super) fn lower_hash_aggregate_node(
         layout: aggregate_layout,
         output_schema: aggregate_output_schema,
     };
-    let visible_layout = layout_from_output_columns(visible_output_columns)?;
+    let visible_path = path.clone().field("output_columns");
+    let visible_layout = NativeFragmentDecodeError::map_invalid(
+        visible_path.clone(),
+        layout_from_output_columns(visible_output_columns),
+    )?;
     if visible_layout.order() == aggregate_node.layout.order() {
         return Ok(aggregate_node);
     }
@@ -182,6 +245,7 @@ pub(super) fn lower_hash_aggregate_node(
         "HashAggregateNode",
         aggregate_node,
         visible_output_columns,
+        visible_path,
         node.node_id,
         arena,
     )
@@ -197,34 +261,50 @@ fn aggregate_output_columns_from_layout(
     columns
 }
 
-fn aggregate_function_name(call: &plan::PlanAggregateCall) -> Result<String, String> {
+fn aggregate_function_name(call: &plan::PlanAggregateCall) -> String {
     // Delegate the DISTINCT-mangling table to the single source of truth; this
     // proto-typed wrapper differs from the planner-typed one only in its input.
-    Ok(mangle_distinct_aggregate_name(&call.name, call.distinct))
+    mangle_distinct_aggregate_name(&call.name, call.distinct)
 }
 
-fn aggregate_signature_arg_types(call: &plan::PlanAggregateCall) -> Result<Vec<DataType>, String> {
+fn aggregate_signature_arg_types(
+    call: &plan::PlanAggregateCall,
+    path: FieldPath,
+) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
     let mut types = call
         .args
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            expr.r#type
-                .as_ref()
-                .ok_or_else(|| format!("aggregate {} argument {idx} type missing", call.name))
-                .and_then(super::super::decode_type)
+            let ty = expr.r#type.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("args").index(idx).field("type"),
+                    format!("aggregate {} argument {idx} type missing", call.name),
+                )
+            })?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone().field("args").index(idx).field("type"),
+                super::super::decode_type(ty),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (idx, item) in call.order_by.iter().enumerate() {
-        let expr = item
-            .expr
-            .as_ref()
-            .ok_or_else(|| format!("aggregate {} order_by[{idx}] expr missing", call.name))?;
-        let data_type = expr
-            .r#type
-            .as_ref()
-            .ok_or_else(|| format!("aggregate {} order_by[{idx}] type missing", call.name))
-            .and_then(super::super::decode_type)?;
+        let expr = item.expr.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("order_by").index(idx).field("expr"),
+                format!("aggregate {} order_by[{idx}] expr missing", call.name),
+            )
+        })?;
+        let data_type = expr.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("order_by").index(idx).field("expr.type"),
+                format!("aggregate {} order_by[{idx}] type missing", call.name),
+            )
+        })?;
+        let data_type = NativeFragmentDecodeError::map_invalid(
+            path.clone().field("order_by").index(idx).field("expr.type"),
+            super::super::decode_type(data_type),
+        )?;
         types.push(data_type);
     }
     Ok(types)
@@ -233,29 +313,43 @@ fn aggregate_signature_arg_types(call: &plan::PlanAggregateCall) -> Result<Vec<D
 fn lower_aggregate_update_inputs(
     call: &plan::PlanAggregateCall,
     aggregate_idx: usize,
+    path: FieldPath,
     child: &DecodedNode,
     arena: &mut ExprArena,
-) -> Result<Vec<crate::exec::expr::ExprId>, String> {
+) -> Result<Vec<crate::exec::expr::ExprId>, NativeFragmentDecodeError> {
     if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
-        return Err(format!(
-            "HashAggregateNode aggregate {aggregate_idx} count_if does not support ORDER BY"
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("order_by"),
+            format!(
+                "HashAggregateNode aggregate {aggregate_idx} count_if does not support ORDER BY"
+            ),
         ));
     }
     let mut inputs = Vec::with_capacity(call.args.len() + call.order_by.len());
     for (arg_idx, expr) in call.args.iter().enumerate() {
-        inputs.push(decode_expr(expr, arena, &child.layout).map_err(|err| {
-            format!("HashAggregateNode aggregate {aggregate_idx} arg {arg_idx}: {err}")
-        })?);
+        inputs.push(decode_expr_at(
+            expr,
+            path.clone().field("args").index(arg_idx),
+            arena,
+            &child.layout,
+        )?);
     }
     for (order_idx, item) in call.order_by.iter().enumerate() {
+        let item_path = path.clone().field("order_by").index(order_idx);
         let expr = item.expr.as_ref().ok_or_else(|| {
-            format!(
-                "HashAggregateNode aggregate {aggregate_idx} order_by[{order_idx}] expr missing"
+            NativeFragmentDecodeError::missing(
+                item_path.clone().field("expr"),
+                format!(
+                    "HashAggregateNode aggregate {aggregate_idx} order_by[{order_idx}] expr missing"
+                ),
             )
         })?;
-        inputs.push(decode_expr(expr, arena, &child.layout).map_err(|err| {
-            format!("HashAggregateNode aggregate {aggregate_idx} order_by[{order_idx}]: {err}")
-        })?);
+        inputs.push(decode_expr_at(
+            expr,
+            item_path.field("expr"),
+            arena,
+            &child.layout,
+        )?);
     }
     Ok(inputs)
 }

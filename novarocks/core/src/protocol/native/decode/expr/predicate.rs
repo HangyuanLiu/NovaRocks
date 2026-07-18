@@ -23,17 +23,19 @@ use super::{lower_expr_list, lower_required_child};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 use crate::types::comparison_common_type;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_is_null(
     is_null: &expr::IsNullExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let child = lower_required_child(&is_null.operand, "IsNull.operand", arena, input_layout)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let child = lower_required_child(&is_null.operand, path.field("operand"), arena, input_layout)?;
     let node = if is_null.negated {
         ExprNode::IsNotNull(child)
     } else {
@@ -44,16 +46,39 @@ pub(crate) fn lower_is_null(
 
 pub(crate) fn lower_in_list(
     in_list: &expr::InListExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let mut child = lower_required_child(&in_list.operand, "InList.operand", arena, input_layout)?;
-    let mut values = lower_expr_list(&in_list.list, arena, input_layout)?;
-    if let Some(compare_type) = in_list_comparison_type(arena, child, &values)? {
-        child = cast_to_type_if_needed(arena, child, &compare_type)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let mut child = lower_required_child(
+        &in_list.operand,
+        path.clone().field("operand"),
+        arena,
+        input_layout,
+    )?;
+    let mut values = lower_expr_list(
+        &in_list.list,
+        path.clone().field("list"),
+        arena,
+        input_layout,
+    )?;
+    if let Some(compare_type) = in_list_comparison_type(arena, child, &values).map_err(|error| {
+        super::super::NativeFragmentDecodeError::inconsistent(path.clone(), error)
+    })? {
+        child = cast_to_type_if_needed(arena, child, &compare_type).map_err(|error| {
+            super::super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("operand"),
+                error,
+            )
+        })?;
         for value in &mut values {
-            *value = cast_to_type_if_needed(arena, *value, &compare_type)?;
+            *value = cast_to_type_if_needed(arena, *value, &compare_type).map_err(|error| {
+                super::super::NativeFragmentDecodeError::inconsistent(
+                    path.clone().field("list"),
+                    error,
+                )
+            })?;
         }
     }
     Ok(arena.push_typed(
@@ -132,16 +157,25 @@ fn cast_to_type_if_needed(
 
 pub(crate) fn lower_between(
     between: &expr::BetweenExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
     if !matches!(data_type, DataType::Boolean) {
-        return Err(format!("Between must return Boolean, got {data_type:?}"));
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            format!("Between must return Boolean, got {data_type:?}"),
+        ));
     }
-    let operand = lower_required_child(&between.operand, "Between.operand", arena, input_layout)?;
-    let low = lower_required_child(&between.low, "Between.low", arena, input_layout)?;
-    let high = lower_required_child(&between.high, "Between.high", arena, input_layout)?;
+    let operand = lower_required_child(
+        &between.operand,
+        path.clone().field("operand"),
+        arena,
+        input_layout,
+    )?;
+    let low = lower_required_child(&between.low, path.clone().field("low"), arena, input_layout)?;
+    let high = lower_required_child(&between.high, path.field("high"), arena, input_layout)?;
     if between.negated {
         let lt_low = arena.push_typed(ExprNode::Lt(operand, low), DataType::Boolean);
         let gt_high = arena.push_typed(ExprNode::Gt(operand, high), DataType::Boolean);
@@ -156,12 +190,18 @@ pub(crate) fn lower_between(
 
 pub(crate) fn lower_like(
     like: &expr::LikeExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let operand = lower_required_child(&like.operand, "Like.operand", arena, input_layout)?;
-    let pattern = lower_required_child(&like.pattern, "Like.pattern", arena, input_layout)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let operand = lower_required_child(
+        &like.operand,
+        path.clone().field("operand"),
+        arena,
+        input_layout,
+    )?;
+    let pattern = lower_required_child(&like.pattern, path.field("pattern"), arena, input_layout)?;
     let like_id = arena.push_typed(
         ExprNode::FunctionCall {
             kind: FunctionKind::Like,
@@ -178,14 +218,23 @@ pub(crate) fn lower_like(
 
 pub(crate) fn lower_is_truth(
     is_truth: &expr::IsTruthExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
     if !matches!(data_type, DataType::Boolean) {
-        return Err(format!("IsTruth must return Boolean, got {data_type:?}"));
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone(),
+            format!("IsTruth must return Boolean, got {data_type:?}"),
+        ));
     }
-    let child = lower_required_child(&is_truth.operand, "IsTruth.operand", arena, input_layout)?;
+    let child = lower_required_child(
+        &is_truth.operand,
+        path.field("operand"),
+        arena,
+        input_layout,
+    )?;
     if is_truth.value && !is_truth.negated {
         Ok(child)
     } else {

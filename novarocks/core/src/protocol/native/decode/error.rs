@@ -20,6 +20,59 @@ use std::fmt;
 
 use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 
+/// Typed error used by nested native-protobuf leaf decoders before the owning
+/// DTO boundary attaches its exact [`FieldPath`].
+#[derive(Debug)]
+pub(crate) struct NativeFragmentLeafDecodeError(String);
+
+impl NativeFragmentLeafDecodeError {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self(detail.into())
+    }
+
+    pub(crate) fn into_native(self, path: FieldPath) -> NativeFragmentDecodeError {
+        NativeFragmentDecodeError::invalid_value(path, self.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, pattern: &str) -> bool {
+        self.0.contains(pattern)
+    }
+}
+
+impl fmt::Display for NativeFragmentLeafDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for NativeFragmentLeafDecodeError {}
+
+impl From<String> for NativeFragmentLeafDecodeError {
+    fn from(detail: String) -> Self {
+        Self(detail)
+    }
+}
+
+impl From<&str> for NativeFragmentLeafDecodeError {
+    fn from(detail: &str) -> Self {
+        Self(detail.to_string())
+    }
+}
+
+impl From<NativeFragmentLeafDecodeError> for String {
+    fn from(error: NativeFragmentLeafDecodeError) -> Self {
+        error.0
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&str> for NativeFragmentLeafDecodeError {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum NativeFragmentDecodeError {
     Protocol(ProtocolError),
@@ -28,6 +81,11 @@ pub(crate) enum NativeFragmentDecodeError {
 }
 
 impl NativeFragmentDecodeError {
+    #[cfg(test)]
+    pub(crate) fn contains(&self, pattern: &str) -> bool {
+        self.to_string().contains(pattern)
+    }
+
     pub(crate) fn protocol(&self) -> Option<&ProtocolError> {
         match self {
             Self::Protocol(error) => Some(error),
@@ -55,6 +113,17 @@ impl NativeFragmentDecodeError {
         Self::protocol_error(path, ProtocolErrorKind::InconsistentFields, detail)
     }
 
+    pub(crate) fn unsupported(path: FieldPath, detail: impl Into<String>) -> Self {
+        Self::protocol_error(path, ProtocolErrorKind::Unsupported, detail)
+    }
+
+    pub(crate) fn map_invalid<T, E: fmt::Display>(
+        path: FieldPath,
+        result: Result<T, E>,
+    ) -> Result<T, Self> {
+        result.map_err(|detail| Self::invalid_value(path, detail.to_string()))
+    }
+
     fn protocol_error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> Self {
         Self::Protocol(ProtocolError::new(
             ProtocolFamily::Native,
@@ -62,6 +131,13 @@ impl NativeFragmentDecodeError {
             kind,
             detail,
         ))
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<&str> for NativeFragmentDecodeError {
+    fn eq(&self, other: &&str) -> bool {
+        self.to_string().ends_with(other)
     }
 }
 

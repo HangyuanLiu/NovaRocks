@@ -22,29 +22,34 @@ use super::common::{
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_limit_node(
     node: &plan::DistributedNode,
     limit_node: &plan::LimitNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("LimitNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let payload_limit = parse_optional_nonnegative_i64(limit_node.limit, "LimitNode.limit")?;
-    let outer_limit = parse_distributed_limit(node.limit, "LimitNode DistributedNode.limit")?;
-    let limit = merge_limits("LimitNode", payload_limit, outer_limit)?;
-    let offset =
-        parse_optional_nonnegative_i64(limit_node.offset, "LimitNode.offset")?.unwrap_or(0);
-    Ok(DecodedNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Limit(LimitNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                limit,
-                offset,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
+) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<DecodedNode, String> {
+        check_exact_arity("LimitNode", 1, children.len())?;
+        let child = children.pop().expect("child");
+        let payload_limit = parse_optional_nonnegative_i64(limit_node.limit, "LimitNode.limit")?;
+        let outer_limit = parse_distributed_limit(node.limit, "LimitNode DistributedNode.limit")?;
+        let limit = merge_limits("LimitNode", payload_limit, outer_limit)?;
+        let offset =
+            parse_optional_nonnegative_i64(limit_node.offset, "LimitNode.offset")?.unwrap_or(0);
+        Ok(DecodedNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Limit(LimitNode {
+                    input: Box::new(child.node),
+                    node_id: node.node_id,
+                    limit,
+                    offset,
+                }),
+            },
+            layout: child.layout,
+            output_schema: child.output_schema,
+        })
+    })();
+    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
 }

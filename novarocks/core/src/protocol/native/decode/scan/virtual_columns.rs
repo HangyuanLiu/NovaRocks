@@ -23,6 +23,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::common::ids::SlotId;
 use crate::exec::row_position::IcebergVirtualSpec;
 use crate::proto::{common, plan};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn iceberg_virtual_count_column(column_id: u32) -> common::OutputColumn {
     common::OutputColumn {
@@ -46,28 +47,28 @@ pub(super) fn record_iceberg_virtual_column(
     table: &plan::IcebergTableInfo,
     col: &common::OutputColumn,
     spec: &mut IcebergVirtualSpec,
-) -> Result<bool, String> {
+) -> Result<bool, NativeFragmentLeafDecodeError> {
     let Some(field) = iceberg_virtual_projected_field(table, col)? else {
         return Ok(false);
     };
     let slot_id = SlotId::new(col.column_id);
     if crate::exec::row_position::is_iceberg_file_path(&col.name) {
         if spec.file_path_slot.replace(slot_id).is_some() {
-            return Err("ScanNode duplicate Iceberg _file virtual column".to_string());
+            return Err("ScanNode duplicate Iceberg _file virtual column".into());
         }
         spec.file_path_field = Some(field);
         return Ok(true);
     }
     if crate::exec::row_position::is_iceberg_row_pos(&col.name) {
         if spec.row_pos_slot.replace(slot_id).is_some() {
-            return Err("ScanNode duplicate Iceberg _pos virtual column".to_string());
+            return Err("ScanNode duplicate Iceberg _pos virtual column".into());
         }
         spec.row_pos_field = Some(field);
         return Ok(true);
     }
     if crate::exec::row_position::is_iceberg_row_id(&col.name) {
         if spec.row_id_slot.replace(slot_id).is_some() {
-            return Err("ScanNode duplicate Iceberg _row_id virtual column".to_string());
+            return Err("ScanNode duplicate Iceberg _row_id virtual column".into());
         }
         spec.row_id_field = Some(field);
         return Ok(true);
@@ -75,8 +76,7 @@ pub(super) fn record_iceberg_virtual_column(
     if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&col.name) {
         if spec.last_updated_seq_slot.replace(slot_id).is_some() {
             return Err(
-                "ScanNode duplicate Iceberg _last_updated_sequence_number virtual column"
-                    .to_string(),
+                "ScanNode duplicate Iceberg _last_updated_sequence_number virtual column".into(),
             );
         }
         spec.last_updated_seq_field = Some(field);
@@ -84,7 +84,7 @@ pub(super) fn record_iceberg_virtual_column(
     }
     if crate::exec::row_position::is_change_op(&col.name) {
         if spec.change_op_slot.replace(slot_id).is_some() {
-            return Err("ScanNode duplicate Iceberg __change_op virtual column".to_string());
+            return Err("ScanNode duplicate Iceberg __change_op virtual column".into());
         }
         spec.change_op_field = Some(field);
         return Ok(true);
@@ -95,7 +95,7 @@ pub(super) fn record_iceberg_virtual_column(
 pub(super) fn iceberg_virtual_projected_field(
     table: &plan::IcebergTableInfo,
     col: &common::OutputColumn,
-) -> Result<Option<Field>, String> {
+) -> Result<Option<Field>, NativeFragmentLeafDecodeError> {
     if iceberg_schema_has_field(table, &col.name) {
         return Ok(None);
     }
@@ -106,28 +106,28 @@ pub(super) fn iceberg_virtual_projected_field(
     let data_type = super::super::decode_type(desc)?;
     if crate::exec::row_position::is_iceberg_file_path(&col.name) {
         if !matches!(data_type, DataType::Utf8) {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::new(format!(
                 "ScanNode Iceberg _file virtual column expects Utf8, got {:?}",
                 data_type
-            ));
+            )));
         }
         return Ok(Some(Field::new(col.name.clone(), data_type, col.nullable)));
     }
     if crate::exec::row_position::is_iceberg_row_pos(&col.name) {
         if !matches!(data_type, DataType::Int64) {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::new(format!(
                 "ScanNode Iceberg _pos virtual column expects Int64, got {:?}",
                 data_type
-            ));
+            )));
         }
         return Ok(Some(Field::new(col.name.clone(), data_type, col.nullable)));
     }
     if crate::exec::row_position::is_iceberg_row_id(&col.name) {
         if !matches!(data_type, DataType::Int64) {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::new(format!(
                 "ScanNode Iceberg _row_id virtual column expects Int64, got {:?}",
                 data_type
-            ));
+            )));
         }
         return Ok(Some(iceberg_virtual_field_with_field_id(
             col,
@@ -137,10 +137,10 @@ pub(super) fn iceberg_virtual_projected_field(
     }
     if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&col.name) {
         if !matches!(data_type, DataType::Int64) {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::new(format!(
                 "ScanNode Iceberg _last_updated_sequence_number virtual column expects Int64, got {:?}",
                 data_type
-            ));
+            )));
         }
         return Ok(Some(iceberg_virtual_field_with_field_id(
             col,
@@ -150,10 +150,10 @@ pub(super) fn iceberg_virtual_projected_field(
     }
     if crate::exec::row_position::is_change_op(&col.name) {
         if !matches!(data_type, DataType::Int8) {
-            return Err(format!(
+            return Err(NativeFragmentLeafDecodeError::new(format!(
                 "ScanNode Iceberg __change_op virtual column expects Int8, got {:?}",
                 data_type
-            ));
+            )));
         }
         return Ok(Some(Field::new(col.name.clone(), data_type, col.nullable)));
     }

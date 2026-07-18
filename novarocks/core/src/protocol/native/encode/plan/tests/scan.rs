@@ -357,8 +357,7 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             files.binding,
             crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
         );
-        let (read_columns, variants) =
-            crate::protocol::native::decode::scan_read_binding_for_test(
+        let (read_columns, variants) = crate::protocol::native::decode::scan_read_binding_for_test(
             scan,
             files.table.as_ref().expect("resolved table"),
             &scan.columns,
@@ -517,8 +516,7 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     else {
         panic!("variant binding must encode as IcebergDataFiles");
     };
-    let (read_columns, variants) =
-        crate::protocol::native::decode::scan_read_binding_for_test(
+    let (read_columns, variants) = crate::protocol::native::decode::scan_read_binding_for_test(
         scan,
         files.table.as_ref().expect("resolved table"),
         &scan.columns[1..],

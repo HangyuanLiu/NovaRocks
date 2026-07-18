@@ -59,6 +59,7 @@ use crate::exec::node::runtime_filter::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
+use crate::protocol::common::error::FieldPath;
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId, ScanAssignments,
@@ -103,6 +104,24 @@ impl Default for NativePlanDecodeContext {
 }
 
 impl NativePlanDecodeContext {
+    pub(crate) fn from_parts(
+        exchange_inputs: ExchangeInputAssignments,
+        scan_assignments: ScanAssignments,
+        query_options: QueryOptions,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
+        query_id: QueryId,
+        fragment_instance_id: FragmentInstanceId,
+    ) -> Self {
+        Self {
+            exchange_inputs,
+            scan_assignments,
+            query_options: Some(query_options),
+            connectors: Some(connectors),
+            query_id: Some(query_id),
+            fragment_instance_id,
+        }
+    }
+
     pub(crate) fn from_native(
         root: &plan::DistributedNode,
         instance_params: &novarocks::InstanceParams,
@@ -110,50 +129,74 @@ impl NativePlanDecodeContext {
         connectors: Arc<crate::connector::ConnectorRegistry>,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
-    ) -> Result<Self, String> {
-        let scan_kinds = collect_scan_assignment_kinds(root)?;
-        let mut scan_assignments = BTreeMap::new();
-        for (raw_node_id, wire_ranges) in &instance_params.per_node_scan_ranges {
-            let node_id = FragmentNodeId::new(*raw_node_id);
-            let kind = scan_kinds.get(&node_id).copied().ok_or_else(|| {
-                format!(
-                    "native InstanceParams assigns scan ranges to unknown scan node_id={raw_node_id}"
-                )
-            })?;
-            let ranges = wire_ranges
-                .ranges
-                .iter()
-                .map(super::decode_scan_range_params)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?;
-            scan_assignments.insert(node_id, (kind, ranges));
-        }
-        let scan_assignments =
-            ScanAssignments::try_new(scan_assignments).map_err(|error| error.to_string())?;
-
-        let mut exchange_inputs = BTreeMap::new();
-        for (raw_node_id, sender_count) in &instance_params.per_exch_num_senders {
-            let sender_count = usize::try_from(*sender_count)
-                .ok()
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| {
+    ) -> Result<Self, super::NativeFragmentDecodeError> {
+        let decoded = (|| -> Result<Self, String> {
+            let scan_kinds =
+                collect_scan_assignment_kinds(root, FieldPath::root("plan_fragment").field("root"))
+                    .map_err(|error| error.to_string())?;
+            let mut scan_assignments = BTreeMap::new();
+            let mut scan_keys = instance_params
+                .per_node_scan_ranges
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            scan_keys.sort_unstable();
+            for raw_node_id in scan_keys {
+                let wire_ranges = &instance_params.per_node_scan_ranges[&raw_node_id];
+                let node_id = FragmentNodeId::new(raw_node_id);
+                let kind = scan_kinds.get(&node_id).copied().ok_or_else(|| {
                     format!(
-                        "native InstanceParams per_exch_num_senders node_id={raw_node_id} must be positive, got {sender_count}"
+                        "native InstanceParams assigns scan ranges to unknown scan node_id={raw_node_id}"
                     )
                 })?;
-            exchange_inputs.insert(
-                FragmentNodeId::new(*raw_node_id),
-                ExchangeInputAssignment::new(sender_count),
-            );
-        }
+                let ranges = wire_ranges
+                    .ranges
+                    .iter()
+                    .map(super::decode_scan_range_params)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                scan_assignments.insert(node_id, (kind, ranges));
+            }
+            let scan_assignments =
+                ScanAssignments::try_new(scan_assignments).map_err(|error| error.to_string())?;
 
-        Ok(Self {
-            exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-            scan_assignments,
-            query_options,
-            connectors: Some(connectors),
-            query_id: Some(query_id),
-            fragment_instance_id,
+            let mut exchange_inputs = BTreeMap::new();
+            let mut exchange_keys = instance_params
+                .per_exch_num_senders
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            exchange_keys.sort_unstable();
+            for raw_node_id in exchange_keys {
+                let raw_sender_count = instance_params.per_exch_num_senders[&raw_node_id];
+                let sender_count = usize::try_from(raw_sender_count)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .ok_or_else(|| {
+                        format!(
+                            "native InstanceParams per_exch_num_senders node_id={raw_node_id} must be positive, got {raw_sender_count}"
+                        )
+                    })?;
+                exchange_inputs.insert(
+                    FragmentNodeId::new(raw_node_id),
+                    ExchangeInputAssignment::new(sender_count),
+                );
+            }
+
+            Ok(Self {
+                exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
+                scan_assignments,
+                query_options,
+                connectors: Some(connectors),
+                query_id: Some(query_id),
+                fragment_instance_id,
+            })
+        })();
+        decoded.map_err(|error| {
+            super::NativeFragmentDecodeError::invalid_value(
+                FieldPath::root("instance_params"),
+                error,
+            )
         })
     }
 
@@ -257,13 +300,15 @@ impl NativePlanDecodeContext {
     }
 }
 
-fn collect_scan_assignment_kinds(
+pub(super) fn collect_scan_assignment_kinds(
     root: &plan::DistributedNode,
-) -> Result<BTreeMap<FragmentNodeId, ScanAssignmentKind>, String> {
+    root_path: FieldPath,
+) -> Result<BTreeMap<FragmentNodeId, ScanAssignmentKind>, super::NativeFragmentDecodeError> {
     fn visit(
         node: &plan::DistributedNode,
+        path: FieldPath,
         assignments: &mut BTreeMap<FragmentNodeId, ScanAssignmentKind>,
-    ) -> Result<(), String> {
+    ) -> Result<(), super::NativeFragmentDecodeError> {
         if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
             && let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref()
         {
@@ -273,7 +318,16 @@ fn collect_scan_assignment_kinds(
                 .and_then(|table| table.source.as_ref())
                 .and_then(|source| source.kind.as_ref())
                 .ok_or_else(|| {
-                    format!("native ScanNode node_id={} source missing", node.node_id)
+                    super::NativeFragmentDecodeError::missing(
+                        path.clone()
+                            .field("payload")
+                            .field("physical")
+                            .field("scan")
+                            .field("table")
+                            .field("source")
+                            .field("kind"),
+                        format!("native ScanNode node_id={} requires source", node.node_id),
+                    )
                 })?;
             let kind = match source {
                 plan::scan_source::Kind::StarrocksTable(_) => ScanAssignmentKind::StarRocksTablet,
@@ -283,20 +337,24 @@ fn collect_scan_assignment_kinds(
                 .insert(FragmentNodeId::new(node.node_id), kind)
                 .is_some()
             {
-                return Err(format!(
-                    "native plan has duplicate scan node_id={}",
-                    node.node_id
+                return Err(super::NativeFragmentDecodeError::inconsistent(
+                    path.clone().field("node_id"),
+                    format!("native plan has duplicate scan node_id={}", node.node_id),
                 ));
             }
         }
-        for child in &node.children {
-            visit(child, assignments)?;
+        for (index, child) in node.children.iter().enumerate() {
+            visit(
+                child,
+                path.clone().field("children").index(index),
+                assignments,
+            )?;
         }
         Ok(())
     }
 
     let mut assignments = BTreeMap::new();
-    visit(root, &mut assignments)?;
+    visit(root, root_path, &mut assignments)?;
     Ok(assignments)
 }
 
@@ -305,8 +363,14 @@ pub(crate) fn decode_node(
     node: &plan::DistributedNode,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, String> {
-    decode_node_inner(node, arena, ctx, None)
+) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    decode_node_inner(
+        node,
+        FieldPath::root("plan_fragment").field("root"),
+        arena,
+        ctx,
+        None,
+    )
 }
 
 pub(crate) fn decode_node_with_runtime_filters(
@@ -314,19 +378,32 @@ pub(crate) fn decode_node_with_runtime_filters(
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
     ledger: &mut NativeRuntimeFilterDecodeLedger,
-) -> Result<DecodedNode, String> {
-    decode_node_inner(node, arena, ctx, Some(ledger))
+) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    decode_node_inner(
+        node,
+        FieldPath::root("plan_fragment").field("root"),
+        arena,
+        ctx,
+        Some(ledger),
+    )
 }
 
 fn decode_node_inner(
     node: &plan::DistributedNode,
+    path: FieldPath,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
     mut ledger: Option<&mut NativeRuntimeFilterDecodeLedger>,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
     let mut children = Vec::with_capacity(node.children.len());
-    for child in &node.children {
-        children.push(decode_node_inner(child, arena, ctx, ledger.as_deref_mut())?);
+    for (index, child) in node.children.iter().enumerate() {
+        children.push(decode_node_inner(
+            child,
+            path.clone().field("children").index(index),
+            arena,
+            ctx,
+            ledger.as_deref_mut(),
+        )?);
     }
 
     let attached = ledger
@@ -338,7 +415,13 @@ fn decode_node_inner(
                 node.fragment_id,
             )
         })
-        .transpose()?
+        .transpose()
+        .map_err(|error| {
+            super::NativeFragmentDecodeError::inconsistent(
+                path.clone().field("runtime_filter_binding_ids"),
+                error,
+            )
+        })?
         .unwrap_or_default();
     let direct_inputs = children
         .iter()
@@ -348,23 +431,41 @@ fn decode_node_inner(
         .into_iter()
         .partition(|binding| matches!(binding.role, DecodedBindingRole::Consumer { .. }));
     if !children.is_empty() {
-        attach_direct_input_consumers(node.node_id, &consumer_bindings, &mut children, arena)?;
+        attach_direct_input_consumers(
+            node.node_id,
+            &consumer_bindings,
+            &mut children,
+            arena,
+            path.clone().field("runtime_filter_binding_ids"),
+        )?;
     }
 
-    let payload = node
-        .payload
-        .as_ref()
-        .ok_or_else(|| format!("DistributedNode node_id={} payload missing", node.node_id))?;
+    let payload = node.payload.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("payload"),
+            format!("DistributedNode node_id={} requires payload", node.node_id),
+        )
+    })?;
     let mut lowered = match payload {
-        plan::distributed_node::Payload::Physical(physical) => {
-            lower_physical_node(node, physical, children, arena, ctx)
-        }
-        plan::distributed_node::Payload::Exchange(exchange) => {
-            exchange::lower_exchange_receiver(node, exchange, children, arena, ctx)
-        }
+        plan::distributed_node::Payload::Physical(physical) => lower_physical_node(
+            node,
+            physical,
+            path.clone().field("physical"),
+            children,
+            arena,
+            ctx,
+        ),
+        plan::distributed_node::Payload::Exchange(exchange) => exchange::lower_exchange_receiver(
+            node,
+            exchange,
+            path.clone().field("exchange"),
+            children,
+            arena,
+            ctx,
+        ),
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena)?;
+        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
     if !producer_bindings.is_empty() {
         attach_hash_join_producers(
@@ -373,11 +474,19 @@ fn decode_node_inner(
             &direct_inputs,
             &mut lowered,
             arena,
+            path.clone(),
         )?;
     }
-    let lowered = apply_distributed_limit_if_needed(node, lowered)?;
+    let lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if let Some(ledger) = ledger {
-        ledger.commit_consumed_many(&node.runtime_filter_binding_ids)?;
+        ledger
+            .commit_consumed_many(&node.runtime_filter_binding_ids)
+            .map_err(|error| {
+                super::NativeFragmentDecodeError::inconsistent(
+                    path.field("runtime_filter_binding_ids"),
+                    error,
+                )
+            })?;
     }
     Ok(lowered)
 }
@@ -391,37 +500,55 @@ fn attach_direct_input_consumers(
     bindings: &[DecodedRuntimeFilterBinding],
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
-) -> Result<(), String> {
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
-            return Err(format!(
-                "native runtime-filter binding_id={} expected consumer role",
-                binding.binding_id
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "native runtime-filter binding_id={} expected consumer role",
+                    binding.binding_id
+                ),
             ));
         };
         let DecodedConsumerBindingTarget::DirectInput {
             input_ordinal: index,
         } = *target
         else {
-            return Err(format!(
-                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} must target a direct input",
-                binding.binding_id
+            return Err(super::NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "native runtime-filter consumer binding_id={} on node_id={owner_node_id} must target a direct input",
+                    binding.binding_id
+                ),
             ));
         };
         let child = children.get(index).ok_or_else(|| {
-            format!(
-                "native runtime-filter consumer binding_id={} on node_id={owner_node_id} targets missing direct input ordinal={index}, input_count={}",
-                binding.binding_id,
-                children.len()
+            super::NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "native runtime-filter consumer binding_id={} on node_id={owner_node_id} targets missing direct input ordinal={index}, input_count={}",
+                    binding.binding_id,
+                    children.len()
+                ),
             )
         })?;
-        let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
+        let expr_id = lower_binding_expression(
+            binding,
+            &child.layout,
+            &child.output_schema,
+            arena,
+            path.clone(),
+        )?;
         grouped
             .entry(index)
             .or_default()
-            .push(consumer_spec(binding, expr_id)?);
+            .push(super::NativeFragmentDecodeError::map_invalid(
+                path.clone(),
+                consumer_spec(binding, expr_id),
+            )?);
     }
     for (index, specs) in grouped {
         let child = &mut children[index];
@@ -442,65 +569,80 @@ fn attach_leaf_consumers(
     bindings: &[DecodedRuntimeFilterBinding],
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
-) -> Result<(), String> {
-    for binding in bindings {
-        let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
-            return Err(format!(
-                "native runtime-filter binding_id={} expected consumer role",
-                binding.binding_id
-            ));
-        };
-        if *target != DecodedConsumerBindingTarget::SourceBoundary {
-            return Err(format!(
-                "native runtime-filter consumer binding_id={} on leaf node_id={} must target source boundary",
-                binding.binding_id, wire_node.node_id
-            ));
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<(), String> {
+        for binding in bindings {
+            let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
+                return Err(format!(
+                    "native runtime-filter binding_id={} expected consumer role",
+                    binding.binding_id
+                ));
+            };
+            if *target != DecodedConsumerBindingTarget::SourceBoundary {
+                return Err(format!(
+                    "native runtime-filter consumer binding_id={} on leaf node_id={} must target source boundary",
+                    binding.binding_id, wire_node.node_id
+                ));
+            }
         }
-    }
-    let specs = bindings
-        .iter()
-        .map(|binding| {
-            let expr_id =
-                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
-            consumer_spec(binding, expr_id)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let payload = wire_node
-        .payload
-        .as_ref()
-        .ok_or_else(|| format!("native node_id={} payload missing", wire_node.node_id))?;
-    match payload {
-        plan::distributed_node::Payload::Exchange(_) => {
-            let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
-                format!(
-                    "native node_id={} exchange lowering lost ExchangeSource boundary",
-                    wire_node.node_id
+        let specs = bindings
+            .iter()
+            .map(|binding| {
+                let expr_id = lower_binding_expression(
+                    binding,
+                    &lowered.layout,
+                    &lowered.output_schema,
+                    arena,
+                    path.clone(),
                 )
-            })?;
-            exchange.set_native_runtime_filter_specs(specs);
-        }
-        plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
-            Some(plan::plan_node::Kind::Scan(_)) => {
-                set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                .map_err(|error| error.to_string())?;
+                consumer_spec(binding, expr_id)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let payload = wire_node
+            .payload
+            .as_ref()
+            .ok_or_else(|| format!("native node_id={} payload missing", wire_node.node_id))?;
+        match payload {
+            plan::distributed_node::Payload::Exchange(_) => {
+                let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
                     format!(
-                        "native node_id={} scan lowering lost Scan boundary",
+                        "native node_id={} exchange lowering lost ExchangeSource boundary",
                         wire_node.node_id
                     )
                 })?;
+                exchange.set_native_runtime_filter_specs(specs);
             }
-            Some(plan::plan_node::Kind::Values(_))
-            | Some(plan::plan_node::Kind::GenerateSeries(_)) => {
-                wrap_source_boundary(&mut lowered.node, wire_node.node_id, specs);
-            }
-            kind => {
-                return Err(format!(
-                    "native runtime-filter consumer binding on leaf node_id={} has unsupported source capability: {kind:?}",
-                    wire_node.node_id
-                ));
-            }
-        },
-    }
-    Ok(())
+            plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
+                Some(plan::plan_node::Kind::Scan(_)) => {
+                    set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                        format!(
+                            "native node_id={} scan lowering lost Scan boundary",
+                            wire_node.node_id
+                        )
+                    })?;
+                }
+                Some(plan::plan_node::Kind::Values(_))
+                | Some(plan::plan_node::Kind::GenerateSeries(_)) => {
+                    wrap_source_boundary(&mut lowered.node, wire_node.node_id, specs);
+                }
+                kind => {
+                    return Err(format!(
+                        "native runtime-filter consumer binding on leaf node_id={} has unsupported source capability: {kind:?}",
+                        wire_node.node_id
+                    ));
+                }
+            },
+        }
+        Ok(())
+    })();
+    decoded.map_err(|error| {
+        super::NativeFragmentDecodeError::inconsistent(
+            path.field("runtime_filter_binding_ids"),
+            error,
+        )
+    })
 }
 
 fn wrap_source_boundary(
@@ -556,104 +698,124 @@ fn attach_hash_join_producers(
     direct_inputs: &[(Layout, ChunkSchemaRef)],
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
-) -> Result<(), String> {
-    let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
-        return Err(format!(
-            "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
-            wire_node.node_id
-        ));
-    };
-    if direct_inputs.len() != 2 {
-        return Err(format!(
-            "native HashJoin node_id={} missing two direct inputs",
-            wire_node.node_id
-        ));
-    }
-    let build_input_index = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-        0
-    } else {
-        1
-    };
-    let (build_layout, build_schema) = &direct_inputs[build_input_index];
-    let plan::distributed_node::Payload::Physical(physical) =
-        wire_node.payload.as_ref().ok_or_else(|| {
-            format!(
-                "native HashJoin node_id={} payload missing",
-                wire_node.node_id
-            )
-        })?
-    else {
-        return Err(format!(
-            "native runtime-filter producer node_id={} is not physical HashJoin",
-            wire_node.node_id
-        ));
-    };
-    let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
-        return Err(format!(
-            "native runtime-filter producer node_id={} is not HashJoin",
-            wire_node.node_id
-        ));
-    };
-    let mut producers = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        let DecodedBindingRole::Producer {
-            contribution_kinds,
-            completion_requirement,
-            join_key_ordinal,
-        } = &binding.role
-        else {
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<(), String> {
+        let ExecNodeKind::Join(join) = &mut lowered.node.kind else {
             return Err(format!(
-                "native runtime-filter binding_id={} expected producer role",
-                binding.binding_id
+                "native runtime-filter producer binding is only supported on HashJoin, node_id={}",
+                wire_node.node_id
             ));
         };
-        let build_key_index = *join_key_ordinal;
-        let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
-            format!(
-                "native runtime-filter producer binding_id={} targets missing join key ordinal={build_key_index}, key_count={}",
-                binding.binding_id,
-                wire_join.eq_conditions.len()
-            )
-        })?;
-        if condition.null_safe {
+        if direct_inputs.len() != 2 {
             return Err(format!(
-                "native runtime-filter producer binding_id={} targets null-safe join key ordinal={build_key_index}",
-                binding.binding_id
+                "native HashJoin node_id={} missing two direct inputs",
+                wire_node.node_id
             ));
         }
-        let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
-            condition.left.as_ref()
+        let build_input_index = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+            0
         } else {
-            condition.right.as_ref()
-        }
-        .ok_or_else(|| {
-            format!(
-                "native runtime-filter producer binding_id={} join key ordinal={build_key_index} missing build expression",
-                binding.binding_id
-            )
-        })?;
-        if raw_build != &binding.expression {
+            1
+        };
+        let (build_layout, build_schema) = &direct_inputs[build_input_index];
+        let plan::distributed_node::Payload::Physical(physical) =
+            wire_node.payload.as_ref().ok_or_else(|| {
+                format!(
+                    "native HashJoin node_id={} payload missing",
+                    wire_node.node_id
+                )
+            })?
+        else {
             return Err(format!(
-                "native runtime-filter producer binding_id={} expression does not match join key ordinal={build_key_index}",
-                binding.binding_id
+                "native runtime-filter producer node_id={} is not physical HashJoin",
+                wire_node.node_id
             ));
+        };
+        let Some(plan::plan_node::Kind::HashJoin(wire_join)) = physical.kind.as_ref() else {
+            return Err(format!(
+                "native runtime-filter producer node_id={} is not HashJoin",
+                wire_node.node_id
+            ));
+        };
+        let mut producers = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let DecodedBindingRole::Producer {
+                contribution_kinds,
+                completion_requirement,
+                join_key_ordinal,
+            } = &binding.role
+            else {
+                return Err(format!(
+                    "native runtime-filter binding_id={} expected producer role",
+                    binding.binding_id
+                ));
+            };
+            let build_key_index = *join_key_ordinal;
+            let condition = wire_join.eq_conditions.get(build_key_index).ok_or_else(|| {
+                format!(
+                    "native runtime-filter producer binding_id={} targets missing join key ordinal={build_key_index}, key_count={}",
+                    binding.binding_id,
+                    wire_join.eq_conditions.len()
+                )
+            })?;
+            if condition.null_safe {
+                return Err(format!(
+                    "native runtime-filter producer binding_id={} targets null-safe join key ordinal={build_key_index}",
+                    binding.binding_id
+                ));
+            }
+            let raw_build = if join.join_type == crate::exec::node::join::JoinType::RightSemi {
+                condition.left.as_ref()
+            } else {
+                condition.right.as_ref()
+            }
+            .ok_or_else(|| {
+                format!(
+                    "native runtime-filter producer binding_id={} join key ordinal={build_key_index} missing build expression",
+                    binding.binding_id
+                )
+            })?;
+            if raw_build != &binding.expression {
+                return Err(format!(
+                    "native runtime-filter producer binding_id={} expression does not match join key ordinal={build_key_index}",
+                    binding.binding_id
+                ));
+            }
+            validate_column_refs_exact(
+                binding.binding_id,
+                raw_build,
+                build_layout,
+                build_schema,
+                path.clone()
+                    .field("physical.hash_join.eq_conditions")
+                    .index(build_key_index),
+            )
+            .map_err(|error| error.to_string())?;
+            let build_expr_id =
+                lower_binding_expression(binding, build_layout, build_schema, arena, path.clone())
+                    .map_err(|error| error.to_string())?;
+            producers.push(NativeJoinRuntimeFilterProducerSpec {
+                binding_id: binding.binding_id,
+                channel_id: binding.channel_id,
+                build_expr_id,
+                build_key_index,
+                contribution_kinds: contribution_kinds.clone(),
+                completion_requirement: *completion_requirement,
+                contract: native_contract(&binding.contract),
+                reduction: native_reduction(&binding.reduction),
+                availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
+            });
         }
-        validate_column_refs_exact(binding.binding_id, raw_build, build_layout, build_schema)?;
-        let build_expr_id = lower_binding_expression(binding, build_layout, build_schema, arena)?;
-        producers.push(NativeJoinRuntimeFilterProducerSpec {
-            binding_id: binding.binding_id,
-            channel_id: binding.channel_id,
-            build_expr_id,
-            build_key_index,
-            contribution_kinds: contribution_kinds.clone(),
-            completion_requirement: *completion_requirement,
-            contract: native_contract(&binding.contract),
-            reduction: native_reduction(&binding.reduction),
-            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
-        });
-    }
-    join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
-    Ok(())
+        join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
+        Ok(())
+    })();
+    decoded.map_err(|error| {
+        super::NativeFragmentDecodeError::inconsistent(
+            path.field("runtime_filter_binding_ids"),
+            error,
+        )
+    })
 }
 
 fn consumer_spec(
@@ -724,14 +886,20 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
-) -> Result<crate::exec::expr::ExprId, String> {
-    validate_column_refs_exact(binding.binding_id, &binding.expression, layout, schema)?;
-    super::expr::decode_expr(&binding.expression, arena, layout).map_err(|error| {
-        format!(
-            "native runtime-filter binding_id={} expression: {error}",
-            binding.binding_id
-        )
-    })
+    path: FieldPath,
+) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
+    let expression_path = path
+        .field("bindings")
+        .map_key(binding.binding_id.to_string())
+        .field("expression");
+    validate_column_refs_exact(
+        binding.binding_id,
+        &binding.expression,
+        layout,
+        schema,
+        expression_path.clone(),
+    )?;
+    super::expr::decode_expr_at(&binding.expression, expression_path, arena, layout)
 }
 
 fn validate_column_refs_exact(
@@ -739,185 +907,197 @@ fn validate_column_refs_exact(
     expression: &crate::proto::expr::Expr,
     layout: &Layout,
     schema: &ChunkSchemaRef,
-) -> Result<(), String> {
-    use crate::proto::expr::expr::Kind;
-    let kind = expression.kind.as_ref().ok_or_else(|| {
-        format!("native runtime-filter binding_id={binding_id} expression kind missing")
-    })?;
-    if let Kind::ColumnRef(column) = kind {
-        let slot_id = layout
-            .resolve_column_id(column.column_id)
-            .map_err(|error| format!("native runtime-filter binding_id={binding_id}: {error}"))?;
-        let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
+    path: FieldPath,
+) -> Result<(), super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<(), String> {
+        use crate::proto::expr::expr::Kind;
+        let kind = expression.kind.as_ref().ok_or_else(|| {
+            format!("native runtime-filter binding_id={binding_id} expression kind missing")
+        })?;
+        if let Kind::ColumnRef(column) = kind {
+            let slot_id = layout
+                .resolve_column_id(column.column_id)
+                .map_err(|error| {
+                    format!("native runtime-filter binding_id={binding_id}: {error}")
+                })?;
+            let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
             format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} has no ChunkSchema field", column.column_id)
         })?;
-        let type_desc = expression.r#type.as_ref().ok_or_else(|| {
+            let type_desc = expression.r#type.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type missing",
                 column.column_id
             )
         })?;
-        let actual = super::decode_field_type("_runtime_filter_column", expression.nullable, type_desc)
+            let actual = super::decode_field_type("_runtime_filter_column", expression.nullable, type_desc)
             .map_err(|error| format!("native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}", column.column_id))?;
-        if expected.data_type() != actual.data_type()
-            || expected.is_nullable() != actual.is_nullable()
-            || crate::exec::chunk::ChunkFieldSchema::from_field(expected)?
-                != crate::exec::chunk::ChunkFieldSchema::from_field(&actual)?
-        {
-            return Err(format!(
-                "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
-                column.column_id
-            ));
-        }
-    }
-    let mut visit = |child: &crate::proto::expr::Expr| {
-        validate_column_refs_exact(binding_id, child, layout, schema)
-    };
-    match kind {
-        Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
-        Kind::BinaryOp(binary) => {
-            visit(
-                binary
-                    .left
-                    .as_ref()
-                    .ok_or_else(|| "BinaryOp.left missing".to_string())?,
-            )?;
-            visit(
-                binary
-                    .right
-                    .as_ref()
-                    .ok_or_else(|| "BinaryOp.right missing".to_string())?,
-            )
-        }
-        Kind::UnaryOp(unary) => visit(
-            unary
-                .operand
-                .as_ref()
-                .ok_or_else(|| "UnaryOp.operand missing".to_string())?,
-        ),
-        Kind::FunctionCall(call) => call.args.iter().try_for_each(&mut visit),
-        Kind::AggregateCall(call) => {
-            call.args.iter().try_for_each(&mut visit)?;
-            call.order_by.iter().try_for_each(|item| {
-                visit(
-                    item.expr
-                        .as_ref()
-                        .ok_or_else(|| "SortItem.expr missing".to_string())?,
-                )
-            })
-        }
-        Kind::WindowCall(call) => {
-            call.args.iter().try_for_each(&mut visit)?;
-            call.partition_by.iter().try_for_each(&mut visit)?;
-            call.order_by.iter().try_for_each(|item| {
-                visit(
-                    item.expr
-                        .as_ref()
-                        .ok_or_else(|| "SortItem.expr missing".to_string())?,
-                )
-            })
-        }
-        Kind::Cast(cast) => visit(
-            cast.operand
-                .as_ref()
-                .ok_or_else(|| "Cast.operand missing".to_string())?,
-        ),
-        Kind::IsNull(is_null) => visit(
-            is_null
-                .operand
-                .as_ref()
-                .ok_or_else(|| "IsNull.operand missing".to_string())?,
-        ),
-        Kind::InList(in_list) => {
-            visit(
-                in_list
-                    .operand
-                    .as_ref()
-                    .ok_or_else(|| "InList.operand missing".to_string())?,
-            )?;
-            in_list.list.iter().try_for_each(&mut visit)
-        }
-        Kind::Between(between) => {
-            visit(
-                between
-                    .operand
-                    .as_ref()
-                    .ok_or_else(|| "Between.operand missing".to_string())?,
-            )?;
-            visit(
-                between
-                    .low
-                    .as_ref()
-                    .ok_or_else(|| "Between.low missing".to_string())?,
-            )?;
-            visit(
-                between
-                    .high
-                    .as_ref()
-                    .ok_or_else(|| "Between.high missing".to_string())?,
-            )
-        }
-        Kind::Like(like) => {
-            visit(
-                like.operand
-                    .as_ref()
-                    .ok_or_else(|| "Like.operand missing".to_string())?,
-            )?;
-            visit(
-                like.pattern
-                    .as_ref()
-                    .ok_or_else(|| "Like.pattern missing".to_string())?,
-            )
-        }
-        Kind::CaseExpr(case_expr) => {
-            if let Some(operand) = &case_expr.operand {
-                visit(operand)?;
+            if expected.data_type() != actual.data_type()
+                || expected.is_nullable() != actual.is_nullable()
+                || crate::exec::chunk::ChunkFieldSchema::from_field(expected)?
+                    != crate::exec::chunk::ChunkFieldSchema::from_field(&actual)?
+            {
+                return Err(format!(
+                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
+                    column.column_id
+                ));
             }
-            for branch in &case_expr.when_then {
+        }
+        let mut visit = |child: &crate::proto::expr::Expr| {
+            validate_column_refs_exact(binding_id, child, layout, schema, path.clone())
+                .map_err(|error| error.to_string())
+        };
+        match kind {
+            Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
+            Kind::BinaryOp(binary) => {
                 visit(
-                    branch
-                        .when
+                    binary
+                        .left
                         .as_ref()
-                        .ok_or_else(|| "Case.when missing".to_string())?,
+                        .ok_or_else(|| "BinaryOp.left missing".to_string())?,
                 )?;
                 visit(
-                    branch
-                        .then
+                    binary
+                        .right
                         .as_ref()
-                        .ok_or_else(|| "Case.then missing".to_string())?,
+                        .ok_or_else(|| "BinaryOp.right missing".to_string())?,
+                )
+            }
+            Kind::UnaryOp(unary) => visit(
+                unary
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| "UnaryOp.operand missing".to_string())?,
+            ),
+            Kind::FunctionCall(call) => call.args.iter().try_for_each(&mut visit),
+            Kind::AggregateCall(call) => {
+                call.args.iter().try_for_each(&mut visit)?;
+                call.order_by.iter().try_for_each(|item| {
+                    visit(
+                        item.expr
+                            .as_ref()
+                            .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                    )
+                })
+            }
+            Kind::WindowCall(call) => {
+                call.args.iter().try_for_each(&mut visit)?;
+                call.partition_by.iter().try_for_each(&mut visit)?;
+                call.order_by.iter().try_for_each(|item| {
+                    visit(
+                        item.expr
+                            .as_ref()
+                            .ok_or_else(|| "SortItem.expr missing".to_string())?,
+                    )
+                })
+            }
+            Kind::Cast(cast) => visit(
+                cast.operand
+                    .as_ref()
+                    .ok_or_else(|| "Cast.operand missing".to_string())?,
+            ),
+            Kind::IsNull(is_null) => visit(
+                is_null
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| "IsNull.operand missing".to_string())?,
+            ),
+            Kind::InList(in_list) => {
+                visit(
+                    in_list
+                        .operand
+                        .as_ref()
+                        .ok_or_else(|| "InList.operand missing".to_string())?,
                 )?;
+                in_list.list.iter().try_for_each(&mut visit)
             }
-            if let Some(else_expr) = &case_expr.else_expr {
-                visit(else_expr)?;
+            Kind::Between(between) => {
+                visit(
+                    between
+                        .operand
+                        .as_ref()
+                        .ok_or_else(|| "Between.operand missing".to_string())?,
+                )?;
+                visit(
+                    between
+                        .low
+                        .as_ref()
+                        .ok_or_else(|| "Between.low missing".to_string())?,
+                )?;
+                visit(
+                    between
+                        .high
+                        .as_ref()
+                        .ok_or_else(|| "Between.high missing".to_string())?,
+                )
             }
-            Ok(())
+            Kind::Like(like) => {
+                visit(
+                    like.operand
+                        .as_ref()
+                        .ok_or_else(|| "Like.operand missing".to_string())?,
+                )?;
+                visit(
+                    like.pattern
+                        .as_ref()
+                        .ok_or_else(|| "Like.pattern missing".to_string())?,
+                )
+            }
+            Kind::CaseExpr(case_expr) => {
+                if let Some(operand) = &case_expr.operand {
+                    visit(operand)?;
+                }
+                for branch in &case_expr.when_then {
+                    visit(
+                        branch
+                            .when
+                            .as_ref()
+                            .ok_or_else(|| "Case.when missing".to_string())?,
+                    )?;
+                    visit(
+                        branch
+                            .then
+                            .as_ref()
+                            .ok_or_else(|| "Case.then missing".to_string())?,
+                    )?;
+                }
+                if let Some(else_expr) = &case_expr.else_expr {
+                    visit(else_expr)?;
+                }
+                Ok(())
+            }
+            Kind::IsTruth(is_truth) => visit(
+                is_truth
+                    .operand
+                    .as_ref()
+                    .ok_or_else(|| "IsTruth.operand missing".to_string())?,
+            ),
+            Kind::Lambda(lambda) => visit(
+                lambda
+                    .body
+                    .as_ref()
+                    .ok_or_else(|| "Lambda.body missing".to_string())?,
+            ),
+            Kind::Nested(nested) => visit(
+                nested
+                    .inner
+                    .as_ref()
+                    .ok_or_else(|| "Nested.inner missing".to_string())?,
+            ),
         }
-        Kind::IsTruth(is_truth) => visit(
-            is_truth
-                .operand
-                .as_ref()
-                .ok_or_else(|| "IsTruth.operand missing".to_string())?,
-        ),
-        Kind::Lambda(lambda) => visit(
-            lambda
-                .body
-                .as_ref()
-                .ok_or_else(|| "Lambda.body missing".to_string())?,
-        ),
-        Kind::Nested(nested) => visit(
-            nested
-                .inner
-                .as_ref()
-                .ok_or_else(|| "Nested.inner missing".to_string())?,
-        ),
-    }
+    })();
+    decoded.map_err(|error| super::NativeFragmentDecodeError::invalid_value(path, error))
 }
 
 fn apply_distributed_limit_if_needed(
     node: &plan::DistributedNode,
     mut lowered: DecodedNode,
-) -> Result<DecodedNode, String> {
-    let Some(limit) = parse_distributed_limit(node.limit, "DistributedNode.limit")? else {
+    path: FieldPath,
+) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    let Some(limit) = super::NativeFragmentDecodeError::map_invalid(
+        path.field("limit"),
+        parse_distributed_limit(node.limit, "DistributedNode.limit"),
+    )?
+    else {
         return Ok(lowered);
     };
     if matches!(
@@ -940,69 +1120,158 @@ fn apply_distributed_limit_if_needed(
 fn lower_physical_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
+    path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, String> {
-    let kind = physical
-        .kind
-        .as_ref()
-        .ok_or_else(|| format!("PlanNode node_id={} kind missing", node.node_id))?;
+) -> Result<DecodedNode, super::NativeFragmentDecodeError> {
+    let kind = physical.kind.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("kind"),
+            format!("PlanNode node_id={} requires kind", node.node_id),
+        )
+    })?;
     match kind {
-        plan::plan_node::Kind::Values(values) => {
-            values::lower_values_node(node, physical, values, children, arena)
-        }
-        plan::plan_node::Kind::Project(project) => {
-            project::lower_project_node(node, project, children, arena)
-        }
+        plan::plan_node::Kind::Values(values) => values::lower_values_node(
+            node,
+            physical,
+            values,
+            path.clone().field("values"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::Project(project) => project::lower_project_node(
+            node,
+            project,
+            path.clone().field("project"),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::Filter(filter) => {
-            filter::lower_filter_node(node, filter, children, arena)
+            filter::lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
         }
-        plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(node, limit, children),
-        plan::plan_node::Kind::Sort(sort) => {
-            sort::lower_sort_node(node, physical, sort, children, arena)
+        plan::plan_node::Kind::Limit(limit) => {
+            limit::lower_limit_node(node, limit, path.clone().field("limit"), children)
         }
-        plan::plan_node::Kind::Topn(topn) => topn::lower_topn_node(node, topn, children, arena),
-        plan::plan_node::Kind::SetOp(set_op) => {
-            set_op::lower_set_op_node(node, physical, set_op, children, arena)
+        plan::plan_node::Kind::Sort(sort) => sort::lower_sort_node(
+            node,
+            physical,
+            sort,
+            path.clone().field("sort"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::Topn(topn) => {
+            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
         }
-        plan::plan_node::Kind::AssertOneRow(assert) => {
-            assert::lower_assert_one_row_node(node, assert, children)
+        plan::plan_node::Kind::SetOp(set_op) => set_op::lower_set_op_node(
+            node,
+            physical,
+            set_op,
+            path.clone().field("set_op"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::AssertOneRow(assert) => assert::lower_assert_one_row_node(
+            node,
+            assert,
+            path.clone().field("assert_one_row"),
+            children,
+        ),
+        plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
+            node,
+            physical,
+            scan,
+            path.clone().field("scan"),
+            ctx,
+            arena,
+        ),
+        plan::plan_node::Kind::HashAggregate(aggregate) => aggregate::lower_hash_aggregate_node(
+            node,
+            physical,
+            aggregate,
+            path.clone().field("hash_aggregate"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::HashJoin(join) => hash_join::lower_hash_join_node(
+            node,
+            physical,
+            join,
+            path.clone().field("hash_join"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::NestLoopJoin(join) => nestloop_join::lower_nest_loop_join_node(
+            node,
+            physical,
+            join,
+            path.clone().field("nest_loop_join"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::Window(window) => window::lower_window_node(
+            node,
+            physical,
+            window,
+            path.clone().field("window"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::Repeat(repeat) => {
+            repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }
-        plan::plan_node::Kind::Scan(scan) => {
-            super::scan::lower_scan_node(node, physical, scan, ctx, arena)
-        }
-        plan::plan_node::Kind::HashAggregate(aggregate) => {
-            aggregate::lower_hash_aggregate_node(node, physical, aggregate, children, arena)
-        }
-        plan::plan_node::Kind::HashJoin(join) => {
-            hash_join::lower_hash_join_node(node, physical, join, children, arena)
-        }
-        plan::plan_node::Kind::NestLoopJoin(join) => {
-            nestloop_join::lower_nest_loop_join_node(node, physical, join, children, arena)
-        }
-        plan::plan_node::Kind::Window(window) => {
-            window::lower_window_node(node, physical, window, children, arena)
-        }
-        plan::plan_node::Kind::Repeat(repeat) => repeat::lower_repeat_node(node, repeat, children),
         plan::plan_node::Kind::GenerateSeries(generate_series) => {
-            generate_series::lower_generate_series_node(node, generate_series, children, arena)
-        }
-        plan::plan_node::Kind::TableFunction(table_function) => {
-            table_function::lower_table_function_node(node, table_function, children, arena)
-        }
-        plan::plan_node::Kind::Decode(_) => unsupported("Decode"),
-        plan::plan_node::Kind::ChangeEventExpand(expand) => {
-            change_event_expand::lower_change_event_expand_node(
-                node, physical, expand, children, arena,
+            generate_series::lower_generate_series_node(
+                node,
+                generate_series,
+                path.clone().field("generate_series"),
+                children,
+                arena,
             )
         }
-        plan::plan_node::Kind::CteAnchor(_) => unsupported("CTEAnchor"),
-        plan::plan_node::Kind::CteProduce(_) => unsupported("CTEProduce"),
-        plan::plan_node::Kind::CteConsume(_) => unsupported("CTEConsume"),
-        plan::plan_node::Kind::Redistribute(redistribute) => {
-            redistribute::lower_redistribute_node(physical, redistribute, children, arena)
+        plan::plan_node::Kind::TableFunction(table_function) => {
+            table_function::lower_table_function_node(
+                node,
+                table_function,
+                path.clone().field("table_function"),
+                children,
+                arena,
+            )
         }
+        plan::plan_node::Kind::Decode(_) => Err(super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("decode"),
+            "native physical node kind Decode is unsupported",
+        )),
+        plan::plan_node::Kind::ChangeEventExpand(expand) => {
+            change_event_expand::lower_change_event_expand_node(
+                node,
+                physical,
+                expand,
+                path.clone().field("change_event_expand"),
+                children,
+                arena,
+            )
+        }
+        plan::plan_node::Kind::CteAnchor(_) => Err(super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("cte_anchor"),
+            "native physical node kind CTEAnchor is unsupported",
+        )),
+        plan::plan_node::Kind::CteProduce(_) => Err(super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("cte_produce"),
+            "native physical node kind CTEProduce is unsupported",
+        )),
+        plan::plan_node::Kind::CteConsume(_) => Err(super::NativeFragmentDecodeError::unsupported(
+            path.clone().field("cte_consume"),
+            "native physical node kind CTEConsume is unsupported",
+        )),
+        plan::plan_node::Kind::Redistribute(redistribute) => redistribute::lower_redistribute_node(
+            physical,
+            redistribute,
+            path.clone().field("redistribute"),
+            children,
+            arena,
+        ),
     }
 }
 
@@ -1613,7 +1882,7 @@ mod tests {
                 ),
             ],
         };
-        let mut ledger = RuntimeFilterBindingLookupLedger::decode(1, Some(&table))
+        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
             .expect("decode duplicate-key producer table");
         let lowered = lower_proto_node_with_bindings(
             &wire,
@@ -1720,6 +1989,7 @@ mod tests {
             &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
+            FieldPath::root("test_node"),
         )
         .expect("scan leaf binding");
         let ExecNodeKind::Scan(scan) = &lowered.node.kind else {
@@ -1764,6 +2034,7 @@ mod tests {
             &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
+            FieldPath::root("test_node"),
         )
         .expect("exchange leaf binding");
         let ExecNodeKind::ExchangeSource(exchange) = &lowered.node.kind else {
@@ -1777,8 +2048,14 @@ mod tests {
     fn unary_node_wraps_only_its_direct_input() {
         let mut children = vec![lower(&one_col_values_node(10))];
         let mut arena = ExprArena::default();
-        attach_direct_input_consumers(20, &[dormant_consumer(1, 20, 1)], &mut children, &mut arena)
-            .expect("attach");
+        attach_direct_input_consumers(
+            20,
+            &[dormant_consumer(1, 20, 1)],
+            &mut children,
+            &mut arena,
+            FieldPath::root("test_node"),
+        )
+        .expect("attach");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
             panic!("consumer wrapper")
         };
@@ -1793,8 +2070,14 @@ mod tests {
             lower(&one_col_values_node_with(11, 2, "right", 2)),
         ];
         let mut arena = ExprArena::default();
-        attach_direct_input_consumers(20, &[dormant_consumer(1, 20, 1)], &mut children, &mut arena)
-            .expect("unique left input");
+        attach_direct_input_consumers(
+            20,
+            &[dormant_consumer(1, 20, 1)],
+            &mut children,
+            &mut arena,
+            FieldPath::root("test_node"),
+        )
+        .expect("unique left input");
         assert!(matches!(
             children[0].node.kind,
             ExecNodeKind::NativeRuntimeFilterConsumer(_)
@@ -1815,7 +2098,8 @@ mod tests {
                 20,
                 &[missing_input],
                 &mut children,
-                &mut ExprArena::default()
+                &mut ExprArena::default(),
+                FieldPath::root("test_node"),
             )
             .is_err()
         );
@@ -1830,6 +2114,7 @@ mod tests {
                 &[dormant_consumer(3, 20, 3)],
                 &mut children,
                 &mut ExprArena::default(),
+                FieldPath::root("test_node"),
             )
             .is_err()
         );
@@ -1852,6 +2137,7 @@ mod tests {
             &[dormant_consumer(1, 20, 1)],
             &mut children,
             &mut ExprArena::default(),
+            FieldPath::root("test_node"),
         )
         .expect("filter input boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
@@ -1873,6 +2159,7 @@ mod tests {
             &[dormant_source_consumer(1, 10, 1)],
             &mut lowered,
             &mut ExprArena::default(),
+            FieldPath::root("test_node"),
         )
         .expect("values source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
@@ -1899,8 +2186,14 @@ mod tests {
         let mut lowered = lower(&wire);
         let mut binding = dormant_source_consumer(1, 10, 1);
         binding.expression.nullable = false;
-        attach_leaf_consumers(&wire, &[binding], &mut lowered, &mut ExprArena::default())
-            .expect("generate series source boundary");
+        attach_leaf_consumers(
+            &wire,
+            &[binding],
+            &mut lowered,
+            &mut ExprArena::default(),
+            FieldPath::root("test_node"),
+        )
+        .expect("generate series source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
             panic!("consumer")
         };
@@ -1925,6 +2218,7 @@ mod tests {
                 &[dormant_source_consumer(1, 10, 1)],
                 &mut lowered,
                 &mut ExprArena::default(),
+                FieldPath::root("test_node"),
             )
             .is_err()
         );

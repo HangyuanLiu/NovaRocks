@@ -28,11 +28,12 @@ use crate::connector::iceberg::{
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::proto::{common, plan};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn iceberg_chunk_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
-) -> Result<ChunkSchemaRef, String> {
+) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     iceberg_chunk_schema_from_output_columns_with_variants(
         table,
         output_columns,
@@ -44,7 +45,7 @@ pub(super) fn iceberg_chunk_schema_from_output_columns_with_variants(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
     variant_path_plan: &NativeVariantPathPlan,
-) -> Result<ChunkSchemaRef, String> {
+) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     let slot_ids = output_columns
         .iter()
         .map(|col| SlotId::new(col.column_id))
@@ -54,13 +55,16 @@ pub(super) fn iceberg_chunk_schema_from_output_columns_with_variants(
         output_columns,
         variant_path_plan,
     )?;
-    ChunkSchema::try_ref_from_schema_and_slot_ids(arrow_schema.as_ref(), &slot_ids)
+    Ok(ChunkSchema::try_ref_from_schema_and_slot_ids(
+        arrow_schema.as_ref(),
+        &slot_ids,
+    )?)
 }
 
 pub(super) fn iceberg_arrow_schema_from_output_columns(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
-) -> Result<std::sync::Arc<Schema>, String> {
+) -> Result<std::sync::Arc<Schema>, NativeFragmentLeafDecodeError> {
     iceberg_arrow_schema_from_output_columns_with_variants(
         table,
         output_columns,
@@ -72,7 +76,7 @@ fn iceberg_arrow_schema_from_output_columns_with_variants(
     table: &plan::IcebergTableInfo,
     output_columns: &[common::OutputColumn],
     variant_path_plan: &NativeVariantPathPlan,
-) -> Result<std::sync::Arc<Schema>, String> {
+) -> Result<std::sync::Arc<Schema>, NativeFragmentLeafDecodeError> {
     let descriptor = iceberg_table_descriptor(table)?;
     let variant_output_fields = variant_path_plan
         .specs
@@ -109,7 +113,7 @@ fn iceberg_arrow_schema_from_output_columns_with_variants(
 
 fn iceberg_table_descriptor(
     table: &plan::IcebergTableInfo,
-) -> Result<IcebergTableDescriptor, String> {
+) -> Result<IcebergTableDescriptor, NativeFragmentLeafDecodeError> {
     let schema = table
         .schema
         .as_ref()

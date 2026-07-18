@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::super::expr::decode_expr;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{
     Layout, chunk_schema_from_output_columns, layout_from_output_columns,
     slot_schemas_from_output_columns,
@@ -29,36 +29,62 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("ProjectNode", 1, children.len())?;
+) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
+    check_exact_arity("ProjectNode", 1, children.len()).map_err(|error| {
+        super::super::NativeFragmentDecodeError::inconsistent(path.clone(), error)
+    })?;
     let child = children.pop().expect("child");
-    let project_outputs = project_output_plan(project, &child.layout)?;
-    let layout = layout_from_output_columns(&project_outputs.output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(&project_outputs.output_columns)?;
-    let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)?;
+    let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
+    let layout = layout_from_output_columns(&project_outputs.output_columns).map_err(|error| {
+        super::super::NativeFragmentDecodeError::invalid_value(path.clone().field("items"), error)
+    })?;
+    let output_schema =
+        chunk_schema_from_output_columns(&project_outputs.output_columns).map_err(|error| {
+            super::super::NativeFragmentDecodeError::invalid_value(
+                path.clone().field("items"),
+                error,
+            )
+        })?;
+    let expr_slot_schemas = slot_schemas_from_output_columns(&project_outputs.computed_columns)
+        .map_err(|error| {
+            super::super::NativeFragmentDecodeError::invalid_value(
+                path.clone().field("items"),
+                error,
+            )
+        })?;
 
     let exprs = project_outputs
         .computed_item_indices
         .iter()
         .map(|idx| {
-            let item = project
-                .items
-                .get(*idx)
-                .ok_or_else(|| format!("ProjectNode item {idx} missing"))?;
-            let expr = item
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("ProjectNode item {} expr missing", idx))?;
-            decode_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("ProjectNode item {}: {err}", idx))
+            let item = project.items.get(*idx).ok_or_else(|| {
+                super::super::NativeFragmentDecodeError::missing(
+                    path.clone().field("items").index(*idx),
+                    "native ProjectNode item is missing",
+                )
+            })?;
+            let expr = item.expr.as_ref().ok_or_else(|| {
+                super::super::NativeFragmentDecodeError::missing(
+                    path.clone().field("items").index(*idx).field("expr"),
+                    "native ProjectNode item requires expr",
+                )
+            })?;
+            decode_expr_at(
+                expr,
+                path.clone().field("items").index(*idx).field("expr"),
+                arena,
+                &child.layout,
+            )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, super::super::NativeFragmentDecodeError>>()?;
     let expr_slot_ids = project_outputs
         .computed_columns
         .iter()
@@ -93,109 +119,113 @@ struct ProjectOutputPlan {
 fn project_output_plan(
     project: &plan::ProjectNode,
     input_layout: &Layout,
-) -> Result<ProjectOutputPlan, String> {
-    let item_outputs = project
-        .items
-        .iter()
-        .enumerate()
-        .map(project_item_output)
-        .collect::<Result<Vec<_>, _>>()?;
-    let input_column_ids = input_layout
-        .order()
-        .iter()
-        .map(|slot| slot.as_u32())
-        .collect::<HashSet<_>>();
-    let output_column_id_candidates = item_outputs
-        .iter()
-        .map(|item| item.output_column_id)
-        .collect::<HashSet<_>>();
-    let mut used_output_column_ids = HashSet::new();
-    let mut used_compute_column_ids = input_column_ids.clone();
-    let mut next_synthetic_column_id = output_column_id_candidates
-        .iter()
-        .chain(used_compute_column_ids.iter())
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let mut first_expr_index_by_column_id = HashMap::new();
-    let mut computed_item_indices = Vec::new();
-    let mut computed_columns = Vec::new();
-    let mut output_columns = Vec::with_capacity(project.items.len());
-    let mut output_indices = Vec::with_capacity(project.items.len());
-    let mut needs_output_indices = false;
+    path: FieldPath,
+) -> Result<ProjectOutputPlan, super::super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<ProjectOutputPlan, String> {
+        let item_outputs = project
+            .items
+            .iter()
+            .enumerate()
+            .map(project_item_output)
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_column_ids = input_layout
+            .order()
+            .iter()
+            .map(|slot| slot.as_u32())
+            .collect::<HashSet<_>>();
+        let output_column_id_candidates = item_outputs
+            .iter()
+            .map(|item| item.output_column_id)
+            .collect::<HashSet<_>>();
+        let mut used_output_column_ids = HashSet::new();
+        let mut used_compute_column_ids = input_column_ids.clone();
+        let mut next_synthetic_column_id = output_column_id_candidates
+            .iter()
+            .chain(used_compute_column_ids.iter())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut first_expr_index_by_column_id = HashMap::new();
+        let mut computed_item_indices = Vec::new();
+        let mut computed_columns = Vec::new();
+        let mut output_columns = Vec::with_capacity(project.items.len());
+        let mut output_indices = Vec::with_capacity(project.items.len());
+        let mut needs_output_indices = false;
 
-    for item in item_outputs {
-        let preferred_compute_column_id = item.preferred_compute_column_id;
-        let mut compute_column_id = if item.can_reuse_input_slot
-            || !input_column_ids.contains(&preferred_compute_column_id)
-        {
-            preferred_compute_column_id
-        } else {
-            allocate_project_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?
-        };
-        if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
-            compute_column_id = allocate_project_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?;
-        }
+        for item in item_outputs {
+            let preferred_compute_column_id = item.preferred_compute_column_id;
+            let mut compute_column_id = if item.can_reuse_input_slot
+                || !input_column_ids.contains(&preferred_compute_column_id)
+            {
+                preferred_compute_column_id
+            } else {
+                allocate_project_synthetic_column_id(
+                    &mut next_synthetic_column_id,
+                    &mut used_output_column_ids,
+                    &mut used_compute_column_ids,
+                )?
+            };
+            if !item.can_reuse_input_slot && used_compute_column_ids.contains(&compute_column_id) {
+                compute_column_id = allocate_project_synthetic_column_id(
+                    &mut next_synthetic_column_id,
+                    &mut used_output_column_ids,
+                    &mut used_compute_column_ids,
+                )?;
+            }
 
-        let (computed_idx, is_duplicate_compute) = if item.can_reuse_input_slot
-            && let Some(computed_idx) = first_expr_index_by_column_id.get(&compute_column_id)
-        {
-            (*computed_idx, true)
-        } else {
-            let computed_idx = computed_columns.len();
-            first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
-            used_compute_column_ids.insert(compute_column_id);
-            computed_item_indices.push(item.item_index);
-            computed_columns.push(proto_common::OutputColumn {
-                column_id: compute_column_id,
+            let (computed_idx, is_duplicate_compute) = if item.can_reuse_input_slot
+                && let Some(computed_idx) = first_expr_index_by_column_id.get(&compute_column_id)
+            {
+                (*computed_idx, true)
+            } else {
+                let computed_idx = computed_columns.len();
+                first_expr_index_by_column_id.insert(compute_column_id, computed_idx);
+                used_compute_column_ids.insert(compute_column_id);
+                computed_item_indices.push(item.item_index);
+                computed_columns.push(proto_common::OutputColumn {
+                    column_id: compute_column_id,
+                    name: item.output_name.clone(),
+                    r#type: Some(item.r#type.clone()),
+                    nullable: item.nullable,
+                    is_internal: false,
+                });
+                (computed_idx, false)
+            };
+
+            let output_column_id = if used_output_column_ids.insert(item.output_column_id) {
+                item.output_column_id
+            } else {
+                allocate_project_synthetic_column_id(
+                    &mut next_synthetic_column_id,
+                    &mut used_output_column_ids,
+                    &mut used_compute_column_ids,
+                )?
+            };
+            output_columns.push(proto_common::OutputColumn {
+                column_id: output_column_id,
                 name: item.output_name.clone(),
-                r#type: Some(item.r#type.clone()),
+                r#type: Some(item.r#type),
                 nullable: item.nullable,
                 is_internal: false,
             });
-            (computed_idx, false)
-        };
-
-        let output_column_id = if used_output_column_ids.insert(item.output_column_id) {
-            item.output_column_id
-        } else {
-            allocate_project_synthetic_column_id(
-                &mut next_synthetic_column_id,
-                &mut used_output_column_ids,
-                &mut used_compute_column_ids,
-            )?
-        };
-        output_columns.push(proto_common::OutputColumn {
-            column_id: output_column_id,
-            name: item.output_name.clone(),
-            r#type: Some(item.r#type),
-            nullable: item.nullable,
-            is_internal: false,
-        });
-        if is_duplicate_compute
-            || computed_idx != output_indices.len()
-            || compute_column_id != output_column_id
-        {
-            needs_output_indices = true;
+            if is_duplicate_compute
+                || computed_idx != output_indices.len()
+                || compute_column_id != output_column_id
+            {
+                needs_output_indices = true;
+            }
+            output_indices.push(computed_idx);
         }
-        output_indices.push(computed_idx);
-    }
 
-    Ok(ProjectOutputPlan {
-        computed_item_indices,
-        computed_columns,
-        output_columns,
-        output_indices: needs_output_indices.then_some(output_indices),
-    })
+        Ok(ProjectOutputPlan {
+            computed_item_indices,
+            computed_columns,
+            output_columns,
+            output_indices: needs_output_indices.then_some(output_indices),
+        })
+    })();
+    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
 }
 
 fn allocate_project_synthetic_column_id(

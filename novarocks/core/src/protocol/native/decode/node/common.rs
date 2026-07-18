@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 
+use super::super::NativeFragmentDecodeError;
 use super::super::layout::{
     Layout, chunk_schema_from_output_columns, layout_from_output_columns,
     slot_schemas_from_output_columns,
@@ -28,6 +29,7 @@ use crate::exec::node::join::JoinType;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(
@@ -85,8 +87,13 @@ pub(crate) fn check_min_arity(kind: &str, min: usize, actual: usize) -> Result<(
 
 pub(crate) fn slot_ids_from_columns(
     cols: &[proto_common::OutputColumn],
-) -> Result<Vec<SlotId>, String> {
-    Ok(layout_from_output_columns(cols)?.order().to_vec())
+    path: FieldPath,
+) -> Result<Vec<SlotId>, NativeFragmentDecodeError> {
+    Ok(
+        NativeFragmentDecodeError::map_invalid(path, layout_from_output_columns(cols))?
+            .order()
+            .to_vec(),
+    )
 }
 
 pub(crate) fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, String> {
@@ -162,18 +169,31 @@ pub(super) fn build_slot_projection(
     label: &str,
     input: DecodedNode,
     output_columns: &[proto_common::OutputColumn],
+    path: FieldPath,
     node_id: i32,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
-    let expr_slot_schemas = slot_schemas_from_output_columns(output_columns)?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    let layout = NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        layout_from_output_columns(output_columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        chunk_schema_from_output_columns(output_columns),
+    )?;
+    let expr_slot_schemas = NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        slot_schemas_from_output_columns(output_columns),
+    )?;
     let mut exprs = Vec::with_capacity(layout.order().len());
     for slot in layout.order().iter().copied() {
         if !input.layout.contains_slot(slot) {
-            return Err(format!(
-                "{label} output column id {} has no input slot",
-                slot.as_u32()
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{label} output column id {} has no input slot",
+                    slot.as_u32()
+                ),
             ));
         }
         exprs.push(arena.push(ExprNode::SlotId(slot)));

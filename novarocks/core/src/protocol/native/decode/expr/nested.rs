@@ -19,29 +19,34 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr, decode_expr_type};
+use super::{decode_expr_at, decode_expr_type_at};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_nested(
     nested: &expr::NestedExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let inner = nested
-        .inner
-        .as_ref()
-        .ok_or_else(|| "NestedExpr.inner missing".to_string())?;
-    let inner_type = decode_expr_type(inner)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let inner = nested.inner.as_ref().ok_or_else(|| {
+        super::super::NativeFragmentDecodeError::missing(
+            path.clone().field("inner"),
+            "native NestedExpr requires inner",
+        )
+    })?;
+    let inner_type = decode_expr_type_at(inner, path.clone().field("inner"))?;
     if inner_type != data_type {
-        return Err(format!(
-            "NestedExpr type {data_type:?} does not match inner type {inner_type:?}"
+        return Err(super::super::NativeFragmentDecodeError::inconsistent(
+            path.clone().field("inner").field("type"),
+            format!("NestedExpr type {data_type:?} does not match inner type {inner_type:?}"),
         ));
     }
-    decode_expr(inner, arena, input_layout)
+    decode_expr_at(inner, path.field("inner"), arena, input_layout)
 }
 
 pub(super) fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {

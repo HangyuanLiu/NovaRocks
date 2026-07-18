@@ -20,86 +20,92 @@ use super::common::{check_exact_arity, parse_optional_nonnegative_i64};
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
     assert: &plan::AssertOneRowNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("AssertOneRowNode", 1, children.len())?;
-    let child = children.pop().expect("child");
-    let desired_num_rows = parse_optional_nonnegative_i64(
-        assert.desired_num_rows,
-        "AssertOneRowNode.desired_num_rows",
-    )?
-    .or(Some(1));
-    let assertion = lower_row_count_assertion(assert.assertion)?;
-    let mode = if assert.group_key_column_ids.is_empty() {
-        if !assert.group_key_labels.is_empty() || assert.keyed_message_prefix.is_some() {
-            return Err(
+) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
+    let decoded = (|| -> Result<DecodedNode, String> {
+        check_exact_arity("AssertOneRowNode", 1, children.len())?;
+        let child = children.pop().expect("child");
+        let desired_num_rows = parse_optional_nonnegative_i64(
+            assert.desired_num_rows,
+            "AssertOneRowNode.desired_num_rows",
+        )?
+        .or(Some(1));
+        let assertion = lower_row_count_assertion(assert.assertion)?;
+        let mode = if assert.group_key_column_ids.is_empty() {
+            if !assert.group_key_labels.is_empty() || assert.keyed_message_prefix.is_some() {
+                return Err(
                 "AssertOneRowNode group_key_column_ids is required when keyed metadata is present"
                     .to_string(),
             );
-        }
-        AssertNumRowsMode::Global {
-            desired_num_rows,
-            assertion,
-            subquery_string: Some(assert.subquery_text.clone()),
-        }
-    } else {
-        if desired_num_rows != Some(1) || !matches!(assertion, Assertion::Le) {
-            return Err(
-                "AssertOneRowNode keyed assertions only support desired_num_rows <= 1".to_string(),
-            );
-        }
-        if !assert.group_key_labels.is_empty()
-            && assert.group_key_labels.len() != assert.group_key_column_ids.len()
-        {
-            return Err(format!(
-                "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
-                assert.group_key_column_ids.len(),
-                assert.group_key_labels.len()
-            ));
-        }
-        let key_slots = assert
-            .group_key_column_ids
-            .iter()
-            .map(|column_id| {
-                child
-                    .layout
-                    .resolve_column_id(*column_id)
-                    .map_err(|err| format!("AssertOneRowNode group key: {err}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let key_labels = if assert.group_key_labels.is_empty() {
-            assert
+            }
+            AssertNumRowsMode::Global {
+                desired_num_rows,
+                assertion,
+                subquery_string: Some(assert.subquery_text.clone()),
+            }
+        } else {
+            if desired_num_rows != Some(1) || !matches!(assertion, Assertion::Le) {
+                return Err(
+                    "AssertOneRowNode keyed assertions only support desired_num_rows <= 1"
+                        .to_string(),
+                );
+            }
+            if !assert.group_key_labels.is_empty()
+                && assert.group_key_labels.len() != assert.group_key_column_ids.len()
+            {
+                return Err(format!(
+                    "AssertOneRowNode group_key_labels length mismatch: key_columns={} labels={}",
+                    assert.group_key_column_ids.len(),
+                    assert.group_key_labels.len()
+                ));
+            }
+            let key_slots = assert
                 .group_key_column_ids
                 .iter()
-                .map(|column_id| format!("column_{column_id}"))
-                .collect()
-        } else {
-            assert.group_key_labels.clone()
+                .map(|column_id| {
+                    child
+                        .layout
+                        .resolve_column_id(*column_id)
+                        .map_err(|err| format!("AssertOneRowNode group key: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let key_labels = if assert.group_key_labels.is_empty() {
+                assert
+                    .group_key_column_ids
+                    .iter()
+                    .map(|column_id| format!("column_{column_id}"))
+                    .collect()
+            } else {
+                assert.group_key_labels.clone()
+            };
+            AssertNumRowsMode::PerKeyAtMostOne {
+                key_slots,
+                key_labels,
+                message_prefix: assert
+                    .keyed_message_prefix
+                    .clone()
+                    .unwrap_or_else(|| "assert_num_rows failed".to_string()),
+            }
         };
-        AssertNumRowsMode::PerKeyAtMostOne {
-            key_slots,
-            key_labels,
-            message_prefix: assert
-                .keyed_message_prefix
-                .clone()
-                .unwrap_or_else(|| "assert_num_rows failed".to_string()),
-        }
-    };
-    Ok(DecodedNode {
-        node: ExecNode {
-            kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                mode,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
+        Ok(DecodedNode {
+            node: ExecNode {
+                kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
+                    input: Box::new(child.node),
+                    node_id: node.node_id,
+                    mode,
+                }),
+            },
+            layout: child.layout,
+            output_schema: child.output_schema,
+        })
+    })();
+    super::super::NativeFragmentDecodeError::map_invalid(path, decoded)
 }
 
 fn lower_row_count_assertion(value: i32) -> Result<Assertion, String> {

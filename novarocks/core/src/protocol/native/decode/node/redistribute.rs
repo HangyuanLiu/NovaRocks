@@ -15,45 +15,69 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::check_exact_arity;
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_redistribute_node(
     physical: &plan::PlanNode,
     redistribute: &plan::RedistributeNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("RedistributeNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("RedistributeNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
     let mode = redistribute
         .mode
         .as_ref()
         .and_then(|mode| mode.mode.as_ref())
-        .ok_or_else(|| "RedistributeNode mode missing".to_string())?;
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("mode.mode"),
+                "RedistributeNode mode missing",
+            )
+        })?;
     match mode {
         plan::redistribute_mode::Mode::Gather(true)
         | plan::redistribute_mode::Mode::Broadcast(true) => {}
         plan::redistribute_mode::Mode::Hash(hash) => {
             if hash.cols.is_empty() {
-                return Err("RedistributeNode hash mode requires cols".to_string());
+                return Err(NativeFragmentDecodeError::missing(
+                    path.clone().field("mode.hash.cols"),
+                    "RedistributeNode hash mode requires cols",
+                ));
             }
             for col in &hash.cols {
-                child.layout.resolve_column_id(*col)?;
+                NativeFragmentDecodeError::map_invalid(
+                    path.clone().field("mode.hash.cols"),
+                    child.layout.resolve_column_id(*col),
+                )?;
             }
         }
         plan::redistribute_mode::Mode::Gather(false)
         | plan::redistribute_mode::Mode::Broadcast(false) => {
-            return Err("RedistributeNode boolean mode must be true".to_string());
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("mode"),
+                "RedistributeNode boolean mode must be true",
+            ));
         }
     }
     for (idx, expr) in redistribute.partition_exprs.iter().enumerate() {
-        decode_expr(expr, arena, &child.layout)
-            .map_err(|err| format!("RedistributeNode partition_exprs[{idx}]: {err}"))?;
+        decode_expr_at(
+            expr,
+            path.clone().field("partition_exprs").index(idx),
+            arena,
+            &child.layout,
+        )?;
     }
     let output_columns = if redistribute.output_columns.is_empty() {
         &physical.output_columns
@@ -63,15 +87,25 @@ pub(super) fn lower_redistribute_node(
     if output_columns.is_empty() {
         return Ok(child);
     }
-    let layout = layout_from_output_columns(output_columns)?;
+    let output_path = path.clone().field("output_columns");
+    let layout = NativeFragmentDecodeError::map_invalid(
+        output_path.clone(),
+        layout_from_output_columns(output_columns),
+    )?;
     if layout.order() != child.layout.order() {
-        return Err(format!(
-            "RedistributeNode output columns must preserve child order: child={:?} output={:?}",
-            child.layout.order(),
-            layout.order()
+        return Err(NativeFragmentDecodeError::inconsistent(
+            output_path.clone(),
+            format!(
+                "RedistributeNode output columns must preserve child order: child={:?} output={:?}",
+                child.layout.order(),
+                layout.order()
+            ),
         ));
     }
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        output_path,
+        chunk_schema_from_output_columns(output_columns),
+    )?;
     Ok(DecodedNode {
         node: child.node,
         layout,

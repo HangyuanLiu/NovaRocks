@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
 use super::DecodedNode;
 use super::common::{
@@ -26,45 +27,73 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{expr, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_sort_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     sort: &plan::SortNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("SortNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("SortNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
     let output_columns = if sort.output_columns.is_empty() {
         &physical.output_columns
     } else {
         &sort.output_columns
     };
-    let order_by = lower_sort_items("SortNode", &sort.items, arena, &child.layout)?;
-    let limit = parse_distributed_limit(node.limit, "SortNode DistributedNode.limit")?;
-    let offset = parse_optional_nonnegative_i64(sort.offset, "SortNode.offset")?.unwrap_or(0);
-    let topn_type = parse_sort_topn_type(sort.topn_type)?;
+    let order_by = lower_sort_items(
+        "SortNode",
+        &sort.items,
+        path.clone().field("items"),
+        arena,
+        &child.layout,
+    )?;
+    let limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_distributed_limit(node.limit, "SortNode DistributedNode.limit"),
+    )?;
+    let offset = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("offset"),
+        parse_optional_nonnegative_i64(sort.offset, "SortNode.offset"),
+    )?
+    .unwrap_or(0);
+    let topn_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("topn_type"),
+        parse_sort_topn_type(sort.topn_type),
+    )?;
     let partition_exprs = sort
         .analytic_partition_by
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            let expr = decode_expr(expr, arena, &child.layout)
-                .map_err(|err| format!("SortNode analytic_partition_by[{idx}]: {err}"))?;
+            let expr = decode_expr_at(
+                expr,
+                path.clone().field("analytic_partition_by").index(idx),
+                arena,
+                &child.layout,
+            )?;
             Ok(SortExpression {
                 expr,
                 asc: true,
                 nulls_first: true,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let partition_limit = sort.partition_limit.map(|value| value as usize);
     let use_top_n = partition_limit.is_some();
     if use_top_n && topn_type != SortTopNType::RowNumber && offset != 0 {
-        return Err(format!(
-            "SortNode node_id={} topn_type {:?} requires offset=0, got {}",
-            node.node_id, topn_type, offset
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("offset"),
+            format!(
+                "SortNode node_id={} topn_type {:?} requires offset=0, got {}",
+                node.node_id, topn_type, offset
+            ),
         ));
     }
     let sort_node = ExecNode {
@@ -91,8 +120,15 @@ pub(super) fn lower_sort_node(
         return Ok(sorted);
     }
 
-    let layout = layout_from_output_columns(output_columns)?;
-    let output_schema = chunk_schema_from_output_columns(output_columns)?;
+    let output_columns_path = path.clone().field("output_columns");
+    let layout = NativeFragmentDecodeError::map_invalid(
+        output_columns_path.clone(),
+        layout_from_output_columns(output_columns),
+    )?;
+    let output_schema = NativeFragmentDecodeError::map_invalid(
+        output_columns_path.clone(),
+        chunk_schema_from_output_columns(output_columns),
+    )?;
     if layout.order() == child.layout.order() {
         return Ok(DecodedNode {
             node: sorted.node,
@@ -101,25 +137,35 @@ pub(super) fn lower_sort_node(
         });
     }
 
-    build_slot_projection("SortNode", sorted, output_columns, node.node_id, arena)
+    build_slot_projection(
+        "SortNode",
+        sorted,
+        output_columns,
+        output_columns_path,
+        node.node_id,
+        arena,
+    )
 }
 
 pub(super) fn lower_sort_items(
     node_kind: &str,
     items: &[expr::SortItem],
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
-) -> Result<Vec<SortExpression>, String> {
+) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
     items
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let expr = item
-                .expr
-                .as_ref()
-                .ok_or_else(|| format!("{node_kind} sort item {idx} expr missing"))?;
-            let expr = decode_expr(expr, arena, input_layout)
-                .map_err(|err| format!("{node_kind} sort item {idx}: {err}"))?;
+            let item_path = path.clone().index(idx);
+            let expr = item.expr.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    item_path.clone().field("expr"),
+                    format!("{node_kind} sort item {idx} expr missing"),
+                )
+            })?;
+            let expr = decode_expr_at(expr, item_path.field("expr"), arena, input_layout)?;
             Ok(SortExpression {
                 expr,
                 asc: item.asc,

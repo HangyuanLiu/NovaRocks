@@ -22,22 +22,41 @@ use arrow::datatypes::DataType;
 use super::lower_required_child;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::proto::expr;
+use crate::protocol::common::error::FieldPath;
 
 use super::super::layout::Layout;
 
 pub(crate) fn lower_binary_op(
     binary: &expr::BinaryOpExpr,
+    path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
     data_type: DataType,
-) -> Result<ExprId, String> {
-    let op = expr::BinaryOp::try_from(binary.op)
-        .map_err(|_| format!("unknown BinaryOp {}", binary.op))?;
-    let left = lower_required_child(&binary.left, "BinaryOp.left", arena, input_layout)?;
-    let right = lower_required_child(&binary.right, "BinaryOp.right", arena, input_layout)?;
+) -> Result<ExprId, super::super::NativeFragmentDecodeError> {
+    let op = expr::BinaryOp::try_from(binary.op).map_err(|_| {
+        super::super::NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("op"),
+            format!("unknown BinaryOp {}", binary.op),
+        )
+    })?;
+    let left = lower_required_child(
+        &binary.left,
+        path.clone().field("left"),
+        arena,
+        input_layout,
+    )?;
+    let right = lower_required_child(
+        &binary.right,
+        path.clone().field("right"),
+        arena,
+        input_layout,
+    )?;
     let node = match op {
         expr::BinaryOp::Unspecified => {
-            return Err("BinaryOp.op is unspecified".to_string());
+            return Err(super::super::NativeFragmentDecodeError::invalid_enum(
+                path.field("op"),
+                "BinaryOp.op is unspecified",
+            ));
         }
         expr::BinaryOp::Add => ExprNode::Add(left, right),
         expr::BinaryOp::Sub => ExprNode::Sub(left, right),

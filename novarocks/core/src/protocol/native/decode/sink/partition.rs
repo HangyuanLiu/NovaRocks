@@ -23,6 +23,7 @@ use iceberg::spec::TableMetadata;
 use crate::exec::expr::function::lookup_function;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 type PartitionMetadataInfo = (Vec<String>, Vec<String>, Vec<String>);
 
@@ -64,20 +65,22 @@ pub(crate) fn build_partition_exprs_from_output_exprs(
     target_columns: &[plan::ColumnDef],
     output_exprs: &[ExprId],
     arena: &mut ExprArena,
-) -> Result<Vec<ExprId>, String> {
+) -> Result<Vec<ExprId>, NativeFragmentLeafDecodeError> {
     if partition_source_column_names.len() != transform_exprs.len() {
         return Err(format!(
             "native Iceberg write sink partition metadata mismatch: sources={} transforms={}",
             partition_source_column_names.len(),
             transform_exprs.len()
-        ));
+        )
+        .into());
     }
     if target_columns.len() != output_exprs.len() {
         return Err(format!(
             "native Iceberg write sink partition expr source mismatch: columns={} output_exprs={}",
             target_columns.len(),
             output_exprs.len()
-        ));
+        )
+        .into());
     }
 
     let mut expr_by_column_name = HashMap::with_capacity(target_columns.len());
@@ -100,7 +103,7 @@ pub(crate) fn build_partition_exprs_from_output_exprs(
                     )
                 })?;
             build_partition_expr_from_transform(transform, source_expr, arena)
-                .map_err(|err| format!("native Iceberg write sink partition expr[{idx}]: {err}"))
+                .map_err(|err| NativeFragmentLeafDecodeError::new(format!("native Iceberg write sink partition expr[{idx}]: {err}")))
         })
         .collect()
 }

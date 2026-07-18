@@ -23,6 +23,7 @@ mod node;
 mod runtime_filter;
 mod scan;
 mod sink;
+mod submission;
 
 pub(crate) use crate::types::native_proto::{decode_field_type, decode_type};
 pub(crate) use error::NativeFragmentDecodeError;
@@ -43,6 +44,7 @@ pub(crate) use runtime_filter::{
 #[cfg(test)]
 pub(crate) use scan::scan_read_binding_for_test;
 pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
+pub(crate) use submission::{DecodedNativeFragment, decode_fragment_submission};
 
 #[cfg(test)]
 mod tests {

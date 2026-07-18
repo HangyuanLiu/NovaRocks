@@ -28,6 +28,7 @@ use crate::connector::iceberg::sink_plan::{
     IcebergSinkObjectStoreConfig, PositionDeleteDataFilePartition,
 };
 use crate::proto::plan;
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 use crate::runtime::global_async_runtime::data_block_on;
 
 pub(crate) fn build_position_delete_data_file_partition_index(
@@ -117,7 +118,7 @@ fn insert_position_delete_data_file_partition(
 
 fn position_delete_descriptor_from_native(
     desc: Option<&plan::PositionDeleteDescriptorInput>,
-) -> Result<PositionDeleteDescriptorInput, String> {
+) -> Result<PositionDeleteDescriptorInput, NativeFragmentLeafDecodeError> {
     let desc =
         desc.ok_or_else(|| "native position delete output descriptor is missing".to_string())?;
     let file_path = desc
@@ -145,17 +146,20 @@ pub(crate) fn bind_position_delete_descriptor_from_native(
     expected: PositionDeleteExpectedBinding,
 ) -> Result<
     crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorBinding,
-    String,
+    NativeFragmentLeafDecodeError,
 > {
     let desc = position_delete_descriptor_from_native(desc)?;
-    bind_position_delete_descriptor(&desc, &expected).map_err(|err| err.to_bracketed_user_message())
+    Ok(bind_position_delete_descriptor(&desc, &expected)
+        .map_err(|err| err.to_bracketed_user_message())?)
 }
 
 fn position_delete_output_field_from_native(
     label: &str,
     field: &plan::PositionDeleteOutputField,
-) -> Result<crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField, String>
-{
+) -> Result<
+    crate::connector::iceberg::position_delete_descriptor::PositionDeleteOutputField,
+    NativeFragmentLeafDecodeError,
+> {
     let output_expr_index = usize::try_from(field.output_expr_index)
         .map_err(|_| format!("native position delete {label} output_expr_index overflows usize"))?;
     let data_type = field
@@ -177,7 +181,7 @@ fn position_delete_partition_source_field_from_native(
     field: &plan::PositionDeletePartitionSourceField,
 ) -> Result<
     crate::connector::iceberg::position_delete_descriptor::PositionDeletePartitionSourceField,
-    String,
+    NativeFragmentLeafDecodeError,
 > {
     let output_expr_index = usize::try_from(field.output_expr_index).map_err(|_| {
         "native position delete partition source output_expr_index overflows usize".to_string()

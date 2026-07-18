@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use super::super::expr::decode_expr;
+use super::super::NativeFragmentDecodeError;
+use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, slot_schemas_from_output_columns};
 use super::DecodedNode;
 use super::common::check_exact_arity;
@@ -31,26 +32,35 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{common as proto_common, expr, plan};
+use crate::protocol::common::error::FieldPath;
 
 pub(super) fn lower_table_function_node(
     node: &plan::DistributedNode,
     table_function: &plan::TableFunctionNode,
+    path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
-    check_exact_arity("TableFunctionNode", 1, children.len())?;
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    NativeFragmentDecodeError::map_invalid(
+        path.clone(),
+        check_exact_arity("TableFunctionNode", 1, children.len()),
+    )?;
     let child = children.pop().expect("child");
-    validate_table_function_signature(table_function)?;
+    validate_table_function_signature(table_function, path.clone())?;
 
     let param_slots = table_function_param_slots(
         &child.layout,
         &table_function.output_columns,
         &table_function.args,
+        path.clone(),
     )?;
     let (param_types, param_slot_schemas) =
-        table_function_param_schemas(table_function, &param_slots)?;
-    let result_slot_schemas = slot_schemas_from_output_columns(&table_function.output_columns)?;
-    let ret_types = table_function_result_types(table_function)?;
+        table_function_param_schemas(table_function, &param_slots, path.clone())?;
+    let result_slot_schemas = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        slot_schemas_from_output_columns(&table_function.output_columns),
+    )?;
+    let ret_types = table_function_result_types(table_function, path.clone())?;
 
     let mut project_exprs = Vec::with_capacity(child.layout.order().len() + param_slots.len());
     let mut project_slot_ids = Vec::with_capacity(project_exprs.capacity());
@@ -69,13 +79,20 @@ pub(super) fn lower_table_function_node(
         .enumerate()
         .zip(param_slot_schemas.iter())
     {
-        let expr = decode_expr(arg, arena, &child.layout)
-            .map_err(|err| format!("TableFunctionNode arg {idx}: {err}"))?;
+        let expr = decode_expr_at(
+            arg,
+            path.clone().field("args").index(idx),
+            arena,
+            &child.layout,
+        )?;
         project_exprs.push(expr);
         project_slot_ids.push(slot_schema.slot_id());
         project_slot_schemas.push(slot_schema.clone());
     }
-    let project_output_schema = Arc::new(ChunkSchema::try_new(project_slot_schemas)?);
+    let project_output_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
+        path.clone().field("args"),
+        ChunkSchema::try_new(project_slot_schemas),
+    )?);
 
     let mut output_slot_schemas =
         Vec::with_capacity(child.output_schema.slots().len() + result_slot_schemas.len());
@@ -95,7 +112,10 @@ pub(super) fn lower_table_function_node(
         output_slot_schemas.push(slot_schema.clone());
         output_slot_sources.push(TableFunctionOutputSlot::Result { index: idx });
     }
-    let output_schema = Arc::new(ChunkSchema::try_new(output_slot_schemas)?);
+    let output_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_columns"),
+        ChunkSchema::try_new(output_slot_schemas),
+    )?);
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
 
     Ok(DecodedNode {
@@ -133,70 +153,104 @@ pub(super) fn lower_table_function_node(
 
 fn validate_table_function_signature(
     table_function: &plan::TableFunctionNode,
-) -> Result<(), String> {
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
     let function_name = table_function.function_name.to_ascii_lowercase();
-    let param_types = table_function_arg_types(table_function)?;
-    let ret_types = table_function_result_types(table_function)?;
+    let param_types = table_function_arg_types(table_function, path.clone())?;
+    let ret_types = table_function_result_types(table_function, path.clone())?;
     match function_name.as_str() {
-        "unnest" => validate_unnest_table_function(&param_types, &ret_types),
+        "unnest" => NativeFragmentDecodeError::map_invalid(
+            path,
+            validate_unnest_table_function(&param_types, &ret_types),
+        ),
         "unnest_bitmap" => {
-            validate_table_function_arity("unnest_bitmap", &param_types, &ret_types, 1, 1)?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone(),
+                validate_table_function_arity("unnest_bitmap", &param_types, &ret_types, 1, 1),
+            )?;
             if !matches!(param_types.first(), Some(DataType::Binary)) {
-                return Err(format!(
-                    "table function unnest_bitmap param 0 expects Binary, got {:?}",
-                    param_types.first()
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("args").index(0).field("type"),
+                    format!(
+                        "table function unnest_bitmap param 0 expects Binary, got {:?}",
+                        param_types.first()
+                    ),
                 ));
             }
             if !matches!(ret_types.first(), Some(DataType::Int64)) {
-                return Err(format!(
-                    "table function unnest_bitmap return type expects Int64, got {:?}",
-                    ret_types.first()
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("output_columns").index(0).field("type"),
+                    format!(
+                        "table function unnest_bitmap return type expects Int64, got {:?}",
+                        ret_types.first()
+                    ),
                 ));
             }
             Ok(())
         }
         "subdivide_bitmap" => {
-            validate_table_function_arity("subdivide_bitmap", &param_types, &ret_types, 2, 1)?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone(),
+                validate_table_function_arity("subdivide_bitmap", &param_types, &ret_types, 2, 1),
+            )?;
             if !matches!(param_types.first(), Some(DataType::Binary)) {
-                return Err(format!(
-                    "table function subdivide_bitmap param 0 expects Binary, got {:?}",
-                    param_types.first()
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("args").index(0).field("type"),
+                    format!(
+                        "table function subdivide_bitmap param 0 expects Binary, got {:?}",
+                        param_types.first()
+                    ),
                 ));
             }
             if !matches!(ret_types.first(), Some(DataType::Binary)) {
-                return Err(format!(
-                    "table function subdivide_bitmap return type expects Binary, got {:?}",
-                    ret_types.first()
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("output_columns").index(0).field("type"),
+                    format!(
+                        "table function subdivide_bitmap return type expects Binary, got {:?}",
+                        ret_types.first()
+                    ),
                 ));
             }
             Ok(())
         }
         "generate_series" => {
             if !(param_types.len() == 2 || param_types.len() == 3) || ret_types.len() != 1 {
-                return Err(format!(
-                    "table function generate_series expects 2 or 3 args and 1 output, got args={} outputs={}",
-                    param_types.len(),
-                    ret_types.len()
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone(),
+                    format!(
+                        "table function generate_series expects 2 or 3 args and 1 output, got args={} outputs={}",
+                        param_types.len(),
+                        ret_types.len()
+                    ),
                 ));
             }
             if !ret_types.iter().all(is_table_function_integer_type) {
-                return Err(format!(
-                    "table function generate_series return type expects integer, got {:?}",
-                    ret_types.first()
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("output_columns").index(0).field("type"),
+                    format!(
+                        "table function generate_series return type expects integer, got {:?}",
+                        ret_types.first()
+                    ),
                 ));
             }
             for (idx, param_type) in param_types.iter().enumerate() {
                 if !is_table_function_integer_type(param_type) {
-                    return Err(format!(
-                        "table function generate_series param {idx} expects integer, got {param_type:?}"
+                    return Err(NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("args").index(idx).field("type"),
+                        format!(
+                            "table function generate_series param {idx} expects integer, got {param_type:?}"
+                        ),
                     ));
                 }
             }
             Ok(())
         }
-        _ => Err(format!(
-            "unsupported native table function: {}",
-            table_function.function_name
+        _ => Err(NativeFragmentDecodeError::unsupported(
+            path.field("function_name"),
+            format!(
+                "unsupported native table function: {}",
+                table_function.function_name
+            ),
         )),
     }
 }
@@ -258,42 +312,50 @@ fn is_table_function_integer_type(data_type: &DataType) -> bool {
 
 fn table_function_arg_types(
     table_function: &plan::TableFunctionNode,
-) -> Result<Vec<DataType>, String> {
+    path: FieldPath,
+) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
     table_function
         .args
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            let type_desc = arg
-                .r#type
-                .as_ref()
-                .ok_or_else(|| format!("TableFunctionNode arg {idx} type missing"))?;
-            super::super::decode_type(type_desc)
-                .map_err(|err| format!("TableFunctionNode arg {idx} type decode failed: {err}"))
+            let type_desc = arg.r#type.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("args").index(idx).field("type"),
+                    format!("TableFunctionNode arg {idx} type missing"),
+                )
+            })?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone().field("args").index(idx).field("type"),
+                super::super::decode_type(type_desc),
+            )
         })
         .collect()
 }
 
 fn table_function_result_types(
     table_function: &plan::TableFunctionNode,
-) -> Result<Vec<DataType>, String> {
+    path: FieldPath,
+) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
     table_function
         .output_columns
         .iter()
         .enumerate()
         .map(|(idx, column)| {
+            let column_path = path.clone().field("output_columns").index(idx);
             let type_desc = column.r#type.as_ref().ok_or_else(|| {
-                format!(
-                    "TableFunctionNode output column {} '{}' type missing",
-                    idx, column.name
+                NativeFragmentDecodeError::missing(
+                    column_path.clone().field("type"),
+                    format!(
+                        "TableFunctionNode output column {} '{}' type missing",
+                        idx, column.name
+                    ),
                 )
             })?;
-            super::super::decode_type(type_desc).map_err(|err| {
-                format!(
-                    "TableFunctionNode output column {} '{}' type decode failed: {err}",
-                    idx, column.name
-                )
-            })
+            NativeFragmentDecodeError::map_invalid(
+                column_path.field("type"),
+                super::super::decode_type(type_desc),
+            )
         })
         .collect()
 }
@@ -301,7 +363,8 @@ fn table_function_result_types(
 fn table_function_param_schemas(
     table_function: &plan::TableFunctionNode,
     param_slots: &[SlotId],
-) -> Result<(Vec<DataType>, Vec<ChunkSlotSchema>), String> {
+    path: FieldPath,
+) -> Result<(Vec<DataType>, Vec<ChunkSlotSchema>), NativeFragmentDecodeError> {
     let mut param_types = Vec::with_capacity(table_function.args.len());
     let mut slot_schemas = Vec::with_capacity(table_function.args.len());
     for (idx, (arg, slot_id)) in table_function
@@ -310,16 +373,26 @@ fn table_function_param_schemas(
         .zip(param_slots.iter())
         .enumerate()
     {
-        let type_desc = arg
-            .r#type
-            .as_ref()
-            .ok_or_else(|| format!("TableFunctionNode arg {idx} type missing"))?;
-        let data_type = super::super::decode_type(type_desc)
-            .map_err(|err| format!("TableFunctionNode arg {idx} type decode failed: {err}"))?;
+        let arg_path = path.clone().field("args").index(idx);
+        let type_desc = arg.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                arg_path.clone().field("type"),
+                format!("TableFunctionNode arg {idx} type missing"),
+            )
+        })?;
+        let data_type = NativeFragmentDecodeError::map_invalid(
+            arg_path.clone().field("type"),
+            super::super::decode_type(type_desc),
+        )?;
         let field =
             super::super::decode_field_type(&format!("__tf_arg_{idx}"), arg.nullable, type_desc)
-                .map_err(|err| format!("TableFunctionNode arg {idx} field decode failed: {err}"))?;
-        slot_schemas.push(ChunkSchema::slot_schema_from_arrow_field(*slot_id, &field)?);
+                .map_err(|err| {
+                    NativeFragmentDecodeError::invalid_value(arg_path.clone().field("type"), err)
+                })?;
+        slot_schemas.push(NativeFragmentDecodeError::map_invalid(
+            arg_path.field("type"),
+            ChunkSchema::slot_schema_from_arrow_field(*slot_id, &field),
+        )?);
         param_types.push(data_type);
     }
     Ok((param_types, slot_schemas))
@@ -329,7 +402,8 @@ fn table_function_param_slots(
     input_layout: &Layout,
     output_columns: &[proto_common::OutputColumn],
     args: &[expr::Expr],
-) -> Result<Vec<SlotId>, String> {
+    path: FieldPath,
+) -> Result<Vec<SlotId>, NativeFragmentDecodeError> {
     let mut used = input_layout
         .order()
         .iter()
@@ -342,9 +416,12 @@ fn table_function_param_slots(
         if used.insert(slot) {
             slots.push(SlotId::new(slot));
         }
-        slot = slot
-            .checked_sub(1)
-            .ok_or_else(|| "TableFunctionNode could not allocate internal slots".to_string())?;
+        slot = slot.checked_sub(1).ok_or_else(|| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone().field("args"),
+                "TableFunctionNode could not allocate internal slots",
+            )
+        })?;
     }
     Ok(slots)
 }

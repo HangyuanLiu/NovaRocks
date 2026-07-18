@@ -29,6 +29,7 @@ use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{lower_scan_predicate, parse_scan_limit, scan_output_columns};
+use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 pub(super) fn lower_iceberg_metadata_scan(
     node: &plan::DistributedNode,
@@ -36,7 +37,7 @@ pub(super) fn lower_iceberg_metadata_scan(
     source: &plan::IcebergMetadataTable,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
-) -> Result<DecodedNode, String> {
+) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     let output_columns = scan_output_columns(scan)?;
     let layout = layout_from_output_columns(&output_columns)?;
     let output_schema = chunk_schema_from_output_columns(&output_columns)?;
@@ -101,7 +102,7 @@ fn decode_metadata_scan_ranges(
 
 fn metadata_output_columns(
     output_columns: &[common::OutputColumn],
-) -> Result<Vec<IcebergMetadataOutputColumn>, String> {
+) -> Result<Vec<IcebergMetadataOutputColumn>, NativeFragmentLeafDecodeError> {
     output_columns
         .iter()
         .map(|col| {
@@ -109,7 +110,8 @@ fn metadata_output_columns(
                 .r#type
                 .as_ref()
                 .ok_or_else(|| format!("metadata output column {} type missing", col.name))
-                .and_then(super::super::decode_type)?;
+                .map_err(NativeFragmentLeafDecodeError::new)?;
+            let data_type = super::super::decode_type(data_type)?;
             Ok(IcebergMetadataOutputColumn {
                 name: col.name.clone(),
                 slot_id: SlotId::new(col.column_id),

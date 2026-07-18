@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 
 use super::decode_field_type;
+use super::error::NativeFragmentLeafDecodeError;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::proto::common;
@@ -86,7 +87,9 @@ impl Layout {
 }
 
 #[allow(dead_code)]
-pub(crate) fn layout_from_output_columns(cols: &[common::OutputColumn]) -> Result<Layout, String> {
+pub(crate) fn layout_from_output_columns(
+    cols: &[common::OutputColumn],
+) -> Result<Layout, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     Ok(Layout::for_slots(decoded.slot_ids))
 }
@@ -94,7 +97,7 @@ pub(crate) fn layout_from_output_columns(cols: &[common::OutputColumn]) -> Resul
 #[allow(dead_code)]
 pub(crate) fn schema_from_output_columns(
     cols: &[common::OutputColumn],
-) -> Result<SchemaRef, String> {
+) -> Result<SchemaRef, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     Ok(schema_from_fields(decoded.fields))
 }
@@ -102,14 +105,15 @@ pub(crate) fn schema_from_output_columns(
 #[allow(dead_code)]
 pub(crate) fn chunk_schema_from_output_columns(
     cols: &[common::OutputColumn],
-) -> Result<ChunkSchemaRef, String> {
+) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
         return Err(format!(
             "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
             decoded.fields.len(),
             decoded.slot_ids.len()
-        ));
+        )
+        .into());
     }
     let slots = decoded
         .fields
@@ -117,33 +121,35 @@ pub(crate) fn chunk_schema_from_output_columns(
         .zip(decoded.slot_ids.iter().copied())
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
         .collect::<Result<Vec<_>, _>>()?;
-    ChunkSchema::try_new(slots).map(Arc::new)
+    Ok(ChunkSchema::try_new(slots).map(Arc::new)?)
 }
 
 #[allow(dead_code)]
 pub(crate) fn slot_schemas_from_output_columns(
     cols: &[common::OutputColumn],
-) -> Result<Vec<ChunkSlotSchema>, String> {
+) -> Result<Vec<ChunkSlotSchema>, NativeFragmentLeafDecodeError> {
     let decoded = decode_output_columns(cols)?;
     if decoded.fields.len() != decoded.slot_ids.len() {
         return Err(format!(
             "OutputColumn schema/slot length mismatch: fields={} slot_ids={}",
             decoded.fields.len(),
             decoded.slot_ids.len()
-        ));
+        )
+        .into());
     }
     decoded
         .fields
         .iter()
         .zip(decoded.slot_ids.iter().copied())
         .map(|(field, slot_id)| ChunkSchema::slot_schema_from_arrow_field(slot_id, field))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 #[allow(dead_code)]
 pub(crate) fn slot_ids_from_output_columns(
     cols: &[common::OutputColumn],
-) -> Result<Vec<SlotId>, String> {
+) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
     Ok(decode_output_columns(cols)?.slot_ids)
 }
 
@@ -158,7 +164,9 @@ struct DecodedOutputColumns {
     fields: Vec<Field>,
 }
 
-fn decode_output_columns(cols: &[common::OutputColumn]) -> Result<DecodedOutputColumns, String> {
+fn decode_output_columns(
+    cols: &[common::OutputColumn],
+) -> Result<DecodedOutputColumns, NativeFragmentLeafDecodeError> {
     let mut slot_ids = Vec::with_capacity(cols.len());
     let mut fields = Vec::with_capacity(cols.len());
     let mut seen = HashMap::with_capacity(cols.len());
@@ -169,7 +177,8 @@ fn decode_output_columns(cols: &[common::OutputColumn]) -> Result<DecodedOutputC
             return Err(format!(
                 "duplicate OutputColumn.column_id {} at index {} (first seen at index {})",
                 col.column_id, idx, first_idx
-            ));
+            )
+            .into());
         }
         let type_desc = col.r#type.as_ref().ok_or_else(|| {
             format!(
