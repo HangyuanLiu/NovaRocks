@@ -66,7 +66,7 @@ pub(super) fn sink_factory_from_native(
     sink: &proto::plan::DataSink,
     instance_params: &proto::novarocks::InstanceParams,
     typed_result_sink: bool,
-    layout: &super::super::layout::Layout,
+    layout: &decode::Layout,
 ) -> Result<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>, String> {
     let kind = sink
         .kind
@@ -177,13 +177,12 @@ pub(super) fn sink_factory_from_native(
             )))
         }
         proto::plan::data_sink::Kind::IcebergWrite(iceberg) => {
-            let (sink_input, _sink_mode) =
-                super::super::sink::lower_iceberg_write_sink_factory_input(
-                    iceberg,
-                    &fragment.output_exprs,
-                    &fragment.output_columns,
-                    layout,
-                )?;
+            let (sink_input, _sink_mode) = decode::decode_iceberg_write_sink_factory_input(
+                iceberg,
+                &fragment.output_exprs,
+                &fragment.output_columns,
+                layout,
+            )?;
             Ok(Box::new(IcebergTableSinkFactory::try_new(sink_input)?))
         }
         proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
@@ -215,7 +214,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
     router: &proto::plan::IcebergChangeStreamRouterSink,
     output_exprs: &[proto::expr::Expr],
     output_columns: &[proto::common::OutputColumn],
-    layout: &super::super::layout::Layout,
+    layout: &decode::Layout,
 ) -> Result<(IcebergChangeStreamRouterSinkFactoryInput, ExprArena), String> {
     let change_op_slot_id =
         output_slot_id_for_ordinal(output_columns, router.change_op_output_ordinal, "change_op")?;
@@ -282,7 +281,7 @@ fn lower_iceberg_change_stream_router_sink_from_native(
             branch_kind,
             stream_sink: DataStreamSinkFactoryInput::try_new(
                 branch.target_exchange_node_id,
-                DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?,
+                decode::decode_stream_partition_type(partition.kind)?,
                 Vec::new(),
                 partition_exprs,
                 output_columns,

@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod native_adapter;
 mod op;
 mod reader;
 
-pub(crate) use native_adapter::prepare_native_starrocks_scan;
 pub(crate) use op::build_native_object_store_profile_from_properties;
 pub use op::{
     LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange,

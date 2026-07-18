@@ -1024,23 +1024,6 @@ pub(crate) struct DataStreamSinkFactoryInput {
 }
 
 impl DataStreamSinkFactoryInput {
-    pub(crate) fn partition_type_from_native_kind(
-        kind: i32,
-    ) -> Result<DataStreamPartitionType, String> {
-        match crate::proto::plan::PartitionKind::try_from(kind)
-            .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
-        {
-            crate::proto::plan::PartitionKind::Unpartitioned => {
-                Ok(DataStreamPartitionType::Unpartitioned)
-            }
-            crate::proto::plan::PartitionKind::Random => Ok(DataStreamPartitionType::Random),
-            crate::proto::plan::PartitionKind::Hash => Ok(DataStreamPartitionType::HashPartitioned),
-            crate::proto::plan::PartitionKind::Unspecified => {
-                Err("native DataPartition kind is unspecified".to_string())
-            }
-        }
-    }
-
     #[cfg(feature = "compat")]
     pub(crate) fn partition_type_from_compat(
         partition_type: partitions::TPartitionType,

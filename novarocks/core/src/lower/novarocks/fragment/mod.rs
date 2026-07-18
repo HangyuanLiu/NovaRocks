@@ -24,12 +24,6 @@ use std::time::Duration;
 
 use sink_factory::{prepare_result_buffer_for_native_sink, sink_factory_from_native};
 
-use super::expr::lower_proto_expr;
-use super::node::{NodeLoweringContext, lower_proto_node_with_bindings};
-use super::runtime_filter_binding::{
-    DecodedApplyPoint, NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole,
-    RuntimeFilterBindingLookupLedger,
-};
 use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
@@ -39,7 +33,12 @@ use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
-use crate::protocol::native::decode;
+use crate::protocol::native::decode::{
+    self, DecodedApplyPoint, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
+    NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole, decode_expr,
+    decode_node_with_runtime_filters,
+};
+use crate::runtime::fragment::instance::FragmentInstanceId;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{
@@ -48,7 +47,6 @@ use crate::runtime::profile::{
     NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS, Profiler,
 };
 use crate::runtime::query_context::QueryId;
-use crate::runtime::query_options::QueryOptions;
 use crate::{connector, proto};
 
 pub(crate) fn execute_fragment_native(
@@ -60,7 +58,7 @@ pub(crate) fn execute_fragment_native(
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
 ) -> Result<FragmentOutput, String> {
-    let mut runtime_filter_bindings = RuntimeFilterBindingLookupLedger::decode(
+    let mut runtime_filter_bindings = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
     )?;
@@ -116,19 +114,18 @@ pub(crate) fn execute_fragment_native(
     arena.set_allow_throw_exception(allow_throw_exception);
     arena.set_session_time_zone(session_time_zone.map(str::to_string));
 
-    let ctx = node_context_from_instance_params(
+    let ctx = NativePlanDecodeContext::from_native(
+        root,
         instance_params,
         query_options.clone(),
-        fragment_instance_id,
-    )?
-    .with_query_id(UniqueId {
-        hi: query_id.hi,
-        lo: query_id.lo,
-    });
+        Arc::new(connector::ConnectorRegistry::default()),
+        query_id,
+        FragmentInstanceId::new(fragment_instance_id),
+    )?;
     let (lowered, dormancy_facts) = {
         let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
         let lowered =
-            lower_proto_node_with_bindings(root, &mut arena, &ctx, &mut runtime_filter_bindings)?;
+            decode_node_with_runtime_filters(root, &mut arena, &ctx, &mut runtime_filter_bindings)?;
         let dormancy_facts = runtime_filter_bindings.finish()?;
         (lowered, dormancy_facts)
     };
@@ -266,8 +263,7 @@ fn data_stream_input_from_native(
         .output_partition
         .as_ref()
         .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?;
-    let partition_type =
-        DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?;
+    let partition_type = decode::decode_stream_partition_type(partition.kind)?;
     DataStreamSinkFactoryInput::try_new(
         stream.dest_node_id,
         partition_type,
@@ -281,11 +277,10 @@ fn data_stream_input_from_native(
 fn lower_stream_partition_exprs_from_native(
     partition: &proto::plan::DataPartition,
     partition_arena: &mut ExprArena,
-    layout: &super::layout::Layout,
+    layout: &decode::Layout,
     context: impl Fn(usize) -> String,
 ) -> Result<Vec<crate::exec::expr::ExprId>, String> {
-    let partition_type =
-        DataStreamSinkFactoryInput::partition_type_from_native_kind(partition.kind)?;
+    let partition_type = decode::decode_stream_partition_type(partition.kind)?;
     if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
         return Ok(Vec::new());
     }
@@ -294,46 +289,10 @@ fn lower_stream_partition_exprs_from_native(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            lower_proto_expr(expr, partition_arena, layout)
+            decode_expr(expr, partition_arena, layout)
                 .map_err(|err| format!("{}: {err}", context(idx)))
         })
         .collect()
-}
-
-fn node_context_from_instance_params(
-    instance_params: &proto::novarocks::InstanceParams,
-    query_options: Option<QueryOptions>,
-    fragment_instance_id: UniqueId,
-) -> Result<NodeLoweringContext, String> {
-    let mut ctx = NodeLoweringContext::default()
-        .with_connector_registry(Arc::new(connector::ConnectorRegistry::default()))
-        .with_query_options(query_options)
-        .with_fragment_instance_id(fragment_instance_id.hi, fragment_instance_id.lo);
-    for (node_id, ranges) in &instance_params.per_node_scan_ranges {
-        ctx = ctx.with_scan_ranges(*node_id, ranges.ranges.clone());
-    }
-    for (node_id, sender_count) in &instance_params.per_exch_num_senders {
-        if *sender_count <= 0 {
-            return Err(format!(
-                "native InstanceParams per_exch_num_senders node_id={} must be positive, got {}",
-                node_id, sender_count
-            ));
-        }
-        ctx = ctx.with_exchange_sender_count(
-            crate::runtime::exchange::ExchangeKey {
-                finst_id_hi: fragment_instance_id.hi,
-                finst_id_lo: fragment_instance_id.lo,
-                node_id: *node_id,
-            },
-            usize::try_from(*sender_count).map_err(|_| {
-                format!(
-                    "native InstanceParams per_exch_num_senders node_id={} cannot convert {} to usize",
-                    node_id, sender_count
-                )
-            })?,
-        );
-    }
-    Ok(ctx)
 }
 
 #[cfg(test)]
@@ -484,7 +443,7 @@ mod tests {
         label: &str,
     ) {
         let sink = fragment.sink.as_ref().expect("fragment sink");
-        let layout = super::super::layout::Layout::default();
+        let layout = decode::Layout::default();
 
         let factory = sink_factory_from_native(fragment, sink, params, false, &layout);
 
@@ -683,7 +642,7 @@ mod tests {
 
     #[test]
     fn dormancy_profile_records_every_binding_and_explicit_zero_side_effects() {
-        use super::super::runtime_filter_binding::{
+        use crate::protocol::native::decode::{
             DecodedApplyPoint, NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole,
         };
 

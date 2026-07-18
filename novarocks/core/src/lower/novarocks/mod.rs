@@ -15,19 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native proto plan lowering scaffolding.
+//! Native fragment execution orchestration.
 
-mod expr;
 mod fragment;
-mod layout;
-mod node;
-mod runtime_filter_binding;
-mod scan;
-mod sink;
 
-pub(crate) use crate::types::native_proto::{decode_field_type, decode_type};
 pub(crate) use fragment::execute_fragment_native;
-#[allow(unused_imports)]
-pub(crate) use node::{LoweredNode, NodeLoweringContext, lower_proto_node};
-#[cfg(test)]
-pub(crate) use scan::scan_read_binding_for_test;

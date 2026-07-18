@@ -548,8 +548,8 @@ mod tests {
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::lower::novarocks::{NodeLoweringContext, lower_proto_node};
     use crate::proto::{common, plan};
+    use crate::protocol::native::decode::{NativePlanDecodeContext, decode_node};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::endpoint::RuntimeFilterProberDestination;
     use crate::runtime::exchange::ExchangeKey;
@@ -761,7 +761,7 @@ mod tests {
             })),
         };
         let mut arena = ExprArena::default();
-        let lowered = lower_proto_node(&node, &mut arena, &NodeLoweringContext::default())
+        let lowered = decode_node(&node, &mut arena, &NativePlanDecodeContext::default())
             .expect("lower native Iceberg delta scan");
         ExecPlan {
             arena,

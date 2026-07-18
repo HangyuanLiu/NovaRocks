@@ -69,7 +69,9 @@ pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
-pub(crate) use data_stream_sink::{DataStreamSinkFactory, DataStreamSinkFactoryInput};
+pub(crate) use data_stream_sink::{
+    DataStreamPartitionType, DataStreamSinkFactory, DataStreamSinkFactoryInput,
+};
 pub use exchange_source::ExchangeSourceFactory;
 #[cfg(feature = "compat")]
 pub use fetch_processor::FetchProcessorFactory;

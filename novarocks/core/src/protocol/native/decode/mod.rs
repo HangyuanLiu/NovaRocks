@@ -16,11 +16,104 @@
 // under the License.
 
 mod error;
+mod expr;
 mod instance;
+mod layout;
+mod node;
+mod runtime_filter;
+mod scan;
+mod sink;
 
+pub(crate) use crate::types::native_proto::{decode_field_type, decode_type};
 pub(crate) use error::NativeFragmentDecodeError;
+pub(crate) use expr::decode_expr;
 #[allow(unused_imports)]
 pub(crate) use instance::{
     NativeSubmissionMetadata, decode_destinations, decode_endpoint, decode_query_options,
     decode_runtime_filter_params, decode_scan_range_params,
 };
+pub(crate) use layout::Layout;
+#[allow(unused_imports)]
+pub(crate) use node::{
+    DecodedNode, NativePlanDecodeContext, decode_node, decode_node_with_runtime_filters,
+};
+pub(crate) use runtime_filter::{
+    DecodedApplyPoint, NativeRuntimeFilterDecodeLedger, NativeRuntimeFilterDormancyFact,
+    NativeRuntimeFilterDormancyRole,
+};
+#[cfg(test)]
+pub(crate) use scan::scan_read_binding_for_test;
+pub(crate) use sink::{decode_iceberg_write_sink_factory_input, decode_stream_partition_type};
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::{NativePlanDecodeContext, decode_node};
+    use crate::common::ids::SlotId;
+    use crate::exec::expr::ExprArena;
+    use crate::exec::node::ExecNodeKind;
+    use crate::proto::{common, expr, plan};
+    use crate::types::native_proto::encode_type;
+
+    fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(encode_type(&data_type).expect("encode type")),
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(encode_type(&DataType::Int64).expect("encode type")),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn values_node() -> plan::DistributedNode {
+        let columns = vec![output_column(7, "value", DataType::Int64)];
+        plan::DistributedNode {
+            node_id: 10,
+            fragment_id: 1,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: columns.clone(),
+                kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                    rows: vec![plan::ExprList {
+                        values: vec![int_literal(42)],
+                    }],
+                    columns,
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn values_node_decodes_from_protocol_owner() {
+        let mut arena = ExprArena::default();
+        let decoded = decode_node(
+            &values_node(),
+            &mut arena,
+            &NativePlanDecodeContext::default(),
+        )
+        .expect("decode values node");
+
+        let ExecNodeKind::Values(values) = decoded.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.chunk_schema().slot_ids(), &[SlotId::new(7)]);
+        assert_eq!(decoded.output_schema.slot_ids(), &[SlotId::new(7)]);
+    }
+}

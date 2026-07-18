@@ -45,11 +45,31 @@ pub struct StarRocksScanRange {
     pub version: Option<i64>,
 }
 
+impl StarRocksScanRange {
+    pub(crate) fn new(tablet_id: i64, partition_id: i64, version: i64) -> Self {
+        Self {
+            tablet_id,
+            partition_id: Some(partition_id),
+            version: Some(version),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StarRocksSchemaColumnHint {
     pub name: String,
     pub unique_id: i32,
     pub default_value: Option<String>,
+}
+
+impl StarRocksSchemaColumnHint {
+    pub(crate) fn new(name: String, unique_id: i32, default_value: Option<String>) -> Self {
+        Self {
+            name,
+            unique_id,
+            default_value,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +81,30 @@ pub struct LakeScanSchemaMeta {
     pub query_id: Option<UniqueId>,
     pub native_tablet_schema: Option<TabletSchemaPb>,
     pub native_column_hints: Option<Vec<StarRocksSchemaColumnHint>>,
+}
+
+impl LakeScanSchemaMeta {
+    pub(crate) fn with_embedded_schema(
+        db_id: i64,
+        table_id: i64,
+        schema_id: i64,
+        query_id: Option<crate::runtime::query_context::QueryId>,
+        tablet_schema: TabletSchemaPb,
+        column_hints: Vec<StarRocksSchemaColumnHint>,
+    ) -> Self {
+        Self {
+            db_id,
+            table_id,
+            schema_id,
+            fe_addr: None,
+            query_id: query_id.map(|query_id| UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            native_tablet_schema: Some(tablet_schema),
+            native_column_hints: Some(column_hints),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
