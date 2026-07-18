@@ -34,9 +34,6 @@ pub(crate) mod refresh_context;
 pub(crate) mod refresh_driver;
 pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin;
-pub(crate) mod refresh_property;
-#[cfg(test)]
-mod refresh_property_contract_tests;
 pub(crate) mod scan_binding;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;

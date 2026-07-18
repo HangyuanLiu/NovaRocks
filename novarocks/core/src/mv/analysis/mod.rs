@@ -17,6 +17,10 @@
 
 //! Materialized-view query-analysis vocabulary and pure staged contract.
 
+pub(crate) mod refresh_property;
+#[cfg(test)]
+mod refresh_property_contract_tests;
+
 use std::collections::HashSet;
 
 use crate::catalog::identifier::normalize_identifier;

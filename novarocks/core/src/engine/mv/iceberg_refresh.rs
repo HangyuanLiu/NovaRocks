@@ -66,9 +66,6 @@ use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
-use crate::engine::mv::refresh_property::{
-    RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
-};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
@@ -84,6 +81,9 @@ use crate::meta::repository::mv::{
 };
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
+use crate::mv::analysis::refresh_property::{
+    RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
+};
 use crate::mv::analysis::{
     MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
     resolve_mv_name, validate_mv_partition_columns,
@@ -16680,7 +16680,7 @@ mod tests {
 
     #[test]
     fn identity_gating_matches_legacy_strategy_gating() {
-        use crate::engine::mv::refresh_property::TargetIdentity;
+        use crate::mv::analysis::refresh_property::TargetIdentity;
 
         let base_row = TargetIdentity::BaseRowId;
         let join_row = TargetIdentity::JoinRowKey(
