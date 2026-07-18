@@ -1005,7 +1005,7 @@ impl DataStreamPartitionType {
         }
     }
 
-    fn requires_exprs(self) -> bool {
+    pub(crate) fn requires_exprs(self) -> bool {
         matches!(
             self,
             Self::HashPartitioned | Self::BucketShuffleHashPartitioned
@@ -1024,6 +1024,24 @@ pub(crate) struct DataStreamSinkFactoryInput {
 }
 
 impl DataStreamSinkFactoryInput {
+    pub(crate) fn from_static_program(
+        dest_node_id: i32,
+        output_partition_type: DataStreamPartitionType,
+        output_exprs: Vec<ExprId>,
+        output_partition_exprs: Vec<ExprId>,
+        output_columns: Vec<SlotId>,
+        destinations: Vec<FragmentDestination>,
+    ) -> Self {
+        Self {
+            dest_node_id,
+            output_exprs,
+            output_partition_type,
+            output_partition_exprs,
+            output_columns,
+            destinations,
+        }
+    }
+
     #[cfg(feature = "compat")]
     pub(crate) fn partition_type_from_compat(
         partition_type: partitions::TPartitionType,
@@ -1042,10 +1060,6 @@ impl DataStreamSinkFactoryInput {
                 other
             )),
         }
-    }
-
-    pub(crate) fn partition_type_requires_exprs(partition_type: DataStreamPartitionType) -> bool {
-        partition_type.requires_exprs()
     }
 
     pub(crate) fn try_new(
@@ -1070,7 +1084,7 @@ impl DataStreamSinkFactoryInput {
             parsed_output_columns.push(slot_id);
         }
 
-        let output_partition_exprs = if Self::partition_type_requires_exprs(output_partition_type) {
+        let output_partition_exprs = if output_partition_type.requires_exprs() {
             output_partition_exprs
         } else {
             Vec::new()

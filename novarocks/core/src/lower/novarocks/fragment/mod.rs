@@ -28,14 +28,13 @@ use crate::common::config::debug_exec_node_output;
 use crate::common::types::UniqueId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::ExecPlan;
-use crate::exec::operators::DataStreamSinkFactoryInput;
 use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
 use crate::lower::common::fragment_runtime::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
 use crate::protocol::native::decode::{
     self, DecodedApplyPoint, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
-    NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole, decode_expr,
+    NativeRuntimeFilterDormancyFact, NativeRuntimeFilterDormancyRole,
     decode_node_with_runtime_filters,
 };
 use crate::runtime::fragment::instance::FragmentInstanceId;
@@ -220,79 +219,6 @@ fn query_id_from_native(src: &proto::common::UniqueId) -> QueryId {
         hi: src.hi,
         lo: src.lo,
     }
-}
-
-fn stream_destination_from_native(
-    src: &proto::plan::StreamDestination,
-) -> Result<crate::runtime::endpoint::FragmentDestination, String> {
-    let finst_id = src
-        .finst_id
-        .as_ref()
-        .ok_or_else(|| "native StreamDestination missing finst_id".to_string())?;
-    Ok(crate::runtime::endpoint::FragmentDestination::new(
-        unique_id_from_native(finst_id),
-        crate::runtime::endpoint::RuntimeEndpoint::parse(&src.endpoint)?,
-    ))
-}
-
-fn stream_destinations_from_native(
-    src: &proto::plan::StreamDestinationList,
-) -> Result<Vec<crate::runtime::endpoint::FragmentDestination>, String> {
-    src.destinations
-        .iter()
-        .map(stream_destination_from_native)
-        .collect()
-}
-
-fn fragment_instance_id_from_native_params(
-    params: &proto::novarocks::InstanceParams,
-) -> Result<UniqueId, String> {
-    params
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "native InstanceParams missing fragment_instance_id".to_string())
-        .map(unique_id_from_native)
-}
-
-fn data_stream_input_from_native(
-    stream: &proto::plan::DataStreamSink,
-    destinations: Vec<crate::runtime::endpoint::FragmentDestination>,
-    partition_exprs: Vec<crate::exec::expr::ExprId>,
-) -> Result<DataStreamSinkFactoryInput, String> {
-    let partition = stream
-        .output_partition
-        .as_ref()
-        .ok_or_else(|| "native DATA_STREAM_SINK missing output_partition".to_string())?;
-    let partition_type = decode::decode_stream_partition_type(partition.kind)?;
-    DataStreamSinkFactoryInput::try_new(
-        stream.dest_node_id,
-        partition_type,
-        Vec::new(),
-        partition_exprs,
-        stream.output_columns.clone(),
-        destinations,
-    )
-}
-
-fn lower_stream_partition_exprs_from_native(
-    partition: &proto::plan::DataPartition,
-    partition_arena: &mut ExprArena,
-    layout: &decode::Layout,
-    context: impl Fn(usize) -> String,
-) -> Result<Vec<crate::exec::expr::ExprId>, String> {
-    let partition_type = decode::decode_stream_partition_type(partition.kind)?;
-    if !DataStreamSinkFactoryInput::partition_type_requires_exprs(partition_type) {
-        return Ok(Vec::new());
-    }
-    partition
-        .exprs
-        .iter()
-        .enumerate()
-        .map(|(idx, expr)| {
-            decode_expr(expr, partition_arena, layout)
-                .map_err(|err| format!("{}: {err}", context(idx)))
-        })
-        .collect()
 }
 
 #[cfg(test)]

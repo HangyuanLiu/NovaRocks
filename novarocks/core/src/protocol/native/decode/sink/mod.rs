@@ -34,8 +34,15 @@ use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
 };
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::fragment::sink::{
+    DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+    IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
+    IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
+};
 use crate::exec::operators::DataStreamPartitionType;
-use crate::proto::{common, expr, plan};
+use crate::proto::{common, expr, novarocks, plan};
+use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::fragment::instance::FragmentSinkAssignment;
 
 use self::equality_delete::{
     build_equality_delete_output_schema, validate_equality_delete_unpartitioned_target_metadata,
@@ -52,6 +59,421 @@ use self::partition::{
 use self::position_delete::{
     bind_position_delete_descriptor_from_native, build_position_delete_data_file_partition_index,
 };
+
+pub(crate) fn decode_fragment_sink_program(
+    fragment: &plan::PlanFragment,
+    layout: &super::layout::Layout,
+) -> Result<FragmentSinkProgram, String> {
+    let sink = fragment
+        .sink
+        .as_ref()
+        .ok_or_else(|| "native PlanFragment missing sink".to_string())?;
+    let kind = sink
+        .kind
+        .as_ref()
+        .ok_or_else(|| "native PlanFragment sink kind missing".to_string())?;
+    match kind {
+        plan::data_sink::Kind::Result(true) => {
+            if !fragment.output_exprs.is_empty() {
+                return Err(
+                    "native RESULT sink does not support fragment output_exprs yet".to_string(),
+                );
+            }
+            Ok(FragmentSinkProgram::Result)
+        }
+        plan::data_sink::Kind::Noop(true) => Ok(FragmentSinkProgram::Noop),
+        plan::data_sink::Kind::Result(false) => {
+            Err("native RESULT sink marker must be true".to_string())
+        }
+        plan::data_sink::Kind::Noop(false) => {
+            Err("native NOOP sink marker must be true".to_string())
+        }
+        plan::data_sink::Kind::DataStream(stream) => {
+            let mut partition_arena = ExprArena::default();
+            let branch = decode_data_stream_branch(
+                stream,
+                &mut partition_arena,
+                layout,
+                "native DATA_STREAM_SINK",
+            )?;
+            Ok(FragmentSinkProgram::DataStream(DataStreamSinkProgram::new(
+                branch.dest_node_id,
+                branch.output_exprs,
+                branch.output_partition_type,
+                branch.output_partition_exprs,
+                branch.output_columns,
+                branch.limit,
+                partition_arena,
+            )))
+        }
+        plan::data_sink::Kind::MultiCastDataStream(grouped) => {
+            let mut partition_arena = ExprArena::default();
+            let sinks = grouped
+                .sinks
+                .iter()
+                .enumerate()
+                .map(|(index, stream)| {
+                    decode_data_stream_branch(
+                        stream,
+                        &mut partition_arena,
+                        layout,
+                        &format!("native MULTI_CAST_DATA_STREAM_SINK sink[{index}]"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FragmentSinkProgram::MultiCastDataStream(
+                MultiCastDataStreamSinkProgram::new(sinks, partition_arena),
+            ))
+        }
+        plan::data_sink::Kind::IcebergWrite(iceberg) => {
+            let (input, _mode) = decode_iceberg_write_sink_factory_input(
+                iceberg,
+                &fragment.output_exprs,
+                &fragment.output_columns,
+                layout,
+            )?;
+            Ok(FragmentSinkProgram::IcebergTable(
+                IcebergTableSinkProgram::from_factory_input(input),
+            ))
+        }
+        plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
+            decode_change_stream_router_program(
+                router,
+                &fragment.output_exprs,
+                &fragment.output_columns,
+                layout,
+            )
+            .map(FragmentSinkProgram::IcebergChangeStreamRouter)
+        }
+    }
+}
+
+pub(crate) fn decode_fragment_sink_assignment(
+    sink: &plan::DataSink,
+    instance: &novarocks::InstanceParams,
+) -> Result<FragmentSinkAssignment, String> {
+    let kind = sink
+        .kind
+        .as_ref()
+        .ok_or_else(|| "native PlanFragment sink kind missing".to_string())?;
+    match kind {
+        plan::data_sink::Kind::DataStream(_) => Ok(FragmentSinkAssignment::StreamDestinations {
+            destinations: super::instance::decode_destinations(&instance.destinations)
+                .map_err(|error| error.to_string())?,
+            sender_id: None,
+        }),
+        plan::data_sink::Kind::MultiCastDataStream(grouped) => {
+            reject_instance_destinations_for_grouped_sink(instance)?;
+            Ok(FragmentSinkAssignment::DestinationGroups {
+                groups: grouped
+                    .destinations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| {
+                        decode_stream_destination_list(
+                            group,
+                            &format!("native MULTI_CAST_DATA_STREAM_SINK destinations[{index}]"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                sender_id: None,
+            })
+        }
+        plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
+            reject_instance_destinations_for_grouped_sink(instance)?;
+            Ok(FragmentSinkAssignment::DestinationGroups {
+                groups: router
+                    .branches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, branch)| {
+                        branch
+                            .destinations
+                            .as_ref()
+                            .ok_or_else(|| {
+                                format!(
+                                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] missing destinations"
+                                )
+                            })
+                            .and_then(|group| {
+                                decode_stream_destination_list(
+                                    group,
+                                    &format!(
+                                        "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] destinations"
+                                    ),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                sender_id: None,
+            })
+        }
+        plan::data_sink::Kind::Result(_)
+        | plan::data_sink::Kind::Noop(_)
+        | plan::data_sink::Kind::IcebergWrite(_) => {
+            if instance.destinations.is_empty() {
+                Ok(FragmentSinkAssignment::None)
+            } else {
+                Ok(FragmentSinkAssignment::StreamDestinations {
+                    destinations: super::instance::decode_destinations(&instance.destinations)
+                        .map_err(|error| error.to_string())?,
+                    sender_id: None,
+                })
+            }
+        }
+    }
+}
+
+fn decode_data_stream_branch(
+    stream: &plan::DataStreamSink,
+    partition_arena: &mut ExprArena,
+    layout: &super::layout::Layout,
+    context: &str,
+) -> Result<DataStreamSinkBranchProgram, String> {
+    let partition = stream
+        .output_partition
+        .as_ref()
+        .ok_or_else(|| format!("{context} missing output_partition"))?;
+    let partition_type = decode_stream_partition_type(partition.kind)?;
+    let output_partition_exprs = if partition_type.requires_exprs() {
+        partition
+            .exprs
+            .iter()
+            .enumerate()
+            .map(|(index, expression)| {
+                decode_expr(expression, partition_arena, layout)
+                    .map_err(|error| format!("{context} partition expr[{index}]: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let output_columns = decode_output_slot_ids(&stream.output_columns, context)?;
+    Ok(DataStreamSinkBranchProgram::new(
+        stream.dest_node_id,
+        Vec::new(),
+        partition_type,
+        output_partition_exprs,
+        output_columns,
+        stream.limit,
+    ))
+}
+
+fn decode_output_slot_ids(raw_ids: &[i32], context: &str) -> Result<Vec<SlotId>, String> {
+    let mut seen = std::collections::HashSet::new();
+    raw_ids
+        .iter()
+        .map(|raw| {
+            let slot_id = SlotId::try_from(*raw)
+                .map_err(|error| format!("{context}: invalid output_columns slot id: {error}"))?;
+            if !seen.insert(slot_id) {
+                return Err(format!(
+                    "{context}: duplicate output_columns slot id: {slot_id}"
+                ));
+            }
+            Ok(slot_id)
+        })
+        .collect()
+}
+
+fn decode_change_stream_router_program(
+    router: &plan::IcebergChangeStreamRouterSink,
+    output_exprs: &[expr::Expr],
+    output_columns: &[common::OutputColumn],
+    layout: &super::layout::Layout,
+) -> Result<IcebergChangeStreamRouterProgram, String> {
+    let change_op_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
+        output_columns,
+        router.change_op_output_ordinal,
+        "change_op",
+    )?)?;
+    let data_route_slot_id = router
+        .data_route_output_ordinal
+        .map(|ordinal| output_slot_id_for_ordinal(output_columns, ordinal, "data_route"))
+        .transpose()?
+        .map(SlotId::try_from)
+        .transpose()?;
+    let mut partition_arena = ExprArena::default();
+    let branches = router
+        .branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| {
+            let partition = branch_partition_from_native(branch, output_exprs)?;
+            let partition_type = decode_stream_partition_type(partition.kind)?;
+            let output_partition_exprs = if partition_type.requires_exprs() {
+                partition
+                    .exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(expr_index, expression)| {
+                        decode_expr(expression, &mut partition_arena, layout).map_err(|error| {
+                            format!(
+                                "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] partition expr[{expr_index}]: {error}"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            let branch_output_columns = decode_router_output_slots(
+                &branch.output_ordinals,
+                output_columns,
+                &format!("branch[{index}] output"),
+            )?;
+            Ok(IcebergChangeStreamRouterBranchProgram {
+                branch_id: branch.branch_id,
+                branch_kind: decode_change_stream_branch_kind(branch.branch_kind)?,
+                stream_sink: DataStreamSinkBranchProgram::new(
+                    branch.target_exchange_node_id,
+                    Vec::new(),
+                    partition_type,
+                    output_partition_exprs,
+                    branch_output_columns,
+                    None,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(IcebergChangeStreamRouterProgram::new(
+        change_op_slot_id,
+        data_route_slot_id,
+        branches,
+        partition_arena,
+    ))
+}
+
+fn branch_partition_from_native(
+    branch: &plan::IcebergChangeStreamBranchRoute,
+    output_exprs: &[expr::Expr],
+) -> Result<plan::DataPartition, String> {
+    if let Some(partition) = branch.output_partition.as_ref() {
+        return Ok(partition.clone());
+    }
+    let exprs = branch
+        .output_partition_ordinals
+        .iter()
+        .map(|ordinal| {
+            let index = usize::try_from(*ordinal).map_err(|_| {
+                format!(
+                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK partition ordinal {ordinal} overflows usize"
+                )
+            })?;
+            output_exprs.get(index).cloned().ok_or_else(|| {
+                format!(
+                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK partition ordinal {ordinal} is out of range"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let kind = if exprs.is_empty() {
+        plan::PartitionKind::Unpartitioned
+    } else {
+        plan::PartitionKind::Hash
+    };
+    Ok(plan::DataPartition {
+        kind: kind as i32,
+        exprs,
+    })
+}
+
+fn output_slot_id_for_ordinal(
+    output_columns: &[common::OutputColumn],
+    ordinal: u64,
+    label: &str,
+) -> Result<i32, String> {
+    let index = usize::try_from(ordinal)
+        .map_err(|_| format!("native router {label} output ordinal {ordinal} overflows usize"))?;
+    let column = output_columns
+        .get(index)
+        .ok_or_else(|| format!("native router {label} output ordinal {ordinal} is out of range"))?;
+    i32::try_from(column.column_id).map_err(|_| {
+        format!(
+            "native router {label} output ordinal {ordinal} column id {} exceeds i32",
+            column.column_id
+        )
+    })
+}
+
+fn decode_router_output_slots(
+    ordinals: &[u64],
+    output_columns: &[common::OutputColumn],
+    label: &str,
+) -> Result<Vec<SlotId>, String> {
+    let mut seen = std::collections::HashSet::new();
+    ordinals
+        .iter()
+        .map(|ordinal| {
+            let slot_id = output_slot_id_for_ordinal(output_columns, *ordinal, label)
+                .and_then(SlotId::try_from)?;
+            if !seen.insert(slot_id) {
+                return Err(format!(
+                    "native ICEBERG_CHANGE_STREAM_ROUTER_SINK {label}: duplicate output slot id: {slot_id}"
+                ));
+            }
+            Ok(slot_id)
+        })
+        .collect()
+}
+
+fn decode_change_stream_branch_kind(
+    value: i32,
+) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
+    match plan::ChangeStreamBranchKind::try_from(value)
+        .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
+    {
+        plan::ChangeStreamBranchKind::DeleteDv => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::DeleteDv)
+        }
+        plan::ChangeStreamBranchKind::ReuseData => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::ReuseData)
+        }
+        plan::ChangeStreamBranchKind::FreshData => {
+            Ok(crate::sql::common::ChangeStreamBranchKind::FreshData)
+        }
+        plan::ChangeStreamBranchKind::Unspecified => {
+            Err("native ChangeStreamBranchKind is unspecified".to_string())
+        }
+    }
+}
+
+fn decode_stream_destination_list(
+    group: &plan::StreamDestinationList,
+    context: &str,
+) -> Result<Vec<FragmentDestination>, String> {
+    group
+        .destinations
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| {
+            let finst_id = destination
+                .finst_id
+                .as_ref()
+                .ok_or_else(|| format!("{context} destination[{index}] missing finst_id"))?;
+            Ok(FragmentDestination::new(
+                crate::common::types::UniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                },
+                RuntimeEndpoint::parse(&destination.endpoint)
+                    .map_err(|error| format!("{context} destination[{index}]: {error}"))?,
+            ))
+        })
+        .collect()
+}
+
+fn reject_instance_destinations_for_grouped_sink(
+    instance: &novarocks::InstanceParams,
+) -> Result<(), String> {
+    if !instance.destinations.is_empty() {
+        return Err(
+            "grouped native sink must carry destinations in ordered sink groups, not InstanceParams.destinations"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
 pub(crate) fn decode_iceberg_write_sink_factory_input(
     sink: &plan::IcebergWriteFragmentSink,
@@ -255,7 +677,7 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
     ))
 }
 
-pub(crate) fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, String> {
+fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, String> {
     match plan::PartitionKind::try_from(kind)
         .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
     {
@@ -347,5 +769,27 @@ fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> 
         plan::IcebergWriteSinkMode::Unspecified => {
             Err("native Iceberg write sink mode is unspecified".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_branch_rejects_duplicate_output_slots() {
+        let output_columns = vec![common::OutputColumn {
+            column_id: 7,
+            name: "value".to_string(),
+            ..Default::default()
+        }];
+
+        let error = decode_router_output_slots(&[0, 0], &output_columns, "branch[0] output")
+            .expect_err("duplicate router output slots must be rejected during decode");
+
+        assert_eq!(
+            error,
+            "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[0] output: duplicate output slot id: 7"
+        );
     }
 }

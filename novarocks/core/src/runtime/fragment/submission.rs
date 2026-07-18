@@ -529,8 +529,12 @@ mod tests {
     };
     use crate::exec::fragment::program::{
         ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-        FragmentProgramOptions, FragmentSinkKind, FragmentSinkSpec, RuntimeFilterContract,
-        RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
+        FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
+        ScanAssignmentKind, ScanSourceContract,
+    };
+    use crate::exec::fragment::sink::{
+        DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+        MultiCastDataStreamSinkProgram,
     };
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
@@ -548,6 +552,7 @@ mod tests {
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::operators::DataStreamPartitionType;
     use crate::proto::{common, plan};
     use crate::protocol::native::decode::{NativePlanDecodeContext, decode_node};
     use crate::runtime::endpoint::RuntimeEndpoint;
@@ -770,7 +775,39 @@ mod tests {
     }
 
     fn result_sink() -> FragmentSinkSpec {
-        FragmentSinkSpec::try_for_kind(FragmentSinkKind::Result, None).expect("result sink")
+        FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink")
+    }
+
+    fn data_stream_sink() -> FragmentSinkSpec {
+        FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(DataStreamSinkProgram::new(
+            9,
+            Vec::new(),
+            DataStreamPartitionType::Unpartitioned,
+            Vec::new(),
+            vec![SlotId::new(1)],
+            None,
+            ExprArena::default(),
+        )))
+        .expect("data stream sink")
+    }
+
+    fn multicast_sink(branch_count: usize) -> FragmentSinkSpec {
+        let branches = (0..branch_count)
+            .map(|index| {
+                DataStreamSinkBranchProgram::new(
+                    i32::try_from(index).expect("branch index fits i32"),
+                    Vec::new(),
+                    DataStreamPartitionType::Unpartitioned,
+                    Vec::new(),
+                    vec![SlotId::new(1)],
+                    None,
+                )
+            })
+            .collect();
+        FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
+            MultiCastDataStreamSinkProgram::new(branches, ExprArena::default()),
+        ))
+        .expect("multicast sink")
     }
 
     fn program_with(
@@ -1598,8 +1635,7 @@ mod tests {
     fn requires_stream_destinations_for_data_stream_sink() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::DataStream, None)
-                .expect("data stream sink"),
+            data_stream_sink(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1615,8 +1651,7 @@ mod tests {
     fn accepts_stream_destinations_and_preserves_sender_id() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::DataStream, None)
-                .expect("data stream sink"),
+            data_stream_sink(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1651,11 +1686,7 @@ mod tests {
     fn rejects_wrong_destination_group_count() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(
-                FragmentSinkKind::MultiCastDataStream,
-                NonZeroUsize::new(2),
-            )
-            .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1684,11 +1715,7 @@ mod tests {
     fn accepts_empty_destination_groups_when_group_count_matches() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(
-                FragmentSinkKind::MultiCastDataStream,
-                NonZeroUsize::new(2),
-            )
-            .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1716,8 +1743,7 @@ mod tests {
     fn rejects_stream_assignment_for_grouped_sink() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::SplitDataStream, NonZeroUsize::new(2))
-                .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
