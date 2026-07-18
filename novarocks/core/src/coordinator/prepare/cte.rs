@@ -95,14 +95,16 @@ mod tests {
     };
 
     #[test]
-    fn sealed_cte_multicast_projection_sorts_consumer_edges_and_preserves_output_occurrences() {
+    fn sealed_cte_multicast_projection_sorts_edges_and_preserves_receive_occurrence_order() {
         let cte_id = 42;
         let first_column = ColumnId::new_for_test(1);
         let second_column = ColumnId::new_for_test(2);
+        let third_column = ColumnId::new_for_test(3);
+        let fourth_column = ColumnId::new_for_test(4);
         let mut fragment = super::super::test_support::result_plan().fragments()[0].clone();
         fragment.cte_exchange_nodes = vec![
-            (cte_id, 11, vec![second_column]),
-            (cte_id, 3, vec![first_column]),
+            (cte_id, 11, vec![fourth_column, second_column]),
+            (cte_id, 3, vec![third_column, first_column]),
         ];
         let edges = vec![
             FragmentEdge {
@@ -113,7 +115,7 @@ mod tests {
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::CteMulticast {
                     cte_id,
-                    receive_producer_column_ids: vec![second_column],
+                    receive_producer_column_ids: vec![fourth_column, second_column],
                 },
                 output_slot_ids: vec![2],
             },
@@ -125,7 +127,7 @@ mod tests {
                 stream_kind: FragmentStreamKind::Gather,
                 edge_kind: FragmentEdgeKind::CteMulticast {
                     cte_id,
-                    receive_producer_column_ids: vec![first_column],
+                    receive_producer_column_ids: vec![third_column, first_column],
                 },
                 output_slot_ids: vec![1],
             },
@@ -138,8 +140,8 @@ mod tests {
         assert_eq!(
             consumers,
             vec![
-                (cte_id, 3, vec![first_column]),
-                (cte_id, 11, vec![second_column]),
+                (cte_id, 3, vec![third_column, first_column]),
+                (cte_id, 11, vec![fourth_column, second_column]),
             ]
         );
     }
