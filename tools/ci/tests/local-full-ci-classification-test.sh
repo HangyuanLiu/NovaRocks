@@ -254,13 +254,16 @@ run_compat_gates_text="$(declare -f run_compat_gates)"
 for expected in \
   'cargo clippy -p novarocks-server -p novarocks --all-targets --features compat' \
   'tools/ci/build-compat-artifact.sh' \
-  'cargo test -p novarocks-server -p novarocks --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
   'run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"'; do
   if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
     echo "explicit compat gates must include: $expected" >&2
     exit 1
   fi
 done
+if grep -Eq 'cargo test compat|cargo test .*--features compat|--test-threads=1' <<<"$run_compat_gates_text"; then
+  echo "explicit compat gates must not include the retired compat Rust test gate" >&2
+  exit 1
+fi
 
 default_compat_output="$({
   WITH_COMPAT="false"
@@ -276,7 +279,6 @@ fi
 for stage in \
   "cargo clippy compat" \
   "cargo build compat artifact" \
-  "cargo test compat" \
   "starrocks-compat E2E"; do
   if ! grep -qx "record:$stage:SKIP" <<<"$default_compat_output"; then
     echo "default local-full-ci must record $stage as SKIP" >&2
@@ -296,7 +298,6 @@ explicit_compat_output="$({
 for stage in \
   "cargo clippy compat" \
   "cargo build compat artifact" \
-  "cargo test compat" \
   "starrocks-compat E2E"; do
   if ! grep -qx "run:$stage" <<<"$explicit_compat_output"; then
     echo "--with-compat must execute $stage" >&2
