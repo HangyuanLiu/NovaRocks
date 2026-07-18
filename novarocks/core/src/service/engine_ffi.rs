@@ -30,10 +30,11 @@ use crate::connector::starrocks::lake::transactions::{
 use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
-    DeleteTabletRequest, DropTableRequest, PLookUpRequest, PLookUpResponse, PTransmitChunkParams,
-    PTransmitChunkResult, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
-    PUpdateFailPointStatusRequest, PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest,
-    PublishLogVersionRequest, PublishVersionRequest, TabletStatRequest, VacuumRequest,
+    DeleteTabletRequest, DropTableRequest, PLookUpCloseRequest, PLookUpCloseResponse,
+    PLookUpRequest, PLookUpResponse, PTransmitChunkParams, PTransmitChunkResult,
+    PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, PUpdateFailPointStatusRequest,
+    PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest, PublishLogVersionRequest,
+    PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
 use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};
@@ -385,6 +386,23 @@ pub extern "C" fn novarocks_rs_lookup(
         out_err,
         "lookup",
         internal_rpc::handle_lookup_compat,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lookup_close(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    handle_unary_proto_rpc::<PLookUpCloseRequest, PLookUpCloseResponse, _>(
+        ptr,
+        len,
+        out_resp,
+        out_err,
+        "lookup_close",
+        internal_rpc::handle_lookup_close_compat,
     )
 }
 

@@ -38,6 +38,13 @@ required-features = ["mysql-state-store-provider", "state-store-test-hooks"]
 test = false
 bench = false
 
+[[bin]]
+name = "starrocks-compat-probe"
+path = "../../tests/starrocks-compat-probe/main.rs"
+required-features = ["compat"]
+test = false
+bench = false
+
 [dependencies]
 novarocks-version = { path = "../version" }
 

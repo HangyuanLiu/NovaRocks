@@ -17,20 +17,26 @@
 
 mod benchmark_bootstrap;
 mod cluster;
+mod compat_artifact;
+mod compat_directive;
 mod config;
 mod fault_injection;
 mod imv_stateless;
+mod managed_process;
 mod parser;
 mod results;
 mod runner;
 mod session;
 mod shell;
+mod starrocks_compat_cluster;
+mod suite_manifest;
 mod types;
 
 use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
+use crate::compat_artifact::CompatArtifact;
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -47,6 +53,7 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
 };
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
+use crate::suite_manifest::{SuiteServerMode, select_suite_names};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -70,6 +77,29 @@ fn resolve_effective_target_port(
     match server_port {
         Some(port) => Ok(port.to_string()),
         None => resolve_target_port(cli_port, runner_config),
+    }
+}
+
+fn resolve_selected_cluster(
+    server_mode: SuiteServerMode,
+    manifest_cluster_size: usize,
+    cli_mode: ClusterMode,
+    cli_cluster_size: Option<usize>,
+) -> Result<(ClusterMode, usize)> {
+    match server_mode {
+        SuiteServerMode::Native => Ok((cli_mode, cli_cluster_size.unwrap_or(1))),
+        SuiteServerMode::StarRocksCompat => {
+            if let Some(cluster_size) = cli_cluster_size
+                && cluster_size != manifest_cluster_size
+            {
+                bail!(
+                    "starrocks-compat mode requires --cluster-size {} (got {})",
+                    manifest_cluster_size,
+                    cluster_size
+                );
+            }
+            Ok((ClusterMode::StarRocksCompat, manifest_cluster_size))
+        }
     }
 }
 
@@ -283,8 +313,8 @@ struct Cli {
 
     /// Number of BE processes to launch in cross-process cluster mode (>= 1).
     /// All-in-one mode requires cluster_size = 1.
-    #[arg(long, default_value_t = 1)]
-    cluster_size: usize,
+    #[arg(long)]
+    cluster_size: Option<usize>,
 
     #[arg(long, action = ArgAction::SetTrue)]
     dry_run: bool,
@@ -948,6 +978,57 @@ fn run_explain_directive_checks(
     Ok(())
 }
 
+fn run_compat_directives_for_successful_step(
+    step: &SqlStep,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    snapshot: &compat_directive::BeLogSnapshot,
+    log: &mut String,
+) -> Result<(), String> {
+    match server_handle.lock() {
+        Ok(server_handle) => compat_directive::run(step, server_handle.as_ref(), snapshot, log)
+            .map_err(|error| format!("compatibility directive failed: {error:#}")),
+        Err(_) => Err("server handle mutex is poisoned".to_string()),
+    }
+}
+
+fn finish_expected_error_step(
+    step: &SqlStep,
+    matched_expected_error: bool,
+    last_failure: &str,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    snapshot: &compat_directive::BeLogSnapshot,
+    log: &mut String,
+) -> bool {
+    if !matched_expected_error {
+        let _ = writeln!(
+            log,
+            "    ❌ {}",
+            annotate_failure_with_engine_error_code(last_failure, last_failure)
+        );
+        return false;
+    }
+    if let Err(reason) =
+        run_compat_directives_for_successful_step(step, server_handle, snapshot, log)
+    {
+        let _ = writeln!(log, "    ❌ FAIL: {reason}");
+        return false;
+    }
+    if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+        let _ = writeln!(
+            log,
+            "    ✅ PASS (expected error matched): engine_error_code={} {}",
+            expected_code, last_failure
+        );
+    } else {
+        let _ = writeln!(
+            log,
+            "    ✅ PASS (expected error matched): {}",
+            last_failure
+        );
+    }
+    true
+}
+
 // Per-case execution
 // ---------------------------------------------------------------------------
 
@@ -1279,6 +1360,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        let compat_snapshot = match ctx.server_handle.lock() {
+            Ok(server_handle) => compat_directive::snapshot(&step.meta, server_handle.as_ref()),
+            Err(_) => Err(anyhow::anyhow!("server handle mutex is poisoned")),
+        };
+        let compat_snapshot = match compat_snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                case_failed = true;
+                let _ = writeln!(
+                    log,
+                    "    ❌ failed to snapshot compatibility evidence before step {}: {error:#}",
+                    step.query_number
+                );
+                break;
+            }
+        };
+
         match ctx.mode {
             Mode::Verify => {
                 let retry_count = step_retry_count(step);
@@ -1399,36 +1497,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    if matched_expected_error {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS (expected error matched): engine_error_code={} {}",
-                            expected_code, last_failure
-                        );
-                    } else {
+                if step.meta.expect_error_code.is_some() || step.meta.expect_error.is_some() {
+                    if !finish_expected_error_step(
+                        step,
+                        matched_expected_error,
+                        &last_failure,
+                        &ctx.server_handle,
+                        &compat_snapshot,
+                        &mut log,
+                    ) {
                         case_failed = true;
-                        let _ = writeln!(
-                            log,
-                            "    ❌ {}",
-                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
-                        );
-                    }
-                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                    if matched_expected_error {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ PASS (expected error matched): {}",
-                            last_failure
-                        );
-                    } else {
-                        case_failed = true;
-                        let _ = writeln!(
-                            log,
-                            "    ❌ {}",
-                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
-                        );
-                        let _ = expected_error;
                     }
                 } else if let Some(execution) = passed_execution {
                     // Run wait_alter post-execution polling if annotated.
@@ -1443,6 +1521,20 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        let compat_ok = run_compat_directives_for_successful_step(
+                            step,
+                            &ctx.server_handle,
+                            &compat_snapshot,
+                            &mut log,
+                        );
+                        let compat_ok = match compat_ok {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                case_failed = true;
+                                false
+                            }
+                        };
                         // @imv_stateless_rebuild: trigger the lake-native stateless
                         // rebuild procedure for the named MV and assert its read
                         // face is unchanged. Runs before @imv_equivalence_check so
@@ -1500,7 +1592,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         } else {
                             true
                         };
-                        if explain_ok {
+                        if explain_ok && compat_ok {
                             if !ctx.verify_enabled {
                                 let _ = writeln!(
                                     log,
@@ -1661,8 +1753,28 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
+                let expected_error_compat_ok = if matched_expected_error
+                    && ctx.record_from == RecordFrom::Target
+                {
+                    match run_compat_directives_for_successful_step(
+                        step,
+                        &ctx.server_handle,
+                        &compat_snapshot,
+                        &mut log,
+                    ) {
+                        Ok(()) => true,
+                        Err(reason) => {
+                            case_failed = true;
+                            last_failure = reason;
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
-                    if matched_expected_error {
+                    if matched_expected_error && expected_error_compat_ok {
                         let _ = writeln!(
                             log,
                             "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
@@ -1673,7 +1785,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if step.meta.expect_error.is_some() {
-                    if matched_expected_error {
+                    if matched_expected_error && expected_error_compat_ok {
                         let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
                         case_failed = true;
@@ -1692,8 +1804,26 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if !wait_ok {
                         case_failed = true;
                     } else {
+                        let compat_ok = if ctx.record_from == RecordFrom::Target {
+                            match run_compat_directives_for_successful_step(
+                                step,
+                                &ctx.server_handle,
+                                &compat_snapshot,
+                                &mut log,
+                            ) {
+                                Ok(()) => true,
+                                Err(reason) => {
+                                    case_failed = true;
+                                    let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
                         // @explain_*: validate during record too.
-                        let explain_ok = if !step.meta.explain_contains.is_empty()
+                        let explain_ok = compat_ok
+                            && if !step.meta.explain_contains.is_empty()
                             || !step.meta.explain_not_contains.is_empty()
                         {
                             match run_explain_directive_checks(
@@ -2285,16 +2415,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn shutdown_server_handle(server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>) -> Result<()> {
+    let mut errors = Vec::new();
+    match server_handle.lock() {
+        Ok(mut handle) => {
+            if let Err(error) = handle.shutdown() {
+                errors.push(format!("shutdown failed: {error:#}"));
+            }
+            let residual = handle.residual_process_ids();
+            if !residual.is_empty() {
+                errors.push(format!(
+                    "residual server process IDs after shutdown: {residual:?}"
+                ));
+            }
+        }
+        Err(_) => errors.push("server handle lock poisoned during shutdown".to_string()),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
+}
+
+fn finish_run_with_server_cleanup(
+    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    primary_result: Result<i32>,
+) -> Result<i32> {
+    let cleanup_result = shutdown_server_handle(&server_handle);
+    match (primary_result, cleanup_result) {
+        (Ok(exit_code), Ok(())) => Ok(exit_code),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(0), Err(cleanup)) => Err(anyhow::anyhow!(
+            "server lifecycle cleanup failed: {cleanup:#}"
+        )),
+        (Ok(exit_code), Err(cleanup)) => Err(anyhow::anyhow!(
+            "run exited with code {exit_code}; server lifecycle cleanup failed: {cleanup:#}"
+        )),
+        (Err(primary), Err(cleanup)) => Err(anyhow::anyhow!(
+            "run failed: {primary:#}; server lifecycle cleanup failed: {cleanup:#}"
+        )),
+    }
+}
+
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
-
-    if let Err(e) = validate_cluster_args(cli.cluster_mode, cli.cluster_size) {
-        println!("❌ ERROR: {}", e);
-        return Ok(1);
-    }
 
     ensure_managed_lake_prereqs(&runner_config)?;
 
@@ -2304,32 +2472,31 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    // Resolve selected suites
-    let suite_names: Vec<String> = if cli.suite.eq_ignore_ascii_case("all") {
-        suite_configs.keys().cloned().collect()
-    } else {
-        cli.suite
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect()
-    };
-
-    let all_available: Vec<String> = suite_configs.keys().cloned().collect();
-    for name in &suite_names {
-        if !suite_configs.contains_key(name) {
-            println!(
-                "❌ ERROR: unknown suite '{}'; available suites: {}",
-                name,
-                all_available.join(", ")
-            );
+    let suite_names = match select_suite_names(&cli.suite, &suite_configs) {
+        Ok(suite_names) => suite_names,
+        Err(error) => {
+            println!("❌ ERROR: {error}");
             return Ok(1);
         }
-    }
-
-    if suite_names.is_empty() {
-        println!("❌ ERROR: no suites selected");
+    };
+    let selected_manifest = &suite_configs
+        .get(&suite_names[0])
+        .expect("selected suite exists")
+        .manifest;
+    let (selected_cluster_mode, selected_cluster_size) = match resolve_selected_cluster(
+        selected_manifest.server_mode,
+        selected_manifest.cluster_size,
+        cli.cluster_mode,
+        cli.cluster_size,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            println!("❌ ERROR: {error}");
+            return Ok(1);
+        }
+    };
+    if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
+        println!("❌ ERROR: {error}");
         return Ok(1);
     }
 
@@ -2356,36 +2523,49 @@ fn run() -> Result<i32> {
         scales: parse_scale_overrides(&cli.benchmark_scale)?,
     };
 
+    let launch_cluster_mode = if cli.dry_run {
+        ClusterMode::AllInOne
+    } else {
+        selected_cluster_mode
+    };
+    let launch_cluster_size = if cli.dry_run {
+        1
+    } else {
+        selected_cluster_size
+    };
+    let compat_artifact = if launch_cluster_mode == ClusterMode::StarRocksCompat {
+        Some(CompatArtifact::resolve_expected(&base_dir)?)
+    } else {
+        None
+    };
     let server_handle = launch_server(
-        if cli.dry_run {
-            ClusterMode::AllInOne
-        } else {
-            cli.cluster_mode
-        },
-        cli.cluster_size,
+        launch_cluster_mode,
+        launch_cluster_size,
         &base_dir,
         &runner_config,
+        compat_artifact,
     )?;
+    let launched_target_port = server_handle.target_port();
+    let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
+    let server_handle = Arc::new(Mutex::new(server_handle));
+    let primary_result = (|| -> Result<i32> {
 
     // Resolve global connection params
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
     let target_port = resolve_effective_target_port(
-        server_handle.target_port(),
+        launched_target_port,
         cli.port.as_deref(),
         &runner_config,
     )?;
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
 
-    let target_host = server_handle
-        .target_host()
-        .map(ToOwned::to_owned)
+    let target_host = launched_target_host
         .or_else(|| cli.host.clone())
         .or_else(|| env_optional("STARUST_TEST_HOST"))
         .or_else(|| runner_config.cluster.get("host").cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let server_handle = Arc::new(Mutex::new(server_handle));
     let target_user = cli
         .user
         .clone()
@@ -2604,6 +2784,39 @@ fn run() -> Result<i32> {
             continue;
         }
 
+        for case in &cases {
+            for step in &case.steps {
+                if let Err(error) = compat_directive::validate_record_source(
+                    &step.meta,
+                    cli.mode,
+                    cli.record_from,
+                ) {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
+                if let Err(error) =
+                    compat_directive::validate_execution_mode(&step.meta, cli.mode)
+                {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
+                if let Err(error) = compat_directive::validate_mode(&step.meta, selected_cluster_mode)
+                {
+                    println!(
+                        "❌ ERROR: suite {} case {} step {}: {error}",
+                        suite.name, case.case_id, step.query_number
+                    );
+                    return Ok(1);
+                }
+            }
+        }
+
         if let Err(exc) = validate_fault_injection_jobs(&cases, jobs) {
             println!("❌ ERROR: {}", exc);
             return Ok(1);
@@ -2666,9 +2879,10 @@ fn run() -> Result<i32> {
         println!("mode={}", mode_name(cli.mode));
         println!(
             "cluster_mode={}",
-            match cli.cluster_mode {
+            match selected_cluster_mode {
                 ClusterMode::AllInOne => "all-in-one",
                 ClusterMode::CrossProcess => "cross-process",
+                ClusterMode::StarRocksCompat => "starrocks-compat",
             }
         );
         println!("sql_dir={}", sql_dir.display());
@@ -2896,6 +3110,8 @@ fn run() -> Result<i32> {
     }
 
     Ok(0)
+    })();
+    finish_run_with_server_cleanup(server_handle, primary_result)
 }
 
 #[cfg(test)]
@@ -2913,13 +3129,14 @@ mod tests {
     use crate::{
         Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
-        validate_fault_injection_jobs,
+        finish_expected_error_step, validate_fault_injection_jobs,
     };
     use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_runtime_dir() -> PathBuf {
@@ -3150,6 +3367,132 @@ mod tests {
         assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
     }
 
+    struct MissingCompatEvidenceServer {
+        endpoints: Vec<crate::types::CompatBeEndpoint>,
+    }
+
+    impl crate::cluster::ServerHandle for MissingCompatEvidenceServer {
+        fn target_host(&self) -> Option<&str> {
+            Some("127.0.0.1")
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            Some(9030)
+        }
+
+        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
+            &self.endpoints
+        }
+
+        fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn expected_error_compat_directive_failure_prevents_pass_marker() {
+        let step = SqlStep {
+            query_number: 1,
+            sql: "SELECT rejected".to_string(),
+            meta: QueryMeta {
+                expect_error: Some("planned rejection".to_string()),
+                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                ..QueryMeta::default()
+            },
+        };
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
+            Mutex::new(Box::new(MissingCompatEvidenceServer {
+                endpoints: vec![crate::types::CompatBeEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    heartbeat_port: 19050,
+                    be_port: 19060,
+                    brpc_port: 18060,
+                    http_port: 18040,
+                    grpc_port: 18070,
+                    starlet_port: 19070,
+                }],
+            })),
+        );
+        let mut log = String::new();
+
+        let passed = finish_expected_error_step(
+            &step,
+            true,
+            "planned rejection",
+            &server_handle,
+            &crate::compat_directive::BeLogSnapshot::default(),
+            &mut log,
+        );
+
+        assert!(!passed, "directive failure must fail the step");
+        assert!(log.contains("compatibility directive failed"), "{log}");
+        assert!(!log.contains("PASS (expected error matched)"), "{log}");
+    }
+
+    struct PresentCompatEvidenceServer(MissingCompatEvidenceServer);
+
+    impl crate::cluster::ServerHandle for PresentCompatEvidenceServer {
+        fn target_host(&self) -> Option<&str> {
+            self.0.target_host()
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            self.0.target_port()
+        }
+
+        fn be_endpoints(&self) -> &[crate::types::CompatBeEndpoint] {
+            self.0.be_endpoints()
+        }
+
+        fn be_log_count(&self, _index: usize, _needle: &str) -> anyhow::Result<usize> {
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn expected_error_runs_compat_directives_before_pass_marker() {
+        let step = SqlStep {
+            query_number: 1,
+            sql: "SELECT rejected".to_string(),
+            meta: QueryMeta {
+                expect_error_code: Some("ProtocolDecodeError".to_string()),
+                be_log_contains: vec!["compat_ingress rejected".to_string()],
+                ..QueryMeta::default()
+            },
+        };
+        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> = Arc::new(
+            Mutex::new(Box::new(PresentCompatEvidenceServer(
+                MissingCompatEvidenceServer {
+                    endpoints: vec![crate::types::CompatBeEndpoint {
+                        host: "127.0.0.1".to_string(),
+                        heartbeat_port: 19050,
+                        be_port: 19060,
+                        brpc_port: 18060,
+                        http_port: 18040,
+                        grpc_port: 18070,
+                        starlet_port: 19070,
+                    }],
+                },
+            ))),
+        );
+        let mut log = String::new();
+
+        assert!(finish_expected_error_step(
+            &step,
+            true,
+            "[ProtocolDecodeError] planned rejection",
+            &server_handle,
+            &crate::compat_directive::BeLogSnapshot::default(),
+            &mut log,
+        ));
+
+        let directive = log.find("@be_log_contains PASS").expect("directive PASS");
+        let expected_error = log
+            .find("PASS (expected error matched)")
+            .expect("expected-error PASS");
+        assert!(directive < expected_error, "{log}");
+    }
+
     #[test]
     fn help_includes_benchmark_bootstrap_options() {
         let help = <crate::Cli as clap::CommandFactory>::command()
@@ -3212,6 +3555,95 @@ mod tests {
             "cross-process",
         ]);
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
+    }
+
+    #[test]
+    fn cli_cannot_select_internal_starrocks_compat_cluster_mode() {
+        let error = Cli::try_parse_from([
+            "sql-tests",
+            "--suite",
+            "ssb",
+            "--cluster-mode",
+            "star-rocks-compat",
+        ])
+        .expect_err("internal compatibility mode must not be a CLI escape hatch");
+        let message = error.to_string();
+        assert!(
+            message.contains("[possible values: all-in-one, cross-process]"),
+            "hidden mode leaked into CLI choices: {message}"
+        );
+    }
+
+    #[test]
+    fn selected_cluster_is_manifest_driven_for_starrocks_compat() {
+        let native = super::resolve_selected_cluster(
+            crate::suite_manifest::SuiteServerMode::Native,
+            1,
+            crate::cluster::ClusterMode::CrossProcess,
+            Some(2),
+        )
+        .expect("native CLI selection");
+        assert_eq!(native, (crate::cluster::ClusterMode::CrossProcess, 2));
+
+        for override_size in [None, Some(3)] {
+            let compat = super::resolve_selected_cluster(
+                crate::suite_manifest::SuiteServerMode::StarRocksCompat,
+                3,
+                crate::cluster::ClusterMode::AllInOne,
+                override_size,
+            )
+            .expect("manifest-selected compatibility cluster");
+            assert_eq!(compat, (crate::cluster::ClusterMode::StarRocksCompat, 3));
+        }
+        let error = super::resolve_selected_cluster(
+            crate::suite_manifest::SuiteServerMode::StarRocksCompat,
+            3,
+            crate::cluster::ClusterMode::CrossProcess,
+            Some(2),
+        )
+        .expect_err("compatibility cluster size override must be exactly three");
+        assert!(
+            error
+                .to_string()
+                .contains("starrocks-compat mode requires --cluster-size 3"),
+            "{error:#}"
+        );
+    }
+
+    struct CleanupFailureServer;
+
+    impl crate::cluster::ServerHandle for CleanupFailureServer {
+        fn target_host(&self) -> Option<&str> {
+            Some("127.0.0.1")
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            Some(9030)
+        }
+
+        fn residual_process_ids(&self) -> Vec<u32> {
+            vec![4242]
+        }
+
+        fn shutdown(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("injected shutdown failure")
+        }
+    }
+
+    #[test]
+    fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
+        let server: std::sync::Arc<
+            std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
+        let error = super::finish_run_with_server_cleanup(
+            server,
+            Err(anyhow::anyhow!("injected execution failure")),
+        )
+        .expect_err("primary and cleanup failures must be returned together");
+        let message = format!("{error:#}");
+        assert!(message.contains("injected execution failure"), "{message}");
+        assert!(message.contains("injected shutdown failure"), "{message}");
+        assert!(message.contains("4242"), "{message}");
     }
 
     #[test]
@@ -3635,7 +4067,7 @@ enable_path_style_access = true
     #[test]
     fn cli_cluster_size_defaults_to_one() {
         let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb"]).expect("parse cli");
-        assert_eq!(cli.cluster_size, 1);
+        assert_eq!(cli.cluster_size, None);
     }
 
     #[test]
@@ -3650,7 +4082,7 @@ enable_path_style_access = true
             "2",
         ])
         .expect("parse cli");
-        assert_eq!(cli.cluster_size, 2);
+        assert_eq!(cli.cluster_size, Some(2));
         assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::CrossProcess);
     }
 
@@ -3667,7 +4099,11 @@ enable_path_style_access = true
         ])
         .expect("parse cli");
         // Parsing succeeds; validation rejects it.
-        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        let err = validate_cluster_args(
+            cli.cluster_mode,
+            cli.cluster_size.expect("explicit cluster size"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("--cluster-size must be >= 1"),
             "unexpected: {err}"
@@ -3679,7 +4115,11 @@ enable_path_style_access = true
         let cli = Cli::try_parse_from(["sql-tests", "--suite", "ssb", "--cluster-size", "2"])
             .expect("parse cli");
         assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::AllInOne);
-        let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
+        let err = validate_cluster_args(
+            cli.cluster_mode,
+            cli.cluster_size.expect("explicit cluster size"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("all-in-one mode requires --cluster-size 1"),
@@ -3711,7 +4151,10 @@ enable_path_style_access = true
         let inc = exec(&["k", "c"], &[&["a", "2"]]);
         let full = exec(&["k", "c"], &[&["a", "3"]]);
         let msg = super::imv_equivalence_failure("m", &inc, &full, None).expect("diff");
-        assert!(msg.contains("incremental result != full recompute"), "{msg}");
+        assert!(
+            msg.contains("incremental result != full recompute"),
+            "{msg}"
+        );
     }
 
     #[test]

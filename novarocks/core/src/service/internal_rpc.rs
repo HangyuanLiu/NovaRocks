@@ -23,7 +23,9 @@ use crate::exec::runtime_filter::arrow_type_from_common_type_desc;
 use crate::novarocks_logging::warn;
 use crate::proto;
 use crate::runtime::exchange;
-use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
+use crate::runtime::lookup::{
+    decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
+};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 
 #[cfg(feature = "compat")]
@@ -38,6 +40,10 @@ type CompatTransmitRuntimeFilterResponse = proto::starrocks::PTransmitRuntimeFil
 type CompatLookupRequest = proto::starrocks::PLookUpRequest; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
 type CompatLookupResponse = proto::starrocks::PLookUpResponse; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatLookupCloseRequest = proto::starrocks::PLookUpCloseRequest; // cfg(feature = "compat")
+#[cfg(feature = "compat")]
+type CompatLookupCloseResponse = proto::starrocks::PLookUpCloseResponse; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
 type CompatColumn = proto::starrocks::PColumn; // cfg(feature = "compat")
 
@@ -476,7 +482,7 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
         request_columns.insert(slot_id, array);
     }
 
-    match execute_lookup_request(query_id, tuple_id, request_columns) {
+    match execute_position_lookup_request(query_id, tuple_id, request_columns) {
         Ok(columns) => {
             for (slot_id, array) in columns {
                 let data = match encode_column_ipc(&array) {
@@ -567,6 +573,33 @@ pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResp
                 data: Some(col.data),
             })
             .collect(),
+    }
+}
+
+#[cfg(feature = "compat")]
+pub(crate) fn handle_lookup_close_compat(
+    req: CompatLookupCloseRequest,
+) -> CompatLookupCloseResponse {
+    let Some(query_id) = req.query_id else {
+        return CompatLookupCloseResponse {
+            status: Some(error_status("missing query_id for lookup_close")),
+        };
+    };
+    let Some(lookup_node_id) = req.lookup_node_id else {
+        return CompatLookupCloseResponse {
+            status: Some(error_status("missing lookup_node_id for lookup_close")),
+        };
+    };
+    let query_id = QueryId {
+        hi: query_id.hi,
+        lo: query_id.lo,
+    };
+    let status = match query_context_manager().complete_lookup_fetcher(query_id, lookup_node_id) {
+        Ok(()) => ok_status(),
+        Err(err) => error_status(err),
+    };
+    CompatLookupCloseResponse {
+        status: Some(status),
     }
 }
 
@@ -842,6 +875,8 @@ mod tests {
             pipeline_sink_dop: None,
             report_when_finish: None,
             exec_debug_options: None,
+            per_look_up_num_fetchers: None,
+            per_fetch_target_nodes: None,
         };
         let request = thrift_internal_service::TExecPlanFragmentParams {
             protocol_version: thrift_internal_service::InternalServiceVersion::V1,

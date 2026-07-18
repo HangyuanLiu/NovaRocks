@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::suite_manifest::SuiteManifest;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +32,7 @@ pub struct SuiteConfig {
     pub verify_default: bool,
     pub init_sql: Option<PathBuf>,
     pub cleanup_sql: Option<PathBuf>,
+    pub manifest: SuiteManifest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +109,23 @@ pub struct QueryMeta {
     /// `Package`) — i.e. its lake-native metadata is sufficient to reproduce
     /// current contents without relying on in-process incremental state.
     pub imv_stateless_rebuild: Option<ImvStatelessDirective>,
+    /// Require a substring to occur in at least one runner-owned BE log.
+    pub be_log_contains: Vec<String>,
+    /// Require the total non-overlapping substring count across all BE logs.
+    pub be_log_count_at_least: Vec<(String, usize)>,
+    /// Require a substring to appear in at least this many distinct BE logs.
+    pub be_log_be_count_at_least: Vec<(String, usize)>,
+    /// Run a fresh external BRPC negative compatibility fixture after the SQL step.
+    pub compat_probes: Vec<String>,
+}
+
+impl QueryMeta {
+    pub fn has_compat_directives(&self) -> bool {
+        !self.be_log_contains.is_empty()
+            || !self.be_log_count_at_least.is_empty()
+            || !self.be_log_be_count_at_least.is_empty()
+            || !self.compat_probes.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +158,17 @@ pub struct ConnectionConfig {
     pub password: Option<String>,
     pub catalog: Option<String>,
     pub db: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatBeEndpoint {
+    pub host: String,
+    pub heartbeat_port: u16,
+    pub be_port: u16,
+    pub brpc_port: u16,
+    pub http_port: u16,
+    pub grpc_port: u16,
+    pub starlet_port: u16,
 }
 
 #[derive(Debug, Clone)]

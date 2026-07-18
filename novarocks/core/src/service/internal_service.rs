@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock, mpsc};
 
 use crate::novarocks_logging::{error, info, warn};
 
@@ -27,6 +27,7 @@ use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::lower::compat::fragment::execute_fragment;
 use crate::lower::compat::node::hdfs_scan::cache_iceberg_table_locations;
+use crate::lower::compat::node::lower_row_pos_descs;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{ProfileUnit, Profiler};
@@ -335,6 +336,283 @@ fn collect_exchange_sender_counts(
     counts
 }
 
+fn collect_fragment_row_position_metadata(
+    fragment: &planner::TPlanFragment,
+) -> Result<HashMap<i32, crate::exec::row_position::RowPositionDescriptor>, String> {
+    let Some(plan) = fragment.plan.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let mut prepared: HashMap<i32, crate::exec::row_position::RowPositionDescriptor> =
+        HashMap::new();
+    for node in &plan.nodes {
+        let (node_name, thrift_descs) =
+            if node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE {
+                let lookup = node
+                    .look_up_node
+                    .as_ref()
+                    .ok_or_else(|| "LOOKUP_NODE missing look_up_node payload".to_string())?;
+                (
+                    "LOOKUP_NODE",
+                    lookup
+                        .row_pos_descs
+                        .as_ref()
+                        .ok_or_else(|| "LOOKUP_NODE missing row_pos_descs".to_string())?,
+                )
+            } else if node.node_type == crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
+                let fetch = node
+                    .fetch_node
+                    .as_ref()
+                    .ok_or_else(|| "FETCH_NODE missing fetch_node payload".to_string())?;
+                (
+                    "FETCH_NODE",
+                    fetch
+                        .row_pos_descs
+                        .as_ref()
+                        .ok_or_else(|| "FETCH_NODE missing row_pos_descs".to_string())?,
+                )
+            } else {
+                continue;
+            };
+        let descs = lower_row_pos_descs(thrift_descs)?;
+        if descs.is_empty() {
+            return Err(format!("{node_name} row_pos_descs is empty"));
+        }
+        for (tuple_id, incoming) in descs {
+            if let Some(existing) = prepared.get(&tuple_id) {
+                if existing.row_position_type != incoming.row_position_type
+                    || existing.row_source_slot != incoming.row_source_slot
+                    || existing.fetch_ref_slots != incoming.fetch_ref_slots
+                    || existing.lookup_ref_slots != incoming.lookup_ref_slots
+                {
+                    return Err(format!(
+                        "conflicting row position descriptor for tuple_id={tuple_id}"
+                    ));
+                }
+            } else {
+                prepared.insert(tuple_id, incoming);
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+fn prepare_fragment_row_position_metadata(
+    mgr: &QueryContextManager,
+    query_id: QueryId,
+    fragment: &planner::TPlanFragment,
+) -> Result<(), String> {
+    let prepared = collect_fragment_row_position_metadata(fragment)?;
+    if !prepared.is_empty() {
+        // StarRocks prepares LOOKUP/FETCH metadata before acknowledging fragment ingress.
+        // Register it synchronously so a remote lookup cannot race async plan lowering.
+        mgr.register_row_pos_descs(query_id, prepared)?;
+    }
+    Ok(())
+}
+
+fn prepare_lookup_lifecycle(
+    mgr: &QueryContextManager,
+    query_id: QueryId,
+    fragment: &planner::TPlanFragment,
+    exec_params: &internal_service::TPlanFragmentExecParams,
+) -> Result<(), String> {
+    let Some(plan) = fragment.plan.as_ref() else {
+        return Ok(());
+    };
+    let lookup_node_ids = plan
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE)
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    if lookup_node_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut lifecycles = HashMap::new();
+    for node_id in lookup_node_ids {
+        let lifecycle = match exec_params
+            .per_look_up_num_fetchers
+            .as_ref()
+            .and_then(|counts| counts.get(&node_id))
+        {
+            Some(count) => crate::runtime::query_context::LookupFetcherLifecycle::Exact(
+                usize::try_from(*count).map_err(|_| {
+                    format!("lookup node {node_id} has negative fetcher count {count}")
+                })?,
+            ),
+            None => crate::runtime::query_context::LookupFetcherLifecycle::Unknown,
+        };
+        lifecycles.insert(node_id, lifecycle);
+    }
+    mgr.register_lookup_fetchers(query_id, lifecycles)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LookupCloseTarget {
+    lookup_node_id: i32,
+    host: String,
+    port: i32,
+}
+
+fn collect_lookup_close_targets(fragment: &planner::TPlanFragment) -> Vec<LookupCloseTarget> {
+    let Some(plan) = fragment.plan.as_ref() else {
+        return Vec::new();
+    };
+    let mut targets = HashSet::new();
+    for node in &plan.nodes {
+        if node.node_type != crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
+            continue;
+        }
+        let Some(fetch) = node.fetch_node.as_ref() else {
+            continue;
+        };
+        let (Some(lookup_node_id), Some(nodes_info)) =
+            (fetch.target_node_id, fetch.nodes_info.as_ref())
+        else {
+            continue;
+        };
+        for target in &nodes_info.nodes {
+            targets.insert(LookupCloseTarget {
+                lookup_node_id,
+                host: target.host.clone(),
+                port: target.async_internal_port,
+            });
+        }
+    }
+    targets.into_iter().collect()
+}
+
+struct LookupCloseGuard {
+    query_id: QueryId,
+    targets: Vec<LookupCloseTarget>,
+}
+
+#[derive(Debug)]
+struct LookupCloseTask {
+    query_id: QueryId,
+    target: LookupCloseTarget,
+}
+
+struct LookupCloseDispatcher {
+    sender: mpsc::SyncSender<LookupCloseTask>,
+}
+
+const LOOKUP_CLOSE_WORKERS: usize = 4;
+const LOOKUP_CLOSE_QUEUE_CAPACITY: usize = 256;
+
+impl LookupCloseDispatcher {
+    fn start() -> Result<Self, String> {
+        let (sender, receiver) = mpsc::sync_channel(LOOKUP_CLOSE_QUEUE_CAPACITY);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        for index in 0..LOOKUP_CLOSE_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("lookup-close-{index}"))
+                .spawn(move || lookup_close_worker(receiver))
+                .map_err(|error| format!("failed to start lookup_close worker {index}: {error}"))?;
+        }
+        Ok(Self { sender })
+    }
+
+    fn try_dispatch(&self, task: LookupCloseTask) -> Result<(), String> {
+        self.sender.try_send(task).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "lookup_close queue is full".to_string(),
+            mpsc::TrySendError::Disconnected(_) => {
+                "lookup_close dispatcher is disconnected".to_string()
+            }
+        })
+    }
+}
+
+fn lookup_close_dispatcher() -> Result<&'static LookupCloseDispatcher, String> {
+    static DISPATCHER: OnceLock<Result<LookupCloseDispatcher, String>> = OnceLock::new();
+    DISPATCHER
+        .get_or_init(LookupCloseDispatcher::start)
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn lookup_close_worker(receiver: Arc<std::sync::Mutex<mpsc::Receiver<LookupCloseTask>>>) {
+    loop {
+        let task = {
+            let receiver = receiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            receiver.recv()
+        };
+        let Ok(task) = task else {
+            return;
+        };
+        let port = match u16::try_from(task.target.port) {
+            Ok(port) => port,
+            Err(_) => {
+                warn!(
+                    target: "novarocks::rpc",
+                    query_id = %task.query_id,
+                    lookup_node_id = task.target.lookup_node_id,
+                    host = %task.target.host,
+                    port = task.target.port,
+                    "lookup_close skipped: async_internal_port out of u16 range"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = crate::service::internal_rpc_client::lookup_close(
+            &task.target.host,
+            port,
+            task.query_id,
+            task.target.lookup_node_id,
+        ) {
+            warn!(
+                target: "novarocks::rpc",
+                query_id = %task.query_id,
+                lookup_node_id = task.target.lookup_node_id,
+                host = %task.target.host,
+                port,
+                error = %err,
+                "lookup_close failed"
+            );
+        }
+    }
+}
+
+impl Drop for LookupCloseGuard {
+    fn drop(&mut self) {
+        let dispatcher = match lookup_close_dispatcher() {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                warn!(
+                    target: "novarocks::rpc",
+                    query_id = %self.query_id,
+                    error = %error,
+                    "lookup_close dispatch unavailable"
+                );
+                return;
+            }
+        };
+        for target in self.targets.drain(..) {
+            let lookup_node_id = target.lookup_node_id;
+            let host = target.host.clone();
+            let port = target.port;
+            if let Err(error) = dispatcher.try_dispatch(LookupCloseTask {
+                query_id: self.query_id,
+                target,
+            }) {
+                warn!(
+                    target: "novarocks::rpc",
+                    query_id = %self.query_id,
+                    lookup_node_id,
+                    host = %host,
+                    port,
+                    error = %error,
+                    "lookup_close dispatch rejected"
+                );
+            }
+        }
+    }
+}
+
 fn spawn_exec_fragment(
     fragment: planner::TPlanFragment,
     desc_tbl: Option<descriptors::TDescriptorTable>,
@@ -354,6 +632,7 @@ fn spawn_exec_fragment(
     typed_result_sink: bool,
     mgr: Arc<QueryContextManager>,
 ) {
+    let lookup_close_targets = collect_lookup_close_targets(&fragment);
     let uses_fetch_result_buffer = matches!(
         fragment.output_sink.as_ref().map(|sink| sink.type_),
         Some(data_sinks::TDataSinkType::RESULT_SINK)
@@ -375,34 +654,42 @@ fn spawn_exec_fragment(
         let query_opts = query_opts.as_ref();
         let wall_start = std::time::Instant::now();
         let profiler_for_wall = profiler.clone();
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_fragment(
-                &fragment,
-                desc_tbl.as_ref(),
-                Some(&exec_params),
-                query_opts,
-                session_time_zone.as_deref(),
-                pipeline_dop,
-                group_execution_scan_dop,
-                db_name.as_deref(),
-                profiler,
-                last_query_id.as_deref(),
-                fe_addr.as_ref(),
-                backend_num,
-                mem_tracker,
-                typed_result_sink,
-            )
-        }))
-        .unwrap_or_else(|payload| {
-            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic payload".to_string()
+        let out = {
+            // One guard per fragment instance, not per pipeline driver. Dropping it after the
+            // entire executor returns mirrors StarRocks FetchProcessorFactory::close_context.
+            let _lookup_close_guard = LookupCloseGuard {
+                query_id,
+                targets: lookup_close_targets,
             };
-            Err(format!("panic in fragment execution: {msg}"))
-        });
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_fragment(
+                    &fragment,
+                    desc_tbl.as_ref(),
+                    Some(&exec_params),
+                    query_opts,
+                    session_time_zone.as_deref(),
+                    pipeline_dop,
+                    group_execution_scan_dop,
+                    db_name.as_deref(),
+                    profiler,
+                    last_query_id.as_deref(),
+                    fe_addr.as_ref(),
+                    backend_num,
+                    mem_tracker,
+                    typed_result_sink,
+                )
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                Err(format!("panic in fragment execution: {msg}"))
+            })
+        };
         if let Some(p) = profiler_for_wall.as_ref() {
             let elapsed_ns =
                 crate::runtime::profile::clamp_u128_to_i64(wall_start.elapsed().as_nanos());
@@ -671,6 +958,8 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let fragment = fragment.clone();
         backfill_per_node_scan_ranges(&mut exec_params);
         validate_internal_addresses(&exec_params, Some(&fragment))?;
+        prepare_fragment_row_position_metadata(mgr.as_ref(), query_id, &fragment)?;
+        prepare_lookup_lifecycle(mgr.as_ref(), query_id, &fragment, &exec_params)?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
             let params = RuntimeFilterParams::from_thrift(&params)?;
             mgr.set_runtime_filter_params(query_id, params)?;
@@ -842,6 +1131,8 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let fragment = fragment.clone();
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
+    prepare_fragment_row_position_metadata(mgr.as_ref(), query_id, &fragment)?;
+    prepare_lookup_lifecycle(mgr.as_ref(), query_id, &fragment, &params)?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
         let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
         mgr.set_runtime_filter_params(query_id, rf_params)?;
@@ -971,7 +1262,10 @@ fn resolve_pipeline_dop(request: &internal_service::TExecPlanFragmentParams) -> 
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::validate_internal_addresses;
+    use super::{
+        LookupCloseGuard, collect_fragment_row_position_metadata, collect_lookup_close_targets,
+        validate_internal_addresses,
+    };
     use crate::thrift::{
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
         runtime_filter, types,
@@ -1023,6 +1317,8 @@ mod tests {
             pipeline_sink_dop: None,
             report_when_finish: None,
             exec_debug_options: None,
+            per_look_up_num_fetchers: None,
+            per_fetch_target_nodes: None,
         }
     }
 
@@ -1239,6 +1535,195 @@ mod tests {
                 .port,
             9060
         );
+    }
+
+    #[test]
+    fn fetch_fragment_collects_one_lookup_close_per_target_node() {
+        let mut fragment = fragment(9050, 9060);
+        let duplicate = fragment.plan.as_ref().expect("plan").nodes[0].clone();
+        fragment.plan.as_mut().expect("plan").nodes.push(duplicate);
+
+        let targets = collect_lookup_close_targets(&fragment);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].lookup_node_id, 8);
+        assert_eq!(targets[0].host, "fetch-host");
+        assert_eq!(targets[0].port, 9050);
+    }
+
+    #[test]
+    fn lookup_close_guard_dispatches_concurrently_without_waiting_for_unreachable_targets() {
+        let _hook_guard = crate::service::internal_rpc_client::test_hook_lock();
+        crate::service::internal_rpc_client::clear_test_hooks();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_hook = std::sync::Arc::clone(&release);
+        crate::service::internal_rpc_client::set_lookup_close_hook(move |host, port, request| {
+            started_tx
+                .send((host.to_string(), port, request))
+                .expect("started receiver");
+            let (lock, condvar) = &*release_hook;
+            let released = lock.lock().expect("release lock");
+            let (released, _) = condvar
+                .wait_timeout_while(released, std::time::Duration::from_secs(1), |released| {
+                    !*released
+                })
+                .expect("release wait");
+            if *released {
+                Ok(())
+            } else {
+                Err("simulated unreachable target".to_string())
+            }
+        });
+        let fragment = fragment(9050, 9060);
+        let mut targets = collect_lookup_close_targets(&fragment);
+        targets.push(super::LookupCloseTarget {
+            lookup_node_id: 9,
+            host: "second-fetch-host".to_string(),
+            port: 9051,
+        });
+
+        let started_at = std::time::Instant::now();
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = LookupCloseGuard {
+                query_id: crate::runtime::query_context::QueryId { hi: 41, lo: 42 },
+                targets,
+            };
+            panic!("simulated fragment panic");
+        });
+
+        assert!(unwind.is_err());
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_millis(100),
+            "LookupCloseGuard::drop must not wait for the RPC"
+        );
+        let first = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first close task must be dispatched");
+        let second = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second close task must be dispatched while first is blocked");
+        let mut captured = vec![first, second];
+        captured.sort_by_key(|(_, port, _)| *port);
+        assert_eq!(captured[0].0, "fetch-host");
+        assert_eq!(captured[0].1, 9050);
+        assert_eq!(captured[0].2.lookup_node_id, Some(8));
+        assert_eq!(captured[1].0, "second-fetch-host");
+        assert_eq!(captured[1].1, 9051);
+        assert_eq!(captured[1].2.lookup_node_id, Some(9));
+        assert_eq!(
+            captured[0].2.query_id,
+            Some(crate::proto::starrocks::PUniqueId { hi: 41, lo: 42 })
+        );
+        let (lock, condvar) = &*release;
+        *lock.lock().expect("release lock") = true;
+        condvar.notify_all();
+        crate::service::internal_rpc_client::clear_test_hooks();
+    }
+
+    #[test]
+    fn lookup_close_dispatcher_rejects_full_queue_without_panicking() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let dispatcher = super::LookupCloseDispatcher { sender };
+        let task = |lookup_node_id| super::LookupCloseTask {
+            query_id: crate::runtime::query_context::QueryId { hi: 1, lo: 2 },
+            target: super::LookupCloseTarget {
+                lookup_node_id,
+                host: "fetch-host".to_string(),
+                port: 9050,
+            },
+        };
+
+        dispatcher.try_dispatch(task(8)).expect("first queue slot");
+        let error = dispatcher
+            .try_dispatch(task(9))
+            .expect_err("full queue must reject without blocking");
+
+        assert_eq!(error, "lookup_close queue is full");
+    }
+
+    #[test]
+    fn lookup_metadata_is_registered_during_synchronous_fragment_prepare() {
+        let descriptor = descriptors::TRowPositionDescriptor::new(
+            descriptors::TRowPositionType::LAKE_ROW_POSITION,
+            11,
+            vec![12, 13, 14],
+            vec![15, 16, 17],
+            0,
+        );
+        let mut lookup = plan_node(3, plan_nodes::TPlanNodeType::LOOKUP_NODE, None, None);
+        lookup.look_up_node = Some(plan_nodes::TLookUpNode::new(BTreeMap::from([(
+            3, descriptor,
+        )])));
+        let mut fragment = fragment(9050, 9060);
+        fragment.plan = Some(plan_nodes::TPlan::new(vec![lookup]));
+
+        let prepared = collect_fragment_row_position_metadata(&fragment)
+            .expect("collect lookup metadata during prepare");
+
+        let registered = prepared
+            .get(&3)
+            .expect("lookup metadata must be available to synchronous registration");
+        assert_eq!(registered.row_source_slot.as_u32(), 11);
+        assert_eq!(
+            registered
+                .fetch_ref_slots
+                .iter()
+                .map(|slot| slot.as_u32())
+                .collect::<Vec<_>>(),
+            vec![12, 13, 14]
+        );
+    }
+
+    #[test]
+    fn lookup_prepare_rejects_missing_payload_before_async_execution() {
+        let mut fragment = fragment(9050, 9060);
+        fragment.plan = Some(plan_nodes::TPlan::new(vec![plan_node(
+            3,
+            plan_nodes::TPlanNodeType::LOOKUP_NODE,
+            None,
+            None,
+        )]));
+
+        let error = collect_fragment_row_position_metadata(&fragment)
+            .expect_err("missing lookup payload must fail during prepare");
+        assert_eq!(error, "LOOKUP_NODE missing look_up_node payload");
+    }
+
+    #[test]
+    fn conflicting_fragment_metadata_is_rejected_without_partial_registration() {
+        let lookup_descriptor = descriptors::TRowPositionDescriptor::new(
+            descriptors::TRowPositionType::LAKE_ROW_POSITION,
+            11,
+            vec![12, 13, 14],
+            vec![15, 16, 17],
+            0,
+        );
+        let fetch_descriptor = descriptors::TRowPositionDescriptor::new(
+            descriptors::TRowPositionType::LAKE_ROW_POSITION,
+            21,
+            vec![22, 23, 24],
+            vec![25, 26, 27],
+            0,
+        );
+        let mut lookup = plan_node(3, plan_nodes::TPlanNodeType::LOOKUP_NODE, None, None);
+        lookup.look_up_node = Some(plan_nodes::TLookUpNode::new(BTreeMap::from([(
+            3,
+            lookup_descriptor,
+        )])));
+        let fetch = plan_nodes::TFetchNode::new(
+            3,
+            BTreeMap::from([(3, fetch_descriptor)]),
+            None::<descriptors::TNodesInfo>,
+        );
+        let fetch = plan_node(4, plan_nodes::TPlanNodeType::FETCH_NODE, None, Some(fetch));
+        let mut fragment = fragment(9050, 9060);
+        fragment.plan = Some(plan_nodes::TPlan::new(vec![lookup, fetch]));
+
+        let error = collect_fragment_row_position_metadata(&fragment)
+            .expect_err("conflicting fragment metadata must fail during prepare");
+        assert_eq!(error, "conflicting row position descriptor for tuple_id=3");
     }
 
     #[test]

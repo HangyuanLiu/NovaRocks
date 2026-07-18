@@ -82,6 +82,44 @@ grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
 targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt")"
 grep -qx "optimizer-dist" <<<"$targeted_suites"
 
+RUN_MODE="all-discovered"
+resolve_suites
+if printf '%s\n' "${SUITES[@]}" | grep -qx "starrocks-compat"; then
+  echo "all-discovered mode must exclude explicit-only SQL suites" >&2
+  exit 1
+fi
+
+resolve_root="$tmpdir/resolve-malformed"
+mkdir -p \
+  "$resolve_root/sql-tests/a-valid/sql" \
+  "$resolve_root/sql-tests/z-malformed/sql"
+printf '%s\n' 'explicit_only = false' \
+  >"$resolve_root/sql-tests/a-valid/suite.toml"
+printf '%s\n' 'explicit_only = "false"' \
+  >"$resolve_root/sql-tests/z-malformed/suite.toml"
+resolve_status=0
+(
+  REPO_ROOT="$resolve_root"
+  RUN_MODE="all-discovered"
+  resolve_suites
+) 2>"$resolve_root/resolve.err" || resolve_status=$?
+if [ "$resolve_status" -eq 0 ]; then
+  echo "all-discovered resolution must propagate malformed metadata failure" >&2
+  exit 1
+fi
+if [ "$resolve_status" -ne 2 ]; then
+  echo "all-discovered resolution returned $resolve_status instead of discovery status 2" >&2
+  exit 1
+fi
+
+RUN_MODE="explicit"
+REQUESTED_SUITES=("starrocks-compat")
+resolve_suites
+if [ "${#SUITES[@]}" -ne 1 ] || [ "${SUITES[0]}" != "starrocks-compat" ]; then
+  echo "explicit mode must continue to accept explicit-only SQL suites" >&2
+  exit 1
+fi
+
 if [ "$SQL_CLUSTER_MODE" != "cross-process" ]; then
   echo "default SQL cluster mode must be cross-process" >&2
   exit 1
@@ -201,6 +239,29 @@ if ! (
   exit 1
 fi
 
+run_cargo_gates_text="$(declare -f run_cargo_gates)"
+if grep -q -- '--features compat' <<<"$run_cargo_gates_text"; then
+  echo "default cargo gates must not build or test compat" >&2
+  exit 1
+fi
+
+if ! declare -F run_compat_gates >/dev/null; then
+  echo "local-full-ci must define explicit compat gates" >&2
+  exit 1
+fi
+
+run_compat_gates_text="$(declare -f run_compat_gates)"
+for expected in \
+  'cargo clippy -p novarocks-server -p novarocks --all-targets --features compat' \
+  'tools/ci/build-compat-artifact.sh' \
+  'cargo test -p novarocks-server -p novarocks --profile "$NOVA_CI_CARGO_PROFILE" --features compat' \
+  'run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"'; do
+  if ! grep -q -- "$expected" <<<"$run_compat_gates_text"; then
+    echo "explicit compat gates must include: $expected" >&2
+    exit 1
+  fi
+done
+
 default_compat_output="$({
   WITH_COMPAT="false"
   ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
@@ -212,7 +273,11 @@ if grep -q '^run:' <<<"$default_compat_output"; then
   echo "default local-full-ci must not execute compat gates" >&2
   exit 1
 fi
-for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+for stage in \
+  "cargo clippy compat" \
+  "cargo build compat artifact" \
+  "cargo test compat" \
+  "starrocks-compat E2E"; do
   if ! grep -qx "record:$stage:SKIP" <<<"$default_compat_output"; then
     echo "default local-full-ci must record $stage as SKIP" >&2
     exit 1
@@ -222,14 +287,21 @@ done
 explicit_compat_output="$({
   WITH_COMPAT="true"
   SKIP_CARGO_TEST="false"
+  CI_RUN_DIR="$tmpdir/compat-run"
   ci_record_stage() { printf 'record:%s:%s\n' "$1" "$2"; }
   ci_render_summary() { :; }
   run_fail_fast_stage() { printf 'run:%s\n' "$1"; }
   run_compat_gates
 })"
-for stage in "cargo clippy compat" "cargo build compat" "cargo test compat"; do
+for stage in \
+  "cargo clippy compat" \
+  "cargo build compat artifact" \
+  "cargo test compat" \
+  "starrocks-compat E2E"; do
   if ! grep -qx "run:$stage" <<<"$explicit_compat_output"; then
     echo "--with-compat must execute $stage" >&2
     exit 1
   fi
 done
+
+echo "local-full-ci-classification-test: PASS"

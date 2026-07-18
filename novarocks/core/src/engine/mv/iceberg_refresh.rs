@@ -12191,7 +12191,11 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     #[test]
     fn aggregate_refresh_source_does_not_use_legacy_sql_delta_path() {
-        let source = std::fs::read_to_string(file!()).expect("read source");
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/engine/mv/iceberg_refresh.rs"
+        ))
+        .expect("read source");
         let forbidden = [
             concat!("execute_delta_source_", "query"),
             concat!("iceberg_aggregate_incremental_", "delta_select_sql"),
@@ -12235,7 +12239,11 @@ mod join_delta_append_only_fast_path_tests {
 
     #[test]
     fn join_incremental_refresh_production_route_uses_logical_executors() {
-        let source = std::fs::read_to_string(file!()).expect("read source");
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/engine/mv/iceberg_refresh.rs"
+        ))
+        .expect("read source");
         let route_body = source_between(
             &source,
             "\nfn incremental_refresh_iceberg_join_mv(\n",
@@ -12265,7 +12273,11 @@ mod join_delta_append_only_fast_path_tests {
 
     #[test]
     fn join_repartition_overwrite_uses_change_stream_write_path() {
-        let source = std::fs::read_to_string(file!()).expect("read source");
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/engine/mv/iceberg_refresh.rs"
+        ))
+        .expect("read source");
         let repartition_body = source_between(
             &source,
             "\nfn repartition_iceberg_join_mv_overwrite(\n",

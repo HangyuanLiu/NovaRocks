@@ -301,7 +301,10 @@ int32_t invoke_internal_brpc_client(
                 const Request*,
                 Response*,
                 google::protobuf::Closure*),
-        const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr) {
+        const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr,
+        const uint8_t* attachment_ptr = nullptr,
+        size_t attachment_len = 0,
+        int max_retry = -1) {
     init_compat_buf(out_resp);
     init_compat_buf(out_err);
 
@@ -315,6 +318,10 @@ int32_t invoke_internal_brpc_client(
     }
     if (ptr == nullptr) {
         write_compat_buf(std::string(rpc_name) + " request ptr is null", out_err);
+        return 2;
+    }
+    if (attachment_len > 0 && attachment_ptr == nullptr) {
+        write_compat_buf(std::string(rpc_name) + " attachment ptr is null", out_err);
         return 2;
     }
 
@@ -358,12 +365,24 @@ int32_t invoke_internal_brpc_client(
     starrocks::PInternalService_Stub stub(channel.get());
     brpc::Controller cntl;
     cntl.set_timeout_ms(600000);
+    if (max_retry >= 0) {
+        cntl.set_max_retry(max_retry);
+    }
+    if (attachment_len > 0 &&
+        cntl.request_attachment().append(attachment_ptr, attachment_len) != 0) {
+        write_compat_buf(std::string(rpc_name) + " attachment allocation failed", out_err);
+        return 1;
+    }
     if (configure) {
         configure(&cntl, request);
     }
     Response response;
     (stub.*method)(&cntl, &request, &response, nullptr);
     if (cntl.Failed()) {
+        std::string response_bytes;
+        if (response.IsInitialized() && response.SerializeToString(&response_bytes)) {
+            write_compat_buf(response_bytes, out_resp);
+        }
         write_compat_buf(std::string(rpc_name) + " request failed: " + cntl.ErrorText(), out_err);
         return 1;
     }
@@ -1063,6 +1082,19 @@ public:
                               [cntl, request, response]() { run_lookup(cntl, request, response); });
     }
 
+    void lookup_close(google::protobuf::RpcController* controller,
+                      const starrocks::PLookUpCloseRequest* request,
+                      starrocks::PLookUpCloseResponse* response,
+                      google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task("lookup_close",
+                              response,
+                              done,
+                              [cntl, request, response]() {
+                                  run_lookup_close(cntl, request, response);
+                              });
+    }
+
 private:
     template <typename Response>
     static void finish_query_rpc_error(Response* response,
@@ -1166,6 +1198,7 @@ private:
             return;
         }
 
+        std::cerr << "[INFO] compat_ingress method=exec_plan_fragment" << std::endl;
         status_ok(response->mutable_status());
     }
 
@@ -1197,6 +1230,7 @@ private:
                        "rust submit_exec_batch_plan_fragments failed");
             return;
         }
+        std::cerr << "[INFO] compat_ingress method=exec_batch_plan_fragments" << std::endl;
         status_ok(response->mutable_status());
     }
 
@@ -1240,6 +1274,9 @@ private:
         }
         if (!response->has_status()) {
             status_ok(response->mutable_status());
+        }
+        if (request->eos()) {
+            std::cerr << "[INFO] compat_exchange_receive eos=true" << std::endl;
         }
     }
 
@@ -1297,6 +1334,7 @@ private:
         if (!response->has_status()) {
             status_ok(response->mutable_status());
         }
+        std::cerr << "[INFO] compat_rpc method=transmit_runtime_filter" << std::endl;
     }
 
     static void run_lookup(brpc::Controller* cntl,
@@ -1324,6 +1362,50 @@ private:
         if (!response->has_status()) {
             status_ok(response->mutable_status());
         }
+        std::cerr << "[INFO] compat_rpc method=lookup" << std::endl;
+    }
+
+    static void run_lookup_close(brpc::Controller* cntl,
+                                 const starrocks::PLookUpCloseRequest* request,
+                                 starrocks::PLookUpCloseResponse* response) {
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing lookup_close request/response");
+            }
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing lookup_close request/response");
+            }
+            return;
+        }
+
+        std::string err;
+        if (!invoke_lookup_close(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            std::cerr << "[WARN] compat_rpc method=lookup_close direction=receive status=error error="
+                      << err << std::endl;
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+        if (response->has_status() &&
+            response->status().status_code() ==
+                    static_cast<int32_t>(starrocks::TStatusCode::OK)) {
+            std::cerr << "[INFO] compat_rpc method=lookup_close direction=receive status=ok"
+                      << std::endl;
+        } else {
+            const int32_t status_code = response->has_status()
+                                                ? response->status().status_code()
+                                                : static_cast<int32_t>(
+                                                          starrocks::TStatusCode::INTERNAL_ERROR);
+            std::cerr
+                    << "[WARN] compat_rpc method=lookup_close direction=receive status=error status_code="
+                    << status_code << std::endl;
+        }
     }
 
     static bool invoke_transmit_chunk(const starrocks::PTransmitChunkParams& request,
@@ -1348,6 +1430,13 @@ private:
                               starrocks::PLookUpResponse* response,
                               std::string* err) {
         return invoke_rust_unary_rpc(request, response, novarocks_rs_lookup, "lookup", err);
+    }
+
+    static bool invoke_lookup_close(const starrocks::PLookUpCloseRequest& request,
+                                    starrocks::PLookUpCloseResponse* response,
+                                    std::string* err) {
+        return invoke_rust_unary_rpc(
+                request, response, novarocks_rs_lookup_close, "lookup_close", err);
     }
 
     static bool invoke_update_fail_point_status(
@@ -2463,6 +2552,101 @@ std::atomic<bool> g_brpc_started{false};
 
 } // namespace
 
+int32_t novarocks_compat_exec_plan_fragment(const char* host,
+                                            uint16_t port,
+                                            const uint8_t* request_ptr,
+                                            size_t request_len,
+                                            const uint8_t* attachment_ptr,
+                                            size_t attachment_len,
+                                            NovaRocksRustBuf* out_resp,
+                                            NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PExecPlanFragmentRequest,
+                                       starrocks::PExecPlanFragmentResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "exec_plan_fragment",
+            &starrocks::PInternalService_Stub::exec_plan_fragment,
+            nullptr,
+            attachment_ptr,
+            attachment_len,
+            0);
+}
+
+int32_t novarocks_compat_exec_batch_plan_fragments(const char* host,
+                                                   uint16_t port,
+                                                   const uint8_t* request_ptr,
+                                                   size_t request_len,
+                                                   const uint8_t* attachment_ptr,
+                                                   size_t attachment_len,
+                                                   NovaRocksRustBuf* out_resp,
+                                                   NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PExecBatchPlanFragmentsRequest,
+                                       starrocks::PExecBatchPlanFragmentsResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "exec_batch_plan_fragments",
+            &starrocks::PInternalService_Stub::exec_batch_plan_fragments,
+            nullptr,
+            attachment_ptr,
+            attachment_len,
+            0);
+}
+
+int32_t novarocks_compat_fetch_data(const char* host,
+                                    uint16_t port,
+                                    const uint8_t* request_ptr,
+                                    size_t request_len,
+                                    const uint8_t* attachment_ptr,
+                                    size_t attachment_len,
+                                    NovaRocksRustBuf* out_resp,
+                                    NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PFetchDataRequest, starrocks::PFetchDataResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "fetch_data",
+            &starrocks::PInternalService_Stub::fetch_data,
+            nullptr,
+            attachment_ptr,
+            attachment_len,
+            0);
+}
+
+int32_t novarocks_compat_cancel_plan_fragment(const char* host,
+                                              uint16_t port,
+                                              const uint8_t* request_ptr,
+                                              size_t request_len,
+                                              const uint8_t* attachment_ptr,
+                                              size_t attachment_len,
+                                              NovaRocksRustBuf* out_resp,
+                                              NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PCancelPlanFragmentRequest,
+                                       starrocks::PCancelPlanFragmentResult>(
+            host,
+            port,
+            request_ptr,
+            request_len,
+            out_resp,
+            out_err,
+            "cancel_plan_fragment",
+            &starrocks::PInternalService_Stub::cancel_plan_fragment,
+            nullptr,
+            attachment_ptr,
+            attachment_len,
+            0);
+}
+
 int32_t novarocks_compat_transmit_chunk(const char* host,
                                         uint16_t port,
                                         const uint8_t* ptr,
@@ -2519,6 +2703,28 @@ int32_t novarocks_compat_lookup(const char* host,
             out_err,
             "lookup",
             &starrocks::PInternalService_Stub::lookup);
+}
+
+int32_t novarocks_compat_lookup_close(const char* host,
+                                      uint16_t port,
+                                      const uint8_t* ptr,
+                                      size_t len,
+                                      NovaRocksRustBuf* out_resp,
+                                      NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PLookUpCloseRequest,
+                                       starrocks::PLookUpCloseResponse>(
+            host,
+            port,
+            ptr,
+            len,
+            out_resp,
+            out_err,
+            "lookup_close",
+            &starrocks::PInternalService_Stub::lookup_close,
+            [](brpc::Controller* cntl, const starrocks::PLookUpCloseRequest&) {
+                cntl->set_timeout_ms(2000);
+                cntl->set_max_retry(0);
+            });
 }
 
 extern "C" void novarocks_compat_notify_fetch_ready(int64_t finst_id_hi, int64_t finst_id_lo) {

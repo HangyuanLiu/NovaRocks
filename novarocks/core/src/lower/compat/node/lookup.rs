@@ -40,7 +40,7 @@ fn row_position_type_from_thrift(
     }
 }
 
-fn lower_row_pos_descs(
+pub(crate) fn lower_row_pos_descs(
     descs: &BTreeMap<i32, descriptors::TRowPositionDescriptor>,
 ) -> Result<HashMap<i32, RowPositionDescriptor>, String> {
     let mut out = HashMap::new();

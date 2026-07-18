@@ -132,7 +132,6 @@ mod tests {
             Some(false),
             Some(false),
             None::<i64>,
-            Some("default_catalog".to_string()),
         );
         let scan_range = internal_service::TScanRangeParams::new(
             plan_nodes::TScanRange::new(
@@ -168,6 +167,8 @@ mod tests {
             pipeline_sink_dop: None,
             report_when_finish: None,
             exec_debug_options: None,
+            per_look_up_num_fetchers: None,
+            per_fetch_target_nodes: None,
         }
     }
 

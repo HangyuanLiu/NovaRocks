@@ -15,17 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::types::RunnerConfig;
+use crate::compat_artifact::CompatArtifact;
+use crate::managed_process::{ManagedProcess, ReadyMarker};
+use crate::starrocks_compat_cluster::StarRocksCompatServerHandle;
+use crate::types::{CompatBeEndpoint, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
@@ -34,6 +35,8 @@ use toml::Value;
 pub(crate) enum ClusterMode {
     AllInOne,
     CrossProcess,
+    #[value(skip)]
+    StarRocksCompat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +69,6 @@ struct BackendTopologyRow {
 const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
-const PROCESS_LOG_TAIL_BYTES: usize = 8 * 1024;
 
 fn bounded_backend_topology_timeout(requested: Duration) -> Duration {
     requested.min(BACKEND_TOPOLOGY_TIMEOUT_CAP)
@@ -81,25 +83,6 @@ fn topology_mysql_io_timeout(remaining: Duration) -> Duration {
     remaining
         .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
         .max(TOPOLOGY_MYSQL_IO_TIMEOUT_MIN)
-}
-
-fn push_bounded_log_line(buffer: &mut String, line: &str, capacity: usize) {
-    if capacity == 0 {
-        buffer.clear();
-        return;
-    }
-    if !buffer.is_empty() {
-        buffer.push('\n');
-    }
-    buffer.push_str(line);
-    if buffer.len() <= capacity {
-        return;
-    }
-    let mut start = buffer.len() - capacity;
-    while start < buffer.len() && !buffer.is_char_boundary(start) {
-        start += 1;
-    }
-    buffer.drain(..start);
 }
 
 fn validate_live_backend_topology(
@@ -184,8 +167,8 @@ fn wait_for_live_backend_topology(
     runtime: &CrossProcessRuntime,
     fe_config_path: &Path,
     be_config_paths: &[PathBuf],
-    fe_process: &mut ProcessGuard,
-    be_processes: &mut [ProcessGuard],
+    fe_process: &mut ManagedProcess,
+    be_processes: &mut [ManagedProcess],
 ) -> Result<()> {
     let expected_ports = runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
     let expected = expected_ports.len();
@@ -269,6 +252,30 @@ pub(crate) trait ServerHandle: Send {
     fn restart_be(&mut self, index: usize) -> Result<()> {
         bail!("BE restart is unsupported by this server mode (index={index})")
     }
+    #[allow(dead_code)]
+    fn be_endpoints(&self) -> &[CompatBeEndpoint] {
+        &[]
+    }
+    #[allow(dead_code)]
+    fn assert_be_log(&self, index: usize, _needle: &str) -> Result<()> {
+        bail!("BE log assertions are unsupported by this server mode (index={index})")
+    }
+    #[allow(dead_code)]
+    fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
+        bail!(
+            "BE log counting is unsupported by this server mode (index={index}, pattern={needle:?})"
+        )
+    }
+    #[allow(dead_code)]
+    fn run_compat_probe(&self, probe: &str, _endpoint: &CompatBeEndpoint) -> Result<()> {
+        bail!("compatibility probes are unsupported by this server mode (probe={probe})")
+    }
+    fn residual_process_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn launch_server(
@@ -276,6 +283,7 @@ pub(crate) fn launch_server(
     cluster_size: usize,
     repo_root: &Path,
     runner_config: &RunnerConfig,
+    compat_artifact: Option<CompatArtifact>,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -284,6 +292,16 @@ pub(crate) fn launch_server(
             repo_root,
             runner_config,
         )?)),
+        ClusterMode::StarRocksCompat => {
+            let artifact = compat_artifact.context(
+                "StarRocks compatibility cluster requires a proven compatibility artifact",
+            )?;
+            Ok(Box::new(StarRocksCompatServerHandle::launch(
+                repo_root,
+                runner_config,
+                artifact,
+            )?))
+        }
     }
 }
 
@@ -295,6 +313,12 @@ pub(crate) fn validate_cluster_args(mode: ClusterMode, cluster_size: usize) -> R
     if mode == ClusterMode::AllInOne && cluster_size > 1 {
         bail!(
             "all-in-one mode requires --cluster-size 1 (got {})",
+            cluster_size
+        );
+    }
+    if mode == ClusterMode::StarRocksCompat && cluster_size != 3 {
+        bail!(
+            "starrocks-compat mode requires --cluster-size 3 (got {})",
             cluster_size
         );
     }
@@ -508,8 +532,8 @@ pub(crate) struct CrossProcessServerHandle {
     runtime_dir: PathBuf,
     novarocks_bin: PathBuf,
     be_config_paths: Vec<PathBuf>,
-    be_processes: Vec<ProcessGuard>,
-    fe_process: ProcessGuard,
+    be_processes: Vec<ManagedProcess>,
+    fe_process: ManagedProcess,
 }
 
 struct RuntimeDirGuard {
@@ -651,7 +675,7 @@ impl CrossProcessServerHandle {
             .with_context(|| format!("write {}", fe_config_path.display()))?;
 
         // Spawn all BEs: release each BE's ports immediately before spawning it.
-        let mut be_processes: Vec<ProcessGuard> = Vec::with_capacity(cluster_size);
+        let mut be_processes: Vec<ManagedProcess> = Vec::with_capacity(cluster_size);
         for (i, (reserved_be, be_config_path)) in reserved
             .be_ports
             .into_iter()
@@ -661,11 +685,12 @@ impl CrossProcessServerHandle {
             let grpc_port = reserved_be.grpc.port();
             let _ = reserved_be.http.release();
             let _ = reserved_be.grpc.release();
-            let be_process = ProcessGuard::spawn(
+            let be_process = spawn_novarocks_process(
                 &novarocks_bin,
                 "be",
                 be_config_path,
                 "NOVAROCKS_READY role=be",
+                runtime_dir.path().join(format!("be_{i}.log")),
             )?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -680,11 +705,12 @@ impl CrossProcessServerHandle {
         let _ = reserved.fe_http_port.release();
         let _ = reserved.fe_grpc_port.release();
         let _ = reserved.fe_mysql_port.release();
-        let mut fe_process = ProcessGuard::spawn(
+        let mut fe_process = spawn_novarocks_process(
             &novarocks_bin,
             "fe",
             &fe_config_path,
             "NOVAROCKS_READY mysql_port=",
+            runtime_dir.path().join("fe.log"),
         )?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -770,19 +796,27 @@ impl ServerHandle for CrossProcessServerHandle {
                 anyhow::anyhow!("missing config path for cross-process BE[{index}] during restart")
             })?
             .clone();
-        let new_process = ProcessGuard::spawn(
-            &self.novarocks_bin,
-            "be",
-            &config_path,
-            "NOVAROCKS_READY role=be",
-        )
-        .with_context(|| format!("restart cross-process BE[{index}]"))?;
+        let marker = "NOVAROCKS_READY role=be";
+        let command = build_novarocks_command(&self.novarocks_bin, "be", &config_path);
+        let log_path = self.runtime_dir.join(format!("be_{index}.log"));
+        let be_process = self
+            .be_processes
+            .get_mut(index)
+            .expect("BE index checked above");
+        be_process
+            .restart(
+                command,
+                ReadyMarker::StdoutContains(marker.to_string()),
+                startup_timeout(),
+                log_path,
+            )
+            .map_err(|error| map_novarocks_process_error(&self.novarocks_bin, "be", marker, error))
+            .with_context(|| format!("restart cross-process BE[{index}]"))?;
         println!(
             "restarted cross-process BE[{index}] pid={} config={}",
-            new_process.pid(),
+            be_process.pid(),
             config_path.display()
         );
-        self.be_processes[index] = new_process;
         Ok(())
     }
 }
@@ -797,233 +831,9 @@ impl Drop for CrossProcessServerHandle {
     }
 }
 
-struct ProcessGuard {
-    child: Child,
-    readiness_rx: mpsc::Receiver<()>,
-    stdout_buffer: Arc<Mutex<String>>,
-    stderr_buffer: Arc<Mutex<String>>,
-    _stdout_thread: thread::JoinHandle<()>,
-    stderr_thread: Option<thread::JoinHandle<()>>,
-}
-
-impl ProcessGuard {
-    fn spawn(binary: &Path, role: &str, config_path: &Path, ready_marker: &str) -> Result<Self> {
-        let mut child = build_novarocks_command(binary, role, config_path)
-            .spawn()
-            .with_context(|| format!("spawn novarocks {role} from {}", binary.display()))?;
-
-        let stdout = child.stdout.take().context("capture child stdout")?;
-        let stderr = child.stderr.take();
-        let (ready_tx, readiness_rx) = mpsc::sync_channel::<()>(1);
-        let ready_marker_for_thread = ready_marker.to_string();
-        let stdout_buffer = Arc::new(Mutex::new(String::new()));
-        let stdout_tail = Arc::clone(&stdout_buffer);
-        let stdout_thread = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            let mut ready_sent = false;
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                if let Ok(mut buffer) = stdout_tail.lock() {
-                    push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES);
-                }
-                if !ready_sent && line.contains(&ready_marker_for_thread) {
-                    let _ = ready_tx.try_send(());
-                    ready_sent = true;
-                }
-            }
-        });
-        let stderr_buffer = Arc::new(Mutex::new(String::new()));
-        let stderr_thread = stderr.map(|stderr| {
-            let stderr_buffer = Arc::clone(&stderr_buffer);
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    let Ok(line) = line else {
-                        break;
-                    };
-                    if let Ok(mut buffer) = stderr_buffer.lock() {
-                        push_bounded_log_line(&mut buffer, &line, PROCESS_LOG_TAIL_BYTES);
-                    }
-                }
-            })
-        });
-
-        let mut process = Self {
-            child,
-            readiness_rx,
-            stdout_buffer,
-            stderr_buffer,
-            _stdout_thread: stdout_thread,
-            stderr_thread,
-        };
-        process.wait_for_ready(ready_marker)?;
-        Ok(process)
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if self.child.try_wait()?.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        self.join_stderr_thread();
-        Ok(())
-    }
-
-    fn kill_now(&mut self) -> Result<()> {
-        if self.child.try_wait()?.is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        self.join_stderr_thread();
-        Ok(())
-    }
-
-    fn join_stderr_thread(&mut self) {
-        if let Some(stderr_thread) = self.stderr_thread.take() {
-            let _ = stderr_thread.join();
-        }
-    }
-
-    fn wait_for_ready(&mut self, marker: &str) -> Result<()> {
-        let deadline = backend_topology_deadline(Instant::now(), startup_timeout());
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                self.join_stderr_thread();
-                let stdout = self.read_stdout();
-                let stderr = self.read_stderr();
-                bail!(
-                    "{}",
-                    format_startup_failure(
-                        marker,
-                        &format!(
-                            "novarocks exited before readiness marker with status {status}; stdout_tail={stdout:?}; stderr_tail={stderr}"
-                        ),
-                        &stderr,
-                    )
-                );
-            }
-
-            match self.readiness_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let status = self.wait_for_exit_after_stdout_disconnect()?;
-                    if status.is_none() {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                    }
-                    self.join_stderr_thread();
-                    let stdout = self.read_stdout();
-                    let stderr = self.read_stderr();
-                    let status_detail = match status {
-                        Some(status) => format!("; child status={status}"),
-                        None => {
-                            "; child was still running after stdout closed and was killed"
-                                .to_string()
-                        }
-                    };
-                    bail!(
-                        "{}",
-                        format_startup_failure(
-                            marker,
-                            &format!(
-                                "stdout closed before readiness marker{status_detail}; stdout_tail={stdout:?}; stderr_tail={stderr}"
-                            ),
-                            &stderr,
-                        )
-                    );
-                }
-            }
-
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                self.join_stderr_thread();
-                let stdout = self.read_stdout();
-                let stderr = self.read_stderr();
-                bail!(
-                    "{}",
-                    format_startup_failure(
-                        marker,
-                        &format!(
-                            "timed out waiting for readiness marker; stdout_tail={stdout:?}; stderr_tail={stderr}"
-                        ),
-                        &stderr,
-                    )
-                );
-            }
-        }
-    }
-
-    fn read_stdout(&self) -> String {
-        self.stdout_buffer
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_default()
-    }
-
-    fn read_stderr(&mut self) -> String {
-        self.stderr_buffer
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_default()
-    }
-
-    fn runtime_diagnostic(
-        &mut self,
-        label: &str,
-        endpoint: &str,
-        config_path: &Path,
-    ) -> Result<String> {
-        let pid = self.pid();
-        let status = self.child.try_wait().with_context(|| {
-            format!("inspect {label} pid={pid} endpoint={endpoint} process status")
-        })?;
-        let stdout_tail = self
-            .stdout_buffer
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_else(|_| "<stdout lock poisoned>".to_string());
-        let stderr_tail = self
-            .stderr_buffer
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_else(|_| "<stderr lock poisoned>".to_string());
-        match status {
-            Some(status) => bail!(
-                "{label} exited status={status} pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
-                config_path.display()
-            ),
-            None => Ok(format!(
-                "{label}=running pid={pid} endpoint={endpoint} config={} stdout_tail={stdout_tail:?} stderr_tail={stderr_tail:?}",
-                config_path.display()
-            )),
-        }
-    }
-
-    fn wait_for_exit_after_stdout_disconnect(&mut self) -> Result<Option<ExitStatus>> {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(Some(status));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
 fn process_runtime_diagnostics(
-    fe_process: &mut ProcessGuard,
-    be_processes: &mut [ProcessGuard],
+    fe_process: &mut ManagedProcess,
+    be_processes: &mut [ManagedProcess],
     fe_config_path: &Path,
     be_config_paths: &[PathBuf],
     runtime: &CrossProcessRuntime,
@@ -1075,12 +885,6 @@ fn process_runtime_diagnostics(
     Ok(diagnostics)
 }
 
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
 pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) -> Command {
     let mut command = Command::new(binary);
     command
@@ -1094,6 +898,43 @@ pub(crate) fn build_novarocks_command(binary: &Path, role: &str, config_path: &P
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+fn spawn_novarocks_process(
+    binary: &Path,
+    role: &str,
+    config_path: &Path,
+    marker: &str,
+    log_path: PathBuf,
+) -> Result<ManagedProcess> {
+    let result = ManagedProcess::spawn(
+        "novarocks".to_string(),
+        build_novarocks_command(binary, role, config_path),
+        ReadyMarker::StdoutContains(marker.to_string()),
+        startup_timeout(),
+        log_path,
+    );
+    match result {
+        Ok(process) => Ok(process),
+        Err(error) => Err(map_novarocks_process_error(binary, role, marker, error)),
+    }
+}
+
+fn map_novarocks_process_error(
+    binary: &Path,
+    role: &str,
+    marker: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if format!("{error:#}").starts_with("spawn novarocks;") {
+        return error.context(format!("spawn novarocks {role} from {}", binary.display()));
+    }
+    managed_novarocks_startup_error(marker, error)
+}
+
+fn managed_novarocks_startup_error(marker: &str, error: anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    anyhow::anyhow!(format_startup_failure(marker, &message, &message))
 }
 
 pub(crate) fn startup_timeout() -> Duration {
@@ -1398,18 +1239,6 @@ mod tests {
         let deadline = backend_topology_deadline(now, Duration::MAX);
         assert!(deadline >= now);
         assert!(deadline.duration_since(now) <= Duration::from_secs(120));
-    }
-
-    #[test]
-    fn process_log_tail_is_bounded_and_keeps_the_latest_lines() {
-        let mut buffer = String::new();
-        push_bounded_log_line(&mut buffer, "first", 16);
-        push_bounded_log_line(&mut buffer, "second", 16);
-        push_bounded_log_line(&mut buffer, "third", 16);
-
-        assert!(buffer.len() <= 16, "buffer={buffer:?}");
-        assert!(buffer.contains("third"), "buffer={buffer:?}");
-        assert!(!buffer.contains("first"), "buffer={buffer:?}");
     }
 
     #[test]
@@ -1940,6 +1769,22 @@ exec_node_output = true
     fn validate_cluster_args_cross_process_size_2_ok() {
         validate_cluster_args(ClusterMode::CrossProcess, 2)
             .expect("cluster_size=2 should be valid for cross-process");
+    }
+
+    #[test]
+    fn validate_cluster_args_starrocks_compat_requires_exactly_three() {
+        validate_cluster_args(ClusterMode::StarRocksCompat, 3)
+            .expect("starrocks-compat requires exactly three BEs");
+        for invalid in [1, 2, 4] {
+            let error = validate_cluster_args(ClusterMode::StarRocksCompat, invalid)
+                .expect_err("non-three compatibility topology must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("starrocks-compat mode requires --cluster-size 3"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
