@@ -32,7 +32,6 @@ use std::time::Duration;
 #[cfg(feature = "state-store-test-hooks")]
 use uuid::Uuid;
 
-#[cfg(feature = "state-store-test-hooks")]
 fn repository_root_for_test() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
