@@ -64,13 +64,13 @@ use crate::connector::starrocks::table::model::{
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema,
 };
-use crate::engine::mv::agg_state::mv_shape::{AggregateMvShape, IncrementalMvShape};
-use crate::engine::mv::agg_state::physical_column::{
-    StarRocksPhysicalColumn, starrocks_physical_column,
-};
-use crate::engine::mv::agg_state::sql_type::arrow_data_type_to_sql_type;
 use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::mv::aggregate_state::mv_shape::{AggregateMvShape, IncrementalMvShape};
+use crate::mv::aggregate_state::physical_column::{
+    StarRocksPhysicalColumn, starrocks_physical_column,
+};
+use crate::mv::aggregate_state::sql_type::arrow_data_type_to_sql_type;
 use crate::mv::model::{AggregateFunctionKind, MvStorageEngine, VisibleAggregateOutput};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
@@ -235,7 +235,7 @@ pub(crate) fn create_mv(
         return Err("materialized view SELECT must produce at least one column".to_string());
     }
     let mv_shape =
-        crate::engine::mv::agg_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+        crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
     validate_incremental_mv_analyzed_types(&mv_shape, &analysis.resolved_query)?;
     let storage_layout = build_mv_storage_layout(
         &mv_shape,
@@ -532,15 +532,17 @@ fn build_mv_storage_layout(
         IncrementalMvShape::Aggregate(shape) => {
             validate_aggregate_distribution_columns(distribution, shape)?;
             let aggregate_input_types = if let Some(resolved_query) = resolved_query {
-                crate::engine::mv::agg_state::mv_agg_state::aggregate_input_types_from_resolved_query(
-                    &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+                crate::mv::aggregate_state::mv_agg_state::aggregate_input_types_from_resolved_query(
+                    &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(
+                        shape,
+                    ),
                     resolved_query,
                 )?
             } else {
                 vec![None; shape.aggregates.len()]
             };
-            let layout = crate::engine::mv::agg_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+            let layout = crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
+                &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(shape),
                 output_columns,
                 &aggregate_input_types,
             )?;
@@ -549,7 +551,7 @@ fn build_mv_storage_layout(
                 key_desc: TableKeyDesc {
                     kind: TableKeyKind::Primary,
                     columns: vec![
-                        crate::engine::mv::agg_state::mv_agg_state::ROW_ID_COLUMN.to_string(),
+                        crate::mv::aggregate_state::mv_agg_state::ROW_ID_COLUMN.to_string(),
                     ],
                 },
                 physical_columns: layout.physical_columns,

@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder};
 
-use crate::engine::mv::agg_state::state_codec::{decode_bool_state, encode_bool_state};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::mv::aggregate_state::state_codec::{decode_bool_state, encode_bool_state};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
@@ -203,7 +203,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray};
 
     use super::*;
-    use crate::engine::mv::agg_state::state_codec::{decode_bool_state, encode_bool_state};
+    use crate::mv::aggregate_state::state_codec::{decode_bool_state, encode_bool_state};
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
         let mut builder = BinaryBuilder::new();

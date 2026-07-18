@@ -218,7 +218,7 @@ pub(crate) fn extract_aggregate_sql_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::agg_state::mv_shape::AggregateInput;
+    use crate::mv::aggregate_state::mv_shape::AggregateInput;
     use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {

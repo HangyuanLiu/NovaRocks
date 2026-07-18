@@ -276,7 +276,7 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
     let Statement::Query(query) = &mut statement else {
         return Err("projection_select_with_change_op: expected SELECT query".to_string());
     };
-    if crate::engine::mv::agg_state::mv_shape::query_has_aggregate_surface(query.as_ref()) {
+    if crate::mv::aggregate_state::mv_shape::query_has_aggregate_surface(query.as_ref()) {
         return Err(
             "projection_select_with_change_op: projection/filter SELECT must not be aggregate"
                 .to_string(),

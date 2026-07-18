@@ -20,10 +20,10 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryBuilder, Decimal128Builder, Float64Builder, Int64Array};
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::agg_state::state_codec::{decode_avg_decimal128, decode_avg_int64};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::mv::aggregate_state::state_codec::{decode_avg_decimal128, decode_avg_int64};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
@@ -223,7 +223,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::engine::mv::agg_state::state_codec::{
+    use crate::mv::aggregate_state::state_codec::{
         decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
     };
 

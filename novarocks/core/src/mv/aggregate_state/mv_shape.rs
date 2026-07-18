@@ -1642,7 +1642,7 @@ fn union_all_branch_output_mismatch_error() -> String {
 /// Arrow batch that `materialize_aggregate_result_chunks` can consume.
 pub(crate) fn rewrite_select_sql_for_state(
     select_sql: &str,
-    calls: &crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls,
+    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<String, String> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement};
 
@@ -1684,11 +1684,10 @@ pub(crate) fn rewrite_select_sql_for_state(
             }
         }
     }
-    if crate::engine::mv::agg_state::mv_agg_state::aggregate_shape_needs_retraction_count_state(
-        calls,
-    ) {
+    if crate::mv::aggregate_state::mv_agg_state::aggregate_shape_needs_retraction_count_state(calls)
+    {
         new_projection.push(make_count_star_select_item(
-            crate::engine::mv::agg_state::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
+            crate::mv::aggregate_state::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
     }
     select.projection = new_projection;
@@ -1729,7 +1728,7 @@ fn state_combinator_input_expr(
 
 fn aggregate_state_alias(output_name: &str) -> String {
     let sanitized =
-        crate::engine::mv::agg_state::mv_agg_state::sanitize_state_column_name(output_name);
+        crate::mv::aggregate_state::mv_agg_state::sanitize_state_column_name(output_name);
     format!("__agg_state_{sanitized}")
 }
 
@@ -1844,7 +1843,7 @@ fn make_count_star_select_item(alias: &str) -> sqlparser::ast::SelectItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::mv::agg_state::aggregate_sql_calls::AggregateSqlCalls;
+    use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =

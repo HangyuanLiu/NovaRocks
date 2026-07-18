@@ -42,9 +42,6 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray};
     use arrow::datatypes::DataType;
 
-    use crate::engine::mv::agg_state::state_codec::{
-        MultisetEntry, encode_bool_state, encode_count_state, encode_multiset, encode_sum_int64,
-    };
     use crate::exec::expr::agg::functions::{AggSpec, AggStatePtr};
     use crate::exec::expr::function::mv_state::{
         approx_count_distinct_state_union, avg_state_union, bool_and_state_union,
@@ -52,6 +49,9 @@ mod tests {
         min_state_union,
     };
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::mv::aggregate_state::state_codec::{
+        MultisetEntry, encode_bool_state, encode_count_state, encode_multiset, encode_sum_int64,
+    };
 
     type UnionFn = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
 

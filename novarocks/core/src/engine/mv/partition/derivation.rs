@@ -25,8 +25,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::engine::mv::agg_state::mv_agg_state::AggregateMvLayout;
 use crate::exec::chunk::Chunk;
+use crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout;
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField};
 use crate::mv::persistence::schema as mv_schema;
 #[cfg(test)]
@@ -808,11 +808,11 @@ mod tests {
     // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
 
     use crate::catalog::schema::SqlType;
-    use crate::engine::mv::agg_state::mv_agg_state::{
+    use crate::exec::chunk::Chunk;
+    use crate::mv::aggregate_state::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
-    use crate::engine::mv::agg_state::physical_column::starrocks_physical_column;
-    use crate::exec::chunk::Chunk;
+    use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;

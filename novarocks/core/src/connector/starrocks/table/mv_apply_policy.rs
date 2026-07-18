@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::engine::mv::agg_state::mv_shape::IncrementalMvShape;
+use crate::mv::aggregate_state::mv_shape::IncrementalMvShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MvApplyPolicy {

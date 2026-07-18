@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod agg_state;
 pub(crate) mod analysis;
 pub(crate) mod dependency;
 pub(crate) mod iceberg_aggregate_state;

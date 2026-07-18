@@ -23,11 +23,11 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, StructArray};
 use arrow::datatypes::DataType;
 
-use crate::engine::mv::agg_state::state_codec::{
-    MultisetEntry, decode_multiset_with_key_type, encode_multiset, write_key_at,
-};
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::node::aggregate::AggFunction;
+use crate::mv::aggregate_state::state_codec::{
+    MultisetEntry, decode_multiset_with_key_type, encode_multiset, write_key_at,
+};
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
@@ -602,11 +602,11 @@ mod tests {
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field, Fields};
 
-    use crate::engine::mv::agg_state::state_codec::{
-        MultisetEntry, decode_multiset_with_key_type, encode_multiset,
-    };
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::mv::aggregate_state::state_codec::{
+        MultisetEntry, decode_multiset_with_key_type, encode_multiset,
+    };
 
     use super::super::super::{AggInputView, AggKind, AggSpec, AggStatePtr};
 
