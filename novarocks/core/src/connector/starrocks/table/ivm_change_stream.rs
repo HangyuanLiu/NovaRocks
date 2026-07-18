@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::changes::{ChangeError, IcebergChangeBatch, plan_changes};
 use crate::connector::starrocks::table::mv_refresh::load_current_iceberg_base_table;
-use crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin;
 use crate::engine::StandaloneState;
+use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::runtime::query_result::QueryResult;
 
 // Compatibility wrapper for the older two-branch materialized change stream.

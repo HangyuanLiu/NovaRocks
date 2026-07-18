@@ -32,7 +32,7 @@ pub(crate) mod recovery;
 pub(crate) mod refresh_context;
 pub(crate) mod refresh_driver;
 pub(crate) mod refresh_io;
-pub(crate) mod refresh_pin;
+pub(crate) mod refresh_pin_adapter;
 pub(crate) mod scan_binding;
 pub(crate) mod schema_contract;
 pub(crate) mod stateless_rebuild;

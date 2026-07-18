@@ -38,9 +38,9 @@ use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
-use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
+use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::sql::planner::table::{
     IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
 };
@@ -1474,8 +1474,8 @@ pub(crate) mod tests_support {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::catalog::identifier::TableIdentity;
-    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
     use crate::mv::persistence::definition::StoredMvDefinition;
+    use crate::mv::refresh::pin::RefreshSnapshotPin;
     use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
@@ -1989,7 +1989,7 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::catalog::identifier::TableIdentity;
-    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
+    use crate::mv::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
