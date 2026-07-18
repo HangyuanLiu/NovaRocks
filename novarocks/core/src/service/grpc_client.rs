@@ -390,11 +390,6 @@ pub fn lookup(
     dest_port: u16,
     params: proto::filter::LookupRequest,
 ) -> Result<proto::filter::LookupResponse, String> {
-    #[cfg(test)]
-    if let Some(result) = maybe_lookup_hook(dest_host, dest_port, params.clone()) {
-        return result;
-    }
-
     let dest_host = dest_host.to_string();
     let port = dest_port;
     data_block_on(async move {
@@ -411,56 +406,6 @@ pub fn lookup(
         Ok(resp.into_inner())
     })
     .map_err(|e| format!("lookup runtime execution failed: {e}"))?
-}
-
-#[cfg(test)]
-type LookupHook = std::sync::Arc<
-    dyn Fn(&str, u16, proto::filter::LookupRequest) -> Result<proto::filter::LookupResponse, String>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-fn lookup_hook() -> &'static Mutex<Option<LookupHook>> {
-    static HOOK: OnceLock<Mutex<Option<LookupHook>>> = OnceLock::new();
-    HOOK.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn test_hook_mutex() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[cfg(test)]
-fn maybe_lookup_hook(
-    host: &str,
-    port: u16,
-    params: proto::filter::LookupRequest,
-) -> Option<Result<proto::filter::LookupResponse, String>> {
-    let hook = lookup_hook().lock().expect("lookup hook lock").clone();
-    hook.map(|hook| hook(host, port, params))
-}
-
-#[cfg(test)]
-pub(crate) fn test_hook_lock() -> std::sync::MutexGuard<'static, ()> {
-    test_hook_mutex().lock().expect("test hook global lock")
-}
-
-#[cfg(test)]
-pub(crate) fn clear_test_hooks() {
-    *lookup_hook().lock().expect("lookup hook lock") = None;
-}
-
-#[cfg(test)]
-pub(crate) fn set_lookup_hook<F>(hook: F)
-where
-    F: Fn(&str, u16, proto::filter::LookupRequest) -> Result<proto::filter::LookupResponse, String>
-        + Send
-        + Sync
-        + 'static,
-{
-    *lookup_hook().lock().expect("lookup hook lock") = Some(std::sync::Arc::new(hook));
 }
 
 #[cfg(test)]
@@ -511,8 +456,6 @@ mod lookup_tests {
 
     #[test]
     fn test_lookup_uses_native_tonic_server_without_hook() {
-        let _hook_guard = test_hook_lock();
-        clear_test_hooks();
         let addr = spawn_lookup_server();
 
         let response = lookup(
@@ -530,6 +473,5 @@ mod lookup_tests {
         let status = response.status.expect("lookup response status");
         assert_ne!(status.code, 0);
         assert!(status.message.contains("missing query_id for lookup"));
-        clear_test_hooks();
     }
 }

@@ -21,6 +21,4 @@ pub(crate) mod layout;
 pub(crate) mod node;
 mod runtime_filter_pushdown;
 pub(crate) mod sink;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub(crate) mod type_lowering;

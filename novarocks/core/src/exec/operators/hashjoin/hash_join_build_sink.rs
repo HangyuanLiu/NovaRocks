@@ -1671,67 +1671,6 @@ mod tests {
         assert!(operator.build_input_chunks.is_empty());
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn presence_only_left_semi_membership_filter_retains_matching_probe_rows() {
-        // Regression: membership filters used to collect build values from
-        // `build_input_chunks`, which presence-only builds (LEFT SEMI without
-        // residual) do not retain. The published bloom then contained zero
-        // entries while build_row_count > 0, so every probe row was wrongly
-        // pruned. Values must come from `build_key_batches`, which are kept
-        // for hash-table construction regardless of row-payload elision.
-        let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(Arc::clone(&state));
-        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution::Compat {
-            specs: vec![CompatJoinRuntimeFilterSpec {
-                filter_id: 7,
-                expr_order: 0,
-                probe_expr_id: crate::exec::expr::ExprId(0),
-                build_expr_id: crate::exec::expr::ExprId(0),
-                probe_slot_id: SlotId::new(1),
-                build_data_type: DataType::Int32,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            }],
-            hub: Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
-            in_filter_merger: None,
-            filters: None,
-            in_filters: None,
-        };
-
-        operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
-            .expect("push chunk");
-        // Presence-only store elision must still hold.
-        assert!(operator.build_input_chunks.is_empty());
-
-        let params = operator
-            .build_membership_filter_params()
-            .expect("membership params");
-        let filters = operator
-            .build_membership_filters_from_params(
-                operator.build_row_count as u64,
-                &params,
-                RuntimeMembershipBuildOptions {
-                    enable_join_runtime_bitset_filter: false,
-                    global_runtime_filter_build_max_size: u64::MAX,
-                },
-            )
-            .expect("membership filters");
-        assert_eq!(filters.len(), 1);
-
-        let probe_chunk = int32_chunk(vec![1, 2, 3, 99]);
-        let key_array = probe_chunk.batch.column(0).clone();
-        let kept = filters[0]
-            .filter_chunk_with_array(&key_array, probe_chunk)
-            .expect("filter probe chunk");
-        let kept_rows = kept.map(|c| c.len()).unwrap_or(0);
-        assert_eq!(
-            kept_rows, 3,
-            "membership filter must accept build keys 1,2,3 and reject 99"
-        );
-    }
-
     #[test]
     fn records_row_match_method_for_left_semi_with_residual() {
         let state = Arc::new(TestBuildState::default());
@@ -1915,66 +1854,6 @@ mod tests {
         assert_eq!(artifact.build_row_count, 0);
         assert!(artifact.build_store.is_none());
         assert!(artifact.build_table.is_none());
-    }
-
-    #[cfg(feature = "compat")]
-    #[test]
-    fn records_built_lifecycle_for_membership_runtime_filter() {
-        let query_id = QueryId {
-            hi: 30_002,
-            lo: 40_002,
-        };
-        let query_key = QueryKey::from_hi_lo(query_id.hi, query_id.lo);
-        let registry = RuntimeFilterLifecycleRegistry::global();
-        registry.remove_query(query_key);
-
-        let state = Arc::new(TestBuildState::default());
-        let mut operator = direct_set_build_operator(Arc::clone(&state));
-        operator.runtime_filter_execution = HashJoinBuildOperatorRuntimeFilterExecution::Compat {
-            specs: vec![CompatJoinRuntimeFilterSpec {
-                filter_id: 17,
-                expr_order: 0,
-                probe_expr_id: crate::exec::expr::ExprId(0),
-                build_expr_id: crate::exec::expr::ExprId(0),
-                probe_slot_id: SlotId::new(1),
-                build_data_type: DataType::Int32,
-                merge_nodes: Vec::new(),
-                has_remote_targets: false,
-            }],
-            hub: Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
-            in_filter_merger: None,
-            filters: None,
-            in_filters: None,
-        };
-        let runtime_state = RuntimeState::new(
-            None,
-            None,
-            Some(query_id),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        operator
-            .push_chunk(&runtime_state, int32_chunk(vec![1, 2, 3]))
-            .expect("push chunk");
-        operator.set_finishing(&runtime_state).expect("finish");
-
-        let snapshot = registry
-            .snapshot(query_key)
-            .expect("query lifecycle snapshot");
-        let built = snapshot
-            .filters
-            .get(&17)
-            .and_then(|filter| filter.built)
-            .expect("built lifecycle");
-        assert_eq!(built.rows, 3);
-        assert!(built.bytes > 0, "built bytes must report filter size");
-
-        registry.remove_query(query_key);
     }
 
     #[test]

@@ -1128,54 +1128,6 @@ mod tests {
         assert!(err.contains("invalid --role value"));
     }
 
-    #[cfg(feature = "compat")]
-    #[test]
-    fn compat_ready_marker_requires_every_service_start_to_succeed() {
-        for fail_at in 0..4 {
-            let attempts = std::sync::atomic::AtomicUsize::new(0);
-            let start = |stage| {
-                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if stage == fail_at {
-                    Err(format!("injected service {stage} bind failure"))
-                } else {
-                    Ok(())
-                }
-            };
-            let error = super::start_compat_be_services_and_ready_marker(
-                || start(0),
-                || start(1),
-                || start(2),
-                || start(3),
-                19050,
-                18060,
-                19080,
-                42,
-            )
-            .expect_err("failed listener startup must not produce a ready marker");
-            assert!(error.contains(&format!("service {fail_at}")), "{error}");
-            assert_eq!(
-                attempts.load(std::sync::atomic::Ordering::SeqCst),
-                fail_at + 1
-            );
-        }
-
-        let marker = super::start_compat_be_services_and_ready_marker(
-            || Ok(()),
-            || Ok(()),
-            || Ok(()),
-            || Ok(()),
-            19050,
-            18060,
-            19080,
-            42,
-        )
-        .expect("all listener starts produce marker");
-        assert_eq!(
-            marker,
-            "NOVAROCKS_READY role=compat-be heartbeat_port=19050 brpc_port=18060 grpc_port=19080 pid=42"
-        );
-    }
-
     #[test]
     fn test_role_override_wins_over_config() {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();

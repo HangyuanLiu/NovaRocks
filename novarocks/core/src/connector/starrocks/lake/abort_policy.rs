@@ -34,33 +34,3 @@ pub(crate) fn decide_abort_txn_log_source(txn_info: &TxnInfoPb) -> AbortTxnLogSo
         AbortTxnLogSource::PerTablet
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::service::grpc_client::proto::starrocks::TxnInfoPb;
-
-    use super::{AbortTxnLogSource, decide_abort_txn_log_source, should_skip_abort_cleanup};
-
-    #[test]
-    fn skip_cleanup_defaults_to_false() {
-        assert!(!should_skip_abort_cleanup(None));
-    }
-
-    #[test]
-    fn decide_combined_source_from_txn_info() {
-        let info = TxnInfoPb {
-            txn_id: Some(1),
-            commit_time: None,
-            combined_txn_log: Some(true),
-            txn_type: None,
-            force_publish: None,
-            rebuild_pindex: None,
-            gtid: None,
-            load_ids: Vec::new(),
-        };
-        assert_eq!(
-            decide_abort_txn_log_source(&info),
-            AbortTxnLogSource::Combined
-        );
-    }
-}

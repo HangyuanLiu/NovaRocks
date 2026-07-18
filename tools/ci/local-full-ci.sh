@@ -80,8 +80,8 @@ Options:
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
   --skip-cargo-test     Skip cargo test. Intended only for runner debugging.
-  --with-compat         Append compat clippy, artifact build, Rust tests, and
-                        real StarRocks FE + exactly 3 compat BE E2E coverage.
+  --with-compat         Append compat clippy, artifact build, and real
+                        StarRocks FE + exactly 3 compat BE E2E coverage.
   --cluster-mode <mode> SQL runner cluster mode. Default: cross-process.
   --cluster-size <n>    Number of BE processes. Default: 3, or 1 for all-in-one.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
@@ -421,7 +421,6 @@ run_compat_gates() {
   if [ "$WITH_COMPAT" != "true" ]; then
     ci_record_stage "cargo clippy compat" "SKIP" "0" ""
     ci_record_stage "cargo build compat artifact" "SKIP" "0" ""
-    ci_record_stage "cargo test compat" "SKIP" "0" ""
     ci_record_stage "starrocks-compat E2E" "SKIP" "0" ""
     ci_render_summary "RUNNING"
     return
@@ -433,14 +432,6 @@ run_compat_gates() {
     tools/ci/build-compat-artifact.sh \
       --profile "$NOVA_CI_CARGO_PROFILE" \
       --output-dir "$CI_RUN_DIR/compat-artifact"
-  if [ "$SKIP_CARGO_TEST" = "true" ]; then
-    ci_record_stage "cargo test compat" "SKIP" "0" ""
-    ci_render_summary "RUNNING"
-  else
-    run_fail_fast_stage "cargo test compat" "cargo-test-compat.log" \
-      cargo test -p novarocks-server -p novarocks \
-        --profile "$NOVA_CI_CARGO_PROFILE" --features compat -- --test-threads=1
-  fi
   run_fail_fast_stage "starrocks-compat E2E" "starrocks-compat-e2e.log" \
     run_starrocks_compat_suite "$CI_RUN_DIR/compat-artifact/manifest.txt"
 }

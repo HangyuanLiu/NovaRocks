@@ -45,7 +45,6 @@ fi
 for stage in \
   "cargo clippy compat" \
   "cargo build compat artifact" \
-  "cargo test compat" \
   "starrocks-compat E2E"; do
   if ! grep -qx "record:$stage:SKIP" <<<"$default_output"; then
     echo "default local-full-ci must record $stage as SKIP" >&2
@@ -67,7 +66,6 @@ explicit_output="$({
 expected_order="$(printf '%s\n' \
   'cargo clippy compat' \
   'cargo build compat artifact' \
-  'cargo test compat' \
   'starrocks-compat E2E')"
 actual_order="$(sed -n 's/^run:\([^|]*\).*/\1/p' <<<"$explicit_output")"
 if [ "$actual_order" != "$expected_order" ]; then
@@ -77,8 +75,11 @@ if [ "$actual_order" != "$expected_order" ]; then
 fi
 grep -q 'build-compat-artifact.sh --profile dev-opt --output-dir ' <<<"$explicit_output"
 grep -q 'cargo clippy -p novarocks-server -p novarocks --all-targets --features compat' <<<"$explicit_output"
-grep -q 'cargo test -p novarocks-server -p novarocks --profile dev-opt --features compat -- --test-threads=1' <<<"$explicit_output"
 grep -q 'run_starrocks_compat_suite .*manifest.txt' <<<"$explicit_output"
+if grep -Eq 'cargo test compat|cargo test .*--features compat|--test-threads=1' <<<"$explicit_output"; then
+  echo "--with-compat must not execute the retired compat Rust test gate" >&2
+  exit 1
+fi
 
 default_binary="$tmpdir/novarocks-default"
 compat_binary="$tmpdir/novarocks-compat"

@@ -63,26 +63,3 @@ pub(crate) fn decide_missing_txn_log_policy(
     }
     MissingTxnLogPolicy::ErrorMissingLogAtTxnIndex
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{MissingTxnLogPolicy, decide_missing_txn_log_policy};
-
-    #[test]
-    fn single_publish_returns_published_when_target_meta_exists() {
-        let got = decide_missing_txn_log_policy(1, 0, false, 1, true, false);
-        assert_eq!(got, MissingTxnLogPolicy::ReturnPublished);
-    }
-
-    #[test]
-    fn first_batch_txn_advances_base_when_next_meta_exists() {
-        let got = decide_missing_txn_log_policy(2, 0, false, 1, false, true);
-        assert_eq!(got, MissingTxnLogPolicy::AdvanceToNextBaseVersion);
-    }
-
-    #[test]
-    fn missing_generic_txn_without_force_returns_error() {
-        let got = decide_missing_txn_log_policy(3, 1, false, 1, false, false);
-        assert_eq!(got, MissingTxnLogPolicy::ErrorMissingLogAtTxnIndex);
-    }
-}

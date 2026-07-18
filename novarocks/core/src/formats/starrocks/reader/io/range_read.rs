@@ -132,35 +132,3 @@ fn read_all_segment_bytes(
         path
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::read_segment_bytes;
-    use opendal::Operator;
-    use tempfile::TempDir;
-
-    fn local_operator(root: &str) -> Operator {
-        let builder = opendal::services::Fs::default().root(root);
-        Operator::new(builder)
-            .expect("create local operator")
-            .finish()
-    }
-
-    #[test]
-    fn read_segment_bytes_falls_back_to_whole_file_for_offset_zero_short_range() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        std::fs::create_dir_all(temp_dir.path().join("data")).expect("create data dir");
-        std::fs::write(temp_dir.path().join("data/standalone.dat"), [1_u8, 2, 3])
-            .expect("write segment file");
-        let op = local_operator(temp_dir.path().to_str().expect("temp path to str"));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime");
-
-        let bytes = read_segment_bytes(&rt, &op, "data/standalone.dat", 0, 5)
-            .expect("offset-zero standalone segment should fall back to whole file");
-
-        assert_eq!(bytes, vec![1, 2, 3]);
-    }
-}

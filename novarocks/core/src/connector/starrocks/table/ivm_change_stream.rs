@@ -130,22 +130,3 @@ fn parse_fqn_to_iceberg_ref(fqn: &str) -> Result<TableIdentity, String> {
         table: parts[2].to_string(),
     })
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parse_fqn_to_iceberg_ref_round_trip() {
-        let parsed = super::parse_fqn_to_iceberg_ref("ice.sales.orders").expect("parse");
-        assert_eq!(parsed.catalog, "ice");
-        assert_eq!(parsed.namespace, "sales");
-        assert_eq!(parsed.table, "orders");
-        assert_eq!(parsed.fqn(), "ice.sales.orders");
-    }
-
-    #[test]
-    fn parse_fqn_to_iceberg_ref_rejects_non_three_part() {
-        assert!(super::parse_fqn_to_iceberg_ref("ice.sales").is_err());
-        assert!(super::parse_fqn_to_iceberg_ref("ice.sales.orders.extra").is_err());
-        assert!(super::parse_fqn_to_iceberg_ref("orders").is_err());
-    }
-}

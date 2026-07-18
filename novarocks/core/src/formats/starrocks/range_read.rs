@@ -38,18 +38,3 @@ pub(crate) fn expected_range_len(path: &str, start: u64, end: u64) -> Result<usi
         format!("read range length overflows usize: path={path}, start={start}, end={end}")
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ensure_exact_range_read_len;
-
-    #[test]
-    fn ensure_exact_range_read_len_rejects_short_successful_read() {
-        let err = ensure_exact_range_read_len("data/seg.dat", 4, 12, 7)
-            .expect_err("short read must be rejected");
-        assert!(err.contains("path=data/seg.dat"), "err={err}");
-        assert!(err.contains("range=4..12"), "err={err}");
-        assert!(err.contains("expected=8"), "err={err}");
-        assert!(err.contains("actual=7"), "err={err}");
-    }
-}

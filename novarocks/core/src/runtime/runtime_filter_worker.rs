@@ -295,7 +295,7 @@ impl RuntimeFilterWorker {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "compat"))]
 fn send_final_runtime_filter(
     hostname: &str,
     port: u16,
@@ -311,15 +311,6 @@ fn send_final_runtime_filter(
     req: crate::proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<(), String> {
     tests::send_final_runtime_filter_for_test(hostname, port, req)
-}
-
-#[cfg(all(test, feature = "compat"))]
-fn send_final_runtime_filter(
-    hostname: &str,
-    port: u16,
-    req: crate::proto::filter::TransmitRuntimeFilterRequest,
-) -> Result<(), String> {
-    exchange_sender::send_runtime_filter(hostname, port, req)
 }
 
 #[derive(Clone)]
