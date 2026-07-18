@@ -18,6 +18,7 @@
 use super::super::relational::encoded_physical_variant_names_for_test;
 use super::*;
 use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::planner::physical::PhysicalPlanKind;
 
 #[test]
 fn physical_plan_encoder_variant_guard_tracks_rust_enum_not_proto_arms() {

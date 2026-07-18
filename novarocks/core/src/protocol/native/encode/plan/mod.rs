@@ -53,8 +53,8 @@ use crate::sql::planner::distributed::{
     WriteContractCatalog,
 };
 use crate::sql::planner::physical::{
-    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PhysicalPlanKind, PlanSetOpKind,
-    RedistributeMode, TopNPhase,
+    AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
+    TopNPhase,
 };
 use crate::sql::planner::table as table_model;
 use crate::types::native_proto::encode_type;
