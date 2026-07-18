@@ -20,7 +20,8 @@ use std::num::NonZeroUsize;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::fragment::error::{
-    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+    ExecPlanBuildError, ExecPlanInvariant, FragmentBindingError, FragmentBindingErrorKind,
+    FragmentBindingTarget,
 };
 use crate::exec::fragment::sink::FragmentSinkProgram;
 use crate::exec::node::ExecPlan;
@@ -177,24 +178,18 @@ impl FragmentSinkSpec {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
 
+        program.validate().map_err(static_sink_binding_error)?;
         let (kind, assignment_requirement) = match &program {
             FragmentSinkProgram::Result => (FragmentSinkKind::Result, None),
             FragmentSinkProgram::Noop => (FragmentSinkKind::Noop, None),
-            FragmentSinkProgram::DataStream(stream) => {
-                validate_partition_exprs(stream.partition_arena(), &stream.output_partition_exprs)?;
+            FragmentSinkProgram::DataStream(_) => {
                 (FragmentSinkKind::DataStream, Required(StreamDestinations))
             }
             FragmentSinkProgram::MultiCastDataStream(grouped) => {
                 let count = non_empty_group_count(
                     FragmentSinkKind::MultiCastDataStream,
-                    grouped.sinks.len(),
+                    grouped.sinks().len(),
                 )?;
-                for stream in &grouped.sinks {
-                    validate_partition_exprs(
-                        grouped.partition_arena(),
-                        &stream.output_partition_exprs,
-                    )?;
-                }
                 (
                     FragmentSinkKind::MultiCastDataStream,
                     Required(DestinationGroups(count)),
@@ -204,14 +199,8 @@ impl FragmentSinkSpec {
             FragmentSinkProgram::IcebergChangeStreamRouter(router) => {
                 let count = non_empty_group_count(
                     FragmentSinkKind::IcebergChangeStreamRouter,
-                    router.branches.len(),
+                    router.branches().len(),
                 )?;
-                for branch in &router.branches {
-                    validate_partition_exprs(
-                        router.partition_arena(),
-                        &branch.stream_sink.output_partition_exprs,
-                    )?;
-                }
                 (
                     FragmentSinkKind::IcebergChangeStreamRouter,
                     Required(DestinationGroups(count)),
@@ -238,6 +227,14 @@ impl FragmentSinkSpec {
     }
 }
 
+fn static_sink_binding_error(error: ExecPlanBuildError) -> FragmentBindingError {
+    let kind = match error.invariant() {
+        ExecPlanInvariant::Expression => FragmentBindingErrorKind::ExpressionMismatch,
+        _ => FragmentBindingErrorKind::InvalidAssignment,
+    };
+    FragmentBindingError::new(FragmentBindingTarget::Sink, kind, error.detail())
+}
+
 fn non_empty_group_count(
     kind: FragmentSinkKind,
     count: usize,
@@ -249,23 +246,6 @@ fn non_empty_group_count(
             format!("sink {kind:?} requires at least one static branch"),
         )
     })
-}
-
-fn validate_partition_exprs(
-    arena: &crate::exec::expr::ExprArena,
-    exprs: &[crate::exec::expr::ExprId],
-) -> Result<(), FragmentBindingError> {
-    if let Some(expr_id) = exprs.iter().find(|expr_id| arena.node(**expr_id).is_none()) {
-        return Err(FragmentBindingError::new(
-            FragmentBindingTarget::Sink,
-            FragmentBindingErrorKind::InvalidAssignment,
-            format!(
-                "sink partition expression id {} is missing from its static arena",
-                expr_id.0
-            ),
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -373,7 +353,7 @@ mod tests {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
 
-        let stream = DataStreamSinkProgram::new(
+        let stream = DataStreamSinkProgram::try_new(
             9,
             Vec::new(),
             DataStreamPartitionType::Unpartitioned,
@@ -381,7 +361,8 @@ mod tests {
             vec![SlotId::new(1)],
             Option::None,
             ExprArena::default(),
-        );
+        )
+        .expect("data stream program");
         assert_eq!(
             FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(stream))
                 .expect("data stream sink")
@@ -397,7 +378,7 @@ mod tests {
             );
         }
         let branch = || {
-            DataStreamSinkBranchProgram::new(
+            DataStreamSinkBranchProgram::try_new(
                 9,
                 Vec::new(),
                 DataStreamPartitionType::Unpartitioned,
@@ -405,9 +386,11 @@ mod tests {
                 vec![SlotId::new(1)],
                 Option::None,
             )
+            .expect("data stream branch")
         };
         let grouped = FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
-            MultiCastDataStreamSinkProgram::new(vec![branch(), branch()], ExprArena::default()),
+            MultiCastDataStreamSinkProgram::try_new(vec![branch(), branch()], ExprArena::default())
+                .expect("grouped stream program"),
         ))
         .expect("grouped sink");
         assert_eq!(
@@ -417,12 +400,9 @@ mod tests {
             ))
         );
 
-        let error = FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
-            MultiCastDataStreamSinkProgram::new(Vec::new(), ExprArena::default()),
-        ))
-        .expect_err("empty grouped sink is invalid");
-        assert_eq!(error.target(), FragmentBindingTarget::Sink);
-        assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        let error = MultiCastDataStreamSinkProgram::try_new(Vec::new(), ExprArena::default())
+            .expect_err("empty grouped sink is invalid at static build time");
+        assert_eq!(error.invariant(), ExecPlanInvariant::Sink);
     }
 
     #[test]

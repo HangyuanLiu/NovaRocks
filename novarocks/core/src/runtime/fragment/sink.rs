@@ -55,14 +55,9 @@ pub(crate) fn materialize_fragment_sink_components(
     plan_node_id: i32,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     match (program.program(), assignment) {
-        (FragmentSinkProgram::Result, FragmentSinkAssignment::None) => {
-            Ok(Box::new(ResultBufferSinkFactory::new(
-                None,
-                ResultSinkConfig::mysql(),
-                (plan_node_id >= 0).then_some(plan_node_id),
-                typed_result_sink,
-            )))
-        }
+        (FragmentSinkProgram::Result, FragmentSinkAssignment::None) => Ok(Box::new(
+            ResultBufferSinkFactory::new(None, ResultSinkConfig::mysql(), None, typed_result_sink),
+        )),
         (FragmentSinkProgram::Noop, FragmentSinkAssignment::None) => {
             Ok(Box::new(NoopSinkFactory::new()))
         }
@@ -72,13 +67,16 @@ pub(crate) fn materialize_fragment_sink_components(
                 destinations,
                 sender_id,
             },
-        ) => Ok(Box::new(DataStreamSinkFactory::new(
-            stream_input(stream, destinations.clone()),
-            fragment_instance_id,
-            *sender_id,
-            plan_node_id,
-            stream.partition_arena().clone(),
-        ))),
+        ) => {
+            let input = stream_input(stream, destinations.clone())?;
+            Ok(Box::new(DataStreamSinkFactory::new(
+                input,
+                fragment_instance_id,
+                *sender_id,
+                plan_node_id,
+                stream.partition_arena().clone(),
+            )))
+        }
         (
             FragmentSinkProgram::MultiCastDataStream(grouped),
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
@@ -119,13 +117,15 @@ fn materialize_multicast(
     sender_id: Option<i32>,
     plan_node_id: i32,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    ensure_group_count(program.sinks.len(), groups.len())?;
+    ensure_group_count(program.sinks().len(), groups.len())?;
     let sinks = program
-        .sinks
+        .sinks()
         .iter()
         .zip(groups)
-        .map(|(stream, destinations)| (branch_input(stream, destinations.clone()), stream.limit))
-        .collect();
+        .map(|(stream, destinations)| {
+            Ok((branch_input(stream, destinations.clone())?, stream.limit()))
+        })
+        .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
     Ok(Box::new(MultiCastDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
@@ -142,22 +142,25 @@ fn materialize_router(
     sender_id: Option<i32>,
     plan_node_id: i32,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    ensure_group_count(program.branches.len(), groups.len())?;
+    ensure_group_count(program.branches().len(), groups.len())?;
     let branches = program
-        .branches
+        .branches()
         .iter()
         .zip(groups)
-        .map(
-            |(branch, destinations)| IcebergChangeStreamRouterBranchFactoryInput {
-                branch_id: branch.branch_id,
-                branch_kind: branch.branch_kind,
-                stream_sink: branch_input(&branch.stream_sink, destinations.clone()),
-            },
-        )
-        .collect();
+        .map(|(branch, destinations)| {
+            Ok(IcebergChangeStreamRouterBranchFactoryInput {
+                branch_id: branch.branch_id(),
+                branch_kind: branch.branch_kind(),
+                stream_sink: branch_input(branch.stream_sink(), destinations.clone())?,
+            })
+        })
+        .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
     let input = IcebergChangeStreamRouterSinkFactoryInput {
-        change_op_slot_id: slot_id_as_i32(program.change_op_slot_id)?,
-        data_route_slot_id: program.data_route_slot_id.map(slot_id_as_i32).transpose()?,
+        change_op_slot_id: slot_id_as_i32(program.change_op_slot_id())?,
+        data_route_slot_id: program
+            .data_route_slot_id()
+            .map(slot_id_as_i32)
+            .transpose()?,
         branches,
     };
     IcebergChangeStreamRouterSinkFactory::try_new(
@@ -174,29 +177,31 @@ fn materialize_router(
 fn stream_input(
     program: &crate::exec::fragment::sink::DataStreamSinkProgram,
     destinations: Vec<FragmentDestination>,
-) -> DataStreamSinkFactoryInput {
-    DataStreamSinkFactoryInput::from_static_program(
-        program.dest_node_id,
-        program.output_partition_type,
-        program.output_exprs.clone(),
-        program.output_partition_exprs.clone(),
-        program.output_columns.clone(),
+) -> Result<DataStreamSinkFactoryInput, FragmentLaunchError> {
+    DataStreamSinkFactoryInput::try_from_static_program(
+        program.dest_node_id(),
+        program.output_partition_type(),
+        program.output_exprs().to_vec(),
+        program.output_partition_exprs().to_vec(),
+        program.output_columns().to_vec(),
         destinations,
     )
+    .map_err(materialization_error)
 }
 
 fn branch_input(
     program: &DataStreamSinkBranchProgram,
     destinations: Vec<FragmentDestination>,
-) -> DataStreamSinkFactoryInput {
-    DataStreamSinkFactoryInput::from_static_program(
-        program.dest_node_id,
-        program.output_partition_type,
-        program.output_exprs.clone(),
-        program.output_partition_exprs.clone(),
-        program.output_columns.clone(),
+) -> Result<DataStreamSinkFactoryInput, FragmentLaunchError> {
+    DataStreamSinkFactoryInput::try_from_static_program(
+        program.dest_node_id(),
+        program.output_partition_type(),
+        program.output_exprs().to_vec(),
+        program.output_partition_exprs().to_vec(),
+        program.output_columns().to_vec(),
         destinations,
     )
+    .map_err(materialization_error)
 }
 
 fn ensure_group_count(expected: usize, actual: usize) -> Result<(), FragmentLaunchError> {
@@ -266,10 +271,10 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 
-    use super::materialize_fragment_sink;
+    use super::{materialize_fragment_sink, materialize_fragment_sink_components};
 
     fn stream_program() -> DataStreamSinkProgram {
-        DataStreamSinkProgram::new(
+        DataStreamSinkProgram::try_new(
             17,
             Vec::new(),
             DataStreamPartitionType::Unpartitioned,
@@ -278,10 +283,11 @@ mod tests {
             None,
             ExprArena::default(),
         )
+        .expect("stream program")
     }
 
     fn stream_branch(dest_node_id: i32) -> DataStreamSinkBranchProgram {
-        DataStreamSinkBranchProgram::new(
+        DataStreamSinkBranchProgram::try_new(
             dest_node_id,
             Vec::new(),
             DataStreamPartitionType::Unpartitioned,
@@ -289,6 +295,7 @@ mod tests {
             vec![SlotId::new(3)],
             None,
         )
+        .expect("stream branch")
     }
 
     fn instance(sink_assignment: FragmentSinkAssignment) -> FragmentInstanceSpec {
@@ -324,10 +331,11 @@ mod tests {
     #[test]
     fn grouped_materialization_rejects_mismatched_destination_count() {
         let sink = FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
-            MultiCastDataStreamSinkProgram::new(
+            MultiCastDataStreamSinkProgram::try_new(
                 vec![stream_branch(17), stream_branch(18)],
                 ExprArena::default(),
-            ),
+            )
+            .expect("multicast program"),
         ))
         .expect("two-branch multicast sink");
         let assignment = FragmentSinkAssignment::DestinationGroups {
@@ -343,5 +351,21 @@ mod tests {
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
         assert!(error.detail().contains("expected 2 destination groups"));
+    }
+
+    #[test]
+    fn result_materialization_keeps_bridge_plan_node_unset() {
+        let sink = FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink");
+
+        let factory = materialize_fragment_sink_components(
+            &sink,
+            &FragmentSinkAssignment::None,
+            UniqueId { hi: 3, lo: 4 },
+            false,
+            47,
+        )
+        .expect("result sink materialization");
+
+        assert_eq!(factory.name(), "RESULT_BUFFER_SINK (plan_node_id=-1)");
     }
 }

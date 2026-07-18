@@ -779,22 +779,25 @@ mod tests {
     }
 
     fn data_stream_sink() -> FragmentSinkSpec {
-        FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(DataStreamSinkProgram::new(
-            9,
-            Vec::new(),
-            DataStreamPartitionType::Unpartitioned,
-            Vec::new(),
-            vec![SlotId::new(1)],
-            None,
-            ExprArena::default(),
-        )))
+        FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(
+            DataStreamSinkProgram::try_new(
+                9,
+                Vec::new(),
+                DataStreamPartitionType::Unpartitioned,
+                Vec::new(),
+                vec![SlotId::new(1)],
+                None,
+                ExprArena::default(),
+            )
+            .expect("data stream program"),
+        ))
         .expect("data stream sink")
     }
 
     fn multicast_sink(branch_count: usize) -> FragmentSinkSpec {
         let branches = (0..branch_count)
             .map(|index| {
-                DataStreamSinkBranchProgram::new(
+                DataStreamSinkBranchProgram::try_new(
                     i32::try_from(index).expect("branch index fits i32"),
                     Vec::new(),
                     DataStreamPartitionType::Unpartitioned,
@@ -802,10 +805,12 @@ mod tests {
                     vec![SlotId::new(1)],
                     None,
                 )
+                .expect("data stream branch")
             })
             .collect();
         FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
-            MultiCastDataStreamSinkProgram::new(branches, ExprArena::default()),
+            MultiCastDataStreamSinkProgram::try_new(branches, ExprArena::default())
+                .expect("multicast program"),
         ))
         .expect("multicast sink")
     }

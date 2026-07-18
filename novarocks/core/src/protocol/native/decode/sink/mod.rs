@@ -35,9 +35,8 @@ use crate::connector::iceberg::sink_plan::{
 };
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-    IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
-    IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
+    DataStreamSinkBranchProgram, FragmentSinkProgram, IcebergChangeStreamRouterBranchProgram,
+    IcebergChangeStreamRouterProgram, IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::DataStreamPartitionType;
 use crate::proto::{common, expr, novarocks, plan};
@@ -96,15 +95,10 @@ pub(crate) fn decode_fragment_sink_program(
                 layout,
                 "native DATA_STREAM_SINK",
             )?;
-            Ok(FragmentSinkProgram::DataStream(DataStreamSinkProgram::new(
-                branch.dest_node_id,
-                branch.output_exprs,
-                branch.output_partition_type,
-                branch.output_partition_exprs,
-                branch.output_columns,
-                branch.limit,
-                partition_arena,
-            )))
+            branch
+                .into_program(partition_arena)
+                .map(FragmentSinkProgram::DataStream)
+                .map_err(|error| error.to_string())
         }
         plan::data_sink::Kind::MultiCastDataStream(grouped) => {
             let mut partition_arena = ExprArena::default();
@@ -122,7 +116,8 @@ pub(crate) fn decode_fragment_sink_program(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(FragmentSinkProgram::MultiCastDataStream(
-                MultiCastDataStreamSinkProgram::new(sinks, partition_arena),
+                MultiCastDataStreamSinkProgram::try_new(sinks, partition_arena)
+                    .map_err(|error| error.to_string())?,
             ))
         }
         plan::data_sink::Kind::IcebergWrite(iceberg) => {
@@ -133,7 +128,8 @@ pub(crate) fn decode_fragment_sink_program(
                 layout,
             )?;
             Ok(FragmentSinkProgram::IcebergTable(
-                IcebergTableSinkProgram::from_factory_input(input),
+                IcebergTableSinkProgram::try_from_factory_input(input)
+                    .map_err(|error| error.to_string())?,
             ))
         }
         plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
@@ -163,7 +159,6 @@ pub(crate) fn decode_fragment_sink_assignment(
             sender_id: None,
         }),
         plan::data_sink::Kind::MultiCastDataStream(grouped) => {
-            reject_instance_destinations_for_grouped_sink(instance)?;
             Ok(FragmentSinkAssignment::DestinationGroups {
                 groups: grouped
                     .destinations
@@ -180,7 +175,6 @@ pub(crate) fn decode_fragment_sink_assignment(
             })
         }
         plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
-            reject_instance_destinations_for_grouped_sink(instance)?;
             Ok(FragmentSinkAssignment::DestinationGroups {
                 groups: router
                     .branches
@@ -249,14 +243,15 @@ fn decode_data_stream_branch(
         Vec::new()
     };
     let output_columns = decode_output_slot_ids(&stream.output_columns, context)?;
-    Ok(DataStreamSinkBranchProgram::new(
+    DataStreamSinkBranchProgram::try_new(
         stream.dest_node_id,
         Vec::new(),
         partition_type,
         output_partition_exprs,
         output_columns,
         stream.limit,
-    ))
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn decode_output_slot_ids(raw_ids: &[i32], context: &str) -> Result<Vec<SlotId>, String> {
@@ -322,26 +317,28 @@ fn decode_change_stream_router_program(
                 output_columns,
                 &format!("branch[{index}] output"),
             )?;
-            Ok(IcebergChangeStreamRouterBranchProgram {
-                branch_id: branch.branch_id,
-                branch_kind: decode_change_stream_branch_kind(branch.branch_kind)?,
-                stream_sink: DataStreamSinkBranchProgram::new(
+            Ok(IcebergChangeStreamRouterBranchProgram::new(
+                branch.branch_id,
+                decode_change_stream_branch_kind(branch.branch_kind)?,
+                DataStreamSinkBranchProgram::try_new(
                     branch.target_exchange_node_id,
                     Vec::new(),
                     partition_type,
                     output_partition_exprs,
                     branch_output_columns,
                     None,
-                ),
-            })
+                )
+                .map_err(|error| error.to_string())?,
+            ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(IcebergChangeStreamRouterProgram::new(
+    IcebergChangeStreamRouterProgram::try_new(
         change_op_slot_id,
         data_route_slot_id,
         branches,
         partition_arena,
-    ))
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn branch_partition_from_native(
@@ -461,18 +458,6 @@ fn decode_stream_destination_list(
             ))
         })
         .collect()
-}
-
-fn reject_instance_destinations_for_grouped_sink(
-    instance: &novarocks::InstanceParams,
-) -> Result<(), String> {
-    if !instance.destinations.is_empty() {
-        return Err(
-            "grouped native sink must carry destinations in ordered sink groups, not InstanceParams.destinations"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 pub(crate) fn decode_iceberg_write_sink_factory_input(
@@ -775,6 +760,79 @@ fn iceberg_sink_mode_from_native(value: i32) -> Result<IcebergSinkMode, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_destination(id: i64) -> plan::StreamDestination {
+        plan::StreamDestination {
+            finst_id: Some(common::UniqueId { hi: 1, lo: id }),
+            endpoint: "127.0.0.1:8060".to_string(),
+        }
+    }
+
+    fn instance_destination(id: i64) -> novarocks::Destination {
+        novarocks::Destination {
+            finst_id: Some(common::UniqueId { hi: 2, lo: id }),
+            endpoint: "127.0.0.1:8061".to_string(),
+        }
+    }
+
+    fn assert_single_destination_group(assignment: FragmentSinkAssignment, expected_lo: i64) {
+        let FragmentSinkAssignment::DestinationGroups { groups, sender_id } = assignment else {
+            panic!("expected destination groups");
+        };
+        assert_eq!(sender_id, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[0][0].finst_id().lo, expected_lo);
+    }
+
+    #[test]
+    fn multicast_assignment_ignores_redundant_flat_instance_destinations() {
+        let sink = plan::DataSink {
+            kind: Some(plan::data_sink::Kind::MultiCastDataStream(
+                plan::MultiCastDataStreamSink {
+                    sinks: Vec::new(),
+                    destinations: vec![plan::StreamDestinationList {
+                        destinations: vec![plan_destination(11)],
+                    }],
+                },
+            )),
+        };
+        let instance = novarocks::InstanceParams {
+            destinations: vec![instance_destination(99)],
+            ..Default::default()
+        };
+
+        let assignment = decode_fragment_sink_assignment(&sink, &instance)
+            .expect("redundant flat destinations must remain wire compatible");
+
+        assert_single_destination_group(assignment, 11);
+    }
+
+    #[test]
+    fn router_assignment_ignores_redundant_flat_instance_destinations() {
+        let sink = plan::DataSink {
+            kind: Some(plan::data_sink::Kind::IcebergChangeStreamRouter(
+                plan::IcebergChangeStreamRouterSink {
+                    branches: vec![plan::IcebergChangeStreamBranchRoute {
+                        destinations: Some(plan::StreamDestinationList {
+                            destinations: vec![plan_destination(12)],
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )),
+        };
+        let instance = novarocks::InstanceParams {
+            destinations: vec![instance_destination(98)],
+            ..Default::default()
+        };
+
+        let assignment = decode_fragment_sink_assignment(&sink, &instance)
+            .expect("redundant flat destinations must remain wire compatible");
+
+        assert_single_destination_group(assignment, 12);
+    }
 
     #[test]
     fn router_branch_rejects_duplicate_output_slots() {
