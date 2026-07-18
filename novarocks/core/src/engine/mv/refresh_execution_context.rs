@@ -24,9 +24,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, TimeUnit};
-use iceberg::spec::Schema;
-
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 use crate::connector::iceberg::scan_model::{
@@ -962,9 +959,8 @@ pub(crate) mod tests_support {
 
     use crate::catalog::identifier::TableIdentity;
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
-    pub(crate) use crate::mv::rewrite::context::tests_support::{
-        dummy_rewrite_context, make_mv_definition, make_pin, make_ref, make_schema_contract,
-        make_target, make_target_schema, parse_query,
+    use crate::mv::rewrite::context::tests_support::{
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
@@ -1568,12 +1564,9 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::catalog::identifier::TableIdentity;
-    use crate::mv::persistence::schema as mv_schema;
-    use crate::mv::refresh::pin::RefreshSnapshotPin;
-    use mv_schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
+    use crate::mv::rewrite::context::tests_support::{
+        dummy_rewrite_context, make_mv_definition, make_pin, make_ref, make_schema_contract,
+        make_target_schema, parse_query,
     };
 
     use super::tests_support::*;
@@ -1624,10 +1617,6 @@ mod tests {
             namespace: "NameSpace".to_string(),
             table: "MvTable".to_string(),
         };
-        let identity = rewrite_target_identity(&mixed_case_target);
-        assert_eq!(identity.catalog, mixed_case_target.catalog);
-        assert_eq!(identity.namespace, mixed_case_target.namespace);
-        assert_eq!(identity.table, mixed_case_target.table);
 
         use iceberg::{NamespaceIdent, TableIdent};
 
@@ -1637,7 +1626,7 @@ mod tests {
         let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
         let target_entry = Arc::new(
             crate::connector::iceberg::catalog::registry::build_catalog_entry(
-                "tgt",
+                "TargetCase",
                 &[
                     ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                     ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
@@ -1656,15 +1645,16 @@ mod tests {
             ))
             .to_string_lossy()
             .into_owned();
-        let base_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
-            "ice",
-            &[
-                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                ("iceberg.catalog.warehouse".to_string(), base_warehouse),
-            ],
-        )
-        .expect("base catalog entry");
-        let base_catalog_entries = [("ice".to_string(), base_entry)].into_iter().collect();
+        let mut iceberg_catalogs = IcebergCatalogRegistry::default();
+        iceberg_catalogs
+            .create_catalog(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), base_warehouse),
+                ],
+            )
+            .expect("base catalog entry");
         let schema = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
@@ -1696,23 +1686,63 @@ mod tests {
             .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
-                NamespaceIdent::new("db".to_string()),
-                "mv".to_string(),
+                NamespaceIdent::new("NameSpace".to_string()),
+                "MvTable".to_string(),
             ))
             .build()
             .expect("target table");
-        let ctx = IcebergMvRefreshContext {
-            rewrite: dummy_rewrite_context(),
-            application_target: make_application_target(),
+        let target_metadata = target_table.metadata();
+        let mut contract = make_schema_contract();
+        contract.target.table_fqn = "TargetCase.NameSpace.MvTable".to_string();
+        contract.target.table_uuid = target_metadata.uuid().to_string();
+        contract.target.schema_id_at_create = target_metadata.current_schema_id();
+        let target_schema = target_metadata.current_schema();
+        let field_id = |name: &str| {
+            target_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing target field {name}"))
+                .id
+        };
+        let k_id = field_id("k");
+        let v_id = field_id("v");
+        contract.target.visible_columns[0].target_field_id = k_id;
+        contract.target.visible_columns[1].target_field_id = v_id;
+        contract.target.hidden_apply_key.target_field_id = k_id;
+        let mut mv_definition = make_mv_definition();
+        mv_definition.target_catalog = Some(mixed_case_target.catalog.clone());
+        mv_definition.target_namespace = Some(mixed_case_target.namespace.clone());
+        mv_definition.target_table = Some(mixed_case_target.table.clone());
+        mv_definition.schema_contract = Some(contract);
+        let ctx = IcebergMvRefreshContext::new(
+            mixed_case_target.clone(),
+            mv_definition.mv_id,
+            Some("sess_cat"),
+            "sess_db",
+            Arc::new(mv_definition),
+            Arc::new(parse_query("SELECT k, v FROM ice.db.b")),
+            Arc::from(vec![make_ref("ice", "db", "b")]),
+            Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
+            &iceberg_catalogs,
             target_entry,
-            base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
-                "test context",
-            ),
-            pruning_limits: MvRefreshPruningLimits::default(),
-        };
+        )
+        .expect("mixed-case execution context");
+        assert_eq!(ctx.application_target.catalog, mixed_case_target.catalog);
+        assert_eq!(
+            ctx.application_target.namespace,
+            mixed_case_target.namespace
+        );
+        assert_eq!(ctx.application_target.table, mixed_case_target.table);
+        assert_eq!(ctx.rewrite.target.catalog, ctx.application_target.catalog);
+        assert_eq!(
+            ctx.rewrite.target.namespace,
+            ctx.application_target.namespace
+        );
+        assert_eq!(ctx.rewrite.target.table, ctx.application_target.table);
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),

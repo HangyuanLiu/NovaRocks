@@ -565,7 +565,6 @@ pub(crate) mod tests_support {
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
         ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
         JoinContractKind, JoinPredicateLineage, MvSchemaContract, OutputColumnLineage,
