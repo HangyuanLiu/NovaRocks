@@ -23,8 +23,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_state_store::coordination::{
     AcquireOutcome, AttemptId, ClockHealth, ControlPlaneMode, CoordinationError,
-    CoordinationErrorKind, CoordinationOperation, CoordinationOutcome, HolderId, IncarnationGate,
-    LeaseCancellationReason, LeaseClock, LeaseGuard, LeaseManager, LeaseSettings, ResourceKey,
+    CoordinationErrorKind, CoordinationMetrics, CoordinationOperation, CoordinationOutcome,
+    HolderId, IncarnationGate, LeaseCancellationReason, LeaseClock, LeaseGuard, LeaseManager,
+    LeaseSettings, ResourceKey,
 };
 use novarocks_state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, OperationId, Precondition,
@@ -680,7 +681,8 @@ async fn seed_control(
 
 pub async fn incarnation_gate_lifecycle(factory: &StateStoreFactory) {
     let fixture = open_fixture(factory).await;
-    let gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    let metrics = Arc::new(CoordinationMetrics::new());
+    let gate = IncarnationGate::with_metrics(Arc::clone(&fixture.store), Arc::clone(&metrics));
     assert_eq!(
         gate.load().await.unwrap_err().kind(),
         CoordinationErrorKind::NotBootstrapped
@@ -701,6 +703,21 @@ pub async fn incarnation_gate_lifecycle(factory: &StateStoreFactory) {
     let reopened = gate.open_writes(&restoring, reopen_id).await.unwrap();
     assert_eq!(reopened.incarnation(), restoring.incarnation());
     assert_eq!(reopened.mode(), ControlPlaneMode::WriteOpen);
+    let metrics = metrics.snapshot();
+    assert_eq!(
+        metrics.operation_outcome_count(
+            CoordinationOperation::BeginRestore,
+            CoordinationOutcome::Success,
+        ),
+        1
+    );
+    assert_eq!(
+        metrics.operation_outcome_count(
+            CoordinationOperation::AdmitWrites,
+            CoordinationOutcome::WriteClosed,
+        ),
+        1
+    );
 }
 
 pub async fn concurrent_bootstrap_converges(factory: &StateStoreFactory) {
@@ -1022,12 +1039,6 @@ pub async fn basic_acquire_contention_and_high_watermark(factory: &StateStoreFac
         LeaseSettings::new(
             Duration::from_millis(2),
             Duration::from_millis(1),
-            Duration::ZERO,
-            Duration::from_millis(1),
-        ),
-        LeaseSettings::new(
-            Duration::from_millis(2),
-            Duration::from_millis(1),
             Duration::from_millis(1),
             Duration::ZERO,
         ),
@@ -1049,6 +1060,13 @@ pub async fn basic_acquire_contention_and_high_watermark(factory: &StateStoreFac
             CoordinationErrorKind::InvalidRequest
         );
     }
+    LeaseSettings::new(
+        Duration::from_millis(2),
+        Duration::from_millis(1),
+        Duration::ZERO,
+        Duration::from_millis(1),
+    )
+    .expect("zero maximum clock skew is a valid explicit policy");
 
     let fixture = open_fixture(factory).await;
     IncarnationGate::new(Arc::clone(&fixture.store))
@@ -1643,6 +1661,20 @@ async fn exact_renew_release_and_stale_guards(factory: &StateStoreFactory) {
     );
     assert_eq!(second.token().resource_epoch().get(), 2);
     assert_eq!(
+        manager_b.metrics_snapshot().operation_outcome_count(
+            CoordinationOperation::Acquire,
+            CoordinationOutcome::Takeover,
+        ),
+        0,
+        "released high-watermark acquisition is not a takeover"
+    );
+    assert_eq!(
+        manager_b
+            .metrics_snapshot()
+            .operation_outcome_count(CoordinationOperation::Acquire, CoordinationOutcome::Success,),
+        1
+    );
+    assert_eq!(
         manager_a
             .metrics_snapshot()
             .operation_outcome_count(CoordinationOperation::Renew, CoordinationOutcome::Success,),
@@ -2061,23 +2093,26 @@ async fn force_takeover(
 
 pub async fn stale_fence_finalize(factory: &StateStoreFactory) {
     let fixture = open_fixture(factory).await;
-    IncarnationGate::new(Arc::clone(&fixture.store))
+    let metrics = Arc::new(CoordinationMetrics::new());
+    IncarnationGate::with_metrics(Arc::clone(&fixture.store), Arc::clone(&metrics))
         .bootstrap(OperationId::new_v7())
         .await
         .expect("bootstrap stale-fence fixture");
     let clock = Arc::new(ManualLeaseClock::new(1_100_000, 20_000));
-    let manager_a = LeaseManager::new(
+    let manager_a = LeaseManager::with_metrics(
         Arc::clone(&fixture.store),
         holder(b"fence-holder-a"),
         clock.clone(),
         lease_settings(),
+        Arc::clone(&metrics),
     )
     .expect("manager A");
-    let manager_b = LeaseManager::new(
+    let manager_b = LeaseManager::with_metrics(
         Arc::clone(&fixture.store),
         holder(b"fence-holder-b"),
         clock.clone(),
         lease_settings(),
+        Arc::clone(&metrics),
     )
     .expect("manager B");
 
@@ -2090,6 +2125,13 @@ pub async fn stale_fence_finalize(factory: &StateStoreFactory) {
     );
     let old_fence = first.fence();
     let current = force_takeover(&manager_b, first_resource, attempt(), &clock).await;
+    assert_eq!(
+        manager_b.metrics_snapshot().operation_outcome_count(
+            CoordinationOperation::Acquire,
+            CoordinationOutcome::Takeover,
+        ),
+        1
+    );
     let mut stale_transaction = fixture
         .store
         .begin_write(transaction_id(), "validate stale lease fence")
@@ -2156,7 +2198,7 @@ pub async fn stale_fence_finalize(factory: &StateStoreFactory) {
             CoordinationOperation::ValidateFence,
             CoordinationOutcome::Success,
         ),
-        1
+        2
     );
 }
 

@@ -17,8 +17,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::{CoordinationError, CoordinationErrorKind};
+
 pub const COORDINATION_OPERATION_COUNT: usize = 9;
-pub const COORDINATION_OUTCOME_COUNT: usize = 11;
+pub const COORDINATION_OUTCOME_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -40,14 +42,35 @@ pub enum CoordinationOutcome {
     Success = 0,
     Contended = 1,
     AwaitingTakeover = 2,
-    ClockUnsafe = 3,
-    FenceLost = 4,
-    IncarnationChanged = 5,
-    WriteClosed = 6,
-    OperationNotCommitted = 7,
-    CommitUncertain = 8,
-    Corruption = 9,
-    StoreUnavailable = 10,
+    Takeover = 3,
+    ClockUnsafe = 4,
+    FenceLost = 5,
+    IncarnationChanged = 6,
+    WriteClosed = 7,
+    OperationNotCommitted = 8,
+    CommitUncertain = 9,
+    Corruption = 10,
+    StoreUnavailable = 11,
+}
+
+pub(crate) fn error_outcome(error: &CoordinationError) -> Option<CoordinationOutcome> {
+    match error.kind() {
+        CoordinationErrorKind::ClockUnsafe => Some(CoordinationOutcome::ClockUnsafe),
+        CoordinationErrorKind::FenceLost => Some(CoordinationOutcome::FenceLost),
+        CoordinationErrorKind::IncarnationChanged => Some(CoordinationOutcome::IncarnationChanged),
+        CoordinationErrorKind::WriteClosed => Some(CoordinationOutcome::WriteClosed),
+        CoordinationErrorKind::OperationNotCommitted => {
+            Some(CoordinationOutcome::OperationNotCommitted)
+        }
+        CoordinationErrorKind::CommitUncertain => Some(CoordinationOutcome::CommitUncertain),
+        CoordinationErrorKind::Corruption => Some(CoordinationOutcome::Corruption),
+        CoordinationErrorKind::StoreUnavailable => Some(CoordinationOutcome::StoreUnavailable),
+        CoordinationErrorKind::InvalidRequest
+        | CoordinationErrorKind::LimitExceeded
+        | CoordinationErrorKind::NotBootstrapped
+        | CoordinationErrorKind::EpochExhausted
+        | CoordinationErrorKind::IncarnationExhausted => None,
+    }
 }
 
 #[derive(Debug)]

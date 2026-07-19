@@ -23,6 +23,10 @@ use crate::{
 };
 
 use super::codec::{ControlRecord, control_storage_key, decode_control, encode_control};
+use super::metrics::{
+    CoordinationMetrics, CoordinationMetricsSnapshot, CoordinationOperation, CoordinationOutcome,
+    error_outcome,
+};
 use super::operation::{
     ReadBackCertainty, candidate_mismatch, classify_commit, recover_commit, transaction_id,
 };
@@ -52,53 +56,72 @@ const V1_PERSISTED_VERSION_BYTES: usize = 16;
 
 pub struct IncarnationGate {
     store: Arc<dyn StateStore>,
+    metrics: Arc<CoordinationMetrics>,
 }
 
 impl IncarnationGate {
     pub fn new(store: Arc<dyn StateStore>) -> Self {
-        Self { store }
+        Self::with_metrics(store, Arc::new(CoordinationMetrics::new()))
+    }
+
+    pub fn with_metrics(store: Arc<dyn StateStore>, metrics: Arc<CoordinationMetrics>) -> Self {
+        Self { store, metrics }
+    }
+
+    pub fn metrics_snapshot(&self) -> CoordinationMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub async fn bootstrap(
         &self,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        let identity = self
-            .store
-            .identity()
-            .await
-            .map_err(CoordinationError::from_state_store)?;
-        let candidate = bootstrap_candidate(&identity, operation_id)?;
-        let key = control_storage_key()?;
-        let value = encode_control(&candidate)?;
-        validate_write_limits(self.store.limits(), &key, &value, None)?;
-        let transaction_id = transaction_id(operation_id);
-        let mut transaction = self
-            .store
-            .begin_write(transaction_id, BOOTSTRAP_PURPOSE)
-            .await
-            .map_err(CoordinationError::from_state_store)?;
-        transaction
-            .put(key, value, Precondition::Absent)
-            .await
-            .map_err(CoordinationError::from_state_store)?;
-        let certainty = classify_commit(
-            self.store.as_ref(),
-            transaction_id,
-            transaction.commit().await,
-        )
-        .await?;
-        self.read_back_bootstrap(candidate, &identity, transaction_id, certainty)
-            .await
+        let result = async {
+            let identity = self
+                .store
+                .identity()
+                .await
+                .map_err(CoordinationError::from_state_store)?;
+            let candidate = bootstrap_candidate(&identity, operation_id)?;
+            let key = control_storage_key()?;
+            let value = encode_control(&candidate)?;
+            validate_write_limits(self.store.limits(), &key, &value, None)?;
+            let transaction_id = transaction_id(operation_id);
+            let mut transaction = self
+                .store
+                .begin_write(transaction_id, BOOTSTRAP_PURPOSE)
+                .await
+                .map_err(CoordinationError::from_state_store)?;
+            transaction
+                .put(key, value, Precondition::Absent)
+                .await
+                .map_err(CoordinationError::from_state_store)?;
+            let certainty = classify_commit(
+                self.store.as_ref(),
+                transaction_id,
+                transaction.commit().await,
+            )
+            .await?;
+            self.read_back_bootstrap(candidate, &identity, transaction_id, certainty)
+                .await
+        }
+        .await;
+        self.record_result(CoordinationOperation::Bootstrap, &result);
+        result
     }
 
     pub async fn load(&self) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        let identity = self
-            .store
-            .identity()
-            .await
-            .map_err(CoordinationError::from_state_store)?;
-        Ok(self.load_for_identity(&identity).await?.snapshot)
+        let result = async {
+            let identity = self
+                .store
+                .identity()
+                .await
+                .map_err(CoordinationError::from_state_store)?;
+            Ok(self.load_for_identity(&identity).await?.snapshot)
+        }
+        .await;
+        self.record_result(CoordinationOperation::Load, &result);
+        result
     }
 
     pub async fn begin_restore(
@@ -106,18 +129,23 @@ impl IncarnationGate {
         expected: &ControlPlaneSnapshot,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        if expected.mode() != ControlPlaneMode::WriteOpen {
-            return Err(self.classify_invalid_expected(expected).await?);
+        let result = async {
+            if expected.mode() != ControlPlaneMode::WriteOpen {
+                return Err(self.classify_invalid_expected(expected).await?);
+            }
+            let candidate = ControlRecord {
+                store_id: expected.store_id(),
+                cluster_id: expected.cluster_id().to_owned(),
+                incarnation: expected.incarnation().checked_next()?,
+                mode: ControlPlaneMode::Reconciling,
+                last_operation_id: operation_id,
+            };
+            self.apply_exact(expected, candidate, operation_id, RESTORE_PURPOSE)
+                .await
         }
-        let candidate = ControlRecord {
-            store_id: expected.store_id(),
-            cluster_id: expected.cluster_id().to_owned(),
-            incarnation: expected.incarnation().checked_next()?,
-            mode: ControlPlaneMode::Reconciling,
-            last_operation_id: operation_id,
-        };
-        self.apply_exact(expected, candidate, operation_id, RESTORE_PURPOSE)
-            .await
+        .await;
+        self.record_result(CoordinationOperation::BeginRestore, &result);
+        result
     }
 
     pub async fn open_writes(
@@ -125,34 +153,44 @@ impl IncarnationGate {
         expected: &ControlPlaneSnapshot,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        if expected.mode() != ControlPlaneMode::Reconciling {
-            return Err(self.classify_invalid_expected(expected).await?);
+        let result = async {
+            if expected.mode() != ControlPlaneMode::Reconciling {
+                return Err(self.classify_invalid_expected(expected).await?);
+            }
+            let candidate = ControlRecord {
+                store_id: expected.store_id(),
+                cluster_id: expected.cluster_id().to_owned(),
+                incarnation: expected.incarnation(),
+                mode: ControlPlaneMode::WriteOpen,
+                last_operation_id: operation_id,
+            };
+            self.apply_exact(expected, candidate, operation_id, REOPEN_PURPOSE)
+                .await
         }
-        let candidate = ControlRecord {
-            store_id: expected.store_id(),
-            cluster_id: expected.cluster_id().to_owned(),
-            incarnation: expected.incarnation(),
-            mode: ControlPlaneMode::WriteOpen,
-            last_operation_id: operation_id,
-        };
-        self.apply_exact(expected, candidate, operation_id, REOPEN_PURPOSE)
-            .await
+        .await;
+        self.record_result(CoordinationOperation::OpenWrites, &result);
+        result
     }
 
     pub async fn recover_bootstrap(
         &self,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        let transaction_id = transaction_id(operation_id);
-        let certainty = recover_commit(self.store.as_ref(), transaction_id).await?;
-        let identity = self
-            .store
-            .identity()
-            .await
-            .map_err(CoordinationError::from_state_store)?;
-        let candidate = bootstrap_candidate(&identity, operation_id)?;
-        self.read_back_candidate(candidate, transaction_id, certainty)
-            .await
+        let result = async {
+            let transaction_id = transaction_id(operation_id);
+            let certainty = recover_commit(self.store.as_ref(), transaction_id).await?;
+            let identity = self
+                .store
+                .identity()
+                .await
+                .map_err(CoordinationError::from_state_store)?;
+            let candidate = bootstrap_candidate(&identity, operation_id)?;
+            self.read_back_candidate(candidate, transaction_id, certainty)
+                .await
+        }
+        .await;
+        self.record_result(CoordinationOperation::Bootstrap, &result);
+        result
     }
 
     pub async fn recover_begin_restore(
@@ -160,17 +198,22 @@ impl IncarnationGate {
         expected: &ControlPlaneSnapshot,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        if expected.mode() != ControlPlaneMode::WriteOpen {
-            return Err(CoordinationError::fence_lost());
+        let result = async {
+            if expected.mode() != ControlPlaneMode::WriteOpen {
+                return Err(CoordinationError::fence_lost());
+            }
+            let candidate = ControlRecord {
+                store_id: expected.store_id(),
+                cluster_id: expected.cluster_id().to_owned(),
+                incarnation: expected.incarnation().checked_next()?,
+                mode: ControlPlaneMode::Reconciling,
+                last_operation_id: operation_id,
+            };
+            self.recover_candidate(candidate, operation_id).await
         }
-        let candidate = ControlRecord {
-            store_id: expected.store_id(),
-            cluster_id: expected.cluster_id().to_owned(),
-            incarnation: expected.incarnation().checked_next()?,
-            mode: ControlPlaneMode::Reconciling,
-            last_operation_id: operation_id,
-        };
-        self.recover_candidate(candidate, operation_id).await
+        .await;
+        self.record_result(CoordinationOperation::BeginRestore, &result);
+        result
     }
 
     pub async fn recover_open_writes(
@@ -178,25 +221,52 @@ impl IncarnationGate {
         expected: &ControlPlaneSnapshot,
         operation_id: OperationId,
     ) -> Result<ControlPlaneSnapshot, CoordinationError> {
-        if expected.mode() != ControlPlaneMode::Reconciling {
-            return Err(CoordinationError::fence_lost());
+        let result = async {
+            if expected.mode() != ControlPlaneMode::Reconciling {
+                return Err(CoordinationError::fence_lost());
+            }
+            let candidate = ControlRecord {
+                store_id: expected.store_id(),
+                cluster_id: expected.cluster_id().to_owned(),
+                incarnation: expected.incarnation(),
+                mode: ControlPlaneMode::WriteOpen,
+                last_operation_id: operation_id,
+            };
+            self.recover_candidate(candidate, operation_id).await
         }
-        let candidate = ControlRecord {
-            store_id: expected.store_id(),
-            cluster_id: expected.cluster_id().to_owned(),
-            incarnation: expected.incarnation(),
-            mode: ControlPlaneMode::WriteOpen,
-            last_operation_id: operation_id,
-        };
-        self.recover_candidate(candidate, operation_id).await
+        .await;
+        self.record_result(CoordinationOperation::OpenWrites, &result);
+        result
     }
 
     pub async fn admit_writes(&self) -> Result<WriteAdmission, CoordinationError> {
-        let snapshot = self.load().await?;
-        if snapshot.mode() != ControlPlaneMode::WriteOpen {
-            return Err(CoordinationError::write_closed());
+        let result = async {
+            let snapshot = self.load().await?;
+            if snapshot.mode() != ControlPlaneMode::WriteOpen {
+                return Err(CoordinationError::write_closed());
+            }
+            Ok(WriteAdmission {
+                snapshot,
+                metrics: Arc::clone(&self.metrics),
+            })
         }
-        Ok(WriteAdmission { snapshot })
+        .await;
+        self.record_result(CoordinationOperation::AdmitWrites, &result);
+        result
+    }
+
+    fn record_result<T>(
+        &self,
+        operation: CoordinationOperation,
+        result: &Result<T, CoordinationError>,
+    ) {
+        let outcome = match result {
+            Ok(_) => Some(CoordinationOutcome::Success),
+            Err(error) => error_outcome(error),
+        };
+        if let Some(outcome) = outcome {
+            self.metrics.record(operation, outcome);
+        }
     }
 
     async fn apply_exact(
@@ -374,32 +444,53 @@ impl IncarnationGate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct WriteAdmission {
     snapshot: ControlPlaneSnapshot,
+    metrics: Arc<CoordinationMetrics>,
 }
+
+impl PartialEq for WriteAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+    }
+}
+
+impl Eq for WriteAdmission {}
 
 impl WriteAdmission {
     pub async fn validate_in(
         &self,
         transaction: &mut dyn WriteTransaction,
     ) -> Result<(), CoordinationError> {
-        let key = control_storage_key()?;
-        let current = transaction
-            .get(&key)
-            .await
-            .map_err(CoordinationError::from_state_store)?
-            .ok_or_else(CoordinationError::not_bootstrapped)?;
-        let record = decode_control(&current.value)?;
-        if record.store_id != self.snapshot.store_id()
-            || record.cluster_id != self.snapshot.cluster_id()
-        {
-            return Err(CoordinationError::corruption());
+        let result = async {
+            let key = control_storage_key()?;
+            let current = transaction
+                .get(&key)
+                .await
+                .map_err(CoordinationError::from_state_store)?
+                .ok_or_else(CoordinationError::not_bootstrapped)?;
+            let record = decode_control(&current.value)?;
+            if record.store_id != self.snapshot.store_id()
+                || record.cluster_id != self.snapshot.cluster_id()
+            {
+                return Err(CoordinationError::corruption());
+            }
+            if snapshot_matches(&self.snapshot, &current, &record) {
+                return Ok(());
+            }
+            Err(snapshot_mismatch(&self.snapshot, &record))
         }
-        if snapshot_matches(&self.snapshot, &current, &record) {
-            return Ok(());
+        .await;
+        let outcome = match &result {
+            Ok(()) => Some(CoordinationOutcome::Success),
+            Err(error) => error_outcome(error),
+        };
+        if let Some(outcome) = outcome {
+            self.metrics
+                .record(CoordinationOperation::AdmitWrites, outcome);
         }
-        Err(snapshot_mismatch(&self.snapshot, &record))
+        result
     }
 }
 

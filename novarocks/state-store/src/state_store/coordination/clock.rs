@@ -53,7 +53,7 @@ impl LeaseSettings {
     ) -> Result<Self, CoordinationError> {
         let lease_duration_ms = validated_millis("lease duration", lease_duration)?;
         let renew_interval_ms = validated_millis("renew interval", renew_interval)?;
-        let max_clock_skew_ms = validated_millis("maximum clock skew", max_clock_skew)?;
+        let max_clock_skew_ms = validated_clock_skew_millis(max_clock_skew)?;
         let observation_window_ms =
             validated_millis("lease observation window", observation_window)?;
         if renew_interval_ms >= lease_duration_ms {
@@ -123,6 +123,17 @@ fn validated_millis(name: &'static str, duration: Duration) -> Result<u64, Coord
     })
 }
 
+fn validated_clock_skew_millis(duration: Duration) -> Result<u64, CoordinationError> {
+    if !duration.subsec_nanos().is_multiple_of(1_000_000) {
+        return Err(CoordinationError::invalid_request(
+            "maximum clock skew must be a whole number of milliseconds",
+        ));
+    }
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        CoordinationError::invalid_request("maximum clock skew exceeds the millisecond range")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -137,7 +148,6 @@ mod tests {
         for settings in [
             LeaseSettings::new(Duration::ZERO, one, one, one),
             LeaseSettings::new(two, Duration::ZERO, one, one),
-            LeaseSettings::new(two, one, Duration::ZERO, one),
             LeaseSettings::new(two, one, one, Duration::ZERO),
             LeaseSettings::new(two, two, one, one),
             LeaseSettings::new(Duration::from_secs(u64::MAX), one, one, one),
@@ -148,6 +158,19 @@ mod tests {
                 CoordinationErrorKind::InvalidRequest
             );
         }
+    }
+
+    #[test]
+    fn settings_allow_zero_maximum_clock_skew() {
+        let settings = LeaseSettings::new(
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .expect("zero maximum clock skew is a valid explicit policy");
+
+        assert_eq!(settings.max_clock_skew(), Duration::ZERO);
     }
 
     #[test]
@@ -171,14 +194,17 @@ mod tests {
                 ),
                 "lease renew interval",
             );
-            assert_non_integral_duration(
-                LeaseSettings::new(
-                    Duration::from_millis(2),
-                    Duration::from_millis(1),
-                    duration,
-                    Duration::from_millis(1),
-                ),
-                "maximum clock skew",
+            let error = LeaseSettings::new(
+                Duration::from_millis(2),
+                Duration::from_millis(1),
+                duration,
+                Duration::from_millis(1),
+            )
+            .expect_err("fractional maximum clock skew must fail closed");
+            assert_eq!(error.kind(), CoordinationErrorKind::InvalidRequest);
+            assert_eq!(
+                error.to_string(),
+                "InvalidRequest: maximum clock skew must be a whole number of milliseconds"
             );
             assert_non_integral_duration(
                 LeaseSettings::new(

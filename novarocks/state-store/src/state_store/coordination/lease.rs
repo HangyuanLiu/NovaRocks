@@ -36,6 +36,7 @@ use super::codec::{
 use super::gate::validate_write_limits_with_read_keys;
 use super::metrics::{
     CoordinationMetrics, CoordinationMetricsSnapshot, CoordinationOperation, CoordinationOutcome,
+    error_outcome,
 };
 use super::operation::{
     ReadBackCertainty, candidate_mismatch, classify_commit, recover_commit, transaction_id,
@@ -77,6 +78,7 @@ pub struct LeaseGuard {
     renewed_ms: u64,
     recovery: Option<LeaseMutationRecovery>,
     active: bool,
+    acquired_by_takeover: bool,
     cancellation_tx: watch::Sender<Option<LeaseCancellationReason>>,
 }
 
@@ -406,6 +408,22 @@ impl LeaseManager {
         clock: Arc<dyn LeaseClock>,
         settings: LeaseSettings,
     ) -> Result<Self, CoordinationError> {
+        Self::with_metrics(
+            store,
+            holder,
+            clock,
+            settings,
+            Arc::new(CoordinationMetrics::new()),
+        )
+    }
+
+    pub fn with_metrics(
+        store: Arc<dyn StateStore>,
+        holder: HolderId,
+        clock: Arc<dyn LeaseClock>,
+        settings: LeaseSettings,
+        metrics: Arc<CoordinationMetrics>,
+    ) -> Result<Self, CoordinationError> {
         let control_key = control_storage_key()?;
         let representative_resource = ResourceKey::try_from(Bytes::from_static(b"lease-key"))?;
         let lease_key = lease_storage_key(&representative_resource)?;
@@ -422,7 +440,7 @@ impl LeaseManager {
                 holder,
                 clock,
                 settings,
-                metrics: Arc::new(CoordinationMetrics::new()),
+                metrics,
                 expiry_observations: Mutex::new(HashMap::new()),
             }),
         })
@@ -481,6 +499,7 @@ impl LeaseManager {
                     &current.control.record,
                     &lease.record,
                     lease.state.version.clone(),
+                    false,
                 )?));
             }
             Err(read_back_mismatch(
@@ -505,8 +524,12 @@ impl LeaseManager {
         let loaded = self.read_coordination(&resource).await?;
         match self.decision(&loaded, &resource, attempt, operation_id, wall_now)? {
             AcquireDecision::Immediate(outcome) => Ok(outcome),
-            AcquireDecision::Write(candidate) => {
-                self.write_candidate(loaded, candidate, wall_now).await
+            AcquireDecision::Write {
+                candidate,
+                takeover,
+            } => {
+                self.write_candidate(loaded, candidate, takeover, wall_now)
+                    .await
             }
         }
     }
@@ -532,14 +555,17 @@ impl LeaseManager {
         let control = &loaded.control.record;
         let Some(lease) = &loaded.lease else {
             self.clear_expiry_observation(resource);
-            return Ok(AcquireDecision::Write(self.candidate(
-                resource.clone(),
-                attempt,
-                operation_id,
-                control.incarnation,
-                ResourceEpoch::new(1)?,
-                wall_now,
-            )?));
+            return Ok(AcquireDecision::Write {
+                candidate: self.candidate(
+                    resource.clone(),
+                    attempt,
+                    operation_id,
+                    control.incarnation,
+                    ResourceEpoch::new(1)?,
+                    wall_now,
+                )?,
+                takeover: false,
+            });
         };
         if lease.record.incarnation > control.incarnation {
             self.clear_expiry_observation(resource);
@@ -547,14 +573,17 @@ impl LeaseManager {
         }
         if lease.record.incarnation < control.incarnation {
             self.clear_expiry_observation(resource);
-            return Ok(AcquireDecision::Write(self.candidate(
-                resource.clone(),
-                attempt,
-                operation_id,
-                control.incarnation,
-                lease.record.epoch.checked_next()?,
-                wall_now,
-            )?));
+            return Ok(AcquireDecision::Write {
+                candidate: self.candidate(
+                    resource.clone(),
+                    attempt,
+                    operation_id,
+                    control.incarnation,
+                    lease.record.epoch.checked_next()?,
+                    wall_now,
+                )?,
+                takeover: true,
+            });
         }
 
         match lease.record.state {
@@ -563,7 +592,7 @@ impl LeaseManager {
             {
                 self.clear_expiry_observation(resource);
                 Ok(AcquireDecision::Immediate(AcquireOutcome::Acquired(
-                    self.guard(control, &lease.record, lease.state.version.clone())?,
+                    self.guard(control, &lease.record, lease.state.version.clone(), false)?,
                 )))
             }
             LeaseState::Held => {
@@ -603,14 +632,17 @@ impl LeaseManager {
             }
             LeaseState::Released => {
                 self.clear_expiry_observation(resource);
-                Ok(AcquireDecision::Write(self.candidate(
-                    resource.clone(),
-                    attempt,
-                    operation_id,
-                    control.incarnation,
-                    lease.record.epoch.checked_next()?,
-                    wall_now,
-                )?))
+                Ok(AcquireDecision::Write {
+                    candidate: self.candidate(
+                        resource.clone(),
+                        attempt,
+                        operation_id,
+                        control.incarnation,
+                        lease.record.epoch.checked_next()?,
+                        wall_now,
+                    )?,
+                    takeover: false,
+                })
             }
         }
     }
@@ -663,14 +695,17 @@ impl LeaseManager {
         }
         observations.remove(&digest);
         drop(observations);
-        Ok(AcquireDecision::Write(self.candidate(
-            resource.clone(),
-            attempt,
-            operation_id,
-            control.incarnation,
-            lease.record.epoch.checked_next()?,
-            wall_now,
-        )?))
+        Ok(AcquireDecision::Write {
+            candidate: self.candidate(
+                resource.clone(),
+                attempt,
+                operation_id,
+                control.incarnation,
+                lease.record.epoch.checked_next()?,
+                wall_now,
+            )?,
+            takeover: true,
+        })
     }
 
     fn clear_expiry_observation(&self, resource: &ResourceKey) {
@@ -710,6 +745,7 @@ impl LeaseManager {
         &self,
         loaded: LoadedCoordination,
         candidate: LeaseRecord,
+        takeover: bool,
         wall_now: u64,
     ) -> Result<AcquireOutcome, CoordinationError> {
         let resource = candidate.resource.clone();
@@ -779,7 +815,7 @@ impl LeaseManager {
                 wall_now,
             )? {
                 AcquireDecision::Immediate(outcome) => Ok(outcome),
-                AcquireDecision::Write(_) => Err(CoordinationError::fence_lost()),
+                AcquireDecision::Write { .. } => Err(CoordinationError::fence_lost()),
             };
         }
 
@@ -797,7 +833,7 @@ impl LeaseManager {
             transaction.commit().await,
         )
         .await?;
-        self.read_back_candidate(&loaded.control, candidate, certainty, wall_now)
+        self.read_back_candidate(&loaded.control, candidate, takeover, certainty, wall_now)
             .await
     }
 
@@ -805,6 +841,7 @@ impl LeaseManager {
         &self,
         expected_control: &LoadedControl,
         candidate: LeaseRecord,
+        takeover: bool,
         certainty: ReadBackCertainty,
         wall_now: u64,
     ) -> Result<AcquireOutcome, CoordinationError> {
@@ -829,6 +866,7 @@ impl LeaseManager {
                 &current.control.record,
                 &candidate,
                 lease.state.version.clone(),
+                takeover,
             )?));
         }
         if certainty == ReadBackCertainty::Conflict {
@@ -840,7 +878,7 @@ impl LeaseManager {
                 wall_now,
             )? {
                 AcquireDecision::Immediate(outcome) => Ok(outcome),
-                AcquireDecision::Write(_) => {
+                AcquireDecision::Write { .. } => {
                     Err(CoordinationError::operation_not_committed(transaction_id))
                 }
             };
@@ -1149,6 +1187,7 @@ impl LeaseManager {
         control: &ControlRecord,
         record: &LeaseRecord,
         record_version: VersionToken,
+        acquired_by_takeover: bool,
     ) -> Result<LeaseGuard, CoordinationError> {
         let (cancellation_tx, _) = watch::channel(None);
         Ok(LeaseGuard {
@@ -1166,12 +1205,16 @@ impl LeaseManager {
             renewed_ms: record.renewed_ms,
             recovery: None,
             active: record.state == LeaseState::Held,
+            acquired_by_takeover,
             cancellation_tx,
         })
     }
 
     fn record_result(&self, result: &Result<AcquireOutcome, CoordinationError>) {
         let outcome = match result {
+            Ok(AcquireOutcome::Acquired(guard)) if guard.acquired_by_takeover => {
+                Some(CoordinationOutcome::Takeover)
+            }
             Ok(AcquireOutcome::Acquired(_)) => Some(CoordinationOutcome::Success),
             Ok(AcquireOutcome::Contended(_)) => Some(CoordinationOutcome::Contended),
             Ok(AcquireOutcome::AwaitingTakeover(_)) => Some(CoordinationOutcome::AwaitingTakeover),
@@ -1223,7 +1266,10 @@ impl LeaseManager {
 
 enum AcquireDecision {
     Immediate(AcquireOutcome),
-    Write(LeaseRecord),
+    Write {
+        candidate: LeaseRecord,
+        takeover: bool,
+    },
 }
 
 struct LoadedCoordination {
@@ -1239,26 +1285,6 @@ struct LoadedControl {
 struct LoadedLease {
     state: StateRecord,
     record: LeaseRecord,
-}
-
-fn error_outcome(error: &CoordinationError) -> Option<CoordinationOutcome> {
-    match error.kind() {
-        CoordinationErrorKind::ClockUnsafe => Some(CoordinationOutcome::ClockUnsafe),
-        CoordinationErrorKind::FenceLost => Some(CoordinationOutcome::FenceLost),
-        CoordinationErrorKind::IncarnationChanged => Some(CoordinationOutcome::IncarnationChanged),
-        CoordinationErrorKind::WriteClosed => Some(CoordinationOutcome::WriteClosed),
-        CoordinationErrorKind::OperationNotCommitted => {
-            Some(CoordinationOutcome::OperationNotCommitted)
-        }
-        CoordinationErrorKind::CommitUncertain => Some(CoordinationOutcome::CommitUncertain),
-        CoordinationErrorKind::Corruption => Some(CoordinationOutcome::Corruption),
-        CoordinationErrorKind::StoreUnavailable => Some(CoordinationOutcome::StoreUnavailable),
-        CoordinationErrorKind::InvalidRequest
-        | CoordinationErrorKind::LimitExceeded
-        | CoordinationErrorKind::NotBootstrapped
-        | CoordinationErrorKind::EpochExhausted
-        | CoordinationErrorKind::IncarnationExhausted => None,
-    }
 }
 
 fn resource_digest(resource: &ResourceKey) -> [u8; 32] {

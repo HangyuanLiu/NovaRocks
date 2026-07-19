@@ -165,6 +165,9 @@ pub(crate) fn decode_lease(
     let epoch = ResourceEpoch::new(reader.read_u64()?).map_err(|_| corruption())?;
     let deadline_ms = reader.read_u64()?;
     let renewed_ms = reader.read_u64()?;
+    if deadline_ms < renewed_ms {
+        return Err(corruption());
+    }
     let last_operation_id = OperationId::from(read_uuid(&mut reader)?);
     reader.finish()?;
 
@@ -399,6 +402,18 @@ mod tests {
                 &value,
                 1 + 4 + record.resource.as_bytes().len() + 1 + 4 + record.holder.as_bytes().len(),
                 Uuid::new_v4(),
+            ),
+            with_u64(
+                &value,
+                1 + 4
+                    + record.resource.as_bytes().len()
+                    + 1
+                    + 4
+                    + record.holder.as_bytes().len()
+                    + 16
+                    + 8
+                    + 8,
+                record.renewed_ms - 1,
             ),
         ];
         for malformed_value in malformed {
