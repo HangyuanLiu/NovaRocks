@@ -3436,6 +3436,8 @@ async fn mysql_suite() {
     let databases = Rc::new(RefCell::new(Vec::new()));
     let factory = mysql_conformance_factory(Rc::clone(&runtime), Rc::clone(&databases));
     common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+    common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(&factory))
+        .await;
     drop(factory);
     let mut runtime = Rc::try_unwrap(runtime).expect("all MySQL conformance handles drained");
     runtime

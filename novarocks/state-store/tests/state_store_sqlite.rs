@@ -43,74 +43,7 @@ use common::state_store_conformance::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordination_gate_suite() {
-    common::state_store_coordination_conformance::incarnation_gate_lifecycle(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::concurrent_bootstrap_converges(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::stale_snapshots_cannot_mutate(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::incarnation_overflow_fails_closed(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::identity_mismatch_is_corruption(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::recovery_is_operation_scoped(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::commit_unknown_uses_authoritative_read_back(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::cancelled_mutation_recovers_with_same_operation(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::unresolved_bootstrap_without_visible_record_is_uncertain(
-        &coordination_factory(),
-    )
-    .await;
-    common::state_store_coordination_conformance::admission_read_conflicts_with_restore(
-        &coordination_factory(),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordination_acquire_suite() {
-    let factory = coordination_factory();
-    common::state_store_coordination_conformance::basic_acquire_contention_and_high_watermark(
-        &factory,
-    )
-    .await;
-    common::state_store_coordination_conformance::concurrent_acquire_exactly_one_winner(&factory)
-        .await;
-    common::state_store_coordination_conformance::external_lease_clock_error_is_clock_unsafe(
-        &factory,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordination_lease_lifecycle_suite() {
-    let factory = coordination_factory();
-    common::state_store_coordination_conformance::lease_expiry_observation(&factory).await;
-    common::state_store_coordination_conformance::renew_resets_observation(&factory).await;
-    common::state_store_coordination_conformance::lease_lifecycle_and_cancellation(&factory).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordination_fault_suite() {
+async fn coordination_suite() {
     let factory = coordination_factory();
     common::state_store_coordination_conformance::run_coordination_conformance(factory).await;
 }

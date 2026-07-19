@@ -42,8 +42,9 @@ for macOS arm64 developer use, and
 `ea59d1708519798c7bc4f514cd29af1ac8e41dccbec4371f22d86b713ea81cbf`
 for Linux x86_64 production CI. macOS is auxiliary evidence only.
 
-`state_store_foundationdb` runs all provider-specific scenarios and all 13
-shared conformance cases in one explicit runtime lifecycle.
+`state_store_foundationdb` runs all provider-specific scenarios and, through
+`foundationdb_suite`, both the generic StateStore conformance and the
+provider-neutral coordination conformance in one explicit runtime lifecycle.
 `state_store_foundationdb_cross_process` starts two independent helper
 processes against the same generated cluster and keyspace. Those helpers are
 FDB clients, not FEs, so this test must not be described as a real two-FE
@@ -87,8 +88,9 @@ coverage in this gate is feature-off and non-live, so it does not require
 `libfdb_c`. The final 1FE+3BE baseline also leaves the MySQL provider disabled
 and proves only additive/no-fallback behavior, not a two-FE failover.
 
-`state_store_mysql` runs the provider scenarios and, through `mysql_suite`, all
-13 shared conformance cases without changing
+`state_store_mysql` runs the provider scenarios and, through `mysql_suite`, both
+the generic StateStore conformance and the provider-neutral coordination
+conformance without changing
 `novarocks/state-store/tests/common/state_store_conformance.rs`. Each
 conformance factory invocation uses a separately provisioned database while
 sharing one explicit MySQL runtime. `state_store_mysql_cross_process` starts

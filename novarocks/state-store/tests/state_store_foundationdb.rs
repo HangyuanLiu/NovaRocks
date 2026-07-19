@@ -935,6 +935,10 @@ async fn foundationdb_suite() {
     {
         let factory = conformance_factory(Rc::clone(&runtime));
         common::state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
+        common::state_store_coordination_conformance::run_coordination_conformance(Rc::clone(
+            &factory,
+        ))
+        .await;
         drop(factory);
     }
 
