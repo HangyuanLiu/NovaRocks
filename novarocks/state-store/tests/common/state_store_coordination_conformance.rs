@@ -16,7 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use bytes::Bytes;
 use novarocks_state_store::coordination::{
     AcquireOutcome, AttemptId, ClockHealth, ControlPlaneMode, CoordinationError,
     CoordinationErrorKind, CoordinationOperation, CoordinationOutcome, HolderId, IncarnationGate,
-    LeaseClock, LeaseGuard, LeaseManager, LeaseSettings, ResourceKey,
+    LeaseCancellationReason, LeaseClock, LeaseGuard, LeaseManager, LeaseSettings, ResourceKey,
 };
 use novarocks_state_store::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, OperationId, Precondition,
@@ -33,6 +33,7 @@ use novarocks_state_store::{
     StateStoreOperation, StoreIdentity, TransactionId, Value, WriteTransaction,
     derive_transaction_id,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -41,11 +42,13 @@ use super::state_store_conformance::{
 };
 
 const CONTROL_KEY: &[u8] = b"\0novarocks/cp/v1/control";
+const LEASE_KEY_PREFIX: &[u8] = b"\0novarocks/cp/v1/lease/";
 
 pub struct ManualLeaseClock {
     wall_ms: AtomicU64,
     monotonic_ms: AtomicU64,
     health: AtomicU8,
+    wall_readable: AtomicBool,
 }
 
 impl ManualLeaseClock {
@@ -54,6 +57,7 @@ impl ManualLeaseClock {
             wall_ms: AtomicU64::new(wall_ms),
             monotonic_ms: AtomicU64::new(monotonic_ms),
             health: AtomicU8::new(0),
+            wall_readable: AtomicBool::new(true),
         }
     }
 
@@ -75,11 +79,31 @@ impl ManualLeaseClock {
             })
             .expect("manual wall clock overflow");
     }
+
+    pub fn set_wall(&self, millis: u64) {
+        self.wall_ms.store(millis, Ordering::SeqCst);
+    }
+
+    pub fn advance_monotonic(&self, millis: u64) {
+        self.monotonic_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(millis)
+            })
+            .expect("manual monotonic clock overflow");
+    }
+
+    pub fn set_wall_readable(&self, readable: bool) {
+        self.wall_readable.store(readable, Ordering::SeqCst);
+    }
 }
 
 impl LeaseClock for ManualLeaseClock {
     fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
-        Ok(self.wall_ms.load(Ordering::SeqCst))
+        if self.wall_readable.load(Ordering::SeqCst) {
+            Ok(self.wall_ms.load(Ordering::SeqCst))
+        } else {
+            Err(CoordinationError::clock_unsafe())
+        }
     }
 
     fn monotonic_time_millis(&self) -> u64 {
@@ -250,8 +274,157 @@ impl StateStore for OneAcquireConflictStore {
     }
 }
 
+struct LeaseMutationRaceStore {
+    inner: Arc<dyn StateStore>,
+    first_purpose: &'static str,
+    second_purpose: &'static str,
+    commit_barrier: Arc<Barrier>,
+    remaining_wrapped_writes: AtomicUsize,
+}
+
+impl LeaseMutationRaceStore {
+    fn new(
+        inner: Arc<dyn StateStore>,
+        first_purpose: &'static str,
+        second_purpose: &'static str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            first_purpose,
+            second_purpose,
+            commit_barrier: Arc::new(Barrier::new(2)),
+            remaining_wrapped_writes: AtomicUsize::new(0),
+        })
+    }
+
+    fn arm(&self) {
+        self.remaining_wrapped_writes.store(2, Ordering::SeqCst);
+    }
+}
+
+struct LeaseMutationRaceTransaction {
+    inner: Box<dyn WriteTransaction>,
+    commit_barrier: Arc<Barrier>,
+}
+
+#[async_trait]
+impl ReadTransaction for LeaseMutationRaceTransaction {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        self.inner.get(key).await
+    }
+
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        self.inner.range(request).await
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        self.inner.abort().await
+    }
+}
+
+#[async_trait]
+impl WriteTransaction for LeaseMutationRaceTransaction {
+    fn transaction_id(&self) -> &TransactionId {
+        self.inner.transaction_id()
+    }
+
+    async fn put(
+        &mut self,
+        key: Key,
+        value: Value,
+        precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        self.inner.put(key, value, precondition).await
+    }
+
+    async fn delete(
+        &mut self,
+        key: Key,
+        precondition: Precondition,
+    ) -> Result<(), StateStoreError> {
+        self.inner.delete(key, precondition).await
+    }
+
+    async fn commit(self: Box<Self>) -> CommitOutcome {
+        self.commit_barrier.wait().await;
+        self.inner.commit().await
+    }
+}
+
+#[async_trait]
+impl StateStore for LeaseMutationRaceStore {
+    fn provider_name(&self) -> &'static str {
+        self.inner.provider_name()
+    }
+
+    fn limits(&self) -> &StateStoreLimits {
+        self.inner.limits()
+    }
+
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        self.inner.begin_read().await
+    }
+
+    async fn begin_write(
+        &self,
+        transaction_id: TransactionId,
+        purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        let inner = self.inner.begin_write(transaction_id, purpose).await?;
+        let wrap = (purpose == self.first_purpose || purpose == self.second_purpose)
+            && self
+                .remaining_wrapped_writes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+        if wrap {
+            Ok(Box::new(LeaseMutationRaceTransaction {
+                inner,
+                commit_barrier: Arc::clone(&self.commit_barrier),
+            }))
+        } else {
+            Ok(inner)
+        }
+    }
+
+    async fn poll_changes(
+        &self,
+        request: &ChangePollRequest,
+    ) -> Result<ChangePage, StateStoreError> {
+        self.inner.poll_changes(request).await
+    }
+
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+        self.inner.identity().await
+    }
+
+    async fn resolve_commit(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<CommitResolution, StateStoreError> {
+        self.inner.resolve_commit(transaction_id).await
+    }
+}
+
 async fn open_fixture(factory: &StateStoreFactory) -> StateStoreConformanceFixture {
-    factory().await.expect("open coordination fixture")
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match factory().await {
+                Ok(fixture) => break fixture,
+                Err(error) if error.kind() == StateStoreErrorKind::ProviderUnavailable => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("open coordination fixture: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("best-effort lease drop releases prior fixture ownership")
 }
 
 fn key(bytes: &'static [u8]) -> Key {
@@ -296,6 +469,75 @@ fn acquired(outcome: AcquireOutcome) -> LeaseGuard {
             panic!("expected acquired lease, found takeover observation")
         }
     }
+}
+
+fn assert_cancelled_as(guard: &LeaseGuard, expected: LeaseCancellationReason) {
+    let cancellation = guard.cancellation();
+    assert_eq!(*cancellation.borrow(), Some(expected));
+}
+
+fn lease_key(resource_bytes: &[u8]) -> Key {
+    let digest = Sha256::digest(resource_bytes);
+    let mut bytes = Vec::with_capacity(LEASE_KEY_PREFIX.len() + digest.len());
+    bytes.extend_from_slice(LEASE_KEY_PREFIX);
+    bytes.extend_from_slice(&digest);
+    Key::try_from(Bytes::from(bytes)).expect("valid lease storage key")
+}
+
+fn encoded_released_lease(
+    resource_bytes: &[u8],
+    holder_bytes: &[u8],
+    attempt: Uuid,
+    epoch: u64,
+) -> Value {
+    let mut encoded = Vec::new();
+    encoded.push(1);
+    encoded.extend_from_slice(&(resource_bytes.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(resource_bytes);
+    encoded.push(2);
+    encoded.extend_from_slice(&(holder_bytes.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(holder_bytes);
+    encoded.extend_from_slice(attempt.as_bytes());
+    encoded.extend_from_slice(&1_u64.to_be_bytes());
+    encoded.extend_from_slice(&epoch.to_be_bytes());
+    encoded.extend_from_slice(&100_000_u64.to_be_bytes());
+    encoded.extend_from_slice(&100_000_u64.to_be_bytes());
+    encoded.extend_from_slice(OperationId::new_v7().as_uuid().as_bytes());
+    value(encoded)
+}
+
+async fn seed_released_lease(
+    store: &Arc<dyn StateStore>,
+    resource_bytes: &[u8],
+    holder_bytes: &[u8],
+    attempt: Uuid,
+    epoch: u64,
+) -> StateRecord {
+    let lease_key = lease_key(resource_bytes);
+    let mut transaction = store
+        .begin_write(transaction_id(), "seed released coordination lease")
+        .await
+        .expect("begin released lease seed");
+    transaction
+        .put(
+            lease_key.clone(),
+            encoded_released_lease(resource_bytes, holder_bytes, attempt, epoch),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage released lease seed");
+    assert!(matches!(
+        transaction.commit().await,
+        CommitOutcome::Committed(_)
+    ));
+    let mut reader = store.begin_read().await.expect("begin lease seed read");
+    let record = reader
+        .get(&lease_key)
+        .await
+        .expect("read lease seed")
+        .expect("released lease seed exists");
+    reader.abort().await.expect("abort lease seed read");
+    record
 }
 
 async fn finish_disjoint_acquire(
@@ -1002,4 +1244,652 @@ pub async fn concurrent_acquire_exactly_one_winner(factory: &StateStoreFactory) 
             .count(),
         1
     );
+}
+
+pub async fn lease_expiry_observation(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(100_000, 7_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"expiry-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"expiry-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"expiry-observation");
+    let first_attempt = attempt();
+    let second_attempt = attempt();
+    let first = acquired(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect("first acquisition"),
+    );
+
+    clock.advance_wall(11_000);
+    let early = match manager_b
+        .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+        .await
+        .expect("deadline plus skew boundary is still contended")
+    {
+        AcquireOutcome::Contended(observation) => observation,
+        _ => panic!("takeover must not start at the exact expiry boundary"),
+    };
+    assert_eq!(early.retry_after(), Duration::from_millis(1));
+    clock.advance_wall(1);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+            .await
+            .expect("start expiry observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(499);
+    let awaiting = match manager_b
+        .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+        .await
+        .expect("observation is not complete")
+    {
+        AcquireOutcome::AwaitingTakeover(observation) => observation,
+        _ => panic!("takeover must wait the full monotonic observation window"),
+    };
+    assert_eq!(awaiting.retry_after(), Duration::from_millis(1));
+    clock.advance_monotonic(1);
+    let second = acquired(
+        manager_b
+            .acquire(resource, second_attempt, OperationId::new_v7())
+            .await
+            .expect("take over unchanged expired lease"),
+    );
+    assert_eq!(first.token().resource_epoch().get(), 1);
+    assert_eq!(second.token().resource_epoch().get(), 2);
+}
+
+pub async fn renew_resets_observation(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(200_000, 8_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"renew-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"renew-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"renew-reset-observation");
+    let first_attempt = attempt();
+    let second_attempt = attempt();
+    let mut first = acquired(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect("first acquisition"),
+    );
+
+    clock.advance_wall(11_001);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+            .await
+            .expect("start first expiry observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(250);
+    let old_fence = first.fence();
+    first
+        .renew(OperationId::new_v7())
+        .await
+        .expect("renew exact observed lease");
+    assert_eq!(first.token().resource_epoch().get(), 1);
+    assert_ne!(first.fence(), old_fence);
+
+    clock.advance_wall(11_001);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+            .await
+            .expect("renewed version starts a new observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(499);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), second_attempt, OperationId::new_v7())
+            .await
+            .expect("renewed version still needs a full window"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(1);
+    let second = acquired(
+        manager_b
+            .acquire(resource, second_attempt, OperationId::new_v7())
+            .await
+            .expect("take over unchanged renewed version"),
+    );
+    assert_eq!(second.token().resource_epoch().get(), 2);
+}
+
+pub async fn lease_lifecycle_and_cancellation(factory: &StateStoreFactory) {
+    exact_renew_release_and_stale_guards(factory).await;
+    clock_failures_cancel_renewal(factory).await;
+    release_preserves_maximum_epoch(factory).await;
+    runtime_and_no_runtime_drop(factory).await;
+    renew_acquire_race_has_one_mutation_winner(factory).await;
+    release_acquire_race_has_one_mutation_winner(factory).await;
+    incarnation_change_cancels_guard(factory).await;
+}
+
+async fn exact_renew_release_and_stale_guards(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(300_000, 9_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"lifecycle-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"lifecycle-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"exact-renew-release");
+    let first_attempt = attempt();
+    let mut guard = acquired(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect("first acquisition"),
+    );
+    let mut stale_renew = acquired(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect("stale renew guard snapshot"),
+    );
+    let mut stale_release = acquired(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect("stale release guard snapshot"),
+    );
+    assert_eq!(guard.renew_after(), Duration::from_secs(3));
+    let old_token = guard.token().clone();
+    let old_fence = guard.fence();
+    let renew_operation = OperationId::new_v7();
+    clock.advance_wall(100);
+    guard
+        .renew(renew_operation)
+        .await
+        .expect("renew exact current lease");
+    assert_eq!(guard.token(), &old_token);
+    assert_ne!(guard.fence(), old_fence);
+    assert_eq!(*guard.cancellation().borrow(), None);
+    let renewed_fence = guard.fence();
+    guard
+        .recover_renew(renew_operation)
+        .await
+        .expect("recover exact committed renewal");
+    assert_eq!(guard.fence(), renewed_fence);
+
+    assert_eq!(
+        stale_renew
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("stale renewal must lose its fence")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+    assert_cancelled_as(&stale_renew, LeaseCancellationReason::FenceLost);
+    assert_eq!(
+        stale_release
+            .release(OperationId::new_v7())
+            .await
+            .expect_err("stale release must lose its fence")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+    assert_cancelled_as(&stale_release, LeaseCancellationReason::FenceLost);
+
+    let release_operation = OperationId::new_v7();
+    guard
+        .release(release_operation)
+        .await
+        .expect("release exact current lease");
+    assert_cancelled_as(&guard, LeaseCancellationReason::Released);
+    guard
+        .recover_release(release_operation)
+        .await
+        .expect("recover exact committed release");
+    assert_eq!(
+        manager_a
+            .acquire(resource.clone(), first_attempt, OperationId::new_v7())
+            .await
+            .expect_err("released attempt cannot be reacquired")
+            .kind(),
+        CoordinationErrorKind::InvalidRequest
+    );
+    let second = acquired(
+        manager_b
+            .acquire(resource, attempt(), OperationId::new_v7())
+            .await
+            .expect("different attempt advances released high watermark"),
+    );
+    assert_eq!(second.token().resource_epoch().get(), 2);
+    assert_eq!(
+        manager_a
+            .metrics_snapshot()
+            .operation_outcome_count(CoordinationOperation::Renew, CoordinationOutcome::Success,),
+        2
+    );
+    assert_eq!(
+        manager_a
+            .metrics_snapshot()
+            .operation_outcome_count(CoordinationOperation::Release, CoordinationOutcome::Success,),
+        2
+    );
+}
+
+async fn clock_failures_cancel_renewal(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(400_000, 10_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"clock-lifecycle-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager");
+
+    let mut unsafe_guard = acquired(
+        manager
+            .acquire(resource(b"unsafe-renew"), attempt(), OperationId::new_v7())
+            .await
+            .expect("unsafe test acquisition"),
+    );
+    clock.set_health(ClockHealth::Unsafe);
+    assert_eq!(
+        unsafe_guard
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("unsafe clock cancels renewal")
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
+    assert_cancelled_as(&unsafe_guard, LeaseCancellationReason::ClockUnsafe);
+
+    clock.set_health(ClockHealth::Healthy);
+    let mut unknown_guard = acquired(
+        manager
+            .acquire(resource(b"unknown-renew"), attempt(), OperationId::new_v7())
+            .await
+            .expect("unknown test acquisition"),
+    );
+    clock.set_health(ClockHealth::Unknown);
+    assert_eq!(
+        unknown_guard
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("unknown clock cancels renewal")
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
+    assert_cancelled_as(&unknown_guard, LeaseCancellationReason::ClockUnsafe);
+
+    clock.set_health(ClockHealth::Healthy);
+    let mut unreadable_guard = acquired(
+        manager
+            .acquire(
+                resource(b"unreadable-renew"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("unreadable test acquisition"),
+    );
+    clock.set_wall_readable(false);
+    assert_eq!(
+        unreadable_guard
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("unreadable clock cancels renewal")
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
+    assert_cancelled_as(&unreadable_guard, LeaseCancellationReason::ClockUnsafe);
+
+    clock.set_wall_readable(true);
+    clock.set_wall(500_000);
+    let mut rollback_guard = acquired(
+        manager
+            .acquire(
+                resource(b"rollback-renew"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("rollback test acquisition"),
+    );
+    clock.set_wall(499_999);
+    assert_eq!(
+        rollback_guard
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("wall rollback cancels renewal")
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
+    );
+    assert_cancelled_as(&rollback_guard, LeaseCancellationReason::ClockUnsafe);
+}
+
+async fn incarnation_change_cancels_guard(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    let gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    let open = gate
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(600_000, 11_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"incarnation-holder"),
+        clock,
+        lease_settings(),
+    )
+    .expect("manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"incarnation-renew"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("incarnation test acquisition"),
+    );
+    gate.begin_restore(&open, OperationId::new_v7())
+        .await
+        .expect("advance control incarnation");
+    assert_eq!(
+        guard
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("old incarnation cannot renew")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    assert_cancelled_as(&guard, LeaseCancellationReason::IncarnationChanged);
+}
+
+async fn release_preserves_maximum_epoch(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let resource_bytes = b"maximum-released-epoch";
+    let resource = resource(resource_bytes);
+    let before = seed_released_lease(
+        &fixture.store,
+        resource_bytes,
+        b"maximum-holder",
+        Uuid::now_v7(),
+        u64::MAX,
+    )
+    .await;
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"next-holder"),
+        Arc::new(ManualLeaseClock::new(700_000, 12_000)),
+        lease_settings(),
+    )
+    .expect("manager");
+    assert_eq!(
+        manager
+            .acquire(resource, attempt(), OperationId::new_v7())
+            .await
+            .expect_err("maximum epoch must fail closed")
+            .kind(),
+        CoordinationErrorKind::EpochExhausted
+    );
+    let mut reader = fixture
+        .store
+        .begin_read()
+        .await
+        .expect("begin max epoch read");
+    let after = reader
+        .get(&lease_key(resource_bytes))
+        .await
+        .expect("read max epoch record")
+        .expect("max epoch record remains");
+    reader.abort().await.expect("abort max epoch read");
+    assert_eq!(after, before);
+}
+
+async fn runtime_and_no_runtime_drop(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(800_000, 13_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"drop-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"drop-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let runtime_resource = resource(b"runtime-drop");
+    let runtime_guard = acquired(
+        manager_a
+            .acquire(runtime_resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("runtime drop acquisition"),
+    );
+    drop(runtime_guard);
+    let next_attempt = attempt();
+    let next = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match manager_b
+                .acquire(
+                    runtime_resource.clone(),
+                    next_attempt,
+                    OperationId::new_v7(),
+                )
+                .await
+                .expect("poll best-effort runtime release")
+            {
+                AcquireOutcome::Acquired(guard) => break guard,
+                AcquireOutcome::Contended(_) | AcquireOutcome::AwaitingTakeover(_) => {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("runtime drop eventually writes best-effort release");
+    assert_eq!(next.token().resource_epoch().get(), 2);
+
+    let no_runtime_resource = resource(b"no-runtime-drop");
+    let no_runtime_guard = acquired(
+        manager_a
+            .acquire(
+                no_runtime_resource.clone(),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("no-runtime drop acquisition"),
+    );
+    std::thread::spawn(move || drop(no_runtime_guard))
+        .join()
+        .expect("no-runtime drop must not panic");
+    assert!(matches!(
+        manager_b
+            .acquire(no_runtime_resource, attempt(), OperationId::new_v7())
+            .await
+            .expect("no-runtime drop leaves deadline correctness path"),
+        AcquireOutcome::Contended(_)
+    ));
+}
+
+async fn renew_acquire_race_has_one_mutation_winner(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let concrete = LeaseMutationRaceStore::new(
+        Arc::clone(&fixture.store),
+        "renew fenced resource lease",
+        "acquire fenced resource lease",
+    );
+    let store: Arc<dyn StateStore> = concrete.clone();
+    let clock = Arc::new(ManualLeaseClock::new(900_000, 14_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder(b"renew-race-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        store,
+        holder(b"renew-race-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"renew-acquire-race");
+    let mut guard = acquired(
+        manager_a
+            .acquire(resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("race source acquisition"),
+    );
+    let contender_attempt = attempt();
+    clock.advance_wall(11_001);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), contender_attempt, OperationId::new_v7(),)
+            .await
+            .expect("start race observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(500);
+    concrete.arm();
+    let (renew, acquire) = tokio::join!(
+        guard.renew(OperationId::new_v7()),
+        manager_b.acquire(resource, contender_attempt, OperationId::new_v7())
+    );
+    match (renew, acquire) {
+        (Ok(()), Ok(AcquireOutcome::Contended(_))) => {}
+        (Err(error), Ok(AcquireOutcome::Acquired(_))) => {
+            assert_eq!(error.kind(), CoordinationErrorKind::FenceLost);
+            assert_cancelled_as(&guard, LeaseCancellationReason::FenceLost);
+        }
+        (renew, acquire) => panic!("unexpected renew/acquire race: {renew:?}, {acquire:?}"),
+    }
+}
+
+async fn release_acquire_race_has_one_mutation_winner(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let concrete = LeaseMutationRaceStore::new(
+        Arc::clone(&fixture.store),
+        "release fenced resource lease",
+        "acquire fenced resource lease",
+    );
+    let store: Arc<dyn StateStore> = concrete.clone();
+    let clock = Arc::new(ManualLeaseClock::new(1_000_000, 15_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&store),
+        holder(b"release-race-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        store,
+        holder(b"release-race-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"release-acquire-race");
+    let mut guard = acquired(
+        manager_a
+            .acquire(resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("race source acquisition"),
+    );
+    let contender_attempt = attempt();
+    clock.advance_wall(11_001);
+    assert!(matches!(
+        manager_b
+            .acquire(resource.clone(), contender_attempt, OperationId::new_v7(),)
+            .await
+            .expect("start race observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(500);
+    concrete.arm();
+    let (release, acquire) = tokio::join!(
+        guard.release(OperationId::new_v7()),
+        manager_b.acquire(resource, contender_attempt, OperationId::new_v7())
+    );
+    match (release, acquire) {
+        (Ok(()), Err(error)) => {
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_cancelled_as(&guard, LeaseCancellationReason::Released);
+        }
+        (Err(error), Ok(AcquireOutcome::Acquired(_))) => {
+            assert_eq!(error.kind(), CoordinationErrorKind::FenceLost);
+            assert_cancelled_as(&guard, LeaseCancellationReason::FenceLost);
+        }
+        (release, acquire) => panic!("unexpected release/acquire race: {release:?}, {acquire:?}"),
+    }
 }

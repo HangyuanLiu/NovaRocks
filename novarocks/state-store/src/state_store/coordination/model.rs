@@ -159,6 +159,15 @@ pub struct FencingToken {
     resource_epoch: ResourceEpoch,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseFence {
+    pub(crate) resource: ResourceKey,
+    pub(crate) holder: HolderId,
+    pub(crate) attempt: AttemptId,
+    pub(crate) token: FencingToken,
+    pub(crate) record_version: VersionToken,
+}
+
 impl FencingToken {
     pub fn new(
         cluster_id: impl Into<String>,

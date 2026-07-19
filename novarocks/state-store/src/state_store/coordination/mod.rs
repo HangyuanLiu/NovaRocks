@@ -37,5 +37,5 @@ pub use metrics::{
 };
 pub use model::{
     AttemptId, ControlPlaneIncarnation, ControlPlaneMode, ControlPlaneSnapshot, FencingToken,
-    HolderId, LeaseCancellationReason, LeaseObservation, ResourceEpoch, ResourceKey,
+    HolderId, LeaseCancellationReason, LeaseFence, LeaseObservation, ResourceEpoch, ResourceKey,
 };
