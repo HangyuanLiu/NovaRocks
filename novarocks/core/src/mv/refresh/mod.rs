@@ -23,6 +23,7 @@ pub(crate) mod execution;
 pub(crate) mod execution_context;
 pub(crate) mod pin;
 pub(crate) mod planning;
+pub(crate) mod projection_first_refresh;
 pub(crate) mod scan_binding;
 pub(crate) mod snapshot;
 pub(crate) mod target_apply;
