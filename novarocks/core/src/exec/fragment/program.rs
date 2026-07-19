@@ -20,9 +20,11 @@ use std::num::NonZeroUsize;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::fragment::error::{
-    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+    ExecPlanBuildError, ExecPlanInvariant, FragmentBindingError, FragmentBindingErrorKind,
+    FragmentBindingTarget,
 };
-use crate::exec::node::ExecPlan;
+use crate::exec::fragment::sink::FragmentSinkProgram;
+use crate::exec::node::{ExecNodeKind, ExecPlan};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FragmentContractVersion(u16);
@@ -120,6 +122,28 @@ impl ExchangeInputContract {
 pub(crate) struct RuntimeFilterContract {
     build_filters: BTreeSet<RuntimeFilterId>,
     probe_filters: BTreeSet<RuntimeFilterId>,
+    dormancy_facts: Vec<RuntimeFilterDormancyFact>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterApplyPoint {
+    NodeInput,
+    NodeOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterDormancyRole {
+    Producer,
+    Consumer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterDormancyFact {
+    pub(crate) binding_id: u32,
+    pub(crate) channel_id: u32,
+    pub(crate) node_id: i32,
+    pub(crate) apply_point: RuntimeFilterApplyPoint,
+    pub(crate) role: RuntimeFilterDormancyRole,
 }
 
 impl RuntimeFilterContract {
@@ -130,7 +154,16 @@ impl RuntimeFilterContract {
         Self {
             build_filters,
             probe_filters,
+            dormancy_facts: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_dormancy_facts(
+        mut self,
+        dormancy_facts: Vec<RuntimeFilterDormancyFact>,
+    ) -> Self {
+        self.dormancy_facts = dormancy_facts;
+        self
     }
 
     pub(crate) fn build_filters(&self) -> &BTreeSet<RuntimeFilterId> {
@@ -140,6 +173,10 @@ impl RuntimeFilterContract {
     pub(crate) fn probe_filters(&self) -> &BTreeSet<RuntimeFilterId> {
         &self.probe_filters
     }
+
+    pub(crate) fn dormancy_facts(&self) -> &[RuntimeFilterDormancyFact] {
+        &self.dormancy_facts
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,11 +185,8 @@ pub(crate) enum FragmentSinkKind {
     Noop,
     DataStream,
     MultiCastDataStream,
-    SplitDataStream,
     IcebergChangeStreamRouter,
-    SchemaTable,
     IcebergTable,
-    OlapTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,68 +201,56 @@ pub(crate) enum FragmentSinkAssignmentRequirement {
     Required(FragmentSinkAssignmentKind),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct FragmentSinkSpec {
+    program: FragmentSinkProgram,
     kind: FragmentSinkKind,
     assignment_requirement: FragmentSinkAssignmentRequirement,
 }
 
 impl FragmentSinkSpec {
-    pub(crate) fn try_for_kind(
-        kind: FragmentSinkKind,
-        destination_group_count: Option<NonZeroUsize>,
-    ) -> Result<Self, FragmentBindingError> {
+    pub(crate) fn try_new(program: FragmentSinkProgram) -> Result<Self, FragmentBindingError> {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
 
-        let assignment_requirement = match kind {
-            FragmentSinkKind::MultiCastDataStream
-            | FragmentSinkKind::SplitDataStream
-            | FragmentSinkKind::IcebergChangeStreamRouter => {
-                let count = destination_group_count.ok_or_else(|| {
-                    FragmentBindingError::new(
-                        FragmentBindingTarget::Sink,
-                        FragmentBindingErrorKind::InvalidAssignment,
-                        format!("sink {kind:?} requires a destination group count"),
-                    )
-                })?;
-                Required(DestinationGroups(count))
+        program.validate().map_err(static_sink_binding_error)?;
+        let (kind, assignment_requirement) = match &program {
+            FragmentSinkProgram::Result => (FragmentSinkKind::Result, None),
+            FragmentSinkProgram::Noop => (FragmentSinkKind::Noop, None),
+            FragmentSinkProgram::DataStream(_) => {
+                (FragmentSinkKind::DataStream, Required(StreamDestinations))
             }
-            FragmentSinkKind::DataStream => {
-                if let Some(count) = destination_group_count {
-                    return Err(FragmentBindingError::new(
-                        FragmentBindingTarget::Sink,
-                        FragmentBindingErrorKind::InvalidAssignment,
-                        format!(
-                            "sink {kind:?} does not accept destination group count {}",
-                            count.get()
-                        ),
-                    ));
-                }
-                Required(StreamDestinations)
+            FragmentSinkProgram::MultiCastDataStream(grouped) => {
+                let count = non_empty_group_count(
+                    FragmentSinkKind::MultiCastDataStream,
+                    grouped.sinks().len(),
+                )?;
+                (
+                    FragmentSinkKind::MultiCastDataStream,
+                    Required(DestinationGroups(count)),
+                )
             }
-            FragmentSinkKind::Result
-            | FragmentSinkKind::Noop
-            | FragmentSinkKind::SchemaTable
-            | FragmentSinkKind::IcebergTable
-            | FragmentSinkKind::OlapTable => {
-                if let Some(count) = destination_group_count {
-                    return Err(FragmentBindingError::new(
-                        FragmentBindingTarget::Sink,
-                        FragmentBindingErrorKind::InvalidAssignment,
-                        format!(
-                            "sink {kind:?} does not accept destination group count {}",
-                            count.get()
-                        ),
-                    ));
-                }
-                None
+            FragmentSinkProgram::IcebergTable(_) => (FragmentSinkKind::IcebergTable, None),
+            FragmentSinkProgram::IcebergChangeStreamRouter(router) => {
+                let count = non_empty_group_count(
+                    FragmentSinkKind::IcebergChangeStreamRouter,
+                    router.branches().len(),
+                )?;
+                (
+                    FragmentSinkKind::IcebergChangeStreamRouter,
+                    Required(DestinationGroups(count)),
+                )
             }
         };
         Ok(Self {
+            program,
             kind,
             assignment_requirement,
         })
+    }
+
+    pub(crate) const fn program(&self) -> &FragmentSinkProgram {
+        &self.program
     }
 
     pub(crate) const fn kind(&self) -> FragmentSinkKind {
@@ -240,8 +262,30 @@ impl FragmentSinkSpec {
     }
 }
 
+fn static_sink_binding_error(error: ExecPlanBuildError) -> FragmentBindingError {
+    let kind = match error.invariant() {
+        ExecPlanInvariant::Expression => FragmentBindingErrorKind::ExpressionMismatch,
+        _ => FragmentBindingErrorKind::InvalidAssignment,
+    };
+    FragmentBindingError::new(FragmentBindingTarget::Sink, kind, error.detail())
+}
+
+fn non_empty_group_count(
+    kind: FragmentSinkKind,
+    count: usize,
+) -> Result<NonZeroUsize, FragmentBindingError> {
+    NonZeroUsize::new(count).ok_or_else(|| {
+        FragmentBindingError::new(
+            FragmentBindingTarget::Sink,
+            FragmentBindingErrorKind::InvalidAssignment,
+            format!("sink {kind:?} requires at least one static branch"),
+        )
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct FragmentProgram {
+    root_plan_node_id: FragmentNodeId,
     plan: ExecPlan,
     sink: FragmentSinkSpec,
     program_options: FragmentProgramOptions,
@@ -259,7 +303,9 @@ impl FragmentProgram {
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
         runtime_filters: RuntimeFilterContract,
     ) -> Self {
+        let root_plan_node_id = FragmentNodeId::new(root_plan_node_id(&plan));
         Self {
+            root_plan_node_id,
             plan,
             sink,
             program_options,
@@ -267,6 +313,10 @@ impl FragmentProgram {
             exchange_inputs,
             runtime_filters,
         }
+    }
+
+    pub(crate) const fn root_plan_node_id(&self) -> FragmentNodeId {
+        self.root_plan_node_id
     }
 
     pub(crate) fn plan(&self) -> &ExecPlan {
@@ -294,16 +344,49 @@ impl FragmentProgram {
     }
 }
 
+fn root_plan_node_id(plan: &ExecPlan) -> i32 {
+    match &plan.root.kind {
+        ExecNodeKind::AssertNumRows(node) => node.node_id,
+        ExecNodeKind::Values(node) => node.node_id,
+        ExecNodeKind::Project(node) => node.node_id,
+        ExecNodeKind::Filter(node) => node.node_id,
+        ExecNodeKind::Repeat(node) => node.node_id,
+        ExecNodeKind::ChangeEventExpand(node) => node.node_id,
+        ExecNodeKind::UnionAll(node) => node.node_id,
+        ExecNodeKind::Limit(node) => node.node_id,
+        ExecNodeKind::ExchangeSource(node) => node.key.node_id,
+        ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
+        ExecNodeKind::IcebergDeltaScan(node) => node.node_id,
+        #[cfg(feature = "compat")]
+        ExecNodeKind::Fetch(node) => node.node_id,
+        ExecNodeKind::LookUp(node) => node.node_id,
+        ExecNodeKind::Aggregate(node) => node.node_id,
+        ExecNodeKind::Join(node) => node.node_id,
+        ExecNodeKind::NestedLoopJoin(node) => node.node_id,
+        ExecNodeKind::Sort(node) => node.node_id,
+        ExecNodeKind::TableFunction(node) => node.node_id,
+        ExecNodeKind::Analytic(node) => node.node_id,
+        ExecNodeKind::SetOp(node) => node.node_id,
+        ExecNodeKind::NativeRuntimeFilterConsumer(node) => node.owner_node_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
+    use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprId};
+    use crate::exec::fragment::sink::{
+        DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+        MultiCastDataStreamSinkProgram,
+    };
+    use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+    use crate::exec::operators::DataStreamPartitionType;
 
     use super::*;
 
@@ -317,6 +400,38 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn root_not_minimum_node_id_plan() -> ExecPlan {
+        ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Filter(FilterNode {
+                    input: Box::new(ExecNode {
+                        kind: ExecNodeKind::Values(ValuesNode {
+                            chunk: Chunk::default(),
+                            node_id: 3,
+                        }),
+                    }),
+                    node_id: 99,
+                    predicate: ExprId(0),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn program_preserves_root_plan_node_id_instead_of_minimum_operator_id() {
+        let program = FragmentProgram::new(
+            root_not_minimum_node_id_plan(),
+            FragmentSinkSpec::try_new(FragmentSinkProgram::Noop).expect("noop sink"),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::default(),
+        );
+
+        assert_eq!(program.root_plan_node_id(), FragmentNodeId::new(99));
     }
 
     #[test]
@@ -336,53 +451,60 @@ mod tests {
     }
 
     #[test]
-    fn sink_assignment_requirement_is_derived_from_kind() {
+    fn sink_assignment_requirement_is_derived_from_static_program() {
         use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
         use FragmentSinkAssignmentRequirement::{None, Required};
-        use FragmentSinkKind::{
-            DataStream, IcebergChangeStreamRouter, IcebergTable, MultiCastDataStream, Noop,
-            OlapTable, Result, SchemaTable, SplitDataStream,
-        };
 
-        let two = NonZeroUsize::new(2).expect("non-zero group count");
+        let stream = DataStreamSinkProgram::try_new(
+            9,
+            Vec::new(),
+            DataStreamPartitionType::Unpartitioned,
+            Vec::new(),
+            vec![SlotId::new(1)],
+            Option::None,
+            ExprArena::default(),
+        )
+        .expect("data stream program");
         assert_eq!(
-            FragmentSinkSpec::try_for_kind(DataStream, Option::<NonZeroUsize>::None)
+            FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(stream))
                 .expect("data stream sink")
                 .assignment_requirement(),
             Required(StreamDestinations)
         );
-        for kind in [Result, Noop, SchemaTable, IcebergTable, OlapTable] {
+        for program in [FragmentSinkProgram::Result, FragmentSinkProgram::Noop] {
             assert_eq!(
-                FragmentSinkSpec::try_for_kind(kind, Option::<NonZeroUsize>::None)
+                FragmentSinkSpec::try_new(program)
                     .expect("non-grouped sink")
                     .assignment_requirement(),
                 None
             );
-            let error = FragmentSinkSpec::try_for_kind(kind, Some(two))
-                .expect_err("non-grouped sink rejects group count");
-            assert_eq!(error.target(), FragmentBindingTarget::Sink);
-            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
         }
-        for kind in [
-            MultiCastDataStream,
-            SplitDataStream,
-            IcebergChangeStreamRouter,
-        ] {
-            assert_eq!(
-                FragmentSinkSpec::try_for_kind(kind, Some(two))
-                    .expect("grouped sink")
-                    .assignment_requirement(),
-                Required(DestinationGroups(two))
-            );
-            let error = FragmentSinkSpec::try_for_kind(kind, Option::<NonZeroUsize>::None)
-                .expect_err("grouped sink requires group count");
-            assert_eq!(error.target(), FragmentBindingTarget::Sink);
-            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
-        }
-        let error = FragmentSinkSpec::try_for_kind(DataStream, Some(two))
-            .expect_err("data stream rejects group count");
-        assert_eq!(error.target(), FragmentBindingTarget::Sink);
-        assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
+        let branch = || {
+            DataStreamSinkBranchProgram::try_new(
+                9,
+                Vec::new(),
+                DataStreamPartitionType::Unpartitioned,
+                Vec::new(),
+                vec![SlotId::new(1)],
+                Option::None,
+            )
+            .expect("data stream branch")
+        };
+        let grouped = FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
+            MultiCastDataStreamSinkProgram::try_new(vec![branch(), branch()], ExprArena::default())
+                .expect("grouped stream program"),
+        ))
+        .expect("grouped sink");
+        assert_eq!(
+            grouped.assignment_requirement(),
+            Required(DestinationGroups(
+                std::num::NonZeroUsize::new(2).expect("non-zero group count")
+            ))
+        );
+
+        let error = MultiCastDataStreamSinkProgram::try_new(Vec::new(), ExprArena::default())
+            .expect_err("empty grouped sink is invalid at static build time");
+        assert_eq!(error.invariant(), ExecPlanInvariant::Sink);
     }
 
     #[test]
@@ -403,7 +525,7 @@ mod tests {
         let options = FragmentProgramOptions::new(FragmentContractVersion::CURRENT);
         let program = FragmentProgram::new(
             values_plan(),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::Result, None).expect("result sink"),
+            FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink"),
             options,
             scan_sources,
             exchange_inputs,

@@ -17,10 +17,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::common::types::UniqueId;
-use crate::proto::{common, novarocks};
-use crate::runtime::endpoint::{RuntimeEndpoint, RuntimeFilterProberDestination};
+use crate::runtime::endpoint::RuntimeFilterProberDestination;
 use crate::runtime::runtime_filter_worker::{RuntimeFilterProberTarget, RuntimeFilterWorkerParams};
+#[cfg(feature = "compat")]
+use crate::{common::types::UniqueId, runtime::endpoint::RuntimeEndpoint};
 
 #[cfg(feature = "compat")]
 use crate::thrift::{runtime_filter, types};
@@ -63,55 +63,6 @@ impl RuntimeFilterParams {
 
     pub(crate) fn runtime_filter_max_size(&self) -> Option<i64> {
         self.runtime_filter_max_size
-    }
-
-    pub(crate) fn from_native(src: &novarocks::RuntimeFilterParams) -> Result<Self, String> {
-        let id_to_prober_params = src
-            .id_to_prober_params
-            .iter()
-            .map(|(filter_id, list)| {
-                let params = list
-                    .params
-                    .iter()
-                    .map(prober_params_from_native)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((*filter_id, params))
-            })
-            .collect::<Result<BTreeMap<_, _>, String>>()?;
-        let runtime_filter_builder_number = src
-            .runtime_filter_builder_number
-            .iter()
-            .map(|(filter_id, count)| (*filter_id, *count))
-            .collect::<BTreeMap<_, _>>();
-
-        Ok(Self::new(
-            id_to_prober_params,
-            runtime_filter_builder_number,
-            (src.runtime_filter_max_size > 0).then_some(src.runtime_filter_max_size),
-        ))
-    }
-
-    pub(crate) fn to_native(&self) -> novarocks::RuntimeFilterParams {
-        novarocks::RuntimeFilterParams {
-            id_to_prober_params: self
-                .id_to_prober_params
-                .iter()
-                .map(|(filter_id, params)| {
-                    (
-                        *filter_id,
-                        novarocks::ProberParamsList {
-                            params: params.iter().map(prober_params_to_native).collect(),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>(),
-            runtime_filter_builder_number: self
-                .runtime_filter_builder_number
-                .iter()
-                .map(|(filter_id, count)| (*filter_id, *count))
-                .collect::<HashMap<_, _>>(),
-            runtime_filter_max_size: self.runtime_filter_max_size.unwrap_or(0),
-        }
     }
 
     #[cfg(feature = "compat")]
@@ -188,33 +139,6 @@ impl RuntimeFilterParams {
     }
 }
 
-fn prober_params_from_native(
-    src: &novarocks::ProberParams,
-) -> Result<RuntimeFilterProberDestination, String> {
-    let fragment_instance_id = src
-        .fragment_instance_id
-        .as_ref()
-        .ok_or_else(|| "native ProberParams missing fragment_instance_id".to_string())?;
-    Ok(RuntimeFilterProberDestination::new(
-        UniqueId {
-            hi: fragment_instance_id.hi,
-            lo: fragment_instance_id.lo,
-        },
-        RuntimeEndpoint::parse(&src.endpoint)?,
-    ))
-}
-
-fn prober_params_to_native(src: &RuntimeFilterProberDestination) -> novarocks::ProberParams {
-    let fragment_instance_id = src.fragment_instance_id();
-    novarocks::ProberParams {
-        fragment_instance_id: Some(common::UniqueId {
-            hi: fragment_instance_id.hi,
-            lo: fragment_instance_id.lo,
-        }),
-        endpoint: src.endpoint().as_host_port(),
-    }
-}
-
 #[cfg(feature = "compat")]
 mod compat_adapters {
     use super::*;
@@ -250,7 +174,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::common::types::UniqueId;
-    use crate::proto::{common, novarocks};
     use crate::runtime::endpoint::{RuntimeEndpoint, RuntimeFilterProberDestination};
 
     use super::RuntimeFilterParams;
@@ -260,26 +183,6 @@ mod tests {
             UniqueId { hi, lo },
             RuntimeEndpoint::parse(endpoint).expect("endpoint"),
         )
-    }
-
-    #[test]
-    fn native_runtime_filter_params_round_trip_proto() {
-        let params = RuntimeFilterParams::new(
-            BTreeMap::from([(7, vec![destination(1, 2, "10.0.0.7:8060")])]),
-            BTreeMap::from([(7, 3)]),
-            Some(16 * 1024 * 1024),
-        );
-
-        let decoded = RuntimeFilterParams::from_native(&params.to_native()).unwrap();
-
-        assert_eq!(decoded.runtime_filter_builder_number().get(&7), Some(&3));
-        assert_eq!(decoded.runtime_filter_max_size(), Some(16 * 1024 * 1024));
-        assert_eq!(
-            decoded.id_to_prober_params()[&7][0]
-                .endpoint()
-                .as_host_port(),
-            "10.0.0.7:8060"
-        );
     }
 
     #[test]
@@ -305,49 +208,5 @@ mod tests {
         assert_eq!(targets[0].port(), 8060);
         assert_eq!(targets[1].hostname(), "10.0.0.18");
         assert_eq!(targets[1].port(), 8061);
-    }
-
-    #[test]
-    fn native_runtime_filter_params_reject_missing_prober_fragment_instance_id() {
-        let err = RuntimeFilterParams::from_native(&novarocks::RuntimeFilterParams {
-            id_to_prober_params: [(
-                19,
-                novarocks::ProberParamsList {
-                    params: vec![novarocks::ProberParams {
-                        fragment_instance_id: None,
-                        endpoint: "10.0.0.19:8060".to_string(),
-                    }],
-                },
-            )]
-            .into_iter()
-            .collect(),
-            runtime_filter_builder_number: BTreeMap::new().into_iter().collect(),
-            runtime_filter_max_size: 0,
-        })
-        .expect_err("missing fragment_instance_id");
-
-        assert!(err.contains("fragment_instance_id"), "{err}");
-    }
-
-    #[test]
-    fn native_runtime_filter_params_reject_invalid_prober_endpoint() {
-        let err = RuntimeFilterParams::from_native(&novarocks::RuntimeFilterParams {
-            id_to_prober_params: [(
-                23,
-                novarocks::ProberParamsList {
-                    params: vec![novarocks::ProberParams {
-                        fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                        endpoint: String::new(),
-                    }],
-                },
-            )]
-            .into_iter()
-            .collect(),
-            runtime_filter_builder_number: BTreeMap::new().into_iter().collect(),
-            runtime_filter_max_size: -1,
-        })
-        .expect_err("invalid endpoint");
-
-        assert!(err.contains("host:port"), "{err}");
     }
 }

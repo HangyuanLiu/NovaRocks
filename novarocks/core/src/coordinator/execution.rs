@@ -344,9 +344,33 @@ pub(crate) struct ExecutionCoordinator {
     native_bundle: NativeFragmentBundle,
     execution_ports: CoordinatorExecutionPorts,
     scheduler: Arc<FragmentScheduler>,
-    query_options: Option<QueryOptions>,
+    query_options: CoordinatorQueryOptions,
     #[cfg(test)]
     scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
+}
+
+/// Query options sealed for the native coordinator boundary.
+///
+/// Upstream engine entrypoints may omit session options or leave `pipeline_dop`
+/// in auto mode. A coordinator, however, must always submit a complete native
+/// sidecar with a positive DOP. Keeping that invariant in the field type makes
+/// an invalid coordinator state unrepresentable after construction.
+struct CoordinatorQueryOptions(QueryOptions);
+
+impl CoordinatorQueryOptions {
+    fn from_upstream(query_options: Option<QueryOptions>) -> Self {
+        let mut query_options = query_options.unwrap_or_default();
+        let pipeline_dop = crate::runtime::exec_env::calc_pipeline_dop(
+            query_options.pipeline_dop.unwrap_or_default(),
+        );
+        debug_assert!(pipeline_dop > 0, "resolved pipeline DOP must be positive");
+        query_options.pipeline_dop = Some(pipeline_dop);
+        Self(query_options)
+    }
+
+    fn as_runtime_options(&self) -> &QueryOptions {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -369,7 +393,7 @@ impl ExecutionCoordinator {
             native_bundle,
             execution_ports,
             scheduler,
-            query_options,
+            query_options: CoordinatorQueryOptions::from_upstream(query_options),
             #[cfg(test)]
             scheduled_plan_test_drift: None,
         }
@@ -653,7 +677,7 @@ impl ExecutionCoordinator {
                     crate::protocol::native::encode::encode_instance_params(
                         &query_id,
                         placement,
-                        query_options.as_ref(),
+                        query_options.as_runtime_options(),
                         placement.instance_index as i32,
                         fragment_report_endpoint.as_ref(),
                         typed_result_sink,
@@ -708,8 +732,8 @@ impl ExecutionCoordinator {
             .map(RegisteredWriteCoordinator::coordinator);
 
         let timeout_ms = query_options
-            .as_ref()
-            .and_then(|q| q.query_timeout)
+            .as_runtime_options()
+            .query_timeout
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
         let root_schedule = prepared
@@ -2127,19 +2151,38 @@ mod native_contract_tests {
         scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
         dispatcher: Arc<CapturingDispatcher>,
     ) -> ExecutionCoordinator {
-        ExecutionCoordinator {
+        coordinator_for_artifact_test_with_query_options(
             prepared,
             native_bundle,
-            execution_ports: CoordinatorExecutionPorts::new(
+            scheduler,
+            scheduled_plan_test_drift,
+            dispatcher,
+            None,
+        )
+    }
+
+    fn coordinator_for_artifact_test_with_query_options(
+        prepared: PreparedFragmentSet,
+        native_bundle: NativeFragmentBundle,
+        scheduler: Arc<FragmentScheduler>,
+        scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
+        dispatcher: Arc<CapturingDispatcher>,
+        query_options: Option<QueryOptions>,
+    ) -> ExecutionCoordinator {
+        let mut coordinator = ExecutionCoordinator::new(
+            prepared,
+            native_bundle,
+            CoordinatorExecutionPorts::new(
                 dispatcher,
                 crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
                     .expect("report endpoint"),
                 Arc::new(CountingCoordinatorObserver::default()),
             ),
             scheduler,
-            query_options: None,
-            scheduled_plan_test_drift,
-        }
+            query_options,
+        );
+        coordinator.scheduled_plan_test_drift = scheduled_plan_test_drift;
+        coordinator
     }
 
     fn prepared(fragment_ids: &[FragmentId]) -> PreparedFragmentSet {
@@ -2313,6 +2356,7 @@ mod native_contract_tests {
 
     struct CapturingDispatcher {
         submissions: Mutex<Vec<(usize, FragmentId, UniqueId)>>,
+        query_options: Mutex<Vec<Option<crate::proto::novarocks::QueryOptions>>>,
         submit_count: AtomicUsize,
         fail_on_submit: Option<usize>,
         backend_loss_on_submit: Option<(usize, crate::coordinator::cluster::BeId)>,
@@ -2341,6 +2385,7 @@ mod native_contract_tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 submissions: Mutex::new(Vec::new()),
+                query_options: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
                 fail_on_submit: None,
                 backend_loss_on_submit: Some((call, be_id)),
@@ -2357,6 +2402,7 @@ mod native_contract_tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 submissions: Mutex::new(Vec::new()),
+                query_options: Mutex::new(Vec::new()),
                 submit_count: AtomicUsize::new(0),
                 fail_on_submit,
                 backend_loss_on_submit: None,
@@ -2387,11 +2433,13 @@ mod native_contract_tests {
                 );
             }
             let finst_id = submission.fragment_instance_id()?;
+            let query_options = submission.instance_params_for_test().query_options.clone();
             self.submissions.lock().unwrap().push((
                 backend_idx,
                 submission.plan_for_test().fragment_id,
                 finst_id,
             ));
+            self.query_options.lock().unwrap().push(query_options);
             Ok(())
         }
 
@@ -2587,6 +2635,66 @@ mod native_contract_tests {
             crate::protocol::native::encode::NativeBundleTestDrift::Unknown(99),
             "native fragment ids mismatch",
         );
+    }
+
+    #[test]
+    fn normal_coordinator_encodes_positive_query_options_and_preserves_explicit_override() {
+        let scheduler = || {
+            Arc::new(FragmentScheduler::new(vec![std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                9030,
+            ))]))
+        };
+
+        let (prepared, native_bundle) = real_execution_artifacts();
+        let auto_dispatcher = CapturingDispatcher::new(None);
+        coordinator_for_artifact_test_with_query_options(
+            prepared,
+            native_bundle,
+            scheduler(),
+            None,
+            auto_dispatcher.clone(),
+            None,
+        )
+        .execute_with_write_outcome()
+        .expect("normal coordinator with auto DOP");
+        let auto_options = auto_dispatcher.query_options.lock().unwrap();
+        let auto_options = auto_options[0]
+            .as_ref()
+            .expect("normal coordinator must encode query options");
+        assert_eq!(
+            auto_options.pipeline_dop,
+            crate::runtime::exec_env::calc_pipeline_dop(0)
+        );
+        assert!(auto_options.pipeline_dop > 0);
+
+        let explicit = QueryOptions {
+            pipeline_dop: Some(7),
+            query_timeout: Some(41),
+            enable_profile: true,
+            group_concat_max_len: Some(65_535),
+            ..Default::default()
+        };
+        let (prepared, native_bundle) = real_execution_artifacts();
+        let explicit_dispatcher = CapturingDispatcher::new(None);
+        coordinator_for_artifact_test_with_query_options(
+            prepared,
+            native_bundle,
+            scheduler(),
+            None,
+            explicit_dispatcher.clone(),
+            Some(explicit),
+        )
+        .execute_with_write_outcome()
+        .expect("normal coordinator with explicit DOP");
+        let explicit_options = explicit_dispatcher.query_options.lock().unwrap();
+        let explicit_options = explicit_options[0]
+            .as_ref()
+            .expect("normal coordinator must encode explicit query options");
+        assert_eq!(explicit_options.pipeline_dop, 7);
+        assert_eq!(explicit_options.query_timeout, 41);
+        assert!(explicit_options.enable_profile);
+        assert_eq!(explicit_options.group_concat_max_len, Some(65_535));
     }
 
     fn assert_scheduled_drift_rejected(drift: ScheduledPlanTestDrift, expected_error: &str) {

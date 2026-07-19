@@ -529,14 +529,22 @@ mod tests {
     };
     use crate::exec::fragment::program::{
         ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
-        FragmentProgramOptions, FragmentSinkKind, FragmentSinkSpec, RuntimeFilterContract,
-        RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
+        FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
+        ScanAssignmentKind, ScanSourceContract,
+    };
+    use crate::exec::fragment::sink::{
+        DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+        MultiCastDataStreamSinkProgram,
     };
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
     #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
+    use crate::exec::node::iceberg_delta_scan::{
+        ApplyKeySource, BaseTableIdent, IcebergDeltaScanNode, IcebergDeltaTablePayload,
+        IcebergRuntimeHandles,
+    };
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
     };
@@ -548,8 +556,7 @@ mod tests {
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::lower::novarocks::{NodeLoweringContext, lower_proto_node};
-    use crate::proto::{common, plan};
+    use crate::exec::operators::DataStreamPartitionType;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::endpoint::RuntimeFilterProberDestination;
     use crate::runtime::exchange::ExchangeKey;
@@ -562,7 +569,6 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::types::logical::{LogicalType, field_with_logical_type};
-    use crate::types::native_proto::encode_type;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
 
     use super::*;
@@ -675,102 +681,76 @@ mod tests {
         )
     }
 
-    fn native_type(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("native type")
-    }
-
     fn native_delta_scan_plan(node_id: i32) -> ExecPlan {
-        let output = common::OutputColumn {
-            column_id: 1,
-            name: "id".to_string(),
-            r#type: Some(native_type(&DataType::Int64)),
-            nullable: true,
-            is_internal: false,
-        };
-        let table = plan::IcebergTableInfo {
-            catalog: "rest".to_string(),
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            table_uuid: None,
-            current_snapshot_id: Some(2),
-            schema_id: 7,
-            location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
-            schema: Some(plan::IcebergSchemaDef {
-                fields: vec![plan::IcebergSchemaFieldDef {
-                    field_id: 10,
-                    name: "id".to_string(),
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                }],
-            }),
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
-        let node = plan::DistributedNode {
-            node_id,
-            fragment_id: 0,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children: Vec::new(),
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns: vec![output.clone()],
-                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
-                    database: "db".to_string(),
-                    table: Some(plan::TableDef {
-                        name: "t".to_string(),
-                        columns: vec![plan::ColumnDef {
-                            name: "id".to_string(),
-                            data_type: Some(native_type(&DataType::Int64)),
-                            nullable: true,
-                            write_default_json: None,
-                            logical_type: None,
-                        }],
-                        iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: Some(plan::ScanSource {
-                            kind: Some(plan::scan_source::Kind::IcebergDeltaTable(
-                                plan::IcebergDeltaTable {
-                                    table: Some(table),
-                                    from_snapshot_id: 1,
-                                    to_snapshot_id: 2,
-                                    delta_plan: Some(plan::IcebergDeltaScanPlan {
-                                        table_location: "file:///tmp/novarocks-pbf1c-delta"
-                                            .to_string(),
-                                        data_columns: vec![plan::IcebergDeltaDataColumn {
-                                            name: "id".to_string(),
-                                            field_id: 10,
-                                        }],
-                                        cloud_properties: HashMap::new(),
-                                        change_files: Vec::new(),
-                                        delete_side: None,
-                                    }),
-                                },
-                            )),
-                        }),
-                    }),
-                    alias: None,
-                    columns: vec![output],
-                    predicates: Vec::new(),
-                    required_columns: Vec::new(),
-                    dict_columns: Vec::new(),
-                    variant_columns: Vec::new(),
-                    mv_rewritten_from: None,
-                })),
-            })),
-        };
-        let mut arena = ExprArena::default();
-        let lowered = lower_proto_node(&node, &mut arena, &NodeLoweringContext::default())
-            .expect("lower native Iceberg delta scan");
         ExecPlan {
-            arena,
-            root: lowered.node,
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::IcebergDeltaScan(IcebergDeltaScanNode {
+                    base_table_ident: BaseTableIdent {
+                        catalog: "rest".to_string(),
+                        namespace: "db".to_string(),
+                        table: "t".to_string(),
+                    },
+                    table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
+                    from_snapshot_id: 1,
+                    to_snapshot_id: 2,
+                    output_chunk_schema: Arc::new(ChunkSchema::empty()),
+                    apply_key_source: ApplyKeySource::BaseRowId,
+                    change_files: Vec::new(),
+                    object_store_config: None,
+                    iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
+                        IcebergDeltaTablePayload {
+                            table_location: "file:///tmp/novarocks-pbf1c-delta".to_string(),
+                            data_columns: Vec::new(),
+                        },
+                        None,
+                    )),
+                    node_id,
+                    native_runtime_filter_specs: Vec::new(),
+                }),
+            },
         }
     }
 
     fn result_sink() -> FragmentSinkSpec {
-        FragmentSinkSpec::try_for_kind(FragmentSinkKind::Result, None).expect("result sink")
+        FragmentSinkSpec::try_new(FragmentSinkProgram::Result).expect("result sink")
+    }
+
+    fn data_stream_sink() -> FragmentSinkSpec {
+        FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(
+            DataStreamSinkProgram::try_new(
+                9,
+                Vec::new(),
+                DataStreamPartitionType::Unpartitioned,
+                Vec::new(),
+                vec![SlotId::new(1)],
+                None,
+                ExprArena::default(),
+            )
+            .expect("data stream program"),
+        ))
+        .expect("data stream sink")
+    }
+
+    fn multicast_sink(branch_count: usize) -> FragmentSinkSpec {
+        let branches = (0..branch_count)
+            .map(|index| {
+                DataStreamSinkBranchProgram::try_new(
+                    i32::try_from(index).expect("branch index fits i32"),
+                    Vec::new(),
+                    DataStreamPartitionType::Unpartitioned,
+                    Vec::new(),
+                    vec![SlotId::new(1)],
+                    None,
+                )
+                .expect("data stream branch")
+            })
+            .collect();
+        FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
+            MultiCastDataStreamSinkProgram::try_new(branches, ExprArena::default())
+                .expect("multicast program"),
+        ))
+        .expect("multicast sink")
     }
 
     fn program_with(
@@ -1598,8 +1578,7 @@ mod tests {
     fn requires_stream_destinations_for_data_stream_sink() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::DataStream, None)
-                .expect("data stream sink"),
+            data_stream_sink(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1615,8 +1594,7 @@ mod tests {
     fn accepts_stream_destinations_and_preserves_sender_id() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::DataStream, None)
-                .expect("data stream sink"),
+            data_stream_sink(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1651,11 +1629,7 @@ mod tests {
     fn rejects_wrong_destination_group_count() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(
-                FragmentSinkKind::MultiCastDataStream,
-                NonZeroUsize::new(2),
-            )
-            .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1684,11 +1658,7 @@ mod tests {
     fn accepts_empty_destination_groups_when_group_count_matches() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(
-                FragmentSinkKind::MultiCastDataStream,
-                NonZeroUsize::new(2),
-            )
-            .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
@@ -1716,8 +1686,7 @@ mod tests {
     fn rejects_stream_assignment_for_grouped_sink() {
         let program = program_with(
             values_plan(7),
-            FragmentSinkSpec::try_for_kind(FragmentSinkKind::SplitDataStream, NonZeroUsize::new(2))
-                .expect("grouped sink"),
+            multicast_sink(2),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),

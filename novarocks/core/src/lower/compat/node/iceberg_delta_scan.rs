@@ -30,10 +30,10 @@ use std::sync::Arc;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::iceberg_delta_scan::{
-    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaScanDeleteSide,
-    DeltaScanDeleteSidePayload, DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData,
-    IcebergDeltaDataColumnPayload, IcebergDeltaScanNode, IcebergDeltaTablePayload,
-    IcebergRuntimeHandles, PositionDeleteFileFormat, PositionDeleteSourceData,
+    ApplyKeySource, BaseTableIdent, DeletedFileVisibility, DeltaScanDeleteSidePayload,
+    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, IcebergDeltaDataColumnPayload,
+    IcebergDeltaScanNode, IcebergDeltaTablePayload, IcebergRuntimeHandles,
+    PositionDeleteFileFormat, PositionDeleteSourceData,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::compat::layout::{Layout, chunk_schema_for_layout};
@@ -82,14 +82,6 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         plan.cloud_configuration.as_ref(),
         &table_payload.table_location,
     )?;
-    let object_store_factory = Arc::new(
-        crate::connector::iceberg::changes::build_factory_for_table_location(
-            &table_payload.table_location,
-            object_store_config.as_ref(),
-        )?,
-    );
-    let delete_side =
-        build_delete_side_from_payload(delete_side_payload, object_store_config.as_ref())?;
 
     let output_chunk_schema: ChunkSchemaRef = if out_layout.order.is_empty() {
         Arc::new(crate::exec::chunk::ChunkSchema::empty())
@@ -116,11 +108,10 @@ pub(crate) fn lower_iceberg_delta_scan_node(
         apply_key_source: ApplyKeySource::BaseRowId,
         change_files,
         object_store_config,
-        iceberg_runtime: Arc::new(IcebergRuntimeHandles {
-            table: table_payload,
-            object_store_factory,
-            delete_side,
-        }),
+        iceberg_runtime: Arc::new(IcebergRuntimeHandles::new(
+            table_payload,
+            delete_side_payload,
+        )),
         node_id: node.node_id,
         native_runtime_filter_specs: Vec::new(),
     };
@@ -450,33 +441,4 @@ fn object_store_config_from_cloud_configuration(
     let mut config = credentials.to_object_store_config();
     crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
     Ok(Some(config))
-}
-
-fn build_delete_side_from_payload(
-    payload: Option<DeltaScanDeleteSidePayload>,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<Option<DeltaScanDeleteSide>, String> {
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-    let mut previously_deleted_positions_per_file = std::collections::HashMap::new();
-    for (path, positions) in payload.previously_deleted_positions_per_file {
-        let mut bitmap = roaring::RoaringTreemap::new();
-        for pos in positions {
-            bitmap.insert(pos);
-        }
-        previously_deleted_positions_per_file.insert(path, bitmap);
-    }
-    let previous_delete_visibility =
-        crate::engine::delete_flow::load_existing_delete_visibility_from_descriptors(
-            &payload.previous_delete_visibility_data_files,
-            object_store_config,
-        )?;
-    Ok(Some(DeltaScanDeleteSide {
-        base_data_file_lineage: payload.base_data_file_lineage,
-        previous_delete_visibility,
-        previously_deleted_positions_per_file,
-        previous_data_file_lineage: payload.previous_data_file_lineage,
-        deleted_data_file_paths: payload.deleted_data_file_paths,
-    }))
 }

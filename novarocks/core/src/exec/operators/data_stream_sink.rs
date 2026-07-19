@@ -1005,7 +1005,7 @@ impl DataStreamPartitionType {
         }
     }
 
-    fn requires_exprs(self) -> bool {
+    pub(crate) fn requires_exprs(self) -> bool {
         matches!(
             self,
             Self::HashPartitioned | Self::BucketShuffleHashPartitioned
@@ -1024,21 +1024,37 @@ pub(crate) struct DataStreamSinkFactoryInput {
 }
 
 impl DataStreamSinkFactoryInput {
-    pub(crate) fn partition_type_from_native_kind(
-        kind: i32,
-    ) -> Result<DataStreamPartitionType, String> {
-        match crate::proto::plan::PartitionKind::try_from(kind)
-            .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
-        {
-            crate::proto::plan::PartitionKind::Unpartitioned => {
-                Ok(DataStreamPartitionType::Unpartitioned)
-            }
-            crate::proto::plan::PartitionKind::Random => Ok(DataStreamPartitionType::Random),
-            crate::proto::plan::PartitionKind::Hash => Ok(DataStreamPartitionType::HashPartitioned),
-            crate::proto::plan::PartitionKind::Unspecified => {
-                Err("native DataPartition kind is unspecified".to_string())
-            }
+    pub(crate) fn try_from_static_program(
+        dest_node_id: i32,
+        output_partition_type: DataStreamPartitionType,
+        output_exprs: Vec<ExprId>,
+        mut output_partition_exprs: Vec<ExprId>,
+        output_columns: Vec<SlotId>,
+        destinations: Vec<FragmentDestination>,
+    ) -> Result<Self, String> {
+        if !output_exprs.is_empty() {
+            return Err("DATA_STREAM_SINK output_exprs are not supported".to_string());
         }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(slot_id) = output_columns
+            .iter()
+            .find(|slot_id| !seen.insert(**slot_id))
+        {
+            return Err(format!(
+                "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
+            ));
+        }
+        if !output_partition_type.requires_exprs() {
+            output_partition_exprs.clear();
+        }
+        Ok(Self {
+            dest_node_id,
+            output_exprs,
+            output_partition_type,
+            output_partition_exprs,
+            output_columns,
+            destinations,
+        })
     }
 
     #[cfg(feature = "compat")]
@@ -1059,10 +1075,6 @@ impl DataStreamSinkFactoryInput {
                 other
             )),
         }
-    }
-
-    pub(crate) fn partition_type_requires_exprs(partition_type: DataStreamPartitionType) -> bool {
-        partition_type.requires_exprs()
     }
 
     pub(crate) fn try_new(
@@ -1087,20 +1099,14 @@ impl DataStreamSinkFactoryInput {
             parsed_output_columns.push(slot_id);
         }
 
-        let output_partition_exprs = if Self::partition_type_requires_exprs(output_partition_type) {
-            output_partition_exprs
-        } else {
-            Vec::new()
-        };
-
-        Ok(Self {
+        Self::try_from_static_program(
             dest_node_id,
-            output_exprs,
             output_partition_type,
+            output_exprs,
             output_partition_exprs,
-            output_columns: parsed_output_columns,
+            parsed_output_columns,
             destinations,
-        })
+        )
     }
 }
 

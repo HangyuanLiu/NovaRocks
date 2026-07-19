@@ -63,6 +63,7 @@ use crate::connector::iceberg::report::{
 };
 use crate::connector::iceberg::sink_plan::{
     IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
+    PositionDeleteDataFilePartition,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -86,13 +87,113 @@ pub struct IcebergTableSinkFactory {
 }
 
 impl IcebergTableSinkFactory {
-    pub(crate) fn try_new(input: IcebergSinkFactoryInput) -> Result<Self, String> {
+    pub(crate) fn try_new(mut input: IcebergSinkFactoryInput) -> Result<Self, String> {
+        if let Some(deferred) = input
+            .plan
+            .position_delete_data_file_partition_index_input
+            .take()
+        {
+            if !input.plan.position_delete_data_file_partitions.is_empty() {
+                return Err(
+                    "deferred position-delete partition index conflicts with resolved entries"
+                        .to_string(),
+                );
+            }
+            input.plan.position_delete_data_file_partitions =
+                build_position_delete_data_file_partition_index(
+                    &deferred.metadata,
+                    deferred.target_snapshot_id,
+                    &deferred.table_location,
+                    deferred.object_store_s3.as_ref(),
+                )?;
+        }
         Ok(Self {
             name: input.name,
             arena: Arc::new(input.arena),
             plan: Arc::new(input.plan),
             shared_deletion_vectors: Arc::new(Mutex::new(SharedDeletionVectorState::default())),
         })
+    }
+}
+
+pub(crate) fn build_position_delete_data_file_partition_index(
+    metadata: &TableMetadata,
+    target_snapshot_id: Option<i64>,
+    table_location: &str,
+    s3_config: Option<&IcebergSinkObjectStoreConfig>,
+) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    let Some(snapshot_id) = target_snapshot_id.or_else(|| metadata.current_snapshot_id()) else {
+        return Ok(HashMap::new());
+    };
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        format!("Iceberg delete sink target snapshot id {snapshot_id} not found in table metadata")
+    })?;
+    let file_io = build_staged_file_io(table_location, s3_config)?;
+    data_block_on(async {
+        let manifest_list = snapshot
+            .load_manifest_list(&file_io, metadata)
+            .await
+            .map_err(|e| format!("load Iceberg position-delete target manifest list: {e}"))?;
+        let mut index = HashMap::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+            let manifest = manifest_file.load_manifest(&file_io).await.map_err(|e| {
+                format!(
+                    "load Iceberg position-delete data manifest {} failed: {e}",
+                    manifest_file.manifest_path
+                )
+            })?;
+            for entry in manifest.entries() {
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+                let data_file = entry.data_file();
+                if data_file.content_type() != DataContentType::Data {
+                    continue;
+                }
+                let partition = PositionDeleteDataFilePartition {
+                    partition_spec_id: manifest_file.partition_spec_id,
+                    partition_values: data_file.partition().clone(),
+                };
+                insert_position_delete_data_file_partition(
+                    &mut index,
+                    data_file.file_path().to_string(),
+                    partition,
+                )?;
+            }
+        }
+        Ok(index)
+    })?
+}
+
+fn insert_position_delete_data_file_partition(
+    index: &mut HashMap<String, PositionDeleteDataFilePartition>,
+    path: String,
+    partition: PositionDeleteDataFilePartition,
+) -> Result<(), String> {
+    match index.entry(path) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(partition);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            let existing = entry.get();
+            if existing.partition_spec_id == partition.partition_spec_id
+                && existing.partition_values == partition.partition_values
+            {
+                return Ok(());
+            }
+            Err(format!(
+                "Iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
+                entry.key(),
+                existing.partition_spec_id,
+                partition.partition_spec_id
+            ))
+        }
     }
 }
 
@@ -2505,6 +2606,7 @@ mod tests {
                 target_table_metadata: None,
                 target_snapshot_id: None,
                 position_delete_data_file_partitions: HashMap::new(),
+                position_delete_data_file_partition_index_input: None,
                 object_store_s3: None,
                 file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
                 report_file_format: "parquet".to_string(),
@@ -2558,6 +2660,7 @@ mod tests {
             target_table_metadata: None,
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -2711,6 +2814,7 @@ mod tests {
             target_table_metadata: None,
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -2822,6 +2926,7 @@ mod tests {
             target_table_metadata: Some(target_metadata),
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -2883,6 +2988,7 @@ mod tests {
             target_table_metadata: None,
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -2976,6 +3082,7 @@ mod tests {
             target_table_metadata: None,
             target_snapshot_id: None,
             position_delete_data_file_partitions: HashMap::new(),
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -3105,6 +3212,7 @@ mod tests {
             target_table_metadata: Some(target_metadata.clone()),
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -3242,6 +3350,7 @@ mod tests {
             target_table_metadata: Some(target_metadata.clone()),
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),
@@ -3388,6 +3497,7 @@ mod tests {
             target_table_metadata: Some(target_metadata.clone()),
             target_snapshot_id: None,
             position_delete_data_file_partitions: referenced_partitions,
+            position_delete_data_file_partition_index_input: None,
             object_store_s3: None,
             file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
             report_file_format: "parquet".to_string(),

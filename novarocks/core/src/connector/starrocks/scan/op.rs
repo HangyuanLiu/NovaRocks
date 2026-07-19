@@ -21,6 +21,9 @@ use serde_json::Value;
 
 use crate::common::types::UniqueId;
 use crate::connector::MinMaxPredicate;
+use crate::connector::starrocks::fe_v2_meta::{
+    LakeScanTabletRef, LakeTableIdentity, lake_scan_execution_properties,
+};
 use crate::connector::starrocks::fs_access::{
     path_requires_object_store_profile, resolve_with_profile,
 };
@@ -45,11 +48,31 @@ pub struct StarRocksScanRange {
     pub version: Option<i64>,
 }
 
+impl StarRocksScanRange {
+    pub(crate) fn new(tablet_id: i64, partition_id: i64, version: i64) -> Self {
+        Self {
+            tablet_id,
+            partition_id: Some(partition_id),
+            version: Some(version),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StarRocksSchemaColumnHint {
     pub name: String,
     pub unique_id: i32,
     pub default_value: Option<String>,
+}
+
+impl StarRocksSchemaColumnHint {
+    pub(crate) fn new(name: String, unique_id: i32, default_value: Option<String>) -> Self {
+        Self {
+            name,
+            unique_id,
+            default_value,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +84,51 @@ pub struct LakeScanSchemaMeta {
     pub query_id: Option<UniqueId>,
     pub native_tablet_schema: Option<TabletSchemaPb>,
     pub native_column_hints: Option<Vec<StarRocksSchemaColumnHint>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredLakeScanResolution {
+    pub(crate) query_id: Option<crate::runtime::query_context::QueryId>,
+    pub(crate) table: LakeTableIdentity,
+    pub(crate) tablets: Vec<LakeScanTabletRef>,
+}
+
+impl DeferredLakeScanResolution {
+    pub(crate) fn new(
+        query_id: Option<crate::runtime::query_context::QueryId>,
+        table: LakeTableIdentity,
+        tablets: Vec<LakeScanTabletRef>,
+    ) -> Self {
+        Self {
+            query_id,
+            table,
+            tablets,
+        }
+    }
+}
+
+impl LakeScanSchemaMeta {
+    pub(crate) fn with_embedded_schema(
+        db_id: i64,
+        table_id: i64,
+        schema_id: i64,
+        query_id: Option<crate::runtime::query_context::QueryId>,
+        tablet_schema: TabletSchemaPb,
+        column_hints: Vec<StarRocksSchemaColumnHint>,
+    ) -> Self {
+        Self {
+            db_id,
+            table_id,
+            schema_id,
+            fe_addr: None,
+            query_id: query_id.map(|query_id| UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            native_tablet_schema: Some(tablet_schema),
+            native_column_hints: Some(column_hints),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +148,7 @@ pub struct StarRocksScanConfig {
     pub profile_label: Option<String>,
     pub min_max_predicates: Vec<MinMaxPredicate>,
     pub lake_schema_meta: Option<LakeScanSchemaMeta>,
+    pub(crate) deferred_lake_resolution: Option<DeferredLakeScanResolution>,
     /// Maps TopN runtime filter_id → scan column name.
     /// Populated during lowering so that execute_iter() can convert
     /// `RuntimeMinMaxFilter` instances into `MinMaxPredicate` values
@@ -95,9 +164,22 @@ struct StarRocksExecutionContext {
 
 impl StarRocksExecutionContext {
     fn from_scan_config(cfg: &StarRocksScanConfig) -> Result<Self, String> {
-        let partition_storage_paths = resolve_partition_storage_paths(cfg)?;
+        let resolved_properties;
+        let properties = if parse_partition_storage_paths_optional(&cfg.properties)?.is_some() {
+            &cfg.properties
+        } else if let Some(deferred) = cfg.deferred_lake_resolution.as_ref() {
+            resolved_properties = lake_scan_execution_properties(
+                deferred.query_id,
+                &deferred.table,
+                &deferred.tablets,
+            )?;
+            &resolved_properties
+        } else {
+            &cfg.properties
+        };
+        let partition_storage_paths = resolve_partition_storage_paths(properties)?;
         let object_store_profile =
-            resolve_object_store_profile(&cfg.properties, partition_storage_paths.values())?;
+            resolve_object_store_profile(properties, partition_storage_paths.values())?;
         Ok(Self {
             partition_storage_paths,
             object_store_profile,
@@ -435,9 +517,9 @@ pub(crate) fn build_native_object_store_profile_from_properties(
 }
 
 fn resolve_partition_storage_paths(
-    cfg: &StarRocksScanConfig,
+    properties: &BTreeMap<String, String>,
 ) -> Result<HashMap<i64, String>, String> {
-    if let Some(paths) = parse_partition_storage_paths_optional(&cfg.properties)? {
+    if let Some(paths) = parse_partition_storage_paths_optional(properties)? {
         return Ok(paths);
     }
     Err(
@@ -550,4 +632,38 @@ fn resolve_object_store_profile<'a>(
             ObjectStoreProfile::from_s3_store_config(config)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeferredLakeScanResolution;
+    use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
+    use crate::runtime::query_context::QueryId;
+
+    #[test]
+    fn deferred_lake_scan_resolution_keeps_protocol_neutral_identity_and_tablets() {
+        let input = DeferredLakeScanResolution::new(
+            Some(QueryId { hi: 1, lo: 2 }),
+            LakeTableIdentity {
+                catalog: "default_catalog".to_string(),
+                db_name: "db".to_string(),
+                table_name: "t".to_string(),
+                db_id: 10,
+                table_id: 20,
+                schema_id: 30,
+            },
+            vec![LakeScanTabletRef {
+                tablet_id: 300,
+                partition_id: 100,
+                version: 7,
+            }],
+        );
+
+        assert_eq!(input.query_id, Some(QueryId { hi: 1, lo: 2 }));
+        assert_eq!(input.table.cache_key(), "default_catalog:10:20:30");
+        assert_eq!(input.tablets.len(), 1);
+        assert_eq!(input.tablets[0].tablet_id, 300);
+        assert_eq!(input.tablets[0].partition_id, 100);
+        assert_eq!(input.tablets[0].version, 7);
+    }
 }

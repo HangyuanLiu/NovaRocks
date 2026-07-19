@@ -42,6 +42,30 @@ pub(crate) struct PositionDeleteDataFilePartition {
     pub(crate) partition_values: Struct,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredPositionDeleteDataFilePartitionIndex {
+    pub(crate) metadata: TableMetadata,
+    pub(crate) target_snapshot_id: Option<i64>,
+    pub(crate) table_location: String,
+    pub(crate) object_store_s3: Option<IcebergSinkObjectStoreConfig>,
+}
+
+impl DeferredPositionDeleteDataFilePartitionIndex {
+    pub(crate) fn new(
+        metadata: TableMetadata,
+        target_snapshot_id: Option<i64>,
+        table_location: String,
+        object_store_s3: Option<IcebergSinkObjectStoreConfig>,
+    ) -> Self {
+        Self {
+            metadata,
+            target_snapshot_id,
+            table_location,
+            object_store_s3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergSinkObjectStoreConfig {
     pub(crate) endpoint: String,
@@ -103,6 +127,8 @@ pub(crate) struct IcebergSinkPlan {
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) position_delete_data_file_partitions:
         HashMap<String, PositionDeleteDataFilePartition>,
+    pub(crate) position_delete_data_file_partition_index_input:
+        Option<DeferredPositionDeleteDataFilePartitionIndex>,
     pub(crate) object_store_s3: Option<IcebergSinkObjectStoreConfig>,
     pub(crate) file_format: IcebergFileFormat,
     pub(crate) report_file_format: String,

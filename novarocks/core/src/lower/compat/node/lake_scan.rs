@@ -565,6 +565,7 @@ pub(crate) fn lower_lake_scan_node(
             native_tablet_schema: None,
             native_column_hints: None,
         }),
+        deferred_lake_resolution: None,
         topn_filter_column_map,
     };
 
