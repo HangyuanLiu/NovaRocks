@@ -31,9 +31,9 @@ pub(crate) mod lifecycle;
 pub(crate) mod metadata_consistency;
 pub(crate) mod partition;
 pub(crate) mod recovery;
-pub(crate) mod refresh_execution_context;
 pub(crate) mod refresh_io;
 pub(crate) mod refresh_pin_adapter;
-pub(crate) mod scan_binding;
+#[cfg(test)]
+pub(crate) mod scan_binding_oracle;
 pub(crate) mod schema_validation_adapter;
 pub(crate) mod stateless_rebuild;

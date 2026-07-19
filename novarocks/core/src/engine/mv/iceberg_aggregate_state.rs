@@ -22,12 +22,12 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::mv::refresh_execution_context::MvRefreshPruningLimits;
 use crate::exec::change_op::{ChangeOp, change_op_array, change_op_field};
 use crate::exec::chunk::Chunk;
 use crate::mv::aggregate_state::mv_agg_state::{
     AggregateMvLayout, build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
+use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::runtime::query_result::record_batch_to_chunk;
 
 pub(crate) struct IcebergAggregateMergeResult {
@@ -936,7 +936,7 @@ mod tests {
             &old,
             &delta,
             &layout,
-            crate::engine::mv::refresh_execution_context::MvRefreshPruningLimits {
+            crate::mv::refresh::execution_context::MvRefreshPruningLimits {
                 max_touched_groups: 1,
                 max_affected_partitions: 4_096,
             },

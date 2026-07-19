@@ -236,7 +236,7 @@ pub(crate) struct ChangeStreamPhysicalBuildInput {
     pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) query_opts: Option<QueryOptions>,
     pub(crate) mv_refresh_ctx:
-        Option<Arc<crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>>,
+        Option<Arc<crate::mv::refresh::execution_context::IcebergMvRefreshContext>>,
 }
 
 pub(crate) struct ChangeStreamWriteTransactionExecutor {

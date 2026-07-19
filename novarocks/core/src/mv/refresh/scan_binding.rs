@@ -24,10 +24,10 @@ use crate::coordinator::prepare::scan::{
     IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
     ResolvedScanExecution, ScanBindingResolver,
 };
-use crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext;
 use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
 };
+use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
 
@@ -309,13 +309,13 @@ mod tests {
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
     };
-    use crate::engine::mv::refresh_execution_context::tests_support::{
+    use crate::mv::refresh::execution_context::tests_support::{
         TargetLocatorRefreshFixture, aggregate_target_state_refresh_fixture,
         refresh_context_for_target_fixture, target_fixture_table_info,
         target_locator_refresh_fixture,
     };
     use crate::sql::planner::table::{
-        IcebergMvTargetLocatorScan, IcebergMvTargetStatePartitionConstraint,
+        BranchScope, IcebergMvTargetLocatorScan, IcebergMvTargetStatePartitionConstraint,
         IcebergMvTargetStateRowFilter, IcebergMvTargetStateScan, TableDef,
     };
 
@@ -372,6 +372,40 @@ mod tests {
             required_columns: None,
             variant_columns: Vec::new(),
             mv_rewritten_from: None,
+        }
+    }
+
+    fn data_file_to_written_file_for_test(
+        data_file: &iceberg::spec::DataFile,
+        partition_spec_id: i32,
+    ) -> crate::connector::iceberg::commit::WrittenFile {
+        crate::connector::iceberg::commit::WrittenFile {
+            path: data_file.file_path().to_string(),
+            format: data_file.file_format(),
+            content: data_file.content_type(),
+            partition_values: data_file.partition().clone(),
+            partition_spec_id,
+            record_count: data_file.record_count(),
+            file_size_in_bytes: data_file.file_size_in_bytes(),
+            split_offsets: data_file
+                .split_offsets()
+                .map(|offsets| offsets.to_vec())
+                .unwrap_or_default(),
+            column_sizes: data_file.column_sizes().clone(),
+            value_counts: data_file.value_counts().clone(),
+            null_value_counts: data_file.null_value_counts().clone(),
+            nan_value_counts: data_file.nan_value_counts().clone(),
+            lower_bounds: data_file.lower_bounds().clone(),
+            upper_bounds: data_file.upper_bounds().clone(),
+            key_metadata: data_file.key_metadata().map(|value| value.to_vec()),
+            referenced_data_file: data_file
+                .referenced_data_file()
+                .map(|value| value.to_string()),
+            equality_ids: data_file.equality_ids(),
+            first_row_id: data_file.first_row_id(),
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         }
     }
 
@@ -481,13 +515,10 @@ mod tests {
             .with_table_metadata(metadata.clone()),
         );
         for data_file in replacement_files {
-            collector.inject_written_file(
-                crate::engine::iceberg_writer::data_file_to_written_file(
-                    &data_file,
-                    metadata.default_partition_spec_id(),
-                )
-                .expect("replacement written file"),
-            );
+            collector.inject_written_file(data_file_to_written_file_for_test(
+                &data_file,
+                metadata.default_partition_spec_id(),
+            ));
         }
         block_on_iceberg(async {
             let file_io = loaded.table.file_io().clone();
@@ -699,6 +730,105 @@ mod tests {
         );
     }
 
+    fn resolve_target_state_error(
+        ctx: &IcebergMvRefreshContext,
+        scan: IcebergMvTargetStateScan,
+    ) -> String {
+        ctx.resolve_scan(206, &plan_scan(ScanSource::IcebergMvTargetState(scan)))
+            .expect_err("invalid target-state binding must fail")
+    }
+
+    #[test]
+    fn target_state_scan_rejects_target_identity_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.table = "other_mv".to_string();
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(err.contains("tgt.db.other_mv"), "{err}");
+        assert!(
+            err.contains("does not match MV refresh target tgt.db.mv"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn target_state_scan_rejects_target_uuid_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        let expected = scan.target_table_uuid.clone();
+        scan.target_table_uuid = "unexpected-uuid".to_string();
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(err.contains("tgt.db.mv target uuid mismatch"), "{err}");
+        assert!(err.contains("scan=unexpected-uuid"), "{err}");
+        assert!(err.contains(&format!("context={expected}")), "{err}");
+    }
+
+    #[test]
+    fn target_state_scan_rejects_target_snapshot_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.target_snapshot_id = Some(909);
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(err.contains("tgt.db.mv target snapshot mismatch"), "{err}");
+        assert!(err.contains("scan=Some(909)"), "{err}");
+        assert!(err.contains("context=None"), "{err}");
+    }
+
+    #[test]
+    fn target_state_scan_rejects_aggregate_layout_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.aggregate_state_layout_version = 99;
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(
+            err.contains("tgt.db.mv aggregate layout version mismatch"),
+            "{err}"
+        );
+        assert!(err.contains("scan=99 contract=1"), "{err}");
+    }
+
+    #[test]
+    fn target_state_scan_rejects_physical_columns_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.physical_column_names.push("unexpected".to_string());
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(err.contains("tgt.db.mv physical column mismatch"), "{err}");
+        assert!(err.contains("unexpected"), "{err}");
+        assert!(err.contains("expected="), "{err}");
+    }
+
+    #[test]
+    fn target_state_scan_rejects_row_filter_column_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.row_filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: "unexpected_row_id".to_string(),
+            branch_scope: None,
+        };
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(
+            err.contains("tgt.db.mv row filter column mismatch"),
+            "{err}"
+        );
+        assert!(
+            err.contains("filter=unexpected_row_id scan=__row_id__"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn target_state_scan_rejects_branch_scope_mismatch() {
+        let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
+        scan.row_filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_id_column_name: scan.row_id_column_name.clone(),
+            branch_scope: Some(BranchScope {
+                branch_id_column_name: "__branch_id__".to_string(),
+                branch_id: 0,
+            }),
+        };
+        let err = resolve_target_state_error(&ctx, scan);
+        assert!(err.contains("tgt.db.mv has branch scope"), "{err}");
+        assert!(
+            err.contains("schema contract has no branch contract"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn real_delta_builder_materializes_changes_delete_visibility_and_cloud_properties() {
         let fixture = delta_overwrite_refresh_fixture("scan_binding_delta");
@@ -726,6 +856,31 @@ mod tests {
         assert!(!delete_side.previous_data_file_lineage.is_empty());
         assert!(!delete_side.previous_delete_visibility_data_files.is_empty());
         assert!(!delete_side.deleted_data_file_paths.is_empty());
+    }
+
+    #[test]
+    fn delta_binding_rejects_missing_requested_endpoint_snapshot() {
+        let fixture = delta_overwrite_refresh_fixture("missing_delta_endpoint");
+        let missing_snapshot_id = fixture.to_snapshot_id + 10_000;
+        let err = fixture
+            .ctx
+            .resolve_scan(
+                207,
+                &plan_scan(ScanSource::IcebergDeltaTable {
+                    table: fixture.table,
+                    from_snapshot_id: fixture.from_snapshot_id,
+                    to_snapshot_id: missing_snapshot_id,
+                }),
+            )
+            .expect_err("missing requested delta endpoint must fail");
+        assert!(
+            err.contains(&format!("from_snapshot={}", fixture.from_snapshot_id)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("to_snapshot={missing_snapshot_id}")),
+            "{err}"
+        );
     }
 
     #[test]
