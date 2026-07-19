@@ -26,6 +26,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use novarocks_state_store::coordination::{
+    AttemptId, ControlPlaneIncarnation, FencingToken, HolderId, ResourceEpoch, ResourceKey,
+};
 use novarocks_state_store::{
     ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
     ContinuationToken, Direction, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
@@ -40,6 +43,29 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use common::state_store_conformance::{FaultGate, FaultInjectingStateStore, ScriptedCommitResult};
+
+#[test]
+fn coordination_contract_rejects_invalid_opaque_identities() {
+    assert!(ResourceKey::try_from(Bytes::new()).is_err());
+    assert!(ResourceKey::try_from(Bytes::from(vec![0_u8; 8 * 1024 + 1])).is_err());
+    assert!(HolderId::try_from(Bytes::new()).is_err());
+    assert!(HolderId::try_from(Bytes::from(vec![1_u8; 257])).is_err());
+    assert!(AttemptId::try_from(Uuid::new_v4()).is_err());
+    assert!(AttemptId::try_from(Uuid::now_v7()).is_ok());
+}
+
+#[test]
+fn coordination_contract_token_is_exact_tuple() {
+    let token = FencingToken::new(
+        "cluster-a",
+        ControlPlaneIncarnation::new(2).unwrap(),
+        ResourceEpoch::new(9).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(token.cluster_id(), "cluster-a");
+    assert_eq!(token.control_plane_incarnation().get(), 2);
+    assert_eq!(token.resource_epoch().get(), 9);
+}
 
 fn valid_mysql_client() -> MySqlClientConfig {
     MySqlClientConfig {
