@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use bytes::Bytes;
-use novarocks::state_store::{
+use novarocks_state_store::{
     FeDeploymentView, FoundationDbClientConfig, StateStoreConfig, StateStoreErrorKind,
     StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };

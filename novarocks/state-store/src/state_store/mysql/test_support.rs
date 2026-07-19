@@ -32,6 +32,14 @@ use std::time::Duration;
 #[cfg(feature = "state-store-test-hooks")]
 use uuid::Uuid;
 
+fn repository_root_for_test() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("state-store manifest must be nested under the repository novarocks directory")
+        .to_path_buf()
+}
+
 #[cfg(feature = "state-store-test-hooks")]
 pub use super::open_test_hooks::{MysqlOpenGateControl, MysqlOpenGatePhase, arm_mysql_open_gate};
 pub use super::schema::{
@@ -1405,8 +1413,7 @@ pub async fn restart_mysql_fixture() -> Result<(), StateStoreError> {
             return Err(fixture_control_error());
         }
 
-        let status_script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docker/mysql-state-store/status.sh");
+        let status_script = repository_root_for_test().join("docker/mysql-state-store/status.sh");
         for _ in 0..120 {
             if std::process::Command::new(&status_script)
                 .status()

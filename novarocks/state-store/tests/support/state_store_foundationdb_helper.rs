@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks::state_store::{
+use novarocks_state_store::{
     CommitOutcome, CommitResolution, FeDeploymentView, FoundationDbClientConfig, Key, KeyRange,
     Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, StateStoreConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, TransactionId, Value,
@@ -301,7 +301,7 @@ impl Response {
 }
 
 struct PendingCommit {
-    control: novarocks::state_store::FoundationDbCommitGateControl,
+    control: novarocks_state_store::FoundationDbCommitGateControl,
     owner: JoinHandle<CommitOutcome>,
 }
 
@@ -444,8 +444,8 @@ impl HelperState {
             range: KeyRange::new(store_key(raw_start)?, store_key(raw_end)?)
                 .map_err(display_error)?,
             direction: match direction {
-                Direction::Forward => novarocks::state_store::Direction::Forward,
-                Direction::Reverse => novarocks::state_store::Direction::Reverse,
+                Direction::Forward => novarocks_state_store::Direction::Forward,
+                Direction::Reverse => novarocks_state_store::Direction::Reverse,
             },
             page_size,
             continuation: None,

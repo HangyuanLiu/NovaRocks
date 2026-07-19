@@ -21,6 +21,7 @@
 ))]
 
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,6 +31,8 @@ use std::time::Duration;
 
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
+
+mod common;
 
 const HELPER: &str = env!("CARGO_BIN_EXE_state-store-mysql-helper");
 const TEST_DIAGNOSTIC_CAP_BYTES: usize = 1024;
@@ -673,8 +676,8 @@ struct TestDatabase {
 
 impl TestDatabase {
     fn provision(case_id: &str) -> Self {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docker/mysql-state-store/provision-test-database.sh");
+        let script =
+            common::repo_root().join("docker/mysql-state-store/provision-test-database.sh");
         let output = Command::new(script)
             .args(["create", case_id])
             .output()
@@ -694,8 +697,8 @@ impl TestDatabase {
 
 impl Drop for TestDatabase {
     fn drop(&mut self) {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docker/mysql-state-store/provision-test-database.sh");
+        let script =
+            common::repo_root().join("docker/mysql-state-store/provision-test-database.sh");
         let status = Command::new(script).args(["drop", &self.name]).status();
         if !status.is_ok_and(|status| status.success()) && !std::thread::panicking() {
             panic!("MySQL test database provisioner drop failed");

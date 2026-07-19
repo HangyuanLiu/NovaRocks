@@ -21,16 +21,16 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use novarocks::state_store::mysql::test_support::{
+use novarocks_state_store::mysql::test_support::{
     acquire_operation, acquire_provider_handle, active_readiness, begin_shutdown, hold_connection,
     is_accepting, pollute_session, pool_count, prepare_pool, restart_mysql_fixture, runtime_owner,
     validate_owner,
 };
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::mysql::test_support::{
+use novarocks_state_store::mysql::test_support::{
     delayed_active_readiness, run_sleep_until_deadline,
 };
-use novarocks::state_store::{
+use novarocks_state_store::{
     FeDeploymentView, MySqlClientConfig, MySqlTlsMode, StateStoreConfig, StateStoreErrorKind,
     StateStoreLimitOverrides, StateStoreProviderConfig, StateStoreRuntime, open_state_store,
 };

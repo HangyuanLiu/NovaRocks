@@ -56,13 +56,14 @@ test -x "$NOVA_FDB_FDBCLI"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-cargo test --lib state_store
-cargo test --test state_store_contract
-cargo test --test state_store_sqlite -- --test-threads=1
-cargo build --profile dev-opt
-cargo test --features foundationdb-provider --test state_store_foundationdb_runtime foundationdb_runtime_lifecycle -- --nocapture --test-threads=1
-cargo test --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb foundationdb_suite -- --nocapture --test-threads=1
-cargo test --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_cross_process -- --nocapture --test-threads=1
-cargo build --profile dev-opt --features foundationdb-provider
-cargo test --test cluster_mvp cross_process_three_be_state_store_baseline -- --nocapture
+cargo test -p novarocks-state-store --lib
+cargo test -p novarocks-state-store --test state_store_contract
+cargo test -p novarocks-state-store --test state_store_sqlite -- --test-threads=1
+cargo test -p novarocks --test state_store_app_config
+cargo build -p novarocks-server --profile dev-opt
+cargo test -p novarocks-state-store --features foundationdb-provider --test state_store_foundationdb_runtime foundationdb_runtime_lifecycle -- --nocapture --test-threads=1
+cargo test -p novarocks-state-store --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb foundationdb_suite -- --nocapture --test-threads=1
+cargo test -p novarocks-state-store --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_cross_process -- --nocapture --test-threads=1
+cargo build -p novarocks-server --profile dev-opt --features foundationdb-provider
+cargo test -p novarocks-server --test cluster_mvp cross_process_three_be_state_store_baseline -- --exact --nocapture
 git diff --check

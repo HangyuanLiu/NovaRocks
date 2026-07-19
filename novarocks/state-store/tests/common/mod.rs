@@ -15,6 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    std::process::exit(novarocks::state_store::mysql::helper_protocol::run_stdio());
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+pub mod state_store_conformance;
+
+pub fn repo_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("state-store manifest must be nested under the repository novarocks directory")
+        .to_path_buf();
+    assert!(
+        root.join("docker/mysql-state-store").is_dir(),
+        "state-store tests must resolve the repository Docker fixtures"
+    );
+    root
 }

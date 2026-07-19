@@ -28,14 +28,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
-use novarocks::state_store::{
+use novarocks_state_store::{
     ChangePollRequest, CommitOutcome, CommitResolution, Direction, FeDeploymentView,
     FoundationDbClientConfig, Key, KeyRange, Precondition, RangeRequest, StateStore,
     StateStoreConfig, StateStoreErrorKind, StateStoreLimitOverrides, StateStoreProviderConfig,
     StateStoreRuntime, TransactionId, Value, open_state_store,
 };
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks::state_store::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
+use novarocks_state_store::{FoundationDbCommitGateControl, arm_next_foundationdb_commit};
 use uuid::Uuid;
 
 #[cfg(feature = "state-store-test-hooks")]
