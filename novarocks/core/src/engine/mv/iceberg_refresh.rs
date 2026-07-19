@@ -108,6 +108,11 @@ use crate::mv::refresh::execution::{
     validate_refresh_execution,
 };
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
+use crate::mv::refresh::join_incremental_refresh::{
+    JoinIncrementalLogicalInput, JoinIncrementalRefreshMode,
+    build_join_incremental_refresh_logical_plan, execute_join_incremental_refresh_write,
+    select_join_incremental_refresh_mode,
+};
 use crate::mv::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
 };
@@ -11753,12 +11758,12 @@ mod join_delta_append_only_fast_path_tests {
 
     #[test]
     fn join_incremental_refresh_plan_kind_uses_logical_cutover() {
-        let route = select_join_incremental_refresh_route(false, false);
-        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalAppendOnly);
-        let route = select_join_incremental_refresh_route(true, false);
-        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalCoalesce);
-        let route = select_join_incremental_refresh_route(false, true);
-        assert_eq!(route, JoinIncrementalRefreshRoute::LogicalCoalesce);
+        let mode = select_join_incremental_refresh_mode(false, false);
+        assert_eq!(mode, JoinIncrementalRefreshMode::AppendOnly);
+        let mode = select_join_incremental_refresh_mode(true, false);
+        assert_eq!(mode, JoinIncrementalRefreshMode::Coalesce);
+        let mode = select_join_incremental_refresh_mode(false, true);
+        assert_eq!(mode, JoinIncrementalRefreshMode::Coalesce);
     }
 
     #[test]
@@ -12082,43 +12087,12 @@ fn incremental_refresh_iceberg_join_mv(
             )?,
         );
     }
-    let route = if ctx.rewrite.schema_contract.aggregate.is_some() {
-        JoinIncrementalRefreshRoute::LogicalCoalesce
+    let mode = if ctx.rewrite.schema_contract.aggregate.is_some() {
+        JoinIncrementalRefreshMode::Coalesce
     } else {
-        select_join_incremental_refresh_route(left_has_delete_changes, right_has_delete_changes)
+        select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
     };
-    match route {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly => {
-            execute_append_only_join_delta_branches_logical(state, ctx, branches)
-        }
-        JoinIncrementalRefreshRoute::LogicalCoalesce => {
-            execute_coalescing_join_delta_branches_logical(state, ctx, branches)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JoinIncrementalRefreshRoute {
-    LogicalAppendOnly,
-    LogicalCoalesce,
-}
-
-fn select_join_incremental_refresh_route(
-    left_has_delete_changes: bool,
-    right_has_delete_changes: bool,
-) -> JoinIncrementalRefreshRoute {
-    if left_has_delete_changes || right_has_delete_changes {
-        JoinIncrementalRefreshRoute::LogicalCoalesce
-    } else {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly
-    }
-}
-
-struct JoinRefreshLogicalPlan {
-    plan: crate::sql::planner::logical::LogicalPlanNode,
-    factory: crate::sql::column_id::ColumnRefFactory,
-    change_stream:
-        Option<crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor>,
+    execute_join_delta_branches_logical(state, ctx, mode, branches)
 }
 
 fn plan_join_first_refresh_logical(
@@ -12148,214 +12122,10 @@ fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
     }
 }
 
-fn build_join_incremental_refresh_logical_plan(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    route: JoinIncrementalRefreshRoute,
-) -> Result<JoinRefreshLogicalPlan, String> {
-    let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
-    let is_aggregate_refresh = ctx.rewrite.schema_contract.aggregate.is_some();
-    let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
-    let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-        crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-            plan,
-            mv_ctx: Arc::clone(&ctx.rewrite),
-            disabled_rules: join_refresh_logical_execution_disabled_rules(is_aggregate_refresh),
-            deadline: None,
-            column_ref_factory: std::rc::Rc::clone(&factory_cell),
-        },
-    )
-    .map_err(|e| format!("join refresh logical rewrite: {e}"))?;
-    let mut factory = std::rc::Rc::try_unwrap(factory_cell)
-        .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
-        .into_inner();
-    let mut change_stream = None;
-    let plan = match route {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly => outcome.plan,
-        JoinIncrementalRefreshRoute::LogicalCoalesce if is_aggregate_refresh => outcome.plan,
-        JoinIncrementalRefreshRoute::LogicalCoalesce => {
-            let descriptor = outcome
-                .annotation
-                .change_stream
-                .join_refresh
-                .clone()
-                .ok_or_else(|| {
-                    format!(
-                        "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
-                        ctx.rewrite.target.fqn()
-                    )
-                })?;
-            descriptor.validate().map_err(|e| {
-                format!(
-                    "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
-                    ctx.rewrite.target.fqn()
-                )
-            })?;
-            change_stream = Some(join_refresh_change_stream_descriptor(descriptor.clone()));
-            let locator_columns =
-                allocate_join_coalesce_locator_column_ids(&mut factory, &outcome.plan)?;
-            crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
-                outcome.plan,
-                &descriptor,
-                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(&ctx.rewrite),
-                &mut factory,
-                locator_columns.net,
-                locator_columns.file,
-                locator_columns.pos,
-                locator_columns.row_id,
-                locator_columns.last_updated_sequence_number,
-            )
-            .map_err(|e| format!("build join refresh coalesce logical plan: {e}"))?
-        }
-    };
-    reserve_factory_for_logical_plan(&mut factory, &plan)?;
-    Ok(JoinRefreshLogicalPlan {
-        plan,
-        factory,
-        change_stream,
-    })
-}
-
-fn join_refresh_change_stream_descriptor(
-    descriptor: crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescriptor,
-) -> crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
-    crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor {
-        aggregate: None,
-        join_refresh: Some(descriptor),
-    }
-}
-
-fn join_refresh_logical_execution_disabled_rules(is_aggregate_refresh: bool) -> Vec<String> {
-    let mut disabled_rules = crate::sql::optimizer::options::current_session_optimizer_settings()
-        .disabled_rules
-        .clone();
-    if !disabled_rules
-        .iter()
-        .any(|rule| rule == "InjectTargetLocatorJoin")
-    {
-        disabled_rules.push("InjectTargetLocatorJoin".to_string());
-    }
-    if is_aggregate_refresh
-        && !disabled_rules
-            .iter()
-            .any(|rule| rule == "RecordJoinRefreshDescriptor")
-    {
-        disabled_rules.push("RecordJoinRefreshDescriptor".to_string());
-    }
-    disabled_rules
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JoinCoalesceLocatorColumnIds {
-    net: u32,
-    file: u32,
-    pos: u32,
-    row_id: u32,
-    last_updated_sequence_number: u32,
-}
-
-fn allocate_join_coalesce_locator_column_ids(
-    factory: &mut crate::sql::column_id::ColumnRefFactory,
-    plan: &crate::sql::planner::logical::LogicalPlanNode,
-) -> Result<JoinCoalesceLocatorColumnIds, String> {
-    reserve_factory_for_logical_plan(factory, plan)?;
-    Ok(JoinCoalesceLocatorColumnIds {
-        net: factory
-            .create(
-                None,
-                "net".to_string(),
-                arrow::datatypes::DataType::Int64,
-                false,
-            )
-            .0,
-        file: factory
-            .create(
-                None,
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
-                arrow::datatypes::DataType::Utf8,
-                true,
-            )
-            .0,
-        pos: factory
-            .create(
-                None,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
-            )
-            .0,
-        row_id: factory
-            .create(
-                None,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
-            )
-            .0,
-        last_updated_sequence_number: factory
-            .create(
-                None,
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                arrow::datatypes::DataType::Int64,
-                true,
-            )
-            .0,
-    })
-}
-
-fn reserve_factory_for_logical_plan(
-    factory: &mut crate::sql::column_id::ColumnRefFactory,
-    plan: &crate::sql::planner::logical::LogicalPlanNode,
-) -> Result<(), String> {
-    let max_id = max_logical_plan_output_column_id(plan)?;
-    factory.reserve_until(max_id.saturating_add(1));
-    Ok(())
-}
-
-fn max_logical_plan_output_column_id(
-    plan: &crate::sql::planner::logical::LogicalPlanNode,
-) -> Result<u32, String> {
-    let mut max_id = crate::sql::planner::plan_output_columns(plan)?
-        .iter()
-        .map(|column| column.column_id.0)
-        .max()
-        .unwrap_or(0);
-    for child in &plan.children {
-        max_id = max_id.max(max_logical_plan_output_column_id(child)?);
-    }
-    Ok(max_id)
-}
-
-fn execute_append_only_join_delta_branches_logical(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    execute_join_delta_branches_logical(
-        state,
-        ctx,
-        JoinIncrementalRefreshRoute::LogicalAppendOnly,
-        branches,
-    )
-}
-
-fn execute_coalescing_join_delta_branches_logical(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    execute_join_delta_branches_logical(
-        state,
-        ctx,
-        JoinIncrementalRefreshRoute::LogicalCoalesce,
-        branches,
-    )
-}
-
 fn execute_join_delta_branches_logical(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    route: JoinIncrementalRefreshRoute,
+    mode: JoinIncrementalRefreshMode,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if branches.is_empty() {
@@ -12363,7 +12133,10 @@ fn execute_join_delta_branches_logical(
             .to_string()
             .into());
     }
-    let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
+    let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|err| err.message)?;
+    let logical_input = JoinIncrementalLogicalInput { plan, factory };
+    let logical_plan =
+        build_join_incremental_refresh_logical_plan(&ctx.rewrite, mode, logical_input)?;
     let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
     let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
@@ -12447,60 +12220,50 @@ fn execute_join_delta_branches_logical(
             ));
         }
     };
-    let op_kind = match route {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly => CommitOpKind::FastAppend,
-        JoinIncrementalRefreshRoute::LogicalCoalesce => CommitOpKind::RowDeltaDvFromFiles,
-    };
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let JoinRefreshLogicalPlan {
-        plan,
-        factory,
-        change_stream: change_stream_override,
-    } = logical_plan;
-    let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
-        plan,
-        factory,
-        &connectors_snapshot,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        )
-    })?;
-    let producer_branches = match route {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly => {
-            vec![ImvChangeStreamProducerBranch::FreshData]
-        }
-        JoinIncrementalRefreshRoute::LogicalCoalesce => vec![
-            ImvChangeStreamProducerBranch::DeleteDv,
-            ImvChangeStreamProducerBranch::ReuseData,
-            ImvChangeStreamProducerBranch::FreshData,
-        ],
-    };
     let target_backend = iceberg_mv_target_backend(target);
-    let populated = execute_imv_change_stream_write(
-        state,
-        &target_backend,
-        target_table.clone(),
+    let populated = execute_join_incremental_refresh_write(
+        &target_table,
         &ident,
-        op_kind,
-        ImvRefreshPlannedChangeStream {
-            optimized_tree: planned_query.optimized_tree,
-            output_columns: planned_query.output_columns,
-            change_stream: change_stream_override.unwrap_or(planned_query.change_stream),
-            producer_branches,
-            mv_refresh_ctx: Some(ctx),
-        },
         &staging_branch,
+        mode,
+        logical_plan,
+        |logical| {
+            let connectors_snapshot = state
+                .connectors
+                .read()
+                .expect("standalone connector registry read lock")
+                .clone();
+            let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
+                logical.plan,
+                logical.factory,
+                &connectors_snapshot,
+            )?;
+            let producer_branches = match mode {
+                JoinIncrementalRefreshMode::AppendOnly => {
+                    vec![ImvChangeStreamProducerBranch::FreshData]
+                }
+                JoinIncrementalRefreshMode::Coalesce => vec![
+                    ImvChangeStreamProducerBranch::DeleteDv,
+                    ImvChangeStreamProducerBranch::ReuseData,
+                    ImvChangeStreamProducerBranch::FreshData,
+                ],
+            };
+            execute_imv_change_stream_writer(
+                state,
+                &target_backend,
+                &target_table,
+                ImvRefreshPlannedChangeStream {
+                    optimized_tree: planned_query.optimized_tree,
+                    output_columns: planned_query.output_columns,
+                    change_stream: logical
+                        .change_stream_override
+                        .unwrap_or(planned_query.change_stream),
+                    producer_branches,
+                    mv_refresh_ctx: Some(ctx),
+                },
+                &staging_branch,
+            )
+        },
     )
     .map_err(|err| {
         handle_iceberg_mv_commit_error(
@@ -12521,8 +12284,9 @@ fn execute_join_delta_branches_logical(
         } => (added_rows, deleted_rows),
     };
     let collector = populated.collector;
-    let new_total_rows = match route {
-        JoinIncrementalRefreshRoute::LogicalAppendOnly if added_rows == 0 => {
+    let new_total_rows = match mode {
+        JoinIncrementalRefreshMode::AppendOnly if added_rows == 0 =>
+        {
             tracing::info!(
                 snapshots = ?snapshots,
                 "iceberg join mv {}.{}.{}: append-only logical refresh produced 0 effective rows; \
@@ -12547,7 +12311,7 @@ fn execute_join_delta_branches_logical(
             )?;
             return Ok(StatementResult::Ok);
         }
-        JoinIncrementalRefreshRoute::LogicalAppendOnly => mv_definition
+        JoinIncrementalRefreshMode::AppendOnly => mv_definition
             .last_refresh_rows
             .unwrap_or(0)
             .checked_add(added_rows)
@@ -12564,7 +12328,8 @@ fn execute_join_delta_branches_logical(
                     ),
                 )
             })?,
-        JoinIncrementalRefreshRoute::LogicalCoalesce if added_rows == 0 && deleted_rows == 0 => {
+        JoinIncrementalRefreshMode::Coalesce if added_rows == 0 && deleted_rows == 0 =>
+        {
             drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
             abort_iceberg_mv_refresh(state, refresh_id)?;
             return Ok(
@@ -12578,7 +12343,7 @@ fn execute_join_delta_branches_logical(
                 )?,
             );
         }
-        JoinIncrementalRefreshRoute::LogicalCoalesce => mv_definition
+        JoinIncrementalRefreshMode::Coalesce => mv_definition
             .last_refresh_rows
             .unwrap_or(0)
             .checked_add(added_rows)
@@ -14739,8 +14504,11 @@ mod tests {
         );
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
 
-        let ids = allocate_join_coalesce_locator_column_ids(&mut factory, &plan)
-            .expect("allocate locator column ids");
+        let ids = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
+            &mut factory,
+            &plan,
+        )
+        .expect("allocate locator column ids");
 
         let allocated = [
             ids.net,
@@ -15370,9 +15138,11 @@ mod tests {
             };
         let mut factory = crate::sql::column_id::ColumnRefFactory::new();
         factory.reserve_until(109);
-        let locator_columns =
-            allocate_join_coalesce_locator_column_ids(&mut factory, &branch_union)
-                .expect("allocate locator column ids");
+        let locator_columns = crate::mv::refresh::join_incremental_refresh::allocate_join_coalesce_locator_column_ids(
+            &mut factory,
+            &branch_union,
+        )
+        .expect("allocate locator column ids");
 
         let plan =
             crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
@@ -15387,8 +15157,11 @@ mod tests {
                 locator_columns.last_updated_sequence_number,
             )
             .expect("join coalesce plan");
-        reserve_factory_for_logical_plan(&mut factory, &plan)
-            .expect("reserve rewritten plan outputs");
+        crate::mv::refresh::join_incremental_refresh::reserve_factory_for_logical_plan(
+            &mut factory,
+            &plan,
+        )
+        .expect("reserve rewritten plan outputs");
 
         let watched_columns =
             collect_join_coalesce_factory_watch_columns(&plan, ColumnId(locator_columns.net));
