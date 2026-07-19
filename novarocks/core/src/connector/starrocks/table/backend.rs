@@ -33,7 +33,8 @@ use crate::engine::mv::lifecycle::{
     MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
     StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
-use crate::mv::model::MvStorageEngine;
+use crate::mv::model::{MvStorageEngine, MvTarget};
+use crate::mv::refresh::execution::{RefreshExecutionObservation, validate_refresh_execution};
 use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 use crate::sql::parser::ast::{Literal, ObjectName};
@@ -288,6 +289,9 @@ impl MvBackend for StarRocksTableMvBackend {
     }
 
     fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
+        let (database, name) =
+            crate::mv::analysis::resolve_mv_name(&req.statement.name, &req.current_database)
+                .map_err(RefreshError::pre_commit)?;
         Ok(RefreshPlan {
             contract: RefreshPlanContract {
                 mv_id: None,
@@ -297,8 +301,8 @@ impl MvBackend for StarRocksTableMvBackend {
                 state_baseline: RefreshStateBaseline::Pinless,
                 base_refs: vec![TableIdentity {
                     catalog: "starrocks".to_string(),
-                    namespace: req.current_database.clone(),
-                    table: req.statement.name.parts.join("."),
+                    namespace: database,
+                    table: name,
                 }],
                 snapshot_pins: Default::default(),
                 affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
@@ -323,6 +327,8 @@ impl MvBackend for StarRocksTableMvBackend {
                 "StarRocks table backend received non-StarRocks refresh plan",
             ));
         };
+        validate_starrocks_refresh_contract(plan_payload, &plan.contract)
+            .map_err(RefreshError::pre_commit)?;
         let state = self.state().map_err(RefreshError::pre_commit)?;
         super::mv_refresh::refresh_mv(
             &state,
@@ -358,5 +364,114 @@ impl MvBackend for StarRocksTableMvBackend {
         _ctx: &mut RefreshCtx,
     ) -> Result<(), RefreshError> {
         Ok(())
+    }
+}
+
+fn validate_starrocks_refresh_contract(
+    plan: &StarRocksTableRefreshPlan,
+    contract: &RefreshPlanContract,
+) -> Result<(), String> {
+    let (database, name) =
+        crate::mv::analysis::resolve_mv_name(&plan.stmt.name, &plan.current_database)?;
+    let target = MvTarget {
+        catalog: plan.current_catalog.clone(),
+        database: database.clone(),
+        name: name.clone(),
+    };
+    let base_refs = [TableIdentity {
+        catalog: "starrocks".to_string(),
+        namespace: database,
+        table: name,
+    }];
+    let state_baseline = RefreshStateBaseline::Pinless;
+    validate_refresh_execution(
+        contract,
+        &RefreshExecutionObservation {
+            backend: MvStorageEngine::StarRocks,
+            // This backend has no independently persisted MV id.
+            mv_id: None,
+            target: &target,
+            base_refs: &base_refs,
+            state_baseline: &state_baseline,
+            snapshot_pins: None,
+        },
+    )
+    .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_and_contract() -> (StarRocksTableRefreshPlan, RefreshPlanContract) {
+        let statement = match crate::sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1")
+            .expect("parse refresh")
+            .remove(0)
+        {
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(statement) => statement,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        (
+            StarRocksTableRefreshPlan {
+                stmt: statement,
+                current_catalog: None,
+                current_database: "default".to_string(),
+            },
+            RefreshPlanContract {
+                mv_id: None,
+                target: MvTarget {
+                    catalog: None,
+                    database: "default".to_string(),
+                    name: "mv1".to_string(),
+                },
+                storage_engine: MvStorageEngine::StarRocks,
+                decision: ExecutableRefreshDecision::Incremental,
+                state_baseline: RefreshStateBaseline::Pinless,
+                base_refs: vec![TableIdentity::new("starrocks", "default", "mv1")],
+                snapshot_pins: Default::default(),
+                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                    "test",
+                ),
+            },
+        )
+    }
+
+    #[test]
+    fn pinless_refresh_contract_executes_when_identity_matches() {
+        let (plan, contract) = plan_and_contract();
+        validate_starrocks_refresh_contract(&plan, &contract).expect("valid contract");
+    }
+
+    #[test]
+    fn refresh_contract_rejects_backend_mismatch() {
+        let (plan, mut contract) = plan_and_contract();
+        contract.storage_engine = MvStorageEngine::Iceberg;
+        assert!(
+            validate_starrocks_refresh_contract(&plan, &contract)
+                .unwrap_err()
+                .contains("backend")
+        );
+    }
+
+    #[test]
+    fn refresh_contract_rejects_target_mismatch() {
+        let (plan, mut contract) = plan_and_contract();
+        contract.target.name = "other".to_string();
+        assert!(
+            validate_starrocks_refresh_contract(&plan, &contract)
+                .unwrap_err()
+                .contains("target")
+        );
+    }
+
+    #[test]
+    fn refresh_contract_rejects_mv_id_mismatch() {
+        let (plan, mut contract) = plan_and_contract();
+        contract.mv_id = Some(1);
+        assert!(
+            validate_starrocks_refresh_contract(&plan, &contract)
+                .unwrap_err()
+                .contains("mv id")
+        );
     }
 }
