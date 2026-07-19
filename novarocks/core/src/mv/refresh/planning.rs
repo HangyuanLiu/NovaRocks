@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use crate::catalog::identifier::TableIdentity;
 use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::refresh::snapshot::{
-    BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
+    BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 
 pub(crate) struct RefreshPlanningInput<'a> {
@@ -31,21 +31,36 @@ pub(crate) struct RefreshPlanningInput<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshPlanningDecision {
-    pub(crate) refresh: RefreshDecision,
-    pub(crate) mode: RefreshMode,
+    pub(crate) refresh: ExecutableRefreshDecision,
+}
+
+impl RefreshPlanningDecision {
+    pub(crate) fn mode(&self) -> RefreshMode {
+        self.refresh.mode()
+    }
 }
 
 pub(crate) fn decide_refresh_plan(
     input: &RefreshPlanningInput<'_>,
 ) -> Result<RefreshPlanningDecision, String> {
-    let refresh = decide_refresh(input.snapshot_policy, input.base_snapshots, input.label);
-    let mode = match refresh {
-        RefreshDecision::SkipEmpty | RefreshDecision::MetadataOnly => RefreshMode::Noop,
-        RefreshDecision::FirstRefresh => RefreshMode::Full,
-        RefreshDecision::Incremental => RefreshMode::Incremental,
-        RefreshDecision::FailFast { reason } => return Err(reason),
-    };
-    Ok(RefreshPlanningDecision { refresh, mode })
+    let refresh = ExecutableRefreshDecision::from_refresh_decision(decide_refresh(
+        input.snapshot_policy,
+        input.base_snapshots,
+        input.label,
+    ))?;
+    Ok(RefreshPlanningDecision { refresh })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshStateBaseline {
+    Pinless,
+    SnapshotBacked {
+        previous_snapshot_ids: BTreeMap<String, i64>,
+        previous_table_uuids: BTreeMap<String, String>,
+        target_snapshot_id: Option<i64>,
+        target_table_uuid: String,
+        definition_fingerprint: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,10 +68,17 @@ pub(crate) struct RefreshPlanContract {
     pub(crate) mv_id: Option<i64>,
     pub(crate) target: MvTarget,
     pub(crate) storage_engine: MvStorageEngine,
-    pub(crate) mode: RefreshMode,
+    pub(crate) decision: ExecutableRefreshDecision,
+    pub(crate) state_baseline: RefreshStateBaseline,
     pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) snapshot_pins: BTreeMap<String, Option<i64>>,
     pub(crate) affected_partitions: AffectedTargetPartitions,
+}
+
+impl RefreshPlanContract {
+    pub(crate) fn mode(&self) -> RefreshMode {
+        self.decision.mode()
+    }
 }
 
 #[cfg(test)]
@@ -66,7 +88,9 @@ mod tests {
     use super::*;
     use crate::catalog::identifier::TableIdentity;
     use crate::mv::model::{AffectedTargetPartitions, MvStorageEngine, MvTarget, RefreshMode};
-    use crate::mv::refresh::snapshot::{BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision};
+    use crate::mv::refresh::snapshot::{
+        BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
+    };
 
     const LABEL: &str = "iceberg MV test";
 
@@ -94,10 +118,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(skip.refresh, RefreshDecision::SkipEmpty);
-        assert_eq!(skip.mode, RefreshMode::Noop);
-        assert_eq!(metadata.refresh, RefreshDecision::MetadataOnly);
-        assert_eq!(metadata.mode, RefreshMode::Noop);
+        assert_eq!(skip.refresh, ExecutableRefreshDecision::SkipEmpty);
+        assert_eq!(skip.mode(), RefreshMode::Noop);
+        assert_eq!(metadata.refresh, ExecutableRefreshDecision::MetadataOnly);
+        assert_eq!(metadata.mode(), RefreshMode::Noop);
     }
 
     #[test]
@@ -113,10 +137,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(first.refresh, RefreshDecision::FirstRefresh);
-        assert_eq!(first.mode, RefreshMode::Full);
-        assert_eq!(incremental.refresh, RefreshDecision::Incremental);
-        assert_eq!(incremental.mode, RefreshMode::Incremental);
+        assert_eq!(first.refresh, ExecutableRefreshDecision::FirstRefresh);
+        assert_eq!(first.mode(), RefreshMode::Full);
+        assert_eq!(incremental.refresh, ExecutableRefreshDecision::Incremental);
+        assert_eq!(incremental.mode(), RefreshMode::Incremental);
     }
 
     #[test]
@@ -145,8 +169,8 @@ mod tests {
             "iceberg MV test refresh cannot run first refresh because only some bases have current snapshots; load all bases or recreate the MV"
         );
         let partial = decide(BaseSnapshotPolicy::JoinPairPartialInitialSkip, &statuses).unwrap();
-        assert_eq!(partial.refresh, RefreshDecision::SkipEmpty);
-        assert_eq!(partial.mode, RefreshMode::Noop);
+        assert_eq!(partial.refresh, ExecutableRefreshDecision::SkipEmpty);
+        assert_eq!(partial.mode(), RefreshMode::Noop);
     }
 
     #[test]
@@ -165,12 +189,23 @@ mod tests {
             ("ice.db.right".to_string(), Some(20)),
         ]);
         let affected_partitions = AffectedTargetPartitions::not_derived("join planning");
+        let state_baseline = RefreshStateBaseline::SnapshotBacked {
+            previous_snapshot_ids: BTreeMap::from([("ice.db.left".to_string(), 9)]),
+            previous_table_uuids: BTreeMap::from([(
+                "ice.db.left".to_string(),
+                "uuid-left".to_string(),
+            )]),
+            target_snapshot_id: Some(30),
+            target_table_uuid: "uuid-target".to_string(),
+            definition_fingerprint: "definition-v1".to_string(),
+        };
 
         let contract = RefreshPlanContract {
             mv_id: Some(42),
             target: target.clone(),
             storage_engine: MvStorageEngine::Iceberg,
-            mode: RefreshMode::Incremental,
+            decision: ExecutableRefreshDecision::Incremental,
+            state_baseline: state_baseline.clone(),
             base_refs: base_refs.clone(),
             snapshot_pins: snapshot_pins.clone(),
             affected_partitions: affected_partitions.clone(),
@@ -179,7 +214,8 @@ mod tests {
         assert_eq!(contract.mv_id, Some(42));
         assert_eq!(contract.target, target);
         assert_eq!(contract.storage_engine, MvStorageEngine::Iceberg);
-        assert_eq!(contract.mode, RefreshMode::Incremental);
+        assert_eq!(contract.mode(), RefreshMode::Incremental);
+        assert_eq!(contract.state_baseline, state_baseline);
         assert_eq!(contract.base_refs, base_refs);
         assert_eq!(contract.snapshot_pins, snapshot_pins);
         assert_eq!(contract.affected_partitions, affected_partitions);

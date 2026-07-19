@@ -58,8 +58,9 @@ mod lifecycle_tests {
         MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
         StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
     };
-    use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
-    use crate::mv::refresh::planning::RefreshPlanContract;
+    use crate::mv::model::{MvStorageEngine, MvTarget};
+    use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+    use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 
     #[derive(Default)]
     struct Calls {
@@ -116,7 +117,8 @@ mod lifecycle_tests {
                     mv_id: Some(1),
                     target: req.target,
                     storage_engine: MvStorageEngine::StarRocks,
-                    mode: RefreshMode::Incremental,
+                    decision: ExecutableRefreshDecision::Incremental,
+                    state_baseline: RefreshStateBaseline::Pinless,
                     base_refs: vec![TableIdentity {
                         catalog: "ice".to_string(),
                         namespace: "ns".to_string(),

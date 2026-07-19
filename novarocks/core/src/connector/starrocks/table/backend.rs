@@ -33,8 +33,9 @@ use crate::engine::mv::lifecycle::{
     MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
     StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
-use crate::mv::model::{MvStorageEngine, RefreshMode};
-use crate::mv::refresh::planning::RefreshPlanContract;
+use crate::mv::model::MvStorageEngine;
+use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::sql::planner::table::TableDef;
 
@@ -292,7 +293,8 @@ impl MvBackend for StarRocksTableMvBackend {
                 mv_id: None,
                 target: req.target,
                 storage_engine: MvStorageEngine::StarRocks,
-                mode: RefreshMode::Incremental,
+                decision: ExecutableRefreshDecision::Incremental,
+                state_baseline: RefreshStateBaseline::Pinless,
                 base_refs: vec![TableIdentity {
                     catalog: "starrocks".to_string(),
                     namespace: req.current_database.clone(),
