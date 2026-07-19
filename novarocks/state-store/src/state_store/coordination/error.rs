@@ -95,6 +95,10 @@ impl CoordinationError {
         )
     }
 
+    pub(crate) const fn clock_unsafe() -> Self {
+        Self::new(CoordinationErrorKind::ClockUnsafe, "lease clock is unsafe")
+    }
+
     pub(crate) const fn fence_lost() -> Self {
         Self::new(
             CoordinationErrorKind::FenceLost,
@@ -198,6 +202,7 @@ mod tests {
             CoordinationError::corruption(),
             CoordinationError::epoch_exhausted(),
             CoordinationError::incarnation_exhausted(),
+            CoordinationError::clock_unsafe(),
             CoordinationError::from_state_store(StateStoreError::new(
                 StateStoreErrorKind::ProviderUnavailable,
                 "provider detail must not escape",

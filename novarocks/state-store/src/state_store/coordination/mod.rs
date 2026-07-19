@@ -15,18 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod clock;
 #[allow(dead_code)]
 mod codec;
 #[allow(dead_code)]
 mod error;
 mod gate;
+mod lease;
 mod metrics;
 #[allow(dead_code)]
 mod model;
 mod operation;
 
+pub use clock::{ClockHealth, LeaseClock, LeaseSettings};
 pub use error::{CoordinationError, CoordinationErrorKind};
 pub use gate::{IncarnationGate, WriteAdmission};
+pub use lease::{AcquireOutcome, LeaseGuard, LeaseManager};
 pub use metrics::{
     COORDINATION_OPERATION_COUNT, COORDINATION_OUTCOME_COUNT, CoordinationMetrics,
     CoordinationMetricsSnapshot, CoordinationOperation, CoordinationOutcome,

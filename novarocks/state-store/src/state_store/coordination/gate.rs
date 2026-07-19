@@ -476,6 +476,26 @@ fn validate_write_limits(
     value: &Value,
     expected_version: Option<&crate::VersionToken>,
 ) -> Result<(), CoordinationError> {
+    if expected_version.is_some() {
+        validate_write_limits_with_read_keys(
+            limits,
+            key,
+            value,
+            expected_version,
+            &[key.as_bytes().len()],
+        )
+    } else {
+        validate_write_limits_with_read_keys(limits, key, value, expected_version, &[])
+    }
+}
+
+pub(crate) fn validate_write_limits_with_read_keys(
+    limits: &StateStoreLimits,
+    key: &Key,
+    value: &Value,
+    expected_version: Option<&crate::VersionToken>,
+    additional_read_key_bytes: &[usize],
+) -> Result<(), CoordinationError> {
     if key.as_bytes().len() > limits.max_key_bytes
         || value.as_bytes().len() > limits.max_value_bytes
         || limits.max_transaction_operations < 1
@@ -484,11 +504,11 @@ fn validate_write_limits(
             "coordination mutation exceeds state store limits",
         ));
     }
-    let transaction_bytes = coordination_transaction_upper_bound(
+    let transaction_bytes = coordination_transaction_upper_bound_with_read_keys(
         key.as_bytes().len(),
         value.as_bytes().len(),
         expected_version.map_or(0, |version| version.as_bytes().len()),
-        expected_version.is_some(),
+        additional_read_key_bytes,
     )?;
     if transaction_bytes > limits.max_transaction_bytes {
         return Err(CoordinationError::limit_exceeded(
@@ -498,11 +518,35 @@ fn validate_write_limits(
     Ok(())
 }
 
+#[cfg(test)]
 fn coordination_transaction_upper_bound(
     key_bytes: usize,
     value_bytes: usize,
     version_bytes: usize,
     includes_control_read: bool,
+) -> Result<usize, CoordinationError> {
+    if includes_control_read {
+        coordination_transaction_upper_bound_with_read_keys(
+            key_bytes,
+            value_bytes,
+            version_bytes,
+            &[key_bytes],
+        )
+    } else {
+        coordination_transaction_upper_bound_with_read_keys(
+            key_bytes,
+            value_bytes,
+            version_bytes,
+            &[],
+        )
+    }
+}
+
+fn coordination_transaction_upper_bound_with_read_keys(
+    key_bytes: usize,
+    value_bytes: usize,
+    version_bytes: usize,
+    additional_read_key_bytes: &[usize],
 ) -> Result<usize, CoordinationError> {
     // Use one neutral v1 durability ceiling for every provider. The categories below
     // include the largest current namespace/envelope representation without selecting
@@ -544,8 +588,10 @@ fn coordination_transaction_upper_bound(
     fixed_envelope_bytes = checked_budget_add(fixed_envelope_bytes, high_watermark_conflict_bytes)?;
 
     let mut bytes = fixed_envelope_bytes;
-    if includes_control_read {
-        bytes = checked_budget_add(bytes, record_conflict_bytes)?;
+    for read_key_bytes in additional_read_key_bytes {
+        let read_record_key_bytes = checked_budget_add(V1_NAMESPACE_BYTES, V1_RECORD_TAG_BYTES)?;
+        let read_record_key_bytes = checked_budget_add(read_record_key_bytes, *read_key_bytes)?;
+        bytes = checked_budget_add(bytes, exact_conflict_bytes(read_record_key_bytes)?)?;
     }
 
     bytes = checked_budget_add(bytes, MUTATION_KIND_BYTES)?;

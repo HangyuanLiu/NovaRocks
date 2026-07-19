@@ -86,6 +86,17 @@ async fn coordination_gate_suite() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_acquire_suite() {
+    let factory = coordination_factory();
+    common::state_store_coordination_conformance::basic_acquire_contention_and_high_watermark(
+        &factory,
+    )
+    .await;
+    common::state_store_coordination_conformance::concurrent_acquire_exactly_one_winner(&factory)
+        .await;
+}
+
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
 }
