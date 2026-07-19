@@ -375,6 +375,40 @@ mod tests {
         }
     }
 
+    fn data_file_to_written_file_for_test(
+        data_file: &iceberg::spec::DataFile,
+        partition_spec_id: i32,
+    ) -> crate::connector::iceberg::commit::WrittenFile {
+        crate::connector::iceberg::commit::WrittenFile {
+            path: data_file.file_path().to_string(),
+            format: data_file.file_format(),
+            content: data_file.content_type(),
+            partition_values: data_file.partition().clone(),
+            partition_spec_id,
+            record_count: data_file.record_count(),
+            file_size_in_bytes: data_file.file_size_in_bytes(),
+            split_offsets: data_file
+                .split_offsets()
+                .map(|offsets| offsets.to_vec())
+                .unwrap_or_default(),
+            column_sizes: data_file.column_sizes().clone(),
+            value_counts: data_file.value_counts().clone(),
+            null_value_counts: data_file.null_value_counts().clone(),
+            nan_value_counts: data_file.nan_value_counts().clone(),
+            lower_bounds: data_file.lower_bounds().clone(),
+            upper_bounds: data_file.upper_bounds().clone(),
+            key_metadata: data_file.key_metadata().map(|value| value.to_vec()),
+            referenced_data_file: data_file
+                .referenced_data_file()
+                .map(|value| value.to_string()),
+            equality_ids: data_file.equality_ids(),
+            first_row_id: data_file.first_row_id(),
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        }
+    }
+
     struct DeltaOverwriteRefreshFixture {
         _base_warehouse: tempfile::TempDir,
         _target_fixture: TargetLocatorRefreshFixture,
@@ -481,13 +515,10 @@ mod tests {
             .with_table_metadata(metadata.clone()),
         );
         for data_file in replacement_files {
-            collector.inject_written_file(
-                crate::engine::iceberg_writer::data_file_to_written_file(
-                    &data_file,
-                    metadata.default_partition_spec_id(),
-                )
-                .expect("replacement written file"),
-            );
+            collector.inject_written_file(data_file_to_written_file_for_test(
+                &data_file,
+                metadata.default_partition_spec_id(),
+            ));
         }
         block_on_iceberg(async {
             let file_io = loaded.table.file_io().clone();
