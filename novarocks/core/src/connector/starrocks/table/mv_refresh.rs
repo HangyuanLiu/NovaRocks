@@ -160,9 +160,10 @@ pub(crate) fn refresh_mv(
     // Freeze the snapshot pin for the duration of this refresh. From now on
     // pin is the only source of snapshot ids for base table reads, delta
     // computation, intent recording, and bookkeeping.
-    let pin = crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin::capture(
-        state, &base_refs,
-    )?;
+    let pin =
+        crate::connector::starrocks::table::refresh_pin_adapter::capture_refresh_snapshot_pin(
+            state, &base_refs,
+        )?;
     let current_snapshot_id = pin.get(base_ref);
     let current_table_uuid = pin
         .uuid(base_ref)
@@ -612,7 +613,7 @@ fn execute_aggregate_mv_full_refresh(
 
 fn rewrite_full_refresh_select_with_pin(
     select_sql: &str,
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::mv::refresh::pin::RefreshSnapshotPin,
     base_ref: &TableIdentity,
 ) -> Result<String, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
@@ -622,7 +623,7 @@ fn rewrite_full_refresh_select_with_pin(
     let sqlparser::ast::Statement::Query(query) = &mut stmt else {
         return Err("full refresh pin SELECT expects a SELECT query".to_string());
     };
-    crate::connector::starrocks::table::refresh_pin::inject_pin_as_for_version_as_of(
+    crate::mv::refresh::pin::inject_pin_as_for_version_as_of(
         query,
         pin,
         &HashSet::new(),
@@ -633,7 +634,7 @@ fn rewrite_full_refresh_select_with_pin(
 }
 
 fn current_base_metadata_from_pin(
-    pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
+    pin: &crate::mv::refresh::pin::RefreshSnapshotPin,
 ) -> CurrentBaseMetadata {
     CurrentBaseMetadata {
         snapshots: pin.to_snapshot_map(),

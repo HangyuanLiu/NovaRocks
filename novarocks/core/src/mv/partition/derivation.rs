@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Unified partition-derivation library for Iceberg MV refresh.
+//! Unified partition-derivation domain for Iceberg MV refresh.
 //!
 //! `AffectedTargetPartitions` is the single result type for every affected-
 //! partition source (plan-time manifest planning and delta-chunk evaluation).

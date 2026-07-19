@@ -448,7 +448,7 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context;
+    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };

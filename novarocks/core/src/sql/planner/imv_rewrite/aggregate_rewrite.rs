@@ -231,7 +231,7 @@ pub(crate) fn build_aggregate_state_merge(
 }
 
 fn target_state_old_scan(
-    target: &crate::engine::mv::iceberg_refresh::IcebergMvTarget,
+    target: &crate::catalog::identifier::TableIdentity,
     target_columns: Vec<ColumnDef>,
     group_key_names: &[String],
     aggregate_state_names: &[String],
@@ -2220,13 +2220,13 @@ mod tests {
     use super::*;
     use crate::catalog::schema::ColumnDef;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
-    use crate::engine::mv::refresh_context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
-    };
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
+    };
+    use crate::mv::rewrite::context::IcebergMvRewriteContext;
+    use crate::mv::rewrite::context::tests_support::{
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};

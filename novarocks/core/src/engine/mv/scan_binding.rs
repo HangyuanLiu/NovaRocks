@@ -22,7 +22,7 @@ use crate::coordinator::prepare::scan::{
     IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedIcebergFileScan,
     ResolvedScanExecution, ScanBindingResolver,
 };
-use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
+use crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext;
 use crate::exec::node::iceberg_delta_scan::{
     DeltaScanDeleteSidePayload, IcebergDeltaDataColumnPayload,
 };
@@ -303,7 +303,7 @@ mod tests {
     use crate::connector::iceberg::scan_model::{
         IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
     };
-    use crate::engine::mv::refresh_context::tests_support::{
+    use crate::engine::mv::refresh_execution_context::tests_support::{
         TargetLocatorRefreshFixture, aggregate_target_state_refresh_fixture,
         refresh_context_for_target_fixture, target_fixture_table_info,
         target_locator_refresh_fixture,

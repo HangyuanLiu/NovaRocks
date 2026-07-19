@@ -18,4 +18,5 @@
 pub(crate) mod apply_key;
 pub(crate) mod capabilities;
 pub(crate) mod contract;
+pub(crate) mod pin;
 pub(crate) mod snapshot;

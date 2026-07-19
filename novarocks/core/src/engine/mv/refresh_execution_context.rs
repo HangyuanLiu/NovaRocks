@@ -15,22 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable refresh-time context for Iceberg MV refresh.
+//! Concrete execution context for Iceberg MV refresh.
 //!
-//! Two layers:
-//! - `IcebergMvRewriteContext` — pure metadata that future optimizer rewrite
-//!   rules (TODO list tasks 2 / 3 / 4) consume.
-//! - `IcebergMvRefreshContext` — wraps the rewrite layer and adds the
-//!   execution handles only the current refresh path needs.
-//!
-//! Constructed once per refresh attempt, after pin capture and schema-contract
-//! rebind. See `docs/design/specs/2026-05-26-iceberg-mv-rewrite-context-design.md`.
+//! This adapter owns catalog/table handles, affected-partition state, pruning
+//! limits, and scan/file binding. Immutable rewrite metadata is held by the
+//! canonical `mv::rewrite::context::IcebergMvRewriteContext`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-
-use arrow::datatypes::{DataType, TimeUnit};
-use iceberg::spec::Schema;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
@@ -38,9 +30,10 @@ use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
     IcebergSchemaFieldDef, IcebergTableInfo,
 };
-use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
+use crate::mv::refresh::pin::RefreshSnapshotPin;
+use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::planner::table::{
     IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
 };
@@ -48,44 +41,14 @@ use mv_schema::MvSchemaContract;
 
 use super::iceberg_refresh::IcebergMvTarget;
 
-/// Read-only metadata that drives Iceberg MV refresh rewrite.
-///
-/// Future optimizer rewrite rules consume `Arc<IcebergMvRewriteContext>` and
-/// MUST NOT depend on `iceberg::table::Table`, `iceberg::Catalog`, or
-/// `IcebergCatalogEntry` — those live in `IcebergMvRefreshContext`.
-#[derive(Debug)]
-pub(crate) struct IcebergMvRewriteContext {
-    // ---- Identity ----
-    pub target: IcebergMvTarget,
-    pub mv_id: i64,
-
-    // ---- Session ----
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-
-    // ---- MV definition (post schema-contract rebind) ----
-    pub mv_definition: Arc<StoredMvDefinition>,
-    pub canonical_select_query: Arc<sqlparser::ast::Query>,
-
-    // ---- Base table inputs ----
-    pub base_refs: Arc<[TableIdentity]>,
-    pub pin: Arc<RefreshSnapshotPin>,
-    pub previous_snapshot_ids: BTreeMap<String, i64>,
-    pub previous_table_uuids: BTreeMap<String, String>,
-
-    // ---- Target table inputs (extracted from target_table.metadata()) ----
-    pub target_snapshot_id: Option<i64>,
-    pub target_table_uuid: String,
-    pub target_schema: Arc<Schema>,
-
-    // ---- Contracts ----
-    pub schema_contract: Arc<MvSchemaContract>,
-}
-
 /// Refresh-time context. Wraps `IcebergMvRewriteContext` and adds execution
 /// handles only the refresh path needs.
 pub(crate) struct IcebergMvRefreshContext {
     pub rewrite: Arc<IcebergMvRewriteContext>,
+    /// Engine application DTO retained by this execution adapter until EBD-16
+    /// moves the create/refresh application flow onto canonical identities.
+    /// SQL and rewrite consumers must use `rewrite.target` instead.
+    pub(super) application_target: IcebergMvTarget,
     pub target_entry: Arc<IcebergCatalogEntry>,
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
@@ -128,493 +91,12 @@ impl MvRefreshPruningLimits {
     }
 }
 
-/// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
-/// via `tracing::info!(summary = ?ctx.rewrite.summary(), ...)`.
-#[derive(Debug)]
-pub(crate) struct CtxSummary<'a> {
-    pub target: &'a IcebergMvTarget,
-    pub mv_id: i64,
-    pub base_count: usize,
-    pub base_fqns: Vec<String>,
-    pub pinned_snapshots: Vec<(String, i64)>,
-    pub previous_snapshots: Vec<(String, Option<i64>)>,
-    pub target_snapshot_id: Option<i64>,
-    pub schema_contract_version: u16,
-    pub partition_contract_present: bool,
-    pub visible_output_column_count: usize,
-    pub hidden_apply_key_column: &'a str,
-}
-
-fn err(msg: impl Into<String>) -> String {
-    format!("IcebergMvRewriteContext::new: {}", msg.into())
-}
-
-impl IcebergMvRewriteContext {
-    /// Build the rewrite layer from already-derived primitive inputs.
-    ///
-    /// `IcebergMvRefreshContext::new` uses this internally after pulling
-    /// `target_snapshot_id` / `target_table_uuid` / `target_schema` out of
-    /// `target_table.metadata()`. Unit tests construct the rewrite layer
-    /// directly via this helper without needing a real `iceberg::table::Table`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
-        target: IcebergMvTarget,
-        mv_id: i64,
-        current_catalog: Option<String>,
-        current_database: String,
-        mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<sqlparser::ast::Query>,
-        base_refs: Arc<[TableIdentity]>,
-        pin: Arc<RefreshSnapshotPin>,
-        target_snapshot_id: Option<i64>,
-        target_table_uuid: String,
-        target_schema: Arc<Schema>,
-        schema_contract: Option<Arc<MvSchemaContract>>,
-    ) -> Result<Self, String> {
-        let target_fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
-        let schema_contract = schema_contract.ok_or_else(|| {
-            err(format!(
-                "missing schema contract on target {target_fqn}; rebuild or recreate the MV"
-            ))
-        })?;
-
-        if base_refs.is_empty() {
-            return Err(err("mv definition has no base table refs"));
-        }
-
-        let pin_count = pin.len();
-        if pin_count != base_refs.len() {
-            return Err(err(format!(
-                "refresh pin covers {} bases but definition has {}",
-                pin_count,
-                base_refs.len()
-            )));
-        }
-
-        for base_ref in base_refs.iter() {
-            if pin.uuid(base_ref).is_none() {
-                return Err(err(format!(
-                    "refresh pin missing uuid for base {}",
-                    base_ref.fqn()
-                )));
-            }
-        }
-
-        let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
-        let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
-
-        for base_ref in base_refs.iter() {
-            let fqn = base_ref.fqn();
-            if let Some(previous_uuid) = previous_table_uuids.get(&fqn) {
-                let current_uuid = pin
-                    .uuid(base_ref)
-                    .expect("uuid presence verified above")
-                    .to_string();
-                if previous_uuid != &current_uuid {
-                    return Err(err(format!(
-                        "base table identity changed for {fqn}; incremental refresh unsafe, rebuild the MV"
-                    )));
-                }
-            }
-        }
-
-        // The target schema is the union of visible columns (those listed in
-        // `schema_contract.target.visible_columns`), the hidden apply-key
-        // column (`schema_contract.target.hidden_apply_key.target_field_id`),
-        // and — for aggregate MVs — the hidden aggregate-state columns listed
-        // in `schema_contract.aggregate.state_columns`. The hidden apply-key
-        // field id can coincide with a visible column (when the apply-key
-        // aliases an existing user column) or be a distinct field (the
-        // common case, e.g. `__nova_base_row_id` / `__row_id__`).
-        let schema_field_ids: BTreeSet<i32> = target_schema
-            .as_ref()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let mut contract_field_ids: BTreeSet<i32> = schema_contract
-            .target
-            .visible_columns
-            .iter()
-            .map(|c| c.target_field_id)
-            .collect();
-        contract_field_ids.insert(schema_contract.target.hidden_apply_key.target_field_id);
-        if let Some(aggregate) = &schema_contract.aggregate {
-            for state_col in &aggregate.state_columns {
-                contract_field_ids.insert(state_col.target_field_id);
-            }
-        }
-        if let Some(branch) = &schema_contract.branch {
-            contract_field_ids.insert(branch.branch_id_column.target_field_id);
-        }
-        if schema_field_ids != contract_field_ids {
-            return Err(err(format!(
-                "target schema/contract field id mismatch: schema has {:?}, contract has {:?}",
-                schema_field_ids, contract_field_ids
-            )));
-        }
-
-        let apply_key_name = &schema_contract.target.hidden_apply_key.column_name;
-        let apply_key_in_schema = target_schema
-            .as_ref()
-            .as_struct()
-            .fields()
-            .iter()
-            .any(|f| &f.name == apply_key_name);
-        if !apply_key_in_schema {
-            return Err(err(format!(
-                "target apply-key column {apply_key_name} not present in target schema"
-            )));
-        }
-
-        Ok(Self {
-            target,
-            mv_id,
-            current_catalog,
-            current_database,
-            mv_definition,
-            canonical_select_query,
-            base_refs,
-            pin,
-            previous_snapshot_ids,
-            previous_table_uuids,
-            target_snapshot_id,
-            target_table_uuid,
-            target_schema,
-            schema_contract,
-        })
+fn rewrite_target_identity(target: &IcebergMvTarget) -> TableIdentity {
+    TableIdentity {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
     }
-
-    pub(crate) fn summary(&self) -> CtxSummary<'_> {
-        let n = self.base_refs.len();
-        let mut base_fqns: Vec<String> = Vec::with_capacity(n);
-        let mut pinned_snapshots: Vec<(String, i64)> = Vec::with_capacity(n);
-        let mut previous_snapshots: Vec<(String, Option<i64>)> = Vec::with_capacity(n);
-        for r in self.base_refs.iter() {
-            let fqn = r.fqn();
-            let snap = self
-                .pin
-                .get(r)
-                .expect("pin coverage verified in constructor");
-            let prev = self.previous_snapshot_ids.get(&fqn).copied();
-            pinned_snapshots.push((fqn.clone(), snap));
-            previous_snapshots.push((fqn.clone(), prev));
-            base_fqns.push(fqn);
-        }
-
-        CtxSummary {
-            target: &self.target,
-            mv_id: self.mv_id,
-            base_count: self.base_refs.len(),
-            base_fqns,
-            pinned_snapshots,
-            previous_snapshots,
-            target_snapshot_id: self.target_snapshot_id,
-            schema_contract_version: self.schema_contract.contract_version,
-            partition_contract_present: self.schema_contract.target.partition.is_some(),
-            visible_output_column_count: self.schema_contract.target.visible_columns.len(),
-            hidden_apply_key_column: &self.schema_contract.target.hidden_apply_key.column_name,
-        }
-    }
-
-    pub(crate) fn aggregate_shape_and_layout_for_execution(
-        &self,
-    ) -> Result<
-        (
-            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-            crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-        ),
-        String,
-    > {
-        // Source the aggregate-call surface from the focused extractor (not the
-        // legacy union classifier), so a composed branch (`Agg(a JOIN b)` /
-        // `Agg(fan-in)`) is supported. For a branch UNION ALL, every branch shares
-        // the same output schema (the UNION ALL requirement) and — under the
-        // CREATE-time homogeneity gate — the same aggregate layout, so the
-        // aggregate-state physical layout is derived from the FIRST branch's
-        // aggregate calls, exactly the surface the CREATE path used to build the
-        // target schema + contract. For a single aggregate / join aggregate, the
-        // whole query is the aggregate.
-        let query = self.canonical_select_query.as_ref();
-        let aggregate_query = if is_union_all_query(query) {
-            first_union_branch_query(query)?
-        } else {
-            query.clone()
-        };
-        let aggregate_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                &aggregate_query,
-            )
-            .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
-
-        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(self.target_schema.as_ref())
-            .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
-        let iceberg_fields = self.target_schema.as_ref().as_struct().fields();
-        let mut output_columns =
-            Vec::with_capacity(self.schema_contract.target.visible_columns.len());
-        for visible in &self.schema_contract.target.visible_columns {
-            let field_idx = iceberg_fields
-                .iter()
-                .position(|field| field.id == visible.target_field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "target visible column {} field id {} is missing from target schema",
-                        visible.output_name, visible.target_field_id
-                    )
-                })?;
-            let arrow_field = arrow_schema.field(field_idx);
-            output_columns.push(crate::sql::analysis::OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
-                name: visible.output_name.clone(),
-                data_type: arrow_field.data_type().clone(),
-                nullable: visible.nullable,
-                is_internal: false,
-            });
-        }
-
-        let aggregate_input_types =
-            aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
-        let layout =
-            crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                &aggregate_calls,
-                &output_columns,
-                &aggregate_input_types,
-            )?;
-        Ok((aggregate_calls, layout))
-    }
-}
-
-/// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
-/// to decide whether to source aggregate calls from the first branch.
-fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
-    matches!(
-        query.body.as_ref(),
-        sqlparser::ast::SetExpr::SetOperation {
-            op: sqlparser::ast::SetOperator::Union,
-            set_quantifier: sqlparser::ast::SetQuantifier::All,
-            ..
-        }
-    )
-}
-
-/// The first UNION ALL branch as a standalone `Query` (keeps the branch's own
-/// FROM — a scan, a join, or a fan-in union). Works off the AST so a composed
-/// branch is not classified.
-fn first_union_branch_query(
-    query: &sqlparser::ast::Query,
-) -> Result<sqlparser::ast::Query, String> {
-    fn first_branch_body(
-        body: &sqlparser::ast::SetExpr,
-    ) -> Result<&sqlparser::ast::SetExpr, String> {
-        match body {
-            sqlparser::ast::SetExpr::SetOperation { left, .. } => first_branch_body(left),
-            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
-            other => Ok(other),
-        }
-    }
-    let mut branch = query.clone();
-    branch.body = Box::new(first_branch_body(query.body.as_ref())?.clone());
-    Ok(branch)
-}
-
-fn aggregate_input_types_from_schema_contract(
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    contract: &MvSchemaContract,
-) -> Result<Vec<Option<DataType>>, String> {
-    use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::mv::model::VisibleAggregateOutput;
-
-    let mut input_types = vec![None; calls.aggregates.len()];
-    for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
-        if matches!(aggregate.input, AggregateInput::Star) {
-            continue;
-        }
-        if let Some(cast_type) = aggregate_input_cast_type(&aggregate.input)? {
-            input_types[aggregate_index] = Some(cast_type);
-            continue;
-        }
-
-        let visible_index = calls
-            .visible_outputs
-            .iter()
-            .position(|output| {
-                matches!(output, VisibleAggregateOutput::Aggregate(index) if *index == aggregate_index)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "aggregate MV aggregate output is not visible: aggregate_index={aggregate_index}"
-                )
-            })?;
-        let lineage = contract.output.columns.get(visible_index).ok_or_else(|| {
-            format!(
-                "aggregate MV contract output lineage missing for visible index {visible_index}"
-            )
-        })?;
-        input_types[aggregate_index] =
-            aggregate_input_type_from_lineage(contract, &lineage.expression)?;
-    }
-    Ok(input_types)
-}
-
-fn aggregate_input_cast_type(
-    input: &crate::mv::aggregate_state::mv_shape::AggregateInput,
-) -> Result<Option<DataType>, String> {
-    let crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(expr) = input else {
-        return Ok(None);
-    };
-    explicit_cast_type(expr)
-}
-
-fn explicit_cast_type(expr: &sqlparser::ast::Expr) -> Result<Option<DataType>, String> {
-    match expr {
-        sqlparser::ast::Expr::Cast { data_type, .. } => sql_data_type_to_arrow(data_type).map(Some),
-        sqlparser::ast::Expr::Nested(inner) => explicit_cast_type(inner),
-        _ => Ok(None),
-    }
-}
-
-fn aggregate_input_type_from_lineage(
-    contract: &MvSchemaContract,
-    lineage: &mv_schema::ExpressionLineage,
-) -> Result<Option<DataType>, String> {
-    if let [qualified] = lineage.referenced_base_fields.as_slice() {
-        let Some(field) = base_contracts(contract)
-            .into_iter()
-            .find(|base| base.table_fqn.eq_ignore_ascii_case(&qualified.table_fqn))
-            .and_then(|base| {
-                base.schema_at_create
-                    .fields
-                    .iter()
-                    .find(|field| field.field_id == qualified.field_id)
-            })
-        else {
-            return Err(format!(
-                "aggregate MV contract references unknown base field {}#{}",
-                qualified.table_fqn, qualified.field_id
-            ));
-        };
-        return arrow_type_from_contract_signature(&field.type_signature).map(Some);
-    }
-
-    if let [field_id] = lineage.referenced_base_field_ids.as_slice() {
-        let mut matches = base_contracts(contract)
-            .into_iter()
-            .filter_map(|base| {
-                base.schema_at_create
-                    .fields
-                    .iter()
-                    .find(|field| field.field_id == *field_id)
-                    .map(|field| field.type_signature.as_str())
-            })
-            .collect::<Vec<_>>();
-        matches.sort_unstable();
-        matches.dedup();
-        match matches.as_slice() {
-            [type_signature] => {
-                return arrow_type_from_contract_signature(type_signature).map(Some);
-            }
-            [] => {
-                return Err(format!(
-                    "aggregate MV contract references unknown base field id {field_id}"
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "aggregate MV contract base field id {field_id} is ambiguous across join inputs"
-                ));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-fn base_contracts(contract: &MvSchemaContract) -> Vec<&mv_schema::BaseContract> {
-    if contract.bases.is_empty() {
-        vec![&contract.base]
-    } else {
-        contract.bases.iter().collect()
-    }
-}
-
-fn sql_data_type_to_arrow(data_type: &sqlparser::ast::DataType) -> Result<DataType, String> {
-    use sqlparser::ast as sqlast;
-
-    Ok(match data_type {
-        sqlast::DataType::TinyInt(_) => DataType::Int8,
-        sqlast::DataType::SmallInt(_) => DataType::Int16,
-        sqlast::DataType::Int(_) | sqlast::DataType::Integer(_) => DataType::Int32,
-        sqlast::DataType::BigInt(_) => DataType::Int64,
-        sqlast::DataType::Float(_) => DataType::Float32,
-        sqlast::DataType::Double(_) | sqlast::DataType::DoublePrecision => DataType::Float64,
-        sqlast::DataType::Boolean => DataType::Boolean,
-        sqlast::DataType::Varchar(_)
-        | sqlast::DataType::CharVarying(_)
-        | sqlast::DataType::Text
-        | sqlast::DataType::Char(_)
-        | sqlast::DataType::Character(_)
-        | sqlast::DataType::String(_) => DataType::Utf8,
-        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => DataType::Binary,
-        sqlast::DataType::Date => DataType::Date32,
-        sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        sqlast::DataType::Decimal(info)
-        | sqlast::DataType::Dec(info)
-        | sqlast::DataType::Numeric(info) => match info {
-            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                DataType::Decimal128(*p as u8, *s as i8)
-            }
-            sqlast::ExactNumberInfo::Precision(p) => DataType::Decimal128(*p as u8, 0),
-            sqlast::ExactNumberInfo::None => DataType::Decimal128(38, 0),
-        },
-        other => {
-            return Err(format!(
-                "aggregate MV explicit cast input type is unsupported: {other}"
-            ));
-        }
-    })
-}
-
-fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
-    let trimmed = type_signature.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    Ok(match lower.as_str() {
-        "boolean" | "bool" => DataType::Boolean,
-        "tinyint" => DataType::Int8,
-        "smallint" => DataType::Int16,
-        "int" | "integer" => DataType::Int32,
-        "long" | "bigint" => DataType::Int64,
-        "float" => DataType::Float32,
-        "double" => DataType::Float64,
-        "date" => DataType::Date32,
-        "timestamp" | "timestamptz" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        "string" | "varchar" | "char" => DataType::Utf8,
-        "binary" | "varbinary" => DataType::Binary,
-        _ if lower.starts_with("decimal(") => {
-            let inner = trimmed
-                .strip_prefix("decimal(")
-                .or_else(|| trimmed.strip_prefix("DECIMAL("))
-                .and_then(|value| value.strip_suffix(')'))
-                .ok_or_else(|| format!("invalid decimal type signature `{type_signature}`"))?;
-            let mut parts = inner.split(',').map(str::trim);
-            let precision = parts
-                .next()
-                .and_then(|value| value.parse::<u8>().ok())
-                .ok_or_else(|| format!("invalid decimal precision in `{type_signature}`"))?;
-            let scale = parts
-                .next()
-                .and_then(|value| value.parse::<i8>().ok())
-                .ok_or_else(|| format!("invalid decimal scale in `{type_signature}`"))?;
-            DataType::Decimal128(precision, scale)
-        }
-        _ => {
-            return Err(format!(
-                "aggregate MV contract input type is unsupported: {type_signature}"
-            ));
-        }
-    })
 }
 
 impl IcebergMvRefreshContext {
@@ -746,8 +228,9 @@ impl IcebergMvRefreshContext {
         let target_schema = metadata.current_schema().clone();
         let schema_contract = mv_definition.schema_contract.clone().map(Arc::new);
 
+        let rewrite_target = rewrite_target_identity(&target);
         let rewrite = IcebergMvRewriteContext::from_parts(
-            target,
+            rewrite_target,
             mv_id,
             current_catalog.map(str::to_string),
             current_database.to_string(),
@@ -764,6 +247,7 @@ impl IcebergMvRefreshContext {
 
         Ok(Self {
             rewrite: Arc::new(rewrite),
+            application_target: target,
             target_entry,
             base_catalog_entries,
             iceberg_catalog,
@@ -1474,208 +958,19 @@ pub(crate) mod tests_support {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::catalog::identifier::TableIdentity;
-    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use crate::mv::persistence::definition::StoredMvDefinition;
+    use crate::mv::rewrite::context::IcebergMvRewriteContext;
+    use crate::mv::rewrite::context::tests_support::{
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
+    };
     use crate::sql::planner::table::{
         IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
     };
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
-        OutputContract, TargetContract, TargetVisibleColumn,
+        ApplyKeySource, JOIN_APPLY_KEY_COLUMN_NAME,
     };
 
     use super::*;
-
-    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> TableIdentity {
-        TableIdentity {
-            catalog: c.to_string(),
-            namespace: n.to_string(),
-            table: t.to_string(),
-        }
-    }
-
-    pub(crate) fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
-        RefreshSnapshotPin::from_entries_for_tests(entries)
-    }
-
-    pub(crate) fn make_target_schema() -> Arc<Schema> {
-        Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        )
-    }
-
-    pub(crate) fn make_schema_contract() -> MvSchemaContract {
-        MvSchemaContract {
-            contract_version: 3,
-            base: BaseContract {
-                table_fqn: "ice.db.b".to_string(),
-                table_uuid: "uuid-b".to_string(),
-                alias_at_create: None,
-                schema_id_at_create: 0,
-                schema_at_create: BaseSchemaSnapshot {
-                    fields: vec![
-                        BaseFieldRecord {
-                            field_id: 1,
-                            name_at_create: "k".to_string(),
-                            type_signature: "long".to_string(),
-                            required: true,
-                        },
-                        BaseFieldRecord {
-                            field_id: 2,
-                            name_at_create: "v".to_string(),
-                            type_signature: "long".to_string(),
-                            required: false,
-                        },
-                    ],
-                },
-            },
-            bases: Vec::new(),
-            output: OutputContract {
-                columns: vec![
-                    OutputColumnLineage {
-                        expression: ExpressionLineage {
-                            kind: ExpressionKind::Column,
-                            referenced_base_field_ids: vec![1],
-                            referenced_base_fields: Vec::new(),
-                        },
-                    },
-                    OutputColumnLineage {
-                        expression: ExpressionLineage {
-                            kind: ExpressionKind::Column,
-                            referenced_base_field_ids: vec![2],
-                            referenced_base_fields: Vec::new(),
-                        },
-                    },
-                ],
-                filter: None,
-            },
-            join: None,
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "tgt.db.mv".to_string(),
-                table_uuid: "uuid-tgt".to_string(),
-                schema_id_at_create: 7,
-                visible_columns: vec![
-                    TargetVisibleColumn {
-                        output_name: "k".to_string(),
-                        target_field_id: 100,
-                        type_signature: "long".to_string(),
-                        nullable: false,
-                    },
-                    TargetVisibleColumn {
-                        output_name: "v".to_string(),
-                        target_field_id: 101,
-                        type_signature: "long".to_string(),
-                        nullable: true,
-                    },
-                ],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "k".to_string(),
-                    target_field_id: 100,
-                    source: ApplyKeySource::BaseRowId,
-                },
-                partition: None,
-            },
-        }
-    }
-
-    pub(crate) fn make_mv_definition() -> StoredMvDefinition {
-        StoredMvDefinition {
-            mv_id: 42,
-            select_sql: "SELECT k, v FROM ice.db.b".to_string(),
-            base_table_refs: vec!["ice.db.b".to_string()],
-            primary_key_columns: vec!["k".to_string()],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("tgt".to_string()),
-            target_namespace: Some("db".to_string()),
-            target_table: Some("mv".to_string()),
-            schema_contract: Some(make_schema_contract()),
-            partition_spec: None,
-            partition_state_complete: false,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),
-            last_refresh_table_uuids: [("ice.db.b".to_string(), "uuid-b".to_string())]
-                .into_iter()
-                .collect(),
-            last_refreshed_iceberg_snapshot_id: Some(99),
-            refresh_in_progress: false,
-            active_refresh_id: None,
-            refresh_target_snapshots: Default::default(),
-            refresh_policy: Default::default(),
-            refresh_paused: false,
-            refresh_interval_ms: None,
-            max_staleness_ms: None,
-            last_scheduler_error: None,
-            next_refresh_after_ms: None,
-            created_at_ms: 0,
-        }
-    }
-
-    pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse_sql");
-        match statements.into_iter().next().expect("one statement") {
-            sqlparser::ast::Statement::Query(q) => *q,
-            other => panic!("expected SELECT, got {other:?}"),
-        }
-    }
-
-    pub(crate) fn make_target() -> IcebergMvTarget {
-        IcebergMvTarget {
-            catalog: "tgt".to_string(),
-            namespace: "db".to_string(),
-            table: "mv".to_string(),
-        }
-    }
-
-    /// Returns a minimally-valid `Arc<IcebergMvRewriteContext>` for use in
-    /// unit tests outside this module (e.g. `imv/entrypoint.rs`).
-    pub(crate) fn dummy_rewrite_context() -> Arc<IcebergMvRewriteContext> {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        Arc::new(
-            IcebergMvRewriteContext::from_parts(
-                target,
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                mv_def,
-                query,
-                base_refs,
-                pin,
-                Some(99),
-                "uuid-tgt".to_string(),
-                schema,
-                Some(contract),
-            )
-            .expect("dummy_rewrite_context: from_parts must succeed on canonical fixture"),
-        )
-    }
 
     pub(crate) struct TargetLocatorRefreshFixture {
         pub(crate) _warehouse: tempfile::TempDir,
@@ -1817,6 +1112,7 @@ pub(crate) mod tests_support {
                 &fixture.target_table,
                 fixture.target_snapshot_id,
             ),
+            application_target: make_application_target(),
             target_entry: fixture.target_entry.clone(),
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog: fixture.iceberg_catalog.clone(),
@@ -1830,6 +1126,34 @@ pub(crate) mod tests_support {
 
     pub(crate) fn target_fixture_table_info(ctx: &IcebergMvRefreshContext) -> IcebergTableInfo {
         target_table_info_for_target(ctx, "tgt", "db", "mv").expect("target fixture table info")
+    }
+
+    pub(crate) fn make_application_target() -> IcebergMvTarget {
+        IcebergMvTarget {
+            catalog: "tgt".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        }
+    }
+
+    pub(crate) fn refresh_context_for_handles(
+        rewrite: Arc<IcebergMvRewriteContext>,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+    ) -> IcebergMvRefreshContext {
+        IcebergMvRefreshContext {
+            rewrite,
+            application_target: make_application_target(),
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                "engine test context",
+            ),
+            pruning_limits: MvRefreshPruningLimits::default(),
+        }
     }
 
     pub(crate) fn aggregate_target_state_refresh_fixture()
@@ -1951,6 +1275,7 @@ pub(crate) mod tests_support {
             .collect();
         let ctx = IcebergMvRefreshContext {
             rewrite,
+            application_target: make_application_target(),
             target_entry,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
@@ -1980,6 +1305,257 @@ pub(crate) mod tests_support {
         };
         (ctx, scan)
     }
+
+    pub(crate) fn join_projection_refresh_context_for_test()
+    -> (tempfile::TempDir, IcebergMvRefreshContext) {
+        let warehouse = tempfile::Builder::new()
+            .prefix("novarocks_join_projection_target_")
+            .tempdir()
+            .expect("target warehouse tempdir");
+        let target_warehouse_uri = format!("file://{}", warehouse.path().join("target").display());
+        let base_warehouse_uri = format!("file://{}", warehouse.path().join("base").display());
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("type".to_string(), "iceberg".to_string()),
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    (
+                        "iceberg.catalog.warehouse".to_string(),
+                        target_warehouse_uri,
+                    ),
+                ],
+            )
+            .expect("target catalog entry"),
+        );
+        let base_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), base_warehouse_uri),
+            ],
+        )
+        .expect("base catalog entry");
+        crate::connector::iceberg::catalog::registry::create_namespace(&target_entry, "db")
+            .expect("create target namespace");
+        crate::connector::iceberg::catalog::registry::create_namespace(&base_entry, "db")
+            .expect("create base namespace");
+        for table in ["l", "r"] {
+            crate::connector::iceberg::catalog::registry::create_table(
+                &base_entry,
+                "db",
+                table,
+                &[
+                    crate::sql::TableColumnDef {
+                        name: "k".to_string(),
+                        data_type: crate::catalog::schema::SqlType::BigInt,
+                        nullable: false,
+                        aggregation: None,
+                        default: None,
+                    },
+                    crate::sql::TableColumnDef {
+                        name: "v".to_string(),
+                        data_type: crate::catalog::schema::SqlType::BigInt,
+                        nullable: true,
+                        aggregation: None,
+                        default: None,
+                    },
+                ],
+                None,
+                &[],
+                &[
+                    ("format-version".to_string(), "3".to_string()),
+                    ("write.row-lineage".to_string(), "true".to_string()),
+                ],
+            )
+            .expect("create base table");
+        }
+        let left_lineage = seed_join_projection_base_table(&base_entry, "l", 10, 11);
+        let right_lineage = seed_join_projection_base_table(&base_entry, "r", 20, 21);
+        crate::connector::iceberg::catalog::registry::create_table(
+            &target_entry,
+            "db",
+            "mv",
+            &[
+                crate::sql::TableColumnDef {
+                    name: "k".to_string(),
+                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: "v".to_string(),
+                    data_type: crate::catalog::schema::SqlType::BigInt,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                crate::sql::TableColumnDef {
+                    name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                    data_type: crate::catalog::schema::SqlType::String,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create target table");
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            &target_entry,
+            "db",
+            "mv",
+            &[vec![
+                crate::sql::Literal::Int(1),
+                crate::sql::Literal::Int(10),
+                crate::sql::Literal::String("join-key-1".to_string()),
+            ]],
+        )
+        .expect("insert target row");
+        let loaded =
+            crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
+                .expect("load target table");
+        let target_snapshot_id = loaded
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("target snapshot");
+        let iceberg_catalog =
+            crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&target_entry)
+                .expect("build target iceberg catalog");
+
+        let base = crate::mv::rewrite::context::tests_support::join_projection_rewrite_context();
+        let mut mv_definition = (*base.mv_definition).clone();
+        mv_definition.last_refresh_snapshots = [
+            ("ice.db.l".to_string(), left_lineage.previous_snapshot_id),
+            ("ice.db.r".to_string(), right_lineage.previous_snapshot_id),
+        ]
+        .into_iter()
+        .collect();
+        mv_definition.last_refresh_table_uuids = [
+            ("ice.db.l".to_string(), left_lineage.table_uuid.clone()),
+            ("ice.db.r".to_string(), right_lineage.table_uuid.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let mut schema_contract = (*base.schema_contract).clone();
+        for base_contract in &mut schema_contract.bases {
+            if base_contract.table_fqn.eq_ignore_ascii_case("ice.db.l") {
+                base_contract.table_uuid = left_lineage.table_uuid.clone();
+            } else if base_contract.table_fqn.eq_ignore_ascii_case("ice.db.r") {
+                base_contract.table_uuid = right_lineage.table_uuid.clone();
+            }
+        }
+        mv_definition.schema_contract = Some(schema_contract.clone());
+        let pin = make_pin(&[
+            (
+                "ice.db.l",
+                left_lineage.current_snapshot_id,
+                left_lineage.table_uuid.as_str(),
+            ),
+            (
+                "ice.db.r",
+                right_lineage.current_snapshot_id,
+                right_lineage.table_uuid.as_str(),
+            ),
+        ]);
+        let rewrite = Arc::new(
+            IcebergMvRewriteContext::from_parts(
+                base.target.clone(),
+                base.mv_id,
+                base.current_catalog.clone(),
+                base.current_database.clone(),
+                Arc::new(mv_definition),
+                Arc::clone(&base.canonical_select_query),
+                Arc::clone(&base.base_refs),
+                Arc::new(pin),
+                Some(target_snapshot_id),
+                loaded.table.metadata().uuid().to_string(),
+                Arc::clone(&base.target_schema),
+                Some(Arc::new(schema_contract)),
+            )
+            .expect("join projection refresh rewrite context"),
+        );
+
+        let mut base_catalog_entries = BTreeMap::new();
+        base_catalog_entries.insert("ice".to_string(), base_entry);
+
+        (
+            warehouse,
+            IcebergMvRefreshContext {
+                rewrite,
+                application_target: make_application_target(),
+                target_entry,
+                base_catalog_entries,
+                iceberg_catalog,
+                target_table: loaded.table,
+                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                    "test context",
+                ),
+                pruning_limits: MvRefreshPruningLimits::default(),
+            },
+        )
+    }
+
+    #[derive(Debug)]
+    struct JoinProjectionBaseLineage {
+        previous_snapshot_id: i64,
+        current_snapshot_id: i64,
+        table_uuid: String,
+    }
+
+    fn seed_join_projection_base_table(
+        entry: &crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
+        table: &str,
+        previous_value: i64,
+        current_value: i64,
+    ) -> JoinProjectionBaseLineage {
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            entry,
+            "db",
+            table,
+            &[vec![
+                crate::sql::Literal::Int(1),
+                crate::sql::Literal::Int(previous_value),
+            ]],
+        )
+        .expect("insert previous base row");
+        let previous = crate::connector::iceberg::catalog::registry::load_table(entry, "db", table)
+            .expect("load previous base table");
+        let previous_snapshot_id = previous
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("previous base snapshot");
+
+        crate::connector::iceberg::catalog::registry::insert_rows(
+            entry,
+            "db",
+            table,
+            &[vec![
+                crate::sql::Literal::Int(2),
+                crate::sql::Literal::Int(current_value),
+            ]],
+        )
+        .expect("insert current base row");
+        let current = crate::connector::iceberg::catalog::registry::load_table(entry, "db", table)
+            .expect("load current base table");
+        let current_snapshot_id = current
+            .table
+            .metadata()
+            .current_snapshot_id()
+            .expect("current base snapshot");
+
+        JoinProjectionBaseLineage {
+            previous_snapshot_id,
+            current_snapshot_id,
+            table_uuid: current.table.metadata().uuid().to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1988,637 +1564,60 @@ mod tests {
 
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
-    use crate::catalog::identifier::TableIdentity;
-    use crate::engine::mv::refresh_pin::RefreshSnapshotPin;
-    use mv_schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
+    use crate::mv::rewrite::context::tests_support::{
+        dummy_rewrite_context, make_mv_definition, make_pin, make_ref, make_schema_contract,
+        make_target_schema, parse_query,
     };
 
     use super::tests_support::*;
     use super::*;
 
     #[test]
-    fn from_parts_happy_path_derives_all_fields() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
+    fn pure_join_refresh_fragment_materialization_lowers_coalesce_plan() {
+        std::thread::Builder::new()
+            .name("imv-join-fragment-lowering-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (_warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
+                let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering(
+                    &refresh_ctx.rewrite,
+                );
+                let mut connectors = crate::connector::ConnectorRegistry::default();
+                connectors.register_scan_planner(Arc::new(
+                    crate::connector::iceberg::IcebergConnectorScanPlanner::new(),
+                ));
 
-        let ctx = IcebergMvRewriteContext::from_parts(
-            target.clone(),
-            42,
-            Some("sess_cat".to_string()),
-            "sess_db".to_string(),
-            mv_def.clone(),
-            query.clone(),
-            base_refs.clone(),
-            pin.clone(),
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema.clone(),
-            Some(contract.clone()),
-        )
-        .expect("constructor should succeed on happy path");
-
-        assert_eq!(ctx.target.table, "mv");
-        assert_eq!(ctx.mv_id, 42);
-        assert_eq!(ctx.current_catalog.as_deref(), Some("sess_cat"));
-        assert_eq!(ctx.current_database, "sess_db");
-        assert!(Arc::ptr_eq(&ctx.mv_definition, &mv_def));
-        assert!(Arc::ptr_eq(&ctx.canonical_select_query, &query));
-        assert_eq!(ctx.base_refs.len(), 1);
-        assert!(Arc::ptr_eq(&ctx.base_refs, &base_refs));
-        assert!(Arc::ptr_eq(&ctx.pin, &pin));
-        assert_eq!(ctx.previous_snapshot_ids.get("ice.db.b"), Some(&11));
-        assert_eq!(
-            ctx.previous_table_uuids.get("ice.db.b").map(String::as_str),
-            Some("uuid-b")
-        );
-        assert_eq!(ctx.target_snapshot_id, Some(99));
-        assert_eq!(ctx.target_table_uuid, "uuid-tgt");
-        assert!(Arc::ptr_eq(&ctx.target_schema, &schema));
-        assert!(Arc::ptr_eq(&ctx.schema_contract, &contract));
-    }
-
-    #[test]
-    fn from_parts_rejects_missing_schema_contract() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-
-        let err_msg = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            None,
-        )
-        .expect_err("missing schema contract must fail");
-        assert!(
-            err_msg.contains("missing schema contract on target tgt.db.mv"),
-            "got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_empty_base_refs() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(Vec::<TableIdentity>::new());
-        let pin = Arc::new(RefreshSnapshotPin::default());
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("empty base_refs must fail");
-        assert!(err.contains("no base table refs"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_rejects_pin_coverage_mismatch() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> =
-            Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("pin coverage mismatch must fail");
-        assert!(err.contains("refresh pin covers"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_rejects_pin_missing_uuid() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        // Pin has the right count but the entry is for a different fqn.
-        let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("missing pin uuid must fail");
-        assert!(
-            err.contains("refresh pin missing uuid for base"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_base_identity_drift() {
-        let target = make_target();
-        let mut def = make_mv_definition();
-        def.last_refresh_table_uuids
-            .insert("ice.db.b".to_string(), "uuid-OLD".to_string());
-        let mv_def = Arc::new(def);
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("identity drift must fail");
-        assert!(err.contains("base table identity changed"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_first_refresh_passes_with_empty_previous() {
-        let target = make_target();
-        let mut def = make_mv_definition();
-        def.last_refresh_snapshots.clear();
-        def.last_refresh_table_uuids.clear();
-        let mv_def = Arc::new(def);
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let ctx = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect("first refresh must succeed");
-        assert!(ctx.previous_snapshot_ids.is_empty());
-        assert!(ctx.previous_table_uuids.is_empty());
-    }
-
-    #[test]
-    fn from_parts_rejects_target_schema_contract_field_mismatch() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns.pop();
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("schema/contract mismatch must fail");
-        assert!(
-            err.contains("target schema/contract field id mismatch"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_target_schema_contract_field_ids_differ_same_count() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        // Contract has two columns (matching schema count) but one has a wrong
-        // target_field_id (schema has 100/101; contract claims 100/999).
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[1].target_field_id = 999;
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("field-id set mismatch must fail even when counts match");
-        assert!(
-            err.contains("target schema/contract field id mismatch"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn summary_orders_by_base_refs_declared_order() {
-        let target = make_target();
-        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![
-            make_ref("ice", "db", "b"),
-            make_ref("ice", "db", "a"),
-            make_ref("ice", "db", "c"),
-        ]);
-        let pin = Arc::new(make_pin(&[
-            // Insert in NON-declared order to confirm summary reorders.
-            ("ice.db.a", 30, "uuid-a"),
-            ("ice.db.c", 50, "uuid-c"),
-            ("ice.db.b", 20, "uuid-b"),
-        ]));
-        let schema = make_target_schema();
-        let mut def_for_three_bases = make_mv_definition();
-        def_for_three_bases.last_refresh_snapshots.clear();
-        def_for_three_bases
-            .last_refresh_snapshots
-            .insert("ice.db.b".to_string(), 11);
-        def_for_three_bases.last_refresh_table_uuids.clear();
-        def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.b".to_string(), "uuid-b".to_string());
-        def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.a".to_string(), "uuid-a".to_string());
-        def_for_three_bases
-            .last_refresh_table_uuids
-            .insert("ice.db.c".to_string(), "uuid-c".to_string());
-        let mv_def = Arc::new(def_for_three_bases);
-        let contract = Arc::new(make_schema_contract());
-
-        let ctx = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect("ctx happy path");
-
-        let summary = ctx.summary();
-        assert_eq!(
-            summary.base_fqns,
-            vec![
-                "ice.db.b".to_string(),
-                "ice.db.a".to_string(),
-                "ice.db.c".to_string()
-            ],
-            "base_fqns must use base_refs declared order"
-        );
-        assert_eq!(
-            summary.pinned_snapshots,
-            vec![
-                ("ice.db.b".to_string(), 20),
-                ("ice.db.a".to_string(), 30),
-                ("ice.db.c".to_string(), 50),
-            ],
-            "summary must use base_refs declared order, not BTreeMap key order"
-        );
-        assert_eq!(
-            summary.previous_snapshots,
-            vec![
-                ("ice.db.b".to_string(), Some(11)),
-                ("ice.db.a".to_string(), None),
-                ("ice.db.c".to_string(), None),
-            ]
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_apply_key_not_in_target_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let schema = make_target_schema();
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "nonexistent".to_string();
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect_err("apply-key absence must fail");
-        assert!(err.contains("apply-key column"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_distinct_hidden_apply_key_field() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        // Three-field target schema: 100=k (visible), 101=v (visible),
-        // 999=__nova_apply_key (hidden — present in schema but NOT in
-        // visible_columns).
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__nova_apply_key",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
-
-        // Contract: visible columns are 100/101; hidden apply key is 999.
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect("ctx must succeed when apply-key is a distinct hidden schema field");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_branch_id_field_in_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__nova_apply_key",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        4242,
-                        BRANCH_ID_COLUMN_NAME,
-                        Type::Primitive(PrimitiveType::Int),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
-
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
-                target_field_id: 4242,
-            },
-            branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::BaseRowId,
-        });
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect("ctx must accept branch id field in target schema");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_aggregate_state_columns_in_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        // Aggregate target schema: visible columns 100=k and 101=v, hidden
-        // apply key 999=__row_id__, and aggregate-state columns
-        // 200=__agg_state_c, 201=__agg_state_s. All must be accepted by
-        // from_parts.
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "v",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_c",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        201,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
-
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_c".to_string(),
-                    target_field_id: 200,
-                    type_signature: "long".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_s".to_string(),
-                    target_field_id: 201,
-                    type_signature: "long".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-            ],
-        });
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Some(contract),
-        )
-        .expect("ctx must accept aggregate state columns in target schema");
+                let physical_plan =
+                    crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
+                        .expect("convert optimizer physical plan");
+                let distributed_plan =
+                    crate::sql::planner::pipeline::build_distributed_plan(physical_plan)
+                        .expect("build DistributedPlan");
+                let prepared = crate::coordinator::prepare::prepare_fragments(
+                    &distributed_plan,
+                    &connectors,
+                    Some(&refresh_ctx),
+                )
+                .expect("join projection coalesce plan must prepare");
+                crate::protocol::native::encode::encode_native_fragment_bundle(
+                    &distributed_plan,
+                    &prepared,
+                )
+                .expect("join projection coalesce plan must lower");
+            })
+            .expect("spawn fragment lowering test")
+            .join()
+            .expect("fragment lowering test");
     }
 
     #[test]
     fn version_scan_source_does_not_reject_base_catalog_that_differs_from_target() {
+        let mixed_case_target = IcebergMvTarget {
+            catalog: "TargetCase".to_string(),
+            namespace: "NameSpace".to_string(),
+            table: "MvTable".to_string(),
+        };
+
         use iceberg::{NamespaceIdent, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
@@ -2627,7 +1626,7 @@ mod tests {
         let warehouse = format!("file://{}", warehouse_dir.join("warehouse").display());
         let target_entry = Arc::new(
             crate::connector::iceberg::catalog::registry::build_catalog_entry(
-                "tgt",
+                "TargetCase",
                 &[
                     ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
                     ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
@@ -2646,15 +1645,16 @@ mod tests {
             ))
             .to_string_lossy()
             .into_owned();
-        let base_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
-            "ice",
-            &[
-                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                ("iceberg.catalog.warehouse".to_string(), base_warehouse),
-            ],
-        )
-        .expect("base catalog entry");
-        let base_catalog_entries = [("ice".to_string(), base_entry)].into_iter().collect();
+        let mut iceberg_catalogs = IcebergCatalogRegistry::default();
+        iceberg_catalogs
+            .create_catalog(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), base_warehouse),
+                ],
+            )
+            .expect("base catalog entry");
         let schema = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
@@ -2686,22 +1686,63 @@ mod tests {
             .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
-                NamespaceIdent::new("db".to_string()),
-                "mv".to_string(),
+                NamespaceIdent::new("NameSpace".to_string()),
+                "MvTable".to_string(),
             ))
             .build()
             .expect("target table");
-        let ctx = IcebergMvRefreshContext {
-            rewrite: dummy_rewrite_context(),
+        let target_metadata = target_table.metadata();
+        let mut contract = make_schema_contract();
+        contract.target.table_fqn = "TargetCase.NameSpace.MvTable".to_string();
+        contract.target.table_uuid = target_metadata.uuid().to_string();
+        contract.target.schema_id_at_create = target_metadata.current_schema_id();
+        let target_schema = target_metadata.current_schema();
+        let field_id = |name: &str| {
+            target_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing target field {name}"))
+                .id
+        };
+        let k_id = field_id("k");
+        let v_id = field_id("v");
+        contract.target.visible_columns[0].target_field_id = k_id;
+        contract.target.visible_columns[1].target_field_id = v_id;
+        contract.target.hidden_apply_key.target_field_id = k_id;
+        let mut mv_definition = make_mv_definition();
+        mv_definition.target_catalog = Some(mixed_case_target.catalog.clone());
+        mv_definition.target_namespace = Some(mixed_case_target.namespace.clone());
+        mv_definition.target_table = Some(mixed_case_target.table.clone());
+        mv_definition.schema_contract = Some(contract);
+        let ctx = IcebergMvRefreshContext::new(
+            mixed_case_target.clone(),
+            mv_definition.mv_id,
+            Some("sess_cat"),
+            "sess_db",
+            Arc::new(mv_definition),
+            Arc::new(parse_query("SELECT k, v FROM ice.db.b")),
+            Arc::from(vec![make_ref("ice", "db", "b")]),
+            Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
+            &iceberg_catalogs,
             target_entry,
-            base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
-                "test context",
-            ),
-            pruning_limits: MvRefreshPruningLimits::default(),
-        };
+        )
+        .expect("mixed-case execution context");
+        assert_eq!(ctx.application_target.catalog, mixed_case_target.catalog);
+        assert_eq!(
+            ctx.application_target.namespace,
+            mixed_case_target.namespace
+        );
+        assert_eq!(ctx.application_target.table, mixed_case_target.table);
+        assert_eq!(ctx.rewrite.target.catalog, ctx.application_target.catalog);
+        assert_eq!(
+            ctx.rewrite.target.namespace,
+            ctx.application_target.namespace
+        );
+        assert_eq!(ctx.rewrite.target.table, ctx.application_target.table);
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
@@ -2996,6 +2037,7 @@ mod tests {
             .expect("target table");
         let mut ctx = IcebergMvRefreshContext {
             rewrite: dummy_rewrite_context(),
+            application_target: make_application_target(),
             target_entry,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
