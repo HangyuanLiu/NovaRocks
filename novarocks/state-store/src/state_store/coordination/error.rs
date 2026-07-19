@@ -44,7 +44,7 @@ pub struct CoordinationError {
 }
 
 impl CoordinationError {
-    pub(crate) const fn new(kind: CoordinationErrorKind, message: &'static str) -> Self {
+    const fn new(kind: CoordinationErrorKind, message: &'static str) -> Self {
         Self {
             kind,
             message,
@@ -139,3 +139,45 @@ impl fmt::Display for CoordinationError {
 }
 
 impl std::error::Error for CoordinationError {}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::CoordinationError;
+    use crate::{StateStoreError, StateStoreErrorKind, TransactionId};
+
+    fn transaction_id() -> TransactionId {
+        TransactionId::from(Uuid::now_v7())
+    }
+
+    #[test]
+    fn transaction_errors_always_expose_their_transaction_id() {
+        let transaction_id = transaction_id();
+        for error in [
+            CoordinationError::operation_not_committed(transaction_id),
+            CoordinationError::commit_uncertain(transaction_id),
+        ] {
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+        }
+    }
+
+    #[test]
+    fn no_payload_error_constructors_expose_no_transaction_id() {
+        let errors = [
+            CoordinationError::invalid_request("invalid request"),
+            CoordinationError::limit_exceeded("limit exceeded"),
+            CoordinationError::corruption(),
+            CoordinationError::epoch_exhausted(),
+            CoordinationError::incarnation_exhausted(),
+            CoordinationError::from_state_store(StateStoreError::new(
+                StateStoreErrorKind::ProviderUnavailable,
+                "provider detail must not escape",
+            )),
+        ];
+
+        for error in errors {
+            assert_eq!(error.transaction_id(), None);
+        }
+    }
+}

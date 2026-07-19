@@ -92,7 +92,7 @@ impl TryFrom<Uuid> for AttemptId {
     type Error = CoordinationError;
 
     fn try_from(value: Uuid) -> Result<Self, Self::Error> {
-        if value.get_version_num() != 7 {
+        if value.get_version_num() != 7 || value.get_variant() != uuid::Variant::RFC4122 {
             return Err(CoordinationError::invalid_request(
                 "lease attempt id must be UUIDv7",
             ));
@@ -242,4 +242,25 @@ pub enum LeaseCancellationReason {
     IncarnationChanged,
     ClockUnsafe,
     Released,
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::{Uuid, Variant};
+
+    use super::AttemptId;
+
+    #[test]
+    fn attempt_id_rejects_v7_uuids_with_non_rfc4122_variants() {
+        for variant_byte in [0x00, 0xc0, 0xe0] {
+            let mut bytes = [0; 16];
+            bytes[6] = 0x70;
+            bytes[8] = variant_byte;
+            let attempt = Uuid::from_bytes(bytes);
+
+            assert_eq!(attempt.get_version_num(), 7);
+            assert_ne!(attempt.get_variant(), Variant::RFC4122);
+            assert!(AttemptId::try_from(attempt).is_err());
+        }
+    }
 }

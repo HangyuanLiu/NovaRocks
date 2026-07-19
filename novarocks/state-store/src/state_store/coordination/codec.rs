@@ -417,6 +417,28 @@ mod tests {
         assert_eq!(error.kind(), CoordinationErrorKind::Corruption);
     }
 
+    #[test]
+    fn v1_lease_decoder_rejects_v7_attempt_with_non_rfc4122_variant() {
+        let record = record();
+        let key = lease_storage_key(&record.resource).expect("storage key");
+        let value = encode_lease(&record).expect("encode lease");
+        let attempt_offset =
+            1 + 4 + record.resource.as_bytes().len() + 1 + 4 + record.holder.as_bytes().len();
+        let mut bytes = [0; 16];
+        bytes[6] = 0x70;
+        bytes[8] = 0xc0;
+        let invalid_attempt = Uuid::from_bytes(bytes);
+
+        assert_eq!(invalid_attempt.get_version_num(), 7);
+        let error = decode_lease(
+            &key,
+            &Value::try_from(with_uuid(&value, attempt_offset, invalid_attempt))
+                .expect("nonempty value"),
+        )
+        .expect_err("non-RFC UUIDv7 attempt must fail closed");
+        assert_eq!(error.kind(), CoordinationErrorKind::Corruption);
+    }
+
     fn with_u64(value: &Value, offset: usize, replacement: u64) -> Bytes {
         let mut bytes = value.as_bytes().to_vec();
         bytes[offset..offset + 8].copy_from_slice(&replacement.to_be_bytes());
