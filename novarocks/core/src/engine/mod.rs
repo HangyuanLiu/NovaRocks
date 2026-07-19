@@ -5474,8 +5474,12 @@ mysql_port = 47892
                 .expect("build hadoop catalog"),
         );
 
+        let rewrite = crate::engine::mv::refresh_execution_context::tests_support::rewrite_context_for_target_fixture(
+            &target_table,
+            None,
+        );
         crate::engine::mv::refresh_execution_context::tests_support::refresh_context_for_handles(
-            crate::mv::rewrite::context::tests_support::dummy_rewrite_context(),
+            rewrite,
             target_entry,
             iceberg_catalog,
             target_table,
