@@ -98,6 +98,10 @@ use crate::mv::persistence::schema::{
     ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
     HIDDEN_APPLY_KEY_COLUMN_NAME, HIDDEN_COLUMNS_PROPERTY, JOIN_APPLY_KEY_COLUMN_NAME,
 };
+use crate::mv::refresh::aggregate_first_refresh::{
+    AggregateStateRead, prepare_aggregate_first_refresh_chunks,
+    prepare_branch_union_aggregate_first_refresh_chunks,
+};
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
@@ -122,7 +126,6 @@ use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
 };
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::query_result::record_batch_to_chunk;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::parser::ast::{
@@ -2777,13 +2780,6 @@ fn append_union_projection_hidden_columns_to_set_expr(
         }
         _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
     }
-}
-
-fn iceberg_aggregate_first_refresh_select_sql(
-    select_sql: &str,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<String, String> {
-    crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)
 }
 
 /// Refresh an iceberg-backed materialized view.
@@ -8779,13 +8775,25 @@ fn first_refresh_iceberg_aggregate_mv(
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
+    let mut read = |select_sql: &str,
+                    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+                    state_query: sqlparser::ast::Query| {
+        read_aggregate_state_for_refresh(
+            state,
+            current_catalog,
+            current_database,
+            select_sql,
+            calls,
+            state_query,
+        )
+    };
     let chunks = match prepare_aggregate_first_refresh_chunks(
-        state,
-        current_catalog,
-        current_database,
-        mv_definition,
+        &mv_definition.select_sql,
         aggregate_calls,
         pin,
+        current_catalog,
+        current_database,
+        &mut read,
     ) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -8815,14 +8823,26 @@ fn first_refresh_branch_union_aggregate_iceberg_mv(
     let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
+    let mut read = |select_sql: &str,
+                    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+                    state_query: sqlparser::ast::Query| {
+        read_aggregate_state_for_refresh(
+            state,
+            current_catalog,
+            current_database,
+            select_sql,
+            calls,
+            state_query,
+        )
+    };
     let chunks = match prepare_branch_union_aggregate_first_refresh_chunks(
-        state,
-        current_catalog,
-        current_database,
-        mv_definition,
+        &mv_definition.select_sql,
         branch_count,
         first_branch_calls,
         pin,
+        current_catalog,
+        current_database,
+        &mut read,
     ) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -8994,42 +9014,15 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     Ok(StatementResult::Ok)
 }
 
-fn prepare_aggregate_first_refresh_chunks(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    prepare_aggregate_first_refresh_chunks_for_select_sql(
-        state,
-        current_catalog,
-        current_database,
-        &mv_definition.select_sql,
-        calls,
-        pin,
-    )
-}
-
-fn prepare_aggregate_first_refresh_chunks_for_select_sql(
+fn read_aggregate_state_for_refresh(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     select_sql: &str,
     calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    let state_sql = iceberg_aggregate_first_refresh_select_sql(select_sql, calls)?;
-    let mut state_query = parse_mv_select_query(&state_sql)?;
-    inject_pin_as_for_version_as_of(
-        &mut state_query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
-    let layout = build_aggregate_layout_for_refresh_select_sql(
+    state_query: sqlparser::ast::Query,
+) -> Result<AggregateStateRead, String> {
+    let source_layout = build_aggregate_layout_for_refresh_select_sql(
         state,
         current_catalog,
         current_database,
@@ -9037,8 +9030,10 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
         calls,
     )?;
     let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
-    let result = normalize_aggregate_state_result_column_names(result, &layout, calls)?;
-    crate::mv::aggregate_state::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+    Ok(AggregateStateRead {
+        result,
+        source_layout,
+    })
 }
 
 fn build_aggregate_repartition_payload(
@@ -9052,13 +9047,26 @@ fn build_aggregate_repartition_payload(
     let calls = crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
         &select_query,
     )?;
-    let chunks = prepare_aggregate_first_refresh_chunks_for_select_sql(
-        state,
-        current_catalog,
-        current_database,
+    let mut read =
+        |visible_sql: &str,
+         actual_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+         state_query: sqlparser::ast::Query| {
+            read_aggregate_state_for_refresh(
+                state,
+                current_catalog,
+                current_database,
+                visible_sql,
+                actual_calls,
+                state_query,
+            )
+        };
+    let chunks = prepare_aggregate_first_refresh_chunks(
         select_sql,
         &calls,
         pin,
+        current_catalog,
+        current_database,
+        &mut read,
     )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
@@ -9091,365 +9099,6 @@ fn build_union_projection_repartition_payload(
         &pinned_full_select_sql,
     )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
-}
-
-fn prepare_branch_union_aggregate_first_refresh_chunks(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    branch_count: usize,
-    first_branch_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    // Flatten the stored UNION ALL SELECT into one full SELECT per branch. The
-    // per-branch SELECT keeps its own FROM (a scan, a join, or a fan-in union):
-    // first refresh runs each branch SELECT as a normal full aggregate, so a
-    // composed branch (`Agg(a JOIN b)`) executes its join in the branch SELECT.
-    let (branch_queries, branch_select_sqls) =
-        branch_union_first_refresh_branch_queries(&mv_definition.select_sql, branch_count)?;
-    let mut chunks = Vec::new();
-    for (branch_id, (branch_query, branch_sql)) in branch_queries
-        .iter()
-        .zip(branch_select_sqls.iter())
-        .enumerate()
-    {
-        // Source the per-branch aggregate-call model from the focused extractor,
-        // which tolerates joins/unions in the branch FROM (the legacy classifier
-        // rejected them). Under the homogeneity gate every branch shares the
-        // first branch's aggregate layout; validate that arity here.
-        let branch_calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-                branch_query,
-            )?;
-        validate_branch_union_aggregate_branch_layout(first_branch_calls, &branch_calls)?;
-        let branch_chunks = prepare_aggregate_first_refresh_chunks_for_select_sql(
-            state,
-            current_catalog,
-            current_database,
-            branch_sql,
-            &branch_calls,
-            pin,
-        )?;
-        chunks.extend(append_branch_id_to_first_refresh_chunks(
-            branch_chunks,
-            branch_id as i32,
-        )?);
-    }
-    Ok(chunks)
-}
-
-fn validate_branch_union_aggregate_branch_layout(
-    first: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    branch: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<(), String> {
-    if first.group_keys.len() != branch.group_keys.len()
-        || first.aggregates.len() != branch.aggregates.len()
-        || first.visible_outputs.len() != branch.visible_outputs.len()
-    {
-        return Err(format!(
-            "branch UNION ALL aggregate MV branches must have matching aggregate layout: first group_keys={}, aggregates={}, visible_outputs={}; branch group_keys={}, aggregates={}, visible_outputs={}",
-            first.group_keys.len(),
-            first.aggregates.len(),
-            first.visible_outputs.len(),
-            branch.group_keys.len(),
-            branch.aggregates.len(),
-            branch.visible_outputs.len()
-        ));
-    }
-    Ok(())
-}
-
-/// Flatten the stored UNION ALL SELECT into per-branch full SELECT queries
-/// (ASTs + their rendered SQL), asserting the branch count matches the persisted
-/// branch contract. Works off the AST so a composed branch (`Agg(a JOIN b)` /
-/// `Agg(fan-in)`) is split correctly without classifying the branch.
-fn branch_union_first_refresh_branch_queries(
-    select_sql: &str,
-    branch_count: usize,
-) -> Result<(Vec<sqlparser::ast::Query>, Vec<String>), String> {
-    let normalized =
-        crate::sql::parser::dialect::normalize_for_raw_parse(select_sql).map_err(|e| {
-            format!("iceberg branch UNION ALL aggregate first refresh SELECT normalize error: {e}")
-        })?;
-    let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).map_err(|e| {
-        format!("iceberg branch UNION ALL aggregate first refresh SELECT parse error: {e}")
-    })?;
-    let sqlparser::ast::Statement::Query(query) = stmt else {
-        return Err(
-            "iceberg branch UNION ALL aggregate first refresh expects a SELECT query".to_string(),
-        );
-    };
-    let mut branch_bodies = Vec::new();
-    flatten_branch_union_all_set_expr(query.body.as_ref(), &mut branch_bodies)?;
-    if branch_bodies.len() != branch_count {
-        return Err(format!(
-            "iceberg branch UNION ALL aggregate first refresh expected {branch_count} branches, found {}",
-            branch_bodies.len()
-        ));
-    }
-    let branch_queries = branch_bodies
-        .into_iter()
-        .map(|body| {
-            let mut branch_query = query.as_ref().clone();
-            branch_query.body = Box::new(body);
-            branch_query
-        })
-        .collect::<Vec<_>>();
-    let branch_select_sqls = branch_queries.iter().map(|q| q.to_string()).collect();
-    Ok((branch_queries, branch_select_sqls))
-}
-
-fn flatten_branch_union_all_set_expr(
-    body: &sqlparser::ast::SetExpr,
-    out: &mut Vec<sqlparser::ast::SetExpr>,
-) -> Result<(), String> {
-    match body {
-        sqlparser::ast::SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            if !matches!(op, sqlparser::ast::SetOperator::Union)
-                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
-            {
-                return Err(
-                    "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
-                        .to_string(),
-                );
-            }
-            flatten_branch_union_all_set_expr(left, out)?;
-            flatten_branch_union_all_set_expr(right, out)
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            flatten_branch_union_all_set_expr(query.body.as_ref(), out)
-        }
-        sqlparser::ast::SetExpr::Select(_) => {
-            out.push(body.clone());
-            Ok(())
-        }
-        _ => Err(
-            "iceberg branch UNION ALL aggregate first refresh expects SELECT branches".to_string(),
-        ),
-    }
-}
-
-fn append_branch_id_to_first_refresh_chunks(
-    chunks: Vec<crate::exec::chunk::Chunk>,
-    branch_id: i32,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
-    chunks
-        .into_iter()
-        .map(|chunk| append_branch_id_to_first_refresh_chunk(chunk, branch_id))
-        .collect()
-}
-
-fn append_branch_id_to_first_refresh_chunk(
-    chunk: crate::exec::chunk::Chunk,
-    branch_id: i32,
-) -> Result<crate::exec::chunk::Chunk, String> {
-    let mut fields = chunk
-        .batch
-        .schema()
-        .fields()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
-        BRANCH_ID_COLUMN_NAME,
-        arrow::datatypes::DataType::Int32,
-        false,
-    )));
-    let mut columns = chunk.batch.columns().to_vec();
-    columns.push(std::sync::Arc::new(arrow::array::Int32Array::from(vec![
-        branch_id;
-        chunk.batch.num_rows()
-    ])));
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
-        columns,
-    )
-    .map_err(|e| {
-        format!("append branch id to branch UNION ALL aggregate first refresh chunk failed: {e}")
-    })?;
-    record_batch_to_chunk(batch)
-}
-
-fn normalize_aggregate_state_result_column_names(
-    mut result: crate::runtime::query_result::QueryResult,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<crate::runtime::query_result::QueryResult, String> {
-    let expected_names = aggregate_state_result_column_names(layout, calls)?;
-    if result.columns.len() != expected_names.len() {
-        return Ok(result);
-    }
-    let metadata_permutation =
-        aggregate_state_result_name_permutation(&result.columns, &expected_names)
-            .unwrap_or_else(|| (0..expected_names.len()).collect());
-    let old_columns = std::mem::take(&mut result.columns);
-    result.columns = metadata_permutation
-        .iter()
-        .zip(expected_names.iter())
-        .map(|(old_index, expected_name)| {
-            let mut column = old_columns[*old_index].clone();
-            column.name.clone_from(expected_name);
-            column
-        })
-        .collect();
-    result.chunks = result
-        .chunks
-        .into_iter()
-        .map(|chunk| {
-            let chunk_permutation =
-                aggregate_state_result_chunk_name_permutation(&chunk, &expected_names)
-                    .unwrap_or_else(|| metadata_permutation.clone());
-            reorder_and_rename_chunk_columns(chunk, &expected_names, &chunk_permutation)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(result)
-}
-
-fn aggregate_state_result_name_permutation(
-    columns: &[crate::runtime::query_result::QueryResultColumn],
-    expected_names: &[String],
-) -> Option<Vec<usize>> {
-    if columns.len() != expected_names.len() {
-        return None;
-    }
-    let mut used = vec![false; columns.len()];
-    let mut permutation = Vec::with_capacity(expected_names.len());
-    for expected_name in expected_names {
-        let index = columns
-            .iter()
-            .enumerate()
-            .find(|(index, column)| {
-                !used[*index] && column.name.eq_ignore_ascii_case(expected_name)
-            })?
-            .0;
-        used[index] = true;
-        permutation.push(index);
-    }
-    Some(permutation)
-}
-
-fn aggregate_state_result_chunk_name_permutation(
-    chunk: &crate::exec::chunk::Chunk,
-    expected_names: &[String],
-) -> Option<Vec<usize>> {
-    if chunk.batch.num_columns() != expected_names.len() {
-        return None;
-    }
-    let schema = chunk.batch.schema();
-    let mut used = vec![false; chunk.batch.num_columns()];
-    let mut permutation = Vec::with_capacity(expected_names.len());
-    for expected_name in expected_names {
-        let index = (0..chunk.batch.num_columns()).find(|index| {
-            !used[*index]
-                && schema
-                    .field(*index)
-                    .name()
-                    .eq_ignore_ascii_case(expected_name)
-        })?;
-        used[index] = true;
-        permutation.push(index);
-    }
-    Some(permutation)
-}
-
-fn aggregate_state_result_column_names(
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-    calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-) -> Result<Vec<String>, String> {
-    let mut names = Vec::with_capacity(calls.visible_outputs.len() + layout.state_columns.len());
-    for output in &calls.visible_outputs {
-        match output {
-            crate::mv::model::VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let visible_source_index = layout
-                    .group_key_source_indexes
-                    .get(*group_key_index)
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate MV state result group key index {group_key_index} out of range"
-                        )
-                    })?;
-                let visible = layout
-                    .visible_columns
-                    .get(*visible_source_index)
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate MV state result visible source index {visible_source_index} out of range"
-                        )
-                    })?;
-                names.push(visible.name.clone());
-            }
-            crate::mv::model::VisibleAggregateOutput::Aggregate(aggregate_index) => {
-                let state_column = layout
-                    .state_columns
-                    .iter()
-                    .find(|column| {
-                        column.state_role
-                            == crate::mv::model::AggregateStateRole::Single
-                            && column.aggregate_index == *aggregate_index
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate MV state result missing state column for aggregate index {aggregate_index}"
-                        )
-                    })?;
-                names.push(state_column.name.clone());
-            }
-        }
-    }
-    for state_column in layout
-        .state_columns
-        .iter()
-        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount)
-    {
-        names.push(state_column.name.clone());
-    }
-    Ok(names)
-}
-
-fn reorder_and_rename_chunk_columns(
-    chunk: crate::exec::chunk::Chunk,
-    names: &[String],
-    permutation: &[usize],
-) -> Result<crate::exec::chunk::Chunk, String> {
-    if chunk.batch.num_columns() != names.len() || permutation.len() != names.len() {
-        return Ok(chunk);
-    }
-    if permutation
-        .iter()
-        .any(|old_index| *old_index >= chunk.batch.num_columns())
-    {
-        return Err(format!(
-            "aggregate MV state result column permutation out of range: columns={} permutation={permutation:?}",
-            chunk.batch.num_columns()
-        ));
-    }
-    let schema_fields = chunk.batch.schema().fields().clone();
-    let fields = permutation
-        .iter()
-        .zip(names.iter())
-        .map(|(old_index, name)| {
-            std::sync::Arc::new(
-                schema_fields[*old_index]
-                    .as_ref()
-                    .clone()
-                    .with_name(name.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let columns = permutation
-        .iter()
-        .map(|old_index| chunk.batch.column(*old_index).clone())
-        .collect::<Vec<_>>();
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-    let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
-        .map_err(|e| format!("reorder aggregate MV state result columns failed: {e}"))?;
-    record_batch_to_chunk(batch)
 }
 
 fn alias_aggregate_refresh_group_key_projection(
@@ -16180,7 +15829,7 @@ mod tests {
     use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
     use crate::sql::planner::payload::*;
-    use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
@@ -17222,150 +16871,6 @@ mod tests {
                 "__agg_state_s"
             ]
         );
-    }
-
-    #[test]
-    fn normalize_aggregate_state_result_reorders_named_columns() {
-        let query =
-            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .expect("aggregate calls");
-        let layout = aggregate_apply_test_helpers::count_layout("region");
-        let schema = StdArc::new(ArrowSchema::new(vec![
-            Field::new("__agg_state_c", DataType::Binary, false),
-            Field::new("region", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            StdArc::clone(&schema),
-            vec![
-                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
-                StdArc::new(StringArray::from(vec![Some("east")])),
-            ],
-        )
-        .expect("record batch");
-        let result = crate::runtime::query_result::QueryResult {
-            columns: vec![
-                crate::runtime::query_result::QueryResultColumn {
-                    name: "__agg_state_c".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
-                    logical_type: None,
-                },
-                crate::runtime::query_result::QueryResultColumn {
-                    name: "region".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    logical_type: None,
-                },
-            ],
-            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
-        };
-
-        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
-            .expect("normalize");
-
-        let column_names = normalized
-            .columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(column_names, vec!["region", "__agg_state_c"]);
-        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
-        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
-
-        let chunk = &normalized.chunks[0];
-        assert_eq!(chunk.batch.schema().field(0).name(), "region");
-        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
-        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
-        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
-        let region = chunk
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("region column");
-        assert_eq!(region.value(0), "east");
-        let state = chunk
-            .batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("state column");
-        assert_eq!(state.value(0), b"east-state");
-    }
-
-    #[test]
-    fn normalize_aggregate_state_result_reorders_chunk_columns_when_metadata_is_logical() {
-        let query =
-            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .expect("aggregate calls");
-        let layout = aggregate_apply_test_helpers::count_layout("region");
-        let schema = StdArc::new(ArrowSchema::new(vec![
-            Field::new("__agg_state_c", DataType::Binary, false),
-            Field::new("region", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            StdArc::clone(&schema),
-            vec![
-                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
-                StdArc::new(StringArray::from(vec![Some("east")])),
-            ],
-        )
-        .expect("record batch");
-        let result = crate::runtime::query_result::QueryResult {
-            columns: vec![
-                crate::runtime::query_result::QueryResultColumn {
-                    name: "region".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    logical_type: None,
-                },
-                crate::runtime::query_result::QueryResultColumn {
-                    name: "__agg_state_c".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
-                    logical_type: None,
-                },
-            ],
-            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
-        };
-
-        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
-            .expect("normalize");
-
-        assert_eq!(normalized.columns[0].name, "region");
-        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
-        assert_eq!(normalized.columns[1].name, "__agg_state_c");
-        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
-        let chunk = &normalized.chunks[0];
-        assert_eq!(chunk.batch.schema().field(0).name(), "region");
-        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
-        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
-        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
-    }
-
-    #[test]
-    fn aggregate_first_refresh_uses_state_shaped_select() {
-        let sql = "select region, avg(amount) as a \
-                   from ice.ns.fact group by region";
-        let query = parse_select_query(sql);
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .expect("extract aggregate calls");
-
-        let state_sql = iceberg_aggregate_first_refresh_select_sql(sql, &calls).expect("rewrite");
-        let upper = state_sql.to_uppercase();
-
-        assert!(
-            upper.contains("AVG_STATE(AMOUNT) AS __AGG_STATE_A"),
-            "sql={state_sql}"
-        );
-        assert!(!upper.contains("__AGG_STATE_A__SUM"), "sql={state_sql}");
-        assert!(!upper.contains("__AGG_STATE_A__COUNT"), "sql={state_sql}");
-        assert!(!upper.contains("__ROW_ID__"), "sql={state_sql}");
     }
 
     #[test]
