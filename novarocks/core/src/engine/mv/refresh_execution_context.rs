@@ -555,7 +555,7 @@ impl IcebergMvRefreshContext {
 #[cfg(test)]
 pub(crate) fn bind_target_state_file_positions(
     mut source: ScanSource,
-    matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
+    matched_positions: &[crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet],
     target: &str,
 ) -> Result<ScanSource, String> {
     let ScanSource::IcebergDataFiles { files, .. } = &mut source else {
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn bind_target_state_file_positions_keeps_only_matched_files() {
         let positions = vec![
-            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+            crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet {
                 referenced_data_file: "s3://bucket/mv/data-b.parquet".to_string(),
                 positions: vec![2, 8, 13],
             },
@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn bind_target_state_file_positions_rejects_missing_files() {
         let positions = vec![
-            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+            crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet {
                 referenced_data_file: "s3://bucket/mv/missing.parquet".to_string(),
                 positions: vec![1],
             },

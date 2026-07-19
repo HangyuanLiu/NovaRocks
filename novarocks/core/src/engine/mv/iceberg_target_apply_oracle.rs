@@ -15,17 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Target-row location helpers for Iceberg MV incremental apply.
+//! Differential oracle for Iceberg MV target-row location.
 //!
 //! The production apply path locates old target rows *in-plan*: the refresh
 //! framework scans the target, emits `_file`/`_pos` plus the apply key, and
 //! joins on the apply key (the W1/W3/W4/W5 cutover). The direct iceberg-rust
-//! scan locators below (`locate_target_rows_*`,
-//! `resolve_target_positions_via_framework`) are therefore no longer on any
-//! production path. They are retained only as `#[cfg(test)]` differential
-//! oracles: unit tests cross-check the new in-plan locator against this
-//! original direct-scan implementation. Gating them out of non-test builds
-//! keeps direct iceberg-rust reads out of the release binary.
+//! scan locators below are retained only as test oracles. This entire module is
+//! gated by `engine::mv::mod`, so release builds cannot compile or call these
+//! direct-scan helpers.
 
 #[cfg(test)]
 use crate::mv::model::TargetPartitionFilter;
@@ -38,135 +35,11 @@ use crate::mv::persistence::schema::{
 use crate::mv::persistence::schema::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
-
-pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
-        name: HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::BigInt,
-        nullable: false,
-        aggregation: None,
-        default: None,
-    }
-}
-
-pub(crate) fn join_apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
-        name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::String,
-        nullable: false,
-        aggregation: None,
-        default: None,
-    }
-}
-
-pub(crate) fn branch_id_table_column() -> crate::sql::parser::ast::TableColumnDef {
-    crate::sql::parser::ast::TableColumnDef {
-        name: BRANCH_ID_COLUMN_NAME.to_string(),
-        data_type: crate::catalog::schema::SqlType::Int,
-        nullable: false,
-        aggregation: None,
-        default: None,
-    }
-}
-
-pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
-        .map_err(|e| format!("iceberg MV physical SELECT normalize error: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("iceberg MV physical SELECT parse error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("iceberg MV physical SELECT expects a SELECT query".to_string());
-    };
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
-    };
-
-    for item in &select.projection {
-        match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                if expr
-                    .to_string()
-                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                {
-                    return Err(format!(
-                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
-                    ));
-                }
-            }
-            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
-                if alias
-                    .value
-                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                {
-                    return Err(format!(
-                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
-                    ));
-                }
-            }
-            sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
-                return Err(
-                    "iceberg MV physical SELECT requires explicit projection columns".to_string(),
-                );
-            }
-        }
-    }
-
-    select
-        .projection
-        .push(sqlparser::ast::SelectItem::ExprWithAlias {
-            expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-            alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
-        });
-    Ok(stmt.to_string())
-}
-
-pub(crate) fn find_apply_key_field_id_by_column(
-    table: &iceberg::table::Table,
-    apply_key_column: &str,
-) -> Result<i32, String> {
-    let mut matches = table
-        .metadata()
-        .current_schema()
-        .as_struct()
-        .fields()
-        .iter()
-        .filter(|field| field.name.eq_ignore_ascii_case(apply_key_column));
-    let Some(field) = matches.next() else {
-        return Err(format!(
-            "iceberg MV target schema is missing apply-key column {apply_key_column}"
-        ));
-    };
-    if matches.next().is_some() {
-        return Err(format!(
-            "iceberg MV target schema has duplicate apply-key column {apply_key_column}"
-        ));
-    }
-    Ok(field.id)
-}
-
-pub(crate) fn ensure_base_row_lineage_contract(
-    table: &iceberg::table::Table,
-    base_fqn: &str,
-) -> Result<(), String> {
-    let metadata = table.metadata();
-    if metadata.format_version() != iceberg::spec::FormatVersion::V3
-        || !row_lineage_property_enabled(metadata.properties())
-    {
-        return Err(format!(
-            "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3 with write.row-lineage=true; \
-             upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
-        ));
-    }
-    Ok(())
-}
-
-fn row_lineage_property_enabled(props: &std::collections::HashMap<String, String>) -> bool {
-    props
-        .get("write.row-lineage")
-        .map(|value| value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
+use crate::mv::refresh::target_apply::{
+    apply_key_table_column, branch_id_table_column,
+    expose_physical_apply_key_for_locator_registration, iceberg_mv_physical_select_sql,
+    join_apply_key_table_column,
+};
 
 #[cfg(test)]
 pub(crate) fn load_target_apply_locator_inputs(
@@ -1320,83 +1193,6 @@ fn framework_locator_loaded_table(
         key_desc: None,
         column_aggregations: std::collections::HashMap::new(),
         object_store_config,
-    })
-}
-
-pub(crate) fn expose_physical_apply_key_for_locator_registration(
-    mut table_def: crate::sql::planner::table::TableDef,
-    target_table: &iceberg::table::Table,
-    apply_key_column: &str,
-) -> Result<crate::sql::planner::table::TableDef, String> {
-    let has_file = table_def
-        .iceberg_row_lineage_metadata_columns
-        .iter()
-        .any(|column| column.name == "_file");
-    let has_pos = table_def
-        .iceberg_row_lineage_metadata_columns
-        .iter()
-        .any(|column| column.name == "_pos");
-    if !has_file || !has_pos {
-        return Err(
-            "framework target locator registration missing _file/_pos metadata".to_string(),
-        );
-    }
-    if table_def
-        .columns
-        .iter()
-        .any(|column| column.name.eq_ignore_ascii_case(apply_key_column))
-    {
-        return Ok(table_def);
-    }
-
-    // Standard MV target registration hides the physical apply-key; the
-    // internal locator table re-exposes it only for this framework SELECT.
-    let apply_key = iceberg_column_def_for_locator(target_table, apply_key_column)?;
-    table_def.columns.insert(0, apply_key);
-    Ok(table_def)
-}
-
-fn iceberg_column_def_for_locator(
-    target_table: &iceberg::table::Table,
-    column_name: &str,
-) -> Result<crate::catalog::schema::ColumnDef, String> {
-    let iceberg_schema = target_table.metadata().current_schema();
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
-    let field = arrow_schema
-        .fields()
-        .iter()
-        .find(|field| field.name().eq_ignore_ascii_case(column_name))
-        .ok_or_else(|| {
-            format!("iceberg MV target schema is missing apply-key column {column_name}")
-        })?;
-    let nested = iceberg_schema.field_by_name(field.name()).ok_or_else(|| {
-        format!(
-            "iceberg target column `{}` missing from schema",
-            field.name()
-        )
-    })?;
-    Ok(crate::catalog::schema::ColumnDef {
-        name: field.name().clone(),
-        data_type: field.data_type().clone(),
-        nullable: field.is_nullable(),
-        write_default: nested
-            .write_default
-            .as_ref()
-            .map(|literal| {
-                crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
-                    literal,
-                    nested.field_type.as_ref(),
-                )
-                .map_err(|e| {
-                    format!(
-                        "convert Iceberg MV locator write-default for column `{}` failed: {e}",
-                        field.name()
-                    )
-                })
-            })
-            .transpose()?,
-        logical_type: None,
     })
 }
 
