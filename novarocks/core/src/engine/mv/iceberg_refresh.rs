@@ -52,10 +52,6 @@ use crate::connector::iceberg::operation_lifecycle::{
 use crate::engine::mv::analysis_adapter::{
     analyze_mv_select, descriptor_from_loaded, now_ms, validate_ivm_primary_key,
 };
-use crate::engine::mv::iceberg_target_apply::{
-    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
-    find_apply_key_field_id_by_column, iceberg_mv_physical_select_sql, join_apply_key_table_column,
-};
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
@@ -116,6 +112,11 @@ use crate::mv::refresh::planning::{
 };
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
+};
+use crate::mv::refresh::target_apply::{
+    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
+    expose_physical_apply_key_for_locator_registration, find_apply_key_field_id_by_column,
+    iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
@@ -14506,7 +14507,7 @@ fn build_join_delta_target_locator_table_def(
     };
     table_def.name =
         crate::engine::mv::iceberg_join_branch::JOIN_DELTA_TARGET_LOCATOR_TABLE.to_string();
-    crate::engine::mv::iceberg_target_apply::expose_physical_apply_key_for_locator_registration(
+    expose_physical_apply_key_for_locator_registration(
         table_def,
         target_table,
         JOIN_APPLY_KEY_COLUMN_NAME,
@@ -16732,7 +16733,7 @@ mod tests {
 
     #[test]
     fn iceberg_join_mv_uses_join_apply_key_column() {
-        let column = crate::engine::mv::iceberg_target_apply::join_apply_key_table_column();
+        let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
         assert_eq!(
             column.name,
             crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME

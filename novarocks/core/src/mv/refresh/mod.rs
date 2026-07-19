@@ -22,3 +22,4 @@ pub(crate) mod execution;
 pub(crate) mod pin;
 pub(crate) mod planning;
 pub(crate) mod snapshot;
+pub(crate) mod target_apply;
