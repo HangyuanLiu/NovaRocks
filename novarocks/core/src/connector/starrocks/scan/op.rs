@@ -32,10 +32,10 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_logging::{info, warn};
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 use crate::runtime::starlet_shard_registry;
 use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
-use crate::thrift::types;
 
 use super::reader::StarRocksNativeReader;
 
@@ -80,7 +80,7 @@ pub struct LakeScanSchemaMeta {
     pub db_id: i64,
     pub table_id: i64,
     pub schema_id: i64,
-    pub fe_addr: Option<types::TNetworkAddress>,
+    pub fe_addr: Option<RuntimeEndpoint>,
     pub query_id: Option<UniqueId>,
     pub native_tablet_schema: Option<TabletSchemaPb>,
     pub native_column_hints: Option<Vec<StarRocksSchemaColumnHint>>,

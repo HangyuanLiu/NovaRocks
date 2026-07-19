@@ -22,6 +22,7 @@ use moka::sync::Cache;
 
 use crate::common::config;
 use crate::common::types::UniqueId;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::thrift::agent_service::TTabletSchema;
@@ -281,14 +282,16 @@ impl TableSchemaService {
     }
 }
 
-pub(crate) fn resolve_frontend_addr(
-    fe_addr: Option<&types::TNetworkAddress>,
+fn scan_frontend_transport_address(
+    fe_addr: Option<&RuntimeEndpoint>,
 ) -> Option<types::TNetworkAddress> {
-    fe_addr.cloned().or_else(disk_report::latest_fe_addr)
+    fe_addr
+        .map(|endpoint| types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()))
+        .or_else(disk_report::latest_fe_addr)
 }
 
 pub(crate) fn fetch_table_schema_for_lake_scan(
-    fe_addr: Option<&types::TNetworkAddress>,
+    fe_addr: Option<&RuntimeEndpoint>,
     db_id: i64,
     table_id: i64,
     schema_id: i64,
@@ -302,7 +305,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
             db_id, table_id, schema_id
         )
     })?;
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
+    let fe_addr = scan_frontend_transport_address(fe_addr).ok_or_else(|| {
         "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
             .to_string()
     })?;

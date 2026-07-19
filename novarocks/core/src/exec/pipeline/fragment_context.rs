@@ -32,14 +32,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::exec::pipeline::schedule::event_scheduler::EventScheduler;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_state::RuntimeState;
-
-#[cfg(feature = "compat")]
-pub(crate) type FragmentFeAddress = crate::thrift::types::TNetworkAddress;
-#[cfg(not(feature = "compat"))]
-pub(crate) type FragmentFeAddress = crate::runtime::endpoint::RuntimeEndpoint;
 
 /// Fragment-scoped runtime context shared across drivers and operator instances.
 pub(crate) struct FragmentContext {
@@ -50,7 +46,7 @@ pub(crate) struct FragmentContext {
     #[allow(dead_code)]
     query_id: Option<QueryId>,
     #[allow(dead_code)]
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     #[allow(dead_code)]
     backend_num: Option<i32>,
     #[allow(dead_code)]
@@ -68,7 +64,7 @@ impl FragmentContext {
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
         query_id: Option<QueryId>,
-        fe_addr: Option<FragmentFeAddress>,
+        fe_addr: Option<RuntimeEndpoint>,
         backend_num: Option<i32>,
     ) -> Self {
         let enable_profile = runtime_state
@@ -110,7 +106,7 @@ impl FragmentContext {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn fe_addr(&self) -> Option<&FragmentFeAddress> {
+    pub(crate) fn fe_addr(&self) -> Option<&RuntimeEndpoint> {
         self.fe_addr.as_ref()
     }
 

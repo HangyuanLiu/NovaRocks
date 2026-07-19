@@ -26,11 +26,10 @@ use crate::common::thrift::{thrift_binary_deserialize, thrift_named_json};
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::lower::compat::fragment::execute_fragment;
-use crate::lower::compat::node::hdfs_scan::cache_iceberg_table_locations;
-use crate::lower::compat::node::lower_row_pos_descs;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::compat::endpoint::destination_address;
 use crate::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
+use crate::protocol::starrocks::decode::node::lower_row_pos_descs;
 use crate::protocol::starrocks::decode::{
     decode_query_options, decode_runtime_endpoint, decode_runtime_filter_params,
 };
@@ -575,6 +574,7 @@ fn spawn_exec_fragment(
     fragment: planner::TPlanFragment,
     desc_tbl: Option<descriptors::TDescriptorTable>,
     exec_params: internal_service::TPlanFragmentExecParams,
+    batch_exchange_sender_counts: HashMap<i32, usize>,
     query_opts: Option<internal_service::TQueryOptions>,
     session_time_zone: Option<String>,
     pipeline_dop: i32,
@@ -624,6 +624,7 @@ fn spawn_exec_fragment(
                     &fragment,
                     desc_tbl.as_ref(),
                     Some(&exec_params),
+                    &batch_exchange_sender_counts,
                     query_opts,
                     session_time_zone.as_deref(),
                     pipeline_dop,
@@ -912,8 +913,6 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             observe_total_fragments(ctx, exec_params);
             Ok(())
         })?;
-        let desc_snapshot = mgr.descriptor_snapshot(query_id);
-        cache_iceberg_table_locations(desc_snapshot.as_deref());
         let pipeline_dop = resolve_pipeline_dop(one);
         let group_execution_scan_dop = one.group_execution_scan_dop;
         let query_opts = query_opts.cloned();
@@ -937,6 +936,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             fragment,
             desc_tbl.clone(),
             exec_params,
+            sender_counts.clone(),
             query_opts,
             session_time_zone,
             pipeline_dop,
@@ -1035,8 +1035,6 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let desc_tbl =
         resolve_desc_tbl_for_instance(mgr.as_ref(), query_id, one.desc_tbl.as_ref(), None)?;
-    let desc_snapshot = mgr.descriptor_snapshot(query_id);
-    cache_iceberg_table_locations(desc_snapshot.as_deref());
     // Result buffer timeout is derived from QueryContext by finst_id.
     let enable_profile = query_opts
         .and_then(|opts| opts.enable_profile)
@@ -1119,6 +1117,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         fragment,
         desc_tbl.clone(),
         params,
+        HashMap::new(),
         one.query_options.clone(),
         session_time_zone,
         pipeline_dop,
@@ -1188,8 +1187,6 @@ pub(crate) fn execute_plan_fragment_sync(
     let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
     let desc_tbl =
         resolve_desc_tbl_for_instance(mgr.as_ref(), query_id, one.desc_tbl.as_ref(), None)?;
-    let desc_snapshot = mgr.descriptor_snapshot(query_id);
-    cache_iceberg_table_locations(desc_snapshot.as_deref());
 
     let pipeline_dop = resolve_pipeline_dop(&one);
     let group_execution_scan_dop = one.group_execution_scan_dop;
@@ -1213,6 +1210,7 @@ pub(crate) fn execute_plan_fragment_sync(
         &fragment,
         desc_tbl.as_ref(),
         Some(&params),
+        &HashMap::new(),
         query_opts,
         session_time_zone,
         pipeline_dop,

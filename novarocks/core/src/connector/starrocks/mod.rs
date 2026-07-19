@@ -18,6 +18,7 @@
 pub mod fe_v2_meta;
 pub(crate) mod fs_access;
 pub mod lake;
+pub(crate) mod lake_meta_storage;
 mod object_store_profile;
 pub mod scan;
 pub mod sink;

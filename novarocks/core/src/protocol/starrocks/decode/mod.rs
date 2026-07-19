@@ -15,12 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod dependency;
+pub(crate) mod descriptor;
 mod endpoint;
 mod error;
+pub(crate) mod expr;
+pub(crate) mod layout;
+pub(crate) mod node;
 mod options;
 mod runtime_filter;
+pub(crate) mod runtime_filter_pushdown;
+pub(crate) mod schema;
+pub(crate) mod sink;
+pub(crate) mod type_lowering;
 
+pub(crate) use dependency::{
+    LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageFacts, LakeMetaStorageRequest,
+    LakeMetaTabletRequest, StarRocksExternalDependency, StarRocksExternalDependencyDraft,
+};
 pub(crate) use endpoint::{decode_fragment_destination, decode_runtime_endpoint};
 pub(crate) use error::StarRocksFragmentDecodeError;
 pub(crate) use options::decode_query_options;
 pub(crate) use runtime_filter::decode_runtime_filter_params;
+
+pub(crate) fn decode_expression_for_layout(
+    expr: &crate::thrift::exprs::TExpr,
+    arena: &mut crate::exec::expr::ExprArena,
+    layout: &layout::Layout,
+) -> Result<crate::exec::expr::ExprId, String> {
+    expr::lower_t_expr(expr, arena, layout, None, None)
+}
+
+#[cfg(test)]
+mod task2_tests;

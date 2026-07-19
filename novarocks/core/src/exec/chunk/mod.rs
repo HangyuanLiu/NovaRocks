@@ -19,8 +19,6 @@ mod chunk_impl;
 mod hydrate;
 mod memory;
 mod schema;
-#[cfg(feature = "compat")]
-pub(crate) mod schema_thrift;
 #[cfg(test)]
 mod tests;
 pub(crate) mod type_compatibility;

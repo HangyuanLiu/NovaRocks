@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use crate::common::types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeEndpoint {
+pub struct RuntimeEndpoint {
     host: String,
     port: i32,
 }

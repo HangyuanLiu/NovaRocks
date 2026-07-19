@@ -27,10 +27,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
-#[cfg(feature = "compat")]
-type SchemaFeAddress = crate::thrift::types::TNetworkAddress;
-#[cfg(not(feature = "compat"))]
-type SchemaFeAddress = crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::endpoint::RuntimeEndpoint;
 
 use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;
@@ -52,7 +49,7 @@ pub(crate) struct SchemaScanOp {
     context: SchemaScanContext,
     output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
-    fe_addr: Option<SchemaFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
 }
 
 impl SchemaScanOp {
@@ -61,7 +58,7 @@ impl SchemaScanOp {
         context: SchemaScanContext,
         output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
-        fe_addr: Option<SchemaFeAddress>,
+        fe_addr: Option<RuntimeEndpoint>,
     ) -> Self {
         Self {
             table,
@@ -73,12 +70,14 @@ impl SchemaScanOp {
     }
 
     fn collect_rows(&self) -> Result<Vec<SchemaRow>, String> {
+        #[cfg(feature = "compat")]
+        let fe_addr = schema_scan_frontend_transport_address(self.fe_addr.as_ref());
         let mut rows = match &self.table {
             #[cfg(feature = "compat")]
-            SchemaTable::Loads => loads::fetch_rows(&self.context, self.fe_addr.as_ref())?,
+            SchemaTable::Loads => loads::fetch_rows(&self.context, fe_addr.as_ref())?,
             #[cfg(feature = "compat")]
             SchemaTable::LoadTrackingLogs => {
-                load_tracking_logs::fetch_rows(&self.context, self.fe_addr.as_ref())?
+                load_tracking_logs::fetch_rows(&self.context, fe_addr.as_ref())?
             }
             #[cfg(feature = "compat")]
             SchemaTable::AnalyzeStatus
@@ -132,7 +131,7 @@ impl SchemaScanOp {
             | SchemaTable::GrantsToRoles
             | SchemaTable::GrantsToUsers
             | SchemaTable::RoleEdges => {
-                fe_tables::fetch_rows(&self.table, &self.context, self.fe_addr.as_ref())?
+                fe_tables::fetch_rows(&self.table, &self.context, fe_addr.as_ref())?
             }
             SchemaTable::Be(BeSchemaTable::TabletWriteLog) => {
                 be_tablet_write_log_store::snapshot(&self.context)
@@ -337,6 +336,15 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
+}
+
+#[cfg(feature = "compat")]
+fn schema_scan_frontend_transport_address(
+    endpoint: Option<&RuntimeEndpoint>,
+) -> Option<crate::thrift::types::TNetworkAddress> {
+    endpoint.map(|endpoint| {
+        crate::thrift::types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port())
+    })
 }
 
 #[cfg(not(feature = "compat"))]
@@ -720,6 +728,20 @@ mod tests {
             #[cfg(feature = "compat")]
             frontends: Vec::new(),
         }
+    }
+
+    #[test]
+    fn schema_scan_op_accepts_runtime_endpoint_in_every_build() {
+        let endpoint = crate::runtime::endpoint::RuntimeEndpoint::new("fe.internal", 9030)
+            .expect("runtime endpoint");
+
+        let _op = SchemaScanOp::new(
+            SchemaTable::Be(BeSchemaTable::TabletWriteLog),
+            ctx("be_tablet_write_log"),
+            Arc::new(ChunkSchema::empty()),
+            true,
+            Some(endpoint),
+        );
     }
 
     #[test]

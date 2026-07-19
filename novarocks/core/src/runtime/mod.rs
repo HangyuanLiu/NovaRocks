@@ -17,8 +17,6 @@
 pub mod backend_id;
 pub(crate) mod change_op;
 pub(crate) mod descriptor_snapshot;
-#[cfg(feature = "compat")]
-pub(crate) mod descriptor_snapshot_thrift;
 pub(crate) mod endpoint;
 pub mod exchange;
 pub mod exchange_scan;

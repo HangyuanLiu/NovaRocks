@@ -28,19 +28,21 @@ pub(super) fn eval_rollup_expr(
     target_name: &str,
 ) -> Result<ArrayRef, String> {
     let mut arena = crate::exec::expr::ExprArena::default();
-    let layout = crate::lower::compat::layout::Layout {
+    let layout = crate::protocol::starrocks::decode::layout::Layout {
         order: eval_input.layout.order.clone(),
         index: eval_input.layout.index.clone(),
     };
-    let expr_id =
-        crate::lower::compat::expr::lower_t_expr(expr, &mut arena, &layout, None, None).map_err(
-            |e| {
+    let expr_id = crate::protocol::starrocks::decode::decode_expression_for_layout(
+        expr,
+        &mut arena,
+        &layout,
+    )
+    .map_err(|e| {
                 format!(
                     "rollup lower expression failed: rowset_idx={} target_index={} target_name={} context={} error={}",
                     rowset_idx, target_idx, target_name, expr_context, e
                 )
-            },
-        )?;
+            })?;
     arena.eval(expr_id, &eval_input.chunk).map_err(|e| {
         format!(
             "rollup evaluate expression failed: rowset_idx={} target_index={} target_name={} context={} error={}",

@@ -36,8 +36,6 @@ use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::service::exchange_sender::{ExchangeSendTask, ExchangeSendTracker, exchange_send_queue};
-#[cfg(feature = "compat")]
-use crate::thrift::partitions;
 use arrow::datatypes::DataType;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -1055,26 +1053,6 @@ impl DataStreamSinkFactoryInput {
             output_columns,
             destinations,
         })
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn partition_type_from_compat(
-        partition_type: partitions::TPartitionType,
-    ) -> Result<DataStreamPartitionType, String> {
-        match partition_type {
-            partitions::TPartitionType::UNPARTITIONED => Ok(DataStreamPartitionType::Unpartitioned),
-            partitions::TPartitionType::RANDOM => Ok(DataStreamPartitionType::Random),
-            partitions::TPartitionType::HASH_PARTITIONED => {
-                Ok(DataStreamPartitionType::HashPartitioned)
-            }
-            partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
-                Ok(DataStreamPartitionType::BucketShuffleHashPartitioned)
-            }
-            other => Err(format!(
-                "unsupported DATA_STREAM_SINK partition type: {:?}",
-                other
-            )),
-        }
     }
 
     pub(crate) fn try_new(

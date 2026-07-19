@@ -38,9 +38,9 @@ use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
-use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 #[cfg(feature = "compat")]
-use crate::runtime::descriptor_snapshot_thrift::descriptor_snapshot_from_thrift;
+use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
+use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
 pub(crate) use crate::runtime::query_options::query_expire_durations;
