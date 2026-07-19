@@ -24,8 +24,10 @@ use crate::connector::scan_model::starrocks::{
     StarRocksTabletSchemaDescriptor, validate_starrocks_source_descriptor,
 };
 use crate::connector::scan_planning::{BeginScanContext, SplitPlanningContext};
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+};
 use crate::connector::starrocks::table::scan_planner::{
-    StarRocksNativeColumnSchema, StarRocksNativeKeysType, StarRocksNativeTabletSchema,
     StarRocksTableScanPlanner, starrocks_scan_handle, starrocks_split,
 };
 use crate::runtime::scan_range;
@@ -111,44 +113,43 @@ pub(crate) fn plan_native_starrocks_scan_with_compat(
     Ok(PlannedNativeStarRocksScan { ranges, source })
 }
 
-fn tablet_schema_descriptor(
-    schema: StarRocksNativeTabletSchema,
-) -> StarRocksTabletSchemaDescriptor {
+fn tablet_schema_descriptor(schema: StarRocksTabletSchema) -> StarRocksTabletSchemaDescriptor {
     StarRocksTabletSchemaDescriptor {
-        schema_id: schema.schema_id,
+        schema_id: schema.id.unwrap_or_default(),
         keys_type: match schema.keys_type {
-            StarRocksNativeKeysType::Duplicate => StarRocksKeysTypeDescriptor::Duplicate,
-            StarRocksNativeKeysType::Unique => StarRocksKeysTypeDescriptor::Unique,
-            StarRocksNativeKeysType::Aggregate => StarRocksKeysTypeDescriptor::Aggregate,
-            StarRocksNativeKeysType::Primary => StarRocksKeysTypeDescriptor::Primary,
+            Some(StarRocksKeysType::Duplicate) => StarRocksKeysTypeDescriptor::Duplicate,
+            Some(StarRocksKeysType::Unique) => StarRocksKeysTypeDescriptor::Unique,
+            Some(StarRocksKeysType::Aggregate) => StarRocksKeysTypeDescriptor::Aggregate,
+            Some(StarRocksKeysType::Primary) => StarRocksKeysTypeDescriptor::Primary,
+            None => StarRocksKeysTypeDescriptor::Duplicate,
         },
         num_short_key_columns: schema.num_short_key_columns,
         sort_key_idxes: schema.sort_key_idxes,
         sort_key_unique_ids: schema.sort_key_unique_ids,
         columns: schema
-            .columns
+            .column
             .into_iter()
             .map(column_schema_descriptor)
             .collect(),
     }
 }
 
-fn column_schema_descriptor(
-    column: StarRocksNativeColumnSchema,
-) -> StarRocksColumnSchemaDescriptor {
+fn column_schema_descriptor(column: StarRocksColumnSchema) -> StarRocksColumnSchemaDescriptor {
     StarRocksColumnSchemaDescriptor {
         unique_id: column.unique_id,
         name: column.name,
-        physical_type: column.physical_type,
-        is_key: column.is_key,
+        physical_type: column.r#type,
+        is_key: column.is_key.unwrap_or(false),
         aggregation: column.aggregation,
-        nullable: column.nullable,
-        default_value: column.default_value,
+        nullable: column.is_nullable.unwrap_or(true),
+        default_value: column
+            .default_value
+            .map(|value| String::from_utf8_lossy(&value).into_owned()),
         precision: column.precision,
-        scale: column.scale,
-        visible: column.visible,
+        scale: column.frac,
+        visible: column.visible.unwrap_or(true),
         children: column
-            .children
+            .children_columns
             .into_iter()
             .map(column_schema_descriptor)
             .collect(),

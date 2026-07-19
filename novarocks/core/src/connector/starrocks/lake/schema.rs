@@ -22,6 +22,8 @@ use crate::connector::starrocks::lake::schema_adapter::{
     build_create_tablet_schema, map_create_tablet_compaction_strategy,
     map_create_tablet_persistent_index_type,
 };
+use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema;
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::writer::bundle_meta::{
     empty_tablet_metadata, load_latest_tablet_metadata, write_initial_meta_file,
     write_standalone_meta_file,
@@ -32,7 +34,7 @@ use crate::formats::starrocks::writer::layout::{
 };
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, FlatJsonConfigPb, TabletMetadataPb, TabletSchemaPb,
+    CompactionStrategyPb, FlatJsonConfigPb, TabletMetadataPb,
 };
 
 pub(crate) fn create_lake_tablet_from_req(
@@ -50,7 +52,7 @@ pub(crate) fn create_lake_tablet_from_req_with_schema_patch<P>(
     patch: P,
 ) -> Result<(), String>
 where
-    P: FnOnce(&mut TabletSchemaPb) -> Result<(), String>,
+    P: FnOnce(&mut StarRocksTabletSchema) -> Result<(), String>,
 {
     let tablet_id = request.tablet_id;
     if tablet_id <= 0 {
@@ -108,7 +110,7 @@ where
                 standalone_v1_path, e
             )
         })?;
-        if existing.schema.as_ref() == Some(&tablet_schema) {
+        if existing.schema.as_ref() == Some(&encode_tablet_schema(&tablet_schema)) {
             return Ok(());
         }
         return write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta);
@@ -135,13 +137,17 @@ where
     }
 }
 
-fn seed_tablet_metadata_schema(metadata: &mut TabletMetadataPb, tablet_schema: &TabletSchemaPb) {
-    metadata.schema = Some(tablet_schema.clone());
+fn seed_tablet_metadata_schema(
+    metadata: &mut TabletMetadataPb,
+    tablet_schema: &StarRocksTabletSchema,
+) {
+    let wire_schema = encode_tablet_schema(tablet_schema);
+    metadata.schema = Some(wire_schema.clone());
     if let Some(schema_id) = tablet_schema.id.filter(|id| *id > 0) {
         metadata
             .historical_schemas
             .entry(schema_id)
-            .or_insert_with(|| tablet_schema.clone());
+            .or_insert(wire_schema);
     }
 }
 

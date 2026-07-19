@@ -19,6 +19,8 @@ use std::collections::HashSet;
 
 use crate::common::ids::SlotId;
 use crate::connector::iceberg::sink_plan::{IcebergSinkFactoryInput, IcebergSinkPlan};
+#[cfg(feature = "compat")]
+use crate::connector::starrocks::sink::plan::StarRocksTableSinkProgram;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::operators::DataStreamPartitionType;
@@ -30,6 +32,9 @@ pub(crate) enum FragmentSinkProgram {
     Noop,
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
+    SplitDataStream(SplitDataStreamSinkProgram),
+    #[cfg(feature = "compat")]
+    StarRocksTable(StarRocksTableSinkProgram),
     IcebergTable(IcebergTableSinkProgram),
     IcebergChangeStreamRouter(IcebergChangeStreamRouterProgram),
 }
@@ -40,6 +45,11 @@ impl FragmentSinkProgram {
             Self::Result | Self::Noop => Ok(()),
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
+            Self::SplitDataStream(program) => program.validate(),
+            #[cfg(feature = "compat")]
+            Self::StarRocksTable(program) => program
+                .validate()
+                .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Sink, error)),
             Self::IcebergTable(program) => program.validate(),
             Self::IcebergChangeStreamRouter(program) => program.validate(),
         }
@@ -246,6 +256,69 @@ impl MultiCastDataStreamSinkProgram {
 
     pub(crate) const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SplitDataStreamSinkProgram {
+    sinks: Vec<DataStreamSinkBranchProgram>,
+    split_exprs: Vec<ExprId>,
+    arena: ExprArena,
+}
+
+impl SplitDataStreamSinkProgram {
+    pub(crate) fn try_new(
+        sinks: Vec<DataStreamSinkBranchProgram>,
+        split_exprs: Vec<ExprId>,
+        arena: ExprArena,
+    ) -> Result<Self, ExecPlanBuildError> {
+        let program = Self {
+            sinks,
+            split_exprs,
+            arena,
+        };
+        program.validate()?;
+        Ok(program)
+    }
+
+    fn validate(&self) -> Result<(), ExecPlanBuildError> {
+        validate_non_empty_group("SPLIT_DATA_STREAM_SINK", self.sinks.len())?;
+        if self.split_exprs.len() != self.sinks.len() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                format!(
+                    "SPLIT_DATA_STREAM_SINK split expression count {} does not match branch count {}",
+                    self.split_exprs.len(),
+                    self.sinks.len()
+                ),
+            ));
+        }
+        validate_expr_ids(
+            &self.arena,
+            &self.split_exprs,
+            "SPLIT_DATA_STREAM_SINK split",
+        )?;
+        for (index, sink) in self.sinks.iter().enumerate() {
+            sink.validate_shape(&format!("SPLIT_DATA_STREAM_SINK sink[{index}]"))?;
+            validate_expr_ids(
+                &self.arena,
+                sink.output_partition_exprs(),
+                &format!("SPLIT_DATA_STREAM_SINK sink[{index}] partition"),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sinks(&self) -> &[DataStreamSinkBranchProgram] {
+        &self.sinks
+    }
+
+    pub(crate) fn split_exprs(&self) -> &[ExprId] {
+        &self.split_exprs
+    }
+
+    pub(crate) const fn arena(&self) -> &ExprArena {
+        &self.arena
     }
 }
 

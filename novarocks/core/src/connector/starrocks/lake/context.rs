@@ -20,15 +20,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fs_access::resolve_tablet_root;
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::connector::starrocks::sink::plan::FrontendAddress;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
-use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
-use crate::thrift::types;
 
 #[derive(Clone)]
 pub(crate) struct TabletRuntimeEntry {
     pub(crate) root_path: String,
-    pub(crate) schema: TabletSchemaPb,
+    pub(crate) schema: StarRocksTabletSchema,
     pub(crate) s3_config: Option<S3StoreConfig>,
 }
 
@@ -83,18 +82,6 @@ pub(crate) enum PartialUpdateWriteMode {
     ColumnUpdate,
 }
 
-impl PartialUpdateWriteMode {
-    pub(crate) fn from_thrift(mode: Option<types::TPartialUpdateMode>) -> Self {
-        match mode {
-            Some(types::TPartialUpdateMode::ROW_MODE) => Self::Row,
-            Some(types::TPartialUpdateMode::COLUMN_UPSERT_MODE) => Self::ColumnUpsert,
-            Some(types::TPartialUpdateMode::AUTO_MODE) => Self::Auto,
-            Some(types::TPartialUpdateMode::COLUMN_UPDATE_MODE) => Self::ColumnUpdate,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AutoIncrementWritePolicy {
     pub(crate) null_expr_in_auto_increment: bool,
@@ -139,7 +126,7 @@ pub(crate) struct TabletWriteContext {
     pub(crate) table_id: i64,
     pub(crate) tablet_id: i64,
     pub(crate) tablet_root_path: String,
-    pub(crate) tablet_schema: TabletSchemaPb,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
     pub(crate) s3_config: Option<S3StoreConfig>,
     pub(crate) partial_update: PartialUpdateWritePolicy,
 }
@@ -258,7 +245,7 @@ pub(crate) fn get_tablet_runtime(tablet_id: i64) -> Result<TabletRuntimeEntry, S
 
 pub(crate) fn update_tablet_runtime_schema(
     tablet_id: i64,
-    schema: &TabletSchemaPb,
+    schema: &StarRocksTabletSchema,
 ) -> Result<(), String> {
     if tablet_id <= 0 {
         return Err(format!(

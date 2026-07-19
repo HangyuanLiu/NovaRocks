@@ -27,6 +27,7 @@ use crate::catalog::identifier::normalize_identifier;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema_bytes;
 use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
@@ -46,7 +47,6 @@ use crate::sql::parser::ast::{
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use prost::Message;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::starrocks::table::catalog::{
@@ -301,7 +301,7 @@ pub(crate) fn create_mv(
         .update_schema_payload(
             txn.as_mut(),
             created.schema.schema_id,
-            tablet_schema_pb.encode_to_vec(),
+            encode_tablet_schema_bytes(&tablet_schema_pb),
         )
         .map_err(|e| format!("update StarRocks materialized view schema metadata failed: {e}"))?;
     state

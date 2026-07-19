@@ -19,7 +19,9 @@ use std::any::Any;
 use std::collections::HashSet;
 
 use crate::connector::scan_planning::{ConnectorScanHandle, ConnectorSplit, ScanHandle, Split};
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
+#[cfg(test)]
+use crate::connector::starrocks::schema::StarRocksKeysType;
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 
 const CONNECTOR_ID: &str = "starrocks";
 
@@ -51,47 +53,14 @@ pub(crate) struct StarRocksStorageColumn {
     pub(crate) default_value: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StarRocksNativeKeysType {
-    Duplicate,
-    Unique,
-    Aggregate,
-    Primary,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StarRocksNativeColumnSchema {
-    pub(crate) unique_id: i32,
-    pub(crate) name: Option<String>,
-    pub(crate) physical_type: String,
-    pub(crate) is_key: bool,
-    pub(crate) aggregation: Option<String>,
-    pub(crate) nullable: bool,
-    pub(crate) default_value: Option<String>,
-    pub(crate) precision: Option<i32>,
-    pub(crate) scale: Option<i32>,
-    pub(crate) visible: bool,
-    pub(crate) children: Vec<StarRocksNativeColumnSchema>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StarRocksNativeTabletSchema {
-    pub(crate) schema_id: i64,
-    pub(crate) keys_type: StarRocksNativeKeysType,
-    pub(crate) num_short_key_columns: Option<i32>,
-    pub(crate) sort_key_idxes: Vec<u32>,
-    pub(crate) sort_key_unique_ids: Vec<u32>,
-    pub(crate) columns: Vec<StarRocksNativeColumnSchema>,
-}
-
 #[cfg(test)]
 pub(crate) fn test_native_tablet_schema(
     schema_id: i64,
     columns: &[StarRocksStorageColumn],
-) -> StarRocksNativeTabletSchema {
-    StarRocksNativeTabletSchema {
-        schema_id,
-        keys_type: StarRocksNativeKeysType::Duplicate,
+) -> StarRocksTabletSchema {
+    StarRocksTabletSchema {
+        id: Some(schema_id),
+        keys_type: Some(StarRocksKeysType::Duplicate),
         num_short_key_columns: Some(1.min(columns.len()) as i32),
         sort_key_idxes: if columns.is_empty() { vec![] } else { vec![0] },
         sort_key_unique_ids: columns
@@ -99,23 +68,28 @@ pub(crate) fn test_native_tablet_schema(
             .map(|column| column.unique_id as u32)
             .into_iter()
             .collect(),
-        columns: columns
+        column: columns
             .iter()
             .enumerate()
-            .map(|(index, column)| StarRocksNativeColumnSchema {
+            .map(|(index, column)| StarRocksColumnSchema {
                 unique_id: column.unique_id,
                 name: Some(column.name.clone()),
-                physical_type: "BIGINT".to_string(),
-                is_key: index == 0,
+                r#type: "BIGINT".to_string(),
+                is_key: Some(index == 0),
                 aggregation: None,
-                nullable: true,
-                default_value: column.default_value.clone(),
+                is_nullable: Some(true),
+                default_value: column
+                    .default_value
+                    .as_ref()
+                    .map(|value| value.as_bytes().to_vec()),
                 precision: None,
-                scale: None,
-                visible: true,
-                children: Vec::new(),
+                frac: None,
+                visible: Some(true),
+                children_columns: Vec::new(),
+                ..Default::default()
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -125,7 +99,7 @@ pub(crate) fn test_native_tablet_schema_for_column(
     name: &str,
     unique_id: i32,
     default_value: Option<&str>,
-) -> StarRocksNativeTabletSchema {
+) -> StarRocksTabletSchema {
     test_native_tablet_schema(
         schema_id,
         &[StarRocksStorageColumn {
@@ -136,14 +110,14 @@ pub(crate) fn test_native_tablet_schema_for_column(
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StarRocksNativeScanSource {
     pub(crate) catalog_name: String,
     pub(crate) db_id: i64,
     pub(crate) table_id: i64,
     pub(crate) schema_id: i64,
     pub(crate) storage_columns: Vec<StarRocksStorageColumn>,
-    pub(crate) tablet_schema: StarRocksNativeTabletSchema,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
 }
 
 impl ConnectorSplit for StarRocksSplit {
@@ -157,7 +131,7 @@ pub(crate) struct StarRocksScanHandle {
     pub(crate) table: StarRocksTableHandle,
     pub(crate) schema_id: i64,
     pub(crate) storage_columns: Vec<StarRocksStorageColumn>,
-    pub(crate) tablet_schema: StarRocksNativeTabletSchema,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
 }
 
 impl StarRocksScanHandle {
@@ -173,22 +147,10 @@ impl StarRocksScanHandle {
     }
 }
 
-fn native_keys_type(raw: Option<i32>) -> Result<StarRocksNativeKeysType, String> {
-    match raw.and_then(|value| KeysType::try_from(value).ok()) {
-        Some(KeysType::DupKeys) => Ok(StarRocksNativeKeysType::Duplicate),
-        Some(KeysType::UniqueKeys) => Ok(StarRocksNativeKeysType::Unique),
-        Some(KeysType::AggKeys) => Ok(StarRocksNativeKeysType::Aggregate),
-        Some(KeysType::PrimaryKeys) => Ok(StarRocksNativeKeysType::Primary),
-        None => Err(format!(
-            "StarRocks tablet schema keys_type is missing or unknown: {raw:?}"
-        )),
-    }
-}
-
 fn native_column_schema(
-    column: &ColumnPb,
+    column: &StarRocksColumnSchema,
     top_level: bool,
-) -> Result<StarRocksNativeColumnSchema, String> {
+) -> Result<StarRocksColumnSchema, String> {
     let name = column
         .name
         .as_deref()
@@ -312,25 +274,26 @@ fn native_column_schema(
             }
         }
     }
-    Ok(StarRocksNativeColumnSchema {
+    Ok(StarRocksColumnSchema {
         unique_id: column.unique_id,
         name,
-        physical_type,
-        is_key,
+        r#type: physical_type,
+        is_key: Some(is_key),
         aggregation,
-        nullable,
-        default_value,
+        is_nullable: Some(nullable),
+        default_value: default_value.map(String::into_bytes),
         precision: column.precision,
-        scale: column.frac,
-        visible,
-        children,
+        frac: column.frac,
+        visible: Some(visible),
+        children_columns: children,
+        ..Default::default()
     })
 }
 
 fn native_tablet_schema(
     schema_id: i64,
-    schema: &TabletSchemaPb,
-) -> Result<StarRocksNativeTabletSchema, String> {
+    schema: &StarRocksTabletSchema,
+) -> Result<StarRocksTabletSchema, String> {
     if schema_id <= 0 || schema.id != Some(schema_id) {
         return Err(format!(
             "StarRocks tablet schema id mismatch: runtime_schema_id={schema_id} tablet_schema_id={:?}",
@@ -397,13 +360,18 @@ fn native_tablet_schema(
             "StarRocks tablet schema sort key indexes and unique ids are inconsistent".to_string(),
         );
     }
-    Ok(StarRocksNativeTabletSchema {
-        schema_id,
-        keys_type: native_keys_type(schema.keys_type)?,
+    Ok(StarRocksTabletSchema {
+        id: Some(schema_id),
+        keys_type: Some(
+            schema
+                .keys_type
+                .ok_or_else(|| "StarRocks tablet schema keys_type is missing".to_string())?,
+        ),
         num_short_key_columns: schema.num_short_key_columns,
         sort_key_idxes: schema.sort_key_idxes.clone(),
         sort_key_unique_ids: schema.sort_key_unique_ids.clone(),
-        columns,
+        column: columns,
+        ..Default::default()
     })
 }
 
@@ -424,7 +392,9 @@ pub(crate) fn starrocks_split(split: &Split) -> Result<&StarRocksSplit, String> 
         .ok_or_else(|| "expected StarRocksSplit for starrocks split".to_string())
 }
 
-fn native_storage_columns(schema: &TabletSchemaPb) -> Result<Vec<StarRocksStorageColumn>, String> {
+fn native_storage_columns(
+    schema: &StarRocksTabletSchema,
+) -> Result<Vec<StarRocksStorageColumn>, String> {
     let mut unique_ids = HashSet::new();
     let mut names = HashSet::new();
     let mut out = Vec::new();
@@ -486,7 +456,7 @@ fn validate_runtime_snapshot(
     runtime_table_id: i64,
     runtime_schema_id: i64,
     runtime_storage_columns: &[StarRocksStorageColumn],
-    runtime_tablet_schema: &StarRocksNativeTabletSchema,
+    runtime_tablet_schema: &StarRocksTabletSchema,
 ) -> Result<(), String> {
     if runtime_db_id != scan.table.db_id || runtime_table_id != scan.table.table_id {
         return Err(format!(

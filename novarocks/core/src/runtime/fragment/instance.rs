@@ -181,6 +181,40 @@ pub(crate) enum FragmentSinkAssignment {
         groups: Vec<Vec<FragmentDestination>>,
         sender_id: Option<i32>,
     },
+    StarRocksTable(StarRocksTableSinkAssignment),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksTableSinkAssignment {
+    txn_id: i64,
+    load_id: UniqueId,
+    frontend: Option<RuntimeEndpoint>,
+}
+
+impl StarRocksTableSinkAssignment {
+    pub(crate) const fn new(
+        txn_id: i64,
+        load_id: UniqueId,
+        frontend: Option<RuntimeEndpoint>,
+    ) -> Self {
+        Self {
+            txn_id,
+            load_id,
+            frontend,
+        }
+    }
+
+    pub(crate) const fn txn_id(&self) -> i64 {
+        self.txn_id
+    }
+
+    pub(crate) const fn load_id(&self) -> UniqueId {
+        self.load_id
+    }
+
+    pub(crate) const fn frontend(&self) -> Option<&RuntimeEndpoint> {
+        self.frontend.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

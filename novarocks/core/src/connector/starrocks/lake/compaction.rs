@@ -23,6 +23,7 @@ use crate::connector::starrocks::lake::txn_log::{
     build_metadata_object_store_profile_for_partial, build_rowset_for_upsert_batch,
     build_tablet_output_schema, write_txn_log_file,
 };
+use crate::connector::starrocks::schema::StarRocksKeysType;
 use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
@@ -32,7 +33,7 @@ use crate::formats::starrocks::writer::parquet::read_bundle_parquet_snapshot_if_
 use crate::novarocks_logging::warn;
 use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortCompactionResponse, CompactRequest, CompactResponse, CompactStat,
-    KeysType, StatusPb, TxnLogPb, txn_log_pb,
+    StatusPb, TxnLogPb, txn_log_pb,
 };
 
 const STATUS_CODE_OK: i32 = 0;
@@ -143,7 +144,7 @@ fn compact_one_tablet(
         object_store_profile.as_ref(),
     )?;
     let tablet_schema = snapshot.tablet_schema.clone();
-    if tablet_schema.keys_type == Some(KeysType::PrimaryKeys as i32) {
+    if tablet_schema.keys_type == Some(StarRocksKeysType::Primary) {
         return Err(format!(
             "compact does not support PRIMARY_KEYS yet: tablet_id={tablet_id}"
         ));

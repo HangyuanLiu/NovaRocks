@@ -29,12 +29,14 @@ use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use arrow::datatypes::{DataType, Field, Fields, SchemaRef, TimeUnit};
 
 use crate::common::largeint;
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+};
 use crate::formats::starrocks::metadata::{
     StarRocksDeletePredicateRaw, StarRocksDelvecMetaRaw, StarRocksSegmentFile,
     StarRocksTabletSnapshot,
 };
 use crate::formats::starrocks::segment::{StarRocksSegmentColumnMeta, StarRocksSegmentFooter};
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
 
 const STARROCKS_TYPE_TINYINT: &str = "TINYINT";
 const STARROCKS_TYPE_SMALLINT: &str = "SMALLINT";
@@ -421,8 +423,8 @@ pub struct StarRocksNativeReadPlan {
 }
 
 struct SchemaColumnLookup<'a> {
-    by_name: HashMap<String, &'a ColumnPb>,
-    by_unique_id: HashMap<u32, &'a ColumnPb>,
+    by_name: HashMap<String, &'a StarRocksColumnSchema>,
+    by_unique_id: HashMap<u32, &'a StarRocksColumnSchema>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -442,7 +444,7 @@ pub fn build_native_read_plan(
     snapshot: &StarRocksTabletSnapshot,
     segment_footers: &[StarRocksSegmentFooter],
     output_schema: &SchemaRef,
-    source_tablet_schema: Option<&TabletSchemaPb>,
+    source_tablet_schema: Option<&StarRocksTabletSchema>,
 ) -> Result<StarRocksNativeReadPlan, String> {
     let output_column_hints = vec![
         StarRocksOutputColumnHint {
@@ -466,7 +468,7 @@ pub fn build_native_read_plan_with_output_hints(
     segment_footers: &[StarRocksSegmentFooter],
     output_schema: &SchemaRef,
     output_column_hints: &[StarRocksOutputColumnHint],
-    source_tablet_schema: Option<&TabletSchemaPb>,
+    source_tablet_schema: Option<&StarRocksTabletSchema>,
 ) -> Result<StarRocksNativeReadPlan, String> {
     if segment_footers.len() != snapshot.segment_files.len() {
         return Err(format!(
@@ -696,12 +698,12 @@ pub fn build_native_read_plan_with_output_hints(
 }
 
 fn build_schema_column_lookup<'a>(
-    schema_columns: &'a [ColumnPb],
+    schema_columns: &'a [StarRocksColumnSchema],
     tablet_id: i64,
     version: i64,
 ) -> Result<SchemaColumnLookup<'a>, String> {
-    let mut by_name = HashMap::<String, &'a ColumnPb>::new();
-    let mut by_unique_id = HashMap::<u32, &'a ColumnPb>::new();
+    let mut by_name = HashMap::<String, &'a StarRocksColumnSchema>::new();
+    let mut by_unique_id = HashMap::<u32, &'a StarRocksColumnSchema>::new();
     for col in schema_columns {
         let name = col
             .name
@@ -746,10 +748,10 @@ fn build_schema_column_lookup<'a>(
 }
 
 fn build_source_schema_lookup<'a>(
-    source_schema: Option<&'a TabletSchemaPb>,
+    source_schema: Option<&'a StarRocksTabletSchema>,
 ) -> Result<SchemaColumnLookup<'a>, String> {
-    let mut by_name = HashMap::<String, &'a ColumnPb>::new();
-    let mut by_unique_id = HashMap::<u32, &'a ColumnPb>::new();
+    let mut by_name = HashMap::<String, &'a StarRocksColumnSchema>::new();
+    let mut by_unique_id = HashMap::<u32, &'a StarRocksColumnSchema>::new();
     if let Some(source_schema) = source_schema {
         for col in &source_schema.column {
             if let Ok(unique_id) = u32::try_from(col.unique_id) {
@@ -794,7 +796,7 @@ fn build_projected_columns(
     output_schema: &SchemaRef,
     output_column_hints: &[StarRocksOutputColumnHint],
     current_lookup: &SchemaColumnLookup<'_>,
-    source_tablet_schema: Option<&TabletSchemaPb>,
+    source_tablet_schema: Option<&StarRocksTabletSchema>,
     use_segment_physical_schema: bool,
 ) -> Result<Vec<StarRocksNativeColumnPlan>, String> {
     let source_lookup = build_source_schema_lookup(source_tablet_schema)?;
@@ -1091,8 +1093,8 @@ fn build_projected_schema_column_plan(
     tablet_id: i64,
     version: i64,
     output_name: &str,
-    current_schema_col: &ColumnPb,
-    source_schema_col: Option<&ColumnPb>,
+    current_schema_col: &StarRocksColumnSchema,
+    source_schema_col: Option<&StarRocksColumnSchema>,
     output_arrow_type: &DataType,
     output_is_nullable: bool,
     authoritative_binding: bool,
@@ -1182,7 +1184,7 @@ fn validate_authoritative_current_schema_nullability(
     tablet_id: i64,
     version: i64,
     output_path: &str,
-    current_schema_col: &ColumnPb,
+    current_schema_col: &StarRocksColumnSchema,
     output_arrow_type: &DataType,
     output_is_nullable: bool,
 ) -> Result<(), String> {
@@ -1246,8 +1248,8 @@ fn build_segment_physical_schema_column_plan(
     tablet_id: i64,
     version: i64,
     output_path: &str,
-    current_schema_col: &ColumnPb,
-    physical_schema_col: Option<&ColumnPb>,
+    current_schema_col: &StarRocksColumnSchema,
+    physical_schema_col: Option<&StarRocksColumnSchema>,
     physical_source_index: Option<usize>,
     source_lookup_attempted: bool,
     output_arrow_type: &DataType,
@@ -1475,7 +1477,7 @@ fn build_segment_physical_schema_column_plan(
 }
 
 pub(crate) fn validate_physical_schema_to_output_type(
-    physical_schema_col: &ColumnPb,
+    physical_schema_col: &StarRocksColumnSchema,
     output_arrow_type: &DataType,
 ) -> Result<DataType, String> {
     if source_schema_column_matches_output_arrow_type(physical_schema_col, output_arrow_type) {
@@ -1537,8 +1539,8 @@ fn signed_integer_schema_arrow_type(schema_type: SupportedSchemaType) -> Option<
 fn resolve_segment_source_schema<'a>(
     snapshot: &'a StarRocksTabletSnapshot,
     segment: &StarRocksSegmentFile,
-    fallback_source_schema: Option<&'a TabletSchemaPb>,
-) -> Result<Option<&'a TabletSchemaPb>, String> {
+    fallback_source_schema: Option<&'a StarRocksTabletSchema>,
+) -> Result<Option<&'a StarRocksTabletSchema>, String> {
     let schema_id = match segment.schema_id {
         None => return Ok(fallback_source_schema),
         Some(schema_id) if schema_id <= 0 => {
@@ -1693,27 +1695,21 @@ fn synthetic_schema_type_from_output_arrow_type(
 }
 
 fn parse_table_model(
-    keys_type: Option<i32>,
+    keys_type: Option<StarRocksKeysType>,
     tablet_id: i64,
     version: i64,
 ) -> Result<StarRocksTableModelPlan, String> {
-    let raw_keys_type = keys_type.ok_or_else(|| {
+    let keys_type = keys_type.ok_or_else(|| {
         format!(
             "missing keys_type in tablet schema for native read plan: tablet_id={}, version={}",
             tablet_id, version
         )
     })?;
-    let keys_type = KeysType::try_from(raw_keys_type).map_err(|_| {
-        format!(
-            "unknown keys_type in tablet schema for native read plan: tablet_id={}, version={}, keys_type={}",
-            tablet_id, version, raw_keys_type
-        )
-    })?;
     let model = match keys_type {
-        KeysType::DupKeys => StarRocksTableModelPlan::DupKeys,
-        KeysType::AggKeys => StarRocksTableModelPlan::AggKeys,
-        KeysType::UniqueKeys => StarRocksTableModelPlan::UniqueKeys,
-        KeysType::PrimaryKeys => StarRocksTableModelPlan::PrimaryKeys,
+        StarRocksKeysType::Duplicate => StarRocksTableModelPlan::DupKeys,
+        StarRocksKeysType::Aggregate => StarRocksTableModelPlan::AggKeys,
+        StarRocksKeysType::Unique => StarRocksTableModelPlan::UniqueKeys,
+        StarRocksKeysType::Primary => StarRocksTableModelPlan::PrimaryKeys,
     };
     Ok(model)
 }
@@ -1721,7 +1717,7 @@ fn parse_table_model(
 fn build_group_key_columns_plan(
     tablet_id: i64,
     version: i64,
-    schema_columns: &[ColumnPb],
+    schema_columns: &[StarRocksColumnSchema],
     table_model: StarRocksTableModelPlan,
 ) -> Result<Vec<StarRocksNativeGroupKeyColumnPlan>, String> {
     if !matches!(
@@ -1785,7 +1781,7 @@ fn build_segment_group_key_schemas(
     snapshot: &StarRocksTabletSnapshot,
     group_keys: &[StarRocksNativeGroupKeyColumnPlan],
     current_lookup: &SchemaColumnLookup<'_>,
-    segment_source_schema: Option<&TabletSchemaPb>,
+    segment_source_schema: Option<&StarRocksTabletSchema>,
 ) -> Result<Vec<StarRocksNativeSchemaColumnPlan>, String> {
     group_keys
         .iter()
@@ -1825,7 +1821,7 @@ fn build_segment_delete_predicate_schemas(
     snapshot: &StarRocksTabletSnapshot,
     delete_predicates: &[StarRocksDeletePredicatePlan],
     current_lookup: &SchemaColumnLookup<'_>,
-    segment_source_schema: Option<&TabletSchemaPb>,
+    segment_source_schema: Option<&StarRocksTabletSchema>,
     rowset_version: i64,
 ) -> Result<HashMap<u32, StarRocksNativeSchemaColumnPlan>, String> {
     let mut schemas = HashMap::new();
@@ -1881,8 +1877,8 @@ fn build_segment_auxiliary_schema_column(
     snapshot: &StarRocksTabletSnapshot,
     output_name: &str,
     schema_unique_id: u32,
-    current_column: &ColumnPb,
-    segment_source_schema: Option<&TabletSchemaPb>,
+    current_column: &StarRocksColumnSchema,
+    segment_source_schema: Option<&StarRocksTabletSchema>,
     output_type: &DataType,
 ) -> Result<StarRocksNativeSchemaColumnPlan, String> {
     let source_column = segment_source_schema
@@ -1922,7 +1918,7 @@ fn infer_group_key_arrow_type(
     tablet_id: i64,
     version: i64,
     output_name: &str,
-    schema_col: &ColumnPb,
+    schema_col: &StarRocksColumnSchema,
 ) -> Result<DataType, String> {
     let schema_type = SupportedSchemaType::parse(&schema_col.r#type).ok_or_else(|| {
         format!(
@@ -2041,14 +2037,14 @@ fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn nonnegative_schema_column_unique_id(column: &ColumnPb) -> Option<u32> {
+fn nonnegative_schema_column_unique_id(column: &StarRocksColumnSchema) -> Option<u32> {
     u32::try_from(column.unique_id).ok()
 }
 
 fn collect_struct_children_by_unique_id<'a>(
-    children: &'a [ColumnPb],
+    children: &'a [StarRocksColumnSchema],
     schema_role: &str,
-) -> Result<HashMap<u32, (usize, &'a ColumnPb)>, String> {
+) -> Result<HashMap<u32, (usize, &'a StarRocksColumnSchema)>, String> {
     let mut children_by_unique_id = HashMap::new();
     for (idx, child_col) in children.iter().enumerate() {
         let Some(unique_id) = nonnegative_schema_column_unique_id(child_col) else {
@@ -2070,7 +2066,7 @@ fn collect_struct_children_by_unique_id<'a>(
 }
 
 fn source_schema_column_matches_output_arrow_type(
-    source_col: &ColumnPb,
+    source_col: &StarRocksColumnSchema,
     output_arrow_type: &DataType,
 ) -> bool {
     let Some(source_type) = SupportedSchemaType::parse(&source_col.r#type) else {
@@ -2101,10 +2097,10 @@ fn source_schema_column_matches_output_arrow_type(
 }
 
 fn align_struct_source_children<'a>(
-    source_schema_col: Option<&'a ColumnPb>,
-    current_children: &[ColumnPb],
+    source_schema_col: Option<&'a StarRocksColumnSchema>,
+    current_children: &[StarRocksColumnSchema],
     output_fields: &Fields,
-) -> Result<Vec<(Option<usize>, Option<&'a ColumnPb>, bool)>, String> {
+) -> Result<Vec<(Option<usize>, Option<&'a StarRocksColumnSchema>, bool)>, String> {
     collect_struct_children_by_unique_id(current_children, "current")?;
     let lookup_attempted = source_schema_col.is_some();
     let Some(source_col) = source_schema_col else {
@@ -2179,10 +2175,10 @@ fn align_struct_source_children<'a>(
 }
 
 fn align_struct_physical_children_for_schema_evolution<'a>(
-    physical_schema_col: &'a ColumnPb,
-    current_children: &[ColumnPb],
+    physical_schema_col: &'a StarRocksColumnSchema,
+    current_children: &[StarRocksColumnSchema],
     output_fields: &Fields,
-) -> Result<Vec<(Option<usize>, Option<&'a ColumnPb>)>, String> {
+) -> Result<Vec<(Option<usize>, Option<&'a StarRocksColumnSchema>)>, String> {
     collect_struct_children_by_unique_id(current_children, "current")?;
     let physical_children_by_unique_id =
         collect_struct_children_by_unique_id(&physical_schema_col.children_columns, "historical")?;
@@ -2280,8 +2276,8 @@ fn parse_flat_json_projection(output_name: &str) -> Option<StarRocksFlatJsonProj
 
 fn try_build_flat_json_projection<'a>(
     output_name: &str,
-    by_name: &'a HashMap<String, &'a ColumnPb>,
-) -> Option<(&'a ColumnPb, StarRocksFlatJsonProjectionPlan)> {
+    by_name: &'a HashMap<String, &'a StarRocksColumnSchema>,
+) -> Option<(&'a StarRocksColumnSchema, StarRocksFlatJsonProjectionPlan)> {
     let projection = parse_flat_json_projection(output_name)?;
     let schema_col = by_name
         .get(&normalize_column_name(&projection.base_column_name))
@@ -2300,7 +2296,7 @@ fn build_delete_predicates_plan(
     tablet_id: i64,
     version: i64,
     raw_predicates: &[StarRocksDeletePredicateRaw],
-    by_name: &HashMap<String, &ColumnPb>,
+    by_name: &HashMap<String, &StarRocksColumnSchema>,
 ) -> Result<Vec<StarRocksDeletePredicatePlan>, String> {
     let mut plans = Vec::with_capacity(raw_predicates.len());
     for raw in raw_predicates {
@@ -2400,7 +2396,7 @@ fn build_delete_predicate_term_plan(
     tablet_id: i64,
     version: i64,
     delete_version: i64,
-    by_name: &HashMap<String, &ColumnPb>,
+    by_name: &HashMap<String, &StarRocksColumnSchema>,
     column_name: &str,
     op: StarRocksDeletePredicateOpPlan,
     values: Vec<String>,
@@ -2662,8 +2658,8 @@ fn build_schema_column_plan(
     tablet_id: i64,
     version: i64,
     output_path: &str,
-    schema_col: &ColumnPb,
-    source_schema_col: Option<&ColumnPb>,
+    schema_col: &StarRocksColumnSchema,
+    source_schema_col: Option<&StarRocksColumnSchema>,
     source_index: Option<usize>,
     source_lookup_attempted: bool,
     output_arrow_type: &DataType,
@@ -2892,7 +2888,7 @@ fn validate_decimal_v3_schema_column(
     tablet_id: i64,
     version: i64,
     output_name: &str,
-    schema_col: &ColumnPb,
+    schema_col: &StarRocksColumnSchema,
     schema_type: SupportedSchemaType,
     output_arrow_type: &DataType,
 ) -> Result<(u8, i8), String> {
@@ -2954,7 +2950,7 @@ fn parse_decimal_v3_schema_metadata(
     tablet_id: i64,
     version: i64,
     output_name: &str,
-    schema_col: &ColumnPb,
+    schema_col: &StarRocksColumnSchema,
     schema_type: SupportedSchemaType,
 ) -> Result<(u8, i8), String> {
     let precision = schema_col.precision.ok_or_else(|| {

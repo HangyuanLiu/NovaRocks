@@ -26,16 +26,17 @@ use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::connector::starrocks::lake::{
     build_sink_tablet_schema, context::PartialUpdateWriteMode,
 };
-use crate::connector::starrocks::sink::frontend_wire::latest_frontend_address;
+use crate::connector::starrocks::schema::StarRocksKeysType;
 use crate::connector::starrocks::sink::partition_key::{PartitionExprPlan, PartitionKeyValue};
 use crate::connector::starrocks::sink::plan::{
-    FrontendAddress, SinkIndexDescriptor, SinkLocationDescriptor, SinkNodeInfo,
-    SinkNodesDescriptor, SinkOutputProjectionPlan, SinkPartitionDescriptor, SinkPartitionEntry,
-    SinkPartitionIndex, SinkPredicatePlan, SinkSchemaDescriptor, SinkSlotDescriptor,
-    SinkTabletLocation, StarRocksSinkDescriptor, StarRocksSinkFactoryInput,
+    SinkIndexDescriptor, SinkLocationDescriptor, SinkNodeInfo, SinkNodesDescriptor,
+    SinkOutputProjectionPlan, SinkPartitionDescriptor, SinkPartitionEntry, SinkPartitionIndex,
+    SinkPredicatePlan, SinkSchemaDescriptor, SinkSlotDescriptor, SinkTabletLocation,
+    StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
 };
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
@@ -43,14 +44,14 @@ use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
 use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
 use crate::protocol::starrocks::decode::expr::lower_t_expr;
 use crate::protocol::starrocks::decode::layout::Layout;
-use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId};
+use crate::runtime::fragment::instance::StarRocksTableSinkAssignment;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 const LOAD_OP_COLUMN: &str = "__op";
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
 
-pub(crate) fn lower_starrocks_sink_factory_input(
+pub(crate) fn lower_starrocks_table_sink(
     sink: &data_sinks::TOlapTableSink,
     output_exprs: Option<&[exprs::TExpr]>,
     exec_plan: Option<&ExecPlan>,
@@ -58,7 +59,7 @@ pub(crate) fn lower_starrocks_sink_factory_input(
     last_query_id: Option<&str>,
     session_time_zone: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<StarRocksSinkFactoryInput, String> {
+) -> Result<(StarRocksTableSinkProgram, StarRocksTableSinkAssignment), String> {
     let keys_type = lower_keys_type(sink.keys_type)?;
     let write_indexes = resolve_sink_write_index_selections(sink)?;
     let primary_schema_id = write_indexes
@@ -95,7 +96,9 @@ pub(crate) fn lower_starrocks_sink_factory_input(
         Some(&output_expr_slot_id_overrides)
     };
 
-    let frontend = lower_frontend_address(external_dependencies);
+    let frontend = external_dependencies
+        .and_then(StarRocksExternalDependencyDraft::frontend_endpoint)
+        .cloned();
     let schema = lower_sink_schema(&sink.schema, keys_type, session_time_zone)?;
     let partition = lower_sink_partition(&sink.partition, session_time_zone, slot_id_overrides)?;
     let location = lower_sink_location(&sink.location);
@@ -103,22 +106,17 @@ pub(crate) fn lower_starrocks_sink_factory_input(
     let literal_partition_values =
         lower_literal_partition_values(sink, primary_schema_id, output_exprs, exec_plan)?;
 
-    Ok(StarRocksSinkFactoryInput {
+    let program = StarRocksTableSinkProgram {
         name: "OLAP_TABLE_SINK".to_string(),
-        descriptor: StarRocksSinkDescriptor {
+        descriptor: StarRocksTableSinkDescriptor {
             db_id: sink.db_id,
             table_id: sink.table_id,
             db_name: sink.db_name.clone(),
             table_name: sink.table_name.clone(),
-            txn_id: sink.txn_id,
-            load_id: PUniqueId {
-                hi: sink.load_id.hi,
-                lo: sink.load_id.lo,
-            },
             keys_type,
             is_lake_table: sink.is_lake_table.unwrap_or(false),
             dynamic_overwrite: sink.dynamic_overwrite.unwrap_or(false),
-            partial_update_mode: PartialUpdateWriteMode::from_thrift(sink.partial_update_mode),
+            partial_update_mode: decode_partial_update_mode(sink.partial_update_mode),
             merge_condition: sink
                 .merge_condition
                 .as_deref()
@@ -131,42 +129,49 @@ pub(crate) fn lower_starrocks_sink_factory_input(
             partition,
             location,
             nodes,
-            frontend,
         },
         output_projection,
         output_expr_slot_name_map,
         output_expr_slot_ids,
         literal_partition_values,
-    })
+    };
+    program.validate()?;
+    let assignment = StarRocksTableSinkAssignment::new(
+        sink.txn_id,
+        UniqueId {
+            hi: sink.load_id.hi,
+            lo: sink.load_id.lo,
+        },
+        frontend,
+    );
+    Ok((program, assignment))
 }
 
-fn lower_frontend_address(
-    external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Option<FrontendAddress> {
-    external_dependencies
-        .and_then(StarRocksExternalDependencyDraft::frontend_endpoint)
-        .map(|endpoint| FrontendAddress {
-            hostname: endpoint.host().to_string(),
-            port: endpoint.port(),
-        })
-        .or_else(latest_frontend_address)
-}
-
-fn lower_keys_type(keys_type: Option<types::TKeysType>) -> Result<KeysType, String> {
+fn lower_keys_type(keys_type: Option<types::TKeysType>) -> Result<StarRocksKeysType, String> {
     match keys_type.unwrap_or(types::TKeysType::DUP_KEYS) {
-        t if t == types::TKeysType::DUP_KEYS => Ok(KeysType::DupKeys),
-        t if t == types::TKeysType::AGG_KEYS => Ok(KeysType::AggKeys),
-        t if t == types::TKeysType::PRIMARY_KEYS => Ok(KeysType::PrimaryKeys),
-        t if t == types::TKeysType::UNIQUE_KEYS => Ok(KeysType::UniqueKeys),
+        t if t == types::TKeysType::DUP_KEYS => Ok(StarRocksKeysType::Duplicate),
+        t if t == types::TKeysType::AGG_KEYS => Ok(StarRocksKeysType::Aggregate),
+        t if t == types::TKeysType::PRIMARY_KEYS => Ok(StarRocksKeysType::Primary),
+        t if t == types::TKeysType::UNIQUE_KEYS => Ok(StarRocksKeysType::Unique),
         other => Err(format!(
             "OLAP_TABLE_SINK does not support keys_type={other:?}"
         )),
     }
 }
 
+fn decode_partial_update_mode(mode: Option<types::TPartialUpdateMode>) -> PartialUpdateWriteMode {
+    match mode {
+        Some(types::TPartialUpdateMode::ROW_MODE) => PartialUpdateWriteMode::Row,
+        Some(types::TPartialUpdateMode::COLUMN_UPSERT_MODE) => PartialUpdateWriteMode::ColumnUpsert,
+        Some(types::TPartialUpdateMode::AUTO_MODE) => PartialUpdateWriteMode::Auto,
+        Some(types::TPartialUpdateMode::COLUMN_UPDATE_MODE) => PartialUpdateWriteMode::ColumnUpdate,
+        _ => PartialUpdateWriteMode::Unknown,
+    }
+}
+
 fn lower_sink_schema(
     schema: &descriptors::TOlapTableSchemaParam,
-    keys_type: KeysType,
+    keys_type: StarRocksKeysType,
     session_time_zone: Option<&str>,
 ) -> Result<SinkSchemaDescriptor, String> {
     let slot_descs = schema
@@ -1436,5 +1441,225 @@ fn scalar_partition_value_to_string(array: &dyn Array, row: usize) -> Option<Str
             Some(date.format("%Y-%m-%d").to_string())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::connector::starrocks::schema::StarRocksKeysType;
+    use crate::connector::starrocks::sink::plan::{
+        StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
+    };
+    use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::thrift::{data_sinks, descriptors, types};
+
+    use super::lower_starrocks_table_sink;
+
+    fn minimal_olap_sink() -> data_sinks::TOlapTableSink {
+        let bigint = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+            types::TPrimitiveType::BIGINT,
+        );
+        let slot = descriptors::TSlotDescriptor::new(
+            1,
+            1,
+            bigint.clone(),
+            0,
+            None,
+            None,
+            None,
+            "k".to_string(),
+            0,
+            true,
+            true,
+            false,
+            1,
+            None,
+            false,
+        );
+        let column = descriptors::TColumn::new(
+            "k".to_string(),
+            None,
+            None,
+            true,
+            false,
+            None,
+            None,
+            None,
+            false,
+            1,
+            false,
+            None,
+            None,
+            bigint,
+            None,
+        );
+        let index = descriptors::TOlapTableIndexSchema::new(
+            10,
+            vec!["k".to_string()],
+            0,
+            descriptors::TOlapTableColumnParam::new(vec![column], vec![1], 1),
+            None,
+            10,
+            None,
+            false,
+        );
+        let schema = descriptors::TOlapTableSchemaParam::new(
+            1,
+            2,
+            0,
+            vec![slot],
+            descriptors::TTupleDescriptor::new(1, None, None, 2, None),
+            vec![index],
+        );
+        let partition = descriptors::TOlapTablePartition::new(
+            20,
+            None,
+            None,
+            None,
+            vec![descriptors::TOlapTableIndexTablets::new(10, vec![30], None)],
+            None,
+            None,
+            None,
+            false,
+        );
+
+        data_sinks::TOlapTableSink::new(
+            types::TUniqueId::new(101, 103),
+            97,
+            1,
+            2,
+            1,
+            1,
+            false,
+            "db".to_string(),
+            "tbl".to_string(),
+            schema,
+            descriptors::TOlapTablePartitionParam::new(
+                1,
+                2,
+                0,
+                None,
+                Vec::<String>::new(),
+                vec![partition],
+                Vec::<String>::new(),
+                Vec::<crate::thrift::exprs::TExpr>::new(),
+                false,
+                None,
+            ),
+            descriptors::TOlapTableLocationParam::new(
+                1,
+                2,
+                0,
+                vec![descriptors::TTabletLocation::new(30, vec![40])],
+            ),
+            descriptors::TNodesInfo::new(
+                0,
+                vec![descriptors::TNodeInfo::new(
+                    40,
+                    0,
+                    "backend".to_string(),
+                    8060,
+                )],
+            ),
+            None,
+            true,
+            None,
+            types::TKeysType::PRIMARY_KEYS,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            types::TPartialUpdateMode::ROW_MODE,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn olap_decode_separates_immutable_program_from_instance_assignment() {
+        let frontend = RuntimeEndpoint::new("frontend", 9020).expect("frontend endpoint");
+        let dependencies =
+            StarRocksExternalDependencyDraft::new(Some(frontend.clone()), BTreeMap::new());
+        let (program, assignment) = lower_starrocks_table_sink(
+            &minimal_olap_sink(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&dependencies),
+        )
+        .expect("OLAP sink decode");
+
+        // Keep this exhaustive: adding transaction, load, or frontend identity to
+        // either immutable type must break this compile-time contract test.
+        let StarRocksTableSinkProgram {
+            name,
+            descriptor,
+            output_projection,
+            output_expr_slot_name_map,
+            output_expr_slot_ids,
+            literal_partition_values,
+        } = program;
+        let StarRocksTableSinkDescriptor {
+            db_id,
+            table_id,
+            db_name,
+            table_name,
+            keys_type,
+            is_lake_table,
+            dynamic_overwrite,
+            partial_update_mode,
+            merge_condition,
+            null_expr_in_auto_increment,
+            miss_auto_increment_column,
+            schema,
+            partition,
+            location,
+            nodes,
+        } = descriptor;
+
+        assert_eq!(name, "OLAP_TABLE_SINK");
+        assert_eq!((db_id, table_id), (1, 2));
+        assert_eq!(db_name.as_deref(), Some("db"));
+        assert_eq!(table_name.as_deref(), Some("tbl"));
+        assert_eq!(keys_type, StarRocksKeysType::Primary);
+        assert!(is_lake_table);
+        assert!(!dynamic_overwrite);
+        assert!(matches!(
+            partial_update_mode,
+            crate::connector::starrocks::lake::context::PartialUpdateWriteMode::Row
+        ));
+        assert!(merge_condition.is_none());
+        assert!(!null_expr_in_auto_increment);
+        assert!(!miss_auto_increment_column);
+        assert_eq!(schema.indexes.len(), 1);
+        assert_eq!(partition.partitions.len(), 1);
+        assert_eq!(location.tablets.len(), 1);
+        assert_eq!(nodes.nodes.len(), 1);
+        assert!(output_projection.is_none());
+        assert!(output_expr_slot_name_map.is_empty());
+        assert!(output_expr_slot_ids.is_empty());
+        assert!(literal_partition_values.is_none());
+
+        assert_eq!(assignment.txn_id(), 97);
+        assert_eq!(
+            (assignment.load_id().hi, assignment.load_id().lo),
+            (101, 103)
+        );
+        assert_eq!(assignment.frontend(), Some(&frontend));
     }
 }

@@ -34,6 +34,7 @@ use prost::Message;
 
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::connector::schema::{self, BeTabletWriteLoadLogRecord, BeTxnActiveRecord};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
@@ -41,6 +42,10 @@ use crate::connector::starrocks::lake::context::{
 };
 use crate::connector::starrocks::lake::delete_payload_codec::{
     decode_delete_keys_payload, encode_delete_keys_payload,
+};
+use crate::connector::starrocks::lake::storage_schema_wire::encode_unique_id;
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::exec::chunk::Chunk;
@@ -69,8 +74,7 @@ use crate::formats::starrocks::writer::{
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    ColumnPb, CombinedTxnLogPb, KeysType, PUniqueId, RowsetMetadataPb, TableSchemaKeyPb,
-    TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
+    CombinedTxnLogPb, RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TxnLogPb, txn_log_pb,
 };
 pub(crate) fn append_lake_txn_log_with_chunk_rowset(
     ctx: &TabletWriteContext,
@@ -80,7 +84,7 @@ pub(crate) fn append_lake_txn_log_with_chunk_rowset(
     file_seq: u64,
     write_format: StarRocksWriteFormat,
     partition_id: i64,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<(), String> {
     let batch_slot_ids = slot_ids_from_chunk(chunk);
     append_lake_txn_log_with_rowset_impl(
@@ -105,7 +109,7 @@ fn append_lake_txn_log_with_rowset_impl(
     file_seq: u64,
     write_format: StarRocksWriteFormat,
     partition_id: i64,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<(), String> {
     tracing::info!(
         "append_lake_txn_log_with_rowset_impl: rows={} columns={} schema_columns={} tablet_id={}",
@@ -160,7 +164,7 @@ fn append_lake_txn_log_with_rowset_impl(
                 op_alter_metadata: None,
                 op_replication: None,
                 partition_id: Some(partition_id),
-                load_id: load_id.cloned(),
+                load_id: load_id.copied().map(encode_unique_id),
             },
         };
         let write_routing = resolve_lake_batch_write_routing_with_slots(
@@ -454,7 +458,7 @@ fn build_txn_upsert_data_file_name(
     driver_id: i32,
     file_seq: u64,
     write_format: StarRocksWriteFormat,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<String, String> {
     let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
     build_txn_data_file_name(
@@ -492,7 +496,7 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
     ctx: &TabletWriteContext,
     txn_id: i64,
     partition_id: i64,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<(), String> {
     if ctx.table_id <= 0 {
         return Err(format!("invalid table_id for lake write: {}", ctx.table_id));
@@ -557,7 +561,7 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
                 op_alter_metadata: None,
                 op_replication: None,
                 partition_id: Some(partition_id),
-                load_id: load_id.cloned(),
+                load_id: load_id.copied().map(encode_unique_id),
             },
         };
         upsert_write_rowset_in_txn_log(
@@ -1338,17 +1342,11 @@ fn routing_debug_tag(routing: &LakeBatchWriteRouting) -> &'static str {
     }
 }
 
-fn is_primary_keys_table_for_write(tablet_schema: &TabletSchemaPb) -> Result<bool, String> {
-    let keys_type_raw = tablet_schema
+fn is_primary_keys_table_for_write(tablet_schema: &StarRocksTabletSchema) -> Result<bool, String> {
+    let keys_type = tablet_schema
         .keys_type
         .ok_or_else(|| "tablet schema missing keys_type for lake write".to_string())?;
-    let keys_type = KeysType::try_from(keys_type_raw).map_err(|_| {
-        format!(
-            "unknown keys_type in tablet schema for lake write: {}",
-            keys_type_raw
-        )
-    })?;
-    Ok(keys_type == KeysType::PrimaryKeys)
+    Ok(keys_type == StarRocksKeysType::Primary)
 }
 
 fn parse_op_batch(batch: &RecordBatch) -> Result<Option<ParsedOpBatch>, String> {
@@ -1625,7 +1623,7 @@ fn project_batch_by_columns(
 type MaterializedRow = Vec<ArrayRef>;
 type VisibleRowMap = HashMap<Vec<u8>, MaterializedRow>;
 
-fn primary_key_schema_indexes(tablet_schema: &TabletSchemaPb) -> Result<Vec<usize>, String> {
+fn primary_key_schema_indexes(tablet_schema: &StarRocksTabletSchema) -> Result<Vec<usize>, String> {
     let key_indexes = tablet_schema
         .column
         .iter()
@@ -1692,7 +1690,7 @@ fn normalize_identifier(raw: &str) -> String {
 }
 
 pub(crate) fn build_tablet_output_schema(
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<SchemaRef, String> {
     let mut fields = Vec::with_capacity(tablet_schema.column.len());
     for (idx, column) in tablet_schema.column.iter().enumerate() {
@@ -1713,7 +1711,7 @@ pub(crate) fn build_tablet_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, String> {
+fn resolve_tablet_column_arrow_type(column: &StarRocksColumnSchema) -> Result<DataType, String> {
     let type_name = column.r#type.trim().to_ascii_uppercase();
     let base = type_name
         .split('(')
@@ -1808,7 +1806,7 @@ fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, Strin
     }
 }
 
-fn resolve_decimal_precision_scale(column: &ColumnPb) -> Result<(u8, i8), String> {
+fn resolve_decimal_precision_scale(column: &StarRocksColumnSchema) -> Result<(u8, i8), String> {
     let base_type = column
         .r#type
         .trim()
@@ -1946,7 +1944,7 @@ fn build_partial_update_base_rows(
 // fill the missing column using the schema default via build_missing_output_schema_column_plan.
 fn build_partial_update_column_hints(
     output_schema: &SchemaRef,
-    current_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    current_schema: &StarRocksTabletSchema,
 ) -> Vec<StarRocksOutputColumnHint> {
     let schema_map: HashMap<String, (Option<u32>, Option<String>)> = current_schema
         .column
@@ -2508,7 +2506,7 @@ fn build_partial_update_default_values(
 
 fn resolve_default_literal_for_column(
     ctx: &TabletWriteContext,
-    column: &ColumnPb,
+    column: &StarRocksColumnSchema,
 ) -> Option<String> {
     if let Some(name) = column.name.as_deref()
         && let Some(expr_default) = ctx.partial_update.expr_default_value_for(name)
@@ -3231,7 +3229,7 @@ fn scalar_array_gt(left: &ArrayRef, right: &ArrayRef) -> Result<bool, String> {
     }
 }
 
-fn native_writer_supports_column(column: &ColumnPb) -> bool {
+fn native_writer_supports_column(column: &StarRocksColumnSchema) -> bool {
     let type_name = column.r#type.trim().to_ascii_uppercase();
     let base_type = type_name.split('(').next().unwrap_or(type_name.as_str());
     let type_supported = matches!(
@@ -3278,7 +3276,7 @@ fn native_writer_supports_column(column: &ColumnPb) -> bool {
 
 fn resolve_batch_write_format(
     requested: StarRocksWriteFormat,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<StarRocksWriteFormat, String> {
     match requested {
         StarRocksWriteFormat::Native => {
@@ -3319,7 +3317,7 @@ pub(crate) fn build_rowset_for_upsert_batch(
     driver_id: i32,
     file_seq: u64,
     write_format: StarRocksWriteFormat,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<RowsetMetadataPb, String> {
     let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
     let sorted_batch = sort_batch_for_native_write(batch, &ctx.tablet_schema)?;
@@ -3416,12 +3414,12 @@ fn pow10_i128(exp: u32) -> Option<i128> {
 
 fn filter_decimal_cast_overflow_rows(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<RecordBatch, String> {
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
-    if tablet_schema.keys_type == Some(KeysType::PrimaryKeys as i32) {
+    if tablet_schema.keys_type == Some(StarRocksKeysType::Primary) {
         return Ok(batch.clone());
     }
 
@@ -3583,7 +3581,7 @@ fn build_txn_delete_file_name(
     txn_id: i64,
     driver_id: i32,
     file_seq: u64,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<String, String> {
     let seed_name = build_txn_data_file_name(
         tablet_id,
@@ -3601,7 +3599,7 @@ fn build_txn_delete_file_name(
 
 fn encode_delete_keys_file_payload(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<Vec<u8>, String> {
     let key_col_count = tablet_schema
         .column
@@ -3632,7 +3630,7 @@ fn upsert_write_rowset_in_txn_log(
     partition_id: i64,
     incoming_rowset: &RowsetMetadataPb,
     incoming_dels: &[String],
-    expected_load_id: Option<&PUniqueId>,
+    expected_load_id: Option<&UniqueId>,
     expected_schema_key: &TableSchemaKeyPb,
 ) -> Result<(), String> {
     if txn_log.tablet_id != Some(tablet_id) {
@@ -3666,7 +3664,7 @@ fn upsert_write_rowset_in_txn_log(
                 tablet_id, txn_id, load_id.hi, load_id.lo, existing_load_id.hi, existing_load_id.lo
             ));
         }
-        txn_log.load_id = Some(*load_id);
+        txn_log.load_id = Some(encode_unique_id(*load_id));
     }
 
     let op_write = txn_log.op_write.get_or_insert_with(|| txn_log_pb::OpWrite {

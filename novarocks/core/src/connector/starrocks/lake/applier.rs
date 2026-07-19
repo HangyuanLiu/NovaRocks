@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::connector::starrocks::lake::storage_schema_wire::{
+    decode_tablet_schema, encode_tablet_schema,
+};
 use crate::connector::starrocks::lake::txn_log::{
     ensure_rowset_segment_meta_consistency, normalize_rowset_shared_segments,
 };
+use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::formats::starrocks::writer::bundle_meta::next_rowset_id;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::{
-    KeysType, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
-};
+use crate::service::grpc_client::proto::starrocks::{TabletMetadataPb, TxnLogPb, txn_log_pb};
 
 enum TxnLogDispatch<'a> {
     Write(&'a txn_log_pb::OpWrite),
@@ -56,7 +58,7 @@ pub(crate) fn apply_txn_log_to_metadata(
     metadata: &mut TabletMetadataPb,
     txn_log: &TxnLogPb,
     default_schema_id: i64,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
     apply_version: i64,
@@ -262,7 +264,7 @@ fn maybe_update_metadata_schema_for_write(
     metadata: &mut TabletMetadataPb,
     op_write: &txn_log_pb::OpWrite,
     default_schema_id: i64,
-    runtime_schema: &TabletSchemaPb,
+    runtime_schema: &StarRocksTabletSchema,
     tablet_id: Option<i64>,
     txn_id: Option<i64>,
 ) -> Result<i64, String> {
@@ -293,7 +295,12 @@ fn maybe_update_metadata_schema_for_write(
     let resolved_schema = if runtime_schema.id == Some(schema_id) {
         Some(runtime_schema.clone())
     } else {
-        metadata.historical_schemas.get(&schema_id).cloned()
+        metadata
+            .historical_schemas
+            .get(&schema_id)
+            .cloned()
+            .map(decode_tablet_schema)
+            .transpose()?
     };
     let resolved_schema = resolved_schema.ok_or_else(|| {
         format!(
@@ -313,7 +320,7 @@ fn maybe_update_metadata_schema_for_write(
 
 fn apply_tablet_schema_update(
     metadata: &mut TabletMetadataPb,
-    new_schema: &TabletSchemaPb,
+    new_schema: &StarRocksTabletSchema,
     reason: String,
 ) -> Result<(), String> {
     let new_schema_id = new_schema
@@ -382,11 +389,12 @@ fn apply_tablet_schema_update(
         }
     }
 
+    let encoded_schema = encode_tablet_schema(new_schema);
     metadata
         .historical_schemas
         .entry(new_schema_id)
-        .or_insert_with(|| new_schema.clone());
-    metadata.schema = Some(new_schema.clone());
+        .or_insert_with(|| encoded_schema.clone());
+    metadata.schema = Some(encoded_schema);
     Ok(())
 }
 
@@ -409,9 +417,10 @@ fn apply_alter_metadata_log(
             metadata.flat_json_config = Some(*flat_json_config);
         }
         if let Some(tablet_schema) = update_info.tablet_schema.as_ref() {
+            let tablet_schema = decode_tablet_schema(tablet_schema.clone())?;
             apply_tablet_schema_update(
                 metadata,
-                tablet_schema,
+                &tablet_schema,
                 format!(
                     "op_alter_metadata schema update: tablet_id={:?} txn_id={:?}",
                     txn_log.tablet_id, txn_log.txn_id
@@ -451,22 +460,16 @@ fn apply_schema_change_log(
     Ok(())
 }
 
-fn is_primary_keys_table(tablet_schema: &TabletSchemaPb) -> Result<bool, String> {
-    let keys_type_raw = tablet_schema
+fn is_primary_keys_table(tablet_schema: &StarRocksTabletSchema) -> Result<bool, String> {
+    let keys_type = tablet_schema
         .keys_type
         .ok_or_else(|| "tablet schema missing keys_type for publish_version".to_string())?;
-    let keys_type = KeysType::try_from(keys_type_raw).map_err(|_| {
-        format!(
-            "unknown keys_type in tablet schema for publish_version: {}",
-            keys_type_raw
-        )
-    })?;
-    Ok(keys_type == KeysType::PrimaryKeys)
+    Ok(keys_type == StarRocksKeysType::Primary)
 }
 
 fn primary_key_schema_change_requires_delvec_support(
     metadata: &TabletMetadataPb,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<bool, String> {
     if !is_primary_keys_table(tablet_schema)? {
         return Ok(false);

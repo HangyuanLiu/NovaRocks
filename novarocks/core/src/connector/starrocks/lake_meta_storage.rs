@@ -25,6 +25,7 @@ use crate::connector::starrocks::build_native_object_store_profile_from_properti
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTableIdentity, lake_scan_object_store_properties, resolve_tablet_paths_for_lake_meta_scan,
 };
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::metadata::{
     StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
 };
@@ -33,7 +34,6 @@ use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::protocol::starrocks::decode::{
     LakeMetaColumnKind, LakeMetaStorageFacts, LakeMetaStorageRequest,
 };
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
 struct LoadedTabletSnapshot {
     tablet_root_path: String,
@@ -189,7 +189,7 @@ fn should_treat_missing_initial_tablet_metadata_as_empty(
 }
 
 fn resolve_dict_scan_arrow_type(
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     column_id: &str,
 ) -> Result<DataType, String> {
     let target = column_id.trim();
@@ -211,7 +211,7 @@ fn resolve_dict_scan_arrow_type(
     ))
 }
 
-fn dict_scan_arrow_type_from_column(column: &ColumnPb) -> Result<DataType, String> {
+fn dict_scan_arrow_type_from_column(column: &StarRocksColumnSchema) -> Result<DataType, String> {
     match column.r#type.trim().to_ascii_uppercase().as_str() {
         "CHAR" | "VARCHAR" | "STRING" => Ok(DataType::Utf8),
         "ARRAY" => {

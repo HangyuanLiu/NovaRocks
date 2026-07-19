@@ -38,9 +38,9 @@ use arrow_buffer::i256;
 use chrono::{DateTime, NaiveDate};
 
 use crate::common::largeint;
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::service::grpc_client::proto::starrocks::{
-    ColumnPb, KeysType, PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TabletSchemaPb,
-    TuplePb, VariantPb, VariantTypePb,
+    PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TuplePb, VariantPb, VariantTypePb,
 };
 
 const TYPE_NODE_SCALAR: i32 = 0;
@@ -118,7 +118,7 @@ impl StarRocksSegmentWireType {
 
 pub fn sort_batch_for_native_write(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<RecordBatch, String> {
     let aligned_batch = align_batch_columns_to_schema(batch, tablet_schema)?;
     if aligned_batch.num_rows() <= 1 {
@@ -167,7 +167,7 @@ pub fn sort_batch_for_native_write(
 
 pub fn build_single_segment_metadata(
     sorted_batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<SegmentMetadataPb, String> {
     let sorted_batch = align_batch_columns_to_schema(sorted_batch, tablet_schema)?;
     if sorted_batch.num_rows() == 0 {
@@ -197,7 +197,7 @@ fn is_positional_generated_field_name(field_name: &str, index: usize) -> bool {
 
 fn align_batch_columns_to_schema(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<RecordBatch, String> {
     if tablet_schema.column.is_empty() {
         return Ok(batch.clone());
@@ -293,22 +293,18 @@ fn align_batch_columns_to_schema(
         .map_err(|e| format!("build schema-aligned record batch failed: {e}"))
 }
 
-fn validate_keys_type_for_native_write(tablet_schema: &TabletSchemaPb) -> Result<(), String> {
-    let keys_type_raw = tablet_schema
+fn validate_keys_type_for_native_write(
+    tablet_schema: &StarRocksTabletSchema,
+) -> Result<(), String> {
+    let keys_type = tablet_schema
         .keys_type
         .ok_or_else(|| "tablet schema missing keys_type for native write".to_string())?;
-    let keys_type = KeysType::try_from(keys_type_raw).map_err(|_| {
-        format!(
-            "unknown keys_type in tablet schema for native write: {}",
-            keys_type_raw
-        )
-    })?;
     let _ = keys_type;
     Ok(())
 }
 
 fn resolve_sort_key_indexes(
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     output_columns: usize,
 ) -> Result<Vec<usize>, String> {
     if tablet_schema.sort_key_idxes.is_empty() {
@@ -331,7 +327,7 @@ fn resolve_sort_key_indexes(
 
 fn build_sort_key_tuple(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     sort_key_indexes: &[usize],
     row_idx: usize,
 ) -> Result<TuplePb, String> {
@@ -354,7 +350,7 @@ fn build_sort_key_tuple(
 
 fn build_variant_for_value(
     array: &ArrayRef,
-    schema_col: &ColumnPb,
+    schema_col: &StarRocksColumnSchema,
     value_type: SortKeyValueType,
     col_idx: usize,
     row_idx: usize,
@@ -463,7 +459,7 @@ fn build_variant_for_value(
     })
 }
 
-fn parse_sort_key_value_type(col: &ColumnPb) -> Result<SortKeyValueType, String> {
+fn parse_sort_key_value_type(col: &StarRocksColumnSchema) -> Result<SortKeyValueType, String> {
     let type_name = col.r#type.trim().to_ascii_uppercase();
     let base_type = type_name.split('(').next().unwrap_or(type_name.as_str());
     match base_type {
@@ -496,7 +492,7 @@ fn parse_sort_key_value_type(col: &ColumnPb) -> Result<SortKeyValueType, String>
 }
 
 fn build_scalar_type_desc(
-    col: &ColumnPb,
+    col: &StarRocksColumnSchema,
     value_type: SortKeyValueType,
 ) -> Result<PTypeDesc, String> {
     let primitive = match value_type {
@@ -544,7 +540,7 @@ fn build_scalar_type_desc(
 }
 
 fn parse_decimal_sort_key_value_type(
-    col: &ColumnPb,
+    col: &StarRocksColumnSchema,
     wire_type: StarRocksSegmentWireType,
 ) -> Result<SortKeyValueType, String> {
     let raw_scale = col

@@ -36,6 +36,7 @@ use crate::connector::starrocks::lake::context::{
 use crate::connector::starrocks::lake::replay_policy::{
     MissingTxnLogPolicy, decide_missing_txn_log_policy,
 };
+use crate::connector::starrocks::lake::storage_schema_wire::decode_tablet_schema;
 use crate::connector::starrocks::lake::txn_loader::{
     LoadedTxnLog, load_txn_logs_for_publish, load_txn_vlog_for_publish,
 };
@@ -43,6 +44,7 @@ use crate::connector::starrocks::lake::txn_log::{
     build_metadata_object_store_profile_for_partial, ensure_rowset_segment_meta_consistency,
     normalize_rowset_shared_segments, read_txn_log_if_exists, write_txn_log_file,
 };
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::connector::starrocks::starmgr;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::formats::starrocks::writer::bundle_meta::{
@@ -67,7 +69,7 @@ use crate::service::grpc_client::proto::starrocks::{
     DeletePredicatePb, DeleteTabletRequest, DeleteTabletResponse, DropTableRequest,
     DropTableResponse, PublishLogVersionBatchRequest, PublishLogVersionRequest,
     PublishLogVersionResponse, PublishVersionRequest, PublishVersionResponse, RowsetMetadataPb,
-    StatusPb, TableSchemaKeyPb, TabletInfoPb, TabletMetadataPb, TabletSchemaPb, TabletStatRequest,
+    StatusPb, TableSchemaKeyPb, TabletInfoPb, TabletMetadataPb, TabletStatRequest,
     TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest, VacuumResponse,
     tablet_stat_response, txn_log_pb,
 };
@@ -2332,7 +2334,7 @@ enum TxnStepDecision {
 #[derive(Debug)]
 struct PublishOneTabletOutput {
     root_path: String,
-    schema: TabletSchemaPb,
+    schema: StarRocksTabletSchema,
     metadata: TabletMetadataPb,
     needs_persist: bool,
     cleanup_txn_log_path: Option<String>,
@@ -2413,9 +2415,9 @@ fn schema_from_metadata(
     tablet_id: i64,
     version: i64,
     metadata: &TabletMetadataPb,
-) -> Result<TabletSchemaPb, String> {
+) -> Result<StarRocksTabletSchema, String> {
     if let Some(schema) = metadata.schema.clone() {
-        return Ok(schema);
+        return decode_tablet_schema(schema);
     }
     let Some((_, schema)) = metadata
         .historical_schemas
@@ -2427,7 +2429,7 @@ fn schema_from_metadata(
             tablet_id, version
         ));
     };
-    Ok(schema.clone())
+    decode_tablet_schema(schema.clone())
 }
 
 fn get_runtime_for_publish(

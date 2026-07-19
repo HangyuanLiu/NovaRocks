@@ -30,17 +30,17 @@ use crate::novarocks_connectors::ConnectorRegistry;
 use crate::common::config::debug_exec_node_output;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-#[cfg(feature = "compat")]
-use crate::exec::operators::OlapTableSinkFactory;
+use crate::exec::fragment::program::FragmentSinkSpec;
+use crate::exec::fragment::sink::{
+    DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+    IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
+    IcebergTableSinkProgram, MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
+};
 use crate::exec::operators::{
-    DataStreamSinkFactory, DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
-    IcebergChangeStreamRouterSinkFactory, IcebergChangeStreamRouterSinkFactoryInput,
-    IcebergTableSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
-    ResultBufferSinkFactory, SplitDataStreamSinkFactory,
+    DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
+    IcebergChangeStreamRouterSinkFactoryInput,
 };
-use crate::exec::pipeline::executor::{
-    execute_compat_plan_with_pipeline, execute_compat_plan_with_pipeline_with_root_sink_dop,
-};
+use crate::exec::pipeline::executor::execute_compat_plan_with_pipeline_with_root_sink_dop;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
@@ -54,9 +54,11 @@ use crate::protocol::starrocks::decode::{
     decode_query_options, decode_runtime_endpoint, decode_runtime_filter_params,
 };
 use crate::runtime::endpoint::FragmentDestination;
+use crate::runtime::fragment::instance::FragmentSinkAssignment;
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
+use crate::runtime::fragment::sink::materialize_fragment_sink_components_with_result;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -427,44 +429,13 @@ fn iceberg_router_input_from_compat(
     })
 }
 
-enum PreparedFragmentSink {
-    DataStream {
-        input: DataStreamSinkFactoryInput,
-        fragment_instance_id: UniqueId,
-        sender_id: Option<i32>,
-    },
-    MultiCast {
-        inputs: Vec<(DataStreamSinkFactoryInput, Option<i64>)>,
-        fragment_instance_id: UniqueId,
-        sender_id: Option<i32>,
-    },
-    Split {
-        inputs: Vec<DataStreamSinkFactoryInput>,
-        split_expr_ids: Vec<crate::exec::expr::ExprId>,
-        fragment_instance_id: UniqueId,
-        sender_id: Option<i32>,
-    },
-    IcebergChangeStreamRouter {
-        input: IcebergChangeStreamRouterSinkFactoryInput,
-        fragment_instance_id: UniqueId,
-        sender_id: Option<i32>,
-    },
-    Result {
-        config: ResultSinkConfig,
-        projections: Option<Vec<ResultProjection>>,
-        exchange_finst_id: Option<(i64, i64)>,
-    },
-    Noop {
-        exchange_finst_id: Option<(i64, i64)>,
-    },
-    Iceberg {
-        input: crate::connector::iceberg::sink_plan::IcebergSinkFactoryInput,
-        root_sink_dop: Option<i32>,
-    },
-    #[cfg(feature = "compat")]
-    Olap {
-        input: crate::connector::starrocks::sink::plan::StarRocksSinkFactoryInput,
-    },
+struct DecodedCompatFragmentSink {
+    spec: FragmentSinkSpec,
+    assignment: FragmentSinkAssignment,
+    fragment_instance_id: UniqueId,
+    exchange_finst_id: Option<(i64, i64)>,
+    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
+    root_sink_dop: Option<i32>,
 }
 
 fn exchange_finst_id(
@@ -475,6 +446,63 @@ fn exchange_finst_id(
             params.fragment_instance_id.hi,
             params.fragment_instance_id.lo,
         )
+    })
+}
+
+fn fragment_instance_id_or_zero(
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> UniqueId {
+    exec_params
+        .map(unique_id_from_exec_params)
+        .unwrap_or(UniqueId { hi: 0, lo: 0 })
+}
+
+fn static_branch_from_factory_input(
+    input: DataStreamSinkFactoryInput,
+    limit: Option<i64>,
+) -> Result<(DataStreamSinkBranchProgram, Vec<FragmentDestination>), String> {
+    let program = DataStreamSinkBranchProgram::try_new(
+        input.dest_node_id,
+        input.output_exprs,
+        input.output_partition_type,
+        input.output_partition_exprs,
+        input.output_columns,
+        limit,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((program, input.destinations))
+}
+
+fn static_stream_from_factory_input(
+    input: DataStreamSinkFactoryInput,
+    limit: Option<i64>,
+    arena: ExprArena,
+) -> Result<(DataStreamSinkProgram, Vec<FragmentDestination>), String> {
+    let program = DataStreamSinkProgram::try_new(
+        input.dest_node_id,
+        input.output_exprs,
+        input.output_partition_type,
+        input.output_partition_exprs,
+        input.output_columns,
+        limit,
+        arena,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((program, input.destinations))
+}
+
+fn decoded_compat_sink(
+    program: FragmentSinkProgram,
+    assignment: FragmentSinkAssignment,
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> Result<DecodedCompatFragmentSink, String> {
+    Ok(DecodedCompatFragmentSink {
+        spec: FragmentSinkSpec::try_new(program).map_err(|error| error.to_string())?,
+        assignment,
+        fragment_instance_id: fragment_instance_id_or_zero(exec_params),
+        exchange_finst_id: exchange_finst_id(exec_params),
+        result_override: None,
+        root_sink_dop: None,
     })
 }
 
@@ -489,7 +517,7 @@ fn decode_fragment_sink(
     last_query_id: Option<&str>,
     session_time_zone: Option<&str>,
     external_dependencies: &StarRocksExternalDependencyDraft,
-) -> Result<PreparedFragmentSink, String> {
+) -> Result<DecodedCompatFragmentSink, String> {
     match sink.type_ {
         data_sinks::TDataSinkType::DATA_STREAM_SINK => {
             let stream_sink = sink
@@ -509,11 +537,16 @@ fn decode_fragment_sink(
                 last_query_id,
                 Some(external_dependencies),
             )?;
-            Ok(PreparedFragmentSink::DataStream {
-                input,
-                fragment_instance_id: unique_id_from_exec_params(exec_params),
-                sender_id: exec_params.sender_id,
-            })
+            let (program, destinations) =
+                static_stream_from_factory_input(input, stream_sink.limit, arena.clone())?;
+            decoded_compat_sink(
+                FragmentSinkProgram::DataStream(program),
+                FragmentSinkAssignment::StreamDestinations {
+                    destinations,
+                    sender_id: exec_params.sender_id,
+                },
+                Some(exec_params),
+            )
         }
         data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
             let multi_cast = sink.multi_cast_stream_sink.as_ref().ok_or_else(|| {
@@ -528,11 +561,22 @@ fn decode_fragment_sink(
                 last_query_id,
                 Some(external_dependencies),
             )?;
-            Ok(PreparedFragmentSink::MultiCast {
-                inputs,
-                fragment_instance_id: unique_id_from_exec_params(exec_params),
-                sender_id: exec_params.sender_id,
-            })
+            let (programs, groups): (Vec<_>, Vec<_>) = inputs
+                .into_iter()
+                .map(|(input, limit)| static_branch_from_factory_input(input, limit))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
+            let program = MultiCastDataStreamSinkProgram::try_new(programs, arena.clone())
+                .map_err(|error| error.to_string())?;
+            decoded_compat_sink(
+                FragmentSinkProgram::MultiCastDataStream(program),
+                FragmentSinkAssignment::DestinationGroups {
+                    groups,
+                    sender_id: exec_params.sender_id,
+                },
+                Some(exec_params),
+            )
         }
         data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK => {
             let split = sink.split_stream_sink.as_ref().ok_or_else(|| {
@@ -563,12 +607,23 @@ fn decode_fragment_sink(
                 last_query_id,
                 Some(external_dependencies),
             )?;
-            Ok(PreparedFragmentSink::Split {
-                inputs,
-                split_expr_ids,
-                fragment_instance_id: unique_id_from_exec_params(exec_params),
-                sender_id: exec_params.sender_id,
-            })
+            let (programs, groups): (Vec<_>, Vec<_>) = inputs
+                .into_iter()
+                .map(|input| static_branch_from_factory_input(input, None))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
+            let program =
+                SplitDataStreamSinkProgram::try_new(programs, split_expr_ids, arena.clone())
+                    .map_err(|error| error.to_string())?;
+            decoded_compat_sink(
+                FragmentSinkProgram::SplitDataStream(program),
+                FragmentSinkAssignment::DestinationGroups {
+                    groups,
+                    sender_id: exec_params.sender_id,
+                },
+                Some(exec_params),
+            )
         }
         data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
             let router = sink
@@ -588,27 +643,69 @@ fn decode_fragment_sink(
                 last_query_id,
                 Some(external_dependencies),
             )?;
-            Ok(PreparedFragmentSink::IcebergChangeStreamRouter {
-                input,
-                fragment_instance_id: unique_id_from_exec_params(exec_params),
-                sender_id: exec_params.sender_id,
-            })
+            let change_op_slot_id = SlotId::try_from(input.change_op_slot_id)
+                .map_err(|error| format!("invalid change_op_slot_id: {error}"))?;
+            let data_route_slot_id = input
+                .data_route_slot_id
+                .map(SlotId::try_from)
+                .transpose()
+                .map_err(|error| format!("invalid data_route_slot_id: {error}"))?;
+            let (branches, groups): (Vec<_>, Vec<_>) = input
+                .branches
+                .into_iter()
+                .map(|branch| {
+                    let (stream, destinations) =
+                        static_branch_from_factory_input(branch.stream_sink, None)?;
+                    Ok((
+                        IcebergChangeStreamRouterBranchProgram::new(
+                            branch.branch_id,
+                            branch.branch_kind,
+                            stream,
+                        ),
+                        destinations,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_iter()
+                .unzip();
+            let program = IcebergChangeStreamRouterProgram::try_new(
+                change_op_slot_id,
+                data_route_slot_id,
+                branches,
+                arena.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            decoded_compat_sink(
+                FragmentSinkProgram::IcebergChangeStreamRouter(program),
+                FragmentSinkAssignment::DestinationGroups {
+                    groups,
+                    sender_id: exec_params.sender_id,
+                },
+                Some(exec_params),
+            )
         }
         data_sinks::TDataSinkType::RESULT_SINK => {
             let result_sink = sink
                 .result_sink
                 .as_ref()
                 .ok_or_else(|| "RESULT_SINK missing result_sink payload".to_string())?;
-            Ok(PreparedFragmentSink::Result {
-                config: result_sink_config_from_thrift(result_sink)?,
-                projections: result_projections_from_thrift_exprs(fragment.output_exprs.as_ref())?,
-                exchange_finst_id: exchange_finst_id(exec_params),
-            })
+            let mut decoded = decoded_compat_sink(
+                FragmentSinkProgram::Result,
+                FragmentSinkAssignment::None,
+                exec_params,
+            )?;
+            decoded.result_override = Some((
+                result_sink_config_from_thrift(result_sink)?,
+                result_projections_from_thrift_exprs(fragment.output_exprs.as_ref())?,
+            ));
+            Ok(decoded)
         }
         data_sinks::TDataSinkType::NOOP_SINK | data_sinks::TDataSinkType::SCHEMA_TABLE_SINK => {
-            Ok(PreparedFragmentSink::Noop {
-                exchange_finst_id: exchange_finst_id(exec_params),
-            })
+            decoded_compat_sink(
+                FragmentSinkProgram::Noop,
+                FragmentSinkAssignment::None,
+                exec_params,
+            )
         }
         data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
         | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
@@ -638,12 +735,17 @@ fn decode_fragment_sink(
                 last_query_id,
                 Some(external_dependencies),
             )?;
-            Ok(PreparedFragmentSink::Iceberg {
-                input,
-                root_sink_dop: (sink_mode
-                    == crate::connector::iceberg::IcebergSinkMode::DeletionVectors)
-                    .then_some(1),
-            })
+            let program = IcebergTableSinkProgram::try_from_factory_input(input)
+                .map_err(|error| error.to_string())?;
+            let mut decoded = decoded_compat_sink(
+                FragmentSinkProgram::IcebergTable(program),
+                FragmentSinkAssignment::None,
+                exec_params,
+            )?;
+            decoded.root_sink_dop = (sink_mode
+                == crate::connector::iceberg::IcebergSinkMode::DeletionVectors)
+                .then_some(1);
+            Ok(decoded)
         }
         data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
             #[cfg(feature = "compat")]
@@ -656,7 +758,7 @@ fn decode_fragment_sink(
                     arena: arena.clone(),
                     root: lowered.node.clone(),
                 };
-                let input = crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_sink_factory_input(
+                let (program, assignment) = crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_table_sink(
                     olap_sink,
                     fragment.output_exprs.as_deref(),
                     Some(&draft_plan),
@@ -665,7 +767,11 @@ fn decode_fragment_sink(
                     session_time_zone,
                     Some(external_dependencies),
                 )?;
-                Ok(PreparedFragmentSink::Olap { input })
+                decoded_compat_sink(
+                    FragmentSinkProgram::StarRocksTable(program),
+                    FragmentSinkAssignment::StarRocksTable(assignment),
+                    exec_params,
+                )
             }
             #[cfg(not(feature = "compat"))]
             Err("OLAP_TABLE_SINK requires the compat feature".to_string())
@@ -1386,217 +1492,40 @@ pub(crate) fn execute_fragment(
         );
         let root_plan_node_id = plan.nodes.first().map(|n| n.node_id).unwrap_or(-1);
 
-        match prepared_sink {
-            PreparedFragmentSink::DataStream {
-                input,
-                fragment_instance_id,
-                sender_id,
-            } => {
-                let exchange_finst_id = Some((fragment_instance_id.hi, fragment_instance_id.lo));
-                let sink_factory = DataStreamSinkFactory::new(
-                    input,
-                    fragment_instance_id,
-                    sender_id,
-                    root_plan_node_id,
-                    exec_plan.arena.clone(),
-                );
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::MultiCast {
-                inputs,
-                fragment_instance_id,
-                sender_id,
-            } => {
-                let exchange_finst_id = Some((fragment_instance_id.hi, fragment_instance_id.lo));
-                let sink_factory = MultiCastDataStreamSinkFactory::new(
-                    inputs,
-                    fragment_instance_id,
-                    sender_id,
-                    exec_plan.arena.clone(),
-                    root_plan_node_id,
-                );
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::Split {
-                inputs,
-                split_expr_ids,
-                fragment_instance_id,
-                sender_id,
-            } => {
-                let exchange_finst_id = Some((fragment_instance_id.hi, fragment_instance_id.lo));
-                let sink_factory = SplitDataStreamSinkFactory::new(
-                    inputs,
-                    fragment_instance_id,
-                    sender_id,
-                    exec_plan.arena.clone(),
-                    root_plan_node_id,
-                    Arc::new(exec_plan.arena.clone()),
-                    split_expr_ids,
-                );
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::IcebergChangeStreamRouter {
-                input,
-                fragment_instance_id,
-                sender_id,
-            } => {
-                let exchange_finst_id = Some((fragment_instance_id.hi, fragment_instance_id.lo));
-                let sink_factory = IcebergChangeStreamRouterSinkFactory::try_new(
-                    input,
-                    fragment_instance_id,
-                    sender_id,
-                    exec_plan.arena.clone(),
-                    root_plan_node_id,
-                )?;
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::Result {
-                config,
-                projections,
-                exchange_finst_id,
-            } => {
-                let sink_factory =
-                    ResultBufferSinkFactory::new(projections, config, None, typed_result_sink);
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::Noop { exchange_finst_id } => {
-                let sink_factory = NoopSinkFactory::new();
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    exchange_finst_id,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-            PreparedFragmentSink::Iceberg {
-                input,
-                root_sink_dop,
-            } => {
-                let sink_factory = IcebergTableSinkFactory::try_new(input)?;
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline_with_root_sink_dop(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    None,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                    root_sink_dop,
-                )?;
-            }
-            #[cfg(feature = "compat")]
-            PreparedFragmentSink::Olap { input } => {
-                let sink_factory = OlapTableSinkFactory::try_new(input)?;
-                let _exec_timer = profiler
-                    .as_ref()
-                    .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_compat_plan_with_pipeline(
-                    exec_plan,
-                    debug_exec_node_output(),
-                    Duration::from_millis(50),
-                    Box::new(sink_factory),
-                    None,
-                    profiler.clone(),
-                    pipeline_dop,
-                    Arc::clone(&runtime_state),
-                    query_id,
-                    runtime_fe_addr.clone(),
-                    backend_num,
-                )?;
-            }
-        }
+        let DecodedCompatFragmentSink {
+            spec,
+            assignment,
+            fragment_instance_id,
+            exchange_finst_id,
+            result_override,
+            root_sink_dop,
+        } = prepared_sink;
+        let sink_factory = materialize_fragment_sink_components_with_result(
+            &spec,
+            &assignment,
+            fragment_instance_id,
+            typed_result_sink,
+            root_plan_node_id,
+            result_override,
+        )
+        .map_err(|error| error.to_string())?;
+        let _exec_timer = profiler
+            .as_ref()
+            .map(|p| p.scoped_timer("PipelineExecuteTime"));
+        execute_compat_plan_with_pipeline_with_root_sink_dop(
+            exec_plan,
+            debug_exec_node_output(),
+            Duration::from_millis(50),
+            sink_factory,
+            exchange_finst_id,
+            profiler.clone(),
+            pipeline_dop,
+            Arc::clone(&runtime_state),
+            query_id,
+            runtime_fe_addr.clone(),
+            backend_num,
+            root_sink_dop,
+        )?;
         return Ok(FragmentOutput { profile_json: None });
     }
 
@@ -1730,6 +1659,25 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn data_sink_with_split(
+        sink_type: data_sinks::TDataSinkType,
+        split: Option<data_sinks::TSplitDataStreamSink>,
+    ) -> data_sinks::TDataSink {
+        data_sinks::TDataSink::new(
+            sink_type, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, split, None,
+        )
+    }
+
+    fn bool_literal_expr(value: bool) -> TExpr {
+        let bool_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
+            types::TPrimitiveType::BOOLEAN,
+        );
+        let mut literal = test_expr_node(TExprNodeType::BOOL_LITERAL, bool_type, 0);
+        literal.bool_literal = Some(crate::thrift::exprs::TBoolLiteral::new(value));
+        TExpr::new(vec![literal])
     }
 
     fn test_fragment(sink: data_sinks::TDataSink) -> planner::TPlanFragment {
@@ -1887,11 +1835,77 @@ mod tests {
         })
         .expect("resolved sink decode must succeed");
 
-        assert!(matches!(
-            ready,
-            Some(PreparedFragmentSink::DataStream { .. })
-        ));
+        assert!(ready.is_some_and(|decoded| matches!(
+            decoded.spec.program(),
+            FragmentSinkProgram::DataStream(_)
+        )));
         assert_eq!(resolver_calls, 1);
+    }
+
+    #[test]
+    fn schema_table_sink_decodes_to_unified_noop_contract() {
+        let sink = data_sink_with_split(data_sinks::TDataSinkType::SCHEMA_TABLE_SINK, None);
+        let fragment = test_fragment(sink.clone());
+        let lowered = empty_lowered();
+        let draft = StarRocksExternalDependencyDraft::new(None, BTreeMap::new());
+
+        let decoded = decode_fragment_sink(
+            &sink,
+            &fragment,
+            None,
+            None,
+            &mut ExprArena::default(),
+            &lowered,
+            None,
+            None,
+            &draft,
+        )
+        .expect("schema table sink");
+
+        assert!(matches!(decoded.spec.program(), FragmentSinkProgram::Noop));
+        assert!(matches!(decoded.assignment, FragmentSinkAssignment::None));
+    }
+
+    #[test]
+    fn split_sink_decode_separates_static_branches_from_destination_assignment() {
+        let split = data_sinks::TSplitDataStreamSink::new(
+            vec![unpartitioned_stream_sink()],
+            vec![Vec::new()],
+            vec![bool_literal_expr(true)],
+        );
+        let sink = data_sink_with_split(
+            data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK,
+            Some(split),
+        );
+        let fragment = test_fragment(sink.clone());
+        let exec_params = test_exec_params();
+        let lowered = empty_lowered();
+        let draft = StarRocksExternalDependencyDraft::new(None, BTreeMap::new());
+
+        let decoded = decode_fragment_sink(
+            &sink,
+            &fragment,
+            Some(&exec_params),
+            None,
+            &mut ExprArena::default(),
+            &lowered,
+            None,
+            None,
+            &draft,
+        )
+        .expect("split sink");
+
+        let FragmentSinkProgram::SplitDataStream(program) = decoded.spec.program() else {
+            panic!("split sink must decode to the static split program");
+        };
+        assert_eq!(program.sinks().len(), 1);
+        assert_eq!(program.split_exprs().len(), 1);
+        let FragmentSinkAssignment::DestinationGroups { groups, sender_id } = decoded.assignment
+        else {
+            panic!("split sink must bind destinations in the instance assignment");
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(sender_id, Some(0));
     }
 
     #[test]

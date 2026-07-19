@@ -21,6 +21,9 @@ use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdenti
 use crate::connector::starrocks::scan::{
     DeferredLakeScanResolution, LakeScanSchemaMeta, StarRocksScanRange, StarRocksSchemaColumnHint,
 };
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+};
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
@@ -35,8 +38,6 @@ fn invalid<T>(detail: String) -> Result<T, NativeFragmentLeafDecodeError> {
         detail,
     ))
 }
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-
 pub(super) struct DecodedStarRocksScanPreparation {
     pub(crate) properties: BTreeMap<String, String>,
     pub(crate) ranges: Vec<StarRocksScanRange>,
@@ -114,8 +115,8 @@ pub(super) fn decode_starrocks_scan_preparation(
 fn validate_source(
     node_id: i32,
     source: &plan::StarRocksTableSource,
-) -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
+) -> Result<StarRocksTabletSchema, NativeFragmentLeafDecodeError> {
+    let decoded = (|| -> Result<StarRocksTabletSchema, NativeFragmentLeafDecodeError> {
         if source.catalog_name.trim().is_empty() {
             return invalid(format!(
                 "StarRocks ScanNode node_id={node_id} catalog_name must not be empty"
@@ -178,8 +179,8 @@ fn validate_source(
 fn decode_native_tablet_schema(
     node_id: i32,
     source: &plan::StarRocksTableSource,
-) -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<TabletSchemaPb, NativeFragmentLeafDecodeError> {
+) -> Result<StarRocksTabletSchema, NativeFragmentLeafDecodeError> {
+    let decoded = (|| -> Result<StarRocksTabletSchema, NativeFragmentLeafDecodeError> {
         let schema = source.current_schema.as_ref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::MissingField,
@@ -194,10 +195,14 @@ fn decode_native_tablet_schema(
             ));
         }
         let keys_type = match plan::StarRocksKeysType::try_from(schema.keys_type).ok() {
-            Some(plan::StarRocksKeysType::StarrocksKeysTypeDuplicate) => KeysType::DupKeys,
-            Some(plan::StarRocksKeysType::StarrocksKeysTypeUnique) => KeysType::UniqueKeys,
-            Some(plan::StarRocksKeysType::StarrocksKeysTypeAggregate) => KeysType::AggKeys,
-            Some(plan::StarRocksKeysType::StarrocksKeysTypePrimary) => KeysType::PrimaryKeys,
+            Some(plan::StarRocksKeysType::StarrocksKeysTypeDuplicate) => {
+                StarRocksKeysType::Duplicate
+            }
+            Some(plan::StarRocksKeysType::StarrocksKeysTypeUnique) => StarRocksKeysType::Unique,
+            Some(plan::StarRocksKeysType::StarrocksKeysTypeAggregate) => {
+                StarRocksKeysType::Aggregate
+            }
+            Some(plan::StarRocksKeysType::StarrocksKeysTypePrimary) => StarRocksKeysType::Primary,
             _ => {
                 return invalid(format!(
                     "StarRocks ScanNode node_id={node_id} current schema keys_type is missing or unknown: {}",
@@ -303,9 +308,9 @@ fn decode_native_tablet_schema(
                 "StarRocks ScanNode node_id={node_id} storage_columns do not match current schema visible columns"
             ));
         }
-        Ok(TabletSchemaPb {
+        Ok(StarRocksTabletSchema {
             id: Some(schema.schema_id),
-            keys_type: Some(keys_type as i32),
+            keys_type: Some(keys_type),
             column: columns,
             num_short_key_columns: schema.num_short_key_columns,
             sort_key_idxes: schema.sort_key_idxes.clone(),
@@ -320,8 +325,8 @@ fn decode_native_column_schema(
     node_id: i32,
     column: &plan::StarRocksColumnSchema,
     top_level: bool,
-) -> Result<ColumnPb, NativeFragmentLeafDecodeError> {
-    let decoded = (|| -> Result<ColumnPb, NativeFragmentLeafDecodeError> {
+) -> Result<StarRocksColumnSchema, NativeFragmentLeafDecodeError> {
+    let decoded = (|| -> Result<StarRocksColumnSchema, NativeFragmentLeafDecodeError> {
         let name = column
             .name
             .as_deref()
@@ -449,7 +454,7 @@ fn decode_native_column_schema(
                 }
             }
         }
-        Ok(ColumnPb {
+        Ok(StarRocksColumnSchema {
             unique_id: column.unique_id,
             name,
             r#type: physical_type,

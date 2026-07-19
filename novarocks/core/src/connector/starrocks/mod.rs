@@ -21,6 +21,7 @@ pub mod lake;
 pub(crate) mod lake_meta_storage;
 mod object_store_profile;
 pub mod scan;
+pub(crate) mod schema;
 pub mod sink;
 pub mod starmgr;
 pub mod table;

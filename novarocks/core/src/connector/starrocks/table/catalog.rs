@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use prost::Message;
 
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::largeint::LARGEINT_BYTE_WIDTH;
@@ -28,8 +27,9 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
     TabletWriteContext, get_tablet_runtime, register_tablet_runtime, remove_tablet_runtime,
 };
+use crate::connector::starrocks::lake::storage_schema_wire::decode_tablet_schema_bytes;
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
 use super::model::{
     StarRocksGlobalMeta, StarRocksIndexState, StarRocksPartitionState, StarRocksTableSnapshot,
@@ -170,7 +170,7 @@ impl StarRocksTableCatalog {
         let mut schemas_by_id = HashMap::new();
         for schema in &snapshot.schemas {
             let decoded =
-                TabletSchemaPb::decode(schema.tablet_schema_pb.as_slice()).map_err(|e| {
+                decode_tablet_schema_bytes(schema.tablet_schema_pb.as_slice()).map_err(|e| {
                     format!(
                         "decode StarRocks tablet_schema_pb failed for schema_id={}: {e}",
                         schema.schema_id
@@ -549,7 +549,7 @@ pub(crate) fn repository_snapshot_for_runtime(
 pub(crate) struct StarRocksTableRuntime {
     pub(crate) database_name: String,
     pub(crate) table: StoredStarRocksTable,
-    pub(crate) tablet_schema: TabletSchemaPb,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
     pub(crate) columns: Vec<StoredStarRocksColumn>,
     pub(crate) partitions: Vec<StoredStarRocksPartition>,
     pub(crate) indexes: Vec<StoredStarRocksIndex>,
@@ -667,8 +667,8 @@ pub(super) fn starrocks_scan_tablets(runtime: &StarRocksTableRuntime) -> Vec<Sta
 }
 
 fn visible_tablet_columns_by_name(
-    tablet_schema: &TabletSchemaPb,
-) -> Result<HashMap<String, ColumnPb>, String> {
+    tablet_schema: &StarRocksTabletSchema,
+) -> Result<HashMap<String, StarRocksColumnSchema>, String> {
     let mut columns = HashMap::new();
     for column in &tablet_schema.column {
         if column.visible == Some(false) {
@@ -688,7 +688,9 @@ fn visible_tablet_columns_by_name(
     Ok(columns)
 }
 
-pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> {
+pub(crate) fn arrow_type_from_tablet_column(
+    column: &StarRocksColumnSchema,
+) -> Result<DataType, String> {
     let raw_type = column.r#type.trim().to_ascii_uppercase();
     let base_type = raw_type
         .split('(')
@@ -806,7 +808,9 @@ pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataTyp
 /// `data_type` does not uniquely identify the logical type (`JSON` collapses
 /// onto `DataType::Utf8`; `BITMAP` and `HLL` collapse onto `DataType::Binary`).
 /// Returns `None` for columns whose Arrow type is authoritative.
-fn logical_type_from_tablet_column(column: &ColumnPb) -> Option<crate::catalog::schema::SqlType> {
+fn logical_type_from_tablet_column(
+    column: &StarRocksColumnSchema,
+) -> Option<crate::catalog::schema::SqlType> {
     let raw_type = column.r#type.trim().to_ascii_uppercase();
     let base_type = raw_type
         .split('(')

@@ -185,6 +185,8 @@ pub(crate) enum FragmentSinkKind {
     Noop,
     DataStream,
     MultiCastDataStream,
+    SplitDataStream,
+    StarRocksTable,
     IcebergChangeStreamRouter,
     IcebergTable,
 }
@@ -193,6 +195,7 @@ pub(crate) enum FragmentSinkKind {
 pub(crate) enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups(NonZeroUsize),
+    StarRocksTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +233,19 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
+            FragmentSinkProgram::SplitDataStream(split) => {
+                let count =
+                    non_empty_group_count(FragmentSinkKind::SplitDataStream, split.sinks().len())?;
+                (
+                    FragmentSinkKind::SplitDataStream,
+                    Required(DestinationGroups(count)),
+                )
+            }
+            #[cfg(feature = "compat")]
+            FragmentSinkProgram::StarRocksTable(_) => (
+                FragmentSinkKind::StarRocksTable,
+                Required(FragmentSinkAssignmentKind::StarRocksTable),
+            ),
             FragmentSinkProgram::IcebergTable(_) => (FragmentSinkKind::IcebergTable, None),
             FragmentSinkProgram::IcebergChangeStreamRouter(router) => {
                 let count = non_empty_group_count(

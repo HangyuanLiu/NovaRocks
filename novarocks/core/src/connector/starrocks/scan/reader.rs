@@ -19,6 +19,10 @@ use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
 use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
+use crate::connector::starrocks::schema::{
+    StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletIndex,
+    StarRocksTabletSchema, StarRocksTypeDesc, StarRocksTypeNode,
+};
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
@@ -31,9 +35,6 @@ use crate::formats::starrocks::plan::{
 };
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_with_output_hints_and_physical_schema_if_any;
 use crate::novarocks_logging::{info, warn};
-use crate::service::grpc_client::proto::starrocks::{
-    AggStateDescPb, ColumnPb, PTypeDesc, PTypeNode, TabletIndexPb, TabletSchemaPb,
-};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use sha2::{Digest, Sha256};
@@ -57,7 +58,7 @@ fn schema_signature_with_hints(
     schema: &SchemaRef,
     chunk_schema: &ChunkSchemaRef,
     output_column_hints: &[StarRocksOutputColumnHint],
-    current_tablet_schema: &TabletSchemaPb,
+    current_tablet_schema: &StarRocksTabletSchema,
 ) -> Result<String, String> {
     if schema.fields().len() != chunk_schema.slots().len() {
         return Err(format!(
@@ -184,14 +185,14 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_type_desc(&mut self, value: &PTypeDesc) {
+    fn push_type_desc(&mut self, value: &StarRocksTypeDesc) {
         self.push_u64(value.types.len() as u64);
         for node in &value.types {
             self.push_type_node(node);
         }
     }
 
-    fn push_type_node(&mut self, value: &PTypeNode) {
+    fn push_type_node(&mut self, value: &StarRocksTypeNode) {
         self.push_i32(value.r#type);
         self.push_bool(value.scalar_type.is_some());
         if let Some(scalar) = value.scalar_type.as_ref() {
@@ -207,7 +208,7 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_agg_state(&mut self, value: &AggStateDescPb) {
+    fn push_agg_state(&mut self, value: &StarRocksAggStateDesc) {
         self.push_optional_string(value.agg_func_name.as_deref());
         self.push_u64(value.arg_types.len() as u64);
         for arg_type in &value.arg_types {
@@ -221,7 +222,7 @@ impl SchemaFingerprintEncoder {
         self.push_optional_i32(value.func_version);
     }
 
-    fn push_column(&mut self, value: &ColumnPb) {
+    fn push_column(&mut self, value: &StarRocksColumnSchema) {
         self.push_i32(value.unique_id);
         self.push_optional_string(value.name.as_deref());
         self.push_string(&value.r#type);
@@ -249,7 +250,7 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_table_index(&mut self, value: &TabletIndexPb) {
+    fn push_table_index(&mut self, value: &StarRocksTabletIndex) {
         self.push_optional_i64(value.index_id);
         self.push_optional_string(value.index_name.as_deref());
         self.push_optional_i32(value.index_type);
@@ -260,8 +261,13 @@ impl SchemaFingerprintEncoder {
         self.push_optional_string(value.index_properties.as_deref());
     }
 
-    fn push_tablet_schema(&mut self, value: &TabletSchemaPb) {
-        self.push_optional_i32(value.keys_type);
+    fn push_tablet_schema(&mut self, value: &StarRocksTabletSchema) {
+        self.push_optional_i32(value.keys_type.map(|keys_type| match keys_type {
+            StarRocksKeysType::Duplicate => 0,
+            StarRocksKeysType::Unique => 1,
+            StarRocksKeysType::Aggregate => 2,
+            StarRocksKeysType::Primary => 3,
+        }));
         self.push_u64(value.column.len() as u64);
         for column in &value.column {
             self.push_column(column);
@@ -291,7 +297,7 @@ impl SchemaFingerprintEncoder {
     }
 }
 
-fn tablet_schema_semantic_fingerprint(schema: &TabletSchemaPb) -> String {
+fn tablet_schema_semantic_fingerprint(schema: &StarRocksTabletSchema) -> String {
     let mut encoder = SchemaFingerprintEncoder::default();
     encoder.push_tablet_schema(schema);
     let digest = Sha256::digest(&encoder.bytes);
@@ -412,6 +418,7 @@ impl StarRocksNativeReader {
         };
         let physical_snapshot = snapshot.clone();
         let snapshot = maybe_refresh_snapshot_schema_for_lake_scan(&snapshot, lake_schema_meta)?;
+        let current_tablet_schema = snapshot.tablet_schema.clone();
         let output_column_hints = build_output_column_hints(
             &snapshot,
             &required_chunk_schema,
@@ -424,7 +431,7 @@ impl StarRocksNativeReader {
             &output_schema,
             &output_chunk_schema,
             &output_column_hints,
-            &snapshot.tablet_schema,
+            &current_tablet_schema,
         )?;
         if use_batch_cache
             && let Some(batch) = native_cache::native_batch_cache_get(
@@ -679,8 +686,8 @@ fn build_lake_schema_column_hints(
     Ok(out)
 }
 
-fn build_lake_schema_column_hints_from_pb(
-    schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+fn build_lake_schema_column_hints_from_domain(
+    schema: &StarRocksTabletSchema,
 ) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
     let mut out = HashMap::new();
     for column in &schema.column {
@@ -775,6 +782,7 @@ fn build_output_column_hints(
         ));
     }
     let required_unique_ids = build_required_schema_unique_id_map(required_chunk_schema)?;
+    let snapshot_domain_schema = snapshot.tablet_schema.clone();
     let snapshot_schema_columns = snapshot
         .tablet_schema
         .column
@@ -804,7 +812,7 @@ fn build_output_column_hints(
             let snapshot_schema_id = snapshot.tablet_schema.id.unwrap_or(0);
             if snapshot_schema_id == meta.schema_id {
                 (
-                    build_lake_schema_column_hints_from_pb(&snapshot.tablet_schema)?,
+                    build_lake_schema_column_hints_from_domain(&snapshot_domain_schema)?,
                     false,
                 )
             } else {

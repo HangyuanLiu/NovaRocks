@@ -39,6 +39,7 @@ pub(crate) mod schema_adapter;
 pub(crate) mod schema_change;
 #[cfg(feature = "compat")]
 pub(crate) mod schema_change_compat;
+pub(crate) mod storage_schema_wire;
 #[allow(dead_code)]
 pub(crate) mod transactions;
 #[allow(dead_code)]

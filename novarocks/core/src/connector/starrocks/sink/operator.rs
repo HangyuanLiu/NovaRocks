@@ -42,6 +42,7 @@ use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset
 use crate::connector::starrocks::lake::{
     TabletWriteContext, append_lake_txn_log_with_chunk_rowset,
 };
+use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
@@ -64,7 +65,6 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry;
-use crate::service::grpc_client::proto::starrocks::KeysType;
 
 const LOAD_OP_COLUMN: &str = "__op";
 
@@ -367,7 +367,7 @@ fn delete_row_mask_for_auto_increment(batch: &RecordBatch) -> Result<Option<Vec<
 
 fn materialize_auto_increment_for_sink_batch(
     batch: &RecordBatch,
-    tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     auto_increment: Option<&AutoIncrementWritePolicy>,
     rejected: &mut [bool],
     tracking_logs: &mut Vec<String>,
@@ -427,7 +427,7 @@ fn materialize_auto_increment_for_sink_batch(
         return Ok(batch.clone());
     }
 
-    let delete_rows = if tablet_schema.keys_type == Some(KeysType::PrimaryKeys as i32) {
+    let delete_rows = if tablet_schema.keys_type == Some(StarRocksKeysType::Primary) {
         delete_row_mask_for_auto_increment(batch)?
     } else {
         None
@@ -684,7 +684,7 @@ fn fill_auto_increment_in_chunk_before_routing(
 
 fn filter_rows_for_tablet_schema(
     batch: &RecordBatch,
-    tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     auto_increment: Option<&AutoIncrementWritePolicy>,
     table_id: i64,
 ) -> Result<FilteredBatch, String> {
@@ -1754,7 +1754,7 @@ impl OlapTableSinkOperator {
                             continue;
                         };
                         let is_primary_keys_table = target.context.tablet_schema.keys_type
-                            == Some(KeysType::PrimaryKeys as i32);
+                            == Some(StarRocksKeysType::Primary);
                         let routed_chunk = match align_chunk_to_schema_slot_bindings(
                             &routed_chunk,
                             &index_plan.schema_slot_bindings,

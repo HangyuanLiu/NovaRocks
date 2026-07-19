@@ -31,9 +31,15 @@ use crate::connector::starrocks::lake::context::{
     update_tablet_runtime_schema, with_txn_log_append_lock,
 };
 use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
+use crate::connector::starrocks::lake::storage_schema_wire::{
+    decode_tablet_schema, encode_tablet_schema,
+};
 use crate::connector::starrocks::lake::txn_log::{
     build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
+};
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::formats::starrocks::metadata::{
@@ -54,8 +60,8 @@ use crate::formats::starrocks::writer::{
 };
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,
-    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
+    CompactionStrategyPb, FlatJsonConfigPb, MetadataUpdateInfoPb, PersistentIndexTypePb,
+    RowsetMetadataPb, TabletMetadataPb, TxnLogPb, txn_log_pb,
 };
 use crate::thrift::agent_service::{
     TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
@@ -253,7 +259,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     register_tablet_runtime(&new_ctx)?;
     if should_patch_initial_metadata_schema(&new_metadata, &new_schema) {
         let mut patched_meta = new_metadata.clone();
-        patched_meta.schema = Some(new_schema.clone());
+        patched_meta.schema = Some(encode_tablet_schema(&new_schema));
         patched_meta.id = Some(new_tablet_id);
         patched_meta.version = Some(1);
         let initial_path = initial_meta_file_path(&new_ctx.tablet_root_path)?;
@@ -422,7 +428,8 @@ fn execute_single_tablet_meta_update(
     let updated_schema = metadata_update_info.tablet_schema.clone();
     write_update_tablet_meta_txn_log(&tablet_root_path, tablet_id, txn_id, metadata_update_info)?;
     if let Some(schema) = updated_schema.as_ref() {
-        update_tablet_runtime_schema(tablet_id, schema)?;
+        let schema = decode_tablet_schema(schema.clone())?;
+        update_tablet_runtime_schema(tablet_id, &schema)?;
     }
     Ok(())
 }
@@ -454,7 +461,7 @@ fn build_metadata_update_info(
         });
     Ok(MetadataUpdateInfoPb {
         enable_persistent_index: tablet_meta_info.enable_persistent_index,
-        tablet_schema,
+        tablet_schema: tablet_schema.as_ref().map(encode_tablet_schema),
         persistent_index_type,
         bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
         compaction_strategy,
@@ -564,9 +571,9 @@ fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, vers
 
 fn should_patch_initial_metadata_schema(
     metadata: &TabletMetadataPb,
-    target_schema: &TabletSchemaPb,
+    target_schema: &StarRocksTabletSchema,
 ) -> bool {
-    metadata.schema.as_ref() != Some(target_schema)
+    metadata.schema.as_ref() != Some(&encode_tablet_schema(target_schema))
 }
 
 fn resolve_tablet_schema_from_metadata_or_runtime(
@@ -574,9 +581,9 @@ fn resolve_tablet_schema_from_metadata_or_runtime(
     metadata: &TabletMetadataPb,
     tablet_id: i64,
     version: i64,
-) -> Result<TabletSchemaPb, String> {
+) -> Result<StarRocksTabletSchema, String> {
     if let Some(schema) = metadata.schema.clone() {
-        return Ok(schema);
+        return decode_tablet_schema(schema);
     }
     let runtime = get_tablet_runtime(tablet_id).map_err(|runtime_err| {
         format!(
@@ -690,16 +697,14 @@ fn resolve_tablet_location(
 }
 
 fn ensure_schema_change_base_supported(
-    schema: &TabletSchemaPb,
+    schema: &StarRocksTabletSchema,
     metadata: &TabletMetadataPb,
     context: &str,
 ) -> Result<(), String> {
-    let keys_type_raw = schema
+    let keys_type = schema
         .keys_type
         .ok_or_else(|| format!("{context} missing keys_type"))?;
-    let keys_type = KeysType::try_from(keys_type_raw)
-        .map_err(|_| format!("{context} has unknown keys_type={keys_type_raw}"))?;
-    if keys_type != KeysType::PrimaryKeys {
+    if keys_type != StarRocksKeysType::Primary {
         return Ok(());
     }
 
@@ -721,10 +726,10 @@ fn ensure_schema_change_base_supported(
 
 fn resolve_target_schema(
     request: &TAlterTabletReqV2,
-    base_read_schema: &TabletSchemaPb,
-    new_metadata_schema: &TabletSchemaPb,
+    base_read_schema: &StarRocksTabletSchema,
+    new_metadata_schema: &StarRocksTabletSchema,
     new_tablet_id: i64,
-) -> Result<TabletSchemaPb, String> {
+) -> Result<StarRocksTabletSchema, String> {
     if let Ok(runtime) = get_tablet_runtime(new_tablet_id) {
         if &runtime.schema != new_metadata_schema {
             tracing::info!(
@@ -747,7 +752,7 @@ fn resolve_target_schema(
     Ok(new_metadata_schema.clone())
 }
 
-fn schemas_equivalent(lhs: &TabletSchemaPb, rhs: &TabletSchemaPb) -> bool {
+fn schemas_equivalent(lhs: &StarRocksTabletSchema, rhs: &StarRocksTabletSchema) -> bool {
     lhs.keys_type == rhs.keys_type
         && lhs.num_short_key_columns == rhs.num_short_key_columns
         && lhs.sort_key_idxes == rhs.sort_key_idxes
@@ -760,10 +765,7 @@ fn schemas_equivalent(lhs: &TabletSchemaPb, rhs: &TabletSchemaPb) -> bool {
             .all(|(l, r)| columns_equivalent(l, r))
 }
 
-fn columns_equivalent(
-    lhs: &crate::service::grpc_client::proto::starrocks::ColumnPb,
-    rhs: &crate::service::grpc_client::proto::starrocks::ColumnPb,
-) -> bool {
+fn columns_equivalent(lhs: &StarRocksColumnSchema, rhs: &StarRocksColumnSchema) -> bool {
     lhs.unique_id == rhs.unique_id
         && lhs.name == rhs.name
         && lhs.r#type == rhs.r#type
@@ -783,7 +785,7 @@ fn columns_equivalent(
 }
 
 fn build_unique_id_index_map(
-    schema: &TabletSchemaPb,
+    schema: &StarRocksTabletSchema,
     context: &str,
 ) -> Result<HashMap<i32, usize>, String> {
     let mut out = HashMap::with_capacity(schema.column.len());
@@ -809,8 +811,8 @@ fn build_unique_id_index_map(
 
 fn transform_rowset_batch(
     source_batch: &RecordBatch,
-    source_schema: &TabletSchemaPb,
-    target_schema: &TabletSchemaPb,
+    source_schema: &StarRocksTabletSchema,
+    target_schema: &StarRocksTabletSchema,
     request: &TAlterTabletReqV2,
     alter_mode: AlterMode,
     rowset_idx: usize,
@@ -834,8 +836,8 @@ fn transform_rowset_batch(
 
 fn transform_rowset_batch_schema_change(
     source_batch: &RecordBatch,
-    source_schema: &TabletSchemaPb,
-    target_schema: &TabletSchemaPb,
+    source_schema: &StarRocksTabletSchema,
+    target_schema: &StarRocksTabletSchema,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
     let target_output_schema = build_tablet_output_schema(target_schema)?;
@@ -927,8 +929,8 @@ fn transform_rowset_batch_schema_change(
 
 fn transform_rowset_batch_rollup(
     source_batch: &RecordBatch,
-    source_schema: &TabletSchemaPb,
-    target_schema: &TabletSchemaPb,
+    source_schema: &StarRocksTabletSchema,
+    target_schema: &StarRocksTabletSchema,
     request: &TAlterTabletReqV2,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
@@ -1105,7 +1107,7 @@ fn transform_rowset_batch_rollup(
 }
 
 fn build_source_name_index_map(
-    schema: &TabletSchemaPb,
+    schema: &StarRocksTabletSchema,
     context: &str,
 ) -> Result<HashMap<String, usize>, String> {
     let mut out = HashMap::with_capacity(schema.column.len());
@@ -1165,7 +1167,7 @@ pub(super) struct RollupExprInput {
 fn build_rollup_expr_input(
     request: &TAlterTabletReqV2,
     source_batch: &RecordBatch,
-    source_schema: &TabletSchemaPb,
+    source_schema: &StarRocksTabletSchema,
     rowset_idx: usize,
 ) -> Result<RollupExprInput, String> {
     let desc_tbl = request
@@ -1318,7 +1320,7 @@ fn eval_rollup_expr(
 
 fn apply_rollup_where_expr(
     source_batch: &RecordBatch,
-    source_schema: &TabletSchemaPb,
+    source_schema: &StarRocksTabletSchema,
     request: &TAlterTabletReqV2,
     rowset_idx: usize,
 ) -> Result<RecordBatch, String> {
@@ -1421,7 +1423,7 @@ fn cast_rollup_expr_to_target(
 
 fn ensure_target_non_nullable_column(
     array: &ArrayRef,
-    target_col: &crate::service::grpc_client::proto::starrocks::ColumnPb,
+    target_col: &StarRocksColumnSchema,
     rowset_idx: usize,
     target_idx: usize,
     target_name: &str,
@@ -1482,7 +1484,7 @@ fn cast_source_column_to_target(
 }
 
 fn build_missing_column_array(
-    target_col: &crate::service::grpc_client::proto::starrocks::ColumnPb,
+    target_col: &StarRocksColumnSchema,
     target_type: &DataType,
     row_count: usize,
     rowset_idx: usize,
