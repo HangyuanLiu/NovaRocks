@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{CoordinationError, CoordinationErrorKind};
 
 pub const COORDINATION_OPERATION_COUNT: usize = 9;
-pub const COORDINATION_OUTCOME_COUNT: usize = 12;
+pub const COORDINATION_OUTCOME_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -51,6 +51,7 @@ pub enum CoordinationOutcome {
     CommitUncertain = 9,
     Corruption = 10,
     StoreUnavailable = 11,
+    NotBootstrapped = 12,
 }
 
 pub(crate) fn error_outcome(error: &CoordinationError) -> Option<CoordinationOutcome> {
@@ -65,9 +66,9 @@ pub(crate) fn error_outcome(error: &CoordinationError) -> Option<CoordinationOut
         CoordinationErrorKind::CommitUncertain => Some(CoordinationOutcome::CommitUncertain),
         CoordinationErrorKind::Corruption => Some(CoordinationOutcome::Corruption),
         CoordinationErrorKind::StoreUnavailable => Some(CoordinationOutcome::StoreUnavailable),
+        CoordinationErrorKind::NotBootstrapped => Some(CoordinationOutcome::NotBootstrapped),
         CoordinationErrorKind::InvalidRequest
         | CoordinationErrorKind::LimitExceeded
-        | CoordinationErrorKind::NotBootstrapped
         | CoordinationErrorKind::EpochExhausted
         | CoordinationErrorKind::IncarnationExhausted => None,
     }

@@ -687,6 +687,10 @@ pub async fn incarnation_gate_lifecycle(factory: &StateStoreFactory) {
         gate.load().await.unwrap_err().kind(),
         CoordinationErrorKind::NotBootstrapped
     );
+    assert_eq!(
+        gate.admit_writes().await.unwrap_err().kind(),
+        CoordinationErrorKind::NotBootstrapped
+    );
     let bootstrap_id = OperationId::new_v7();
     let open = gate.bootstrap(bootstrap_id).await.unwrap();
     assert_eq!(open.incarnation().get(), 1);
@@ -717,6 +721,60 @@ pub async fn incarnation_gate_lifecycle(factory: &StateStoreFactory) {
             CoordinationOutcome::WriteClosed,
         ),
         1
+    );
+    assert_eq!(
+        metrics.operation_outcome_count(
+            CoordinationOperation::AdmitWrites,
+            CoordinationOutcome::NotBootstrapped,
+        ),
+        1
+    );
+}
+
+pub async fn deadline_skew_overflow_is_clock_unsafe(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap deadline-overflow fixture");
+    let clock = Arc::new(ManualLeaseClock::new(u64::MAX - 3, 1));
+    let settings = LeaseSettings::new(
+        Duration::from_millis(2),
+        Duration::from_millis(1),
+        Duration::from_millis(5),
+        Duration::from_millis(1),
+    )
+    .expect("representable relative lease settings");
+    let owner = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"deadline-overflow-owner"),
+        clock.clone(),
+        settings.clone(),
+    )
+    .expect("owner manager");
+    let contender = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"deadline-overflow-contender"),
+        clock.clone(),
+        settings,
+    )
+    .expect("contender manager");
+    let resource = resource(b"deadline-skew-overflow");
+    let _guard = acquired(
+        owner
+            .acquire(resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("acquire near wall-clock maximum"),
+    );
+    clock.set_wall(u64::MAX);
+
+    assert_eq!(
+        contender
+            .acquire(resource, attempt(), OperationId::new_v7())
+            .await
+            .expect_err("deadline plus skew overflow must fail closed")
+            .kind(),
+        CoordinationErrorKind::ClockUnsafe
     );
 }
 
@@ -2986,6 +3044,7 @@ pub async fn overflow_and_corruption_fail_closed(factory: &StateStoreFactory) {
 
 pub async fn run_coordination_conformance(factory: StateStoreFactory) {
     incarnation_gate_lifecycle(&factory).await;
+    deadline_skew_overflow_is_clock_unsafe(&factory).await;
     concurrent_bootstrap_converges(&factory).await;
     basic_acquire_contention_and_high_watermark(&factory).await;
     concurrent_acquire_exactly_one_winner(&factory).await;

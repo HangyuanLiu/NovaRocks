@@ -611,14 +611,16 @@ impl LeaseManager {
                             control,
                             wall_now,
                         ),
-                    expiry_boundary => {
+                    Some(expiry_boundary) => {
                         self.clear_expiry_observation(resource);
-                        let retry_ms = expiry_boundary
-                            .map(|boundary| boundary.saturating_sub(wall_now).max(1))
-                            .unwrap_or(self.inner.settings.lease_duration_ms);
+                        let retry_ms = expiry_boundary.saturating_sub(wall_now).max(1);
                         Ok(AcquireDecision::Immediate(AcquireOutcome::Contended(
                             LeaseObservation::new(current_token, Duration::from_millis(retry_ms)),
                         )))
+                    }
+                    None => {
+                        self.clear_expiry_observation(resource);
+                        Err(CoordinationError::clock_unsafe())
                     }
                 }
             }
