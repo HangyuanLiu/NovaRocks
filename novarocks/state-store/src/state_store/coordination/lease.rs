@@ -75,6 +75,7 @@ pub struct LeaseGuard {
     manager: LeaseManager,
     deadline_ms: u64,
     renewed_ms: u64,
+    recovery: Option<LeaseMutationRecovery>,
     active: bool,
     cancellation_tx: watch::Sender<Option<LeaseCancellationReason>>,
 }
@@ -87,6 +88,19 @@ struct ExpiryObservation {
 struct LeaseMutationSuccess {
     record: LeaseRecord,
     version: VersionToken,
+}
+
+#[derive(Clone)]
+struct LeaseMutationRecoveryEvidence {
+    operation_id: OperationId,
+    state: LeaseState,
+    deadline_ms: u64,
+    renewed_ms: u64,
+}
+
+struct LeaseMutationRecovery {
+    evidence: LeaseMutationRecoveryEvidence,
+    pending: bool,
 }
 
 impl fmt::Debug for LeaseGuard {
@@ -120,10 +134,21 @@ impl LeaseGuard {
         if !self.active {
             return Err(CoordinationError::fence_lost());
         }
-        let result = self
-            .manager
-            .renew_exact(&self.fence, self.deadline_ms, self.renewed_ms, operation_id)
-            .await;
+        self.ensure_no_pending_mutation()?;
+        let candidate = match self.manager.renew_candidate(
+            &self.fence,
+            self.deadline_ms,
+            self.renewed_ms,
+            operation_id,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.cancel_for_error(&error);
+                return Err(error);
+            }
+        };
+        self.begin_mutation_recovery(&candidate)?;
+        let result = self.manager.renew_exact(&self.fence, candidate).await;
         self.apply_renew_result(result)
     }
 
@@ -134,9 +159,10 @@ impl LeaseGuard {
         if !self.active {
             return Err(CoordinationError::fence_lost());
         }
+        let evidence = self.recovery_evidence(operation_id, LeaseState::Held)?;
         let result = self
             .manager
-            .recover_renew_exact(&self.fence, operation_id)
+            .recover_renew_exact(&self.fence, &evidence)
             .await;
         self.apply_renew_result(result)
     }
@@ -145,10 +171,16 @@ impl LeaseGuard {
         if !self.active {
             return Err(CoordinationError::fence_lost());
         }
-        let result = self
-            .manager
-            .release_exact(&self.fence, self.deadline_ms, self.renewed_ms, operation_id)
-            .await;
+        self.ensure_no_pending_mutation()?;
+        let candidate = lease_candidate_from_fence(
+            &self.fence,
+            LeaseState::Released,
+            self.deadline_ms,
+            self.renewed_ms,
+            operation_id,
+        );
+        self.begin_mutation_recovery(&candidate)?;
+        let result = self.manager.release_exact(&self.fence, candidate).await;
         self.apply_release_result(result)
     }
 
@@ -156,9 +188,10 @@ impl LeaseGuard {
         &mut self,
         operation_id: OperationId,
     ) -> Result<(), CoordinationError> {
+        let evidence = self.recovery_evidence(operation_id, LeaseState::Released)?;
         let result = self
             .manager
-            .recover_release_exact(&self.fence, operation_id)
+            .recover_release_exact(&self.fence, &evidence)
             .await;
         self.apply_release_result(result)
     }
@@ -170,9 +203,11 @@ impl LeaseGuard {
         match result {
             Ok(success) => {
                 self.apply_success(success);
+                self.resolve_mutation_recovery();
                 Ok(())
             }
             Err(error) => {
+                self.clear_definite_mutation_recovery(&error);
                 self.cancel_for_error(&error);
                 Err(error)
             }
@@ -186,12 +221,14 @@ impl LeaseGuard {
         match result {
             Ok(success) => {
                 self.apply_success(success);
+                self.resolve_mutation_recovery();
                 self.active = false;
                 self.cancellation_tx
                     .send_replace(Some(LeaseCancellationReason::Released));
                 Ok(())
             }
             Err(error) => {
+                self.clear_definite_mutation_recovery(&error);
                 self.cancel_for_error(&error);
                 Err(error)
             }
@@ -202,6 +239,69 @@ impl LeaseGuard {
         self.fence.record_version = success.version;
         self.deadline_ms = success.record.deadline_ms;
         self.renewed_ms = success.record.renewed_ms;
+    }
+
+    fn ensure_no_pending_mutation(&self) -> Result<(), CoordinationError> {
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.pending)
+        {
+            return Err(CoordinationError::invalid_request(
+                "pending lease mutation must be recovered before starting another mutation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_mutation_recovery(
+        &mut self,
+        candidate: &LeaseRecord,
+    ) -> Result<(), CoordinationError> {
+        self.ensure_no_pending_mutation()?;
+        self.recovery = Some(LeaseMutationRecovery {
+            evidence: LeaseMutationRecoveryEvidence {
+                operation_id: candidate.last_operation_id,
+                state: candidate.state,
+                deadline_ms: candidate.deadline_ms,
+                renewed_ms: candidate.renewed_ms,
+            },
+            pending: true,
+        });
+        Ok(())
+    }
+
+    fn recovery_evidence(
+        &self,
+        operation_id: OperationId,
+        state: LeaseState,
+    ) -> Result<LeaseMutationRecoveryEvidence, CoordinationError> {
+        self.recovery
+            .as_ref()
+            .filter(|recovery| {
+                recovery.evidence.operation_id == operation_id && recovery.evidence.state == state
+            })
+            .map(|recovery| recovery.evidence.clone())
+            .ok_or_else(|| {
+                CoordinationError::invalid_request(
+                    "lease recovery must match the guard's exact mutation evidence",
+                )
+            })
+    }
+
+    fn resolve_mutation_recovery(&mut self) {
+        if let Some(recovery) = &mut self.recovery {
+            recovery.pending = false;
+        }
+    }
+
+    fn clear_definite_mutation_recovery(&mut self, error: &CoordinationError) {
+        if !matches!(
+            error.kind(),
+            CoordinationErrorKind::CommitUncertain | CoordinationErrorKind::StoreUnavailable
+        ) {
+            self.recovery = None;
+        }
     }
 
     fn cancel_for_error(&mut self, error: &CoordinationError) {
@@ -226,7 +326,12 @@ impl LeaseGuard {
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.active
+            || self
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.pending)
+        {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -237,9 +342,15 @@ impl Drop for LeaseGuard {
         let deadline_ms = self.deadline_ms;
         let renewed_ms = self.renewed_ms;
         handle.spawn(async move {
-            let _ = manager
-                .release_exact(&fence, deadline_ms, renewed_ms, OperationId::new_v7())
-                .await;
+            let operation_id = OperationId::new_v7();
+            let candidate = lease_candidate_from_fence(
+                &fence,
+                LeaseState::Released,
+                deadline_ms,
+                renewed_ms,
+                operation_id,
+            );
+            let _ = manager.release_exact(&fence, candidate).await;
         });
     }
 }
@@ -755,14 +866,14 @@ impl LeaseManager {
         })
     }
 
-    async fn renew_exact(
+    fn renew_candidate(
         &self,
         fence: &LeaseFence,
         current_deadline_ms: u64,
         current_renewed_ms: u64,
         operation_id: OperationId,
-    ) -> Result<LeaseMutationSuccess, CoordinationError> {
-        let result = async {
+    ) -> Result<LeaseRecord, CoordinationError> {
+        let result = (|| {
             let wall_now = self.healthy_wall_time()?;
             let deadline_ms = wall_now
                 .checked_add(self.inner.settings.lease_duration_ms)
@@ -770,17 +881,32 @@ impl LeaseManager {
             if wall_now < current_renewed_ms || deadline_ms < current_deadline_ms {
                 return Err(CoordinationError::clock_unsafe());
             }
-            let candidate = lease_candidate_from_fence(
+            Ok(lease_candidate_from_fence(
                 fence,
                 LeaseState::Held,
                 deadline_ms,
                 wall_now,
                 operation_id,
-            );
-            self.write_exact_candidate(fence, candidate, RENEW_PURPOSE)
-                .await
+            ))
+        })();
+        if let Err(error) = &result
+            && let Some(outcome) = error_outcome(error)
+        {
+            self.inner
+                .metrics
+                .record(CoordinationOperation::Renew, outcome);
         }
-        .await;
+        result
+    }
+
+    async fn renew_exact(
+        &self,
+        fence: &LeaseFence,
+        candidate: LeaseRecord,
+    ) -> Result<LeaseMutationSuccess, CoordinationError> {
+        let result = self
+            .write_exact_candidate(fence, candidate, RENEW_PURPOSE)
+            .await;
         self.record_mutation_result(CoordinationOperation::Renew, &result);
         result
     }
@@ -788,19 +914,13 @@ impl LeaseManager {
     async fn recover_renew_exact(
         &self,
         fence: &LeaseFence,
-        operation_id: OperationId,
+        evidence: &LeaseMutationRecoveryEvidence,
     ) -> Result<LeaseMutationSuccess, CoordinationError> {
         let result = async {
-            let transaction_id = transaction_id(operation_id);
+            let transaction_id = transaction_id(evidence.operation_id);
             let certainty = recover_commit(self.inner.store.as_ref(), transaction_id).await?;
-            self.read_back_recovered_mutation(
-                fence,
-                operation_id,
-                LeaseState::Held,
-                certainty,
-                transaction_id,
-            )
-            .await
+            self.read_back_recovered_mutation(fence, evidence, certainty, transaction_id)
+                .await
         }
         .await;
         self.record_mutation_result(CoordinationOperation::Renew, &result);
@@ -810,17 +930,8 @@ impl LeaseManager {
     async fn release_exact(
         &self,
         fence: &LeaseFence,
-        current_deadline_ms: u64,
-        current_renewed_ms: u64,
-        operation_id: OperationId,
+        candidate: LeaseRecord,
     ) -> Result<LeaseMutationSuccess, CoordinationError> {
-        let candidate = lease_candidate_from_fence(
-            fence,
-            LeaseState::Released,
-            current_deadline_ms,
-            current_renewed_ms,
-            operation_id,
-        );
         let result = self
             .write_exact_candidate(fence, candidate, RELEASE_PURPOSE)
             .await;
@@ -831,19 +942,13 @@ impl LeaseManager {
     async fn recover_release_exact(
         &self,
         fence: &LeaseFence,
-        operation_id: OperationId,
+        evidence: &LeaseMutationRecoveryEvidence,
     ) -> Result<LeaseMutationSuccess, CoordinationError> {
         let result = async {
-            let transaction_id = transaction_id(operation_id);
+            let transaction_id = transaction_id(evidence.operation_id);
             let certainty = recover_commit(self.inner.store.as_ref(), transaction_id).await?;
-            self.read_back_recovered_mutation(
-                fence,
-                operation_id,
-                LeaseState::Released,
-                certainty,
-                transaction_id,
-            )
-            .await
+            self.read_back_recovered_mutation(fence, evidence, certainty, transaction_id)
+                .await
         }
         .await;
         self.record_mutation_result(CoordinationOperation::Release, &result);
@@ -973,8 +1078,7 @@ impl LeaseManager {
     async fn read_back_recovered_mutation(
         &self,
         fence: &LeaseFence,
-        operation_id: OperationId,
-        expected_state: LeaseState,
+        evidence: &LeaseMutationRecoveryEvidence,
         certainty: ReadBackCertainty,
         transaction_id: TransactionId,
     ) -> Result<LeaseMutationSuccess, CoordinationError> {
@@ -990,13 +1094,7 @@ impl LeaseManager {
             ));
         }
         if let Some(lease) = &current.lease
-            && recovered_mutation_matches(
-                &lease.record,
-                fence,
-                operation_id,
-                expected_state,
-                self.inner.settings.lease_duration_ms,
-            )
+            && recovered_mutation_matches(&lease.record, fence, evidence)
         {
             return Ok(LeaseMutationSuccess {
                 record: lease.record.clone(),
@@ -1029,6 +1127,7 @@ impl LeaseManager {
             manager: self.clone(),
             deadline_ms: record.deadline_ms,
             renewed_ms: record.renewed_ms,
+            recovery: None,
             active: record.state == LeaseState::Held,
             cancellation_tx,
         })
@@ -1181,22 +1280,17 @@ fn held_lease_matches_fence(
 fn recovered_mutation_matches(
     record: &LeaseRecord,
     fence: &LeaseFence,
-    operation_id: OperationId,
-    expected_state: LeaseState,
-    lease_duration_ms: u64,
+    evidence: &LeaseMutationRecoveryEvidence,
 ) -> bool {
-    record.state == expected_state
+    record.state == evidence.state
         && record.resource == fence.resource
         && record.holder == fence.holder
         && record.attempt == fence.attempt
         && record.incarnation == fence.token.control_plane_incarnation()
         && record.epoch == fence.token.resource_epoch()
-        && record.last_operation_id == operation_id
-        && (expected_state == LeaseState::Released
-            || record
-                .renewed_ms
-                .checked_add(lease_duration_ms)
-                .is_some_and(|deadline| deadline == record.deadline_ms))
+        && record.last_operation_id == evidence.operation_id
+        && record.deadline_ms == evidence.deadline_ms
+        && record.renewed_ms == evidence.renewed_ms
 }
 
 fn validate_identity(
@@ -1295,11 +1389,16 @@ mod tests {
     use bytes::Bytes;
     use uuid::Uuid;
 
-    use super::{LeaseManager, LeaseSettings};
-    use crate::coordination::codec::{ControlRecord, control_storage_key, encode_control};
+    use super::{
+        LeaseManager, LeaseMutationRecoveryEvidence, LeaseSettings, recovered_mutation_matches,
+    };
+    use crate::coordination::codec::{
+        ControlRecord, LeaseRecord, LeaseState, control_storage_key, encode_control,
+    };
     use crate::coordination::{
         AttemptId, ClockHealth, ControlPlaneIncarnation, ControlPlaneMode, CoordinationError,
-        CoordinationErrorKind, HolderId, LeaseClock, ResourceKey,
+        CoordinationErrorKind, FencingToken, HolderId, LeaseClock, LeaseFence, ResourceEpoch,
+        ResourceKey,
     };
     use crate::{
         ChangePage, ChangePollRequest, CommitResolution, Key, OperationId, RangePage, RangeRequest,
@@ -1545,5 +1644,60 @@ mod tests {
 
         assert_eq!(error.kind(), CoordinationErrorKind::ClockUnsafe);
         assert_eq!(concrete.begin_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn recovered_mutation_requires_the_exact_pending_evidence() {
+        let operation_id = OperationId::new_v7();
+        let resource =
+            ResourceKey::try_from(Bytes::from_static(b"recovery-resource")).expect("resource");
+        let holder = HolderId::try_from(Bytes::from_static(b"recovery-holder")).expect("holder");
+        let attempt = AttemptId::try_from(Uuid::now_v7()).expect("attempt");
+        let incarnation = ControlPlaneIncarnation::new(1).expect("incarnation");
+        let epoch = ResourceEpoch::new(1).expect("epoch");
+        let fence = LeaseFence {
+            resource: resource.clone(),
+            holder: holder.clone(),
+            attempt,
+            token: FencingToken::new("lease-test-cluster", incarnation, epoch).expect("token"),
+            record_version: VersionToken::try_from(Bytes::from_static(b"lease-version"))
+                .expect("version"),
+        };
+        let different_valid_candidate = LeaseRecord {
+            resource,
+            state: LeaseState::Held,
+            holder,
+            attempt,
+            incarnation,
+            epoch,
+            renewed_ms: 12_000,
+            deadline_ms: 22_000,
+            last_operation_id: operation_id,
+        };
+
+        let exact_evidence = LeaseMutationRecoveryEvidence {
+            operation_id,
+            state: LeaseState::Held,
+            renewed_ms: 11_000,
+            deadline_ms: 21_000,
+        };
+
+        assert!(!recovered_mutation_matches(
+            &different_valid_candidate,
+            &fence,
+            &exact_evidence,
+        ));
+
+        let mut different_release = different_valid_candidate;
+        different_release.state = LeaseState::Released;
+        let released_evidence = LeaseMutationRecoveryEvidence {
+            state: LeaseState::Released,
+            ..exact_evidence
+        };
+        assert!(!recovered_mutation_matches(
+            &different_release,
+            &fence,
+            &released_evidence,
+        ));
     }
 }

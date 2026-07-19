@@ -1392,12 +1392,93 @@ pub async fn renew_resets_observation(factory: &StateStoreFactory) {
 
 pub async fn lease_lifecycle_and_cancellation(factory: &StateStoreFactory) {
     exact_renew_release_and_stale_guards(factory).await;
+    cancelled_renew_recovers_with_exact_pending_candidate(factory).await;
     clock_failures_cancel_renewal(factory).await;
     release_preserves_maximum_epoch(factory).await;
     runtime_and_no_runtime_drop(factory).await;
     renew_acquire_race_has_one_mutation_winner(factory).await;
     release_acquire_race_has_one_mutation_winner(factory).await;
     incarnation_change_cancels_guard(factory).await;
+}
+
+async fn cancelled_renew_recovers_with_exact_pending_candidate(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let clock = Arc::new(ManualLeaseClock::new(350_000, 9_500));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"cancelled-renew-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"cancelled-renew-recovery"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire lease before cancelled renew"),
+    );
+    let old_fence = guard.fence();
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    clock.advance_wall(100);
+
+    let mut renewal = Box::pin(guard.renew(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut renewal => panic!("renewal returned before cancellation: {result:?}"),
+    }
+    drop(renewal);
+    control.wait_waiter_cancelled().await;
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let resolution = fixture
+                .store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve cancelled renewal");
+            if resolution != CommitResolution::Unresolved {
+                break resolution;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled renewal reaches terminal resolution");
+
+    match terminal {
+        CommitResolution::Committed(_) => {
+            guard
+                .recover_renew(operation_id)
+                .await
+                .expect("recover exact committed cancelled renewal");
+            assert_ne!(guard.fence(), old_fence);
+        }
+        CommitResolution::NotCommitted => {
+            let error = guard
+                .recover_renew(operation_id)
+                .await
+                .expect_err("recover exact noncommitted cancelled renewal");
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+        }
+        CommitResolution::Unresolved => unreachable!("terminal loop excludes unresolved"),
+    }
 }
 
 async fn exact_renew_release_and_stale_guards(factory: &StateStoreFactory) {
