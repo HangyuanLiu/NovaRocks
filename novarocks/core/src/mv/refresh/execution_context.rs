@@ -1818,6 +1818,18 @@ mod tests {
             "unknown affected partitions should disable pruning"
         );
 
+        ctx.affected_partitions = crate::mv::model::AffectedTargetPartitions::Unpartitioned;
+        let unpartitioned_filter = ctx
+            .target_state_partition_allow_list(&scan)
+            .expect("unpartitioned target should fall back to full target scan");
+        assert!(
+            unpartitioned_filter.is_none(),
+            "unpartitioned target should disable pruning"
+        );
+
+        ctx.affected_partitions =
+            crate::mv::model::AffectedTargetPartitions::not_derived("test context");
+
         let new_key = crate::mv::model::MvPartitionKey::new(1, Vec::new());
         let old_key = crate::mv::model::MvPartitionKey::new(2, Vec::new());
         ctx.affected_partitions =
