@@ -858,7 +858,7 @@ fn decode_role(
                     ),
                 ));
             }
-            let activation_path = consumer_path.field("activation");
+            let activation_path = consumer_path.clone().field("activation");
             let activation = consumer.activation.as_ref().ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(
                     activation_path.clone(),
@@ -1483,6 +1483,7 @@ mod tests {
                 contribution_kinds: vec![plan::RuntimeFilterContributionKind::Unspecified as i32],
                 completion_requirement: plan::RuntimeFilterCompletionRequirement::ProducerClosed
                     as i32,
+                join_key_ordinal: Some(0),
             },
         ));
 

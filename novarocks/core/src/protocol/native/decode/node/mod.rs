@@ -1992,6 +1992,9 @@ mod tests {
                             plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
                         ),
                     }),
+                    target: Some(plan::runtime_filter_consumer_role::Target::SourceBoundary(
+                        true,
+                    )),
                 },
             )),
         }
@@ -2420,10 +2423,10 @@ mod tests {
         };
         let mut ledger = NativeRuntimeFilterDecodeLedger::decode(1, Some(&table))
             .expect("decode duplicate-key producer table");
-        let lowered = lower_proto_node_with_bindings(
+        let lowered = decode_node_with_runtime_filters(
             &wire,
             &mut ExprArena::default(),
-            &NodeLoweringContext::default(),
+            &NativePlanDecodeContext::default(),
             &mut ledger,
         )
         .expect("exact ordinals disambiguate duplicate raw build keys");
