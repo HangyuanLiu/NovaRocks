@@ -2290,7 +2290,10 @@ fn resolve_mv_refresh_pruning_limits() -> Result<MvRefreshPruningLimits, String>
     Ok(cfg
         .standalone_server
         .as_ref()
-        .map(MvRefreshPruningLimits::from_standalone_config)
+        .map(|config| MvRefreshPruningLimits {
+            max_touched_groups: config.mv_refresh_max_touched_groups,
+            max_affected_partitions: config.mv_refresh_max_affected_partitions,
+        })
         .unwrap_or_default())
 }
 

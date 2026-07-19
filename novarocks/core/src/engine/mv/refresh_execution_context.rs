@@ -74,15 +74,6 @@ impl Default for MvRefreshPruningLimits {
 }
 
 impl MvRefreshPruningLimits {
-    pub(crate) fn from_standalone_config(
-        config: &crate::common::app_config::StandaloneServerConfig,
-    ) -> Self {
-        Self {
-            max_touched_groups: config.mv_refresh_max_touched_groups,
-            max_affected_partitions: config.mv_refresh_max_affected_partitions,
-        }
-    }
-
     pub(crate) fn affected_partition_count_exceeds_limit(&self, partition_count: usize) -> bool {
         partition_count > self.max_affected_partitions
     }

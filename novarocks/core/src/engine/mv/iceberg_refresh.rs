@@ -151,6 +151,36 @@ pub(crate) struct IcebergMvTarget {
     pub(crate) table: String,
 }
 
+impl From<&TableIdentity> for IcebergMvTarget {
+    fn from(target: &TableIdentity) -> Self {
+        Self {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod target_identity_tests {
+    use super::*;
+
+    #[test]
+    fn iceberg_mv_target_from_table_identity_preserves_exact_case() {
+        let identity = TableIdentity {
+            catalog: "TargetCase".to_string(),
+            namespace: "NameSpace".to_string(),
+            table: "MvTable".to_string(),
+        };
+
+        let target = IcebergMvTarget::from(&identity);
+
+        assert_eq!(target.catalog, identity.catalog);
+        assert_eq!(target.namespace, identity.namespace);
+        assert_eq!(target.table, identity.table);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum IcebergMvRefreshExecutionError {
     PreCommit(String),
