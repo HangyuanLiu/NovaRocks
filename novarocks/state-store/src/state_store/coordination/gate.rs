@@ -88,22 +88,8 @@ impl IncarnationGate {
             transaction.commit().await,
         )
         .await?;
-        let current = self.load_for_identity(&identity).await?;
-
-        if current.record == candidate {
-            return Ok(current.snapshot);
-        }
-        if certainty == ReadBackCertainty::Conflict
-            && bootstrap_compatible(&current.record, &identity)?
-        {
-            return Ok(current.snapshot);
-        }
-        Err(candidate_mismatch(
-            certainty,
-            transaction_id,
-            Some(current.record.incarnation),
-            candidate.incarnation,
-        ))
+        self.read_back_bootstrap(candidate, &identity, transaction_id, certainty)
+            .await
     }
 
     pub async fn load(&self) -> Result<ControlPlaneSnapshot, CoordinationError> {
@@ -288,6 +274,36 @@ impl IncarnationGate {
             ));
         };
         if current.record == candidate {
+            return Ok(current.snapshot);
+        }
+        Err(candidate_mismatch(
+            certainty,
+            transaction_id,
+            Some(current.record.incarnation),
+            candidate.incarnation,
+        ))
+    }
+
+    async fn read_back_bootstrap(
+        &self,
+        candidate: ControlRecord,
+        identity: &StoreIdentity,
+        transaction_id: TransactionId,
+        certainty: ReadBackCertainty,
+    ) -> Result<ControlPlaneSnapshot, CoordinationError> {
+        let current = self.try_load_for_identity(identity).await?;
+        let Some(current) = current else {
+            return Err(candidate_mismatch(
+                certainty,
+                transaction_id,
+                None,
+                candidate.incarnation,
+            ));
+        };
+        if current.record == candidate
+            || (certainty == ReadBackCertainty::Conflict
+                && bootstrap_compatible(&current.record, identity)?)
+        {
             return Ok(current.snapshot);
         }
         Err(candidate_mismatch(
@@ -584,9 +600,10 @@ mod tests {
     use super::{IncarnationGate, coordination_transaction_upper_bound, validate_write_limits};
     use crate::coordination::CoordinationErrorKind;
     use crate::{
-        ChangePage, ChangePollRequest, CommitResolution, Key, OperationId, ReadTransaction,
-        StateStore, StateStoreError, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity,
-        TransactionId, Value, VersionToken, WriteTransaction,
+        ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Key, OperationId,
+        Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
+        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
+        StoreIdentity, TransactionId, Value, VersionToken, WriteTransaction,
     };
 
     fn complete_v1_write_budget(
@@ -611,9 +628,11 @@ mod tests {
             + high_watermark_key_bytes
             + (10 + 4)
             + exact_high_watermark_conflict_bytes;
-        let control_read_bytes = includes_control_read
-            .then_some(exact_record_conflict_bytes)
-            .unwrap_or(0);
+        let control_read_bytes = if includes_control_read {
+            exact_record_conflict_bytes
+        } else {
+            0
+        };
         let logical_mutation_bytes = 1 + key_bytes + value_bytes + 1 + version_bytes;
         let durable_record_bytes = record_key_bytes + 1 + 16 + value_bytes;
         let change_entry_bytes = namespace_bytes + 1 + 10 + 4 + 4 + key_bytes;
@@ -775,5 +794,142 @@ mod tests {
             CoordinationErrorKind::LimitExceeded
         );
         assert_eq!(store.begin_writes.load(Ordering::SeqCst), 0);
+    }
+
+    struct AbsentReadTransaction;
+
+    #[async_trait]
+    impl ReadTransaction for AbsentReadTransaction {
+        async fn get(&mut self, _key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+            Ok(None)
+        }
+
+        async fn range(&mut self, _request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+            panic!("direct bootstrap regression does not scan")
+        }
+
+        async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+            Ok(())
+        }
+    }
+
+    struct UnknownBootstrapTransaction {
+        transaction_id: TransactionId,
+    }
+
+    #[async_trait]
+    impl ReadTransaction for UnknownBootstrapTransaction {
+        async fn get(&mut self, _key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+            panic!("bootstrap does not read in its write transaction")
+        }
+
+        async fn range(&mut self, _request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+            panic!("direct bootstrap regression does not scan")
+        }
+
+        async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WriteTransaction for UnknownBootstrapTransaction {
+        fn transaction_id(&self) -> &TransactionId {
+            &self.transaction_id
+        }
+
+        async fn put(
+            &mut self,
+            _key: Key,
+            _value: Value,
+            _precondition: Precondition,
+        ) -> Result<(), StateStoreError> {
+            Ok(())
+        }
+
+        async fn delete(
+            &mut self,
+            _key: Key,
+            _precondition: Precondition,
+        ) -> Result<(), StateStoreError> {
+            panic!("bootstrap does not delete")
+        }
+
+        async fn commit(self: Box<Self>) -> CommitOutcome {
+            CommitOutcome::CommitUnknown(StateStoreError::new(
+                StateStoreErrorKind::Transient,
+                "scripted unresolved bootstrap",
+            ))
+        }
+    }
+
+    struct UnresolvedAbsentBootstrapStore {
+        limits: StateStoreLimits,
+        identity: StoreIdentity,
+    }
+
+    #[async_trait]
+    impl StateStore for UnresolvedAbsentBootstrapStore {
+        fn provider_name(&self) -> &'static str {
+            "unresolved-absent-bootstrap"
+        }
+
+        fn limits(&self) -> &StateStoreLimits {
+            &self.limits
+        }
+
+        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+            panic!("direct bootstrap regression does not inspect metrics")
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            Ok(Box::new(AbsentReadTransaction))
+        }
+
+        async fn begin_write(
+            &self,
+            transaction_id: TransactionId,
+            _purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            Ok(Box::new(UnknownBootstrapTransaction { transaction_id }))
+        }
+
+        async fn poll_changes(
+            &self,
+            _request: &ChangePollRequest,
+        ) -> Result<ChangePage, StateStoreError> {
+            panic!("direct bootstrap regression does not poll changes")
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+            Ok(self.identity.clone())
+        }
+
+        async fn resolve_commit(
+            &self,
+            _transaction_id: &TransactionId,
+        ) -> Result<CommitResolution, StateStoreError> {
+            Ok(CommitResolution::Unresolved)
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_bootstrap_unresolved_without_visible_record_is_commit_uncertain() {
+        let store: Arc<dyn StateStore> = Arc::new(UnresolvedAbsentBootstrapStore {
+            limits: StateStoreLimits::default(),
+            identity: StoreIdentity {
+                store_id: Uuid::now_v7(),
+                cluster_id: "unresolved-absent-bootstrap".to_owned(),
+                initial_incarnation: 1,
+            },
+        });
+        let gate = IncarnationGate::new(store);
+        let operation_id = OperationId::new_v7();
+        let expected_transaction_id = crate::derive_transaction_id(operation_id, 1);
+
+        let error = gate.bootstrap(operation_id).await.unwrap_err();
+
+        assert_eq!(error.kind(), CoordinationErrorKind::CommitUncertain);
+        assert_eq!(error.transaction_id(), Some(expected_transaction_id));
     }
 }
