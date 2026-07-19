@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod aggregate_first_refresh;
 pub(crate) mod apply_key;
 pub(crate) mod capabilities;
 pub(crate) mod contract;
