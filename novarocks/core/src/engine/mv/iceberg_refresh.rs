@@ -106,6 +106,7 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::execution::dispatch_refresh_decision;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
@@ -180,21 +181,6 @@ impl IcebergMvRefreshExecutionError {
 impl From<String> for IcebergMvRefreshExecutionError {
     fn from(message: String) -> Self {
         Self::pre_commit(message)
-    }
-}
-
-fn run_iceberg_mv_refresh_lifecycle(
-    decision: RefreshDecision,
-    first_refresh: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-    metadata_only: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-    incremental: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    match decision {
-        RefreshDecision::SkipEmpty => Ok(StatementResult::Ok),
-        RefreshDecision::FirstRefresh => first_refresh(),
-        RefreshDecision::MetadataOnly => metadata_only(),
-        RefreshDecision::Incremental => incremental(),
-        RefreshDecision::FailFast { reason } => Err(reason.into()),
     }
 }
 
@@ -3602,8 +3588,10 @@ fn refresh_iceberg_mv_with_planned_partitions(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let Some(cur) = current_snapshot_id else {
                 return Err("invalid projection/filter MV first-refresh decision"
@@ -3891,8 +3879,10 @@ fn refresh_iceberg_union_projection_mv(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
                 &ctx.rewrite.mv_definition.select_sql,
@@ -4245,8 +4235,10 @@ fn refresh_single_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -4593,8 +4585,10 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -4860,8 +4854,10 @@ fn refresh_join_aggregate_iceberg_mv(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -10371,8 +10367,10 @@ fn refresh_iceberg_join_mv(
         &refresh_label,
     );
 
-    run_iceberg_mv_refresh_lifecycle(
+    let refresh_decision = ExecutableRefreshDecision::from_refresh_decision(refresh_decision)?;
+    dispatch_refresh_decision(
         refresh_decision,
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
