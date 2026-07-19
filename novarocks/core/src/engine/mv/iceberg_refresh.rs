@@ -107,6 +107,9 @@ use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
+use crate::mv::refresh::planning::{
+    RefreshPlanContract, RefreshPlanningInput, decide_refresh_plan,
+};
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
 };
@@ -4924,15 +4927,6 @@ fn unknown_join_affected_partitions() -> crate::mv::model::AffectedTargetPartiti
     )
 }
 
-fn plan_refresh_mode_from_decision(decision: RefreshDecision) -> Result<RefreshMode, RefreshError> {
-    match decision {
-        RefreshDecision::SkipEmpty | RefreshDecision::MetadataOnly => Ok(RefreshMode::Noop),
-        RefreshDecision::FirstRefresh => Ok(RefreshMode::Full),
-        RefreshDecision::Incremental => Ok(RefreshMode::Incremental),
-        RefreshDecision::FailFast { reason } => Err(RefreshError::user(reason)),
-    }
-}
-
 fn base_snapshot_statuses_for_plan(
     base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
@@ -5305,11 +5299,13 @@ pub(crate) fn plan_iceberg_mv_refresh(
         );
         let refresh_statuses =
             base_snapshot_statuses_for_plan(&base_refs, previous_snapshots, &current_snapshots);
-        let mode = plan_refresh_mode_from_decision(decide_refresh(
-            BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-            &refresh_statuses,
-            &refresh_label,
-        ))?;
+        let decision = decide_refresh_plan(&RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        })
+        .map_err(RefreshError::user)?;
+        let mode = decision.mode;
         let has_previous = base_refs
             .iter()
             .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -5361,25 +5357,26 @@ pub(crate) fn plan_iceberg_mv_refresh(
         let affected_partitions = unknown_join_affected_partitions();
         log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
         return Ok(RefreshPlan {
-            mv_id: Some(mv_definition.mv_id),
-            target,
-            storage_engine: MvStorageEngine::Iceberg,
-            mode,
-            base_refs: base_refs
-                .iter()
-                .map(|base_ref| TableIdentity {
-                    catalog: base_ref.catalog.clone(),
-                    namespace: base_ref.namespace.clone(),
-                    table: base_ref.table.clone(),
-                })
-                .collect(),
-            snapshot_pins,
-            affected_partitions: affected_partitions.clone(),
+            contract: RefreshPlanContract {
+                mv_id: Some(mv_definition.mv_id),
+                target,
+                storage_engine: MvStorageEngine::Iceberg,
+                mode,
+                base_refs: base_refs
+                    .iter()
+                    .map(|base_ref| TableIdentity {
+                        catalog: base_ref.catalog.clone(),
+                        namespace: base_ref.namespace.clone(),
+                        table: base_ref.table.clone(),
+                    })
+                    .collect(),
+                snapshot_pins,
+                affected_partitions,
+            },
             backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                 stmt: stmt.clone(),
                 current_catalog: current_catalog.map(str::to_string),
                 current_database: current_database.to_string(),
-                affected_partitions: affected_partitions.clone(),
             }),
         });
     }
@@ -5411,16 +5408,18 @@ pub(crate) fn plan_iceberg_mv_refresh(
         "iceberg materialized view {}.{}.{}",
         iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
     );
-    let pre_pin_decision = decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous_snapshot_id,
-            current_snapshot_id_before_pin,
-        )],
-        &refresh_label,
-    );
-    match pre_pin_decision {
+    let pre_pin_statuses = [base_snapshot_status_for_refresh(
+        base_ref,
+        previous_snapshot_id,
+        current_snapshot_id_before_pin,
+    )];
+    let pre_pin_decision = decide_refresh_plan(&RefreshPlanningInput {
+        snapshot_policy: BaseSnapshotPolicy::SingleBase,
+        base_snapshots: &pre_pin_statuses,
+        label: &refresh_label,
+    })
+    .map_err(RefreshError::user)?;
+    match pre_pin_decision.refresh {
         RefreshDecision::SkipEmpty => {
             ensure_schema_contract_compatible_for_refresh(
                 schema_contract,
@@ -5433,29 +5432,30 @@ pub(crate) fn plan_iceberg_mv_refresh(
             let affected_partitions = noop_affected_partitions(schema_contract);
             log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
             return Ok(RefreshPlan {
-                mv_id: Some(mv_definition.mv_id),
-                target,
-                storage_engine: MvStorageEngine::Iceberg,
-                mode: RefreshMode::Noop,
-                base_refs: vec![TableIdentity {
-                    catalog: base_ref.catalog.clone(),
-                    namespace: base_ref.namespace.clone(),
-                    table: base_ref.table.clone(),
-                }],
-                snapshot_pins,
-                affected_partitions: affected_partitions.clone(),
+                contract: RefreshPlanContract {
+                    mv_id: Some(mv_definition.mv_id),
+                    target,
+                    storage_engine: MvStorageEngine::Iceberg,
+                    mode: pre_pin_decision.mode,
+                    base_refs: vec![TableIdentity {
+                        catalog: base_ref.catalog.clone(),
+                        namespace: base_ref.namespace.clone(),
+                        table: base_ref.table.clone(),
+                    }],
+                    snapshot_pins,
+                    affected_partitions,
+                },
                 backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
                     stmt: stmt.clone(),
                     current_catalog: current_catalog.map(str::to_string),
                     current_database: current_database.to_string(),
-                    affected_partitions: affected_partitions.clone(),
                 }),
             });
         }
-        RefreshDecision::FailFast { reason } => return Err(RefreshError::user(reason)),
         RefreshDecision::FirstRefresh
         | RefreshDecision::MetadataOnly
         | RefreshDecision::Incremental => {}
+        RefreshDecision::FailFast { reason } => return Err(RefreshError::user(reason)),
     }
 
     let current_snapshot_id = current_snapshot_id_before_pin;
@@ -5467,16 +5467,18 @@ pub(crate) fn plan_iceberg_mv_refresh(
         ContractDecision::CompatibleSafeWithRebind { .. } | ContractDecision::CompatibleSafe => {}
     }
 
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous_snapshot_id,
-            current_snapshot_id,
-        )],
-        &refresh_label,
-    );
-    if matches!(refresh_decision, RefreshDecision::Incremental) {
+    let refresh_statuses = [base_snapshot_status_for_refresh(
+        base_ref,
+        previous_snapshot_id,
+        current_snapshot_id,
+    )];
+    let decision = decide_refresh_plan(&RefreshPlanningInput {
+        snapshot_policy: BaseSnapshotPolicy::SingleBase,
+        base_snapshots: &refresh_statuses,
+        label: &refresh_label,
+    })
+    .map_err(RefreshError::user)?;
+    if matches!(decision.mode, RefreshMode::Incremental) {
         if let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) {
             crate::connector::iceberg::changes::classify_lineage(
                 loaded.table.metadata(),
@@ -5494,7 +5496,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             })?;
         }
     }
-    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
+    let mode = decision.mode;
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
     let affected_partitions = match mode {
@@ -5535,22 +5537,23 @@ pub(crate) fn plan_iceberg_mv_refresh(
     };
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
-        mv_id: Some(mv_definition.mv_id),
-        target,
-        storage_engine: MvStorageEngine::Iceberg,
-        mode,
-        base_refs: vec![TableIdentity {
-            catalog: base_ref.catalog.clone(),
-            namespace: base_ref.namespace.clone(),
-            table: base_ref.table.clone(),
-        }],
-        snapshot_pins,
-        affected_partitions: affected_partitions.clone(),
+        contract: RefreshPlanContract {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            mode,
+            base_refs: vec![TableIdentity {
+                catalog: base_ref.catalog.clone(),
+                namespace: base_ref.namespace.clone(),
+                table: base_ref.table.clone(),
+            }],
+            snapshot_pins,
+            affected_partitions,
+        },
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
-            affected_partitions: affected_partitions.clone(),
         }),
     })
 }
@@ -5625,12 +5628,13 @@ fn plan_iceberg_union_projection_mv_refresh(
     );
     let refresh_statuses =
         base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &refresh_statuses,
-        &refresh_label,
-    );
-    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
+    let decision = decide_refresh_plan(&RefreshPlanningInput {
+        snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+        base_snapshots: &refresh_statuses,
+        label: &refresh_label,
+    })
+    .map_err(RefreshError::user)?;
+    let mode = decision.mode;
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
@@ -5697,25 +5701,26 @@ fn plan_iceberg_union_projection_mv_refresh(
     );
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
-        mv_id: Some(mv_definition.mv_id),
-        target,
-        storage_engine: MvStorageEngine::Iceberg,
-        mode,
-        base_refs: base_refs
-            .iter()
-            .map(|base_ref| TableIdentity {
-                catalog: base_ref.catalog.clone(),
-                namespace: base_ref.namespace.clone(),
-                table: base_ref.table.clone(),
-            })
-            .collect(),
-        snapshot_pins,
-        affected_partitions: affected_partitions.clone(),
+        contract: RefreshPlanContract {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            mode,
+            base_refs: base_refs
+                .iter()
+                .map(|base_ref| TableIdentity {
+                    catalog: base_ref.catalog.clone(),
+                    namespace: base_ref.namespace.clone(),
+                    table: base_ref.table.clone(),
+                })
+                .collect(),
+            snapshot_pins,
+            affected_partitions,
+        },
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
-            affected_partitions: affected_partitions.clone(),
         }),
     })
 }
@@ -5795,12 +5800,13 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     );
     let refresh_statuses =
         base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &refresh_statuses,
-        &refresh_label,
-    );
-    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
+    let decision = decide_refresh_plan(&RefreshPlanningInput {
+        snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+        base_snapshots: &refresh_statuses,
+        label: &refresh_label,
+    })
+    .map_err(RefreshError::user)?;
+    let mode = decision.mode;
     let has_previous = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -5934,14 +5940,16 @@ fn plan_iceberg_aggregate_mv_refresh(
                 "iceberg aggregate materialized view {}.{}.{}",
                 iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
             );
-            let refresh_decision = decide_refresh(
-                BaseSnapshotPolicy::SingleBase,
-                &[base_snapshot_status_for_refresh(
-                    base_ref, previous, current,
-                )],
-                &refresh_label,
-            );
-            if matches!(refresh_decision, RefreshDecision::Incremental) {
+            let refresh_statuses = [base_snapshot_status_for_refresh(
+                base_ref, previous, current,
+            )];
+            let decision = decide_refresh_plan(&RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                base_snapshots: &refresh_statuses,
+                label: &refresh_label,
+            })
+            .map_err(RefreshError::user)?;
+            if matches!(decision.mode, RefreshMode::Incremental) {
                 if let (Some(prev), Some(cur)) = (previous, current) {
                     crate::connector::iceberg::changes::classify_lineage(
                         loaded.table.metadata(),
@@ -5959,7 +5967,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                     })?;
                 }
             }
-            let mode = plan_refresh_mode_from_decision(refresh_decision)?;
+            let mode = decision.mode;
             let mut snapshot_pins = BTreeMap::new();
             snapshot_pins.insert(base_ref.fqn(), current);
             let affected_partitions = plan_aggregate_mv_affected_partitions(
@@ -6042,11 +6050,13 @@ fn plan_iceberg_aggregate_mv_refresh(
             );
             let refresh_statuses =
                 base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
-            let mode = plan_refresh_mode_from_decision(decide_refresh(
-                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-                &refresh_statuses,
-                &refresh_label,
-            ))?;
+            let decision = decide_refresh_plan(&RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                base_snapshots: &refresh_statuses,
+                label: &refresh_label,
+            })
+            .map_err(RefreshError::user)?;
+            let mode = decision.mode;
             let has_previous = base_refs
                 .iter()
                 .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -6120,25 +6130,26 @@ fn build_iceberg_refresh_plan(
     affected_partitions: crate::mv::model::AffectedTargetPartitions,
 ) -> RefreshPlan {
     RefreshPlan {
-        mv_id: Some(mv_definition.mv_id),
-        target,
-        storage_engine: MvStorageEngine::Iceberg,
-        mode,
-        base_refs: base_refs
-            .iter()
-            .map(|base_ref| TableIdentity {
-                catalog: base_ref.catalog.clone(),
-                namespace: base_ref.namespace.clone(),
-                table: base_ref.table.clone(),
-            })
-            .collect(),
-        snapshot_pins,
-        affected_partitions: affected_partitions.clone(),
+        contract: RefreshPlanContract {
+            mv_id: Some(mv_definition.mv_id),
+            target,
+            storage_engine: MvStorageEngine::Iceberg,
+            mode,
+            base_refs: base_refs
+                .iter()
+                .map(|base_ref| TableIdentity {
+                    catalog: base_ref.catalog.clone(),
+                    namespace: base_ref.namespace.clone(),
+                    table: base_ref.table.clone(),
+                })
+                .collect(),
+            snapshot_pins,
+            affected_partitions,
+        },
         backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
             stmt: stmt.clone(),
             current_catalog: current_catalog.map(str::to_string),
             current_database: current_database.to_string(),
-            affected_partitions: affected_partitions.clone(),
         }),
     }
 }
@@ -6146,13 +6157,14 @@ fn build_iceberg_refresh_plan(
 pub(crate) fn execute_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: &IcebergRefreshPlan,
+    affected_partitions: &crate::mv::model::AffectedTargetPartitions,
 ) -> Result<IcebergRefreshOutcome, RefreshError> {
     refresh_iceberg_mv_with_planned_partitions(
         state,
         plan.current_catalog.as_deref(),
         &plan.current_database,
         &plan.stmt,
-        &plan.affected_partitions,
+        affected_partitions,
     )
     .map_err(IcebergMvRefreshExecutionError::into_refresh_error)?;
     Ok(IcebergRefreshOutcome {
@@ -16659,32 +16671,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_refresh_mode_is_derived_from_refresh_decision() {
-        assert_eq!(
-            plan_refresh_mode_from_decision(RefreshDecision::SkipEmpty).expect("skip"),
-            RefreshMode::Noop
-        );
-        assert_eq!(
-            plan_refresh_mode_from_decision(RefreshDecision::MetadataOnly).expect("metadata"),
-            RefreshMode::Noop
-        );
-        assert_eq!(
-            plan_refresh_mode_from_decision(RefreshDecision::FirstRefresh).expect("first"),
-            RefreshMode::Full
-        );
-        assert_eq!(
-            plan_refresh_mode_from_decision(RefreshDecision::Incremental).expect("incremental"),
-            RefreshMode::Incremental
-        );
-        assert!(
-            plan_refresh_mode_from_decision(RefreshDecision::FailFast {
-                reason: "blocked".to_string()
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
     fn refresh_status_uses_base_ref_fqn() {
         let base_ref = TableIdentity {
             catalog: "ice".to_string(),
@@ -17141,7 +17127,7 @@ mod tests {
             },
         )
         .expect("aggregate incremental refresh plan");
-        assert_eq!(plan.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
             .expect("aggregate incremental refresh");
 
@@ -17241,7 +17227,7 @@ mod tests {
             },
         )
         .expect("join aggregate incremental refresh plan");
-        assert_eq!(plan.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
             .expect("join aggregate incremental refresh");
 
@@ -21618,9 +21604,10 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("projection/filter UNION ALL refresh planning");
 
-        assert_eq!(plan.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode, RefreshMode::Noop);
         assert_eq!(
-            plan.base_refs
+            plan.contract
+                .base_refs
                 .iter()
                 .map(|base| format!("{}.{}.{}", base.catalog, base.namespace, base.table))
                 .collect::<Vec<_>>(),
@@ -21629,13 +21616,16 @@ mod tests {
                 "ice.sales.returns".to_string()
             ]
         );
-        assert_eq!(plan.snapshot_pins.len(), 2);
+        assert_eq!(plan.contract.snapshot_pins.len(), 2);
         assert_eq!(
-            plan.snapshot_pins.get("ice.sales.orders").copied(),
+            plan.contract.snapshot_pins.get("ice.sales.orders").copied(),
             Some(None)
         );
         assert_eq!(
-            plan.snapshot_pins.get("ice.sales.returns").copied(),
+            plan.contract
+                .snapshot_pins
+                .get("ice.sales.returns")
+                .copied(),
             Some(None)
         );
     }
@@ -21848,7 +21838,7 @@ mod tests {
         let plan =
             plan_iceberg_mv_refresh(&env.state, Some(catalog), &env.current_db, &refresh, target)
                 .expect("projection/filter UNION ALL incremental plan");
-        assert_eq!(plan.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
 
         refresh_iceberg_mv(&env.state, Some(catalog), &env.current_db, &refresh)
             .expect("incremental projection/filter UNION ALL refresh");
@@ -22207,9 +22197,10 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("aggregate-over-UNION-ALL refresh planning");
 
-        assert_eq!(plan.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode, RefreshMode::Noop);
         assert_eq!(
-            plan.base_refs
+            plan.contract
+                .base_refs
                 .iter()
                 .map(|base| format!("{}.{}.{}", base.catalog, base.namespace, base.table))
                 .collect::<Vec<_>>(),
@@ -22218,13 +22209,19 @@ mod tests {
                 "ice.sales.fact_west".to_string()
             ]
         );
-        assert_eq!(plan.snapshot_pins.len(), 2);
+        assert_eq!(plan.contract.snapshot_pins.len(), 2);
         assert_eq!(
-            plan.snapshot_pins.get("ice.sales.fact_east").copied(),
+            plan.contract
+                .snapshot_pins
+                .get("ice.sales.fact_east")
+                .copied(),
             Some(None)
         );
         assert_eq!(
-            plan.snapshot_pins.get("ice.sales.fact_west").copied(),
+            plan.contract
+                .snapshot_pins
+                .get("ice.sales.fact_west")
+                .copied(),
             Some(None)
         );
     }
@@ -22486,9 +22483,9 @@ mod tests {
         let plan =
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("empty base plan should be no-op");
-        assert_eq!(plan.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode, RefreshMode::Noop);
         assert_eq!(
-            plan.snapshot_pins.get("ice.sales.orders").copied(),
+            plan.contract.snapshot_pins.get("ice.sales.orders").copied(),
             Some(None)
         );
     }
@@ -23070,11 +23067,11 @@ mod tests {
                 .expect("second refresh plan");
 
         let crate::mv::model::AffectedTargetPartitions::Known { partitions } =
-            plan.affected_partitions
+            plan.contract.affected_partitions
         else {
             panic!(
                 "expected known affected partitions: {:?}",
-                plan.affected_partitions
+                plan.contract.affected_partitions
             );
         };
         let entry = {
@@ -23119,7 +23116,7 @@ mod tests {
                 .expect("unpartitioned refresh plan");
 
         assert_eq!(
-            plan.affected_partitions,
+            plan.contract.affected_partitions,
             crate::mv::model::AffectedTargetPartitions::Unpartitioned
         );
     }
@@ -23151,7 +23148,7 @@ mod tests {
                 .expect("join refresh plan");
 
         assert_eq!(
-            plan.affected_partitions.not_derived_reason(),
+            plan.contract.affected_partitions.not_derived_reason(),
             Some("join MV affected partition planning is not implemented")
         );
     }

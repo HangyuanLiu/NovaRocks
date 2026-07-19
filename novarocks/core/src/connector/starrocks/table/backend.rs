@@ -34,6 +34,7 @@ use crate::engine::mv::lifecycle::{
     StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
 use crate::mv::model::{MvStorageEngine, RefreshMode};
+use crate::mv::refresh::planning::RefreshPlanContract;
 use crate::sql::parser::ast::{Literal, ObjectName};
 use crate::sql::planner::table::TableDef;
 
@@ -287,19 +288,21 @@ impl MvBackend for StarRocksTableMvBackend {
 
     fn plan_refresh(&self, req: RefreshRequest) -> Result<RefreshPlan, RefreshError> {
         Ok(RefreshPlan {
-            mv_id: None,
-            target: req.target,
-            storage_engine: MvStorageEngine::StarRocks,
-            mode: RefreshMode::Incremental,
-            base_refs: vec![TableIdentity {
-                catalog: "starrocks".to_string(),
-                namespace: req.current_database.clone(),
-                table: req.statement.name.parts.join("."),
-            }],
-            snapshot_pins: Default::default(),
-            affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
-                "StarRocks table MV partition planning is not implemented",
-            ),
+            contract: RefreshPlanContract {
+                mv_id: None,
+                target: req.target,
+                storage_engine: MvStorageEngine::StarRocks,
+                mode: RefreshMode::Incremental,
+                base_refs: vec![TableIdentity {
+                    catalog: "starrocks".to_string(),
+                    namespace: req.current_database.clone(),
+                    table: req.statement.name.parts.join("."),
+                }],
+                snapshot_pins: Default::default(),
+                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                    "StarRocks table MV partition planning is not implemented",
+                ),
+            },
             backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {
                 stmt: req.statement,
                 current_catalog: req.current_catalog,
@@ -327,8 +330,8 @@ impl MvBackend for StarRocksTableMvBackend {
         )
         .map_err(RefreshError::pre_commit)?;
         Ok(RefreshOutcome {
-            mv_id: plan.mv_id,
-            target: plan.target.clone(),
+            mv_id: plan.contract.mv_id,
+            target: plan.contract.target.clone(),
             rows: None,
             base_snapshots: Default::default(),
             base_table_uuids: Default::default(),

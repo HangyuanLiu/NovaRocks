@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::catalog::identifier::TableIdentity;
-use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+use crate::mv::model::MvTarget;
+use crate::mv::refresh::planning::RefreshPlanContract;
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
     ShowMaterializedViewsStmt,
@@ -58,14 +58,8 @@ pub(crate) struct RefreshRequest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RefreshPlan {
-    pub mv_id: Option<i64>,
-    pub target: MvTarget,
-    pub storage_engine: MvStorageEngine,
-    pub mode: RefreshMode,
-    pub base_refs: Vec<TableIdentity>,
-    pub snapshot_pins: BTreeMap<String, Option<i64>>,
-    pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
-    pub backend_plan: BackendRefreshPlan,
+    pub(crate) contract: RefreshPlanContract,
+    pub(crate) backend_plan: BackendRefreshPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +80,6 @@ pub(crate) struct IcebergRefreshPlan {
     pub stmt: RefreshMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
-    pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +204,7 @@ impl Error for RefreshError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::model::MvStorageEngine;
 
     #[test]
     fn refresh_error_kind_drives_commit_rollback_policy() {
