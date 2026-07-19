@@ -104,6 +104,8 @@ impl IcebergMvRewriteContext {
         canonical_select_query: Arc<sqlparser::ast::Query>,
         base_refs: Arc<[TableIdentity]>,
         pin: Arc<RefreshSnapshotPin>,
+        previous_snapshot_ids: BTreeMap<String, i64>,
+        previous_table_uuids: BTreeMap<String, String>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         target_schema: Arc<Schema>,
@@ -137,9 +139,6 @@ impl IcebergMvRewriteContext {
                 )));
             }
         }
-
-        let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
-        let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
 
         for base_ref in base_refs.iter() {
             let fqn = base_ref.fqn();
@@ -222,6 +221,44 @@ impl IcebergMvRewriteContext {
             target_schema,
             schema_contract,
         })
+    }
+
+    /// Compatibility constructor for tests, EXPLAIN, and repartition paths
+    /// that do not execute a validated refresh plan. Production refresh
+    /// execution must call `from_parts` with its contract baseline instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_definition_parts(
+        target: TableIdentity,
+        mv_id: i64,
+        current_catalog: Option<String>,
+        current_database: String,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[TableIdentity]>,
+        pin: Arc<RefreshSnapshotPin>,
+        target_snapshot_id: Option<i64>,
+        target_table_uuid: String,
+        target_schema: Arc<Schema>,
+        schema_contract: Option<Arc<MvSchemaContract>>,
+    ) -> Result<Self, String> {
+        let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
+        let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
+        Self::from_parts(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            previous_snapshot_ids,
+            previous_table_uuids,
+            target_snapshot_id,
+            target_table_uuid,
+            target_schema,
+            schema_contract,
+        )
     }
 
     pub(crate) fn summary(&self) -> CtxSummary<'_> {
@@ -744,7 +781,7 @@ pub(crate) mod tests_support {
         let contract = Arc::new(make_schema_contract());
 
         Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 target,
                 42,
                 Some("sess_cat".to_string()),
@@ -832,7 +869,7 @@ pub(crate) mod tests_support {
                 .expect("build join projection target schema"),
         );
         Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 make_target(),
                 42,
                 Some("sess_cat".to_string()),
@@ -915,7 +952,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let ctx = IcebergMvRewriteContext::from_parts(
+        let ctx = IcebergMvRewriteContext::from_definition_parts(
             target.clone(),
             42,
             Some("sess_cat".to_string()),
@@ -962,7 +999,7 @@ mod tests {
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
         let schema = make_target_schema();
 
-        let err_msg = IcebergMvRewriteContext::from_parts(
+        let err_msg = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -993,7 +1030,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1022,7 +1059,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1051,7 +1088,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1085,7 +1122,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1116,7 +1153,7 @@ mod tests {
         let schema = make_target_schema();
         let contract = Arc::new(make_schema_contract());
 
-        let ctx = IcebergMvRewriteContext::from_parts(
+        let ctx = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1147,7 +1184,7 @@ mod tests {
         contract.target.visible_columns.pop();
         let contract = Arc::new(contract);
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1182,7 +1219,7 @@ mod tests {
         contract.target.visible_columns[1].target_field_id = 999;
         let contract = Arc::new(contract);
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1237,7 +1274,7 @@ mod tests {
         let mv_def = Arc::new(def_for_three_bases);
         let contract = Arc::new(make_schema_contract());
 
-        let ctx = IcebergMvRewriteContext::from_parts(
+        let ctx = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1294,7 +1331,7 @@ mod tests {
         contract.target.hidden_apply_key.column_name = "nonexistent".to_string();
         let contract = Arc::new(contract);
 
-        let err = IcebergMvRewriteContext::from_parts(
+        let err = IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1353,7 +1390,7 @@ mod tests {
         contract.target.hidden_apply_key.target_field_id = 999;
         let contract = Arc::new(contract);
 
-        IcebergMvRewriteContext::from_parts(
+        IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1420,7 +1457,7 @@ mod tests {
         });
         let contract = Arc::new(contract);
 
-        IcebergMvRewriteContext::from_parts(
+        IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,
@@ -1509,7 +1546,7 @@ mod tests {
         });
         let contract = Arc::new(contract);
 
-        IcebergMvRewriteContext::from_parts(
+        IcebergMvRewriteContext::from_definition_parts(
             target,
             42,
             None,

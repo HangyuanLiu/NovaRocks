@@ -225,6 +225,52 @@ impl IcebergMvRefreshContext {
         let metadata = target_table.metadata();
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
         let target_table_uuid = metadata.uuid().to_string();
+        let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
+        let previous_table_uuids = mv_definition.last_refresh_table_uuids.clone();
+        Self::new_with_validated_inputs_and_pruning_limits(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            previous_snapshot_ids,
+            previous_table_uuids,
+            target_snapshot_id,
+            target_table_uuid,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            affected_partitions,
+            pruning_limits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_validated_inputs_and_pruning_limits(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[TableIdentity]>,
+        pin: Arc<RefreshSnapshotPin>,
+        previous_snapshot_ids: BTreeMap<String, i64>,
+        previous_table_uuids: BTreeMap<String, String>,
+        target_snapshot_id: Option<i64>,
+        target_table_uuid: String,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        affected_partitions: crate::mv::model::AffectedTargetPartitions,
+        pruning_limits: MvRefreshPruningLimits,
+    ) -> Result<Self, String> {
+        let metadata = target_table.metadata();
         let target_schema = metadata.current_schema().clone();
         let schema_contract = mv_definition.schema_contract.clone().map(Arc::new);
 
@@ -238,6 +284,8 @@ impl IcebergMvRefreshContext {
             canonical_select_query,
             base_refs.clone(),
             pin,
+            previous_snapshot_ids,
+            previous_table_uuids,
             target_snapshot_id,
             target_table_uuid,
             target_schema,
@@ -1086,7 +1134,7 @@ pub(crate) mod tests_support {
         let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
 
         Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 target,
                 42,
                 Some("sess_cat".to_string()),
@@ -1247,7 +1295,7 @@ pub(crate) mod tests_support {
             }],
         });
         let rewrite = Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 make_target(),
                 42,
                 Some("sess_cat".to_string()),
@@ -1464,7 +1512,7 @@ pub(crate) mod tests_support {
             ),
         ]);
         let rewrite = Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 base.target.clone(),
                 base.mv_id,
                 base.current_catalog.clone(),
