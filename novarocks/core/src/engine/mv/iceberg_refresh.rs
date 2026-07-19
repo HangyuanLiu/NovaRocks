@@ -8545,7 +8545,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     physical_sql: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
@@ -8813,7 +8813,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     refresh_label: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -10955,7 +10955,7 @@ fn repartition_iceberg_join_mv_overwrite(
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -11193,7 +11193,7 @@ fn first_refresh_iceberg_join_mv(
     right_ref: &TableIdentity,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
@@ -13488,7 +13488,7 @@ fn execute_join_delta_branches_logical(
     }
     let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -13799,7 +13799,7 @@ fn execute_append_only_join_delta_branches(
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
@@ -15365,7 +15365,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();

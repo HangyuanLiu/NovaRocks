@@ -391,6 +391,70 @@ impl IcebergTargetApplyBinding {
             branch_id_column,
         })
     }
+
+    pub(crate) fn resolve_locator_scan(
+        &self,
+        scan: &crate::sql::planner::table::IcebergMvTargetLocatorScan,
+    ) -> Result<crate::sql::planner::table::ScanSource, String> {
+        if !scan.catalog.eq_ignore_ascii_case(&self.target.catalog)
+            || !scan.database.eq_ignore_ascii_case(&self.target.namespace)
+            || !scan.table.eq_ignore_ascii_case(&self.target.table)
+        {
+            return Err(format!(
+                "Iceberg target-locator scan {} does not match MV refresh target {}",
+                scan.fqn(),
+                self.target.fqn()
+            ));
+        }
+        if scan.target_table_uuid != self.target_table_uuid {
+            return Err(format!(
+                "Iceberg target-locator scan {} target uuid mismatch: scan={} binding={}",
+                scan.fqn(),
+                scan.target_table_uuid,
+                self.target_table_uuid
+            ));
+        }
+        if scan.target_snapshot_id != self.target_snapshot_id {
+            return Err(format!(
+                "Iceberg target-locator scan {} target snapshot mismatch: scan={:?} binding={:?}",
+                scan.fqn(),
+                scan.target_snapshot_id,
+                self.target_snapshot_id
+            ));
+        }
+        if !scan
+            .apply_key_column
+            .eq_ignore_ascii_case(&self.apply_key_column)
+        {
+            return Err(format!(
+                "Iceberg target-locator scan {} apply-key column mismatch: scan={} contract={}",
+                scan.fqn(),
+                scan.apply_key_column,
+                self.apply_key_column
+            ));
+        }
+        match (
+            scan.branch_id_column.as_deref(),
+            self.branch_id_column.as_deref(),
+        ) {
+            (Some(scan_branch), Some(contract_branch))
+                if scan_branch.eq_ignore_ascii_case(contract_branch) => {}
+            (None, None) => {}
+            (scan_branch, contract_branch) => {
+                return Err(format!(
+                    "Iceberg target-locator scan {} branch column mismatch: scan={scan_branch:?} contract={contract_branch:?}",
+                    scan.fqn()
+                ));
+            }
+        }
+
+        Ok(crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table: self.runtime.table_info()?,
+            files: self.runtime.data_files_at_frozen_snapshot()?,
+            cloud_properties: self.runtime.target_entry.cloud_properties_map(),
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        })
+    }
 }
 
 pub(crate) struct IcebergMvTargetBindings {
@@ -857,5 +921,83 @@ mod tests {
         )
         .expect_err("missing _pos metadata must fail");
         assert!(err.contains("_file/_pos"), "got: {err}");
+    }
+
+    #[test]
+    fn resolves_exact_locator_scan_to_pinned_files() {
+        let fixture = target_fixture("resolve_locator");
+        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        )
+        .expect("target bindings");
+        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: rewrite.target_table_uuid.clone(),
+            target_snapshot_id: Some(fixture.target_snapshot_id),
+            apply_key_column: "k".to_string(),
+            branch_id_column: None,
+        };
+
+        let source = bindings
+            .target_apply()
+            .resolve_locator_scan(&scan)
+            .expect("locator source");
+
+        let crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            cloud_properties,
+            binding,
+        } = source
+        else {
+            panic!("expected explicit target files");
+        };
+        assert_eq!(
+            binding,
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
+        );
+        assert_eq!(table.catalog, "tgt");
+        assert_eq!(table.namespace, "db");
+        assert_eq!(table.table, "mv");
+        assert_eq!(table.current_snapshot_id, Some(fixture.target_snapshot_id));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].row_count, Some(1));
+        assert!(files[0].path.ends_with(".parquet"));
+        assert_eq!(
+            cloud_properties,
+            bindings.runtime().target_entry().cloud_properties_map()
+        );
+    }
+
+    #[test]
+    fn rejects_locator_apply_key_drift() {
+        let fixture = target_fixture("locator_apply_key_drift");
+        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        )
+        .expect("target bindings");
+        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: rewrite.target_table_uuid.clone(),
+            target_snapshot_id: Some(fixture.target_snapshot_id),
+            apply_key_column: "wrong_key".to_string(),
+            branch_id_column: None,
+        };
+
+        let err = bindings
+            .target_apply()
+            .resolve_locator_scan(&scan)
+            .expect_err("apply-key drift must fail");
+        assert!(err.contains("apply-key column mismatch"), "got: {err}");
     }
 }
