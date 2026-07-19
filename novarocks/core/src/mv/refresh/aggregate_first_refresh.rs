@@ -269,7 +269,8 @@ fn normalize_and_materialize_aggregate_read(
         target_calls,
         target_layout,
     )?;
-    let source_names = aggregate_state_result_column_names(&read.source_layout, source_calls)?;
+    let source_names =
+        aggregate_state_source_result_column_names(&read.source_layout, source_calls)?;
     let target_names = aggregate_state_result_column_names(target_layout, target_calls)?;
     if source_names.len() != target_names.len() {
         return Err(format!(
@@ -321,6 +322,22 @@ fn normalize_and_materialize_aggregate_read(
         })
         .collect::<Result<Vec<_>, String>>()?;
     materialize_aggregate_result_chunks(read.result, target_layout)
+}
+
+fn aggregate_state_source_result_column_names(
+    layout: &AggregateMvLayout,
+    calls: &AggregateSqlCalls,
+) -> Result<Vec<String>, String> {
+    let mut names = aggregate_state_result_column_names(layout, calls)?;
+    for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
+        if let VisibleAggregateOutput::GroupKey(group_key_index) = output {
+            let group_key = calls.group_keys.get(*group_key_index).ok_or_else(|| {
+                format!("aggregate MV state result group key index {group_key_index} out of range")
+            })?;
+            names[projection_index].clone_from(&group_key.output_name);
+        }
+    }
+    Ok(names)
 }
 
 fn validate_aggregate_layout_compatibility(
@@ -722,6 +739,35 @@ mod tests {
         assert_eq!(chunks[0].batch.schema().field(1).name(), "region");
         assert_eq!(chunks[0].batch.schema().field(2).name(), "c");
         assert_eq!(chunks[0].batch.schema().field(3).name(), "__agg_state_c");
+    }
+
+    #[test]
+    fn single_preparation_matches_exact_qualified_group_key_alias() {
+        let select_sql = "select f.region, count(*) as c from ice.sales.fact f group by f.region";
+        let calls = parse_calls(select_sql);
+        let pin =
+            RefreshSnapshotPin::from_entries_for_tests(&[("ice.sales.fact", 42, "fact-uuid")]);
+
+        let chunks = prepare_aggregate_first_refresh_chunks(
+            select_sql,
+            &calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut |_, _, state_query| {
+                assert!(
+                    state_query.to_string().contains("AS `f.region`"),
+                    "query={state_query}"
+                );
+                Ok(AggregateStateRead {
+                    result: count_result("f.region", 2),
+                    source_layout: count_layout("region"),
+                })
+            },
+        )
+        .expect("prepare qualified aggregate first refresh");
+
+        assert_eq!(chunks[0].batch.schema().field(1).name(), "region");
     }
 
     fn prepare_with_result(result: QueryResult) -> Result<Vec<Chunk>, String> {
