@@ -107,7 +107,7 @@ impl MvBackend for IcebergMvBackend {
         let outcome = crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh(
             &state,
             plan_payload,
-            &plan.contract.affected_partitions,
+            &plan.contract,
         )?;
         Ok(RefreshOutcome {
             mv_id: plan.contract.mv_id,

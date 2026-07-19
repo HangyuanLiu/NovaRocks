@@ -58,8 +58,9 @@ mod lifecycle_tests {
         MvListRow, RefreshCtx, RefreshError, RefreshOutcome, RefreshPlan, RefreshRequest,
         StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
     };
-    use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
-    use crate::mv::refresh::planning::RefreshPlanContract;
+    use crate::mv::model::{MvStorageEngine, MvTarget};
+    use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+    use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 
     #[derive(Default)]
     struct Calls {
@@ -67,6 +68,9 @@ mod lifecycle_tests {
         execute: usize,
         commit: usize,
         rollback: usize,
+        rollback_outcome_present: Option<bool>,
+        rollback_ctx: Option<RefreshCtx>,
+        compensation_count: usize,
     }
 
     struct MockBackend {
@@ -116,7 +120,8 @@ mod lifecycle_tests {
                     mv_id: Some(1),
                     target: req.target,
                     storage_engine: MvStorageEngine::StarRocks,
-                    mode: RefreshMode::Incremental,
+                    decision: ExecutableRefreshDecision::Incremental,
+                    state_baseline: RefreshStateBaseline::Pinless,
                     base_refs: vec![TableIdentity {
                         catalog: "ice".to_string(),
                         namespace: "ns".to_string(),
@@ -171,10 +176,13 @@ mod lifecycle_tests {
 
         fn rollback_refresh(
             &self,
-            _outcome: Option<&RefreshOutcome>,
-            _ctx: &mut RefreshCtx,
+            outcome: Option<&RefreshOutcome>,
+            ctx: &mut RefreshCtx,
         ) -> Result<(), RefreshError> {
-            self.calls.lock().unwrap().rollback += 1;
+            let mut calls = self.calls.lock().unwrap();
+            calls.rollback += 1;
+            calls.rollback_outcome_present = Some(outcome.is_some());
+            calls.rollback_ctx = Some(ctx.clone());
             if let Some(err) = &self.rollback_err {
                 return Err(err.clone());
             }
@@ -228,6 +236,29 @@ mod lifecycle_tests {
         assert_eq!(calls.execute, 1);
         assert_eq!(calls.commit, 0);
         assert_eq!(calls.rollback, 1);
+    }
+
+    #[test]
+    fn pre_commit_failure_rolls_back_empty_context_without_compensation() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut backend = MockBackend::ok(Arc::clone(&calls));
+        backend.execute_err = Some(RefreshError::pre_commit("contract drift"));
+
+        let error = super::run_refresh_lifecycle(Arc::new(backend), refresh_request())
+            .expect_err("pre-commit validation must fail");
+
+        assert_eq!(error, "contract drift");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.plan, 1);
+        assert_eq!(calls.execute, 1);
+        assert_eq!(calls.commit, 0);
+        assert_eq!(calls.rollback, 1);
+        assert_eq!(calls.rollback_outcome_present, Some(false));
+        let rollback_ctx = calls.rollback_ctx.as_ref().expect("rollback context");
+        assert_eq!(rollback_ctx.refresh_id, None);
+        assert_eq!(rollback_ctx.expected_target_snapshot_id, None);
+        assert!(!rollback_ctx.recovery_required);
+        assert_eq!(calls.compensation_count, 0);
     }
 
     #[test]

@@ -106,12 +106,16 @@ use crate::mv::persistence::schema::{
 use crate::mv::refresh::apply_key::{ApplyKeyContract, RewriteEvidence};
 use crate::mv::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::refresh::contract::ImvRefreshContract;
+use crate::mv::refresh::execution::{
+    RefreshExecutionObservation, ValidatedRefreshExecution, dispatch_refresh_decision,
+    validate_refresh_execution,
+};
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::mv::refresh::planning::{
-    RefreshPlanContract, RefreshPlanningInput, decide_refresh_plan,
+    RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
 };
 use crate::mv::refresh::snapshot::{
-    BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
+    BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
 };
 use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
@@ -179,21 +183,6 @@ impl IcebergMvRefreshExecutionError {
 impl From<String> for IcebergMvRefreshExecutionError {
     fn from(message: String) -> Self {
         Self::pre_commit(message)
-    }
-}
-
-fn run_iceberg_mv_refresh_lifecycle(
-    decision: RefreshDecision,
-    first_refresh: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-    metadata_only: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-    incremental: impl FnOnce() -> Result<StatementResult, IcebergMvRefreshExecutionError>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    match decision {
-        RefreshDecision::SkipEmpty => Ok(StatementResult::Ok),
-        RefreshDecision::FirstRefresh => first_refresh(),
-        RefreshDecision::MetadataOnly => metadata_only(),
-        RefreshDecision::Incremental => incremental(),
-        RefreshDecision::FailFast { reason } => Err(reason.into()),
     }
 }
 
@@ -2780,17 +2769,20 @@ pub(crate) fn refresh_iceberg_mv(
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let affected_partitions = crate::mv::model::AffectedTargetPartitions::not_derived(
-        "refresh was executed without a planned affected partition set",
-    );
-    refresh_iceberg_mv_with_planned_partitions(
-        state,
-        current_catalog,
-        current_database,
-        stmt,
-        &affected_partitions,
-    )
-    .map_err(IcebergMvRefreshExecutionError::into_message)
+    let iceberg_target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
+    let target = MvTarget {
+        catalog: Some(iceberg_target.catalog),
+        database: iceberg_target.namespace,
+        name: iceberg_target.table,
+    };
+    let plan = plan_iceberg_mv_refresh(state, current_catalog, current_database, stmt, target)
+        .map_err(|error| error.message)?;
+    let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+        return Err("iceberg planner returned a non-iceberg refresh plan".to_string());
+    };
+    execute_iceberg_mv_refresh(state, payload, &plan.contract)
+        .map(|_| StatementResult::Ok)
+        .map_err(|error| error.message)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3208,12 +3200,19 @@ fn refresh_iceberg_mv_with_planned_partitions(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    stmt: &RefreshMaterializedViewStmt,
-    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    full: bool,
+    runtime: ValidatedIcebergRefreshRuntime,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let _refresh_guard = acquire_mv_refresh_lock()?;
-    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
-    if stmt.full {
+    let ValidatedIcebergRefreshRuntime {
+        target,
+        mv_definition,
+        target_entry,
+        iceberg_catalog,
+        target_table,
+        base_refs,
+    } = runtime;
+    if full {
         // REFRESH FULL is intentionally disabled. The previous implementation
         // dropped the target table, deleted the MV definition, and re-ran
         // create_iceberg_mv — but create_iceberg_mv leaves the new target
@@ -3228,11 +3227,6 @@ fn refresh_iceberg_mv_with_planned_partitions(
         // do the recovery by hand — no silent high-risk side effects.
         return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string().into());
     }
-    recover_iceberg_mv_refreshes(state)?;
-    let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
-    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
-    validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let (select_query, refresh_contract) = derive_refresh_contract_for_strategy_dispatch(
         state,
         current_catalog,
@@ -3240,7 +3234,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         &mv_definition,
         &base_refs,
         &target,
-        &target_loaded.table,
+        &target_table,
     )?;
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&select_query, current_catalog, current_database);
@@ -3337,8 +3331,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &target,
                 &target_entry,
                 &iceberg_catalog,
-                &target_loaded.table,
-                expected_main_snapshot_id_from_table(&target_loaded.table),
+                &target_table,
                 current_catalog,
                 current_database,
                 &mv_definition,
@@ -3348,7 +3341,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 all_bases_is_fan_in,
                 join_aliases.as_ref(),
                 refresh_contract.apply_key,
-                planned_affected_partitions,
+                execution,
             );
         }
         // Branch UNION ALL aggregate: AllBasesRequired + aggregate state +
@@ -3364,8 +3357,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &target,
                 &target_entry,
                 &iceberg_catalog,
-                &target_loaded.table,
-                expected_main_snapshot_id_from_table(&target_loaded.table),
+                &target_table,
                 current_catalog,
                 current_database,
                 &mv_definition,
@@ -3375,7 +3367,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                     first_branch_calls: &first_branch_calls,
                 },
                 refresh_contract.apply_key,
-                planned_affected_partitions,
+                execution,
             );
         }
         // Two-table inner equi-join projection/filter. The left/right table
@@ -3388,13 +3380,13 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &target,
                 &target_entry,
                 &iceberg_catalog,
-                &target_loaded.table,
-                expected_main_snapshot_id_from_table(&target_loaded.table),
+                &target_table,
                 current_catalog,
                 current_database,
                 &mv_definition,
                 &base_refs,
                 refresh_contract.apply_key,
+                execution,
             );
         }
         // UNION ALL of projection/filter branches.
@@ -3414,8 +3406,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &target,
                 &target_entry,
                 &iceberg_catalog,
-                &target_loaded.table,
-                expected_main_snapshot_id_from_table(&target_loaded.table),
+                &target_table,
                 current_catalog,
                 current_database,
                 &mv_definition,
@@ -3424,6 +3415,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 branch_count,
                 dispatch_schema_contract,
                 refresh_contract.apply_key,
+                execution,
             );
         }
         // Projection / filter over a single scan: fall through to the inline
@@ -3456,35 +3448,16 @@ fn refresh_iceberg_mv_with_planned_partitions(
         )
     })?;
     let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let current_snapshot_id_before_pin = pre_pin_loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
-    let previous_snapshot_id = mv_definition
-        .last_refresh_snapshots
+    let previous_snapshot_id = execution
+        .previous_snapshot_ids()?
         .get(&base_ref.fqn())
         .copied();
-    let refresh_label = format!(
-        "iceberg materialized view {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
-    let pre_pin_decision = decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous_snapshot_id,
-            current_snapshot_id_before_pin,
-        )],
-        &refresh_label,
-    );
-
-    match pre_pin_decision {
-        RefreshDecision::SkipEmpty => {
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             ensure_schema_contract_compatible_for_refresh(
                 schema_contract,
                 &pre_pin_loaded.table,
-                &target_loaded.table,
+                &target_table,
             )?;
             tracing::info!(
                 "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
@@ -3494,13 +3467,12 @@ fn refresh_iceberg_mv_with_planned_partitions(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, &base_refs)?;
+    let pin = execution.pin()?;
     let current_snapshot_id = pin.get(base_ref);
     let current_table_uuid = pin
         .uuid(base_ref)
@@ -3520,28 +3492,25 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // current snapshot id unchanged. validate_schema_contract subsumes the earlier
     // ensure_base_row_lineage_contract check (it already enforces v3 +
     // row-lineage).
-    let effective_definition = match validate_current_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}").into());
-        }
-        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
-            tracing::info!(
-                target = ?target,
-                rebound = ?rebound_columns,
-                "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
-            );
-            let rewritten_sql =
-                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-            let mut def = mv_definition.clone();
-            def.select_sql = rewritten_sql;
-            def
-        }
-        ContractDecision::CompatibleSafe => mv_definition.clone(),
-    };
+    let effective_definition =
+        match validate_current_schema_contract(schema_contract, &loaded.table, &target_table) {
+            ContractDecision::Incompatible(err) => {
+                return Err(format!("{err}").into());
+            }
+            ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+                tracing::info!(
+                    target = ?target,
+                    rebound = ?rebound_columns,
+                    "iceberg MV refresh: base columns rebound by field id; rewriting select_sql",
+                );
+                let rewritten_sql =
+                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+                let mut def = mv_definition.clone();
+                def.select_sql = rewritten_sql;
+                def
+            }
+            ContractDecision::CompatibleSafe => mv_definition.clone(),
+        };
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
         rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
@@ -3551,37 +3520,20 @@ fn refresh_iceberg_mv_with_planned_partitions(
         uuid::Uuid::new_v4().simple()
     );
 
-    if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
-        && previous_uuid != &current_table_uuid
-    {
-        return Err(format!(
-            "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
-            base_ref.fqn()
-        )
-        .into());
-    }
-
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(mv_definition.clone()),
-            Arc::new(canonical_select_query.clone()),
-            Arc::from(base_refs.clone()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            iceberg_catalog.clone(),
-            target_loaded.table.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        ValidatedRefreshShape::SingleProjection,
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query.clone()),
+        Arc::from(base_refs.clone()),
+        execution,
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
@@ -3591,18 +3543,9 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // execution so the optimizer can bind version/delta scans against the
     // refresh pin and fail fast when required rewrite evidence is missing.
 
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous_snapshot_id,
-            current_snapshot_id,
-        )],
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let Some(cur) = current_snapshot_id else {
                 return Err("invalid projection/filter MV first-refresh decision"
@@ -3642,7 +3585,9 @@ fn refresh_iceberg_mv_with_planned_partitions(
             );
             let snapshots = pin.to_snapshot_map();
             let table_uuids = pin.to_table_uuid_map();
-            let target_snapshot_id = recorded_target_snapshot_id(&target, mv_definition)?;
+            let target_snapshot_id = ctx.rewrite.target_snapshot_id.ok_or_else(|| {
+                "metadata-only Iceberg MV refresh requires a planned target snapshot".to_string()
+            })?;
             let refresh_id =
                 begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
             finalize_iceberg_mv_refresh_with_partition_state(
@@ -3686,7 +3631,6 @@ fn refresh_iceberg_union_projection_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    target_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -3695,10 +3639,10 @@ fn refresh_iceberg_union_projection_mv(
     branch_count: usize,
     schema_contract: &mv_schema::MvSchemaContract,
     apply_key: ApplyKeyContract,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     validate_union_projection_base_refs(base_refs, schema_contract)?;
 
-    let mut pre_pin_current_snapshots = BTreeMap::new();
     for base_ref in base_refs {
         let loaded = load_current_iceberg_base_table(state, base_ref)?;
         validate_union_projection_schema_contract_for_base(
@@ -3709,18 +3653,10 @@ fn refresh_iceberg_union_projection_mv(
             &loaded.table,
             target_table,
         )?;
-        pre_pin_current_snapshots.insert(
-            base_ref.fqn(),
-            loaded
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id()),
-        );
     }
 
-    let previous_snapshots = &mv_definition.last_refresh_snapshots;
-    let previous_table_uuids = &mv_definition.last_refresh_table_uuids;
+    let previous_snapshots = execution.previous_snapshot_ids()?;
+    let previous_table_uuids = execution.previous_table_uuids()?;
     let has_previous_snapshots = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -3742,29 +3678,8 @@ fn refresh_iceberg_union_projection_mv(
         )
         .into());
     }
-    let refresh_label = format!(
-        "iceberg UNION ALL projection/filter MV {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
-    let pre_pin_statuses = base_refs
-        .iter()
-        .map(|base_ref| {
-            base_snapshot_status_for_refresh(
-                base_ref,
-                previous_snapshots.get(&base_ref.fqn()).copied(),
-                pre_pin_current_snapshots
-                    .get(&base_ref.fqn())
-                    .copied()
-                    .flatten(),
-            )
-        })
-        .collect::<Vec<_>>();
-    match decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &pre_pin_statuses,
-        &refresh_label,
-    ) {
-        RefreshDecision::SkipEmpty => {
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             tracing::info!(
                 "iceberg mv {}.{}.{}: all UNION ALL branch bases have no snapshot; skipping refresh",
                 target.catalog,
@@ -3773,14 +3688,12 @@ fn refresh_iceberg_union_projection_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, base_refs)?;
-    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+    let pin = execution.pin()?;
     let mut loaded_bases = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
         let loaded = load_current_iceberg_base_table(state, base_ref)?;
@@ -3847,51 +3760,28 @@ fn refresh_iceberg_union_projection_mv(
         }
     }
 
-    let effective_definition = mv_definition.clone();
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(effective_definition),
-            Arc::new(canonical_select_query.clone()),
-            Arc::from(base_refs.to_vec()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            Arc::clone(iceberg_catalog),
-            target_table.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        ValidatedRefreshShape::UnionProjection,
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query.clone()),
+        Arc::from(base_refs.to_vec()),
+        execution,
+        Arc::new(target_entry.clone()),
+        Arc::clone(iceberg_catalog),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg UNION ALL projection/filter MV refresh context constructed"
     );
 
-    let refresh_statuses = loaded_bases
-        .iter()
-        .map(|(base_ref, _, current, _)| {
-            base_snapshot_status_for_refresh(
-                base_ref,
-                previous_snapshots.get(&base_ref.fqn()).copied(),
-                Some(*current),
-            )
-        })
-        .collect::<Vec<_>>();
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &refresh_statuses,
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
                 &ctx.rewrite.mv_definition.select_sql,
@@ -3909,7 +3799,7 @@ fn refresh_iceberg_union_projection_mv(
                 state,
                 target,
                 mv_definition.mv_id,
-                target_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
@@ -3984,7 +3874,6 @@ fn refresh_iceberg_aggregate_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -3994,7 +3883,7 @@ fn refresh_iceberg_aggregate_mv(
     all_bases_is_fan_in: bool,
     join_aliases: Option<&crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     // Tier-2 dispatch (Phase 3 / B2): single-base aggregate, fan-in aggregate
@@ -4020,14 +3909,13 @@ fn refresh_iceberg_aggregate_mv(
                 target_entry,
                 iceberg_catalog,
                 target_table,
-                expected_main_snapshot_id,
                 current_catalog,
                 current_database,
                 mv_definition,
                 base_refs,
                 refresh,
                 apply_key,
-                planned_affected_partitions,
+                execution,
             )
         }
         BaseSnapshotPolicy::SingleBase => refresh_single_aggregate_iceberg_mv(
@@ -4036,7 +3924,6 @@ fn refresh_iceberg_aggregate_mv(
             target_entry,
             iceberg_catalog,
             target_table,
-            expected_main_snapshot_id,
             current_catalog,
             current_database,
             mv_definition,
@@ -4044,7 +3931,7 @@ fn refresh_iceberg_aggregate_mv(
             schema_contract,
             aggregate_calls,
             apply_key,
-            planned_affected_partitions,
+            execution,
         ),
         BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
             let join_aliases = join_aliases.ok_or_else(|| {
@@ -4057,7 +3944,6 @@ fn refresh_iceberg_aggregate_mv(
                 target_entry,
                 iceberg_catalog,
                 target_table,
-                expected_main_snapshot_id,
                 current_catalog,
                 current_database,
                 mv_definition,
@@ -4066,7 +3952,7 @@ fn refresh_iceberg_aggregate_mv(
                 join_aliases,
                 aggregate_calls,
                 apply_key,
-                planned_affected_partitions,
+                execution,
             )
         }
     }
@@ -4104,7 +3990,6 @@ fn refresh_single_aggregate_iceberg_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -4112,7 +3997,7 @@ fn refresh_single_aggregate_iceberg_mv(
     schema_contract: &mv_schema::MvSchemaContract,
     aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let [base_ref] = base_refs else {
         return Err(
@@ -4121,26 +4006,12 @@ fn refresh_single_aggregate_iceberg_mv(
                 .into(),
         );
     };
-    let pre_pin_loaded = load_current_iceberg_base_table(state, base_ref)?;
-    let current_before_pin = expected_main_snapshot_id_from_table(&pre_pin_loaded.table);
-    let previous = mv_definition
-        .last_refresh_snapshots
+    let previous = execution
+        .previous_snapshot_ids()?
         .get(&base_ref.fqn())
         .copied();
-    let refresh_label = format!(
-        "iceberg aggregate materialized view {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
-    match decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous,
-            current_before_pin,
-        )],
-        &refresh_label,
-    ) {
-        RefreshDecision::SkipEmpty => {
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             tracing::info!(
                 "iceberg aggregate mv {}.{}.{}: base table has no snapshot; skipping refresh",
                 target.catalog,
@@ -4149,14 +4020,12 @@ fn refresh_single_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, base_refs)?;
-    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+    let pin = execution.pin()?;
     let current = pin
         .get(base_ref)
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
@@ -4207,45 +4076,28 @@ fn refresh_single_aggregate_iceberg_mv(
         aggregate_calls.clone()
     };
     let aggregate_calls = &reextracted_aggregate_calls;
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(mv_definition.clone()),
-            Arc::new(canonical_select_query),
-            Arc::from(base_refs.to_vec()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            iceberg_catalog.clone(),
-            target_table.clone(),
-            planned_affected_partitions.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        ValidatedRefreshShape::SingleAggregate,
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        execution,
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
     );
 
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::SingleBase,
-        &[base_snapshot_status_for_refresh(
-            base_ref,
-            previous,
-            Some(current),
-        )],
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -4256,7 +4108,7 @@ fn refresh_single_aggregate_iceberg_mv(
                 state,
                 target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
@@ -4387,14 +4239,13 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     refresh: AllBasesAggregateRefresh<'_>,
     apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     // Identity-gated branch-contract validation. `FanIn` already received its
     // validated schema contract; `BranchUnion` re-derives + validates it here,
@@ -4429,7 +4280,6 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         AllBasesAggregateRefresh::BranchUnion { .. } => "branch UNION ALL aggregate",
     };
 
-    let mut pre_pin_current_snapshots = BTreeMap::new();
     for base_ref in base_refs {
         let loaded = load_current_iceberg_base_table(state, base_ref)?;
         validate_aggregate_schema_contract_for_base(
@@ -4438,30 +4288,11 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             &loaded.table,
             target_table,
         )?;
-        pre_pin_current_snapshots.insert(
-            base_ref.fqn(),
-            loaded
-                .table
-                .metadata()
-                .current_snapshot()
-                .map(|s| s.snapshot_id()),
-        );
     }
 
-    let previous_snapshots = &mv_definition.last_refresh_snapshots;
-    let refresh_label = format!(
-        "iceberg {refresh_kind_label} MV {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
-    let pre_pin_statuses =
-        base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &pre_pin_current_snapshots);
-
-    match decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &pre_pin_statuses,
-        &refresh_label,
-    ) {
-        RefreshDecision::SkipEmpty => {
+    let previous_snapshots = execution.previous_snapshot_ids()?;
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             tracing::info!(
                 "iceberg {refresh_kind_label} mv {}.{}.{}: all bases have no snapshot; skipping refresh",
                 target.catalog,
@@ -4470,14 +4301,12 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, base_refs)?;
-    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
+    let pin = execution.pin()?;
 
     let mut loaded_bases = Vec::with_capacity(base_refs.len());
     for base_ref in base_refs {
@@ -4548,52 +4377,37 @@ fn refresh_fan_in_aggregate_iceberg_mv(
         current_catalog,
         current_database,
     );
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(mv_definition.clone()),
-            Arc::new(canonical_select_query),
-            Arc::from(base_refs.to_vec()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            iceberg_catalog.clone(),
-            target_table.clone(),
-            planned_affected_partitions.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        match &refresh {
+            AllBasesAggregateRefresh::FanIn { .. } => ValidatedRefreshShape::FanInAggregate,
+            AllBasesAggregateRefresh::ComposedAggregate { .. } => {
+                ValidatedRefreshShape::ComposedAggregate
+            }
+            AllBasesAggregateRefresh::BranchUnion { .. } => {
+                ValidatedRefreshShape::BranchUnionAggregate
+            }
+        },
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        execution,
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         refresh_kind = refresh_kind_label,
         "iceberg AllBasesRequired aggregate MV refresh context constructed"
     );
 
-    let refresh_statuses = loaded_bases
-        .iter()
-        .map(|(base_ref, _, current, _)| {
-            base_snapshot_status_for_refresh(
-                base_ref,
-                previous_snapshots.get(&base_ref.fqn()).copied(),
-                Some(*current),
-            )
-        })
-        .collect::<Vec<_>>();
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::AllBasesRequired,
-        &refresh_statuses,
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -4604,7 +4418,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
                 state,
                 target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
@@ -4702,7 +4516,6 @@ fn refresh_join_aggregate_iceberg_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -4711,7 +4524,7 @@ fn refresh_join_aggregate_iceberg_mv(
     join_aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
     aggregate_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
     _apply_key: ApplyKeyContract,
-    planned_affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
         return Err(
@@ -4725,34 +4538,8 @@ fn refresh_join_aggregate_iceberg_mv(
     // drives the first-refresh full-state build.
     validate_join_aliases_base_refs(join_aliases, base_refs)?;
     let (left_ref, right_ref) = join_base_refs_for_aliases(join_aliases, base_refs)?;
-    let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
-    let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
-    let left_current_before_pin =
-        expected_main_snapshot_id_from_table(&left_loaded_before_pin.table);
-    let right_current_before_pin =
-        expected_main_snapshot_id_from_table(&right_loaded_before_pin.table);
-    let left_previous = mv_definition
-        .last_refresh_snapshots
-        .get(&left_ref.fqn())
-        .copied();
-    let right_previous = mv_definition
-        .last_refresh_snapshots
-        .get(&right_ref.fqn())
-        .copied();
-    let refresh_label = format!(
-        "iceberg join aggregate MV {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
-
-    match decide_refresh(
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-        &[
-            base_snapshot_status_for_refresh(left_ref, left_previous, left_current_before_pin),
-            base_snapshot_status_for_refresh(right_ref, right_previous, right_current_before_pin),
-        ],
-        &refresh_label,
-    ) {
-        RefreshDecision::SkipEmpty => {
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             tracing::info!(
                 "iceberg join aggregate mv {}.{}.{}: both base tables have no snapshot; skipping refresh",
                 target.catalog,
@@ -4761,13 +4548,12 @@ fn refresh_join_aggregate_iceberg_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, base_refs)?;
+    let pin = execution.pin()?;
     if pin.len() != 2 {
         return Err(format!(
             "iceberg join aggregate MV refresh expected two refresh pins, got {}",
@@ -4775,8 +4561,6 @@ fn refresh_join_aggregate_iceberg_mv(
         )
         .into());
     }
-    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
-
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
     let decision = validate_current_join_schema_contract(
@@ -4816,51 +4600,28 @@ fn refresh_join_aggregate_iceberg_mv(
         aggregate_calls.clone()
     };
     let aggregate_calls = &reextracted_aggregate_calls;
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_affected_partitions_and_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(mv_definition.clone()),
-            Arc::new(canonical_select_query),
-            Arc::from(base_refs.to_vec()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            iceberg_catalog.clone(),
-            target_table.clone(),
-            planned_affected_partitions.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        ValidatedRefreshShape::JoinAggregate,
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        execution,
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
     );
 
-    let left_current = pin
-        .get(left_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))?;
-    let right_current = pin
-        .get(right_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
-
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-        &[
-            base_snapshot_status_for_refresh(left_ref, left_previous, Some(left_current)),
-            base_snapshot_status_for_refresh(right_ref, right_previous, Some(right_current)),
-        ],
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -4871,7 +4632,7 @@ fn refresh_join_aggregate_iceberg_mv(
                 state,
                 target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
@@ -5134,6 +4895,71 @@ fn log_planned_iceberg_mv_affected_partitions(
     );
 }
 
+#[derive(Serialize)]
+struct RefreshDefinitionFingerprint<'a> {
+    mv_id: i64,
+    canonical_select_sql: String,
+    canonical_base_refs: BTreeSet<String>,
+    storage_engine: &'a str,
+    target_catalog: &'a Option<String>,
+    target_namespace: &'a Option<String>,
+    target_table: &'a Option<String>,
+    schema_contract: &'a Option<mv_schema::MvSchemaContract>,
+    partition_contract: &'a Option<MvPartitionContract>,
+}
+
+fn refresh_execution_definition_fingerprint(
+    mv_definition: &StoredMvDefinition,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<String, String> {
+    let canonical_select_sql = canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(&mv_definition.select_sql)?,
+        current_catalog,
+        current_database,
+    )
+    .to_string();
+    let canonical_base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?
+        .into_iter()
+        .map(|base_ref| base_ref.fqn())
+        .collect::<BTreeSet<_>>();
+    let input = RefreshDefinitionFingerprint {
+        mv_id: mv_definition.mv_id,
+        canonical_select_sql,
+        canonical_base_refs,
+        storage_engine: &mv_definition.storage_engine,
+        target_catalog: &mv_definition.target_catalog,
+        target_namespace: &mv_definition.target_namespace,
+        target_table: &mv_definition.target_table,
+        schema_contract: &mv_definition.schema_contract,
+        partition_contract: &mv_definition.partition_spec,
+    };
+    let canonical = serde_json::to_vec(&input)
+        .map_err(|error| format!("encode MV refresh definition fingerprint failed: {error}"))?;
+    String::from_utf8(canonical).map_err(|error| {
+        format!("encode MV refresh definition fingerprint as UTF-8 failed: {error}")
+    })
+}
+
+fn build_refresh_state_baseline(
+    mv_definition: &StoredMvDefinition,
+    target_table: &iceberg::table::Table,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<RefreshStateBaseline, String> {
+    Ok(RefreshStateBaseline::SnapshotBacked {
+        previous_snapshot_ids: mv_definition.last_refresh_snapshots.clone(),
+        previous_table_uuids: mv_definition.last_refresh_table_uuids.clone(),
+        target_snapshot_id: expected_main_snapshot_id_from_table(target_table),
+        target_table_uuid: target_table.metadata().uuid().to_string(),
+        definition_fingerprint: refresh_execution_definition_fingerprint(
+            mv_definition,
+            current_catalog,
+            current_database,
+        )?,
+    })
+}
+
 pub(crate) fn plan_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -5157,6 +4983,13 @@ pub(crate) fn plan_iceberg_mv_refresh(
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;
+    let refresh_state_baseline = build_refresh_state_baseline(
+        &mv_definition,
+        &target_loaded.table,
+        current_catalog,
+        current_database,
+    )
+    .map_err(RefreshError::user)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&mv_definition.select_sql).map_err(RefreshError::user)?,
         current_catalog,
@@ -5305,7 +5138,6 @@ pub(crate) fn plan_iceberg_mv_refresh(
             label: &refresh_label,
         })
         .map_err(RefreshError::user)?;
-        let mode = decision.mode;
         let has_previous = base_refs
             .iter()
             .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -5361,7 +5193,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 mv_id: Some(mv_definition.mv_id),
                 target,
                 storage_engine: MvStorageEngine::Iceberg,
-                mode,
+                decision: decision.refresh,
+                state_baseline: refresh_state_baseline.clone(),
                 base_refs: base_refs
                     .iter()
                     .map(|base_ref| TableIdentity {
@@ -5420,7 +5253,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
     })
     .map_err(RefreshError::user)?;
     match pre_pin_decision.refresh {
-        RefreshDecision::SkipEmpty => {
+        ExecutableRefreshDecision::SkipEmpty => {
             ensure_schema_contract_compatible_for_refresh(
                 schema_contract,
                 &pre_pin_loaded.table,
@@ -5436,7 +5269,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
                     mv_id: Some(mv_definition.mv_id),
                     target,
                     storage_engine: MvStorageEngine::Iceberg,
-                    mode: pre_pin_decision.mode,
+                    decision: pre_pin_decision.refresh,
+                    state_baseline: refresh_state_baseline.clone(),
                     base_refs: vec![TableIdentity {
                         catalog: base_ref.catalog.clone(),
                         namespace: base_ref.namespace.clone(),
@@ -5452,10 +5286,9 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 }),
             });
         }
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
-        RefreshDecision::FailFast { reason } => return Err(RefreshError::user(reason)),
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
     let current_snapshot_id = current_snapshot_id_before_pin;
@@ -5478,7 +5311,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
         label: &refresh_label,
     })
     .map_err(RefreshError::user)?;
-    if matches!(decision.mode, RefreshMode::Incremental) {
+    if matches!(decision.mode(), RefreshMode::Incremental) {
         if let (Some(prev), Some(cur)) = (previous_snapshot_id, current_snapshot_id) {
             crate::connector::iceberg::changes::classify_lineage(
                 loaded.table.metadata(),
@@ -5496,7 +5329,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             })?;
         }
     }
-    let mode = decision.mode;
+    let mode = decision.mode();
     let mut snapshot_pins = BTreeMap::new();
     snapshot_pins.insert(base_ref.fqn(), current_snapshot_id);
     let affected_partitions = match mode {
@@ -5541,7 +5374,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
             mv_id: Some(mv_definition.mv_id),
             target,
             storage_engine: MvStorageEngine::Iceberg,
-            mode,
+            decision: decision.refresh,
+            state_baseline: refresh_state_baseline,
             base_refs: vec![TableIdentity {
                 catalog: base_ref.catalog.clone(),
                 namespace: base_ref.namespace.clone(),
@@ -5634,7 +5468,7 @@ fn plan_iceberg_union_projection_mv_refresh(
         label: &refresh_label,
     })
     .map_err(RefreshError::user)?;
-    let mode = decision.mode;
+    let mode = decision.mode();
     if has_previous {
         for base_ref in base_refs {
             let fqn = base_ref.fqn();
@@ -5700,12 +5534,20 @@ fn plan_iceberg_union_projection_mv_refresh(
         "UNION ALL MV affected partition planning",
     );
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+    let state_baseline = build_refresh_state_baseline(
+        mv_definition,
+        target_table,
+        current_catalog,
+        current_database,
+    )
+    .map_err(RefreshError::user)?;
     Ok(RefreshPlan {
         contract: RefreshPlanContract {
             mv_id: Some(mv_definition.mv_id),
             target,
             storage_engine: MvStorageEngine::Iceberg,
-            mode,
+            decision: decision.refresh,
+            state_baseline,
             base_refs: base_refs
                 .iter()
                 .map(|base_ref| TableIdentity {
@@ -5806,7 +5648,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         label: &refresh_label,
     })
     .map_err(RefreshError::user)?;
-    let mode = decision.mode;
+    let mode = decision.mode();
     let has_previous = base_refs
         .iter()
         .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -5870,7 +5712,14 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         current_database,
         base_refs,
         snapshot_pins,
-        mode,
+        decision.refresh,
+        build_refresh_state_baseline(
+            mv_definition,
+            target_table,
+            current_catalog,
+            current_database,
+        )
+        .map_err(RefreshError::user)?,
         affected_partitions,
     ))
 }
@@ -5949,7 +5798,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                 label: &refresh_label,
             })
             .map_err(RefreshError::user)?;
-            if matches!(decision.mode, RefreshMode::Incremental) {
+            if matches!(decision.mode(), RefreshMode::Incremental) {
                 if let (Some(prev), Some(cur)) = (previous, current) {
                     crate::connector::iceberg::changes::classify_lineage(
                         loaded.table.metadata(),
@@ -5967,7 +5816,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                     })?;
                 }
             }
-            let mode = decision.mode;
+            let mode = decision.mode();
             let mut snapshot_pins = BTreeMap::new();
             snapshot_pins.insert(base_ref.fqn(), current);
             let affected_partitions = plan_aggregate_mv_affected_partitions(
@@ -5986,7 +5835,14 @@ fn plan_iceberg_aggregate_mv_refresh(
                 current_database,
                 base_refs,
                 snapshot_pins,
-                mode,
+                decision.refresh,
+                build_refresh_state_baseline(
+                    mv_definition,
+                    target_table,
+                    current_catalog,
+                    current_database,
+                )
+                .map_err(RefreshError::user)?,
                 affected_partitions,
             ))
         }
@@ -6056,7 +5912,6 @@ fn plan_iceberg_aggregate_mv_refresh(
                 label: &refresh_label,
             })
             .map_err(RefreshError::user)?;
-            let mode = decision.mode;
             let has_previous = base_refs
                 .iter()
                 .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
@@ -6111,7 +5966,14 @@ fn plan_iceberg_aggregate_mv_refresh(
                 current_database,
                 base_refs,
                 snapshot_pins,
-                mode,
+                decision.refresh,
+                build_refresh_state_baseline(
+                    mv_definition,
+                    target_table,
+                    current_catalog,
+                    current_database,
+                )
+                .map_err(RefreshError::user)?,
                 affected_partitions,
             ))
         }
@@ -6126,7 +5988,8 @@ fn build_iceberg_refresh_plan(
     current_database: &str,
     base_refs: &[TableIdentity],
     snapshot_pins: BTreeMap<String, Option<i64>>,
-    mode: RefreshMode,
+    decision: ExecutableRefreshDecision,
+    state_baseline: RefreshStateBaseline,
     affected_partitions: crate::mv::model::AffectedTargetPartitions,
 ) -> RefreshPlan {
     RefreshPlan {
@@ -6134,7 +5997,8 @@ fn build_iceberg_refresh_plan(
             mv_id: Some(mv_definition.mv_id),
             target,
             storage_engine: MvStorageEngine::Iceberg,
-            mode,
+            decision,
+            state_baseline,
             base_refs: base_refs
                 .iter()
                 .map(|base_ref| TableIdentity {
@@ -6154,17 +6018,462 @@ fn build_iceberg_refresh_plan(
     }
 }
 
+struct IcebergValidatedRefreshExecution<'a> {
+    validated: ValidatedRefreshExecution<'a>,
+    pin: Option<Arc<RefreshSnapshotPin>>,
+}
+
+struct ValidatedIcebergRefreshRuntime {
+    target: IcebergMvTarget,
+    mv_definition: StoredMvDefinition,
+    target_entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: Arc<dyn iceberg::Catalog>,
+    target_table: iceberg::table::Table,
+    base_refs: Vec<TableIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ValidatedRefreshShape {
+    SingleProjection,
+    UnionProjection,
+    SingleAggregate,
+    FanInAggregate,
+    ComposedAggregate,
+    BranchUnionAggregate,
+    JoinAggregate,
+    JoinProjection,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATED_REFRESH_SHAPE_OBSERVER: std::cell::RefCell<
+        Option<Arc<dyn Fn(ValidatedRefreshShape) + Send + Sync>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ValidatedRefreshShapeObserverGuard;
+
+#[cfg(test)]
+impl ValidatedRefreshShapeObserverGuard {
+    fn install(observer: Arc<dyn Fn(ValidatedRefreshShape) + Send + Sync>) -> Self {
+        VALIDATED_REFRESH_SHAPE_OBSERVER.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "refresh shape observer already installed"
+            );
+            *slot.borrow_mut() = Some(observer);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ValidatedRefreshShapeObserverGuard {
+    fn drop(&mut self) {
+        VALIDATED_REFRESH_SHAPE_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn observe_validated_refresh_shape(shape: ValidatedRefreshShape) {
+    VALIDATED_REFRESH_SHAPE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer(shape);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEFINITION_LOAD_COUNTER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct DefinitionLoadCounterGuard;
+
+#[cfg(test)]
+impl DefinitionLoadCounterGuard {
+    fn install(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        DEFINITION_LOAD_COUNTER.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "definition load counter already installed"
+            );
+            *slot.borrow_mut() = Some(counter);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DefinitionLoadCounterGuard {
+    fn drop(&mut self) {
+        DEFINITION_LOAD_COUNTER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn record_definition_load() {
+    DEFINITION_LOAD_COUNTER.with(|slot| {
+        if let Some(counter) = slot.borrow().as_ref() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(test)]
+type AfterObserveBeforeCaptureHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+struct AfterObserveBeforeCaptureHookRegistration {
+    owner: std::thread::ThreadId,
+    hook: AfterObserveBeforeCaptureHook,
+}
+
+#[cfg(test)]
+fn after_observe_before_capture_hook_slot()
+-> &'static std::sync::Mutex<Option<AfterObserveBeforeCaptureHookRegistration>> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<AfterObserveBeforeCaptureHookRegistration>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn invoke_after_observe_before_capture_hook() {
+    let current_thread = std::thread::current().id();
+    let hook = after_observe_before_capture_hook_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|registration| {
+            (registration.owner == current_thread).then(|| Arc::clone(&registration.hook))
+        });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+struct AfterObserveBeforeCaptureHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl AfterObserveBeforeCaptureHookGuard {
+    fn install(hook: AfterObserveBeforeCaptureHook) -> Self {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *after_observe_before_capture_hook_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(AfterObserveBeforeCaptureHookRegistration {
+                owner: std::thread::current().id(),
+                hook,
+            });
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AfterObserveBeforeCaptureHookGuard {
+    fn drop(&mut self) {
+        *after_observe_before_capture_hook_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+impl IcebergValidatedRefreshExecution<'_> {
+    fn decision(&self) -> ExecutableRefreshDecision {
+        self.validated.decision()
+    }
+
+    fn pin(&self) -> Result<&Arc<RefreshSnapshotPin>, String> {
+        self.pin.as_ref().ok_or_else(|| {
+            "validated Iceberg refresh execution has no full snapshot pin".to_string()
+        })
+    }
+
+    fn state_baseline(&self) -> &RefreshStateBaseline {
+        self.validated.state_baseline()
+    }
+
+    fn previous_snapshot_ids(&self) -> Result<&BTreeMap<String, i64>, String> {
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_snapshot_ids,
+            ..
+        } = self.state_baseline()
+        else {
+            return Err(
+                "validated Iceberg refresh execution requires a snapshot-backed baseline"
+                    .to_string(),
+            );
+        };
+        Ok(previous_snapshot_ids)
+    }
+
+    fn previous_table_uuids(&self) -> Result<&BTreeMap<String, String>, String> {
+        let RefreshStateBaseline::SnapshotBacked {
+            previous_table_uuids,
+            ..
+        } = self.state_baseline()
+        else {
+            return Err(
+                "validated Iceberg refresh execution requires a snapshot-backed baseline"
+                    .to_string(),
+            );
+        };
+        Ok(previous_table_uuids)
+    }
+
+    fn affected_partitions(&self) -> &crate::mv::model::AffectedTargetPartitions {
+        self.validated.affected_partitions()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_validated_refresh_context(
+    shape: ValidatedRefreshShape,
+    state: &Arc<StandaloneState>,
+    target: IcebergMvTarget,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: Arc<StoredMvDefinition>,
+    canonical_select_query: Arc<sqlparser::ast::Query>,
+    base_refs: Arc<[TableIdentity]>,
+    execution: &IcebergValidatedRefreshExecution<'_>,
+    target_entry: Arc<crate::connector::iceberg::catalog::IcebergCatalogEntry>,
+    iceberg_catalog: Arc<dyn iceberg::Catalog>,
+    target_table: iceberg::table::Table,
+) -> Result<IcebergMvRefreshContext, String> {
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_snapshot_ids,
+        previous_table_uuids,
+        target_snapshot_id,
+        target_table_uuid,
+        ..
+    } = execution.state_baseline()
+    else {
+        return Err(
+            "validated Iceberg refresh context requires a snapshot-backed baseline".to_string(),
+        );
+    };
+    let iceberg_catalogs = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+    let ctx = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+        target,
+        mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        mv_definition,
+        canonical_select_query,
+        base_refs,
+        Arc::clone(execution.pin()?),
+        previous_snapshot_ids.clone(),
+        previous_table_uuids.clone(),
+        *target_snapshot_id,
+        target_table_uuid.clone(),
+        &iceberg_catalogs,
+        target_entry,
+        iceberg_catalog,
+        target_table,
+        execution.affected_partitions().clone(),
+        state.mv_refresh_pruning_limits,
+    )?;
+    #[cfg(test)]
+    {
+        assert!(
+            Arc::ptr_eq(&ctx.rewrite.pin, execution.pin()?),
+            "validated refresh context must reuse the captured pin"
+        );
+        assert_eq!(
+            &ctx.affected_partitions,
+            execution.affected_partitions(),
+            "validated refresh context must reuse planned affected partitions"
+        );
+        observe_validated_refresh_shape(shape);
+    }
+    #[cfg(not(test))]
+    let _ = shape;
+    Ok(ctx)
+}
+
+fn optional_snapshot_map(pin: &RefreshSnapshotPin) -> BTreeMap<String, Option<i64>> {
+    pin.to_snapshot_map()
+        .into_iter()
+        .map(|(fqn, snapshot_id)| (fqn, Some(snapshot_id)))
+        .collect()
+}
+
+fn observe_current_snapshot_ids(
+    state: &Arc<StandaloneState>,
+    base_refs: &[TableIdentity],
+) -> Result<BTreeMap<String, Option<i64>>, String> {
+    let mut observed = BTreeMap::new();
+    for base_ref in base_refs {
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        observed.insert(
+            base_ref.fqn(),
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|snapshot| snapshot.snapshot_id()),
+        );
+    }
+    Ok(observed)
+}
+
+fn validate_refresh_pin_table_uuids_against_baseline(
+    baseline: &RefreshStateBaseline,
+    pin: &RefreshSnapshotPin,
+    base_refs: &[TableIdentity],
+) -> Result<(), String> {
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_table_uuids,
+        ..
+    } = baseline
+    else {
+        return Err(
+            "iceberg refresh execution requires a snapshot-backed state baseline".to_string(),
+        );
+    };
+    for base_ref in base_refs {
+        let Some(previous_uuid) = previous_table_uuids.get(&base_ref.fqn()) else {
+            continue;
+        };
+        let current_uuid = pin.uuid(base_ref).ok_or_else(|| {
+            format!(
+                "refresh pin missing uuid for base {} (this should not happen)",
+                base_ref.fqn()
+            )
+        })?;
+        if previous_uuid != current_uuid {
+            return Err(format!(
+                "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
+                base_ref.fqn(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn execute_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: &IcebergRefreshPlan,
-    affected_partitions: &crate::mv::model::AffectedTargetPartitions,
+    contract: &RefreshPlanContract,
 ) -> Result<IcebergRefreshOutcome, RefreshError> {
+    let _refresh_guard = acquire_mv_refresh_lock().map_err(RefreshError::pre_commit)?;
+    // Recovery may complete or roll back historical attempts before validating
+    // this plan. The no-write guarantee below applies to the current attempt.
+    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+
+    let payload_target = resolve_refresh_target(
+        plan.current_catalog.as_deref(),
+        &plan.current_database,
+        &plan.stmt.name,
+    )
+    .map_err(RefreshError::pre_commit)?;
+    let observed_target = MvTarget {
+        catalog: Some(payload_target.catalog.clone()),
+        database: payload_target.namespace.clone(),
+        name: payload_target.table.clone(),
+    };
+    let contract_target = IcebergMvTarget {
+        catalog: contract.target.catalog.clone().ok_or_else(|| {
+            RefreshError::pre_commit(
+                "iceberg refresh execution contract target is missing a catalog",
+            )
+        })?,
+        namespace: contract.target.database.clone(),
+        table: contract.target.name.clone(),
+    };
+    let mv_definition = load_iceberg_mv_definition_by_target(state, &contract_target)
+        .map_err(RefreshError::pre_commit)?;
+    let (target_entry, iceberg_catalog, target_loaded) =
+        load_iceberg_mv_target(state, &contract_target).map_err(RefreshError::pre_commit)?;
+    validate_target_snapshot(&contract_target, &mv_definition, &target_loaded.table)
+        .map_err(RefreshError::pre_commit)?;
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)
+        .map_err(RefreshError::pre_commit)?;
+    let observed_baseline = build_refresh_state_baseline(
+        &mv_definition,
+        &target_loaded.table,
+        plan.current_catalog.as_deref(),
+        &plan.current_database,
+    )
+    .map_err(RefreshError::pre_commit)?;
+    let observed_snapshot_ids =
+        observe_current_snapshot_ids(state, &base_refs).map_err(RefreshError::pre_commit)?;
+
+    let initial_observation = RefreshExecutionObservation {
+        backend: MvStorageEngine::Iceberg,
+        mv_id: Some(mv_definition.mv_id),
+        target: &observed_target,
+        base_refs: &base_refs,
+        state_baseline: &observed_baseline,
+        snapshot_pins: Some(&observed_snapshot_ids),
+    };
+    let initially_validated = validate_refresh_execution(contract, &initial_observation)
+        .map_err(RefreshError::pre_commit)?;
+
+    let execution = if matches!(contract.decision, ExecutableRefreshDecision::SkipEmpty) {
+        IcebergValidatedRefreshExecution {
+            validated: initially_validated,
+            pin: None,
+        }
+    } else {
+        #[cfg(test)]
+        invoke_after_observe_before_capture_hook();
+        let pin = Arc::new(
+            capture_refresh_snapshot_pin(state, &base_refs).map_err(RefreshError::pre_commit)?,
+        );
+        let captured_snapshot_ids = optional_snapshot_map(&pin);
+        let captured_observation = RefreshExecutionObservation {
+            backend: MvStorageEngine::Iceberg,
+            mv_id: Some(mv_definition.mv_id),
+            target: &observed_target,
+            base_refs: &base_refs,
+            state_baseline: &observed_baseline,
+            snapshot_pins: Some(&captured_snapshot_ids),
+        };
+        let validated = validate_refresh_execution(contract, &captured_observation)
+            .map_err(RefreshError::pre_commit)?;
+        validate_refresh_pin_table_uuids_against_baseline(
+            validated.state_baseline(),
+            &pin,
+            validated.base_refs(),
+        )
+        .map_err(RefreshError::pre_commit)?;
+        IcebergValidatedRefreshExecution {
+            validated,
+            pin: Some(pin),
+        }
+    };
+
+    let runtime = ValidatedIcebergRefreshRuntime {
+        target: contract_target,
+        mv_definition,
+        target_entry,
+        iceberg_catalog,
+        target_table: target_loaded.table,
+        base_refs,
+    };
     refresh_iceberg_mv_with_planned_partitions(
         state,
         plan.current_catalog.as_deref(),
         &plan.current_database,
-        &plan.stmt,
-        affected_partitions,
+        plan.stmt.full,
+        runtime,
+        &execution,
     )
     .map_err(IcebergMvRefreshExecutionError::into_refresh_error)?;
     Ok(IcebergRefreshOutcome {
@@ -6176,6 +6485,8 @@ fn load_iceberg_mv_definition_by_target(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
 ) -> Result<StoredMvDefinition, String> {
+    #[cfg(test)]
+    record_definition_load();
     let provider = state
         .metadata_provider
         .as_ref()
@@ -10210,12 +10521,12 @@ fn refresh_iceberg_join_mv(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
-    expected_main_snapshot_id: Option<i64>,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     apply_key: ApplyKeyContract,
+    execution: &IcebergValidatedRefreshExecution<'_>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     if base_refs.len() != 2 {
         return Err("iceberg join MV refresh requires exactly two base tables"
@@ -10245,22 +10556,6 @@ fn refresh_iceberg_join_mv(
     let (left_ref, right_ref) = join_base_refs_for_schema_contract(schema_contract, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
-    let left_current_before_pin =
-        expected_main_snapshot_id_from_table(&left_loaded_before_pin.table);
-    let right_current_before_pin =
-        expected_main_snapshot_id_from_table(&right_loaded_before_pin.table);
-    let left_previous = mv_definition
-        .last_refresh_snapshots
-        .get(&left_ref.fqn())
-        .copied();
-    let right_previous = mv_definition
-        .last_refresh_snapshots
-        .get(&right_ref.fqn())
-        .copied();
-    let refresh_label = format!(
-        "iceberg join MV {}.{}.{}",
-        target.catalog, target.namespace, target.table
-    );
     let pre_pin_join_bases = [
         (left_ref, &left_loaded_before_pin.table),
         (right_ref, &right_loaded_before_pin.table),
@@ -10269,15 +10564,8 @@ fn refresh_iceberg_join_mv(
         validate_current_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)
             .map_err(|error| error.to_string())?;
 
-    match decide_refresh(
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-        &[
-            base_snapshot_status_for_refresh(left_ref, left_previous, left_current_before_pin),
-            base_snapshot_status_for_refresh(right_ref, right_previous, right_current_before_pin),
-        ],
-        &refresh_label,
-    ) {
-        RefreshDecision::SkipEmpty => {
+    match execution.decision() {
+        ExecutableRefreshDecision::SkipEmpty => {
             tracing::info!(
                 "iceberg join mv {}.{}.{}: both base tables have no snapshot; skipping refresh",
                 target.catalog,
@@ -10286,13 +10574,12 @@ fn refresh_iceberg_join_mv(
             );
             return Ok(StatementResult::Ok);
         }
-        RefreshDecision::FailFast { reason } => return Err(reason.into()),
-        RefreshDecision::FirstRefresh
-        | RefreshDecision::MetadataOnly
-        | RefreshDecision::Incremental => {}
+        ExecutableRefreshDecision::FirstRefresh
+        | ExecutableRefreshDecision::MetadataOnly
+        | ExecutableRefreshDecision::Incremental => {}
     }
 
-    let pin = capture_refresh_snapshot_pin(state, base_refs)?;
+    let pin = execution.pin()?;
     if pin.len() != 2 {
         return Err(format!(
             "iceberg join MV refresh expected two refresh pins, got {}",
@@ -10300,8 +10587,6 @@ fn refresh_iceberg_join_mv(
         )
         .into());
     }
-    validate_refresh_pin_table_uuids(mv_definition, &pin, base_refs)?;
-
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
     let decision = validate_current_join_schema_contract(
@@ -10316,60 +10601,36 @@ fn refresh_iceberg_join_mv(
     let effective_definition = apply_join_schema_contract_decision(decision, mv_definition)?;
     let mv_definition = &effective_definition;
 
-    let left_current = pin
-        .get(left_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", left_ref.fqn()))?;
-    let right_current = pin
-        .get(right_ref)
-        .ok_or_else(|| format!("missing refresh pin for {}", right_ref.fqn()))?;
-
-    // Construct the refresh context once, after pin capture and join schema
-    // contract validation. The early no-op match arms above return BEFORE pin
-    // capture because `capture_refresh_snapshot_pin` errors out if any base
-    // lacks a current snapshot — hoisting pin capture would regress those
-    // no-op paths into errors. Option (b) from the design spec.
+    // Construct the refresh context once after join schema validation. The
+    // validated execution owns the previously captured pin; SkipEmpty reaches
+    // this branch without requiring one, preserving the early no-op behavior.
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&mv_definition.select_sql)?,
         current_catalog,
         current_database,
     );
-    let ctx = {
-        let iceberg_catalog_guard = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        IcebergMvRefreshContext::new_with_pruning_limits(
-            target.clone(),
-            mv_definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(mv_definition.clone()),
-            Arc::new(canonical_select_query),
-            Arc::from(base_refs.to_vec()),
-            Arc::new(pin.clone()),
-            &iceberg_catalog_guard,
-            Arc::new(target_entry.clone()),
-            iceberg_catalog.clone(),
-            target_table.clone(),
-            state.mv_refresh_pruning_limits,
-        )?
-    };
+    let ctx = build_validated_refresh_context(
+        ValidatedRefreshShape::JoinProjection,
+        state,
+        target.clone(),
+        current_catalog,
+        current_database,
+        Arc::new(mv_definition.clone()),
+        Arc::new(canonical_select_query),
+        Arc::from(base_refs.to_vec()),
+        execution,
+        Arc::new(target_entry.clone()),
+        iceberg_catalog.clone(),
+        target_table.clone(),
+    )?;
     tracing::info!(
         summary = ?ctx.rewrite.summary(),
         "iceberg MV refresh context constructed"
     );
 
-    let refresh_decision = decide_refresh(
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-        &[
-            base_snapshot_status_for_refresh(left_ref, left_previous, Some(left_current)),
-            base_snapshot_status_for_refresh(right_ref, right_previous, Some(right_current)),
-        ],
-        &refresh_label,
-    );
-
-    run_iceberg_mv_refresh_lifecycle(
-        refresh_decision,
+    dispatch_refresh_decision(
+        execution.decision(),
+        || Ok(StatementResult::Ok),
         || {
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
@@ -10380,7 +10641,7 @@ fn refresh_iceberg_join_mv(
                 state,
                 target,
                 mv_definition.mv_id,
-                expected_main_snapshot_id,
+                ctx.rewrite.target_snapshot_id,
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
@@ -17127,7 +17388,7 @@ mod tests {
             },
         )
         .expect("aggregate incremental refresh plan");
-        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode(), RefreshMode::Incremental);
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
             .expect("aggregate incremental refresh");
 
@@ -17142,6 +17403,567 @@ mod tests {
             .expect("second aggregate snapshot")
             .snapshot_id();
         assert_ne!(first_snapshot, second_snapshot);
+    }
+
+    #[test]
+    fn execute_rejects_contract_target_drift_before_current_attempt_intent() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_contract_target
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_contract_target");
+        let mut plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_contract_target".to_string(),
+            },
+        )
+        .expect("plan first refresh");
+        plan.contract.target.name = "different_target".to_string();
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        let error = execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect_err("target drift must fail before execution");
+
+        assert_eq!(
+            error.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed
+        );
+        let definition =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_contract_target")
+                .expect("mv definition");
+        assert_eq!(definition.active_refresh_id, None);
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let target = load_iceberg_mv_table(&entry, "analytics", "mv_contract_target");
+        assert!(target.table.metadata().current_snapshot().is_none());
+    }
+
+    #[test]
+    fn execute_binds_definition_once_before_validated_dispatch() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "one")]);
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_single_load");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_single_load");
+        let plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_single_load".to_string(),
+            },
+        )
+        .expect("plan refresh");
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = DefinitionLoadCounterGuard::install(Arc::clone(&loads));
+
+        execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect("execute validated refresh");
+
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "validated dispatch must reuse the definition loaded for validation"
+        );
+    }
+
+    #[test]
+    fn execute_rejects_missing_payload_target_with_contract_mismatch() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "one")]);
+        create_mv_only(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "mv_contract_authority",
+        );
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_contract_authority");
+        let mut plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_contract_authority".to_string(),
+            },
+        )
+        .expect("plan refresh");
+        let BackendRefreshPlan::Iceberg(payload) = &mut plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+        payload.stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW missing_payload_target");
+
+        let error = execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect_err("payload target drift must be rejected deterministically");
+
+        assert_eq!(
+            error.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed
+        );
+        assert!(
+            error.message.contains("refresh execution target mismatch"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn definition_fingerprint_is_exact_canonical_json_and_order_independent() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "one")]);
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_fingerprint");
+        let mut definition =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_fingerprint")
+                .expect("definition");
+        definition.base_table_refs = vec![
+            "ice.sales.orders".to_string(),
+            "ice.sales.other".to_string(),
+        ];
+        let first =
+            refresh_execution_definition_fingerprint(&definition, Some("ice"), &env.current_db)
+                .expect("fingerprint");
+        definition.base_table_refs.reverse();
+        let reordered =
+            refresh_execution_definition_fingerprint(&definition, Some("ice"), &env.current_db)
+                .expect("reordered fingerprint");
+
+        assert_eq!(first, reordered);
+        let encoded: serde_json::Value =
+            serde_json::from_str(&first).expect("fingerprint must be exact JSON");
+        assert_eq!(encoded["mv_id"], definition.mv_id);
+        assert_eq!(
+            encoded["canonical_base_refs"],
+            serde_json::json!(["ice.sales.orders", "ice.sales.other"])
+        );
+    }
+
+    #[test]
+    fn execute_rejects_base_snapshot_drift_before_current_attempt_intent() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_snapshot_drift
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_snapshot_drift");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 20)]);
+        let plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_snapshot_drift".to_string(),
+            },
+        )
+        .expect("plan incremental refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(3, "north", 30)]);
+        let before =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_snapshot_drift")
+                .expect("definition before execute");
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let target_snapshot_before =
+            load_iceberg_mv_table(&entry, "analytics", "mv_snapshot_drift")
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|snapshot| snapshot.snapshot_id());
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        let error = execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect_err("snapshot drift must fail before execution");
+
+        assert_eq!(
+            error.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed
+        );
+        let after = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_snapshot_drift")
+            .expect("definition after execute");
+        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
+        assert_eq!(
+            after.last_refresh_table_uuids,
+            before.last_refresh_table_uuids
+        );
+        assert_eq!(after.active_refresh_id, None);
+        let target_snapshot_after = load_iceberg_mv_table(&entry, "analytics", "mv_snapshot_drift")
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        assert_eq!(target_snapshot_after, target_snapshot_before);
+    }
+
+    #[test]
+    fn execute_rejects_stale_previous_watermark_after_concurrent_refresh() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_concurrent_watermark
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_concurrent_watermark");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 20)]);
+
+        let target = MvTarget {
+            catalog: Some("ice".to_string()),
+            database: "analytics".to_string(),
+            name: "mv_concurrent_watermark".to_string(),
+        };
+        let first_plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            target.clone(),
+        )
+        .expect("first concurrent plan");
+        let stale_plan =
+            plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
+                .expect("second concurrent plan");
+        let BackendRefreshPlan::Iceberg(first_payload) = &first_plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+        execute_iceberg_mv_refresh(&env.state, first_payload, &first_plan.contract)
+            .expect("first planned refresh");
+        let after_first =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_concurrent_watermark")
+                .expect("definition after first execution");
+        let BackendRefreshPlan::Iceberg(stale_payload) = &stale_plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        let error = execute_iceberg_mv_refresh(&env.state, stale_payload, &stale_plan.contract)
+            .expect_err("stale watermark must fail before execution");
+
+        assert_eq!(
+            error.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed
+        );
+        let after_stale =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_concurrent_watermark")
+                .expect("definition after stale execution");
+        assert_eq!(
+            after_stale.last_refresh_snapshots,
+            after_first.last_refresh_snapshots
+        );
+        assert_eq!(after_stale.active_refresh_id, None);
+    }
+
+    #[test]
+    fn execute_accepts_definition_base_ref_reorder() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "left_fact");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "right_fact");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "left_fact",
+            &[(1, "east", 10)],
+        );
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "right_fact",
+            &[(2, "west", 20)],
+        );
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_reordered_bases
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM (
+                    SELECT region FROM ice.sales.left_fact
+                    UNION ALL
+                    SELECT region FROM ice.sales.right_fact
+                ) u
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_reordered_bases");
+        let mut plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_reordered_bases".to_string(),
+            },
+        )
+        .expect("plan refresh");
+        assert_eq!(plan.contract.base_refs.len(), 2);
+        plan.contract.base_refs.reverse();
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect("base-ref ordering must not change execution identity");
+    }
+
+    #[test]
+    fn execute_rejects_snapshot_change_between_observe_and_full_pin() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_observe_capture_race
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_observe_capture_race");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 20)]);
+        let plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_observe_capture_race".to_string(),
+            },
+        )
+        .expect("plan incremental refresh");
+        let before =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_observe_capture_race")
+                .expect("definition before execute");
+        let state_for_hook = Arc::clone(&env.state);
+        let _hook = AfterObserveBeforeCaptureHookGuard::install(Arc::new(move || {
+            insert_into_aggregate_fact_table(
+                &state_for_hook,
+                "ice",
+                "sales",
+                "fact",
+                &[(3, "north", 30)],
+            );
+        }));
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        let error = execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect_err("observe-to-capture drift must fail before execution");
+
+        assert_eq!(
+            error.kind,
+            crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed
+        );
+        let after =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_observe_capture_race")
+                .expect("definition after execute");
+        assert_eq!(after.last_refresh_snapshots, before.last_refresh_snapshots);
+        assert_eq!(after.active_refresh_id, None);
+    }
+
+    #[test]
+    fn execute_keeps_captured_pin_when_snapshot_changes_after_capture() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_after_capture_race
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_after_capture_race");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 20)]);
+        let plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_after_capture_race".to_string(),
+            },
+        )
+        .expect("plan incremental refresh");
+        let planned_snapshots = plan
+            .contract
+            .snapshot_pins
+            .iter()
+            .map(|(fqn, snapshot)| {
+                (
+                    fqn.clone(),
+                    snapshot.expect("non-empty refresh must plan concrete snapshots"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let state_for_hook = Arc::clone(&env.state);
+        let _hook = crate::engine::mv::refresh_pin_adapter::AfterCaptureHookGuard::install(
+            Arc::new(move || {
+                insert_into_aggregate_fact_table(
+                    &state_for_hook,
+                    "ice",
+                    "sales",
+                    "fact",
+                    &[(3, "north", 30)],
+                );
+            }),
+        );
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        execute_iceberg_mv_refresh(&env.state, payload, &plan.contract)
+            .expect("post-capture drift must not replace the frozen pin");
+
+        let after =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_after_capture_race")
+                .expect("definition after execute");
+        assert_eq!(after.last_refresh_snapshots, planned_snapshots);
+        let live_snapshot = load_iceberg_table(&env.state, "ice", "sales", "fact")
+            .metadata()
+            .current_snapshot()
+            .expect("live base snapshot")
+            .snapshot_id();
+        assert_ne!(
+            after.last_refresh_snapshots["ice.sales.fact"], live_snapshot,
+            "refresh watermark must remain bound to the captured pin"
+        );
+    }
+
+    #[test]
+    fn execute_rejects_uuid_and_definition_fingerprint_baseline_drift() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_baseline_identity
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c
+                FROM ice.sales.fact
+                GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_baseline_identity");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first refresh");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 20)]);
+        let plan = plan_iceberg_mv_refresh(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &refresh,
+            MvTarget {
+                catalog: Some("ice".to_string()),
+                database: "analytics".to_string(),
+                name: "mv_baseline_identity".to_string(),
+            },
+        )
+        .expect("plan incremental refresh");
+        let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+            panic!("expected iceberg plan");
+        };
+
+        for mutation in ["previous_uuid", "target_uuid", "fingerprint"] {
+            let mut contract = plan.contract.clone();
+            let RefreshStateBaseline::SnapshotBacked {
+                previous_table_uuids,
+                target_table_uuid,
+                definition_fingerprint,
+                ..
+            } = &mut contract.state_baseline
+            else {
+                panic!("expected snapshot-backed baseline");
+            };
+            match mutation {
+                "previous_uuid" => {
+                    previous_table_uuids.insert(
+                        "ice.sales.fact".to_string(),
+                        "different-base-uuid".to_string(),
+                    );
+                }
+                "target_uuid" => *target_table_uuid = "different-target-uuid".to_string(),
+                "fingerprint" => *definition_fingerprint = "different-definition".to_string(),
+                _ => unreachable!(),
+            }
+
+            let error = execute_iceberg_mv_refresh(&env.state, payload, &contract)
+                .expect_err("baseline identity drift must fail before execution");
+            assert_eq!(
+                error.kind,
+                crate::engine::mv::lifecycle::RefreshErrorKind::PreCommitFailed,
+                "mutation={mutation}"
+            );
+        }
+        let after =
+            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_baseline_identity")
+                .expect("definition after rejected mutations");
+        assert_eq!(after.active_refresh_id, None);
     }
 
     #[test]
@@ -17227,7 +18049,7 @@ mod tests {
             },
         )
         .expect("join aggregate incremental refresh plan");
-        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode(), RefreshMode::Incremental);
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
             .expect("join aggregate incremental refresh");
 
@@ -21604,7 +22426,7 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("projection/filter UNION ALL refresh planning");
 
-        assert_eq!(plan.contract.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode(), RefreshMode::Noop);
         assert_eq!(
             plan.contract
                 .base_refs
@@ -21838,7 +22660,7 @@ mod tests {
         let plan =
             plan_iceberg_mv_refresh(&env.state, Some(catalog), &env.current_db, &refresh, target)
                 .expect("projection/filter UNION ALL incremental plan");
-        assert_eq!(plan.contract.mode, RefreshMode::Incremental);
+        assert_eq!(plan.contract.mode(), RefreshMode::Incremental);
 
         refresh_iceberg_mv(&env.state, Some(catalog), &env.current_db, &refresh)
             .expect("incremental projection/filter UNION ALL refresh");
@@ -22197,7 +23019,7 @@ mod tests {
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("aggregate-over-UNION-ALL refresh planning");
 
-        assert_eq!(plan.contract.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode(), RefreshMode::Noop);
         assert_eq!(
             plan.contract
                 .base_refs
@@ -22465,6 +23287,13 @@ mod tests {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let capture_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture_count_for_hook = Arc::clone(&capture_count);
+        let _capture_hook = crate::engine::mv::refresh_pin_adapter::AfterCaptureHookGuard::install(
+            Arc::new(move || {
+                capture_count_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
 
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
         refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
@@ -22483,10 +23312,91 @@ mod tests {
         let plan =
             plan_iceberg_mv_refresh(&env.state, Some("ice"), &env.current_db, &refresh, target)
                 .expect("empty base plan should be no-op");
-        assert_eq!(plan.contract.mode, RefreshMode::Noop);
+        assert_eq!(plan.contract.mode(), RefreshMode::Noop);
+        assert_eq!(plan.contract.decision, ExecutableRefreshDecision::SkipEmpty);
         assert_eq!(
             plan.contract.snapshot_pins.get("ice.sales.orders").copied(),
             Some(None)
+        );
+        assert_eq!(
+            capture_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "SkipEmpty must not capture a full refresh pin"
+        );
+    }
+
+    #[test]
+    fn production_refresh_paths_reuse_validated_inputs_for_all_eight_shapes() {
+        let observed = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observed_for_hook = Arc::clone(&observed);
+        let _observer = ValidatedRefreshShapeObserverGuard::install(Arc::new(move |shape| {
+            observed_for_hook
+                .lock()
+                .expect("refresh shape observer lock")
+                .insert(shape);
+        }));
+
+        // These are the real end-to-end unit paths for each production dispatch
+        // arm. The observer is invoked only by build_validated_refresh_context,
+        // where pin identity and affected-partition equality are asserted.
+        refresh_iceberg_mv_second_write_refresh_publishes_and_drops_staging_branch();
+        refresh_iceberg_union_all_projection_mv_refreshes_branch_aware_rows();
+        aggregate_first_refresh_writes_state_and_refreshes_incrementally();
+        aggregate_over_union_all_fan_in_refresh_merges_branches_incrementally();
+        composed_aggregate_cross_join_first_refresh_uses_validated_context();
+        union_of_aggregates_keeps_same_group_key_independent_across_branches();
+        join_aggregate_first_refresh_writes_state_for_two_bases();
+        alter_iceberg_join_mv_repartition_rebuilds_with_join_apply_key();
+
+        let expected = std::collections::BTreeSet::from([
+            ValidatedRefreshShape::SingleProjection,
+            ValidatedRefreshShape::UnionProjection,
+            ValidatedRefreshShape::SingleAggregate,
+            ValidatedRefreshShape::FanInAggregate,
+            ValidatedRefreshShape::ComposedAggregate,
+            ValidatedRefreshShape::BranchUnionAggregate,
+            ValidatedRefreshShape::JoinAggregate,
+            ValidatedRefreshShape::JoinProjection,
+        ]);
+        assert_eq!(
+            *observed.lock().expect("refresh shape observer lock"),
+            expected
+        );
+    }
+
+    #[test]
+    fn composed_aggregate_cross_join_first_refresh_uses_validated_context() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        create_aggregate_dim_table(&env.state, "ice", "sales", "dim");
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact",
+            &[(1, "east", 10), (2, "west", 20)],
+        );
+        insert_into_aggregate_dim_table(&env.state, "ice", "sales", "dim", &[(10, "a"), (20, "b")]);
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_cross_aggregate
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT f.region, count(*) AS c, sum(f.amount) AS s
+                FROM ice.sales.fact f CROSS JOIN ice.sales.dim d
+                GROUP BY f.region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create composed aggregate iceberg mv");
+
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_cross_aggregate");
+        refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect("first composed aggregate refresh");
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_cross_aggregate",
+            &[("east", 2, 20), ("west", 2, 40)],
         );
     }
 

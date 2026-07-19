@@ -109,6 +109,27 @@ fn clear_after_capture_hook() {
 }
 
 #[cfg(test)]
+pub(crate) struct AfterCaptureHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl AfterCaptureHookGuard {
+    pub(crate) fn install(hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let lock = lock_after_capture_hook_for_test();
+        set_after_capture_hook(hook);
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AfterCaptureHookGuard {
+    fn drop(&mut self) {
+        clear_after_capture_hook();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

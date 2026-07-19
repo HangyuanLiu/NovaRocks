@@ -2407,7 +2407,7 @@ mod tests {
                 .expect("build schema"),
         );
         let mv_ctx = Arc::new(
-            IcebergMvRewriteContext::from_parts(
+            IcebergMvRewriteContext::from_definition_parts(
                 make_target(),
                 42,
                 Some("sess_cat".to_string()),

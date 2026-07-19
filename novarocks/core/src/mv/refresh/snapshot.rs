@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::mv::model::RefreshMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BaseSnapshotPolicy {
     SingleBase,
@@ -50,6 +52,34 @@ pub(crate) enum RefreshDecision {
     MetadataOnly,
     Incremental,
     FailFast { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutableRefreshDecision {
+    SkipEmpty,
+    FirstRefresh,
+    MetadataOnly,
+    Incremental,
+}
+
+impl ExecutableRefreshDecision {
+    pub(crate) fn from_refresh_decision(decision: RefreshDecision) -> Result<Self, String> {
+        match decision {
+            RefreshDecision::SkipEmpty => Ok(Self::SkipEmpty),
+            RefreshDecision::FirstRefresh => Ok(Self::FirstRefresh),
+            RefreshDecision::MetadataOnly => Ok(Self::MetadataOnly),
+            RefreshDecision::Incremental => Ok(Self::Incremental),
+            RefreshDecision::FailFast { reason } => Err(reason),
+        }
+    }
+
+    pub(crate) fn mode(self) -> RefreshMode {
+        match self {
+            Self::SkipEmpty | Self::MetadataOnly => RefreshMode::Noop,
+            Self::FirstRefresh => RefreshMode::Full,
+            Self::Incremental => RefreshMode::Incremental,
+        }
+    }
 }
 
 pub(crate) fn decide_refresh(
@@ -221,6 +251,48 @@ fn fail_fast(reason: String) -> RefreshDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_raw_refresh_decisions_to_executable_decisions() {
+        let cases = [
+            (
+                RefreshDecision::SkipEmpty,
+                ExecutableRefreshDecision::SkipEmpty,
+                RefreshMode::Noop,
+            ),
+            (
+                RefreshDecision::FirstRefresh,
+                ExecutableRefreshDecision::FirstRefresh,
+                RefreshMode::Full,
+            ),
+            (
+                RefreshDecision::MetadataOnly,
+                ExecutableRefreshDecision::MetadataOnly,
+                RefreshMode::Noop,
+            ),
+            (
+                RefreshDecision::Incremental,
+                ExecutableRefreshDecision::Incremental,
+                RefreshMode::Incremental,
+            ),
+        ];
+
+        for (raw, expected, mode) in cases {
+            let executable = ExecutableRefreshDecision::from_refresh_decision(raw).unwrap();
+            assert_eq!(executable, expected);
+            assert_eq!(executable.mode(), mode);
+        }
+    }
+
+    #[test]
+    fn executable_decision_preserves_fail_fast_reason() {
+        let error = ExecutableRefreshDecision::from_refresh_decision(RefreshDecision::FailFast {
+            reason: "planned refresh is unsafe".to_string(),
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "planned refresh is unsafe");
+    }
 
     #[test]
     fn single_base_empty_skips() {
