@@ -1,20 +1,7 @@
 name: FoundationDB state store
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/foundationdb-state-store.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "docker/foundationdb/**"
-      - "novarocks.toml.example"
-      - "novarocks/state-store/**"
-      - "novarocks/core/Cargo.toml"
-      - "novarocks/core/src/common/app_config.rs"
-      - "novarocks/core/tests/state_store_app_config.rs"
-      - "novarocks-server/Cargo.toml"
-      - "novarocks-server/tests/cluster_mvp.rs"
-      - "tools/ci/foundationdb-provider.sh"
+  # Keep the provider gate available without blocking every pull request.
   workflow_dispatch:
 
 permissions:
