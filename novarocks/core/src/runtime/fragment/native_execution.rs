@@ -255,7 +255,7 @@ pub(crate) fn execute_native_submission(
     if let Some(profiler) = context.profiler.as_ref() {
         record_runtime_filter_dormancy(profiler, program.runtime_filters().dormancy_facts());
     }
-    let sink = materialize_fragment_sink(program.sink(), instance).map_err(|error| {
+    let sink = materialize_fragment_sink(program, instance).map_err(|error| {
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
     })?;
     if program.sink().kind() != FragmentSinkKind::Result {

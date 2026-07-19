@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::exec::fragment::program::FragmentSinkSpec;
+use crate::exec::fragment::program::{FragmentProgram, FragmentSinkSpec};
 use crate::exec::fragment::sink::{
     DataStreamSinkBranchProgram, FragmentSinkProgram, IcebergChangeStreamRouterProgram,
     MultiCastDataStreamSinkProgram,
@@ -35,15 +35,15 @@ use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssig
 use crate::service::result_batch_wire::ResultSinkConfig;
 
 pub(crate) fn materialize_fragment_sink(
-    program: &FragmentSinkSpec,
+    program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     materialize_fragment_sink_components(
-        program,
+        program.sink(),
         instance.sink_assignment(),
         instance.fragment_instance_id().get(),
         instance.runtime_options().typed_result_sink(),
-        -1,
+        program.root_plan_node_id().get(),
     )
 }
 
@@ -251,16 +251,24 @@ fn sink_assignment_name(assignment: &FragmentSinkAssignment) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
 
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
-    use crate::exec::fragment::program::FragmentSinkSpec;
+    use crate::exec::fragment::program::{
+        FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
+        RuntimeFilterContract,
+    };
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+        IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
         MultiCastDataStreamSinkProgram,
     };
+    use crate::exec::node::values::ValuesNode;
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::DataStreamPartitionType;
     use crate::runtime::fragment::error::{FragmentLaunchErrorKind, FragmentLaunchStage};
     use crate::runtime::fragment::instance::{
@@ -270,6 +278,7 @@ mod tests {
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_filter_params::RuntimeFilterParams;
+    use crate::sql::common::ChangeStreamBranchKind;
 
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
 
@@ -313,16 +322,109 @@ mod tests {
         )
     }
 
+    fn fragment_program(sink: FragmentSinkProgram) -> FragmentProgram {
+        FragmentProgram::new(
+            ExecPlan {
+                arena: ExprArena::default(),
+                root: ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode {
+                        chunk: Chunk::default(),
+                        node_id: 99,
+                    }),
+                },
+            },
+            FragmentSinkSpec::try_new(sink).expect("fragment sink"),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::default(),
+        )
+    }
+
+    fn assert_factory_and_operator_name(
+        factory: &dyn crate::exec::pipeline::operator_factory::OperatorFactory,
+        expected: &str,
+    ) {
+        assert_eq!(factory.name(), expected);
+        assert_eq!(factory.create(1, 0).name(), expected);
+    }
+
+    #[test]
+    fn data_stream_materialization_uses_fragment_root_plan_node_id() {
+        let program = fragment_program(FragmentSinkProgram::DataStream(stream_program()));
+        let instance = instance(FragmentSinkAssignment::StreamDestinations {
+            destinations: Vec::new(),
+            sender_id: None,
+        });
+
+        let factory = materialize_fragment_sink(&program, &instance).expect("data stream sink");
+
+        assert_factory_and_operator_name(factory.as_ref(), "EXCHANGE_SINK (id=99)");
+    }
+
+    #[test]
+    fn multicast_materialization_uses_fragment_root_plan_node_id() {
+        let program = fragment_program(FragmentSinkProgram::MultiCastDataStream(
+            MultiCastDataStreamSinkProgram::try_new(vec![stream_branch(17)], ExprArena::default())
+                .expect("multicast program"),
+        ));
+        let instance = instance(FragmentSinkAssignment::DestinationGroups {
+            groups: vec![Vec::new()],
+            sender_id: None,
+        });
+
+        let factory = materialize_fragment_sink(&program, &instance).expect("multicast sink");
+
+        assert_factory_and_operator_name(factory.as_ref(), "MULTI_CAST_DATA_STREAM_SINK (id=99)");
+    }
+
+    #[test]
+    fn iceberg_router_materialization_uses_fragment_root_plan_node_id() {
+        let program = fragment_program(FragmentSinkProgram::IcebergChangeStreamRouter(
+            IcebergChangeStreamRouterProgram::try_new(
+                SlotId::new(1),
+                None,
+                vec![IcebergChangeStreamRouterBranchProgram::new(
+                    7,
+                    ChangeStreamBranchKind::DeleteDv,
+                    stream_branch(17),
+                )],
+                ExprArena::default(),
+            )
+            .expect("router program"),
+        ));
+        let instance = instance(FragmentSinkAssignment::DestinationGroups {
+            groups: vec![Vec::new()],
+            sender_id: None,
+        });
+
+        let factory = materialize_fragment_sink(&program, &instance).expect("router sink");
+
+        assert_factory_and_operator_name(
+            factory.as_ref(),
+            "ICEBERG_CHANGE_STREAM_ROUTER_SINK (id=99)",
+        );
+    }
+
+    #[test]
+    fn result_materialization_remains_anonymous_with_fragment_root_plan_node_id() {
+        let program = fragment_program(FragmentSinkProgram::Result);
+        let instance = instance(FragmentSinkAssignment::None);
+
+        let factory = materialize_fragment_sink(&program, &instance).expect("result sink");
+
+        assert_factory_and_operator_name(factory.as_ref(), "RESULT_BUFFER_SINK (plan_node_id=-1)");
+    }
+
     #[test]
     fn data_stream_materialization_requires_stream_destinations() {
-        let sink = FragmentSinkSpec::try_new(FragmentSinkProgram::DataStream(stream_program()))
-            .expect("data stream sink");
+        let program = fragment_program(FragmentSinkProgram::DataStream(stream_program()));
 
-        let error = match materialize_fragment_sink(&sink, &instance(FragmentSinkAssignment::None))
-        {
-            Ok(_) => panic!("missing stream destinations must fail"),
-            Err(error) => error,
-        };
+        let error =
+            match materialize_fragment_sink(&program, &instance(FragmentSinkAssignment::None)) {
+                Ok(_) => panic!("missing stream destinations must fail"),
+                Err(error) => error,
+            };
 
         assert_eq!(error.stage(), FragmentLaunchStage::Materialize);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Materialization);
@@ -330,20 +432,19 @@ mod tests {
 
     #[test]
     fn grouped_materialization_rejects_mismatched_destination_count() {
-        let sink = FragmentSinkSpec::try_new(FragmentSinkProgram::MultiCastDataStream(
+        let program = fragment_program(FragmentSinkProgram::MultiCastDataStream(
             MultiCastDataStreamSinkProgram::try_new(
                 vec![stream_branch(17), stream_branch(18)],
                 ExprArena::default(),
             )
             .expect("multicast program"),
-        ))
-        .expect("two-branch multicast sink");
+        ));
         let assignment = FragmentSinkAssignment::DestinationGroups {
             groups: vec![Vec::new()],
             sender_id: None,
         };
 
-        let error = match materialize_fragment_sink(&sink, &instance(assignment)) {
+        let error = match materialize_fragment_sink(&program, &instance(assignment)) {
             Ok(_) => panic!("one destination group must not be truncated against two branches"),
             Err(error) => error,
         };
