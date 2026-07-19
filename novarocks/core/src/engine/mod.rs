@@ -28,8 +28,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
 
-use crate::engine::mv::refresh_execution_context::MvRefreshPruningLimits;
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_options::QueryOptions;
@@ -3110,7 +3110,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
     let connectors_snapshot = state
@@ -3176,7 +3176,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     query_opts: Option<QueryOptions>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
     let planned = build_physical_plan_as_iceberg_change_stream_write(
         state,
@@ -3244,7 +3244,7 @@ pub(crate) fn execute_query_with_options(
     query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator(
         query,
@@ -3271,7 +3271,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
@@ -3302,7 +3302,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
     query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
@@ -3334,7 +3334,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     run_imv_rewrite: bool,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
@@ -3440,7 +3440,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     run_imv_rewrite: bool,
@@ -3554,7 +3554,7 @@ pub(crate) fn execute_logical_plan_with_options(
     query_opts: Option<QueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
-    mv_refresh_ctx: Option<&crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext>,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
@@ -5418,7 +5418,7 @@ mysql_port = 47892
     }
 
     fn dummy_mv_refresh_context_for_validator_test()
-    -> crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext {
+    -> crate::mv::refresh::execution_context::IcebergMvRefreshContext {
         use iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
             TableMetadataBuilder, Type,
@@ -5477,11 +5477,11 @@ mysql_port = 47892
                 .expect("build hadoop catalog"),
         );
 
-        let rewrite = crate::engine::mv::refresh_execution_context::tests_support::rewrite_context_for_target_fixture(
+        let rewrite = crate::mv::refresh::execution_context::tests_support::rewrite_context_for_target_fixture(
             &target_table,
             None,
         );
-        crate::engine::mv::refresh_execution_context::tests_support::refresh_context_for_handles(
+        crate::mv::refresh::execution_context::tests_support::refresh_context_for_handles(
             rewrite,
             target_entry,
             iceberg_catalog,

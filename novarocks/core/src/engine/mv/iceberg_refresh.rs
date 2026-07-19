@@ -56,7 +56,6 @@ use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
 use crate::engine::mv::recovery::{StagingDisposition, classify_staging_branch};
-use crate::engine::mv::refresh_execution_context::IcebergMvRefreshContext;
 use crate::engine::mv::refresh_io::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
@@ -106,6 +105,7 @@ use crate::mv::refresh::execution::{
     RefreshExecutionObservation, ValidatedRefreshExecution, dispatch_refresh_decision,
     validate_refresh_execution,
 };
+use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
@@ -6299,8 +6299,13 @@ fn build_validated_refresh_context(
         .iceberg_catalogs
         .read()
         .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+    let target_identity = TableIdentity {
+        catalog: target.catalog,
+        namespace: target.namespace,
+        table: target.table,
+    };
     let ctx = IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
-        target,
+        target_identity,
         mv_definition.mv_id,
         current_catalog,
         current_database,
@@ -8574,7 +8579,8 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     table_uuids: BTreeMap<String, String>,
     physical_sql: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -8842,7 +8848,8 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     chunks: Vec<crate::exec::chunk::Chunk>,
     refresh_label: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -10955,7 +10962,11 @@ fn build_join_projection_repartition_context(
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         IcebergMvRefreshContext::new_with_pruning_limits(
-            target.clone(),
+            TableIdentity {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
             effective_definition.mv_id,
             current_catalog,
             current_database,
@@ -10984,7 +10995,8 @@ fn repartition_iceberg_join_mv_overwrite(
     partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -11222,7 +11234,8 @@ fn first_refresh_iceberg_join_mv(
     left_ref: &TableIdentity,
     right_ref: &TableIdentity,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -12563,7 +12576,11 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         IcebergMvRefreshContext::new_with_pruning_limits(
-            target,
+            TableIdentity {
+                catalog: target.catalog,
+                namespace: target.namespace,
+                table: target.table,
+            },
             mv_definition.mv_id,
             current_catalog,
             current_database,
@@ -12633,7 +12650,8 @@ fn incremental_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     base_refs: &[TableIdentity],
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let mv_definition = &*ctx.rewrite.mv_definition;
     let pin = &*ctx.rewrite.pin;
     if base_refs.len() != 2 {
@@ -13517,7 +13535,8 @@ fn execute_join_delta_branches_logical(
             .into());
     }
     let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -13828,7 +13847,8 @@ fn execute_append_only_join_delta_branches(
     base_query: &sqlparser::ast::Query,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
@@ -15394,7 +15414,8 @@ fn incremental_refresh_iceberg_mv_with_changes(
     pinned_full_select_sql: Option<&str>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let target = &ctx.application_target;
+    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
+    let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
