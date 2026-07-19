@@ -607,14 +607,32 @@ mod tests {
         _warehouse: tempfile::TempDir,
         target_entry: Arc<IcebergCatalogEntry>,
         target_table: iceberg::table::Table,
-        target_snapshot_id: i64,
+        target_snapshot_id: Option<i64>,
+    }
+
+    impl TargetFixture {
+        fn snapshot_id(&self) -> i64 {
+            self.target_snapshot_id.expect("target snapshot")
+        }
     }
 
     fn target_fixture(test_name: &str) -> TargetFixture {
-        target_fixture_with_branch(test_name, false)
+        target_fixture_with_options(test_name, false, true)
     }
 
     fn target_fixture_with_branch(test_name: &str, with_branch: bool) -> TargetFixture {
+        target_fixture_with_options(test_name, with_branch, true)
+    }
+
+    fn target_fixture_without_snapshot(test_name: &str) -> TargetFixture {
+        target_fixture_with_options(test_name, false, false)
+    }
+
+    fn target_fixture_with_options(
+        test_name: &str,
+        with_branch: bool,
+        insert_target_row: bool,
+    ) -> TargetFixture {
         let warehouse = tempfile::Builder::new()
             .prefix(&format!("novarocks_target_apply_{test_name}_"))
             .tempdir()
@@ -677,21 +695,20 @@ mod tests {
         } else {
             vec![crate::sql::Literal::Int(10), crate::sql::Literal::Int(100)]
         };
-        crate::connector::iceberg::catalog::registry::insert_rows(
-            &target_entry,
-            "db",
-            "mv",
-            &[row],
-        )
-        .expect("insert target row");
+        if insert_target_row {
+            crate::connector::iceberg::catalog::registry::insert_rows(
+                &target_entry,
+                "db",
+                "mv",
+                &[row],
+            )
+            .expect("insert target row");
+        }
         let target_table =
             crate::connector::iceberg::catalog::registry::load_table(&target_entry, "db", "mv")
                 .expect("load target table")
                 .table;
-        let target_snapshot_id = target_table
-            .metadata()
-            .current_snapshot_id()
-            .expect("target snapshot");
+        let target_snapshot_id = target_table.metadata().current_snapshot_id();
         TargetFixture {
             _warehouse: warehouse,
             target_entry,
@@ -761,7 +778,7 @@ mod tests {
     #[test]
     fn rejects_target_snapshot_drift() {
         let fixture = target_fixture("snapshot_drift");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id + 1), |_| {});
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id() + 1), |_| {});
 
         let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
             &rewrite,
@@ -775,9 +792,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_live_target_uuid_drift() {
+        let fixture = target_fixture("live_uuid_rewrite");
+        let other = target_fixture("live_uuid_table");
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
+
+        let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            other.target_entry,
+            other.target_table,
+        ) else {
+            panic!("live target UUID drift must fail");
+        };
+
+        assert!(err.contains("runtime UUID mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_none_to_some_target_snapshot_drift() {
+        let fixture = target_fixture("none_to_some_snapshot");
+        let rewrite = rewrite_context(&fixture, None, |_| {});
+
+        let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        ) else {
+            panic!("None-to-Some target snapshot drift must fail");
+        };
+
+        assert!(err.contains("snapshot mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_some_to_none_target_snapshot_drift() {
+        let fixture = target_fixture_without_snapshot("some_to_none_snapshot");
+        let rewrite = rewrite_context(&fixture, Some(7), |_| {});
+
+        let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        ) else {
+            panic!("Some-to-None target snapshot drift must fail");
+        };
+
+        assert!(err.contains("snapshot mismatch"), "got: {err}");
+    }
+
+    #[test]
     fn rejects_contract_target_identity_drift() {
         let fixture = target_fixture("identity_drift");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |contract| {
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |contract| {
             contract.target.table_fqn = "other.db.mv".to_string()
         });
 
@@ -795,7 +861,7 @@ mod tests {
     #[test]
     fn rejects_contract_target_uuid_drift() {
         let fixture = target_fixture("contract_uuid_drift");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |contract| {
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |contract| {
             contract.target.table_uuid = "other-uuid".to_string()
         });
 
@@ -814,7 +880,7 @@ mod tests {
     fn rejects_apply_key_field_identity_drift() {
         let fixture = target_fixture("apply_key_field_drift");
         let v_id = field_id(&fixture.target_table, "v");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |contract| {
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |contract| {
             contract.target.hidden_apply_key.target_field_id = v_id
         });
 
@@ -830,11 +896,55 @@ mod tests {
     }
 
     #[test]
+    fn rejects_apply_key_field_name_drift() {
+        let fixture = target_fixture("apply_key_name_drift");
+        let mut rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
+        Arc::make_mut(&mut rewrite.schema_contract)
+            .target
+            .hidden_apply_key
+            .column_name = "wrong_apply_key".to_string();
+
+        let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        ) else {
+            panic!("apply-key field name drift must fail");
+        };
+
+        assert!(
+            err.contains("apply-key field identity mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_apply_key_field_id() {
+        let fixture = target_fixture("apply_key_missing_field");
+        let mut rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
+        Arc::make_mut(&mut rewrite.schema_contract)
+            .target
+            .hidden_apply_key
+            .target_field_id = i32::MAX;
+
+        let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        ) else {
+            panic!("missing apply-key field must fail");
+        };
+
+        assert!(err.contains("apply-key field id"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+    }
+
+    #[test]
     fn rejects_branch_field_identity_drift() {
         let fixture = target_fixture_with_branch("branch_field_drift", true);
         let v_id = field_id(&fixture.target_table, "v");
         let branch_id = field_id(&fixture.target_table, BRANCH_ID_COLUMN_NAME);
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |contract| {
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |contract| {
             contract.target.visible_columns[1].target_field_id = branch_id;
             contract
                 .branch
@@ -856,9 +966,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_branch_field_name_and_missing_id_drift() {
+        for (test_name, mutate, expected) in [
+            (
+                "branch_name_drift",
+                0_u8,
+                "branch-id field identity mismatch",
+            ),
+            ("branch_missing_field", 1_u8, "branch-id field id"),
+        ] {
+            let fixture = target_fixture_with_branch(test_name, true);
+            let mut rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
+            let branch = Arc::make_mut(&mut rewrite.schema_contract)
+                .branch
+                .as_mut()
+                .expect("branch contract");
+            if mutate == 0 {
+                branch.branch_id_column.column_name = "wrong_branch_id".to_string();
+            } else {
+                branch.branch_id_column.target_field_id = i32::MAX;
+            }
+
+            let Err(err) = IcebergMvTargetBindings::from_rewrite_context(
+                &rewrite,
+                fixture.target_entry,
+                fixture.target_table,
+            ) else {
+                panic!("{test_name} must fail");
+            };
+
+            assert!(err.contains(expected), "{test_name}: got {err}");
+        }
+    }
+
+    #[test]
     fn exact_bindings_share_one_runtime_identity() {
         let fixture = target_fixture("exact_bindings");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
 
         let bindings = IcebergMvTargetBindings::from_rewrite_context(
             &rewrite,
@@ -871,6 +1015,7 @@ mod tests {
             &bindings.runtime,
             &bindings.target_apply.runtime
         ));
+        assert!(bindings.target_apply.branch_id_column.is_none());
         let table_info = bindings.runtime().table_info().expect("table info");
         assert_eq!(table_info.catalog, "tgt");
         assert_eq!(table_info.namespace, "db");
@@ -885,11 +1030,21 @@ mod tests {
     }
 
     #[test]
+    fn physical_select_rejects_reserved_apply_key_alias() {
+        let err = iceberg_mv_physical_select_sql("SELECT k AS __nova_base_row_id, v FROM ice.db.b")
+            .expect_err("reserved apply-key alias must fail");
+        assert!(
+            err.contains("reserved for internal apply key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn rejects_locator_registration_without_row_position_metadata() {
         use arrow::datatypes::DataType;
 
         let fixture = target_fixture("missing_position_metadata");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
         let bindings = IcebergMvTargetBindings::from_rewrite_context(
             &rewrite,
             Arc::clone(&fixture.target_entry),
@@ -925,9 +1080,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_locator_registration_when_physical_apply_key_is_missing() {
+        use arrow::datatypes::DataType;
+
+        let fixture = target_fixture("missing_physical_apply_key");
+        let rewrite = rewrite_context(&fixture, Some(fixture.snapshot_id()), |_| {});
+        let bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            Arc::clone(&fixture.target_entry),
+            fixture.target_table.clone(),
+        )
+        .expect("target bindings");
+        let metadata_column = |name: &str, data_type| crate::catalog::schema::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        let table_def = crate::sql::planner::table::TableDef {
+            name: "mv".to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: vec![
+                metadata_column("_file", DataType::Utf8),
+                metadata_column("_pos", DataType::Int64),
+            ],
+            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+                table: bindings.runtime().table_info().expect("table info"),
+                files: Vec::new(),
+                cloud_properties: Default::default(),
+                binding:
+                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+            },
+        };
+
+        let err = expose_physical_apply_key_for_locator_registration(
+            table_def,
+            bindings.runtime().target_table(),
+            "missing_apply_key",
+        )
+        .expect_err("missing physical apply-key must fail");
+        assert!(err.contains("missing apply-key column"), "got: {err}");
+    }
+
+    #[test]
     fn resolves_exact_locator_scan_to_pinned_files() {
         let fixture = target_fixture("resolve_locator");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let snapshot_id = fixture.snapshot_id();
+        let rewrite = rewrite_context(&fixture, Some(snapshot_id), |_| {});
         let bindings = IcebergMvTargetBindings::from_rewrite_context(
             &rewrite,
             fixture.target_entry,
@@ -939,7 +1139,7 @@ mod tests {
             database: "db".to_string(),
             table: "mv".to_string(),
             target_table_uuid: rewrite.target_table_uuid.clone(),
-            target_snapshot_id: Some(fixture.target_snapshot_id),
+            target_snapshot_id: Some(snapshot_id),
             apply_key_column: "k".to_string(),
             branch_id_column: None,
         };
@@ -965,7 +1165,7 @@ mod tests {
         assert_eq!(table.catalog, "tgt");
         assert_eq!(table.namespace, "db");
         assert_eq!(table.table, "mv");
-        assert_eq!(table.current_snapshot_id, Some(fixture.target_snapshot_id));
+        assert_eq!(table.current_snapshot_id, Some(snapshot_id));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].row_count, Some(1));
         assert!(files[0].path.ends_with(".parquet"));
@@ -976,9 +1176,97 @@ mod tests {
     }
 
     #[test]
+    fn resolves_none_snapshot_to_empty_explicit_files_without_fallback() {
+        let fixture = target_fixture_without_snapshot("empty_snapshot_locator");
+        let rewrite = rewrite_context(&fixture, None, |_| {});
+        let bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        )
+        .expect("empty target bindings");
+        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: rewrite.target_table_uuid.clone(),
+            target_snapshot_id: None,
+            apply_key_column: "k".to_string(),
+            branch_id_column: None,
+        };
+
+        let source = bindings
+            .target_apply()
+            .resolve_locator_scan(&scan)
+            .expect("empty locator source");
+        let crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            binding,
+            ..
+        } = source
+        else {
+            panic!("expected explicit target files");
+        };
+        assert_eq!(
+            binding,
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
+        );
+        assert_eq!(table.current_snapshot_id, None);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn rejects_each_locator_identity_drift() {
+        let fixture = target_fixture_with_branch("locator_identity_drift", true);
+        let snapshot_id = fixture.snapshot_id();
+        let rewrite = rewrite_context(&fixture, Some(snapshot_id), |_| {});
+        let bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry,
+            fixture.target_table,
+        )
+        .expect("target bindings");
+        let exact = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+            catalog: "tgt".to_string(),
+            database: "db".to_string(),
+            table: "mv".to_string(),
+            target_table_uuid: rewrite.target_table_uuid.clone(),
+            target_snapshot_id: Some(snapshot_id),
+            apply_key_column: "k".to_string(),
+            branch_id_column: Some(BRANCH_ID_COLUMN_NAME.to_string()),
+        };
+        let mut cases = Vec::new();
+        let mut fqn = exact.clone();
+        fqn.catalog = "other".to_string();
+        cases.push(("FQN", fqn, "does not match MV refresh target"));
+        let mut uuid = exact.clone();
+        uuid.target_table_uuid = "other-uuid".to_string();
+        cases.push(("UUID", uuid, "target uuid mismatch"));
+        let mut snapshot = exact.clone();
+        snapshot.target_snapshot_id = Some(snapshot_id + 1);
+        cases.push(("snapshot", snapshot, "target snapshot mismatch"));
+        let mut missing_branch = exact.clone();
+        missing_branch.branch_id_column = None;
+        cases.push(("missing branch", missing_branch, "branch column mismatch"));
+        let mut wrong_branch = exact;
+        wrong_branch.branch_id_column = Some("wrong_branch".to_string());
+        cases.push(("branch", wrong_branch, "branch column mismatch"));
+
+        for (name, scan, expected) in cases {
+            let err = bindings
+                .target_apply()
+                .resolve_locator_scan(&scan)
+                .expect_err("locator drift must fail");
+            assert!(err.contains(expected), "{name}: got {err}");
+        }
+    }
+
+    #[test]
     fn rejects_locator_apply_key_drift() {
         let fixture = target_fixture("locator_apply_key_drift");
-        let rewrite = rewrite_context(&fixture, Some(fixture.target_snapshot_id), |_| {});
+        let snapshot_id = fixture.snapshot_id();
+        let rewrite = rewrite_context(&fixture, Some(snapshot_id), |_| {});
         let bindings = IcebergMvTargetBindings::from_rewrite_context(
             &rewrite,
             fixture.target_entry,
@@ -990,7 +1278,7 @@ mod tests {
             database: "db".to_string(),
             table: "mv".to_string(),
             target_table_uuid: rewrite.target_table_uuid.clone(),
-            target_snapshot_id: Some(fixture.target_snapshot_id),
+            target_snapshot_id: Some(snapshot_id),
             apply_key_column: "wrong_key".to_string(),
             branch_id_column: None,
         };
