@@ -277,6 +277,7 @@ impl IcebergMvTargetRuntimeBinding {
         &self.target_entry
     }
 
+    #[cfg(test)]
     pub(crate) fn target_table(&self) -> &iceberg::table::Table {
         &self.target_table
     }
