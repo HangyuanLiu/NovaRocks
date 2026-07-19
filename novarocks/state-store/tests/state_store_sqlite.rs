@@ -42,6 +42,21 @@ use common::state_store_conformance::{
     PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_suite() {
+    let factory = coordination_factory();
+    common::state_store_coordination_conformance::run_coordination_conformance(factory).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_candidate_limit_uses_provider_limit() {
+    let factory = state_store_factory(16 * 1_024, 1_899);
+    common::state_store_coordination_conformance::basic_acquire_contention_and_high_watermark(
+        &factory,
+    )
+    .await;
+}
+
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
 }
@@ -120,10 +135,25 @@ async fn read_state_record(
 }
 
 fn conformance_factory() -> StateStoreFactory {
-    let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
+    state_store_factory(1_024, 128)
+}
+
+fn coordination_factory() -> StateStoreFactory {
+    // The current control read+put upper bound is 1,039 bytes. Keep the ordinary
+    // provider conformance limit at 1 KiB and widen only this coordination fixture.
+    state_store_factory(2 * 1_024, 128)
+}
+
+fn state_store_factory(max_transaction_bytes: usize, max_value_bytes: usize) -> StateStoreFactory {
+    let keepalive = Arc::new(Mutex::new(Vec::<Arc<TempDir>>::new()));
     std::rc::Rc::new(move || {
-        let temp = Arc::clone(&temp);
+        let keepalive = Arc::clone(&keepalive);
         Box::pin(async move {
+            let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
+            keepalive
+                .lock()
+                .expect("conformance temp keepalive")
+                .push(Arc::clone(&temp));
             let path = temp.path().join("state-store.sqlite");
             let runtime = StateStoreRuntime::local()?;
             let store = open_state_store(
@@ -132,10 +162,10 @@ fn conformance_factory() -> StateStoreFactory {
                     cluster_id: "conformance-cluster".to_owned(),
                     limits: StateStoreLimitOverrides {
                         max_key_bytes: Some(64),
-                        max_value_bytes: Some(128),
+                        max_value_bytes: Some(max_value_bytes),
                         max_page_size: Some(10),
                         max_transaction_operations: Some(8),
-                        max_transaction_bytes: Some(1_024),
+                        max_transaction_bytes: Some(max_transaction_bytes),
                         transaction_deadline_ms: Some(250),
                         runner_max_attempts: Some(3),
                     },
@@ -155,6 +185,7 @@ fn conformance_factory() -> StateStoreFactory {
                 Arc::new(SqlitePostDispatchController {
                     fault: Arc::clone(&fault),
                     path,
+                    _temp: temp,
                 });
             let store: Arc<dyn StateStore> = fault;
             Ok(StateStoreConformanceFixture::new(store, controller))
@@ -165,6 +196,7 @@ fn conformance_factory() -> StateStoreFactory {
 struct SqlitePostDispatchController {
     fault: Arc<FaultInjectingStateStore>,
     path: PathBuf,
+    _temp: Arc<TempDir>,
 }
 
 #[async_trait]

@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 pub mod config;
 pub mod contract;
+pub mod coordination;
 pub mod error;
 pub mod limits;
 pub mod metrics;

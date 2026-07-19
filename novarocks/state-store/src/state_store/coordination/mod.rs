@@ -15,22 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(dead_code)]
+mod clock;
+#[allow(dead_code)]
+mod codec;
+#[allow(dead_code)]
+mod error;
+mod gate;
+mod lease;
+mod metrics;
+#[allow(dead_code)]
+mod model;
+mod operation;
 
-use std::path::{Path, PathBuf};
-
-pub mod state_store_conformance;
-pub mod state_store_coordination_conformance;
-
-pub fn repo_root() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("state-store manifest must be nested under the repository novarocks directory")
-        .to_path_buf();
-    assert!(
-        root.join("docker/mysql-state-store").is_dir(),
-        "state-store tests must resolve the repository Docker fixtures"
-    );
-    root
-}
+pub use clock::{ClockHealth, LeaseClock, LeaseSettings};
+pub use error::{CoordinationError, CoordinationErrorKind};
+pub use gate::{IncarnationGate, WriteAdmission};
+pub use lease::{AcquireOutcome, LeaseGuard, LeaseManager};
+pub use metrics::{
+    COORDINATION_OPERATION_COUNT, COORDINATION_OUTCOME_COUNT, CoordinationMetrics,
+    CoordinationMetricsSnapshot, CoordinationOperation, CoordinationOutcome,
+};
+pub use model::{
+    AttemptId, ControlPlaneIncarnation, ControlPlaneMode, ControlPlaneSnapshot, FencingToken,
+    HolderId, LeaseCancellationReason, LeaseFence, LeaseObservation, ResourceEpoch, ResourceKey,
+};
