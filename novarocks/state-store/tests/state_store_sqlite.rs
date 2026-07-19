@@ -109,6 +109,12 @@ async fn coordination_lease_lifecycle_suite() {
     common::state_store_coordination_conformance::lease_lifecycle_and_cancellation(&factory).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_fault_suite() {
+    let factory = coordination_factory();
+    common::state_store_coordination_conformance::run_coordination_conformance(factory).await;
+}
+
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
 }
@@ -197,10 +203,15 @@ fn coordination_factory() -> StateStoreFactory {
 }
 
 fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
-    let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
+    let keepalive = Arc::new(Mutex::new(Vec::<Arc<TempDir>>::new()));
     std::rc::Rc::new(move || {
-        let temp = Arc::clone(&temp);
+        let keepalive = Arc::clone(&keepalive);
         Box::pin(async move {
+            let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
+            keepalive
+                .lock()
+                .expect("conformance temp keepalive")
+                .push(Arc::clone(&temp));
             let path = temp.path().join("state-store.sqlite");
             let runtime = StateStoreRuntime::local()?;
             let store = open_state_store(
@@ -232,6 +243,7 @@ fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
                 Arc::new(SqlitePostDispatchController {
                     fault: Arc::clone(&fault),
                     path,
+                    _temp: temp,
                 });
             let store: Arc<dyn StateStore> = fault;
             Ok(StateStoreConformanceFixture::new(store, controller))
@@ -242,6 +254,7 @@ fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
 struct SqlitePostDispatchController {
     fault: Arc<FaultInjectingStateStore>,
     path: PathBuf,
+    _temp: Arc<TempDir>,
 }
 
 #[async_trait]

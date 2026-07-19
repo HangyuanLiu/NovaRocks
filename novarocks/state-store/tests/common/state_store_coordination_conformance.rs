@@ -411,6 +411,55 @@ impl StateStore for LeaseMutationRaceStore {
     }
 }
 
+struct OpaqueProviderStore {
+    inner: Arc<dyn StateStore>,
+}
+
+#[async_trait]
+impl StateStore for OpaqueProviderStore {
+    fn provider_name(&self) -> &'static str {
+        "opaque-test-provider"
+    }
+
+    fn limits(&self) -> &StateStoreLimits {
+        self.inner.limits()
+    }
+
+    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        self.inner.metrics_snapshot()
+    }
+
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        self.inner.begin_read().await
+    }
+
+    async fn begin_write(
+        &self,
+        transaction_id: TransactionId,
+        purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        self.inner.begin_write(transaction_id, purpose).await
+    }
+
+    async fn poll_changes(
+        &self,
+        request: &ChangePollRequest,
+    ) -> Result<ChangePage, StateStoreError> {
+        self.inner.poll_changes(request).await
+    }
+
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+        self.inner.identity().await
+    }
+
+    async fn resolve_commit(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<CommitResolution, StateStoreError> {
+        self.inner.resolve_commit(transaction_id).await
+    }
+}
+
 async fn open_fixture(factory: &StateStoreFactory) -> StateStoreConformanceFixture {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -814,6 +863,14 @@ pub async fn commit_unknown_uses_authoritative_read_back(factory: &StateStoreFac
     control.wait_inner_dropped().await;
     assert_eq!(snapshot.incarnation().get(), 1);
     assert_eq!(snapshot.mode(), ControlPlaneMode::WriteOpen);
+    let recovery_gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    assert_eq!(
+        recovery_gate
+            .recover_bootstrap(operation_id)
+            .await
+            .expect("recover exact response-loss bootstrap"),
+        snapshot
+    );
 }
 
 pub async fn cancelled_mutation_recovers_with_same_operation(factory: &StateStoreFactory) {
@@ -1632,6 +1689,10 @@ async fn clock_failures_cancel_renewal(factory: &StateStoreFactory) {
     assert_cancelled_as(&unsafe_guard, LeaseCancellationReason::ClockUnsafe);
 
     clock.set_health(ClockHealth::Healthy);
+    unsafe_guard
+        .renew(OperationId::new_v7())
+        .await
+        .expect("clock-unsafe result must not make the guard inactive");
     let mut unknown_guard = acquired(
         manager
             .acquire(resource(b"unknown-renew"), attempt(), OperationId::new_v7())
@@ -1973,4 +2034,928 @@ async fn release_acquire_race_has_one_mutation_winner(factory: &StateStoreFactor
         }
         (release, acquire) => panic!("unexpected release/acquire race: {release:?}, {acquire:?}"),
     }
+}
+
+async fn force_takeover(
+    manager: &LeaseManager,
+    resource: ResourceKey,
+    attempt: AttemptId,
+    clock: &ManualLeaseClock,
+) -> LeaseGuard {
+    clock.advance_wall(11_001);
+    assert!(matches!(
+        manager
+            .acquire(resource.clone(), attempt, OperationId::new_v7())
+            .await
+            .expect("start complete takeover observation"),
+        AcquireOutcome::AwaitingTakeover(_)
+    ));
+    clock.advance_monotonic(500);
+    acquired(
+        manager
+            .acquire(resource, attempt, OperationId::new_v7())
+            .await
+            .expect("take over after complete monotonic observation window"),
+    )
+}
+
+pub async fn stale_fence_finalize(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap stale-fence fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_100_000, 20_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fence-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fence-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+
+    let first_resource = resource(b"fence-before-validation");
+    let first = acquired(
+        manager_a
+            .acquire(first_resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("acquire old fence"),
+    );
+    let old_fence = first.fence();
+    let current = force_takeover(&manager_b, first_resource, attempt(), &clock).await;
+    let mut stale_transaction = fixture
+        .store
+        .begin_write(transaction_id(), "validate stale lease fence")
+        .await
+        .expect("begin stale fence validation");
+    assert_eq!(
+        old_fence
+            .validate_in(stale_transaction.as_mut())
+            .await
+            .expect_err("taken-over fence must be stale")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+    stale_transaction
+        .abort()
+        .await
+        .expect("abort stale validation");
+    let mut current_transaction = fixture
+        .store
+        .begin_write(transaction_id(), "validate current lease fence")
+        .await
+        .expect("begin current fence validation");
+    current
+        .fence()
+        .validate_in(current_transaction.as_mut())
+        .await
+        .expect("current fence validates");
+    current_transaction
+        .abort()
+        .await
+        .expect("abort current validation");
+
+    let deadline_resource = resource(b"deadline-is-not-fence");
+    let deadline_guard = acquired(
+        manager_a
+            .acquire(deadline_resource, attempt(), OperationId::new_v7())
+            .await
+            .expect("acquire deadline-only fence"),
+    );
+    clock.advance_wall(11_001);
+    let mut deadline_transaction = fixture
+        .store
+        .begin_write(transaction_id(), "validate deadline-only fence")
+        .await
+        .expect("begin deadline validation");
+    deadline_guard
+        .fence()
+        .validate_in(deadline_transaction.as_mut())
+        .await
+        .expect("deadline passage alone does not stale a fence");
+    deadline_transaction
+        .abort()
+        .await
+        .expect("abort deadline validation");
+    assert_eq!(
+        manager_a.metrics_snapshot().operation_outcome_count(
+            CoordinationOperation::ValidateFence,
+            CoordinationOutcome::FenceLost,
+        ),
+        1
+    );
+    assert_eq!(
+        manager_a.metrics_snapshot().operation_outcome_count(
+            CoordinationOperation::ValidateFence,
+            CoordinationOutcome::Success,
+        ),
+        1
+    );
+}
+
+pub async fn early_takeover_is_fenced(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap early-takeover fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_200_000, 21_000));
+    let manager_a = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"early-holder-a"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager A");
+    let manager_b = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"early-holder-b"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("manager B");
+    let resource = resource(b"early-takeover-finalize");
+    let guard = acquired(
+        manager_a
+            .acquire(resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("acquire fence before early wall jump"),
+    );
+    let mut domain = fixture
+        .store
+        .begin_write(transaction_id(), "fenced domain finalize")
+        .await
+        .expect("begin fenced domain finalize");
+    guard
+        .fence()
+        .validate_in(domain.as_mut())
+        .await
+        .expect("validate fence before takeover");
+    domain
+        .put(
+            key(b"domain/fenced-finalize"),
+            value(b"value".to_vec()),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage fenced domain write");
+
+    let current = force_takeover(&manager_b, resource, attempt(), &clock).await;
+    assert_eq!(current.token().resource_epoch().get(), 2);
+    assert!(matches!(domain.commit().await, CommitOutcome::Conflict(_)));
+}
+
+pub async fn restore_invalidates_old_tokens(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    let gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    let open = gate
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap restore-permanence fixture");
+    let admission = gate.admit_writes().await.expect("old admission");
+    let clock = Arc::new(ManualLeaseClock::new(1_300_000, 22_000));
+    let manager_old = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"restore-holder-old"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("old manager");
+    let manager_new = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"restore-holder-new"),
+        clock,
+        lease_settings(),
+    )
+    .expect("new manager");
+    let resource = resource(b"restore-permanent-fence");
+    let old_attempt = attempt();
+    let mut old_renew = acquired(
+        manager_old
+            .acquire(resource.clone(), old_attempt, OperationId::new_v7())
+            .await
+            .expect("old incarnation acquisition"),
+    );
+    let mut old_release = acquired(
+        manager_old
+            .acquire(resource.clone(), old_attempt, OperationId::new_v7())
+            .await
+            .expect("old release guard"),
+    );
+    let old_fence = old_renew.fence();
+    let restoring = gate
+        .begin_restore(&open, OperationId::new_v7())
+        .await
+        .expect("begin restore");
+    assert_eq!(restoring.incarnation().get(), 2);
+    assert_eq!(restoring.mode(), ControlPlaneMode::Reconciling);
+    assert_eq!(
+        old_renew
+            .renew(OperationId::new_v7())
+            .await
+            .expect_err("old lease cannot renew")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    assert_eq!(
+        old_release
+            .release(OperationId::new_v7())
+            .await
+            .expect_err("old lease cannot release")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    let mut old_transaction = fixture
+        .store
+        .begin_write(transaction_id(), "validate old restore tokens")
+        .await
+        .expect("begin old token validation");
+    assert_eq!(
+        admission
+            .validate_in(old_transaction.as_mut())
+            .await
+            .expect_err("old admission fails after restore")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    assert_eq!(
+        old_fence
+            .validate_in(old_transaction.as_mut())
+            .await
+            .expect_err("old fence fails after restore")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    old_transaction.abort().await.expect("abort old validation");
+    assert_eq!(
+        gate.admit_writes()
+            .await
+            .expect_err("user admission is closed during restore")
+            .kind(),
+        CoordinationErrorKind::WriteClosed
+    );
+
+    let current = acquired(
+        manager_new
+            .acquire(resource, attempt(), OperationId::new_v7())
+            .await
+            .expect("new incarnation immediately supersedes old lease"),
+    );
+    assert_eq!(current.token().control_plane_incarnation().get(), 2);
+    assert_eq!(current.token().resource_epoch().get(), 2);
+    let reopened = gate
+        .open_writes(&restoring, OperationId::new_v7())
+        .await
+        .expect("reopen exact restoring incarnation");
+    assert_eq!(reopened.mode(), ControlPlaneMode::WriteOpen);
+    let new_admission = gate.admit_writes().await.expect("new admission");
+    let mut reopened_transaction = fixture
+        .store
+        .begin_write(transaction_id(), "validate reopened tokens")
+        .await
+        .expect("begin reopened validation");
+    new_admission
+        .validate_in(reopened_transaction.as_mut())
+        .await
+        .expect("new admission validates");
+    current
+        .fence()
+        .validate_in(reopened_transaction.as_mut())
+        .await
+        .expect("new fence validates after reopen");
+    assert_eq!(
+        admission
+            .validate_in(reopened_transaction.as_mut())
+            .await
+            .expect_err("incarnation-1 admission stays permanently stale")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    assert_eq!(
+        old_fence
+            .validate_in(reopened_transaction.as_mut())
+            .await
+            .expect_err("incarnation-1 fence stays permanently stale")
+            .kind(),
+        CoordinationErrorKind::IncarnationChanged
+    );
+    reopened_transaction
+        .abort()
+        .await
+        .expect("abort reopened validation");
+}
+
+async fn await_coordination_terminal(
+    store: &Arc<dyn StateStore>,
+    transaction_id: TransactionId,
+) -> CommitResolution {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let resolution = store
+                .resolve_commit(&transaction_id)
+                .await
+                .expect("resolve coordination mutation");
+            if resolution != CommitResolution::Unresolved {
+                return resolution;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coordination mutation reaches a terminal resolution")
+}
+
+async fn acquire_fault_semantics(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap acquire response-loss fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_400_000, 23_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fault-acquire-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("acquire manager");
+    let contender = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fault-acquire-contender"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("acquire contender");
+    let response_resource = resource(b"fault-acquire-response-loss");
+    let response_attempt = attempt();
+    let operation_id = OperationId::new_v7();
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::LoseCommittedResponse)
+        .await;
+    let mut acquisition =
+        Box::pin(manager.acquire(response_resource.clone(), response_attempt, operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut acquisition => panic!("acquisition returned before response loss: {result:?}"),
+    }
+    control.allow_provider_progress().await;
+    control.release_response().await;
+    let acquired_guard = acquired(
+        acquisition
+            .await
+            .expect("response-loss acquisition resolves committed candidate"),
+    );
+    control.wait_inner_dropped().await;
+    let recovered = acquired(
+        manager
+            .recover_acquire(response_resource.clone(), response_attempt, operation_id)
+            .await
+            .expect("recover exact response-loss acquisition"),
+    );
+    assert_eq!(recovered.fence(), acquired_guard.fence());
+    let current = force_takeover(&contender, response_resource.clone(), attempt(), &clock).await;
+    assert_eq!(current.token().resource_epoch().get(), 2);
+    assert_eq!(
+        manager
+            .recover_acquire(response_resource, response_attempt, operation_id)
+            .await
+            .expect_err("committed acquisition superseded by takeover")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap cancelled acquire fixture");
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"cancel-acquire-holder"),
+        Arc::new(ManualLeaseClock::new(1_500_000, 24_000)),
+        lease_settings(),
+    )
+    .expect("cancel acquire manager");
+    let resource = resource(b"fault-acquire-cancel");
+    let attempt = attempt();
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    let mut acquisition = Box::pin(manager.acquire(resource.clone(), attempt, operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut acquisition => panic!("acquisition returned before cancellation: {result:?}"),
+    }
+    let unresolved = manager
+        .recover_acquire(resource.clone(), attempt, operation_id)
+        .await
+        .expect_err("unresolved absent acquisition is uncertain");
+    assert_eq!(unresolved.kind(), CoordinationErrorKind::CommitUncertain);
+    assert_eq!(unresolved.transaction_id(), Some(transaction_id));
+    drop(acquisition);
+    control.wait_waiter_cancelled().await;
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+    let terminal = await_coordination_terminal(&fixture.store, transaction_id).await;
+    match terminal {
+        CommitResolution::Committed(_) => {
+            let recovered = acquired(
+                manager
+                    .recover_acquire(resource, attempt, operation_id)
+                    .await
+                    .expect("recover committed cancelled acquisition"),
+            );
+            assert_eq!(recovered.token().resource_epoch().get(), 1);
+        }
+        CommitResolution::NotCommitted => {
+            let error = manager
+                .recover_acquire(resource, attempt, operation_id)
+                .await
+                .expect_err("recover noncommitted cancelled acquisition");
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+        }
+        CommitResolution::Unresolved => unreachable!("terminal helper excludes unresolved"),
+    }
+}
+
+async fn renew_fault_semantics(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap renew response-loss fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_600_000, 25_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fault-renew-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("renew manager");
+    let response_resource = resource(b"fault-renew-response-loss");
+    let response_attempt = attempt();
+    let mut guard = acquired(
+        manager
+            .acquire(
+                response_resource.clone(),
+                response_attempt,
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire renew response-loss lease"),
+    );
+    let operation_id = OperationId::new_v7();
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::LoseCommittedResponse)
+        .await;
+    clock.advance_wall(100);
+    let mut renewal = Box::pin(guard.renew(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut renewal => panic!("renewal returned before response loss: {result:?}"),
+    }
+    control.allow_provider_progress().await;
+    control.release_response().await;
+    renewal
+        .await
+        .expect("response-loss renewal resolves committed candidate");
+    control.wait_inner_dropped().await;
+    guard
+        .recover_renew(operation_id)
+        .await
+        .expect("recover exact response-loss renewal");
+    let mut superseding = acquired(
+        manager
+            .acquire(response_resource, response_attempt, OperationId::new_v7())
+            .await
+            .expect("load exact renewed guard"),
+    );
+    clock.advance_wall(100);
+    superseding
+        .renew(OperationId::new_v7())
+        .await
+        .expect("supersede committed renewal");
+    assert_eq!(
+        guard
+            .recover_renew(operation_id)
+            .await
+            .expect_err("committed renewal was subsequently superseded")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap unresolved renew fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_700_000, 26_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"unresolved-renew-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("unresolved renew manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"fault-renew-unresolved"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire unresolved-renew lease"),
+    );
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    clock.advance_wall(100);
+    let mut renewal = Box::pin(guard.renew(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut renewal => panic!("renewal returned before unresolved probe: {result:?}"),
+    }
+    drop(renewal);
+    control.wait_waiter_cancelled().await;
+    let unresolved = guard
+        .recover_renew(operation_id)
+        .await
+        .expect_err("unresolved mismatching renewal is uncertain");
+    assert_eq!(unresolved.kind(), CoordinationErrorKind::CommitUncertain);
+    assert_eq!(unresolved.transaction_id(), Some(transaction_id));
+    assert_ne!(
+        *guard.cancellation().borrow(),
+        Some(LeaseCancellationReason::Released)
+    );
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+    let terminal = await_coordination_terminal(&fixture.store, transaction_id).await;
+    match terminal {
+        CommitResolution::Committed(_) => guard
+            .recover_renew(operation_id)
+            .await
+            .expect("recover committed unresolved renewal"),
+        CommitResolution::NotCommitted => {
+            let error = guard
+                .recover_renew(operation_id)
+                .await
+                .expect_err("recover noncommitted unresolved renewal");
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+            clock.advance_wall(100);
+            guard
+                .renew(OperationId::new_v7())
+                .await
+                .expect("definite noncommit leaves renewal guard active");
+        }
+        CommitResolution::Unresolved => unreachable!("terminal helper excludes unresolved"),
+    }
+}
+
+async fn release_fault_semantics(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap release response-loss fixture");
+    let clock = Arc::new(ManualLeaseClock::new(1_800_000, 27_000));
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fault-release-holder"),
+        clock.clone(),
+        lease_settings(),
+    )
+    .expect("release manager");
+    let contender = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"fault-release-contender"),
+        clock,
+        lease_settings(),
+    )
+    .expect("release contender");
+    let response_resource = resource(b"fault-release-response-loss");
+    let mut guard = acquired(
+        manager
+            .acquire(response_resource.clone(), attempt(), OperationId::new_v7())
+            .await
+            .expect("acquire release response-loss lease"),
+    );
+    let operation_id = OperationId::new_v7();
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::LoseCommittedResponse)
+        .await;
+    let mut release = Box::pin(guard.release(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut release => panic!("release returned before response loss: {result:?}"),
+    }
+    control.allow_provider_progress().await;
+    control.release_response().await;
+    release
+        .await
+        .expect("response-loss release resolves committed candidate");
+    control.wait_inner_dropped().await;
+    guard
+        .recover_release(operation_id)
+        .await
+        .expect("recover exact response-loss release");
+    let next = acquired(
+        contender
+            .acquire(response_resource, attempt(), OperationId::new_v7())
+            .await
+            .expect("supersede committed release"),
+    );
+    assert_eq!(next.token().resource_epoch().get(), 2);
+    assert_eq!(
+        guard
+            .recover_release(operation_id)
+            .await
+            .expect_err("committed release was subsequently superseded")
+            .kind(),
+        CoordinationErrorKind::FenceLost
+    );
+
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap cancelled release fixture");
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"cancel-release-holder"),
+        Arc::new(ManualLeaseClock::new(1_900_000, 28_000)),
+        lease_settings(),
+    )
+    .expect("cancel release manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"fault-release-cancel"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire cancelled-release lease"),
+    );
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    let mut release = Box::pin(guard.release(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut release => panic!("release returned before cancellation: {result:?}"),
+    }
+    drop(release);
+    control.wait_waiter_cancelled().await;
+    let unresolved = guard
+        .recover_release(operation_id)
+        .await
+        .expect_err("unresolved mismatching release is uncertain");
+    assert_eq!(unresolved.kind(), CoordinationErrorKind::CommitUncertain);
+    assert_eq!(unresolved.transaction_id(), Some(transaction_id));
+    assert_ne!(
+        *guard.cancellation().borrow(),
+        Some(LeaseCancellationReason::Released)
+    );
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+    let terminal = await_coordination_terminal(&fixture.store, transaction_id).await;
+    match terminal {
+        CommitResolution::Committed(_) => guard
+            .recover_release(operation_id)
+            .await
+            .expect("recover committed cancelled release"),
+        CommitResolution::NotCommitted => {
+            let error = guard
+                .recover_release(operation_id)
+                .await
+                .expect_err("recover noncommitted cancelled release");
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+            guard
+                .release(OperationId::new_v7())
+                .await
+                .expect("definite noncommit leaves release guard active");
+        }
+        CommitResolution::Unresolved => unreachable!("terminal helper excludes unresolved"),
+    }
+
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap exact cancelled release fixture");
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"exact-cancel-release-holder"),
+        Arc::new(ManualLeaseClock::new(1_950_000, 28_500)),
+        lease_settings(),
+    )
+    .expect("exact cancel release manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"fault-release-exact-cancel"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire exact cancelled-release lease"),
+    );
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    let mut release = Box::pin(guard.release(operation_id));
+    tokio::select! {
+        () = control.wait_dispatched() => {}
+        result = &mut release => panic!("release returned before exact cancellation: {result:?}"),
+    }
+    drop(release);
+    control.wait_waiter_cancelled().await;
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+    let terminal = await_coordination_terminal(&fixture.store, transaction_id).await;
+    match terminal {
+        CommitResolution::Committed(_) => guard
+            .recover_release(operation_id)
+            .await
+            .expect("recover committed exact cancelled release"),
+        CommitResolution::NotCommitted => {
+            let error = guard
+                .recover_release(operation_id)
+                .await
+                .expect_err("recover noncommitted exact cancelled release");
+            assert_eq!(error.kind(), CoordinationErrorKind::OperationNotCommitted);
+            assert_eq!(error.transaction_id(), Some(transaction_id));
+        }
+        CommitResolution::Unresolved => unreachable!("terminal helper excludes unresolved"),
+    }
+}
+
+pub async fn stable_operation_fault_matrix(factory: &StateStoreFactory) {
+    commit_unknown_uses_authoritative_read_back(factory).await;
+    cancelled_mutation_recovers_with_same_operation(factory).await;
+    unresolved_bootstrap_without_visible_record_is_uncertain(factory).await;
+    recovery_is_operation_scoped(factory).await;
+    acquire_fault_semantics(factory).await;
+    cancelled_renew_recovers_with_exact_pending_candidate(factory).await;
+    renew_fault_semantics(factory).await;
+    release_fault_semantics(factory).await;
+}
+
+async fn contention_round(
+    store: Arc<dyn StateStore>,
+    clock: Arc<ManualLeaseClock>,
+    resource: ResourceKey,
+    round: usize,
+) -> LeaseGuard {
+    let mut contenders = tokio::task::JoinSet::new();
+    for contender in 0..8 {
+        let manager = LeaseManager::new(
+            Arc::clone(&store),
+            HolderId::try_from(Bytes::from(format!(
+                "contention-{round}-holder-{contender}"
+            )))
+            .expect("dynamic contention holder"),
+            clock.clone(),
+            lease_settings(),
+        )
+        .expect("contention manager");
+        let resource = resource.clone();
+        contenders.spawn(async move {
+            manager
+                .acquire(resource, attempt(), OperationId::new_v7())
+                .await
+        });
+    }
+    let mut winner = None;
+    let mut contended = 0;
+    while let Some(result) = contenders.join_next().await {
+        match result
+            .expect("join contention contender")
+            .expect("contention contender reaches a typed outcome")
+        {
+            AcquireOutcome::Acquired(guard) => {
+                assert!(winner.replace(guard).is_none(), "only one lease winner");
+            }
+            AcquireOutcome::Contended(_) => contended += 1,
+            AcquireOutcome::AwaitingTakeover(_) => {
+                panic!("fresh/released resource must not require takeover observation")
+            }
+        }
+    }
+    assert_eq!(contended, 7);
+    winner.expect("one high-contention winner")
+}
+
+pub async fn high_contention_is_monotonic(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap high-contention fixture");
+    let clock = Arc::new(ManualLeaseClock::new(2_000_000, 29_000));
+    let resource = resource(b"high-contention-monotonic");
+    let mut first = contention_round(
+        Arc::clone(&fixture.store),
+        clock.clone(),
+        resource.clone(),
+        1,
+    )
+    .await;
+    assert_eq!(first.token().resource_epoch().get(), 1);
+    first
+        .release(OperationId::new_v7())
+        .await
+        .expect("release first contention winner");
+    let second = contention_round(Arc::clone(&fixture.store), clock, resource, 2).await;
+    assert_eq!(second.token().resource_epoch().get(), 2);
+}
+
+pub async fn opaque_provider_name_has_no_branch(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    let store: Arc<dyn StateStore> = Arc::new(OpaqueProviderStore {
+        inner: Arc::clone(&fixture.store),
+    });
+    assert_eq!(store.provider_name(), "opaque-test-provider");
+    IncarnationGate::new(Arc::clone(&store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap through opaque provider name");
+    let manager = LeaseManager::new(
+        store,
+        holder(b"opaque-provider-holder"),
+        Arc::new(ManualLeaseClock::new(2_100_000, 30_000)),
+        lease_settings(),
+    )
+    .expect("opaque provider manager");
+    let mut guard = acquired(
+        manager
+            .acquire(
+                resource(b"opaque-provider-resource"),
+                attempt(),
+                OperationId::new_v7(),
+            )
+            .await
+            .expect("acquire through opaque provider name"),
+    );
+    guard
+        .renew(OperationId::new_v7())
+        .await
+        .expect("renew through opaque provider name");
+    guard
+        .release(OperationId::new_v7())
+        .await
+        .expect("release through opaque provider name");
+}
+
+pub async fn overflow_and_corruption_fail_closed(factory: &StateStoreFactory) {
+    incarnation_overflow_fails_closed(factory).await;
+    identity_mismatch_is_corruption(factory).await;
+}
+
+pub async fn run_coordination_conformance(factory: StateStoreFactory) {
+    incarnation_gate_lifecycle(&factory).await;
+    concurrent_bootstrap_converges(&factory).await;
+    basic_acquire_contention_and_high_watermark(&factory).await;
+    concurrent_acquire_exactly_one_winner(&factory).await;
+    lease_expiry_observation(&factory).await;
+    renew_resets_observation(&factory).await;
+    lease_lifecycle_and_cancellation(&factory).await;
+    stale_fence_finalize(&factory).await;
+    early_takeover_is_fenced(&factory).await;
+    stable_operation_fault_matrix(&factory).await;
+    external_lease_clock_error_is_clock_unsafe(&factory).await;
+    restore_invalidates_old_tokens(&factory).await;
+    overflow_and_corruption_fail_closed(&factory).await;
+    high_contention_is_monotonic(&factory).await;
+    opaque_provider_name_has_no_branch(&factory).await;
 }

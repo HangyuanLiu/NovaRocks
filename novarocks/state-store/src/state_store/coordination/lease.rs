@@ -41,7 +41,7 @@ use super::operation::{
     ReadBackCertainty, candidate_mismatch, classify_commit, recover_commit, transaction_id,
 };
 use super::{
-    AttemptId, ControlPlaneMode, CoordinationError, CoordinationErrorKind, FencingToken, HolderId,
+    AttemptId, CoordinationError, CoordinationErrorKind, FencingToken, HolderId,
     LeaseCancellationReason, LeaseFence, LeaseObservation, ResourceEpoch, ResourceKey,
 };
 
@@ -66,12 +66,12 @@ struct LeaseManagerInner {
     holder: HolderId,
     clock: Arc<dyn LeaseClock>,
     settings: LeaseSettings,
-    metrics: CoordinationMetrics,
+    metrics: Arc<CoordinationMetrics>,
     expiry_observations: Mutex<HashMap<[u8; 32], ExpiryObservation>>,
 }
 
 pub struct LeaseGuard {
-    fence: LeaseFence,
+    fence: Box<LeaseFence>,
     manager: LeaseManager,
     deadline_ms: u64,
     renewed_ms: u64,
@@ -119,7 +119,7 @@ impl LeaseGuard {
     }
 
     pub fn fence(&self) -> LeaseFence {
-        self.fence.clone()
+        self.fence.as_ref().clone()
     }
 
     pub fn renew_after(&self) -> Duration {
@@ -324,6 +324,50 @@ impl LeaseGuard {
     }
 }
 
+impl LeaseFence {
+    pub async fn validate_in(
+        &self,
+        transaction: &mut dyn crate::WriteTransaction,
+    ) -> Result<(), CoordinationError> {
+        let result = async {
+            let control_key = control_storage_key()?;
+            let lease_key = lease_storage_key(&self.resource)?;
+            let control_state = transaction
+                .get(&control_key)
+                .await
+                .map_err(CoordinationError::from_state_store)?
+                .ok_or_else(CoordinationError::not_bootstrapped)?;
+            let control = decode_control(&control_state.value)?;
+            if control.store_id != self.store_id || control.cluster_id != self.token.cluster_id() {
+                return Err(CoordinationError::corruption());
+            }
+            if control.incarnation != self.token.control_plane_incarnation() {
+                return Err(CoordinationError::incarnation_changed());
+            }
+            let lease_state = transaction
+                .get(&lease_key)
+                .await
+                .map_err(CoordinationError::from_state_store)?
+                .ok_or_else(CoordinationError::fence_lost)?;
+            let lease = decode_lease(&lease_key, &lease_state.value)?;
+            if !held_lease_matches_fence(&lease, &lease_state.version, self) {
+                return Err(CoordinationError::fence_lost());
+            }
+            Ok(())
+        }
+        .await;
+        let outcome = match &result {
+            Ok(()) => Some(CoordinationOutcome::Success),
+            Err(error) => error_outcome(error),
+        };
+        if let Some(outcome) = outcome {
+            self.metrics
+                .record(CoordinationOperation::ValidateFence, outcome);
+        }
+        result
+    }
+}
+
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         if !self.active
@@ -378,7 +422,7 @@ impl LeaseManager {
                 holder,
                 clock,
                 settings,
-                metrics: CoordinationMetrics::new(),
+                metrics: Arc::new(CoordinationMetrics::new()),
                 expiry_observations: Mutex::new(HashMap::new()),
             }),
         })
@@ -433,14 +477,6 @@ impl LeaseManager {
                         lease.record.incarnation,
                     ));
                 }
-                if current.control.record.mode != ControlPlaneMode::WriteOpen {
-                    return Err(read_back_mismatch(
-                        certainty,
-                        transaction_id,
-                        current.control.record.incarnation,
-                        lease.record.incarnation,
-                    ));
-                }
                 return Ok(AcquireOutcome::Acquired(self.guard(
                     &current.control.record,
                     &lease.record,
@@ -467,7 +503,6 @@ impl LeaseManager {
     ) -> Result<AcquireOutcome, CoordinationError> {
         let wall_now = self.healthy_wall_time()?;
         let loaded = self.read_coordination(&resource).await?;
-        require_write_open(&loaded.control.record)?;
         match self.decision(&loaded, &resource, attempt, operation_id, wall_now)? {
             AcquireDecision::Immediate(outcome) => Ok(outcome),
             AcquireDecision::Write(candidate) => {
@@ -1117,13 +1152,15 @@ impl LeaseManager {
     ) -> Result<LeaseGuard, CoordinationError> {
         let (cancellation_tx, _) = watch::channel(None);
         Ok(LeaseGuard {
-            fence: LeaseFence {
+            fence: Box::new(LeaseFence {
+                store_id: control.store_id,
                 resource: record.resource.clone(),
                 holder: record.holder.clone(),
                 attempt: record.attempt,
                 token: token(control, record.epoch)?,
                 record_version,
-            },
+                metrics: Arc::clone(&self.inner.metrics),
+            }),
             manager: self.clone(),
             deadline_ms: record.deadline_ms,
             renewed_ms: record.renewed_ms,
@@ -1260,7 +1297,7 @@ fn validate_control_fence(
     if control.incarnation != fence.token.control_plane_incarnation() {
         return Err(CoordinationError::incarnation_changed());
     }
-    require_write_open(control)
+    Ok(())
 }
 
 fn held_lease_matches_fence(
@@ -1303,13 +1340,6 @@ fn validate_identity(
     Ok(())
 }
 
-fn require_write_open(control: &ControlRecord) -> Result<(), CoordinationError> {
-    if control.mode != ControlPlaneMode::WriteOpen {
-        return Err(CoordinationError::write_closed());
-    }
-    Ok(())
-}
-
 fn validate_exact_control(
     expected: &LoadedControl,
     current_state: &StateRecord,
@@ -1322,9 +1352,6 @@ fn validate_exact_control(
     }
     if current.incarnation != expected.record.incarnation {
         return Err(CoordinationError::incarnation_changed());
-    }
-    if current.mode != ControlPlaneMode::WriteOpen {
-        return Err(CoordinationError::write_closed());
     }
     if current != &expected.record || current_state.version != expected.state.version {
         return Err(CoordinationError::fence_lost());
@@ -1656,12 +1683,14 @@ mod tests {
         let incarnation = ControlPlaneIncarnation::new(1).expect("incarnation");
         let epoch = ResourceEpoch::new(1).expect("epoch");
         let fence = LeaseFence {
+            store_id: Uuid::now_v7(),
             resource: resource.clone(),
             holder: holder.clone(),
             attempt,
             token: FencingToken::new("lease-test-cluster", incarnation, epoch).expect("token"),
             record_version: VersionToken::try_from(Bytes::from_static(b"lease-version"))
                 .expect("version"),
+            metrics: Arc::new(crate::coordination::CoordinationMetrics::new()),
         };
         let different_valid_candidate = LeaseRecord {
             resource,

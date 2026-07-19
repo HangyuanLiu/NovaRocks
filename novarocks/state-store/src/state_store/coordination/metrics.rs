@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const COORDINATION_OPERATION_COUNT: usize = 8;
+pub const COORDINATION_OPERATION_COUNT: usize = 9;
 pub const COORDINATION_OUTCOME_COUNT: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +31,7 @@ pub enum CoordinationOperation {
     Acquire = 5,
     Renew = 6,
     Release = 7,
+    ValidateFence = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

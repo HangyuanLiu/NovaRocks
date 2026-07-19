@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use uuid::Uuid;
 
 use super::error::CoordinationError;
+use super::metrics::CoordinationMetrics;
 use crate::{OperationId, VersionToken};
 
 const MAX_RESOURCE_KEY_BYTES: usize = 8 * 1024;
@@ -159,14 +161,29 @@ pub struct FencingToken {
     resource_epoch: ResourceEpoch,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LeaseFence {
+    pub(crate) store_id: Uuid,
     pub(crate) resource: ResourceKey,
     pub(crate) holder: HolderId,
     pub(crate) attempt: AttemptId,
     pub(crate) token: FencingToken,
     pub(crate) record_version: VersionToken,
+    pub(crate) metrics: Arc<CoordinationMetrics>,
 }
+
+impl PartialEq for LeaseFence {
+    fn eq(&self, other: &Self) -> bool {
+        self.store_id == other.store_id
+            && self.resource == other.resource
+            && self.holder == other.holder
+            && self.attempt == other.attempt
+            && self.token == other.token
+            && self.record_version == other.record_version
+    }
+}
+
+impl Eq for LeaseFence {}
 
 impl FencingToken {
     pub fn new(
