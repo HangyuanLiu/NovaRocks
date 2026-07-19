@@ -37,10 +37,6 @@ pub(crate) struct ValidatedRefreshExecution<'a> {
 }
 
 impl<'a> ValidatedRefreshExecution<'a> {
-    pub(crate) fn contract(&self) -> &'a RefreshPlanContract {
-        self.contract
-    }
-
     pub(crate) fn decision(&self) -> ExecutableRefreshDecision {
         self.contract.decision
     }
@@ -55,10 +51,6 @@ impl<'a> ValidatedRefreshExecution<'a> {
 
     pub(crate) fn state_baseline(&self) -> &'a RefreshStateBaseline {
         &self.contract.state_baseline
-    }
-
-    pub(crate) fn snapshot_pins(&self) -> &'a BTreeMap<String, Option<i64>> {
-        &self.contract.snapshot_pins
     }
 
     pub(crate) fn affected_partitions(&self) -> &'a AffectedTargetPartitions {

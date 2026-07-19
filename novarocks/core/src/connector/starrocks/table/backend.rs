@@ -34,7 +34,9 @@ use crate::engine::mv::lifecycle::{
     StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
 };
 use crate::mv::model::{MvStorageEngine, MvTarget};
-use crate::mv::refresh::execution::{RefreshExecutionObservation, validate_refresh_execution};
+use crate::mv::refresh::execution::{
+    RefreshExecutionObservation, ValidatedRefreshExecution, validate_refresh_execution,
+};
 use crate::mv::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
 use crate::mv::refresh::snapshot::ExecutableRefreshDecision;
 use crate::sql::parser::ast::{Literal, ObjectName};
@@ -327,16 +329,21 @@ impl MvBackend for StarRocksTableMvBackend {
                 "StarRocks table backend received non-StarRocks refresh plan",
             ));
         };
-        validate_starrocks_refresh_contract(plan_payload, &plan.contract)
+        let validated = validate_starrocks_refresh_contract(plan_payload, &plan.contract)
             .map_err(RefreshError::pre_commit)?;
-        let state = self.state().map_err(RefreshError::pre_commit)?;
-        super::mv_refresh::refresh_mv(
-            &state,
-            plan_payload.current_catalog.as_deref(),
-            &plan_payload.current_database,
-            &plan_payload.stmt,
-        )
-        .map_err(RefreshError::pre_commit)?;
+        if matches!(
+            validated.decision(),
+            ExecutableRefreshDecision::FirstRefresh | ExecutableRefreshDecision::Incremental
+        ) {
+            let state = self.state().map_err(RefreshError::pre_commit)?;
+            super::mv_refresh::refresh_mv(
+                &state,
+                plan_payload.current_catalog.as_deref(),
+                &plan_payload.current_database,
+                &plan_payload.stmt,
+            )
+            .map_err(RefreshError::pre_commit)?;
+        }
         Ok(RefreshOutcome {
             mv_id: plan.contract.mv_id,
             target: plan.contract.target.clone(),
@@ -367,10 +374,10 @@ impl MvBackend for StarRocksTableMvBackend {
     }
 }
 
-fn validate_starrocks_refresh_contract(
+fn validate_starrocks_refresh_contract<'a>(
     plan: &StarRocksTableRefreshPlan,
-    contract: &RefreshPlanContract,
-) -> Result<(), String> {
+    contract: &'a RefreshPlanContract,
+) -> Result<ValidatedRefreshExecution<'a>, String> {
     let (database, name) =
         crate::mv::analysis::resolve_mv_name(&plan.stmt.name, &plan.current_database)?;
     let target = MvTarget {
@@ -396,7 +403,6 @@ fn validate_starrocks_refresh_contract(
             snapshot_pins: None,
         },
     )
-    .map(|_| ())
 }
 
 #[cfg(test)]
