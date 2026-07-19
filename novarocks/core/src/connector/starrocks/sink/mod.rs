@@ -21,7 +21,6 @@ pub(crate) mod frontend_wire;
 pub(crate) mod operator;
 pub(crate) mod partition_key;
 pub(crate) mod plan;
-pub(crate) mod report_wire;
 pub(crate) mod routing;
 pub(crate) mod storage_rpc_wire;
 

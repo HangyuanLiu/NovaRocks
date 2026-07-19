@@ -21,4 +21,6 @@ pub(crate) mod launch_context;
 pub(crate) mod native_execution;
 pub(crate) mod runtime_state;
 pub(crate) mod sink;
+#[cfg(feature = "compat")]
+pub(crate) mod starrocks_execution;
 pub(crate) mod submission;

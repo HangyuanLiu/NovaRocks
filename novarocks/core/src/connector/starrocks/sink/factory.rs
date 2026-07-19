@@ -46,13 +46,13 @@ use crate::connector::starrocks::sink::plan::{
     FrontendAddress, SinkIndexDescriptor, SinkOutputProjectionPlan, SinkPredicatePlan,
     SinkSchemaDescriptor, SinkSlotDescriptor, StarRocksSinkDescriptor, StarRocksSinkFactoryInput,
 };
-use crate::connector::starrocks::sink::report_wire::TabletCommitInfo;
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing_for_index_id};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
+use crate::runtime::sink_commit::TabletCommitInfo;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 
 const LOAD_OP_COLUMN: &str = "__op";

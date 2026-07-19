@@ -18,8 +18,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
+use crate::cache::ExternalDataCacheRangeOptions;
+use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind, ScanSourceContract};
+use crate::exec::node::scan::{HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange};
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::fragment::instance::ScanAssignments;
@@ -431,6 +434,7 @@ pub(crate) fn decode_instance_parts(
 pub(crate) fn decode_scan_contracts_and_assignments(
     nodes: &[plan_nodes::TPlanNode],
     raw_ranges: &BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
+    descriptors: Option<&descriptors::TDescriptorTable>,
     facts: &StarRocksDecodeFacts,
     path: FieldPath,
 ) -> Result<
@@ -443,6 +447,7 @@ pub(crate) fn decode_scan_contracts_and_assignments(
     let mut kinds = BTreeMap::new();
     let mut known_node_ids = BTreeMap::new();
     let mut schema_requirements = BTreeMap::new();
+    let change_op_slots = decode_change_op_slots(nodes, descriptors)?;
     for (index, node) in nodes.iter().enumerate() {
         known_node_ids.insert(node.node_id, index);
         let kind = match node.node_type {
@@ -518,6 +523,7 @@ pub(crate) fn decode_scan_contracts_and_assignments(
             decoded.extend(decode_scan_range_params(
                 kind,
                 params,
+                change_op_slots.get(&id.get()).copied().flatten(),
                 facts,
                 path.clone().map_key(id.get().to_string()).index(index),
             )?);
@@ -532,6 +538,7 @@ pub(crate) fn decode_scan_contracts_and_assignments(
 fn decode_scan_range_params(
     kind: ScanAssignmentKind,
     params: &internal_service::TScanRangeParams,
+    change_op_slot: Option<SlotId>,
     facts: &StarRocksDecodeFacts,
     path: FieldPath,
 ) -> Result<Vec<ScanRangeParams>, StarRocksFragmentDecodeError> {
@@ -621,6 +628,7 @@ fn decode_scan_range_params(
             })?;
             vec![ScanRangeParams::file(decode_hdfs_scan_range(
                 hdfs,
+                change_op_slot,
                 facts,
                 path.clone(),
             )?)]
@@ -678,6 +686,7 @@ fn decode_scan_range_params(
 
 fn decode_hdfs_scan_range(
     src: &plan_nodes::THdfsScanRange,
+    change_op_slot: Option<SlotId>,
     facts: &StarRocksDecodeFacts,
     path: FieldPath,
 ) -> Result<FileScanRange, StarRocksFragmentDecodeError> {
@@ -764,6 +773,15 @@ fn decode_hdfs_scan_range(
                 size_in_bytes: value.size_in_bytes,
                 cardinality: value.cardinality,
             });
+    let empty_extended_columns = BTreeMap::new();
+    let ivm_change_op = decode_change_op_extended_column(
+        -1,
+        src.extended_columns
+            .as_ref()
+            .unwrap_or(&empty_extended_columns),
+        change_op_slot,
+    )
+    .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(path.clone(), detail))?;
     Ok(FileScanRange {
         file_format,
         full_path,
@@ -788,7 +806,381 @@ fn decode_hdfs_scan_range(
         included_positions: src.included_positions.clone().unwrap_or_default(),
         serialized_split: src.serialized_split.clone(),
         use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader.unwrap_or(false),
-        ivm_change_op: None,
+        ivm_change_op,
         file_pruning_min_max_values: None,
     })
+}
+
+fn decode_change_op_slots(
+    nodes: &[plan_nodes::TPlanNode],
+    descriptors: Option<&descriptors::TDescriptorTable>,
+) -> Result<BTreeMap<i32, Option<SlotId>>, StarRocksFragmentDecodeError> {
+    let mut output = BTreeMap::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        if node.node_type != plan_nodes::TPlanNodeType::HDFS_SCAN_NODE {
+            continue;
+        }
+        let Some(hdfs) = node.hdfs_scan_node.as_ref() else {
+            continue;
+        };
+        let extended = hdfs.extended_slot_ids.as_deref().unwrap_or(&[]);
+        let Some(descriptors) = descriptors else {
+            output.insert(node.node_id, None);
+            continue;
+        };
+        let mut selected = None;
+        for slot in descriptors.slot_descriptors.as_deref().unwrap_or(&[]) {
+            let (Some(raw_slot_id), Some(parent)) = (slot.id, slot.parent) else {
+                continue;
+            };
+            if !extended.contains(&raw_slot_id)
+                || hdfs.tuple_id.is_some_and(|tuple_id| tuple_id != parent)
+                || !super::layout::slot_name_from_desc(slot)
+                    .is_some_and(|name| crate::exec::row_position::is_change_op(&name))
+            {
+                continue;
+            }
+            let slot_id = SlotId::try_from(raw_slot_id).map_err(|detail| {
+                StarRocksFragmentDecodeError::invalid_value(
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("plan")
+                        .field("nodes")
+                        .index(node_index)
+                        .field("hdfs_scan_node")
+                        .field("extended_slot_ids"),
+                    detail,
+                )
+            })?;
+            if selected.replace(slot_id).is_some() {
+                return Err(StarRocksFragmentDecodeError::invalid_value(
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("plan")
+                        .field("nodes")
+                        .index(node_index)
+                        .field("hdfs_scan_node")
+                        .field("extended_slot_ids"),
+                    format!(
+                        "HDFS_SCAN_NODE node_id={} has multiple __change_op extended slots",
+                        node.node_id
+                    ),
+                ));
+            }
+        }
+        output.insert(node.node_id, selected);
+    }
+    Ok(output)
+}
+
+pub(crate) fn decode_change_op_extended_column(
+    node_id: i32,
+    extended_columns: &BTreeMap<i32, crate::thrift::exprs::TExpr>,
+    change_op_slot: Option<SlotId>,
+) -> Result<Option<i8>, String> {
+    let Some(slot) = change_op_slot else {
+        return Ok(None);
+    };
+    let slot_id = i32::try_from(slot.as_u32()).map_err(|_| {
+        format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot} exceeds i32")
+    })?;
+    let context = || format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot_id}");
+    let Some(expr) = extended_columns.get(&slot_id) else {
+        return Ok(None);
+    };
+    if expr.nodes.len() != 1 {
+        return Err(format!(
+            "{} expects exactly one INT_LITERAL extended column node, got {}",
+            context(),
+            expr.nodes.len()
+        ));
+    }
+    let node = &expr.nodes[0];
+    if node.node_type != crate::thrift::exprs::TExprNodeType::INT_LITERAL {
+        return Err(format!(
+            "{} expects INT_LITERAL extended column, got {:?}",
+            context(),
+            node.node_type
+        ));
+    }
+    if node.num_children != 0 {
+        return Err(format!(
+            "{} INT_LITERAL extended column expects 0 children, got {}",
+            context(),
+            node.num_children
+        ));
+    }
+    let value = node
+        .int_literal
+        .as_ref()
+        .ok_or_else(|| format!("{} INT_LITERAL missing int payload", context()))?
+        .value;
+    let value = i8::try_from(value)
+        .map_err(|_| format!("{} value {} does not fit in int8", context(), value))?;
+    crate::exec::change_op::validate_change_op_value(value)
+        .map_err(|error| format!("{} invalid value: {error}", context()))?;
+    Ok(Some(value))
+}
+
+pub(crate) fn decode_incremental_scan_ranges(
+    node_id: i32,
+    scan_ranges: &[internal_service::TScanRangeParams],
+    change_op_slot: Option<SlotId>,
+) -> Result<Vec<IncrementalScanRange>, StarRocksFragmentDecodeError> {
+    scan_ranges
+        .iter()
+        .enumerate()
+        .map(|(index, params)| {
+            let path = FieldPath::root("exec_plan_fragment")
+                .field("params")
+                .field("per_node_scan_ranges")
+                .map_key(node_id.to_string())
+                .index(index);
+            if params.empty.unwrap_or(false) {
+                return Ok(IncrementalScanRange::Empty {
+                    has_more: params.has_more,
+                });
+            }
+            let Some(hdfs) = params.scan_range.hdfs_scan_range.as_ref() else {
+                return Ok(IncrementalScanRange::Other {
+                    has_more: params.has_more,
+                });
+            };
+            let empty_extended_columns = BTreeMap::new();
+            let ivm_change_op = decode_change_op_extended_column(
+                node_id,
+                hdfs.extended_columns
+                    .as_ref()
+                    .unwrap_or(&empty_extended_columns),
+                change_op_slot,
+            )
+            .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(path.clone(), detail))?;
+            let candidate_node = hdfs
+                .candidate_node
+                .as_ref()
+                .map(|node| node.trim())
+                .filter(|node| !node.is_empty())
+                .map(str::to_string);
+            let external_datacache = ExternalDataCacheRangeOptions {
+                modification_time: hdfs.modification_time,
+                enable_populate_datacache: hdfs
+                    .datacache_options
+                    .as_ref()
+                    .and_then(|options| options.enable_populate_datacache),
+                datacache_priority: hdfs
+                    .datacache_options
+                    .as_ref()
+                    .and_then(|options| options.priority),
+                candidate_node,
+            };
+            let external_datacache = (external_datacache.modification_time.is_some()
+                || external_datacache.enable_populate_datacache.is_some()
+                || external_datacache.datacache_priority.is_some()
+                || external_datacache.candidate_node.is_some())
+            .then_some(external_datacache);
+            Ok(IncrementalScanRange::Hdfs {
+                has_more: params.has_more,
+                range: IncrementalHdfsScanRange {
+                    file_format: hdfs.file_format.as_ref().map(|format| match *format {
+                        descriptors::THdfsFileFormat::PARQUET => HdfsScanFileFormat::Parquet,
+                        descriptors::THdfsFileFormat::ORC => HdfsScanFileFormat::Orc,
+                        _ => HdfsScanFileFormat::Other,
+                    }),
+                    full_path: hdfs.full_path.clone(),
+                    relative_path: hdfs.relative_path.clone(),
+                    table_id: hdfs.table_id,
+                    file_length: hdfs.file_length.unwrap_or(0),
+                    offset: hdfs.offset.unwrap_or(0),
+                    length: hdfs.length.unwrap_or(0),
+                    first_row_id: hdfs.first_row_id,
+                    ivm_change_op,
+                    external_datacache,
+                },
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod change_op_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TIntLiteral};
+
+    fn expr_node(node_type: TExprNodeType, children: i32, value: Option<i64>) -> TExprNode {
+        TExprNode {
+            node_type,
+            type_: types::TTypeDesc::new(Vec::<types::TTypeNode>::new()),
+            opcode: None,
+            num_children: children,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: value.map(TIntLiteral::new),
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: -1,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn columns(slot: i32, expr: TExpr) -> BTreeMap<i32, TExpr> {
+        BTreeMap::from([(slot, expr)])
+    }
+
+    fn decode(slot: i32, columns: BTreeMap<i32, TExpr>) -> Result<Option<i8>, String> {
+        decode_change_op_extended_column(41, &columns, Some(SlotId::try_from(slot).expect("slot")))
+    }
+
+    #[test]
+    fn change_op_accepts_valid_selected_int_literal_and_ignores_unrelated_columns() {
+        let mut values = columns(
+            7,
+            TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 0, Some(1))]),
+        );
+        values.insert(
+            8,
+            TExpr::new(vec![expr_node(TExprNodeType::STRING_LITERAL, 3, None)]),
+        );
+
+        assert_eq!(decode(7, values).expect("valid change op"), Some(1));
+    }
+
+    #[test]
+    fn change_op_rejects_wrong_node_kind() {
+        let error = decode(
+            7,
+            columns(
+                7,
+                TExpr::new(vec![expr_node(TExprNodeType::STRING_LITERAL, 0, None)]),
+            ),
+        )
+        .expect_err("wrong kind must fail");
+        assert!(error.contains("expects INT_LITERAL"), "{error}");
+    }
+
+    #[test]
+    fn change_op_rejects_literal_with_children() {
+        let error = decode(
+            7,
+            columns(
+                7,
+                TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 1, Some(1))]),
+            ),
+        )
+        .expect_err("children must fail");
+        assert!(error.contains("expects 0 children"), "{error}");
+    }
+
+    #[test]
+    fn change_op_rejects_missing_int_payload() {
+        let error = decode(
+            7,
+            columns(
+                7,
+                TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 0, None)]),
+            ),
+        )
+        .expect_err("missing payload must fail");
+        assert!(error.contains("missing int payload"), "{error}");
+    }
+
+    #[test]
+    fn change_op_rejects_value_outside_i8() {
+        let error = decode(
+            7,
+            columns(
+                7,
+                TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 0, Some(128))]),
+            ),
+        )
+        .expect_err("out of i8 must fail");
+        assert!(error.contains("does not fit in int8"), "{error}");
+    }
+
+    #[test]
+    fn change_op_rejects_invalid_semantic_value() {
+        let error = decode(
+            7,
+            columns(
+                7,
+                TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 0, Some(3))]),
+            ),
+        )
+        .expect_err("invalid semantic value must fail");
+        assert!(error.contains("invalid value"), "{error}");
+    }
+
+    #[test]
+    fn initial_and_incremental_hdfs_decoders_share_selected_change_op_semantics() {
+        let selected = SlotId::new(7);
+        let mut hdfs = plan_nodes::THdfsScanRange::default();
+        hdfs.file_format = Some(descriptors::THdfsFileFormat::PARQUET);
+        hdfs.extended_columns = Some(columns(
+            7,
+            TExpr::new(vec![expr_node(TExprNodeType::INT_LITERAL, 0, Some(-1))]),
+        ));
+        hdfs.extended_columns.as_mut().expect("columns").insert(
+            8,
+            TExpr::new(vec![expr_node(TExprNodeType::STRING_LITERAL, 2, None)]),
+        );
+
+        let initial = decode_hdfs_scan_range(
+            &hdfs,
+            Some(selected),
+            &StarRocksDecodeFacts::default(),
+            FieldPath::root("exec_plan_fragment")
+                .field("params")
+                .field("per_node_scan_ranges")
+                .map_key("41")
+                .index(0),
+        )
+        .expect("initial range");
+        let params = internal_service::TScanRangeParams::new(
+            plan_nodes::TScanRange::new(None, None, None, None, Some(hdfs), None, None),
+            None,
+            Some(false),
+            Some(false),
+        );
+        let incremental = decode_incremental_scan_ranges(41, &[params], Some(selected))
+            .expect("incremental range");
+        let IncrementalScanRange::Hdfs { range, .. } = &incremental[0] else {
+            panic!("expected HDFS incremental range");
+        };
+
+        assert_eq!(initial.ivm_change_op, Some(-1));
+        assert_eq!(range.ivm_change_op, Some(-1));
+    }
 }

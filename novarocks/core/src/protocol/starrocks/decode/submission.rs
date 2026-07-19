@@ -28,10 +28,12 @@ use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec, FragmentRuntimeOptions,
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
+use crate::runtime::query_context::LookupFetcherLifecycle;
 use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
 use crate::thrift::{descriptors, internal_service, planner, types};
 
@@ -60,6 +62,7 @@ pub(crate) struct StarRocksDecodeInput<'a> {
     pub(crate) query_globals: Option<&'a internal_service::TQueryGlobals>,
     pub(crate) db_name: Option<&'a str>,
     pub(crate) coord: Option<&'a types::TNetworkAddress>,
+    pub(crate) novarocks_report_endpoint: Option<&'a RuntimeEndpoint>,
     pub(crate) backend_num: Option<i32>,
     pub(crate) pipeline_dop: i32,
     pub(crate) group_execution_scan_dop: Option<i32>,
@@ -107,6 +110,36 @@ pub(crate) struct StarRocksSubmissionMetadata {
     result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
+    report_destination: Option<StarRocksReportDestination>,
+    lookup_fetcher_lifecycles: HashMap<i32, LookupFetcherLifecycle>,
+    lookup_close_targets: Vec<StarRocksLookupCloseTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StarRocksReportDestination {
+    NovaRocks(RuntimeEndpoint),
+    Coordinator(RuntimeEndpoint),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StarRocksLookupCloseTarget {
+    lookup_node_id: i32,
+    host: String,
+    port: u16,
+}
+
+impl StarRocksLookupCloseTarget {
+    pub(crate) const fn lookup_node_id(&self) -> i32 {
+        self.lookup_node_id
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) const fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl StarRocksSubmissionMetadata {
@@ -130,6 +163,18 @@ impl StarRocksSubmissionMetadata {
 
     pub(crate) const fn group_execution_scan_dop(&self) -> Option<i32> {
         self.group_execution_scan_dop
+    }
+
+    pub(crate) fn report_destination(&self) -> Option<&StarRocksReportDestination> {
+        self.report_destination.as_ref()
+    }
+
+    pub(crate) fn lookup_fetcher_lifecycles(&self) -> &HashMap<i32, LookupFetcherLifecycle> {
+        &self.lookup_fetcher_lifecycles
+    }
+
+    pub(crate) fn lookup_close_targets(&self) -> &[StarRocksLookupCloseTarget] {
+        &self.lookup_close_targets
     }
 }
 
@@ -441,6 +486,7 @@ fn decode_draft_parts(
     let (scan_contracts, scan_assignments) = decode_scan_contracts_and_assignments(
         &plan.nodes,
         &instance.scan_ranges,
+        input.descriptors,
         input.facts,
         FieldPath::root("exec_plan_fragment")
             .field("params")
@@ -566,6 +612,18 @@ fn decode_draft_parts(
                 detail,
             )
         })?;
+    let lookup_fetcher_lifecycles = decode_lookup_fetcher_lifecycles(input)?;
+    let lookup_close_targets = decode_lookup_close_targets(input)?;
+    let report_destination = input
+        .novarocks_report_endpoint
+        .cloned()
+        .map(StarRocksReportDestination::NovaRocks)
+        .or_else(|| {
+            instance
+                .report_endpoint
+                .clone()
+                .map(StarRocksReportDestination::Coordinator)
+        });
     let instance_spec = FragmentInstanceSpec::new(
         FragmentContractVersion::CURRENT,
         instance.query_id,
@@ -591,8 +649,113 @@ fn decode_draft_parts(
             result_override,
             root_sink_dop,
             group_execution_scan_dop: input.group_execution_scan_dop,
+            report_destination,
+            lookup_fetcher_lifecycles,
+            lookup_close_targets,
         },
     })
+}
+
+fn decode_lookup_fetcher_lifecycles(
+    input: &StarRocksDecodeInput<'_>,
+) -> Result<HashMap<i32, LookupFetcherLifecycle>, StarRocksFragmentDecodeError> {
+    let Some(plan) = input.fragment.plan.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let mut lifecycles = HashMap::new();
+    for node in plan
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE)
+    {
+        let lifecycle = match input
+            .params
+            .per_look_up_num_fetchers
+            .as_ref()
+            .and_then(|counts| counts.get(&node.node_id))
+        {
+            Some(count) => {
+                LookupFetcherLifecycle::Exact(usize::try_from(*count).map_err(|_| {
+                    StarRocksFragmentDecodeError::out_of_range(
+                        FieldPath::root("exec_plan_fragment")
+                            .field("params")
+                            .field("per_look_up_num_fetchers")
+                            .map_key(node.node_id.to_string()),
+                        format!(
+                            "lookup node {} has negative fetcher count {count}",
+                            node.node_id
+                        ),
+                    )
+                })?)
+            }
+            None => LookupFetcherLifecycle::Unknown,
+        };
+        lifecycles.insert(node.node_id, lifecycle);
+    }
+    Ok(lifecycles)
+}
+
+fn decode_lookup_close_targets(
+    input: &StarRocksDecodeInput<'_>,
+) -> Result<Vec<StarRocksLookupCloseTarget>, StarRocksFragmentDecodeError> {
+    let Some(plan) = input.fragment.plan.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut targets = std::collections::HashSet::new();
+    for (node_index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type != crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
+            continue;
+        }
+        let Some(fetch) = node.fetch_node.as_ref() else {
+            continue;
+        };
+        let (Some(lookup_node_id), Some(nodes_info)) =
+            (fetch.target_node_id, fetch.nodes_info.as_ref())
+        else {
+            continue;
+        };
+        for (target_index, target) in nodes_info.nodes.iter().enumerate() {
+            if target.host.trim().is_empty() {
+                return Err(StarRocksFragmentDecodeError::invalid_value(
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("plan")
+                        .field("nodes")
+                        .index(node_index)
+                        .field("fetch_node")
+                        .field("nodes_info")
+                        .field("nodes")
+                        .index(target_index)
+                        .field("host"),
+                    "lookup close target host is empty",
+                ));
+            }
+            let port = u16::try_from(target.async_internal_port).map_err(|_| {
+                StarRocksFragmentDecodeError::out_of_range(
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("plan")
+                        .field("nodes")
+                        .index(node_index)
+                        .field("fetch_node")
+                        .field("nodes_info")
+                        .field("nodes")
+                        .index(target_index)
+                        .field("async_internal_port"),
+                    format!(
+                        "lookup async_internal_port {} is out of u16 range",
+                        target.async_internal_port
+                    ),
+                )
+            })?;
+            targets.insert(StarRocksLookupCloseTarget {
+                lookup_node_id,
+                host: target.host.clone(),
+                port,
+            });
+        }
+    }
+    Ok(targets.into_iter().collect())
 }
 
 fn decode_runtime_filter_contract(
@@ -1278,6 +1441,7 @@ mod tests {
             query_globals: None,
             db_name: None,
             coord: None,
+            novarocks_report_endpoint: None,
             backend_num: Some(3),
             pipeline_dop: 1,
             group_execution_scan_dop: None,
@@ -1311,6 +1475,70 @@ mod tests {
             ExecNodeKind::Values(_)
         ));
         assert!(metadata.descriptor_snapshot().is_none());
+    }
+
+    #[test]
+    fn novarocks_report_endpoint_takes_precedence_over_coordinator() {
+        let fragment = values_noop_fragment();
+        let params = params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 33, lo: 34 });
+        let coordinator = types::TNetworkAddress::new("coordinator".to_string(), 9020);
+        let novarocks = RuntimeEndpoint::new("novarocks-report", 9030).expect("endpoint");
+        let mut input = decode_input(&fragment, &params);
+        input.coord = Some(&coordinator);
+        input.novarocks_report_endpoint = Some(&novarocks);
+
+        let draft = prepare_fragment_submission(input).expect("prepare values/noop fragment");
+        let decoded = finish_fragment_submission(draft, StarRocksResolvedDependencies::default())
+            .expect("finish values/noop fragment");
+        let (_, metadata) = decoded.into_parts();
+
+        assert_eq!(
+            metadata.report_destination(),
+            Some(&StarRocksReportDestination::NovaRocks(novarocks))
+        );
+    }
+
+    #[test]
+    fn lookup_lifecycle_and_close_targets_are_preserved() {
+        let mut lookup = empty_set_node();
+        lookup.node_id = 41;
+        lookup.node_type = plan_nodes::TPlanNodeType::LOOKUP_NODE;
+
+        let mut fetch = empty_set_node();
+        fetch.node_id = 42;
+        fetch.node_type = plan_nodes::TPlanNodeType::FETCH_NODE;
+        fetch.fetch_node = Some(plan_nodes::TFetchNode {
+            target_node_id: Some(41),
+            row_pos_descs: None,
+            nodes_info: Some(descriptors::TNodesInfo::new(
+                1,
+                vec![descriptors::TNodeInfo::new(
+                    7,
+                    0,
+                    "be-lookup".to_string(),
+                    8060,
+                )],
+            )),
+        });
+
+        let mut fragment = values_noop_fragment();
+        fragment.plan.as_mut().expect("plan").nodes = vec![lookup, fetch];
+        let mut params = params(UniqueId { hi: 43, lo: 44 }, UniqueId { hi: 45, lo: 46 });
+        params.per_look_up_num_fetchers = Some(BTreeMap::from([(41, 3)]));
+        let input = decode_input(&fragment, &params);
+
+        let lifecycles = decode_lookup_fetcher_lifecycles(&input).expect("lookup lifecycles");
+        let targets = decode_lookup_close_targets(&input).expect("lookup close targets");
+
+        assert_eq!(lifecycles.get(&41), Some(&LookupFetcherLifecycle::Exact(3)));
+        assert_eq!(
+            targets,
+            vec![StarRocksLookupCloseTarget {
+                lookup_node_id: 41,
+                host: "be-lookup".to_string(),
+                port: 8060,
+            }]
+        );
     }
 
     #[test]
@@ -1550,6 +1778,7 @@ mod tests {
             super::super::instance::decode_scan_contracts_and_assignments(
                 &[scan_node],
                 &raw_ranges,
+                None,
                 &facts,
                 FieldPath::root("exec_plan_fragment")
                     .field("params")
@@ -1705,6 +1934,7 @@ mod tests {
             super::super::instance::decode_scan_contracts_and_assignments(
                 &[hdfs_node, lake_node, schema_node],
                 &raw_ranges,
+                None,
                 &facts,
                 FieldPath::root("exec_plan_fragment")
                     .field("params")
@@ -1861,6 +2091,7 @@ mod tests {
         let error = super::super::instance::decode_scan_contracts_and_assignments(
             &[hdfs_node],
             &raw_ranges,
+            None,
             &super::super::instance::StarRocksDecodeFacts::default(),
             FieldPath::root("exec_plan_fragment")
                 .field("params")
@@ -1913,6 +2144,7 @@ mod tests {
             super::super::instance::decode_scan_contracts_and_assignments(
                 &[node],
                 &BTreeMap::new(),
+                None,
                 &facts,
                 FieldPath::root("exec_plan_fragment")
                     .field("params")

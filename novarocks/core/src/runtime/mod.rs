@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_id;
-pub(crate) mod change_op;
 pub(crate) mod descriptor_snapshot;
 pub(crate) mod endpoint;
 pub mod exchange;
@@ -42,13 +41,12 @@ pub mod result_buffer;
 pub mod runtime_filter_hub;
 pub mod runtime_filter_observability;
 pub(crate) mod runtime_filter_params;
+pub(crate) mod runtime_filter_transmission;
 pub mod runtime_filter_worker;
 pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scan_range;
 pub mod sink_commit;
-#[cfg(feature = "compat")]
-pub(crate) mod sink_commit_wire;
 pub mod starlet_shard_registry;
 pub mod start_epoch;
 pub mod thread_cpu_time;

@@ -321,11 +321,13 @@ fn execute_plan_with_pipeline_in_mode(
     };
 
     let completion = FragmentCompletion::new(all_drivers.len(), Arc::clone(&ctx));
-    if query_id.is_some()
+    let completion_execution = if query_id.is_some()
         && let Some(finst_id) = finst_id
     {
-        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion));
-    }
+        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion))
+    } else {
+        None
+    };
     if let Some(query_id) = query_id
         && query_context_manager().is_query_canceled(query_id)
     {
@@ -350,7 +352,11 @@ fn execute_plan_with_pipeline_in_mode(
         })
         .unwrap_or_else(|| completion.wait());
     if let Some(finst_id) = finst_id {
-        query_context_manager().unregister_fragment_completion(finst_id);
+        if let Some(execution) = completion_execution {
+            query_context_manager().unregister_fragment_completion_execution(finst_id, execution);
+        } else {
+            query_context_manager().unregister_fragment_completion(finst_id);
+        }
     }
     res?;
 

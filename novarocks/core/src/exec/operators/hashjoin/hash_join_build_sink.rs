@@ -41,7 +41,6 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{CompatJoinRuntimeFilterSpec, JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::runtime_filter::arrow_type_to_common_type_desc;
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
@@ -56,6 +55,7 @@ use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
 use std::collections::{HashMap, HashSet};
@@ -956,16 +956,16 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(addr.host.clone()) {
                         continue;
                     }
-                    let req = crate::proto::filter::TransmitRuntimeFilterRequest {
+                    let req = RuntimeFilterTransmission {
                         is_partial: true,
-                        query_id: Some(crate::proto::common::UniqueId {
+                        query_id: crate::common::types::UniqueId {
                             hi: query_id.hi,
                             lo: query_id.lo,
-                        }),
+                        },
                         filter_id: filter.filter_id(),
                         data: data.clone(),
                         build_be_number,
-                        column_type: arrow_type_to_common_type_desc(&spec.build_data_type),
+                        column_type: Some(spec.build_data_type.clone()),
                     };
                     let dest_port = addr.port as u16;
                     if !recorded_sent {
@@ -994,12 +994,12 @@ impl HashJoinBuildSinkOperator {
                     if !seen_hosts.insert(endpoint.host().to_string()) {
                         continue;
                     }
-                    let req = crate::proto::filter::TransmitRuntimeFilterRequest {
+                    let req = RuntimeFilterTransmission {
                         is_partial: false,
-                        query_id: Some(crate::proto::common::UniqueId {
+                        query_id: crate::common::types::UniqueId {
                             hi: query_id.hi,
                             lo: query_id.lo,
-                        }),
+                        },
                         filter_id: filter.filter_id(),
                         data: data.clone(),
                         build_be_number: 0,

@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -72,6 +73,69 @@ impl FragmentSubmission {
 
     pub(crate) const fn instance(&self) -> &FragmentInstanceSpec {
         &self.instance
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
+        let mut contracts = HashMap::new();
+        collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
+        contracts
+    }
+}
+
+#[cfg(feature = "compat")]
+fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32, Option<SlotId>>) {
+    match &node.kind {
+        ExecNodeKind::Scan(scan) => {
+            if let Some(node_id) = scan.node_id() {
+                output.insert(
+                    node_id,
+                    scan.iceberg_virtual().and_then(|spec| spec.change_op_slot),
+                );
+            }
+        }
+        ExecNodeKind::AssertNumRows(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Project(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Filter(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Repeat(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::ChangeEventExpand(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::UnionAll(value) => {
+            for input in &value.inputs {
+                collect_incremental_scan_contracts(input, output);
+            }
+        }
+        ExecNodeKind::Limit(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Fetch(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Aggregate(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Join(value) => {
+            collect_incremental_scan_contracts(&value.left, output);
+            collect_incremental_scan_contracts(&value.right, output);
+        }
+        ExecNodeKind::NestedLoopJoin(value) => {
+            collect_incremental_scan_contracts(&value.left, output);
+            collect_incremental_scan_contracts(&value.right, output);
+        }
+        ExecNodeKind::Sort(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::TableFunction(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Analytic(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::SetOp(value) => {
+            for input in &value.inputs {
+                collect_incremental_scan_contracts(input, output);
+            }
+        }
+        ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Values(_)
+        | ExecNodeKind::ExchangeSource(_)
+        | ExecNodeKind::IcebergDeltaScan(_)
+        | ExecNodeKind::LookUp(_) => {}
     }
 }
 

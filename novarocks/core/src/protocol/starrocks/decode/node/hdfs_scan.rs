@@ -947,8 +947,12 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
         if crate::exec::row_position::is_change_op(&name)
-            && assignment.ranges().iter().any(|range| {
-                matches!(&range.range, ScanRange::File(file) if file.ivm_change_op.is_some())
+            && hdfs.extended_slot_ids.as_deref().is_some_and(|slots| {
+                slots.iter().any(|raw| {
+                    u32::try_from(*raw)
+                        .ok()
+                        .is_some_and(|raw| raw == slot_id.as_u32())
+                })
             })
         {
             if !logical.is_int8() {

@@ -26,6 +26,7 @@ use crate::novarocks_logging::{debug, error};
 use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::service::internal_rpc_transport::{
     InternalRpcTransport, internal_rpc_transport_for_current_process,
@@ -83,10 +84,10 @@ pub struct ExchangeSendTask {
     pub tracker: Arc<ExchangeSendTracker>,
 }
 
-pub fn send_runtime_filter(
+pub(crate) fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: crate::proto::filter::TransmitRuntimeFilterRequest,
+    params: RuntimeFilterTransmission,
 ) -> Result<(), String> {
     match internal_rpc_transport_for_current_process() {
         #[cfg(feature = "compat")]

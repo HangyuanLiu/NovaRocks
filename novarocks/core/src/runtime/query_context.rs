@@ -14,8 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -23,11 +24,9 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 
-use crate::cache::{CacheOptions, ExternalDataCacheRangeOptions};
+use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::exec::node::scan::HdfsScanFileFormat;
-use crate::exec::node::scan::IncrementalHdfsScanRange;
 use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
@@ -38,8 +37,6 @@ use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
-#[cfg(feature = "compat")]
-use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thrift;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
@@ -51,15 +48,98 @@ use crate::runtime::runtime_filter_observability::{
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_filter_worker::{RuntimeFilterWorker, RuntimeFilterWorkerParams};
 use crate::runtime_filter::service::RuntimeFilterService;
-#[cfg(feature = "compat")]
-use crate::thrift::descriptors;
-#[cfg(feature = "compat")]
-use crate::thrift::internal_service;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryId {
     pub(crate) hi: i64,
     pub(crate) lo: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StarRocksQueryGeneration(NonZeroU64);
+
+impl StarRocksQueryGeneration {
+    pub(crate) fn new(generation: u64) -> Result<Self, String> {
+        NonZeroU64::new(generation)
+            .map(Self)
+            .ok_or_else(|| "StarRocks query generation must be non-zero".to_string())
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum QueryExecutionGeneration {
+    Native,
+    StarRocks(StarRocksQueryGeneration),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct QueryExecutionKey {
+    query_id: QueryId,
+    generation: QueryExecutionGeneration,
+}
+
+impl QueryExecutionKey {
+    pub(crate) const fn native(query_id: QueryId) -> Self {
+        Self {
+            query_id,
+            generation: QueryExecutionGeneration::Native,
+        }
+    }
+
+    pub(crate) const fn starrocks(query_id: QueryId, generation: StarRocksQueryGeneration) -> Self {
+        Self {
+            query_id,
+            generation: QueryExecutionGeneration::StarRocks(generation),
+        }
+    }
+
+    pub(crate) const fn query_id(self) -> QueryId {
+        self.query_id
+    }
+
+    pub(crate) const fn starrocks_generation(self) -> Option<StarRocksQueryGeneration> {
+        match self.generation {
+            QueryExecutionGeneration::Native => None,
+            QueryExecutionGeneration::StarRocks(generation) => Some(generation),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryContextGeneration {
+    Native,
+    StarRocksUnbound,
+    StarRocks(StarRocksQueryGeneration),
+}
+
+pub(crate) struct QueryCleanupLease {
+    release: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl QueryCleanupLease {
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+
+    pub(crate) fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl Drop for QueryCleanupLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
 }
 
 impl fmt::Display for QueryId {
@@ -72,9 +152,8 @@ impl fmt::Display for QueryId {
 pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_id: QueryId,
+    execution_generation: QueryContextGeneration,
     pub(crate) cache_options: Option<CacheOptions>,
-    #[cfg(feature = "compat")]
-    pub(crate) desc_tbl: Option<descriptors::TDescriptorTable>,
     pub(crate) desc_snapshot: Option<Arc<DescriptorSnapshot>>,
     pub(crate) num_fragments: usize,
     pub(crate) num_active_fragments: usize,
@@ -101,6 +180,7 @@ pub(crate) struct QueryContext {
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
+    cleanup_leases: Vec<QueryCleanupLease>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -132,6 +212,20 @@ impl QueryContext {
         delivery_expire: Duration,
         query_expire: Duration,
     ) -> Self {
+        Self::new_with_generation(
+            query_id,
+            QueryContextGeneration::Native,
+            delivery_expire,
+            query_expire,
+        )
+    }
+
+    fn new_with_generation(
+        query_id: QueryId,
+        execution_generation: QueryContextGeneration,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Self {
         let now = Instant::now();
         let process = mem_tracker::process_mem_tracker();
         let query_label = format!("query_{:x}_{:x}", query_id.hi, query_id.lo);
@@ -151,9 +245,8 @@ impl QueryContext {
         ));
         Self {
             query_id,
+            execution_generation,
             cache_options: None,
-            #[cfg(feature = "compat")]
-            desc_tbl: None,
             desc_snapshot: None,
             num_fragments: 0,
             num_active_fragments: 0,
@@ -178,12 +271,64 @@ impl QueryContext {
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
+            cleanup_leases: Vec::new(),
+        }
+    }
+
+    fn matches_execution(&self, key: QueryExecutionKey) -> bool {
+        self.query_id == key.query_id
+            && matches!(
+                (self.execution_generation, key.generation),
+                (
+                    QueryContextGeneration::Native,
+                    QueryExecutionGeneration::Native
+                ) | (
+                    QueryContextGeneration::StarRocks(_),
+                    QueryExecutionGeneration::StarRocks(_)
+                )
+            )
+            && match (self.execution_generation, key.generation) {
+                (
+                    QueryContextGeneration::StarRocks(current),
+                    QueryExecutionGeneration::StarRocks(requested),
+                ) => current == requested,
+                (QueryContextGeneration::Native, QueryExecutionGeneration::Native) => true,
+                _ => false,
+            }
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    fn bind_starrocks_generation(
+        &mut self,
+        generation: StarRocksQueryGeneration,
+    ) -> Result<(), String> {
+        match self.execution_generation {
+            QueryContextGeneration::StarRocksUnbound if self.num_fragments == 0 => {
+                self.execution_generation = QueryContextGeneration::StarRocks(generation);
+                Ok(())
+            }
+            QueryContextGeneration::StarRocks(current) if current == generation => Ok(()),
+            QueryContextGeneration::StarRocksUnbound => {
+                Err("cannot bind StarRocks generation after fragment registration".to_string())
+            }
+            QueryContextGeneration::StarRocks(current) => Err(format!(
+                "StarRocks query generation mismatch: current={} requested={}",
+                current.get(),
+                generation.get()
+            )),
+            QueryContextGeneration::Native => {
+                Err("cannot bind StarRocks generation to native query context".to_string())
+            }
         }
     }
 
     pub(crate) fn increment_num_fragments(&mut self) {
         self.num_fragments += 1;
         self.num_active_fragments += 1;
+    }
+
+    pub(crate) fn attach_cleanup_lease(&mut self, lease: QueryCleanupLease) {
+        self.cleanup_leases.push(lease);
     }
 
     #[allow(dead_code)]
@@ -245,6 +390,7 @@ impl QueryContext {
         &mut self,
         claim: LegacyRuntimeFilterExecutionClaim,
     ) -> Result<(), String> {
+        self.validate_legacy_runtime_filter_execution_claim(claim)?;
         match (self.legacy_runtime_filter_execution, claim) {
             (_, LegacyRuntimeFilterExecutionClaim::Unclaimed) => Ok(()),
             (current, requested) if current == requested => Ok(()),
@@ -274,6 +420,41 @@ impl QueryContext {
                 self.legacy_runtime_filter_execution = claim;
                 Ok(())
             }
+            (current, requested) => Err(format!(
+                "legacy runtime-filter execution claim conflict: current={current:?} requested={requested:?}"
+            )),
+        }
+    }
+
+    fn validate_legacy_runtime_filter_execution_claim(
+        &self,
+        claim: LegacyRuntimeFilterExecutionClaim,
+    ) -> Result<(), String> {
+        match (self.legacy_runtime_filter_execution, claim) {
+            (_, LegacyRuntimeFilterExecutionClaim::Unclaimed) => Ok(()),
+            (current, requested) if current == requested => Ok(()),
+            (
+                LegacyRuntimeFilterExecutionClaim::Unclaimed,
+                LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+            ) => {
+                if self.runtime_filter_params.is_some()
+                    || self.runtime_filter_worker_params.is_some()
+                    || self.runtime_filter_hub.is_some()
+                    || self.runtime_filter_worker.is_some()
+                    || !self.pending_runtime_filters.is_empty()
+                {
+                    return Err(
+                        "cannot claim NativeDisabled with unexpected legacy runtime-filter state"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(feature = "compat")]
+            (
+                LegacyRuntimeFilterExecutionClaim::Unclaimed,
+                LegacyRuntimeFilterExecutionClaim::Compat,
+            ) => Ok(()),
             (current, requested) => Err(format!(
                 "legacy runtime-filter execution claim conflict: current={current:?} requested={requested:?}"
             )),
@@ -360,7 +541,18 @@ impl QueryContext {
         &mut self,
         descs: HashMap<i32, RowPositionDescriptor>,
     ) -> Result<(), String> {
-        for (tuple_id, incoming) in &descs {
+        self.validate_row_pos_descs(&descs)?;
+        for (tuple_id, incoming) in descs {
+            self.row_pos_descs.entry(tuple_id).or_insert(incoming);
+        }
+        Ok(())
+    }
+
+    fn validate_row_pos_descs(
+        &self,
+        descs: &HashMap<i32, RowPositionDescriptor>,
+    ) -> Result<(), String> {
+        for (tuple_id, incoming) in descs {
             if let Some(existing) = self.row_pos_descs.get(tuple_id) {
                 if existing.row_position_type != incoming.row_position_type
                     || existing.row_source_slot != incoming.row_source_slot
@@ -372,9 +564,6 @@ impl QueryContext {
                     ));
                 }
             }
-        }
-        for (tuple_id, incoming) in descs {
-            self.row_pos_descs.entry(tuple_id).or_insert(incoming);
         }
         Ok(())
     }
@@ -543,131 +732,11 @@ impl IncrementalScanNodeHandle {
         }
     }
 
-    fn append_scan_ranges(
-        &self,
-        scan_ranges: &[internal_service::TScanRangeParams],
-    ) -> Result<(), String> {
+    fn append_scan_ranges(&self, scan_ranges: &[IncrementalScanRange]) -> Result<(), String> {
         let _guard = self.update_mu.lock().expect("incremental scan handle lock");
-        let ranges = incremental_scan_ranges_from_thrift(scan_ranges)?;
-        let morsels = self.scan.build_incremental_morsels(&ranges)?;
+        let morsels = self.scan.build_incremental_morsels(scan_ranges)?;
         self.dispatch
             .append_morsels(morsels.morsels, morsels.has_more)
-    }
-}
-
-#[cfg(feature = "compat")]
-fn incremental_scan_ranges_from_thrift(
-    scan_ranges: &[internal_service::TScanRangeParams],
-) -> Result<Vec<IncrementalScanRange>, String> {
-    scan_ranges
-        .iter()
-        .map(incremental_scan_range_from_thrift)
-        .collect()
-}
-
-#[cfg(feature = "compat")]
-fn incremental_scan_range_from_thrift(
-    params: &internal_service::TScanRangeParams,
-) -> Result<IncrementalScanRange, String> {
-    if params.empty.unwrap_or(false) {
-        return Ok(IncrementalScanRange::Empty {
-            has_more: params.has_more,
-        });
-    }
-    let Some(hdfs_range) = params.scan_range.hdfs_scan_range.as_ref() else {
-        return Ok(IncrementalScanRange::Other {
-            has_more: params.has_more,
-        });
-    };
-    Ok(IncrementalScanRange::Hdfs {
-        has_more: params.has_more,
-        range: IncrementalHdfsScanRange {
-            file_format: hdfs_range
-                .file_format
-                .as_ref()
-                .map(hdfs_file_format_from_thrift),
-            full_path: hdfs_range.full_path.clone(),
-            relative_path: hdfs_range.relative_path.clone(),
-            table_id: hdfs_range.table_id,
-            file_length: hdfs_range.file_length.unwrap_or(0),
-            offset: hdfs_range.offset.unwrap_or(0),
-            length: hdfs_range.length.unwrap_or(0),
-            first_row_id: hdfs_range.first_row_id,
-            ivm_change_op: incremental_change_op_from_thrift(hdfs_range)?,
-            external_datacache: external_datacache_options_from_thrift(hdfs_range),
-        },
-    })
-}
-
-#[cfg(feature = "compat")]
-fn hdfs_file_format_from_thrift(format: &descriptors::THdfsFileFormat) -> HdfsScanFileFormat {
-    match *format {
-        descriptors::THdfsFileFormat::PARQUET => HdfsScanFileFormat::Parquet,
-        descriptors::THdfsFileFormat::ORC => HdfsScanFileFormat::Orc,
-        _ => HdfsScanFileFormat::Other,
-    }
-}
-
-#[cfg(feature = "compat")]
-fn incremental_change_op_from_thrift(
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-) -> Result<Option<i8>, String> {
-    let Some(extended_columns) = hdfs_range.extended_columns.as_ref() else {
-        return Ok(None);
-    };
-    if extended_columns.is_empty() {
-        return Ok(None);
-    }
-    if extended_columns.len() != 1 {
-        return Err(format!(
-            "incremental hdfs scan range expects exactly one __change_op extended column, got {}",
-            extended_columns.len()
-        ));
-    }
-    let slot_id = *extended_columns
-        .keys()
-        .next()
-        .expect("non-empty extended_columns has a first key");
-    let slot = SlotId::try_from(slot_id).map_err(|e| {
-        format!("incremental hdfs scan range has invalid __change_op slot_id={slot_id}: {e}")
-    })?;
-    crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
-        -1,
-        hdfs_range,
-        Some(slot),
-    )
-}
-
-#[cfg(feature = "compat")]
-fn external_datacache_options_from_thrift(
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-) -> Option<ExternalDataCacheRangeOptions> {
-    let candidate_node = hdfs_range
-        .candidate_node
-        .as_ref()
-        .map(|node| node.trim())
-        .filter(|node| !node.is_empty())
-        .map(|node| node.to_string());
-    let options = ExternalDataCacheRangeOptions {
-        modification_time: hdfs_range.modification_time,
-        enable_populate_datacache: hdfs_range
-            .datacache_options
-            .as_ref()
-            .and_then(|opts| opts.enable_populate_datacache),
-        datacache_priority: hdfs_range
-            .datacache_options
-            .as_ref()
-            .and_then(|opts| opts.priority),
-        candidate_node,
-    };
-    if options.modification_time.is_some()
-        || options.enable_populate_datacache.is_some()
-        || options.datacache_priority.is_some()
-        || options.candidate_node.is_some()
-    {
-        Some(options)
-    } else {
-        None
     }
 }
 
@@ -675,13 +744,19 @@ fn external_datacache_options_from_thrift(
 struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
-    finst_to_query: HashMap<UniqueId, QueryId>,
-    fragment_completions: HashMap<UniqueId, Weak<FragmentCompletion>>,
+    finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
+    fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
     #[cfg(feature = "compat")]
     incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
     #[cfg(feature = "compat")]
-    pending_incremental_scan_ranges:
-        HashMap<UniqueId, HashMap<i32, Vec<internal_service::TScanRangeParams>>>,
+    pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
+    #[cfg(feature = "compat")]
+    incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
+}
+
+struct FragmentCompletionEntry {
+    execution: QueryExecutionKey,
+    completion: Weak<FragmentCompletion>,
 }
 
 pub(crate) struct QueryContextManager {
@@ -693,6 +768,27 @@ pub(crate) struct QueryContextManager {
 pub(crate) struct FragmentFinishReportDecision {
     pub(crate) include_runtime_filter_profile: bool,
     remove_runtime_filter_lifecycle_after_report: bool,
+}
+
+pub(crate) struct FinstCancelResult {
+    pub(crate) query_id: Option<QueryId>,
+    pub(crate) finsts: Vec<UniqueId>,
+}
+
+#[cfg(feature = "compat")]
+pub(crate) struct StarRocksQueryHandoff {
+    pub(crate) execution: QueryExecutionKey,
+    pub(crate) delivery_expire: Duration,
+    pub(crate) query_expire: Duration,
+    pub(crate) fragment_count: usize,
+    pub(crate) cache_options: CacheOptions,
+    pub(crate) exchange_senders: HashMap<i32, usize>,
+    pub(crate) descriptor_snapshot: Option<Arc<DescriptorSnapshot>>,
+    pub(crate) total_fragments: Option<usize>,
+    pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
+    pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
+    pub(crate) runtime_filter_params: RuntimeFilterParams,
+    pub(crate) instances: Vec<(UniqueId, HashMap<i32, Option<SlotId>>)>,
 }
 
 impl QueryContextManager {
@@ -757,6 +853,30 @@ impl QueryContextManager {
     #[cfg(test)]
     pub(crate) fn clean_expired_for_test(&self) {
         self.clean_expired();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_delivery_for_test(&self, query_id: QueryId) {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let context = if guard.active.contains_key(&query_id) {
+            guard.active.get_mut(&query_id).expect("checked active")
+        } else {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("query context must exist")
+        };
+        context.delivery_deadline = Instant::now() - Duration::from_millis(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fragment_counts_for_test(&self, query_id: QueryId) -> Option<(usize, usize)> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .map(|context| (context.num_fragments, context.num_active_fragments))
     }
 
     fn remove_runtime_filter_lifecycle_if_context_absent(&self, query_id: QueryId) {
@@ -923,7 +1043,13 @@ impl QueryContextManager {
         if return_error_if_not_exist {
             return Err("Query terminates prematurely (missing QueryContext)".to_string());
         }
-        let mut ctx = QueryContext::new(query_id, delivery_expire, query_expire);
+        let generation = match claim {
+            #[cfg(feature = "compat")]
+            LegacyRuntimeFilterExecutionClaim::Compat => QueryContextGeneration::StarRocksUnbound,
+            _ => QueryContextGeneration::Native,
+        };
+        let mut ctx =
+            QueryContext::new_with_generation(query_id, generation, delivery_expire, query_expire);
         if claim != LegacyRuntimeFilterExecutionClaim::Unclaimed {
             ctx.claim_legacy_runtime_filter_execution(claim)?;
         }
@@ -932,6 +1058,207 @@ impl QueryContextManager {
         }
         guard.active.insert(query_id, ctx);
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    pub(crate) fn get_or_register_compat_generation(
+        &self,
+        execution: QueryExecutionKey,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        let generation = execution
+            .starrocks_generation()
+            .ok_or_else(|| "compat query registration requires StarRocks generation".to_string())?;
+        let query_id = execution.query_id();
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .finst_to_query
+            .values()
+            .any(|existing| existing.query_id() == query_id && *existing != execution)
+        {
+            return Err(format!(
+                "previous StarRocks query generation still has fragment routing: query_id={query_id}"
+            ));
+        }
+        if let Some(ctx) = guard.active.get_mut(&query_id) {
+            ctx.bind_starrocks_generation(generation)?;
+            ctx.claim_legacy_runtime_filter_execution(LegacyRuntimeFilterExecutionClaim::Compat)?;
+            ctx.increment_num_fragments();
+            return Ok(());
+        }
+        if guard.second_chance.contains_key(&query_id) {
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("checked")
+                .bind_starrocks_generation(generation)?;
+            guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("checked")
+                .claim_legacy_runtime_filter_execution(LegacyRuntimeFilterExecutionClaim::Compat)?;
+            let mut ctx = guard.second_chance.remove(&query_id).expect("checked");
+            ctx.increment_num_fragments();
+            guard.active.insert(query_id, ctx);
+            return Ok(());
+        }
+        if return_error_if_not_exist {
+            return Err("Query terminates prematurely (missing QueryContext)".to_string());
+        }
+        let mut ctx = QueryContext::new_with_generation(
+            query_id,
+            QueryContextGeneration::StarRocks(generation),
+            delivery_expire,
+            query_expire,
+        );
+        ctx.claim_legacy_runtime_filter_execution(LegacyRuntimeFilterExecutionClaim::Compat)?;
+        ctx.increment_num_fragments();
+        guard.active.insert(query_id, ctx);
+        Ok(())
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn commit_starrocks_handoff<F>(
+        &self,
+        handoff: StarRocksQueryHandoff,
+        make_cleanup_lease: F,
+    ) -> Result<Arc<MemTracker>, String>
+    where
+        F: FnOnce() -> Option<QueryCleanupLease>,
+    {
+        let generation = handoff
+            .execution
+            .starrocks_generation()
+            .ok_or_else(|| "StarRocks handoff requires query generation".to_string())?;
+        if handoff.fragment_count == 0 || handoff.fragment_count != handoff.instances.len() {
+            return Err("StarRocks handoff fragment count does not match instances".to_string());
+        }
+
+        let query_id = handoff.execution.query_id();
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .finst_to_query
+            .values()
+            .any(|existing| existing.query_id() == query_id && *existing != handoff.execution)
+        {
+            return Err(format!(
+                "previous StarRocks query generation still has fragment routing: query_id={query_id}"
+            ));
+        }
+        let mut incoming_finsts = HashSet::with_capacity(handoff.instances.len());
+        for (finst_id, _) in &handoff.instances {
+            if !incoming_finsts.insert(*finst_id) {
+                return Err(format!(
+                    "duplicate fragment instance in StarRocks handoff: finst_id={finst_id}"
+                ));
+            }
+            if let Some(existing) = guard.finst_to_query.get(finst_id) {
+                return Err(format!(
+                    "fragment instance is already registered: finst_id={finst_id} execution={existing:?}"
+                ));
+            }
+        }
+
+        let existing = guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id));
+        if let Some(context) = existing {
+            match context.execution_generation {
+                QueryContextGeneration::StarRocksUnbound if context.num_fragments == 0 => {}
+                QueryContextGeneration::StarRocks(current) if current == generation => {}
+                QueryContextGeneration::StarRocksUnbound => {
+                    return Err(
+                        "cannot bind StarRocks generation after fragment registration".to_string(),
+                    );
+                }
+                QueryContextGeneration::StarRocks(current) => {
+                    return Err(format!(
+                        "StarRocks query generation mismatch: current={} requested={}",
+                        current.get(),
+                        generation.get()
+                    ));
+                }
+                QueryContextGeneration::Native => {
+                    return Err(
+                        "cannot bind StarRocks generation to native query context".to_string()
+                    );
+                }
+            }
+            context.validate_legacy_runtime_filter_execution_claim(
+                LegacyRuntimeFilterExecutionClaim::Compat,
+            )?;
+            if context
+                .cache_options
+                .as_ref()
+                .is_some_and(|current| current != &handoff.cache_options)
+            {
+                return Err("cache options mismatch for query".to_string());
+            }
+            context.validate_row_pos_descs(&handoff.row_pos_descs)?;
+        }
+
+        // All fallible checks finish before the descriptor lease is created or any Q state is
+        // published. The caller may therefore keep the descriptor-cache lock across this call
+        // without risking a cleanup-lease drop while that lock is held.
+        let cleanup_lease = make_cleanup_lease();
+        let mut context = if let Some(context) = guard.active.remove(&query_id) {
+            context
+        } else if let Some(context) = guard.second_chance.remove(&query_id) {
+            context
+        } else {
+            QueryContext::new_with_generation(
+                query_id,
+                QueryContextGeneration::StarRocks(generation),
+                handoff.delivery_expire,
+                handoff.query_expire,
+            )
+        };
+        if context.execution_generation == QueryContextGeneration::StarRocksUnbound {
+            context.execution_generation = QueryContextGeneration::StarRocks(generation);
+        }
+        if context.legacy_runtime_filter_execution == LegacyRuntimeFilterExecutionClaim::Unclaimed {
+            context.legacy_runtime_filter_execution = LegacyRuntimeFilterExecutionClaim::Compat;
+        }
+        if context.cache_options.is_none() {
+            context.cache_options = Some(handoff.cache_options);
+        }
+        context.update_exchange_senders(handoff.exchange_senders);
+        if let Some(snapshot) = handoff.descriptor_snapshot {
+            context.desc_snapshot = Some(snapshot);
+        }
+        if let Some(total_fragments) = handoff.total_fragments {
+            context.total_fragments = Some(
+                context
+                    .total_fragments
+                    .map_or(total_fragments, |current| current.max(total_fragments)),
+            );
+        }
+        for (tuple_id, descriptor) in handoff.row_pos_descs {
+            context.row_pos_descs.entry(tuple_id).or_insert(descriptor);
+        }
+        context.register_lookup_fetchers(&handoff.lookup_fetchers);
+        if context.runtime_filter_params.is_none() {
+            context.runtime_filter_worker_params =
+                Some(handoff.runtime_filter_params.to_worker_params());
+            context.runtime_filter_params = Some(handoff.runtime_filter_params);
+        }
+        context.num_fragments += handoff.fragment_count;
+        context.num_active_fragments += handoff.fragment_count;
+        if let Some(lease) = cleanup_lease {
+            context.attach_cleanup_lease(lease);
+        }
+        let mem_tracker = context.mem_tracker();
+        guard.active.insert(query_id, context);
+        for (finst_id, contracts) in handoff.instances {
+            guard.finst_to_query.insert(finst_id, handoff.execution);
+            guard
+                .incremental_change_op_slots
+                .insert(finst_id, contracts);
+        }
+        Ok(mem_tracker)
     }
 
     pub(crate) fn with_context_mut<T, F>(&self, query_id: QueryId, f: F) -> Result<T, String>
@@ -952,6 +1279,17 @@ impl QueryContextManager {
         options: CacheOptions,
     ) -> Result<(), String> {
         self.with_context_mut(query_id, |ctx| ctx.set_cache_options(options))
+    }
+
+    pub(crate) fn attach_cleanup_lease(
+        &self,
+        query_id: QueryId,
+        lease: QueryCleanupLease,
+    ) -> Result<(), String> {
+        self.with_context_mut(query_id, |ctx| {
+            ctx.attach_cleanup_lease(lease);
+            Ok(())
+        })
     }
 
     pub(crate) fn cache_options(&self, query_id: QueryId) -> Option<CacheOptions> {
@@ -1149,16 +1487,6 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .map(|ctx| ctx.mem_tracker())
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn desc_tbl(&self, query_id: QueryId) -> Option<descriptors::TDescriptorTable> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.desc_tbl.clone())
     }
 
     pub(crate) fn descriptor_snapshot(&self, query_id: QueryId) -> Option<Arc<DescriptorSnapshot>> {
@@ -1362,7 +1690,7 @@ impl QueryContextManager {
         &self,
         finst_id: UniqueId,
         node_id: i32,
-        mut scan_ranges: Vec<internal_service::TScanRangeParams>,
+        mut scan_ranges: Vec<IncrementalScanRange>,
     ) -> Result<(), String> {
         if scan_ranges.is_empty() {
             return Ok(());
@@ -1394,12 +1722,114 @@ impl QueryContextManager {
         Ok(())
     }
 
+    #[cfg(feature = "compat")]
+    pub(crate) fn incremental_change_op_slot(
+        &self,
+        finst_id: UniqueId,
+        node_id: i32,
+    ) -> Result<Option<SlotId>, String> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .incremental_change_op_slots
+            .get(&finst_id)
+            .and_then(|contracts| contracts.get(&node_id))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "incremental scan range has no registered scan contract for finst_id={finst_id} node_id={node_id}"
+                )
+            })
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    fn pending_incremental_scan_ranges_for_test(
+        &self,
+        finst_id: UniqueId,
+        node_id: i32,
+    ) -> Vec<IncrementalScanRange> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .pending_incremental_scan_ranges
+            .get(&finst_id)
+            .and_then(|nodes| nodes.get(&node_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn register_finst(&self, finst_id: UniqueId, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard.finst_to_query.insert(finst_id, query_id);
+        guard
+            .finst_to_query
+            .insert(finst_id, QueryExecutionKey::native(query_id));
+    }
+
+    pub(crate) fn register_finsts<I>(&self, finst_ids: I, query_id: QueryId)
+    where
+        I: IntoIterator<Item = UniqueId>,
+    {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        for finst_id in finst_ids {
+            guard
+                .finst_to_query
+                .insert(finst_id, QueryExecutionKey::native(query_id));
+        }
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    pub(crate) fn register_starrocks_finsts<I>(
+        &self,
+        finst_ids: I,
+        execution: QueryExecutionKey,
+    ) -> Result<(), String>
+    where
+        I: IntoIterator<Item = UniqueId>,
+    {
+        if execution.starrocks_generation().is_none() {
+            return Err("StarRocks finst registration requires generation".to_string());
+        }
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let context = guard
+            .active
+            .get(&execution.query_id())
+            .ok_or_else(|| "QueryContext not found".to_string())?;
+        if !context.matches_execution(execution) {
+            return Err("StarRocks query generation is not active".to_string());
+        }
+        for finst_id in finst_ids {
+            guard.finst_to_query.insert(finst_id, execution);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    pub(crate) fn register_finsts_with_incremental_contracts<I>(
+        &self,
+        instances: I,
+        query_id: QueryId,
+    ) where
+        I: IntoIterator<Item = (UniqueId, HashMap<i32, Option<SlotId>>)>,
+    {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        for (finst_id, contracts) in instances {
+            guard
+                .finst_to_query
+                .insert(finst_id, QueryExecutionKey::native(query_id));
+            guard
+                .incremental_change_op_slots
+                .insert(finst_id, contracts);
+        }
     }
 
     pub(crate) fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .finst_to_query
+            .get(&finst_id)
+            .map(|execution| execution.query_id())
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    pub(crate) fn query_execution_by_finst(&self, finst_id: UniqueId) -> Option<QueryExecutionKey> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.get(&finst_id).copied()
     }
@@ -1412,17 +1842,50 @@ impl QueryContextManager {
         guard.incremental_scan_nodes.remove(&finst_id);
         #[cfg(feature = "compat")]
         guard.pending_incremental_scan_ranges.remove(&finst_id);
+        #[cfg(feature = "compat")]
+        guard.incremental_change_op_slots.remove(&finst_id);
+    }
+
+    pub(crate) fn unregister_finst_execution(
+        &self,
+        finst_id: UniqueId,
+        execution: QueryExecutionKey,
+    ) {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard.finst_to_query.get(&finst_id) != Some(&execution) {
+            return;
+        }
+        guard.finst_to_query.remove(&finst_id);
+        if guard
+            .fragment_completions
+            .get(&finst_id)
+            .is_some_and(|entry| entry.execution == execution)
+        {
+            guard.fragment_completions.remove(&finst_id);
+        }
+        #[cfg(feature = "compat")]
+        guard.incremental_scan_nodes.remove(&finst_id);
+        #[cfg(feature = "compat")]
+        guard.pending_incremental_scan_ranges.remove(&finst_id);
+        #[cfg(feature = "compat")]
+        guard.incremental_change_op_slots.remove(&finst_id);
     }
 
     pub(crate) fn register_fragment_completion(
         &self,
         finst_id: UniqueId,
         completion: Arc<FragmentCompletion>,
-    ) {
+    ) -> Option<QueryExecutionKey> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .fragment_completions
-            .insert(finst_id, Arc::downgrade(&completion));
+        let execution = guard.finst_to_query.get(&finst_id).copied()?;
+        guard.fragment_completions.insert(
+            finst_id,
+            FragmentCompletionEntry {
+                execution,
+                completion: Arc::downgrade(&completion),
+            },
+        );
+        Some(execution)
     }
 
     pub(crate) fn unregister_fragment_completion(&self, finst_id: UniqueId) {
@@ -1430,9 +1893,24 @@ impl QueryContextManager {
         guard.fragment_completions.remove(&finst_id);
     }
 
+    pub(crate) fn unregister_fragment_completion_execution(
+        &self,
+        finst_id: UniqueId,
+        execution: QueryExecutionKey,
+    ) {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .fragment_completions
+            .get(&finst_id)
+            .is_some_and(|entry| entry.execution == execution)
+        {
+            guard.fragment_completions.remove(&finst_id);
+        }
+    }
+
     pub(crate) fn get_query_timeout_by_finst(&self, finst_id: UniqueId) -> Option<Duration> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        let query_id = guard.finst_to_query.get(&finst_id).copied()?;
+        let query_id = guard.finst_to_query.get(&finst_id)?.query_id();
         guard
             .active
             .get(&query_id)
@@ -1471,7 +1949,9 @@ impl QueryContextManager {
             let finsts = guard
                 .finst_to_query
                 .iter()
-                .filter_map(|(finst_id, qid)| (*qid == query_id).then_some(*finst_id))
+                .filter_map(|(finst_id, execution)| {
+                    (execution.query_id() == query_id).then_some(*finst_id)
+                })
                 .collect();
             (service, finsts)
         };
@@ -1497,13 +1977,13 @@ impl QueryContextManager {
             let mut finsts = Vec::new();
             let mut completions = Vec::new();
             let mut stale = Vec::new();
-            for (finst_id, qid) in guard.finst_to_query.iter() {
-                if *qid != query_id {
+            for (finst_id, execution) in guard.finst_to_query.iter() {
+                if execution.query_id() != query_id {
                     continue;
                 }
                 finsts.push(*finst_id);
-                if let Some(weak) = guard.fragment_completions.get(finst_id) {
-                    if let Some(completion) = weak.upgrade() {
+                if let Some(entry) = guard.fragment_completions.get(finst_id) {
+                    if let Some(completion) = entry.completion.upgrade() {
                         completions.push(completion);
                     } else {
                         stale.push(*finst_id);
@@ -1525,12 +2005,133 @@ impl QueryContextManager {
         finsts
     }
 
+    pub(crate) fn cancel_query_execution(
+        &self,
+        execution: QueryExecutionKey,
+        err: String,
+    ) -> Vec<UniqueId> {
+        let (service, finsts, completions) = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let query_id = execution.query_id();
+            let context = if guard.active.contains_key(&query_id) {
+                guard.active.get_mut(&query_id)
+            } else {
+                guard.second_chance.get_mut(&query_id)
+            };
+            let service = context
+                .filter(|ctx| ctx.matches_execution(execution))
+                .map(|ctx| {
+                    ctx.cancelled_by_fe = true;
+                    ctx.runtime_filter_service()
+                });
+            let finsts = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .collect::<Vec<_>>();
+            let completions = finsts
+                .iter()
+                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
+                .filter(|entry| entry.execution == execution)
+                .filter_map(|entry| entry.completion.upgrade())
+                .collect::<Vec<_>>();
+            (service, finsts, completions)
+        };
+        if let Some(service) = service {
+            service.cancel();
+        }
+        for completion in completions {
+            completion.abort_from_query(err.clone());
+        }
+        finsts
+    }
+
+    pub(crate) fn cancel_finst(&self, finst_id: UniqueId, err: String) -> FinstCancelResult {
+        self.cancel_finst_internal(finst_id, err, || {})
+    }
+
+    fn cancel_finst_internal<F>(
+        &self,
+        finst_id: UniqueId,
+        err: String,
+        binding_observer: F,
+    ) -> FinstCancelResult
+    where
+        F: FnOnce(),
+    {
+        let collected = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let Some(execution) = guard.finst_to_query.get(&finst_id).copied() else {
+                return FinstCancelResult {
+                    query_id: None,
+                    finsts: Vec::new(),
+                };
+            };
+            binding_observer();
+            let query_id = execution.query_id();
+            let context = if guard.active.contains_key(&query_id) {
+                guard.active.get_mut(&query_id)
+            } else {
+                guard.second_chance.get_mut(&query_id)
+            };
+            let service = context
+                .filter(|ctx| ctx.matches_execution(execution))
+                .map(|ctx| {
+                    ctx.cancelled_by_fe = true;
+                    ctx.runtime_filter_service()
+                });
+            let finsts = guard
+                .finst_to_query
+                .iter()
+                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .collect::<Vec<_>>();
+            let completions = finsts
+                .iter()
+                .filter_map(|finst_id| guard.fragment_completions.get(finst_id))
+                .filter(|entry| entry.execution == execution)
+                .filter_map(|entry| entry.completion.upgrade())
+                .collect::<Vec<_>>();
+            (query_id, service, finsts, completions)
+        };
+        let (query_id, service, finsts, completions) = collected;
+        if let Some(service) = service {
+            service.cancel();
+        }
+        for completion in completions {
+            completion.abort_from_query(err.clone());
+        }
+        if finsts.is_empty() {
+            return FinstCancelResult {
+                query_id: Some(query_id),
+                finsts,
+            };
+        }
+        FinstCancelResult {
+            query_id: Some(query_id),
+            finsts,
+        }
+    }
+
+    #[cfg(all(test, feature = "compat"))]
+    fn cancel_finst_with_binding_observer<F>(
+        &self,
+        finst_id: UniqueId,
+        err: String,
+        binding_observer: F,
+    ) -> FinstCancelResult
+    where
+        F: FnOnce(),
+    {
+        self.cancel_finst_internal(finst_id, err, binding_observer)
+    }
+
     /// A sender's exchange RPC failed. Map the finst to its query and cancel
     /// the whole query so blocked receivers abort instead of timing out.
     pub(crate) fn propagate_sender_error(&self, finst_id: UniqueId, err: String) -> Vec<UniqueId> {
-        match self.query_id_by_finst(finst_id) {
-            Some(qid) => {
-                let finsts = self.cancel_query(qid, format!("exchange send failed: {err}"));
+        let result = self.cancel_finst(finst_id, format!("exchange send failed: {err}"));
+        match result.query_id {
+            Some(_) => {
+                let finsts = result.finsts;
                 for id in &finsts {
                     crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
                 }
@@ -1557,6 +2158,21 @@ impl QueryContextManager {
         self.finish_fragment_internal(query_id)
     }
 
+    pub(crate) fn finish_fragment_execution(&self, execution: QueryExecutionKey) {
+        let decision =
+            self.finish_fragment_internal_execution(execution.query_id(), Some(execution));
+        if decision.remove_runtime_filter_lifecycle_after_report {
+            self.remove_runtime_filter_lifecycle_if_context_absent(execution.query_id());
+        }
+    }
+
+    pub(crate) fn finish_fragment_for_report_execution(
+        &self,
+        execution: QueryExecutionKey,
+    ) -> FragmentFinishReportDecision {
+        self.finish_fragment_internal_execution(execution.query_id(), Some(execution))
+    }
+
     pub(crate) fn cleanup_after_fragment_report(
         &self,
         query_id: QueryId,
@@ -1568,7 +2184,26 @@ impl QueryContextManager {
     }
 
     fn finish_fragment_internal(&self, query_id: QueryId) -> FragmentFinishReportDecision {
+        self.finish_fragment_internal_execution(query_id, None)
+    }
+
+    fn finish_fragment_internal_execution(
+        &self,
+        query_id: QueryId,
+        execution: Option<QueryExecutionKey>,
+    ) -> FragmentFinishReportDecision {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if execution.is_some_and(|execution| {
+            !guard
+                .active
+                .get(&query_id)
+                .is_some_and(|ctx| ctx.matches_execution(execution))
+        }) {
+            return FragmentFinishReportDecision {
+                include_runtime_filter_profile: false,
+                remove_runtime_filter_lifecycle_after_report: false,
+            };
+        }
         let Some(mut ctx) = guard.active.remove(&query_id) else {
             return FragmentFinishReportDecision {
                 include_runtime_filter_profile: true,
@@ -1602,6 +2237,116 @@ impl QueryContextManager {
 fn remove_runtime_filter_lifecycle(query_id: QueryId) {
     RuntimeFilterLifecycleRegistry::global()
         .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod generation_race_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use crate::common::types::UniqueId;
+
+    use super::{
+        QueryContextManager, QueryContextManagerInner, QueryExecutionKey, QueryId,
+        StarRocksQueryGeneration,
+    };
+
+    fn test_manager() -> Arc<QueryContextManager> {
+        Arc::new(QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn cancel_resolution_is_atomic_with_old_generation_drain_and_reuse() {
+        let manager = test_manager();
+        let query_id = QueryId {
+            hi: 86_001,
+            lo: 86_002,
+        };
+        let old_finst = UniqueId {
+            hi: 86_003,
+            lo: 86_004,
+        };
+        let new_finst = UniqueId {
+            hi: 86_005,
+            lo: 86_006,
+        };
+        let old_execution = QueryExecutionKey::starrocks(
+            query_id,
+            StarRocksQueryGeneration::new(1).expect("old generation"),
+        );
+        let new_execution = QueryExecutionKey::starrocks(
+            query_id,
+            StarRocksQueryGeneration::new(2).expect("new generation"),
+        );
+        manager
+            .get_or_register_compat_generation(
+                old_execution,
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .expect("old context");
+        manager
+            .register_starrocks_finsts([old_finst], old_execution)
+            .expect("old routing");
+
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancel_manager = Arc::clone(&manager);
+        let cancel = std::thread::spawn(move || {
+            cancel_manager.cancel_finst_with_binding_observer(
+                old_finst,
+                "old generation cancel".to_string(),
+                || {
+                    resolved_tx.send(()).expect("signal resolved binding");
+                    release_rx.recv().expect("release cancel lock");
+                },
+            )
+        });
+        resolved_rx.recv().expect("cancel resolved old binding");
+
+        let (reuse_started_tx, reuse_started_rx) = mpsc::channel();
+        let reuse_manager = Arc::clone(&manager);
+        let reuse = std::thread::spawn(move || {
+            reuse_started_tx.send(()).expect("signal reuse attempt");
+            reuse_manager.unregister_finst_execution(old_finst, old_execution);
+            reuse_manager.finish_fragment_execution(old_execution);
+            reuse_manager
+                .get_or_register_compat_generation(
+                    new_execution,
+                    false,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+                .expect("new context after old routing drain");
+            reuse_manager
+                .register_starrocks_finsts([new_finst], new_execution)
+                .expect("new routing");
+        });
+        reuse_started_rx.recv().expect("reuse thread started");
+        release_tx.send(()).expect("release cancel lock");
+
+        let cancelled = cancel.join().expect("cancel thread");
+        reuse.join().expect("reuse thread");
+        assert_eq!(cancelled.query_id, Some(query_id));
+        assert_eq!(cancelled.finsts, vec![old_finst]);
+        assert_eq!(
+            manager.query_execution_by_finst(new_finst),
+            Some(new_execution)
+        );
+        assert!(
+            !manager.is_query_canceled(query_id),
+            "old cancellation must only touch the service captured for its generation"
+        );
+
+        manager.unregister_finst_execution(new_finst, new_execution);
+        manager.cancel_query_execution(new_execution, "test cleanup".to_string());
+        manager.finish_fragment_execution(new_execution);
+    }
 }
 
 #[cfg(test)]
@@ -2058,6 +2803,78 @@ mod runtime_filter_lifecycle_cleanup_tests {
         mgr.clean_expired();
 
         assert!(registry.snapshot(query_key).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod incremental_scan_domain_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
+    use crate::common::ids::SlotId;
+    use crate::common::types::UniqueId;
+    use crate::exec::node::scan::IncrementalScanRange;
+
+    fn manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn pending_incremental_ranges_store_domain_values_and_registered_slot_contract() {
+        let manager = manager();
+        let finst_id = UniqueId { hi: 91, lo: 92 };
+        manager.register_finsts_with_incremental_contracts(
+            [(finst_id, HashMap::from([(41, Some(SlotId::new(7)))]))],
+            QueryId { hi: 81, lo: 82 },
+        );
+
+        assert_eq!(
+            manager
+                .incremental_change_op_slot(finst_id, 41)
+                .expect("registered contract"),
+            Some(SlotId::new(7))
+        );
+        manager
+            .append_incremental_scan_ranges(
+                finst_id,
+                41,
+                vec![IncrementalScanRange::Empty {
+                    has_more: Some(true),
+                }],
+            )
+            .expect("queue domain range");
+        let pending = manager.pending_incremental_scan_ranges_for_test(finst_id, 41);
+        assert!(matches!(
+            pending.as_slice(),
+            [IncrementalScanRange::Empty {
+                has_more: Some(true)
+            }]
+        ));
+    }
+
+    #[test]
+    fn incremental_slot_lookup_rejects_unknown_node_without_pending_side_effect() {
+        let manager = manager();
+        let finst_id = UniqueId { hi: 93, lo: 94 };
+        manager.register_finsts_with_incremental_contracts(
+            [(finst_id, HashMap::from([(41, None)]))],
+            QueryId { hi: 83, lo: 84 },
+        );
+
+        let error = manager
+            .incremental_change_op_slot(finst_id, 42)
+            .expect_err("unknown node must fail before append");
+        assert!(error.contains("no registered scan contract"), "{error}");
+        assert!(
+            manager
+                .pending_incremental_scan_ranges_for_test(finst_id, 42)
+                .is_empty()
+        );
     }
 }
 
@@ -2721,75 +3538,4 @@ mod runtime_filter_service_lifecycle_tests {
             .expect_err("context drop must close retained service");
         assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
     }
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn observe_total_fragments(
-    ctx: &mut QueryContext,
-    exec_params: &internal_service::TPlanFragmentExecParams,
-) {
-    if let Some(n) = exec_params.instances_number {
-        let n = n.max(0) as usize;
-        ctx.total_fragments = Some(ctx.total_fragments.map_or(n, |cur| cur.max(n)));
-    }
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn desc_tbl_is_cached(desc: &descriptors::TDescriptorTable) -> bool {
-    desc.is_cached.unwrap_or(false)
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn is_desc_tbl_effectively_empty(desc: &descriptors::TDescriptorTable) -> bool {
-    let has_tuple = !desc.tuple_descriptors.is_empty();
-    let has_table = desc
-        .table_descriptors
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    let has_slot = desc
-        .slot_descriptors
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
-    !(has_tuple || has_table || has_slot)
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn resolve_desc_tbl_for_instance(
-    mgr: &QueryContextManager,
-    query_id: QueryId,
-    incoming: Option<&descriptors::TDescriptorTable>,
-    fallback: Option<&descriptors::TDescriptorTable>,
-) -> Result<Option<descriptors::TDescriptorTable>, String> {
-    mgr.with_context_mut(query_id, |ctx| {
-        if let Some(desc) = incoming {
-            if desc_tbl_is_cached(desc) {
-                if ctx.desc_snapshot.is_none() {
-                    let existing = ctx.desc_tbl.as_ref().ok_or_else(|| {
-                        "Query terminates prematurely (missing desc_tbl)".to_string()
-                    })?;
-                    ctx.desc_snapshot = Some(Arc::new(descriptor_snapshot_from_thrift(existing)?));
-                }
-                return ctx
-                    .desc_tbl
-                    .clone()
-                    .ok_or_else(|| "Query terminates prematurely (missing desc_tbl)".to_string())
-                    .map(Some);
-            }
-            if !is_desc_tbl_effectively_empty(desc) {
-                let snapshot = descriptor_snapshot_from_thrift(desc)?;
-                ctx.desc_tbl = Some(desc.clone());
-                ctx.desc_snapshot = Some(Arc::new(snapshot));
-                return Ok(Some(desc.clone()));
-            }
-        }
-        if let Some(desc) = fallback
-            && !is_desc_tbl_effectively_empty(desc)
-        {
-            let snapshot = descriptor_snapshot_from_thrift(desc)?;
-            ctx.desc_tbl = Some(desc.clone());
-            ctx.desc_snapshot = Some(Arc::new(snapshot));
-            return Ok(Some(desc.clone()));
-        }
-        Ok(ctx.desc_tbl.clone())
-    })
 }

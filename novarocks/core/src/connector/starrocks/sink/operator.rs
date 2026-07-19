@@ -54,9 +54,6 @@ use crate::connector::starrocks::sink::partition_key::{
     partition_key_source_len, validate_partition_key_length,
 };
 use crate::connector::starrocks::sink::plan::{CreatePartitionResult, SinkPredicatePlan};
-use crate::connector::starrocks::sink::report_wire::{
-    TabletCommitInfo, TabletFailInfo, tablet_commit_info, tablet_fail_info,
-};
 use crate::connector::starrocks::sink::routing::{
     RowRejectReason, RowRoutingPlan, route_chunk_rows,
 };
@@ -64,6 +61,7 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use crate::runtime::starlet_shard_registry;
 
 const LOAD_OP_COLUMN: &str = "__op";
@@ -1038,7 +1036,10 @@ impl OlapTableSinkOperator {
     fn all_tablet_fail_infos(&self) -> Vec<TabletFailInfo> {
         self.tablet_commit_infos
             .iter()
-            .map(|info| tablet_fail_info(info.tablet_id, info.backend_id))
+            .map(|info| TabletFailInfo {
+                tablet_id: info.tablet_id,
+                backend_id: info.backend_id,
+            })
             .collect::<Vec<_>>()
     }
 
@@ -1415,8 +1416,10 @@ impl OlapTableSinkOperator {
                 current.tablet_id == tablet.tablet_id && current.backend_id == backend_id
             });
             if !exists {
-                self.tablet_commit_infos
-                    .push(tablet_commit_info(tablet.tablet_id, backend_id));
+                self.tablet_commit_infos.push(TabletCommitInfo {
+                    tablet_id: tablet.tablet_id,
+                    backend_id,
+                });
             }
         }
 
