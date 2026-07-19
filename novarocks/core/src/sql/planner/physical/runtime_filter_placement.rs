@@ -7,7 +7,7 @@
 //! port of the retired optimizer-side pass -- do not "improve" placement here;
 //! changes belong in the RF baseline / producer arcs.
 
-use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
@@ -18,7 +18,7 @@ use crate::sql::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, RedistributeMode,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
 /// Kept identical to the retired optimizer constant so the session knob is
@@ -368,6 +368,119 @@ fn bindable_members(node: &PhysicalPlanNode, members: &[TypedExpr]) -> Vec<Typed
         .collect()
 }
 
+fn bind_expression_to_columns(
+    expression: &TypedExpr,
+    columns: &[OutputColumn],
+) -> Option<TypedExpr> {
+    // Runtime-filter bindings are applied at NodeInput, so every ColumnRef leaf
+    // must carry the exact type and nullability of that direct-input schema.
+    let mut columns_by_id = HashMap::with_capacity(columns.len());
+    for column in columns {
+        if columns_by_id.insert(column.column_id, column).is_some() {
+            return None;
+        }
+    }
+
+    fn bind(
+        expression: &TypedExpr,
+        columns_by_id: &HashMap<ColumnId, &OutputColumn>,
+    ) -> Option<TypedExpr> {
+        let mut bound = expression.clone();
+        match &mut bound.kind {
+            ExprKind::ColumnRef {
+                column_id, column, ..
+            } => {
+                let input = columns_by_id.get(column_id)?;
+                if expression.data_type != input.data_type {
+                    return None;
+                }
+                *column = input.name.clone();
+                bound.nullable = input.nullable;
+            }
+            ExprKind::BinaryOp { left, right, .. } => {
+                **left = bind(left, columns_by_id)?;
+                **right = bind(right, columns_by_id)?;
+            }
+            ExprKind::UnaryOp { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::IsNull { expr, .. }
+            | ExprKind::IsTruthValue { expr, .. }
+            | ExprKind::Nested(expr) => **expr = bind(expr, columns_by_id)?,
+            ExprKind::FunctionCall { args, .. } => {
+                for argument in args {
+                    *argument = bind(argument, columns_by_id)?;
+                }
+            }
+            ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
+                **body = bind(body, columns_by_id)?;
+            }
+            ExprKind::AggregateCall { args, order_by, .. } => {
+                for argument in args {
+                    *argument = bind(argument, columns_by_id)?;
+                }
+                for item in order_by {
+                    item.expr = bind(&item.expr, columns_by_id)?;
+                }
+            }
+            ExprKind::InList { expr, list, .. } => {
+                **expr = bind(expr, columns_by_id)?;
+                for item in list {
+                    *item = bind(item, columns_by_id)?;
+                }
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                **expr = bind(expr, columns_by_id)?;
+                **low = bind(low, columns_by_id)?;
+                **high = bind(high, columns_by_id)?;
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                **expr = bind(expr, columns_by_id)?;
+                **pattern = bind(pattern, columns_by_id)?;
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    **operand = bind(operand, columns_by_id)?;
+                }
+                for (when, then) in when_then {
+                    *when = bind(when, columns_by_id)?;
+                    *then = bind(then, columns_by_id)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    **else_expr = bind(else_expr, columns_by_id)?;
+                }
+            }
+            ExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for argument in args {
+                    *argument = bind(argument, columns_by_id)?;
+                }
+                for partition in partition_by {
+                    *partition = bind(partition, columns_by_id)?;
+                }
+                for item in order_by {
+                    item.expr = bind(&item.expr, columns_by_id)?;
+                }
+            }
+            ExprKind::Literal(_)
+            | ExprKind::LambdaParamRef { .. }
+            | ExprKind::SubqueryPlaceholder { .. } => {}
+        }
+        Some(bound)
+    }
+
+    bind(expression, &columns_by_id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrossExchangeMode {
     Disabled,
@@ -431,7 +544,21 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
 }
 
 fn place_probe(node: &mut PhysicalPlanNode, filter_id: i32, members: &[TypedExpr]) -> bool {
-    let Some(expr) = best_member(members) else {
+    let bindable: Vec<TypedExpr> = if node.children.is_empty() {
+        members
+            .iter()
+            .filter_map(|member| bind_expression_to_columns(member, &node.output_columns))
+            .collect()
+    } else {
+        members
+            .iter()
+            .filter_map(|member| {
+                let child = expr_bound_child(node, member)?;
+                bind_expression_to_columns(member, &node.children[child].output_columns)
+            })
+            .collect()
+    };
+    let Some(expr) = best_member(&bindable) else {
         return false;
     };
     node.probe_runtime_filters.push(RuntimeFilterProbeIntent {
@@ -691,17 +818,31 @@ fn place_current_node(
         allow_cross_exchange: config.allow_cross_exchange,
         cross_exchange: CrossExchangeMode::from(&distribution),
     };
-    for desc in &descs {
-        let _ = push_probe_down(
+    let mut placed_descs = Vec::with_capacity(descs.len());
+    for desc in descs {
+        let pushed = push_probe_down(
             &mut node.children[sides.probe_child],
             desc.filter_id,
             std::slice::from_ref(&desc.probe_expr),
             policy,
         );
+        if !pushed {
+            let Some(probe_expr) = bind_expression_to_columns(
+                &desc.probe_expr,
+                &node.children[sides.probe_child].output_columns,
+            ) else {
+                continue;
+            };
+            node.probe_runtime_filters.push(RuntimeFilterProbeIntent {
+                filter_id: desc.filter_id,
+                probe_expr,
+            });
+        }
+        placed_descs.push(desc);
     }
 
     if let PhysicalPlanKind::HashJoin(join) = &mut node.kind {
-        join.build_runtime_filters = descs;
+        join.build_runtime_filters = placed_descs;
     }
 }
 
@@ -1271,6 +1412,101 @@ mod tests {
             join.children[0].children[1]
                 .probe_runtime_filters
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn producer_join_fallback_binds_to_the_probe_direct_input() {
+        let left = leaf(vec![out_col(1, "left_key")]);
+        let right = leaf(vec![out_col(3, "right_key")]);
+        let mut boundary = hash_join_node(
+            JoinKind::FullOuter,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "left_key"),
+                col_ref(3, "right_key"),
+                false,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (3, 8.0)]),
+        );
+        boundary.output_columns = vec![
+            OutputColumn {
+                nullable: true,
+                ..out_col(1, "left_key")
+            },
+            OutputColumn {
+                nullable: true,
+                ..out_col(3, "right_key")
+            },
+        ];
+        let coalesced_key = typed_expr(ExprKind::FunctionCall {
+            name: "coalesce".to_string(),
+            args: vec![col_ref(1, "left_key"), col_ref(3, "right_key")],
+            distinct: false,
+        });
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(coalesced_key, col_ref(2, "build_key"), false)],
+            vec![boundary, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut next_filter_id = 0;
+
+        place_node(&mut join, &cfg, &mut next_filter_id);
+
+        assert_eq!(expect_hash_join(&join).build_runtime_filters.len(), 1);
+        assert_eq!(join.probe_runtime_filters.len(), 1);
+        assert!(join.children[0].probe_runtime_filters.is_empty());
+        let ExprKind::FunctionCall { args, .. } = &join.probe_runtime_filters[0].probe_expr.kind
+        else {
+            panic!("coalesced probe expression")
+        };
+        assert!(args.iter().all(|argument| argument.nullable));
+    }
+
+    #[test]
+    fn non_leaf_probe_binding_requires_a_direct_input_expression() {
+        let child = leaf(vec![out_col(1, "input_key")]);
+        let mut project = project_node(
+            vec![ProjectItem {
+                expr: col_ref(1, "input_key"),
+                output_name: "computed_key".to_string(),
+                output_column_id: ColumnId::new_for_test(9),
+            }],
+            vec![out_col(9, "computed_key")],
+            child,
+        );
+
+        assert!(
+            !place_probe(&mut project, 7, &[col_ref(9, "computed_key")]),
+            "a NodeInput binding cannot reference a non-leaf output-only column"
+        );
+        assert!(project.probe_runtime_filters.is_empty());
+
+        let mut leaf = leaf(vec![out_col(9, "source_key")]);
+        assert!(place_probe(&mut leaf, 8, &[col_ref(9, "source_key")]));
+        assert_probe_filter(&leaf, 8, 9);
+    }
+
+    #[test]
+    fn probe_binding_uses_direct_input_column_nullability() {
+        let mut input_column = out_col(1, "outer_key");
+        input_column.nullable = true;
+        let child = leaf(vec![input_column]);
+        let mut parent = values_node(1.0, vec![child]);
+        parent.output_columns = vec![out_col(1, "outer_key")];
+
+        assert!(place_probe(&mut parent, 9, &[col_ref(1, "outer_key")]));
+        let probe = &parent.probe_runtime_filters[0];
+        assert!(
+            probe.probe_expr.nullable,
+            "binding metadata must match the exact direct-input schema"
         );
     }
 
