@@ -628,7 +628,7 @@ pub(crate) fn refresh_mv(
         database: target.namespace,
         name: target.table,
     };
-    let requested_object = crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+    let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
         target
             .catalog
             .as_deref()

@@ -33,9 +33,9 @@ use std::sync::Arc;
 use crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1;
 use crate::engine::StandaloneState;
 use crate::engine::mv::iceberg_discovery::{DiscoveredIcebergMv, discover_iceberg_mvs_from_entry};
-use crate::meta::repository::mv::{
-    CreateMvDefinitionRequest, CreateMvDependencyRequest, MvDependencyObjectRef,
-    MvDependencyObjectType, MvDependencyStorageEngine,
+use crate::meta::repository::mv::{CreateMvDefinitionRequest, CreateMvDependencyRequest};
+use crate::mv::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::descriptor::DescriptorDependency;

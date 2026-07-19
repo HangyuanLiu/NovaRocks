@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod definition;
-pub mod dependency;
-pub mod descriptor;
-pub mod schema;
+pub(crate) mod graph;
+pub mod model;
+pub(crate) mod refresh;
+pub(crate) mod scope;

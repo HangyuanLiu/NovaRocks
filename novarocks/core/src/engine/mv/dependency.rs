@@ -21,76 +21,27 @@ use crate::catalog::identifier::TableIdentity;
 #[cfg(feature = "compat")]
 use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
-use crate::meta::repository::mv::{
-    CreateMvDependencyRequest, MvDependencyObjectRef, MvDependencyObjectType,
-    MvDependencyStorageEngine,
-};
+use crate::meta::repository::mv::CreateMvDependencyRequest;
 use crate::mv::analysis::ResolvedTableRef;
+use crate::mv::dependency::graph::{
+    topological_upstream_order_for_edges, validate_no_cycle_for_edges,
+};
+use crate::mv::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
+    iceberg_table_dependency_ref,
+};
+use crate::mv::dependency::refresh::{MvRefreshDependencyStep, refresh_step_for_dependency_object};
+use crate::mv::dependency::scope::{
+    validate_no_external_dependents_for_scope, validate_no_iceberg_mv_targets_in_scope,
+};
 use crate::mv::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
 use crate::mv::persistence::definition::StoredMvRefreshPolicy;
+use crate::mv::persistence::dependency::stored_definition_dependency_ref;
 
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
-}
-
-pub(crate) fn iceberg_table_dependency_ref(base: &TableIdentity) -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: Some(base.catalog.clone()),
-        database_or_namespace: base.namespace.clone(),
-        name: base.table.clone(),
-        object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::Iceberg,
-    }
-}
-
-pub(crate) fn iceberg_mv_dependency_ref(
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: Some(catalog.to_string()),
-        database_or_namespace: namespace.to_string(),
-        name: table.to_string(),
-        object_type: MvDependencyObjectType::MaterializedView,
-        storage_engine: MvDependencyStorageEngine::Iceberg,
-    }
-}
-
-pub(crate) fn starrocks_mv_dependency_ref(database: &str, table: &str) -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: None,
-        database_or_namespace: database.to_string(),
-        name: table.to_string(),
-        object_type: MvDependencyObjectType::MaterializedView,
-        storage_engine: MvDependencyStorageEngine::StarRocks,
-    }
-}
-
-pub(crate) fn iceberg_table_object_ref(
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: Some(catalog.to_string()),
-        database_or_namespace: namespace.to_string(),
-        name: table.to_string(),
-        object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::Iceberg,
-    }
-}
-
-pub(crate) fn starrocks_table_object_ref(database: &str, table: &str) -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: None,
-        database_or_namespace: database.to_string(),
-        name: table.to_string(),
-        object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::StarRocks,
-    }
 }
 
 pub(crate) fn ensure_no_downstream_dependencies(
@@ -109,29 +60,17 @@ pub(crate) fn ensure_no_downstream_dependencies(
         .map_err(|e| e.to_string())
 }
 
-pub(crate) fn stored_definition_dependency_ref(
+fn iceberg_mv_target_ref_for_scope(
     definition: &StoredMvDefinition,
-    starrocks_name: Option<(&str, &str)>,
-) -> Result<MvDependencyObjectRef, String> {
-    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        let catalog = definition
-            .target_catalog
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target catalog".to_string())?;
-        let namespace = definition
-            .target_namespace
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target namespace".to_string())?;
-        let table = definition
-            .target_table
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target table".to_string())?;
-        return Ok(iceberg_mv_dependency_ref(catalog, namespace, table));
+) -> Option<MvDependencyObjectRef> {
+    if !definition.storage_engine.eq_ignore_ascii_case("iceberg") {
+        return None;
     }
-    let (database, table) = starrocks_name.ok_or_else(|| {
-        "StarRocks table MV definition requires database/table name for dependency ref".to_string()
-    })?;
-    Ok(starrocks_mv_dependency_ref(database, table))
+    Some(iceberg_mv_dependency_ref(
+        definition.target_catalog.as_deref()?,
+        definition.target_namespace.as_deref()?,
+        definition.target_table.as_deref()?,
+    ))
 }
 
 pub(crate) fn resolve_create_mv_dependencies(
@@ -217,76 +156,6 @@ pub(crate) fn resolve_create_mv_dependencies(
     })
 }
 
-fn object_in_iceberg_scope(
-    object: &MvDependencyObjectRef,
-    scope_catalog: &str,
-    scope_namespace: Option<&str>,
-) -> bool {
-    if object.storage_engine != MvDependencyStorageEngine::Iceberg {
-        return false;
-    }
-    let Some(obj_catalog) = object.catalog.as_deref() else {
-        return false;
-    };
-    if !obj_catalog.eq_ignore_ascii_case(scope_catalog) {
-        return false;
-    }
-    if let Some(ns) = scope_namespace
-        && !object.database_or_namespace.eq_ignore_ascii_case(ns)
-    {
-        return false;
-    }
-    true
-}
-
-fn iceberg_mv_target_in_scope(
-    definition: &StoredMvDefinition,
-    scope_catalog: &str,
-    scope_namespace: Option<&str>,
-) -> Option<String> {
-    if !definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        return None;
-    }
-    let catalog = definition.target_catalog.as_deref()?;
-    let namespace = definition.target_namespace.as_deref()?;
-    let table = definition.target_table.as_deref()?;
-    if !catalog.eq_ignore_ascii_case(scope_catalog) {
-        return None;
-    }
-    if let Some(ns) = scope_namespace
-        && !namespace.eq_ignore_ascii_case(ns)
-    {
-        return None;
-    }
-    Some(format!("{catalog}.{namespace}.{table}"))
-}
-
-pub(crate) fn validate_no_iceberg_mv_targets_in_scope(
-    scope_catalog: &str,
-    scope_namespace: Option<&str>,
-    definitions: &[StoredMvDefinition],
-) -> Result<(), String> {
-    let mut in_scope_targets = definitions
-        .iter()
-        .filter_map(|definition| {
-            iceberg_mv_target_in_scope(definition, scope_catalog, scope_namespace)
-        })
-        .collect::<Vec<_>>();
-    if in_scope_targets.is_empty() {
-        return Ok(());
-    }
-    in_scope_targets.sort();
-    in_scope_targets.dedup();
-    let scope_str = match scope_namespace {
-        Some(ns) => format!("`{scope_catalog}.{ns}`"),
-        None => format!("`{scope_catalog}`"),
-    };
-    Err(format!(
-        "cannot drop {scope_str}: contains materialized views: {}; use DROP MATERIALIZED VIEW first",
-        in_scope_targets.join(", ")
-    ))
-}
-
 pub(crate) fn ensure_no_iceberg_mv_targets_in_scope(
     state: &Arc<StandaloneState>,
     scope_catalog: &str,
@@ -302,48 +171,12 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope(
         .mv_repo
         .list_definitions(read.as_ref())
         .map_err(|e| format!("load MV definitions for drop target scope check failed: {e}"))?;
+    let targets = definitions
+        .iter()
+        .filter_map(iceberg_mv_target_ref_for_scope)
+        .collect::<Vec<_>>();
 
-    validate_no_iceberg_mv_targets_in_scope(scope_catalog, scope_namespace, &definitions)
-}
-
-/// Pure orphan-prevention check: given the full set of MV targets and their
-/// upstream dependencies, reject the scope drop if any MV outside the scope
-/// depends on an upstream inside the scope.
-pub(crate) fn validate_no_external_dependents_for_scope(
-    scope_catalog: &str,
-    scope_namespace: Option<&str>,
-    definitions_with_deps: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
-) -> Result<(), String> {
-    let mut external_dependents: Vec<String> = Vec::new();
-    for (target, upstreams) in definitions_with_deps {
-        let target_in_scope = object_in_iceberg_scope(target, scope_catalog, scope_namespace);
-        if target_in_scope {
-            continue;
-        }
-        for upstream in upstreams {
-            if object_in_iceberg_scope(upstream, scope_catalog, scope_namespace) {
-                external_dependents.push(format!(
-                    "{} depends on {}",
-                    target.display_name(),
-                    upstream.display_name(),
-                ));
-                break;
-            }
-        }
-    }
-
-    if external_dependents.is_empty() {
-        return Ok(());
-    }
-    external_dependents.sort();
-    let scope_str = match scope_namespace {
-        Some(ns) => format!("`{scope_catalog}.{ns}`"),
-        None => format!("`{scope_catalog}`"),
-    };
-    Err(format!(
-        "cannot drop {scope_str}: would orphan downstream materialized views: {}",
-        external_dependents.join(", ")
-    ))
+    validate_no_iceberg_mv_targets_in_scope(scope_catalog, scope_namespace, &targets)
 }
 
 /// State-aware wrapper around `validate_no_external_dependents_for_scope`:
@@ -381,137 +214,6 @@ pub(crate) fn ensure_no_external_iceberg_dependents(
     }
 
     validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
-}
-
-pub(crate) fn validate_no_cycle_for_edges(
-    new_target: &MvDependencyObjectRef,
-    new_upstreams: &[MvDependencyObjectRef],
-    existing_edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
-) -> Result<(), String> {
-    let mut graph: std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>> =
-        std::collections::BTreeMap::new();
-    for (downstream, upstreams) in existing_edges {
-        graph.insert(downstream.clone(), upstreams.clone());
-    }
-    graph.insert(new_target.clone(), new_upstreams.to_vec());
-
-    fn visit(
-        graph: &std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>>,
-        node: &MvDependencyObjectRef,
-        target: &MvDependencyObjectRef,
-        path: &mut Vec<MvDependencyObjectRef>,
-    ) -> Option<Vec<MvDependencyObjectRef>> {
-        if path.contains(node) {
-            return None;
-        }
-        path.push(node.clone());
-        for upstream in graph.get(node).cloned().unwrap_or_default() {
-            if &upstream == target {
-                let mut cycle = path.clone();
-                cycle.push(upstream);
-                return Some(cycle);
-            }
-            if upstream.object_type == MvDependencyObjectType::MaterializedView
-                && let Some(cycle) = visit(graph, &upstream, target, path)
-            {
-                return Some(cycle);
-            }
-        }
-        path.pop();
-        None
-    }
-
-    if let Some(cycle) = visit(&graph, new_target, new_target, &mut Vec::new()) {
-        let display = cycle
-            .iter()
-            .map(MvDependencyObjectRef::display_name)
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        return Err(format!("dependency cycle detected: {display}"));
-    }
-    Ok(())
-}
-
-pub(crate) fn topological_upstream_order_for_edges(
-    target: &MvDependencyObjectRef,
-    existing_edges: &[(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)],
-) -> Result<Vec<MvDependencyObjectRef>, String> {
-    let mut graph: std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>> =
-        std::collections::BTreeMap::new();
-    for (downstream, upstreams) in existing_edges {
-        graph.insert(downstream.clone(), upstreams.clone());
-    }
-
-    let mut permanent = std::collections::BTreeSet::new();
-    let mut temporary = std::collections::BTreeSet::new();
-    let mut ordered = Vec::new();
-
-    fn visit(
-        node: &MvDependencyObjectRef,
-        graph: &std::collections::BTreeMap<MvDependencyObjectRef, Vec<MvDependencyObjectRef>>,
-        permanent: &mut std::collections::BTreeSet<MvDependencyObjectRef>,
-        temporary: &mut std::collections::BTreeSet<MvDependencyObjectRef>,
-        ordered: &mut Vec<MvDependencyObjectRef>,
-    ) -> Result<(), String> {
-        if permanent.contains(node) {
-            return Ok(());
-        }
-        if !temporary.insert(node.clone()) {
-            return Err(format!(
-                "dependency cycle detected while planning refresh at {}",
-                node.display_name()
-            ));
-        }
-        for upstream in graph.get(node).cloned().unwrap_or_default() {
-            if upstream.object_type == MvDependencyObjectType::MaterializedView {
-                visit(&upstream, graph, permanent, temporary, ordered)?;
-            }
-        }
-        temporary.remove(node);
-        permanent.insert(node.clone());
-        ordered.push(node.clone());
-        Ok(())
-    }
-
-    visit(target, &graph, &mut permanent, &mut temporary, &mut ordered)?;
-    Ok(ordered)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvRefreshDependencyStep {
-    pub(crate) object: MvDependencyObjectRef,
-    pub(crate) target: crate::mv::model::MvTarget,
-    pub(crate) storage_engine: crate::mv::model::MvStorageEngine,
-}
-
-pub(crate) fn refresh_step_for_dependency_object(
-    object: &MvDependencyObjectRef,
-) -> Result<MvRefreshDependencyStep, String> {
-    if object.object_type != MvDependencyObjectType::MaterializedView {
-        return Err(format!(
-            "refresh dependency object is not a materialized view: {}",
-            object.display_name()
-        ));
-    }
-    let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::StarRocks => crate::mv::model::MvStorageEngine::StarRocks,
-        MvDependencyStorageEngine::Iceberg => crate::mv::model::MvStorageEngine::Iceberg,
-        MvDependencyStorageEngine::ExternalTable => {
-            return Err(format!(
-                "external table cannot be refreshed as materialized view: {}",
-                object.display_name()
-            ));
-        }
-    };
-    Ok(MvRefreshDependencyStep {
-        object: object.clone(),
-        target: crate::mv::model::MvTarget {
-            catalog: object.catalog.clone(),
-            database: object.database_or_namespace.clone(),
-            name: object.name.clone(),
-        },
-        storage_engine,
-    })
 }
 
 pub(crate) fn build_upstream_refresh_steps(
@@ -624,6 +326,8 @@ fn stored_definition_dependency_ref_from_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::dependency::model::iceberg_mv_dependency_ref;
+    use crate::mv::dependency::scope as dependency_scope;
 
     fn stored_mv_definition(
         storage_engine: &str,
@@ -662,219 +366,36 @@ mod tests {
     }
 
     #[test]
-    fn dependency_ref_display_distinguishes_table_and_mv() {
-        let table = iceberg_table_dependency_ref(&TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "sales".to_string(),
-            table: "orders".to_string(),
-        });
-        let mv = iceberg_mv_dependency_ref("ice", "sales", "orders_mv");
-
-        assert_eq!(table.display_name(), "ice.sales.orders");
-        assert_eq!(mv.display_name(), "mv:ice.sales.orders_mv");
-    }
-
-    #[test]
-    fn iceberg_mv_targets_scope_rejects_namespace_scope() {
-        let definitions = vec![stored_mv_definition(
-            "iceberg",
-            Some("ice"),
-            Some("analytics"),
-            Some("mv_orders"),
-        )];
-
-        let err = validate_no_iceberg_mv_targets_in_scope("ice", Some("analytics"), &definitions)
-            .expect_err("namespace drop containing an iceberg MV must be rejected");
-        assert!(err.contains("cannot drop `ice.analytics`"), "err: {err}");
-        assert!(err.contains("ice.analytics.mv_orders"), "err: {err}");
-        assert!(err.contains("DROP MATERIALIZED VIEW"), "err: {err}");
-    }
-
-    #[test]
-    fn iceberg_mv_targets_scope_rejects_catalog_scope() {
-        let definitions = vec![stored_mv_definition(
-            "iceberg",
-            Some("ice"),
-            Some("analytics"),
-            Some("mv_orders"),
-        )];
-
-        let err = validate_no_iceberg_mv_targets_in_scope("ice", None, &definitions)
-            .expect_err("catalog drop containing an iceberg MV must be rejected");
-        assert!(err.contains("cannot drop `ice`"), "err: {err}");
-        assert!(err.contains("ice.analytics.mv_orders"), "err: {err}");
-    }
-
-    #[test]
-    fn iceberg_mv_targets_scope_ignores_non_iceberg_and_outside_scope() {
-        let definitions = vec![
+    fn iceberg_mv_target_projection_tolerates_legacy_definitions() {
+        let definitions = [
             stored_mv_definition(
                 "starrocks",
-                Some("ice"),
-                Some("analytics"),
-                Some("mv_starrocks"),
+                Some("Catalog"),
+                Some("Namespace"),
+                Some("Table"),
             ),
-            stored_mv_definition("iceberg", Some("ice"), Some("other"), Some("mv_other")),
-            stored_mv_definition(
-                "iceberg",
-                Some("other_catalog"),
-                Some("analytics"),
-                Some("mv_other_catalog"),
-            ),
+            stored_mv_definition("iceberg", None, Some("Namespace"), Some("Table")),
+            stored_mv_definition("iceberg", Some("Catalog"), None, Some("Table")),
+            stored_mv_definition("iceberg", Some("Catalog"), Some("Namespace"), None),
+            stored_mv_definition("Iceberg", Some("Catalog"), Some("Namespace"), Some("Table")),
         ];
 
-        validate_no_iceberg_mv_targets_in_scope("ice", Some("analytics"), &definitions)
-            .expect("only in-scope iceberg MV targets should block the drop");
-    }
+        let projected = definitions
+            .iter()
+            .filter_map(iceberg_mv_target_ref_for_scope)
+            .collect::<Vec<_>>();
 
-    #[test]
-    fn iceberg_mv_targets_scope_case_insensitive_matching() {
-        let definitions = vec![stored_mv_definition(
-            "Iceberg",
-            Some("ICE"),
-            Some("Analytics"),
-            Some("mv_orders"),
-        )];
-
-        let err = validate_no_iceberg_mv_targets_in_scope("ice", Some("analytics"), &definitions)
-            .expect_err("case-insensitive scope match must reject the drop");
-        assert!(err.contains("ICE.Analytics.mv_orders"), "err: {err}");
-    }
-
-    #[test]
-    fn dependency_cycle_detector_rejects_new_back_edge() {
-        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
-        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
-        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
-        let existing = vec![
-            (mv_a.clone(), vec![mv_b.clone()]),
-            (mv_b.clone(), vec![mv_c.clone()]),
-        ];
-
-        let err = validate_no_cycle_for_edges(&mv_c, &[mv_a.clone()], &existing)
-            .expect_err("c -> a should form a cycle");
         assert_eq!(
-            err,
-            "dependency cycle detected: mv:ice.sales.mv_c -> mv:ice.sales.mv_a -> mv:ice.sales.mv_b -> mv:ice.sales.mv_c"
+            projected,
+            vec![iceberg_mv_dependency_ref("Catalog", "Namespace", "Table")]
         );
-    }
-
-    #[test]
-    fn dependency_cycle_detector_accepts_dag() {
-        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
-        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
-        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
-        let existing = vec![(mv_b.clone(), vec![mv_a.clone()])];
-
-        validate_no_cycle_for_edges(&mv_c, &[mv_b], &existing).expect("dag should be accepted");
-        let _ = mv_a;
-    }
-
-    #[test]
-    fn topological_upstream_order_runs_deepest_first() {
-        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
-        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
-        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
-        let edges = vec![
-            (mv_b.clone(), vec![mv_a.clone()]),
-            (mv_c.clone(), vec![mv_b.clone()]),
-        ];
-
-        let order = topological_upstream_order_for_edges(&mv_c, &edges).expect("order");
-        assert_eq!(order, vec![mv_a, mv_b, mv_c]);
-    }
-
-    #[test]
-    fn external_dependents_scope_passes_when_scope_is_self_contained() {
-        // Downstream MV is *inside* the scope (cat1.db1), so dropping the
-        // scope also drops the downstream — no orphan risk.
-        let mv_target = iceberg_mv_dependency_ref("cat1", "db1", "mv_inside");
-        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
-        let edges = vec![(mv_target, vec![upstream])];
-
-        validate_no_external_dependents_for_scope("cat1", Some("db1"), &edges)
-            .expect("scope-internal MV must not block the drop");
-    }
-
-    #[test]
-    fn external_dependents_scope_rejects_external_dependent() {
-        // Downstream MV lives outside the scope but depends on a table inside
-        // it — dropping the scope would orphan the MV.
-        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
-        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
-        let edges = vec![(mv_target, vec![upstream])];
-
-        let err = validate_no_external_dependents_for_scope("cat1", Some("db1"), &edges)
-            .expect_err("orphaning MV must be rejected");
-        assert!(
-            err.contains("cannot drop `cat1.db1`"),
-            "err missing scope label: {err}"
-        );
-        assert!(
-            err.contains("mv:cat2.db2.mv_outside depends on cat1.db1.orders"),
-            "err missing dependent detail: {err}"
-        );
-    }
-
-    #[test]
-    fn external_dependents_scope_at_catalog_granularity() {
-        // DROP CATALOG cat1 — same risk, but the scope spans every namespace
-        // under cat1. An MV in cat2.* depending on anything under cat1.*
-        // must block the drop.
-        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
-        let upstream_a = iceberg_table_object_ref("cat1", "ns1", "events");
-        let upstream_b = iceberg_table_object_ref("cat1", "ns2", "orders");
-        let edges = vec![(mv_target, vec![upstream_a.clone(), upstream_b.clone()])];
-
-        let err = validate_no_external_dependents_for_scope("cat1", None, &edges)
-            .expect_err("catalog-wide drop must reject the orphan");
-        assert!(err.contains("cannot drop `cat1`"), "err: {err}");
-
-        // Reverse: dropping cat2 should be fine — cat2.mv depends only on
-        // cat1.* upstreams; nothing inside cat2 has external dependents.
-        validate_no_external_dependents_for_scope("cat2", None, &edges)
-            .expect("dropping the catalog that contains only an MV is allowed");
-    }
-
-    #[test]
-    fn external_dependents_scope_ignores_non_iceberg_upstreams() {
-        // StarRocks table upstreams are never in an Iceberg scope, even if the
-        // catalog/namespace strings happen to match.
-        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
-        let upstream = starrocks_table_object_ref("cat1", "orders");
-        let edges = vec![(mv_target, vec![upstream])];
-
-        validate_no_external_dependents_for_scope("cat1", Some("orders"), &edges)
-            .expect("non-iceberg upstreams must not block iceberg-scope drops");
-    }
-
-    #[test]
-    fn external_dependents_scope_case_insensitive_matching() {
-        // Catalog/namespace identifiers are normalized to lowercase by the
-        // resolver; ensure the scope check also works when the caller passes
-        // mixed-case values.
-        let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
-        let upstream = iceberg_table_object_ref("cat1", "db1", "orders");
-        let edges = vec![(mv_target, vec![upstream])];
-
-        let err = validate_no_external_dependents_for_scope("CAT1", Some("DB1"), &edges)
-            .expect_err("case-insensitive scope match must still reject orphan");
-        assert!(err.contains("cannot drop `CAT1.DB1`"), "err: {err}");
-    }
-
-    #[test]
-    fn topological_upstream_order_deduplicates_shared_dependencies() {
-        let mv_a = iceberg_mv_dependency_ref("ice", "sales", "mv_a");
-        let mv_b = iceberg_mv_dependency_ref("ice", "sales", "mv_b");
-        let mv_c = iceberg_mv_dependency_ref("ice", "sales", "mv_c");
-        let mv_d = iceberg_mv_dependency_ref("ice", "sales", "mv_d");
-        let edges = vec![
-            (mv_b.clone(), vec![mv_a.clone()]),
-            (mv_c.clone(), vec![mv_a.clone()]),
-            (mv_d.clone(), vec![mv_b.clone(), mv_c.clone()]),
-        ];
-
-        let order = topological_upstream_order_for_edges(&mv_d, &edges).expect("order");
-        assert_eq!(order, vec![mv_a, mv_b, mv_c, mv_d]);
+        let err = dependency_scope::validate_no_iceberg_mv_targets_in_scope(
+            "catalog",
+            Some("namespace"),
+            &projected,
+        )
+        .expect_err("the complete mixed-case target must remain visible to the scope check");
+        assert!(err.contains("Catalog.Namespace.Table"), "err: {err}");
+        assert!(!err.contains("mv:"), "err: {err}");
     }
 }

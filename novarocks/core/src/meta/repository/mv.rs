@@ -27,15 +27,18 @@ use crate::meta::{
     ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
     MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
+use crate::mv::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
 use crate::mv::persistence::definition::{
     MV_DEFINITION_SUBJECT, StoredMvDefinition, StoredMvDefinitionAvro, StoredMvRefreshPolicy,
 };
+use crate::mv::persistence::dependency::{MV_DEPENDENCY_SUBJECT, StoredMvDependency};
 use crate::mv::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
 const MV_TARGET_LOOKUP_KIND: &str = "mv.target_lookup";
 const MV_REFRESH_KIND: &str = "mv.refresh";
 const MV_PARTITION_STATE_KIND: &str = "mv.partition_state";
-const MV_DEPENDENCY_KIND: &str = "mv.dependency";
 
 #[derive(Default)]
 pub struct MvMetaRepository;
@@ -112,50 +115,6 @@ pub struct RecordFailedMvPartitionStatesRequest {
     pub target_snapshot_id: Option<i64>,
     pub last_refresh_id: i64,
     pub max_entries: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvDependencyObjectType {
-    Table,
-    MaterializedView,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MvDependencyStorageEngine {
-    StarRocks,
-    Iceberg,
-    ExternalTable,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct MvDependencyObjectRef {
-    pub catalog: Option<String>,
-    pub database_or_namespace: String,
-    pub name: String,
-    pub object_type: MvDependencyObjectType,
-    pub storage_engine: MvDependencyStorageEngine,
-}
-
-impl MvDependencyObjectRef {
-    pub fn display_name(&self) -> String {
-        let object = match self.catalog.as_deref() {
-            Some(catalog) => format!("{catalog}.{}.{}", self.database_or_namespace, self.name),
-            None => format!("{}.{}", self.database_or_namespace, self.name),
-        };
-        match self.object_type {
-            MvDependencyObjectType::Table => object,
-            MvDependencyObjectType::MaterializedView => format!("mv:{object}"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMvDependency {
-    pub downstream_mv_id: i64,
-    pub upstream: MvDependencyObjectRef,
-    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1701,23 +1660,23 @@ fn key_prefix_dependency_by_upstream(
 }
 
 fn decode_dependency_record(record: MetaRecord) -> RepositoryResult<StoredMvDependency> {
-    decode_record_payload(&record, MV_DEPENDENCY_KIND)
+    decode_record_payload(&record, MV_DEPENDENCY_SUBJECT)
 }
 
 fn put_dependency_indexes(
     txn: &mut dyn MetaWriteTxn,
     dependency: &StoredMvDependency,
 ) -> RepositoryResult<()> {
-    let payload = encode_record_payload(MV_DEPENDENCY_KIND, dependency)?;
+    let payload = encode_record_payload(MV_DEPENDENCY_SUBJECT, dependency)?;
     txn.put(MetaRecordPut::new(
         key_dependency_by_downstream(dependency.downstream_mv_id, &dependency.upstream)?,
-        record_kind(MV_DEPENDENCY_KIND)?,
+        record_kind(MV_DEPENDENCY_SUBJECT)?,
         ExpectedRevision::Any,
         payload.clone(),
     ))?;
     txn.put(MetaRecordPut::new(
         key_dependency_by_upstream(&dependency.upstream, dependency.downstream_mv_id)?,
-        record_kind(MV_DEPENDENCY_KIND)?,
+        record_kind(MV_DEPENDENCY_SUBJECT)?,
         ExpectedRevision::Any,
         payload,
     ))?;

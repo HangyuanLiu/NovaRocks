@@ -74,9 +74,8 @@ use crate::meta::repository::iceberg_operation::{
     StoredIcebergOperation,
 };
 use crate::meta::repository::mv::{
-    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvDependencyObjectType,
-    MvDependencyStorageEngine, MvRefreshFinalizeRequest, MvRefreshState,
-    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
+    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvRefreshFinalizeRequest,
+    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshExternalOutcome,
     ReplaceMvPartitionStatesRequest, StoredMvRefresh, UpdateMvPartitionContractRequest,
 };
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
@@ -89,6 +88,7 @@ use crate::mv::analysis::{
     MvAnalysis, canonicalize_iceberg_mv_select_query, output_column_to_table_column,
     resolve_mv_name, validate_mv_partition_columns,
 };
+use crate::mv::dependency::model::{MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::descriptor::{
@@ -225,7 +225,7 @@ pub(crate) fn create_iceberg_mv(
         &analysis.resolved_refs,
         created_at_ms,
     )?;
-    let dependency_target = crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+    let dependency_target = crate::mv::dependency::model::iceberg_mv_dependency_ref(
         &target.catalog,
         &target.namespace,
         &target.table,
@@ -235,8 +235,8 @@ pub(crate) fn create_iceberg_mv(
     // target has no inbound edges, while an already-existing target fails on
     // existence first). Kept as a safety net for future paths that bypass the
     // existence check — e.g. ALTER MATERIALIZED VIEW rewriting a SELECT, or
-    // racy metadata writes. Algorithm coverage lives in
-    // src/engine/mv/dependency.rs::tests.
+    // racy metadata writes. Canonical cycle algorithm coverage lives in
+    // crate::mv::dependency::graph::tests.
     crate::engine::mv::dependency::validate_no_create_cycle(
         state,
         &dependency_target,
@@ -15939,7 +15939,7 @@ fn preflight_iceberg_mv_drop(
     }
     crate::engine::mv::dependency::ensure_no_downstream_dependencies(
         state,
-        &crate::engine::mv::dependency::iceberg_mv_dependency_ref(
+        &crate::mv::dependency::model::iceberg_mv_dependency_ref(
             &target.catalog,
             &target.namespace,
             &target.table,
