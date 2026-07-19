@@ -347,75 +347,142 @@ fn validate_aggregate_layout_compatibility(
     target_calls: &AggregateSqlCalls,
     target_layout: &AggregateMvLayout,
 ) -> Result<(), String> {
-    let call_shape_matches = source_calls
+    let mismatch = |dimension: &str| {
+        Err(format!(
+            "aggregate MV branch {branch_index} {dimension} mismatch with branch 0"
+        ))
+    };
+    if source_calls.visible_outputs != target_calls.visible_outputs {
+        return mismatch("visible output order");
+    }
+    if source_calls.group_keys.len() != target_calls.group_keys.len() {
+        return mismatch("group-key count");
+    }
+    if source_calls.aggregates.len() != target_calls.aggregates.len() {
+        return mismatch("aggregate count");
+    }
+    for (aggregate_index, (source, target)) in source_calls
         .aggregates
         .iter()
         .zip(target_calls.aggregates.iter())
-        .all(|(source, target)| {
-            source.function == target.function
-                && matches!(
-                    (&source.input, &target.input),
-                    (
-                        crate::mv::aggregate_state::mv_shape::AggregateInput::Star,
-                        crate::mv::aggregate_state::mv_shape::AggregateInput::Star
-                    ) | (
-                        crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_),
-                        crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_)
-                    )
-                )
-        });
-    let visible_layout_matches = source_layout
+        .enumerate()
+    {
+        if source.function != target.function {
+            return mismatch(&format!("aggregate {aggregate_index} function"));
+        }
+        let input_kind_matches = matches!(
+            (&source.input, &target.input),
+            (
+                crate::mv::aggregate_state::mv_shape::AggregateInput::Star,
+                crate::mv::aggregate_state::mv_shape::AggregateInput::Star
+            ) | (
+                crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_),
+                crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_)
+            )
+        );
+        if !input_kind_matches {
+            return mismatch(&format!("aggregate {aggregate_index} input kind"));
+        }
+    }
+    if source_layout.visible_columns.len() != target_layout.visible_columns.len() {
+        return mismatch("visible column count");
+    }
+    for (column_index, (source, target)) in source_layout
         .visible_columns
         .iter()
         .zip(target_layout.visible_columns.iter())
-        .all(|(source, target)| {
-            source.data_type == target.data_type
-                && source.sql_type == target.sql_type
-                && source.nullable == target.nullable
-                && source.source_index == target.source_index
-        });
-    let state_layout_matches = source_layout
+        .enumerate()
+    {
+        if source.data_type != target.data_type {
+            return mismatch(&format!("visible column {column_index} Arrow type"));
+        }
+        if source.sql_type != target.sql_type {
+            return mismatch(&format!("visible column {column_index} SQL type"));
+        }
+        if source.nullable != target.nullable {
+            return mismatch(&format!("visible column {column_index} nullability"));
+        }
+        if source.source_index != target.source_index {
+            return mismatch(&format!("visible column {column_index} source index"));
+        }
+    }
+    if source_layout.state_columns.len() != target_layout.state_columns.len() {
+        return mismatch("state column count");
+    }
+    for (column_index, (source, target)) in source_layout
         .state_columns
         .iter()
         .zip(target_layout.state_columns.iter())
-        .all(|(source, target)| {
-            source.data_type == target.data_type
-                && source.sql_type == target.sql_type
-                && source.nullable == target.nullable
-                && source.visible_source_index == target.visible_source_index
-                && source.aggregate_index == target.aggregate_index
-                && source.function == target.function
-                && source.state_role == target.state_role
-                && source.count_star == target.count_star
-        });
-    let physical_layout_matches = source_layout
+        .enumerate()
+    {
+        if source.data_type != target.data_type {
+            return mismatch(&format!("state column {column_index} Arrow type"));
+        }
+        if source.sql_type != target.sql_type {
+            return mismatch(&format!("state column {column_index} SQL type"));
+        }
+        if source.nullable != target.nullable {
+            return mismatch(&format!("state column {column_index} nullability"));
+        }
+        if source.visible_source_index != target.visible_source_index {
+            return mismatch(&format!("state column {column_index} visible source index"));
+        }
+        if source.aggregate_index != target.aggregate_index {
+            return mismatch(&format!("state column {column_index} aggregate index"));
+        }
+        if source.function != target.function {
+            return mismatch(&format!("state column {column_index} function"));
+        }
+        if source.state_role != target.state_role {
+            return mismatch(&format!("state column {column_index} role"));
+        }
+        if source.count_star != target.count_star {
+            return mismatch(&format!("state column {column_index} count-star flag"));
+        }
+    }
+    if source_layout.aggregate_input_types.len() != target_layout.aggregate_input_types.len() {
+        return mismatch("aggregate input type count");
+    }
+    for (aggregate_index, (source, target)) in source_layout
+        .aggregate_input_types
+        .iter()
+        .zip(target_layout.aggregate_input_types.iter())
+        .enumerate()
+    {
+        if source != target {
+            return mismatch(&format!("aggregate {aggregate_index} input type"));
+        }
+    }
+    if source_layout.group_key_source_indexes != target_layout.group_key_source_indexes {
+        return mismatch("group-key source indexes");
+    }
+    if source_layout.physical_columns.len() != target_layout.physical_columns.len() {
+        return mismatch("physical column count");
+    }
+    for (column_index, (source, target)) in source_layout
         .physical_columns
         .iter()
         .zip(target_layout.physical_columns.iter())
-        .all(|(source, target)| {
-            source.column.data_type == target.column.data_type
-                && source.column.nullable == target.column.nullable
-                && source.column.aggregation == target.column.aggregation
-                && source.column.default == target.column.default
-                && source.visible == target.visible
-                && source.is_key == target.is_key
-        });
-    if source_calls.visible_outputs != target_calls.visible_outputs
-        || source_calls.group_keys.len() != target_calls.group_keys.len()
-        || source_calls.aggregates.len() != target_calls.aggregates.len()
-        || source_layout.visible_columns.len() != target_layout.visible_columns.len()
-        || source_layout.state_columns.len() != target_layout.state_columns.len()
-        || source_layout.physical_columns.len() != target_layout.physical_columns.len()
-        || source_layout.aggregate_input_types != target_layout.aggregate_input_types
-        || source_layout.group_key_source_indexes != target_layout.group_key_source_indexes
-        || !call_shape_matches
-        || !visible_layout_matches
-        || !state_layout_matches
-        || !physical_layout_matches
+        .enumerate()
     {
-        return Err(format!(
-            "aggregate MV branch {branch_index} layout shape mismatch with branch 0"
-        ));
+        if source.column.data_type != target.column.data_type {
+            return mismatch(&format!("physical column {column_index} SQL type"));
+        }
+        if source.column.nullable != target.column.nullable {
+            return mismatch(&format!("physical column {column_index} nullability"));
+        }
+        if source.column.aggregation != target.column.aggregation {
+            return mismatch(&format!("physical column {column_index} aggregation role"));
+        }
+        if source.column.default != target.column.default {
+            return mismatch(&format!("physical column {column_index} default"));
+        }
+        if source.visible != target.visible {
+            return mismatch(&format!("physical column {column_index} visibility role"));
+        }
+        if source.is_key != target.is_key {
+            return mismatch(&format!("physical column {column_index} key role"));
+        }
     }
     Ok(())
 }
@@ -971,8 +1038,127 @@ mod tests {
         assert!(error.contains("first branch calls drifted"), "{error}");
     }
 
+    fn assert_branch_layout_mismatch(
+        source_calls: &AggregateSqlCalls,
+        source_layout: &AggregateMvLayout,
+        target_calls: &AggregateSqlCalls,
+        target_layout: &AggregateMvLayout,
+        dimension: &str,
+    ) {
+        let error = validate_aggregate_layout_compatibility(
+            1,
+            source_calls,
+            source_layout,
+            target_calls,
+            target_layout,
+        )
+        .expect_err("branch layout drift must fail");
+
+        assert_eq!(
+            error,
+            format!("aggregate MV branch 1 {dimension} mismatch with branch 0")
+        );
+    }
+
     #[test]
-    fn branch_rejects_layout_shape_drift() {
+    fn branch_reports_specific_layout_mismatch_dimensions() {
+        let target_calls =
+            parse_calls("select region, count(*) as c from ice.sales.fact_a group by region");
+        let target_layout = count_layout("region");
+
+        let reordered_calls =
+            parse_calls("select count(*) as c, region from ice.sales.fact_b group by region");
+        assert_branch_layout_mismatch(
+            &reordered_calls,
+            &target_layout,
+            &target_calls,
+            &target_layout,
+            "visible output order",
+        );
+
+        let sum_calls =
+            parse_calls("select region, sum(amount) as c from ice.sales.fact_b group by region");
+        assert_branch_layout_mismatch(
+            &sum_calls,
+            &target_layout,
+            &target_calls,
+            &target_layout,
+            "aggregate 0 function",
+        );
+
+        let count_expr_calls =
+            parse_calls("select region, count(region) as c from ice.sales.fact_b group by region");
+        assert_branch_layout_mismatch(
+            &count_expr_calls,
+            &target_layout,
+            &target_calls,
+            &target_layout,
+            "aggregate 0 input kind",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.visible_columns[0].data_type = DataType::Int64;
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "visible column 0 Arrow type",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.visible_columns[0].sql_type = SqlType::BigInt;
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "visible column 0 SQL type",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.visible_columns[0].nullable = false;
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "visible column 0 nullability",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.state_columns[0].state_role = AggregateStateRole::RetractionCount;
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "state column 0 role",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.aggregate_input_types[0] = Some(DataType::Int64);
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "aggregate 0 input type",
+        );
+
+        let mut source_layout = target_layout.clone();
+        source_layout.physical_columns[1].visible = false;
+        assert_branch_layout_mismatch(
+            &target_calls,
+            &source_layout,
+            &target_calls,
+            &target_layout,
+            "physical column 1 visibility role",
+        );
+    }
+
+    #[test]
+    fn branch_preparation_propagates_specific_layout_mismatch() {
         let select_sql = branch_select_sql();
         let first_calls = first_branch_calls(select_sql);
         let pin = branch_pin();
@@ -1002,7 +1188,10 @@ mod tests {
         .expect_err("layout nullability drift must fail");
 
         assert_eq!(reads, 2);
-        assert!(error.contains("branch 1 layout shape mismatch"), "{error}");
+        assert_eq!(
+            error,
+            "aggregate MV branch 1 visible column 0 nullability mismatch with branch 0"
+        );
     }
 
     #[test]
