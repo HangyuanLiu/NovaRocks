@@ -9662,50 +9662,6 @@ pub(crate) async fn commit_iceberg_mv_with_populated_collector(
     finalize_mv_branch_commit_outcome(catalog, ident, &collector, target_ref, outcome).await
 }
 
-/// IVM-A1 helper: construct an empty `IcebergCommitCollector` configured for
-/// the supplied target table and branch. The refresh driver hands the
-/// resulting `Arc` to the change-stream write DAG routing step so writer
-/// reports can be injected during execution, then later passes the same `Arc` to
-/// [`commit_iceberg_mv_with_populated_collector`].
-#[allow(dead_code)]
-pub(crate) fn new_iceberg_mv_commit_collector(
-    table: &iceberg::table::Table,
-    ident: &TableIdent,
-    target_ref: &str,
-    op_kind: CommitOpKind,
-) -> Arc<IcebergCommitCollector> {
-    let metadata = table.metadata();
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let base_snapshot_id = metadata
-        .refs()
-        .get(target_ref)
-        .map(|r| r.snapshot_id)
-        .or_else(|| {
-            if target_ref == "main" {
-                metadata.current_snapshot().map(|s| s.snapshot_id())
-            } else {
-                None
-            }
-        });
-    Arc::new(
-        IcebergCommitCollector::new(
-            op_kind,
-            ident.clone(),
-            base_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        )
-        .with_table_metadata(metadata.clone()),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_apply_with_ref(
     table: &iceberg::table::Table,
@@ -10616,12 +10572,6 @@ fn repartition_iceberg_join_mv_overwrite(
             );
         }
     };
-    let collector = new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        staging_branch,
-        CommitOpKind::Overwrite,
-    );
     let connectors_snapshot = state
         .connectors
         .read()
@@ -10649,12 +10599,12 @@ fn repartition_iceberg_join_mv_overwrite(
         )
     })?;
     let target_backend = iceberg_mv_target_backend(target);
-    if let Err(err) = execute_imv_change_stream_write(
+    let populated = execute_imv_change_stream_write(
         state,
         &target_backend,
-        Arc::clone(iceberg_catalog),
         target_table.clone(),
-        Arc::clone(&collector),
+        &ident,
+        CommitOpKind::Overwrite,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
@@ -10663,21 +10613,29 @@ fn repartition_iceberg_join_mv_overwrite(
             mv_refresh_ctx: Some(ctx),
         },
         staging_branch,
-    ) {
-        return Err(
+    )
+    .map_err(|err| {
+        IcebergMvRefreshExecutionError::from(
             handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                 state,
                 target,
                 target_entry,
                 staging_branch,
                 refresh_id,
-                err,
+                err.into_message(),
                 Some(repartition_restore),
             ),
-        );
-    }
+        )
+    })?;
 
-    let total_rows = collector.injected_or_appended_data_record_count();
+    let total_rows = match populated.effect {
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty => 0,
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Changed {
+            added_rows,
+            ..
+        } => added_rows,
+    };
+    let collector = populated.collector;
     let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
         &target_table,
         iceberg_catalog,
@@ -10839,12 +10797,6 @@ fn first_refresh_iceberg_join_mv(
     let ident = iceberg_mv_table_ident(target).map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
     })?;
-    let collector = new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        staging_branch,
-        CommitOpKind::FastAppend,
-    );
     let connectors_snapshot = state
         .connectors
         .read()
@@ -10864,12 +10816,12 @@ fn first_refresh_iceberg_join_mv(
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
     })?;
     let target_backend = iceberg_mv_target_backend(target);
-    if let Err(err) = execute_imv_change_stream_write(
+    let populated = execute_imv_change_stream_write(
         state,
         &target_backend,
-        Arc::clone(iceberg_catalog),
         target_table.clone(),
-        Arc::clone(&collector),
+        &ident,
+        CommitOpKind::FastAppend,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
@@ -10878,23 +10830,34 @@ fn first_refresh_iceberg_join_mv(
             mv_refresh_ctx: Some(ctx),
         },
         staging_branch,
-    ) {
-        return Err(handle_iceberg_mv_commit_error(
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
             state,
             target,
             target_entry,
             staging_branch,
             refresh_id,
-            err,
-        ));
-    }
+            err.into_message(),
+        )
+    })?;
 
-    let added_rows = collector.injected_or_appended_data_record_count();
-    if added_rows == 0 {
+    let added_rows = match populated.effect {
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty => 0,
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Changed {
+            added_rows,
+            ..
+        } => added_rows,
+    };
+    if matches!(
+        populated.effect,
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty
+    ) {
         drop_iceberg_mv_staging_branch(state, target, target_entry, staging_branch)?;
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Ok(StatementResult::Ok);
     }
+    let collector = populated.collector;
     let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
         &target_table,
         iceberg_catalog,
@@ -11891,40 +11854,6 @@ mod join_delta_append_only_fast_path_tests {
                 .any(|rule| rule == "RecordJoinRefreshDescriptor"),
             "aggregate refresh explain must not record a pure join refresh descriptor"
         );
-    }
-
-    #[test]
-    fn join_incremental_refresh_production_route_uses_logical_executors() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/engine/mv/iceberg_refresh.rs"
-        ))
-        .expect("read source");
-        let route_body = source_between(
-            &source,
-            "\nfn incremental_refresh_iceberg_join_mv(\n",
-            "\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\nenum JoinIncrementalRefreshRoute",
-        );
-
-        assert!(route_body.contains("execute_append_only_join_delta_branches_logical("));
-        assert!(route_body.contains("execute_coalescing_join_delta_branches_logical("));
-
-        let forbidden = [
-            "parse_mv_select_query(",
-            "should_use_join_delta_append_only_fast_path(",
-            "execute_append_only_join_delta_branches(",
-            "execute_join_delta_branches(",
-            "rewrite_join_branch_query(",
-            "rewrite_join_delta_append_only_query(",
-            "rewrite_join_delta_coalesce_query",
-            "extract_join_aliases(",
-        ];
-        for token in forbidden {
-            assert!(
-                !route_body.contains(token),
-                "incremental join refresh production route still references legacy SQL path: {token}"
-            );
-        }
     }
 
     #[test]
@@ -13158,8 +13087,6 @@ fn execute_join_delta_branches_logical(
         JoinIncrementalRefreshRoute::LogicalAppendOnly => CommitOpKind::FastAppend,
         JoinIncrementalRefreshRoute::LogicalCoalesce => CommitOpKind::RowDeltaDvFromFiles,
     };
-    let collector =
-        new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
     let connectors_snapshot = state
         .connectors
         .read()
@@ -13196,12 +13123,12 @@ fn execute_join_delta_branches_logical(
         ],
     };
     let target_backend = iceberg_mv_target_backend(target);
-    if let Err(err) = execute_imv_change_stream_write(
+    let populated = execute_imv_change_stream_write(
         state,
         &target_backend,
-        Arc::clone(iceberg_catalog),
         target_table.clone(),
-        Arc::clone(&collector),
+        &ident,
+        op_kind,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
@@ -13210,19 +13137,26 @@ fn execute_join_delta_branches_logical(
             mv_refresh_ctx: Some(ctx),
         },
         &staging_branch,
-    ) {
-        return Err(handle_iceberg_mv_commit_error(
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
             state,
             target,
             target_entry,
             &staging_branch,
             refresh_id,
-            err,
-        ));
-    }
+            err.into_message(),
+        )
+    })?;
 
-    let added_rows = collector.injected_or_appended_data_record_count();
-    let deleted_rows = collector.injected_delete_record_count();
+    let (added_rows, deleted_rows) = match populated.effect {
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty => (0, 0),
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Changed {
+            added_rows,
+            deleted_rows,
+        } => (added_rows, deleted_rows),
+    };
+    let collector = populated.collector;
     let new_total_rows = match route {
         JoinIncrementalRefreshRoute::LogicalAppendOnly if added_rows == 0 => {
             tracing::info!(
@@ -13374,624 +13308,6 @@ fn should_use_join_delta_append_only_fast_path(
         && crate::engine::mv::iceberg_join_branch::is_append_only_join_delta_eligible(query)
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn execute_append_only_join_delta_branches(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
-    base_query: &sqlparser::ast::Query,
-    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
-    let target = &application_target;
-    let target_entry = ctx.target_bindings.runtime().target_entry();
-    let iceberg_catalog = &ctx.iceberg_catalog;
-    let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
-    let mv_definition = &*ctx.rewrite.mv_definition;
-    let pin = &*ctx.rewrite.pin;
-    let first_branch = branches.first().ok_or_else(|| {
-        "append-only join delta execution requires at least one branch".to_string()
-    })?;
-    let left_uuid = pin
-        .uuid(&first_branch.left_base)
-        .ok_or_else(|| format!("missing uuid for {}", first_branch.left_base.fqn()))?
-        .to_string();
-    let right_uuid = pin
-        .uuid(&first_branch.right_base)
-        .ok_or_else(|| format!("missing uuid for {}", first_branch.right_base.fqn()))?
-        .to_string();
-    let snapshots = pin.to_snapshot_map();
-    let table_uuids = pin.to_table_uuid_map();
-    let staging_branch = format!(
-        "__nova_mv_refresh_{}_{}",
-        mv_definition.mv_id,
-        uuid::Uuid::new_v4().simple()
-    );
-    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-        state,
-        target,
-        mv_definition.mv_id,
-        expected_main_snapshot_id,
-        snapshots.clone(),
-        &staging_branch,
-    )?;
-    let ident = iceberg_mv_table_ident(target)?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?
-        .to_summary_properties();
-    if let Err(err) = ensure_iceberg_mv_staging_branch(
-        iceberg_catalog,
-        target,
-        &staging_branch,
-        expected_main_snapshot_id,
-    ) {
-        abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err.into());
-    }
-    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
-        Ok(table) => table,
-        Err(err) => {
-            return Err(handle_iceberg_mv_definite_pre_publish_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    };
-    let collector = new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        &staging_branch,
-        CommitOpKind::FastAppend,
-    );
-    for branch in branches {
-        let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
-            base_query,
-            &branch,
-            &aliases.left_alias,
-            &aliases.right_alias,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        normalize_join_branch_snapshot_tables(&mut branch_query, &branch).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        let query = crate::engine::mv::iceberg_join_branch::rewrite_join_delta_append_only_query(
-            base_query,
-            branch_query,
-            &left_uuid,
-            &right_uuid,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        let branch_catalog = build_join_branch_catalog(state, &branch).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        let connectors_snapshot = state
-            .connectors
-            .read()
-            .expect("standalone connector registry read lock")
-            .clone();
-        let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
-            &query,
-            &branch_catalog,
-            &connectors_snapshot,
-            current_database,
-            Some(ctx),
-            None,
-            false,
-        );
-        let planned_query = match planned_query {
-            Ok(planned_query) => planned_query,
-            Err(err) => {
-                return Err(handle_iceberg_mv_commit_error(
-                    state,
-                    target,
-                    target_entry,
-                    &staging_branch,
-                    refresh_id,
-                    err,
-                ));
-            }
-        };
-        let target_backend = iceberg_mv_target_backend(target);
-        if let Err(err) = execute_imv_change_stream_write(
-            state,
-            &target_backend,
-            Arc::clone(iceberg_catalog),
-            target_table.clone(),
-            Arc::clone(&collector),
-            ImvRefreshPlannedChangeStream {
-                optimized_tree: planned_query.optimized_tree,
-                output_columns: planned_query.output_columns,
-                change_stream: planned_query.change_stream,
-                producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
-                mv_refresh_ctx: Some(ctx),
-            },
-            &staging_branch,
-        ) {
-            return Err(handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    }
-
-    let added_rows = collector.injected_or_appended_data_record_count();
-    if added_rows == 0 {
-        tracing::info!(
-            snapshots = ?snapshots,
-            "iceberg join mv {}.{}.{}: append-only fast path produced 0 effective rows; \
-             advancing lineage without new iceberg snapshot",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
-        abort_iceberg_mv_refresh(state, refresh_id)?;
-        let target_snapshot_id = recorded_target_snapshot_id(target, mv_definition)?;
-        let metadata_refresh_id =
-            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
-        finalize_iceberg_mv_refresh_with_partition_state(
-            state,
-            metadata_refresh_id,
-            mv_definition.last_refresh_rows.unwrap_or(0),
-            snapshots,
-            table_uuids,
-            target_snapshot_id,
-            IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-        )?;
-        return Ok(StatementResult::Ok);
-    }
-    let new_total_rows = mv_definition
-        .last_refresh_rows
-        .unwrap_or(0)
-        .checked_add(added_rows)
-        .ok_or_else(|| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                format!(
-                    "iceberg join MV append-only row-count overflow: current={:?}, inserts={added_rows}",
-                    mv_definition.last_refresh_rows
-                ),
-            )
-        })?;
-    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
-        &target_table,
-        iceberg_catalog,
-        target_entry,
-        &ident,
-        Arc::clone(&collector),
-        &staging_branch,
-        marker,
-    )) {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(err)) => {
-            return Err(handle_iceberg_mv_commit_service_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-        Err(err) => {
-            return Err(handle_iceberg_mv_definite_pre_publish_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    };
-
-    record_iceberg_mv_staging_commit(
-        state,
-        refresh_id,
-        commit_outcome.new_snapshot_id,
-        new_total_rows,
-        table_uuids.clone(),
-    )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
-        state,
-        target,
-        target_entry,
-        &staging_branch,
-        expected_main_snapshot_id,
-        commit_outcome.new_snapshot_id,
-        refresh_id,
-        mv_definition.mv_id,
-    )?;
-    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
-    finalize_iceberg_mv_refresh_with_partition_state(
-        state,
-        refresh_id,
-        new_total_rows,
-        snapshots,
-        table_uuids,
-        published_snapshot_id,
-        IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-    )?;
-    Ok(StatementResult::Ok)
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn execute_join_delta_branches(
-    state: &Arc<StandaloneState>,
-    target: &IcebergMvTarget,
-    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    expected_main_snapshot_id: Option<i64>,
-    current_database: &str,
-    mv_definition: &StoredMvDefinition,
-    aliases: &crate::mv::aggregate_state::aggregate_sql_calls::JoinAliases,
-    pin: &RefreshSnapshotPin,
-    ctx: &IcebergMvRefreshContext,
-    affected_partitions: &crate::mv::model::AffectedTargetPartitions,
-    branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let base_query = parse_mv_select_query(&mv_definition.select_sql)?;
-    let first_branch = branches
-        .first()
-        .ok_or_else(|| "join delta branch execution requires at least one branch".to_string())?;
-    let left_uuid = pin
-        .uuid(&first_branch.left_base)
-        .ok_or_else(|| format!("missing uuid for {}", first_branch.left_base.fqn()))?
-        .to_string();
-    let right_uuid = pin
-        .uuid(&first_branch.right_base)
-        .ok_or_else(|| format!("missing uuid for {}", first_branch.right_base.fqn()))?
-        .to_string();
-    let staging_branch = format!(
-        "__nova_mv_refresh_{}_{}",
-        mv_definition.mv_id,
-        uuid::Uuid::new_v4().simple()
-    );
-    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-        state,
-        target,
-        mv_definition.mv_id,
-        expected_main_snapshot_id,
-        pin.to_snapshot_map(),
-        &staging_branch,
-    )?;
-    if let Err(err) = ensure_iceberg_mv_staging_branch(
-        iceberg_catalog,
-        target,
-        &staging_branch,
-        expected_main_snapshot_id,
-    ) {
-        abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Err(err.into());
-    }
-    let target_table = match reload_iceberg_mv_target_table(target_entry, target) {
-        Ok(table) => table,
-        Err(err) => {
-            return Err(handle_iceberg_mv_definite_pre_publish_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    };
-    let mut branch_queries = Vec::with_capacity(branches.len());
-    for branch in &branches {
-        let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
-            &base_query,
-            branch,
-            &aliases.left_alias,
-            &aliases.right_alias,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        normalize_join_branch_snapshot_tables(&mut branch_query, branch).map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-        branch_queries.push(branch_query);
-    }
-    let target_locator_relation =
-        crate::engine::mv::iceberg_join_branch::join_delta_target_locator_relation(
-            &target.namespace,
-        );
-    let query =
-        crate::engine::mv::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
-            &base_query,
-            branch_queries,
-            &left_uuid,
-            &right_uuid,
-            &target_locator_relation,
-        )
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?;
-    let branch_catalog = build_join_delta_coalesce_catalog(
-        state,
-        &branches,
-        target,
-        &target_table,
-        expected_main_snapshot_id,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        )
-    })?;
-    let marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)
-        .map_err(|err| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            )
-        })?
-        .to_summary_properties();
-
-    let ident = iceberg_mv_table_ident(target).map_err(|err| {
-        handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        )
-    })?;
-    let collector = new_iceberg_mv_commit_collector(
-        &target_table,
-        &ident,
-        &staging_branch,
-        CommitOpKind::RowDeltaDvFromFiles,
-    );
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
-        &query,
-        &branch_catalog,
-        &connectors_snapshot,
-        current_database,
-        Some(ctx),
-        None,
-        false,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        )
-    })?;
-    let target_backend = iceberg_mv_target_backend(target);
-    if let Err(err) = execute_imv_change_stream_write(
-        state,
-        &target_backend,
-        Arc::clone(iceberg_catalog),
-        target_table.clone(),
-        Arc::clone(&collector),
-        ImvRefreshPlannedChangeStream {
-            optimized_tree: planned_query.optimized_tree,
-            output_columns: planned_query.output_columns,
-            change_stream: planned_query.change_stream,
-            producer_branches: vec![
-                ImvChangeStreamProducerBranch::DeleteDv,
-                ImvChangeStreamProducerBranch::ReuseData,
-                ImvChangeStreamProducerBranch::FreshData,
-            ],
-            mv_refresh_ctx: Some(ctx),
-        },
-        &staging_branch,
-    ) {
-        return Err(handle_iceberg_mv_commit_error(
-            state,
-            target,
-            target_entry,
-            &staging_branch,
-            refresh_id,
-            err,
-        ));
-    }
-
-    let added_rows = collector.injected_or_appended_data_record_count();
-    let deleted_rows = collector.injected_delete_record_count();
-    if added_rows == 0 && deleted_rows == 0 {
-        drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
-        abort_iceberg_mv_refresh(state, refresh_id)?;
-        return Ok(
-            finalize_iceberg_mv_metadata_only_refresh_with_partition_state(
-                state,
-                target,
-                mv_definition,
-                pin.to_snapshot_map(),
-                pin.to_table_uuid_map(),
-                IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
-            )?,
-        );
-    }
-    let new_total_rows = mv_definition
-        .last_refresh_rows
-        .unwrap_or(0)
-        .checked_add(added_rows)
-        .and_then(|rows| rows.checked_sub(deleted_rows))
-        .ok_or_else(|| {
-            handle_iceberg_mv_commit_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                format!(
-                    "iceberg join MV row-count delta overflow: current={:?}, inserts={}, deletes={}",
-                    mv_definition.last_refresh_rows, added_rows, deleted_rows
-                ),
-            )
-        })?;
-
-    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
-        &target_table,
-        iceberg_catalog,
-        target_entry,
-        &ident,
-        Arc::clone(&collector),
-        &staging_branch,
-        marker,
-    )) {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(err)) => {
-            return Err(handle_iceberg_mv_commit_service_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-        Err(err) => {
-            return Err(handle_iceberg_mv_definite_pre_publish_error(
-                state,
-                target,
-                target_entry,
-                &staging_branch,
-                refresh_id,
-                err,
-            ));
-        }
-    };
-
-    let snapshots = pin.to_snapshot_map();
-    let table_uuids = pin.to_table_uuid_map();
-    record_iceberg_mv_staging_commit(
-        state,
-        refresh_id,
-        commit_outcome.new_snapshot_id,
-        new_total_rows,
-        table_uuids.clone(),
-    )?;
-    let published_snapshot_id = publish_iceberg_mv_refresh(
-        state,
-        target,
-        target_entry,
-        &staging_branch,
-        expected_main_snapshot_id,
-        commit_outcome.new_snapshot_id,
-        refresh_id,
-        mv_definition.mv_id,
-    )?;
-    record_iceberg_mv_publish_commit(state, refresh_id, published_snapshot_id)?;
-    drop_iceberg_mv_staging_branch(state, target, target_entry, &staging_branch)?;
-    finalize_iceberg_mv_refresh_with_partition_state(
-        state,
-        refresh_id,
-        new_total_rows,
-        snapshots,
-        table_uuids,
-        published_snapshot_id,
-        IcebergMvPartitionStateFinalize::FromAffected(affected_partitions),
-    )?;
-    Ok(StatementResult::Ok)
-}
-
-/// Build a one-shot `InMemoryCatalog` for IMV incremental refresh execution.
-///
-/// The catalog registers the base table as a *normal* Iceberg table whose
-/// `ScanSource` is `IcebergDataFiles` and whose `IcebergTableInfo` carries
-/// the same catalog/namespace/table identity as `ctx.rewrite.base_refs`, so
-/// the analyzer plans normal Iceberg scans that the IMV rewrite pipeline
-/// can then rebind into delta/version scans via `BindIcebergScanRule`
-/// (`find_base_ref` matches by case-insensitive catalog/namespace/table).
-/// `build_iceberg_table_def_for_delta_scan` is the right factory here even
-/// though the source it publishes is `IcebergDataFiles`: the file list is
-/// intentionally empty (the runtime `IcebergDeltaScan` operator obtains its
-/// per-snapshot files from the iceberg catalog registry passed to
-/// `execute_query_with_options`), and the v3 row-lineage metadata columns
-/// (`_row_id`, `__change_op`, ...) it advertises are what gives codegen the
-/// slot bindings the IMV rewrite rules (`InjectRowIdRule`,
-/// `InjectActionColumnRule`) reference by name.
 fn build_imv_refresh_catalog(
     state: &Arc<StandaloneState>,
     base_refs: &[&TableIdentity],
@@ -14010,16 +13326,6 @@ fn build_imv_refresh_catalog(
             .register(&base_ref.namespace, table_def.clone())
             .map_err(|e| format!("register IMV refresh base table {}: {e}", base_ref.fqn()))?;
     }
-    Ok(catalog)
-}
-
-fn build_join_branch_catalog(
-    state: &Arc<StandaloneState>,
-    branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
-) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
-    let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
-    register_join_branch_side(&mut catalog, state, &branch.left_base, branch.left)?;
-    register_join_branch_side(&mut catalog, state, &branch.right_base, branch.right)?;
     Ok(catalog)
 }
 
@@ -14174,31 +13480,6 @@ fn join_catalog_registration_key(
     ))
 }
 
-fn register_join_branch_side(
-    catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
-    state: &Arc<StandaloneState>,
-    base: &TableIdentity,
-    side: crate::engine::mv::iceberg_join_branch::BranchSide,
-) -> Result<(), String> {
-    catalog.create_database(&base.namespace)?;
-    let table_def = match side {
-        crate::engine::mv::iceberg_join_branch::BranchSide::Delta(_) => {
-            crate::engine::query_prep::build_iceberg_table_def_for_delta_scan(
-                state,
-                &base.catalog,
-                &base.namespace,
-                &base.table,
-            )?
-        }
-        crate::engine::mv::iceberg_join_branch::BranchSide::Snapshot(snapshot_id) => {
-            build_iceberg_table_def_for_snapshot_scan(state, base, snapshot_id)?
-        }
-    };
-    catalog
-        .register(&base.namespace, table_def)
-        .map_err(|e| format!("register join branch table {}: {e}", base.fqn()))
-}
-
 fn normalize_join_branch_snapshot_tables(
     query: &mut sqlparser::ast::Query,
     branch: &crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan,
@@ -14283,78 +13564,136 @@ struct ImvRefreshPlannedChangeStream<'a> {
     mv_refresh_ctx: Option<&'a IcebergMvRefreshContext>,
 }
 
+#[cfg(test)]
+fn imv_change_stream_execution_failure_for_test() -> &'static std::sync::Mutex<Option<String>> {
+    static FAILURE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    FAILURE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+struct ImvChangeStreamExecutionFailureGuard;
+
+#[cfg(test)]
+impl Drop for ImvChangeStreamExecutionFailureGuard {
+    fn drop(&mut self) {
+        *imv_change_stream_execution_failure_for_test()
+            .lock()
+            .expect("IMV change-stream failure test lock") = None;
+    }
+}
+
+#[cfg(test)]
+fn install_imv_change_stream_execution_failure_for_test(
+    message: &str,
+) -> ImvChangeStreamExecutionFailureGuard {
+    let mut failure = imv_change_stream_execution_failure_for_test()
+        .lock()
+        .expect("IMV change-stream failure test lock");
+    assert!(
+        failure.is_none(),
+        "IMV change-stream failure already installed"
+    );
+    *failure = Some(message.to_string());
+    ImvChangeStreamExecutionFailureGuard
+}
+
+#[cfg(test)]
+fn take_imv_change_stream_execution_failure_for_test() -> Option<String> {
+    imv_change_stream_execution_failure_for_test()
+        .lock()
+        .expect("IMV change-stream failure test lock")
+        .take()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_imv_change_stream_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    _catalog: Arc<dyn iceberg::Catalog>,
     table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
+    ident: &TableIdent,
+    op_kind: CommitOpKind,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
-) -> Result<crate::coordinator::execution::CoordinatedQueryResult, String> {
-    let (refresh_plan, data_route_output_ordinal) =
-        ensure_imv_change_stream_data_route(refresh_plan)?;
-    let entry = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
-        .get(&target.catalog)?;
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let resolved = connectors_snapshot
-        .catalog_backend(target.backend_name)?
-        .load_table(&target.catalog, &target.namespace, &target.table)?;
-    let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
-        target,
-        &resolved,
+) -> Result<
+    crate::mv::refresh::change_stream_write::PopulatedChangeStreamWrite,
+    crate::mv::refresh::change_stream_write::ChangeStreamWriteError,
+> {
+    crate::mv::refresh::change_stream_write::execute_and_collect_change_stream_write(
         &table,
-        &entry,
-        &refresh_plan,
+        ident,
         target_ref,
-        data_route_output_ordinal,
-    )?;
-    let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
-        state,
-        Some(&target.catalog),
-        &target.namespace,
-        &refresh_plan.optimized_tree,
-        &mut dag,
-        refresh_plan.mv_refresh_ctx,
-        None,
-    )?;
-    #[cfg(test)]
-    if let Some(result) =
-        crate::engine::observe_change_stream_write_build_for_test(&planned.topology)
-    {
-        return Ok(result);
-    }
-    let commit_plan = planned.commit_plan.clone();
-    let result = crate::engine::execute_planned_iceberg_change_stream_write(
-        planned.prepared,
-        planned.native_bundle,
-        None,
-    )?;
-    if let Some(abort) = result.write_abort.as_ref() {
-        return Err(abort.reason.clone());
+        op_kind,
+        || {
+            let (refresh_plan, data_route_output_ordinal) =
+                ensure_imv_change_stream_data_route(refresh_plan)?;
+            let entry = state
+                .iceberg_catalogs
+                .read()
+                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
+                .get(&target.catalog)?;
+            let connectors_snapshot = state
+                .connectors
+                .read()
+                .expect("standalone connector registry read lock")
+                .clone();
+            let resolved = connectors_snapshot
+                .catalog_backend(target.backend_name)?
+                .load_table(&target.catalog, &target.namespace, &target.table)?;
+            let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
+                target,
+                &resolved,
+                &table,
+                &entry,
+                &refresh_plan,
+                target_ref,
+                data_route_output_ordinal,
+            )?;
+            let planned = crate::engine::build_physical_plan_as_iceberg_change_stream_write(
+                state,
+                Some(&target.catalog),
+                &target.namespace,
+                &refresh_plan.optimized_tree,
+                &mut dag,
+                refresh_plan.mv_refresh_ctx,
+                None,
+            )?;
+            #[cfg(test)]
+            if let Some(message) = take_imv_change_stream_execution_failure_for_test() {
+                return Err(message);
+            }
+            #[cfg(test)]
+            if let Some(result) =
+                crate::engine::observe_change_stream_write_build_for_test(&planned.topology)
+            {
+                return executed_change_stream_write_from_result(result, planned.commit_plan);
+            }
+            let result = crate::engine::execute_planned_iceberg_change_stream_write(
+                planned.prepared,
+                planned.native_bundle,
+                None,
+            )?;
+            executed_change_stream_write_from_result(result, planned.commit_plan)
+        },
+    )
+}
+
+fn executed_change_stream_write_from_result(
+    result: crate::coordinator::execution::CoordinatedQueryResult,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
+) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
+    if let Some(abort) = result.write_abort {
+        return Err(abort.reason);
     }
     let write_commit = result
         .write_commit
-        .as_ref()
         .ok_or_else(|| "IMV change-stream write completed without writer commit".to_string())?;
-    let routed =
-        crate::connector::iceberg::change_stream_routing::route_change_stream_writer_reports(
-            &collector,
-            table.metadata(),
+    Ok(
+        crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite {
             write_commit,
-            &commit_plan,
-        )
-        .map_err(|err| err.into_parts().0)?;
-    routed.inject(&collector);
-    Ok(result)
+            commit_plan,
+        },
+    )
 }
 
 fn ensure_imv_change_stream_data_route(
@@ -15298,8 +14637,6 @@ fn incremental_refresh_iceberg_mv_with_changes(
     } else {
         CommitOpKind::FastAppend
     };
-    let collector =
-        new_iceberg_mv_commit_collector(&target_table, &ident, &staging_branch, op_kind);
     let connectors_snapshot = state
         .connectors
         .read()
@@ -15345,12 +14682,12 @@ fn incremental_refresh_iceberg_mv_with_changes(
         producer_branches.push(ImvChangeStreamProducerBranch::FreshData);
     }
     let target_backend = iceberg_mv_target_backend(target);
-    if let Err(err) = execute_imv_change_stream_write(
+    let populated = execute_imv_change_stream_write(
         state,
         &target_backend,
-        Arc::clone(iceberg_catalog),
         target_table.clone(),
-        Arc::clone(&collector),
+        &ident,
+        op_kind,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
             output_columns: planned_query.output_columns,
@@ -15359,19 +14696,26 @@ fn incremental_refresh_iceberg_mv_with_changes(
             mv_refresh_ctx: Some(ctx),
         },
         &staging_branch,
-    ) {
-        return Err(handle_iceberg_mv_commit_error(
+    )
+    .map_err(|err| {
+        handle_iceberg_mv_commit_error(
             state,
             target,
             target_entry,
             &staging_branch,
             refresh_id,
-            err,
-        ));
-    }
+            err.into_message(),
+        )
+    })?;
 
-    let added_rows = collector.injected_or_appended_data_record_count();
-    let deleted_rows = collector.injected_delete_record_count();
+    let (added_rows, deleted_rows) = match populated.effect {
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Empty => (0, 0),
+        crate::mv::refresh::change_stream_write::ChangeStreamWriteEffect::Changed {
+            added_rows,
+            deleted_rows,
+        } => (added_rows, deleted_rows),
+    };
+    let collector = populated.collector;
 
     // 8b. Post-execution empty-delta short-circuit.
     //
@@ -24388,6 +23732,57 @@ mod tests {
         assert_eq!(
             load_test_operation_for_refresh(&env.state, refresh_id).state,
             crate::meta::repository::iceberg_operation::IcebergOperationState::Aborted
+        );
+    }
+
+    #[test]
+    fn change_stream_writer_error_aborts_staged_intent_and_drops_staging_branch() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let target_snapshot_before =
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "mv_orders")
+                .expect("target snapshot before failed refresh");
+
+        insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
+        let _failure = install_imv_change_stream_execution_failure_for_test(
+            "injected change-stream writer failure",
+        );
+        let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)
+            .expect_err("writer failure must abort refresh");
+
+        assert!(
+            err.contains("injected change-stream writer failure"),
+            "root cause must be preserved: {err}"
+        );
+        assert_eq!(
+            read_target_current_snapshot_id(&env.state, "ice", "analytics", "mv_orders"),
+            Some(target_snapshot_before),
+            "failed write must not publish a new main snapshot"
+        );
+        let refreshes = load_all_mv_refreshes(&env.state);
+        let failed = refreshes.last().expect("failed refresh record");
+        assert_eq!(failed.state, MvRefreshState::Aborted);
+
+        let entry = env
+            .state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get("ice")
+            .expect("catalog");
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target after failed refresh");
+        assert!(
+            !loaded
+                .table
+                .metadata()
+                .refs()
+                .keys()
+                .any(|name| name.starts_with("__nova_mv_refresh_")),
+            "failed writer staging branch must be dropped"
         );
     }
 

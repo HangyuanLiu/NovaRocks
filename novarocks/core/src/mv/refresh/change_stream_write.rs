@@ -1,0 +1,417 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with this
+// work for additional information regarding copyright ownership. The ASF
+// licenses this file to you under the Apache License, Version 2.0.
+
+//! Canonical populated-collector seam for MV change-stream writes.
+
+use std::sync::Arc;
+
+use iceberg::TableIdent;
+
+use crate::connector::iceberg::change_stream_routing::{
+    ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
+    route_change_stream_writer_reports,
+};
+use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
+use crate::coordinator::write::report::WriteCommitInput;
+
+pub(crate) struct ExecutedChangeStreamWrite {
+    pub(crate) write_commit: WriteCommitInput,
+    pub(crate) commit_plan: ChangeStreamWriterCommitPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChangeStreamWriteEffect {
+    Empty,
+    Changed { added_rows: i64, deleted_rows: i64 },
+}
+
+pub(crate) struct PopulatedChangeStreamWrite {
+    pub(crate) collector: Arc<IcebergCommitCollector>,
+    pub(crate) effect: ChangeStreamWriteEffect,
+}
+
+#[derive(Debug)]
+pub(crate) enum ChangeStreamWriteError {
+    Execution(String),
+    Routing(ChangeStreamWriterRoutingError),
+}
+
+impl ChangeStreamWriteError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Execution(message) => message,
+            Self::Routing(error) => error.into_parts().0,
+        }
+    }
+}
+
+pub(crate) fn execute_and_collect_change_stream_write<F>(
+    table: &iceberg::table::Table,
+    ident: &TableIdent,
+    target_ref: &str,
+    op_kind: CommitOpKind,
+    execute: F,
+) -> Result<PopulatedChangeStreamWrite, ChangeStreamWriteError>
+where
+    F: FnOnce() -> Result<ExecutedChangeStreamWrite, String>,
+{
+    let collector = new_iceberg_mv_commit_collector(table, ident, target_ref, op_kind);
+    let executed = execute().map_err(ChangeStreamWriteError::Execution)?;
+    let routed = route_change_stream_writer_reports(
+        &collector,
+        table.metadata(),
+        &executed.write_commit,
+        &executed.commit_plan,
+    )
+    .map_err(ChangeStreamWriteError::Routing)?;
+    routed.inject(&collector);
+
+    let added_rows = collector.injected_or_appended_data_record_count();
+    let deleted_rows = collector.injected_delete_record_count();
+    let effect = if added_rows == 0 && deleted_rows == 0 {
+        ChangeStreamWriteEffect::Empty
+    } else {
+        ChangeStreamWriteEffect::Changed {
+            added_rows,
+            deleted_rows,
+        }
+    };
+
+    Ok(PopulatedChangeStreamWrite { collector, effect })
+}
+
+fn new_iceberg_mv_commit_collector(
+    table: &iceberg::table::Table,
+    ident: &TableIdent,
+    target_ref: &str,
+    op_kind: CommitOpKind,
+) -> Arc<IcebergCommitCollector> {
+    let metadata = table.metadata();
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let base_snapshot_id = metadata
+        .refs()
+        .get(target_ref)
+        .map(|reference| reference.snapshot_id)
+        .or_else(|| {
+            if target_ref == "main" {
+                metadata
+                    .current_snapshot()
+                    .map(|snapshot| snapshot.snapshot_id())
+            } else {
+                None
+            }
+        });
+    Arc::new(
+        IcebergCommitCollector::new(
+            op_kind,
+            ident.clone(),
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Struct,
+        TableMetadataBuilder, Type,
+    };
+    use iceberg::{NamespaceIdent, TableIdent};
+
+    use crate::common::types::UniqueId;
+    use crate::connector::iceberg::delete_file::IcebergFileContent;
+    use crate::connector::iceberg::report::{
+        IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
+    };
+    use crate::coordinator::write::report::{WriterCommitInput, WriterKey};
+    use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
+    use crate::sql::common::ChangeStreamBranchKind;
+
+    fn test_table() -> iceberg::table::Table {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///warehouse/db/t".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("table metadata builder")
+        .build()
+        .expect("table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .identifier(test_ident())
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("table")
+    }
+
+    fn test_ident() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new("db".to_string()), "t".to_string())
+    }
+
+    fn writer_key(query_id: UniqueId, writer_fragment_id: i32, backend_num: i32) -> WriterKey {
+        WriterKey {
+            query_id,
+            fragment_instance_id: UniqueId {
+                hi: 101,
+                lo: ((writer_fragment_id as i64) << 16) | backend_num as i64,
+            },
+            backend_num,
+        }
+    }
+
+    fn writer_report(
+        table: &iceberg::table::Table,
+        path: &str,
+        content: IcebergFileContent,
+        record_count: i64,
+    ) -> crate::proto::novarocks::IcebergCommitInfo {
+        let is_delete = matches!(content, IcebergFileContent::PositionDeletes);
+        let report = IcebergWriterReport {
+            file: IcebergWrittenFileReport {
+                path: path.to_string(),
+                format: if is_delete { "puffin" } else { "parquet" }.to_string(),
+                content,
+                record_count,
+                file_size_in_bytes: 128,
+                partition: IcebergPartitionReport {
+                    partition_path: String::new(),
+                    null_fingerprint: String::new(),
+                    partition_spec_id: table.metadata().default_partition_spec_id(),
+                    partition_values: Struct::empty(),
+                },
+                split_offsets: if is_delete { None } else { Some(vec![4]) },
+                column_stats: None,
+                referenced_data_file: is_delete.then(|| "base.parquet".to_string()),
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
+                content_offset: is_delete.then_some(4),
+                content_size_in_bytes: is_delete.then_some(12),
+                cardinality: is_delete.then_some(record_count),
+            },
+            is_overwrite: None,
+            is_rewrite: None,
+        };
+        writer_report_to_iceberg_commit_info(report, table.metadata()).expect("wire encode")
+    }
+
+    fn executed_write(
+        table: &iceberg::table::Table,
+        writers: Vec<(i32, &str, IcebergFileContent, i64)>,
+        branches: BTreeMap<i32, ChangeStreamBranchKind>,
+    ) -> ExecutedChangeStreamWrite {
+        let query_id = UniqueId { hi: 10, lo: 20 };
+        let writers = writers
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (fragment_id, path, content, record_count))| WriterCommitInput {
+                    writer_id: index,
+                    writer_key: writer_key(query_id, fragment_id, index as i32),
+                    iceberg_commits: vec![writer_report(table, path, content, record_count)],
+                    load_counters: BTreeMap::new(),
+                    loaded_rows: record_count,
+                    loaded_bytes: 128,
+                    filtered_rows: 0,
+                },
+            )
+            .collect();
+        ExecutedChangeStreamWrite {
+            write_commit: WriteCommitInput {
+                write_id: query_id,
+                writers,
+            },
+            commit_plan: ChangeStreamWriterCommitPlan::new(branches),
+        }
+    }
+
+    #[test]
+    fn zero_reports_are_empty_and_callback_runs_once() {
+        let table = test_table();
+        let calls = Cell::new(0);
+
+        let populated = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(executed_write(&table, Vec::new(), BTreeMap::new()))
+            },
+        )
+        .unwrap_or_else(|_| panic!("empty write should succeed"));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(populated.effect, ChangeStreamWriteEffect::Empty);
+        assert_eq!(populated.collector.table_ident, test_ident());
+        assert_eq!(
+            populated.collector.injected_or_appended_data_record_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn fast_append_returns_populated_collector_and_added_effect() {
+        let table = test_table();
+
+        let populated = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+            || {
+                Ok(executed_write(
+                    &table,
+                    vec![(11, "fresh.parquet", IcebergFileContent::Data, 2)],
+                    BTreeMap::from([(11, ChangeStreamBranchKind::FreshData)]),
+                ))
+            },
+        )
+        .unwrap_or_else(|_| panic!("append write should succeed"));
+
+        assert_eq!(
+            populated.effect,
+            ChangeStreamWriteEffect::Changed {
+                added_rows: 2,
+                deleted_rows: 0,
+            }
+        );
+        assert_eq!(
+            populated.collector.injected_or_appended_data_record_count(),
+            2
+        );
+        assert_eq!(
+            populated
+                .collector
+                .take_written_files()
+                .expect("written files")[0]
+                .path,
+            "fresh.parquet"
+        );
+    }
+
+    #[test]
+    fn row_delta_returns_added_and_deleted_effect() {
+        let table = test_table();
+
+        let populated = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::RowDeltaDvFromFiles,
+            || {
+                Ok(executed_write(
+                    &table,
+                    vec![
+                        (10, "delete.puffin", IcebergFileContent::PositionDeletes, 3),
+                        (11, "fresh.parquet", IcebergFileContent::Data, 2),
+                    ],
+                    BTreeMap::from([
+                        (10, ChangeStreamBranchKind::DeleteDv),
+                        (11, ChangeStreamBranchKind::FreshData),
+                    ]),
+                ))
+            },
+        )
+        .unwrap_or_else(|_| panic!("row-delta write should succeed"));
+
+        assert_eq!(
+            populated.effect,
+            ChangeStreamWriteEffect::Changed {
+                added_rows: 2,
+                deleted_rows: 3,
+            }
+        );
+        assert_eq!(populated.collector.injected_delete_record_count(), 3);
+    }
+
+    #[test]
+    fn callback_failure_is_typed_as_execution_error() {
+        let table = test_table();
+        let calls = Cell::new(0);
+
+        let result = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+            || {
+                calls.set(calls.get() + 1);
+                Err("writer failed".to_string())
+            },
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            result,
+            Err(ChangeStreamWriteError::Execution(message)) if message == "writer failed"
+        ));
+    }
+
+    #[test]
+    fn routing_failure_preserves_converted_file_evidence() {
+        let table = test_table();
+
+        let result = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+            || {
+                Ok(executed_write(
+                    &table,
+                    vec![
+                        (11, "known.parquet", IcebergFileContent::Data, 2),
+                        (12, "unknown.parquet", IcebergFileContent::Data, 3),
+                    ],
+                    BTreeMap::from([(11, ChangeStreamBranchKind::FreshData)]),
+                ))
+            },
+        );
+
+        let Err(ChangeStreamWriteError::Routing(error)) = result else {
+            panic!("routing failure expected");
+        };
+        let (message, converted) = error.into_parts();
+        assert!(message.contains("writer fragment 12 is not declared"));
+        assert_eq!(
+            converted
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["known.parquet", "unknown.parquet"]
+        );
+    }
+}
