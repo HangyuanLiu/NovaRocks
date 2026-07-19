@@ -52,6 +52,29 @@ pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
 where
     F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
 {
+    let read = read_aggregate_state(
+        select_sql,
+        calls,
+        pin,
+        current_catalog,
+        current_database,
+        read,
+    )?;
+    let target_layout = read.source_layout.clone();
+    normalize_and_materialize_aggregate_read(read, calls, &target_layout, calls)
+}
+
+fn read_aggregate_state<F>(
+    select_sql: &str,
+    calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    read: &mut F,
+) -> Result<AggregateStateRead, String>
+where
+    F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
+{
     let state_sql =
         crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
@@ -62,9 +85,164 @@ where
         current_catalog,
         current_database,
     )?;
-    let read = read(select_sql, calls, state_query)?;
-    let target_layout = read.source_layout.clone();
-    normalize_and_materialize_aggregate_read(read, calls, &target_layout, calls)
+    read(select_sql, calls, state_query)
+}
+
+pub(crate) fn prepare_branch_union_aggregate_first_refresh_chunks<F>(
+    select_sql: &str,
+    branch_count: usize,
+    first_branch_calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    read: &mut F,
+) -> Result<Vec<Chunk>, String>
+where
+    F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
+{
+    let branches = branch_union_first_refresh_branch_queries(select_sql, branch_count)?;
+    let mut target_layout = None;
+    let mut prepared = Vec::new();
+    for (branch_index, (branch_query, branch_sql)) in branches.into_iter().enumerate() {
+        let branch_id = i32::try_from(branch_index).map_err(|_| {
+            format!(
+                "iceberg branch UNION ALL aggregate first refresh branch index {branch_index} exceeds Int32"
+            )
+        })?;
+        let branch_calls =
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &branch_query,
+            )?;
+        if branch_index == 0 && &branch_calls != first_branch_calls {
+            return Err(
+                "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                    .to_string(),
+            );
+        }
+        let branch_read = read_aggregate_state(
+            &branch_sql,
+            &branch_calls,
+            pin,
+            current_catalog,
+            current_database,
+            read,
+        )?;
+        let canonical_layout = target_layout
+            .get_or_insert_with(|| branch_read.source_layout.clone())
+            .clone();
+        validate_aggregate_layout_compatibility(
+            branch_index,
+            &branch_calls,
+            &branch_read.source_layout,
+            first_branch_calls,
+            &canonical_layout,
+        )?;
+        let branch_chunks = normalize_and_materialize_aggregate_read(
+            branch_read,
+            &branch_calls,
+            &canonical_layout,
+            first_branch_calls,
+        )?;
+        prepared.extend(append_branch_id_to_chunks(branch_chunks, branch_id)?);
+    }
+    Ok(prepared)
+}
+
+fn branch_union_first_refresh_branch_queries(
+    select_sql: &str,
+    branch_count: usize,
+) -> Result<Vec<(sqlparser::ast::Query, String)>, String> {
+    let query = parse_stored_select_query(select_sql).map_err(|error| {
+        format!("iceberg branch UNION ALL aggregate first refresh SELECT parse error: {error}")
+    })?;
+    let mut branch_bodies = Vec::new();
+    flatten_branch_union_all_set_expr(query.body.as_ref(), &mut branch_bodies)?;
+    if branch_bodies.len() != branch_count {
+        return Err(format!(
+            "iceberg branch UNION ALL aggregate first refresh expected {branch_count} branches, found {}",
+            branch_bodies.len()
+        ));
+    }
+    branch_bodies
+        .into_iter()
+        .map(|body| {
+            let mut branch_query = query.clone();
+            branch_query.body = Box::new(body);
+            let branch_sql = branch_query.to_string();
+            Ok((branch_query, branch_sql))
+        })
+        .collect()
+}
+
+fn flatten_branch_union_all_set_expr(
+    body: &sqlparser::ast::SetExpr,
+    out: &mut Vec<sqlparser::ast::SetExpr>,
+) -> Result<(), String> {
+    match body {
+        sqlparser::ast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if !matches!(op, sqlparser::ast::SetOperator::Union)
+                || !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All)
+            {
+                return Err(
+                    "iceberg branch UNION ALL aggregate first refresh supports UNION ALL only"
+                        .to_string(),
+                );
+            }
+            flatten_branch_union_all_set_expr(left, out)?;
+            flatten_branch_union_all_set_expr(right, out)
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            flatten_branch_union_all_set_expr(query.body.as_ref(), out)
+        }
+        sqlparser::ast::SetExpr::Select(_) => {
+            out.push(body.clone());
+            Ok(())
+        }
+        _ => Err(
+            "iceberg branch UNION ALL aggregate first refresh expects SELECT branches".to_string(),
+        ),
+    }
+}
+
+fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<Chunk>, String> {
+    chunks
+        .into_iter()
+        .map(|chunk| append_branch_id_to_chunk(chunk, branch_id))
+        .collect()
+}
+
+fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, String> {
+    let mut fields = chunk
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME,
+        arrow::datatypes::DataType::Int32,
+        false,
+    )));
+    let mut columns = chunk.batch.columns().to_vec();
+    columns.push(Arc::new(arrow::array::Int32Array::from(vec![
+        branch_id;
+        chunk
+            .batch
+            .num_rows(
+            )
+    ])));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+        format!(
+            "append branch id to branch UNION ALL aggregate first refresh chunk failed: {error}"
+        )
+    })?;
+    record_batch_to_chunk(batch)
 }
 
 fn parse_stored_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
@@ -152,11 +330,71 @@ fn validate_aggregate_layout_compatibility(
     target_calls: &AggregateSqlCalls,
     target_layout: &AggregateMvLayout,
 ) -> Result<(), String> {
+    let call_shape_matches = source_calls
+        .aggregates
+        .iter()
+        .zip(target_calls.aggregates.iter())
+        .all(|(source, target)| {
+            source.function == target.function
+                && matches!(
+                    (&source.input, &target.input),
+                    (
+                        crate::mv::aggregate_state::mv_shape::AggregateInput::Star,
+                        crate::mv::aggregate_state::mv_shape::AggregateInput::Star
+                    ) | (
+                        crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_),
+                        crate::mv::aggregate_state::mv_shape::AggregateInput::Expr(_)
+                    )
+                )
+        });
+    let visible_layout_matches = source_layout
+        .visible_columns
+        .iter()
+        .zip(target_layout.visible_columns.iter())
+        .all(|(source, target)| {
+            source.data_type == target.data_type
+                && source.sql_type == target.sql_type
+                && source.nullable == target.nullable
+                && source.source_index == target.source_index
+        });
+    let state_layout_matches = source_layout
+        .state_columns
+        .iter()
+        .zip(target_layout.state_columns.iter())
+        .all(|(source, target)| {
+            source.data_type == target.data_type
+                && source.sql_type == target.sql_type
+                && source.nullable == target.nullable
+                && source.visible_source_index == target.visible_source_index
+                && source.aggregate_index == target.aggregate_index
+                && source.function == target.function
+                && source.state_role == target.state_role
+                && source.count_star == target.count_star
+        });
+    let physical_layout_matches = source_layout
+        .physical_columns
+        .iter()
+        .zip(target_layout.physical_columns.iter())
+        .all(|(source, target)| {
+            source.column.data_type == target.column.data_type
+                && source.column.nullable == target.column.nullable
+                && source.column.aggregation == target.column.aggregation
+                && source.column.default == target.column.default
+                && source.visible == target.visible
+                && source.is_key == target.is_key
+        });
     if source_calls.visible_outputs != target_calls.visible_outputs
         || source_calls.group_keys.len() != target_calls.group_keys.len()
         || source_calls.aggregates.len() != target_calls.aggregates.len()
         || source_layout.visible_columns.len() != target_layout.visible_columns.len()
         || source_layout.state_columns.len() != target_layout.state_columns.len()
+        || source_layout.physical_columns.len() != target_layout.physical_columns.len()
+        || source_layout.aggregate_input_types != target_layout.aggregate_input_types
+        || source_layout.group_key_source_indexes != target_layout.group_key_source_indexes
+        || !call_shape_matches
+        || !visible_layout_matches
+        || !state_layout_matches
+        || !physical_layout_matches
     {
         return Err(format!(
             "aggregate MV branch {branch_index} layout shape mismatch with branch 0"
@@ -302,7 +540,7 @@ fn reorder_and_rename_chunk_columns(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{BinaryArray, StringArray};
+    use arrow::array::{Array, BinaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
@@ -381,11 +619,15 @@ mod tests {
     }
 
     fn reordered_count_result() -> QueryResult {
-        let state = encode_count_state(2);
+        count_result("region", 2)
+    }
+
+    fn count_result(group_key: &str, count: i64) -> QueryResult {
+        let state = encode_count_state(count);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("__agg_state_c", DataType::Binary, false),
-                Field::new("region", DataType::Utf8, true),
+                Field::new(group_key, DataType::Utf8, true),
             ])),
             vec![
                 Arc::new(BinaryArray::from_vec(vec![state.as_slice()])),
@@ -402,7 +644,7 @@ mod tests {
                     logical_type: Some(SqlType::Binary),
                 },
                 QueryResultColumn {
-                    name: "region".to_string(),
+                    name: group_key.to_string(),
                     data_type: DataType::Utf8,
                     nullable: true,
                     logical_type: Some(SqlType::String),
@@ -410,6 +652,35 @@ mod tests {
             ],
             chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         }
+    }
+
+    fn branch_select_sql() -> &'static str {
+        "select region, count(*) as c from ice.sales.fact_a group by region \
+         union all \
+         select area, count(*) as c from ice.sales.fact_b group by area"
+    }
+
+    fn first_branch_calls(select_sql: &str) -> AggregateSqlCalls {
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+            .expect("normalize union");
+        let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse union");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected union query");
+        };
+        let sqlparser::ast::SetExpr::SetOperation { left, .. } = query.body.as_ref() else {
+            panic!("expected set operation");
+        };
+        let mut first_query = query.as_ref().clone();
+        first_query.body = left.clone();
+        crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&first_query)
+            .expect("first calls")
+    }
+
+    fn branch_pin() -> RefreshSnapshotPin {
+        RefreshSnapshotPin::from_entries_for_tests(&[
+            ("ice.sales.fact_a", 41, "a-uuid"),
+            ("ice.sales.fact_b", 42, "b-uuid"),
+        ])
     }
 
     #[test]
@@ -544,5 +815,179 @@ mod tests {
         .expect_err("callback failure must propagate");
 
         assert_eq!(error, "query read failed");
+    }
+
+    #[test]
+    fn branch_aliases_normalize_to_first_layout_and_append_stable_ids() {
+        let select_sql = branch_select_sql();
+        let first_calls = first_branch_calls(select_sql);
+        let pin = branch_pin();
+        let mut reads = 0;
+        let mut read =
+            |visible_sql: &str, _: &AggregateSqlCalls, state_query: sqlparser::ast::Query| {
+                let branch = reads;
+                reads += 1;
+                let source_name = if branch == 0 { "region" } else { "area" };
+                let snapshot = if branch == 0 { 41 } else { 42 };
+                assert!(visible_sql.contains(source_name), "sql={visible_sql}");
+                assert!(
+                    state_query
+                        .to_string()
+                        .contains(&format!("VERSION AS OF {snapshot}")),
+                    "query={state_query}"
+                );
+                Ok(AggregateStateRead {
+                    result: count_result(source_name, branch as i64 + 1),
+                    source_layout: count_layout(source_name),
+                })
+            };
+
+        let chunks = prepare_branch_union_aggregate_first_refresh_chunks(
+            select_sql,
+            2,
+            &first_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut read,
+        )
+        .expect("prepare branch aggregate first refresh");
+
+        assert_eq!(reads, 2);
+        assert_eq!(chunks.len(), 2);
+        for (branch_id, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.batch.schema().field(1).name(), "region");
+            let branch = chunk
+                .batch
+                .column(chunk.batch.num_columns() - 1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("branch id");
+            assert_eq!(branch.value(0), branch_id as i32);
+            assert!(!branch.is_null(0));
+        }
+    }
+
+    #[test]
+    fn branch_requires_union_all_and_exact_branch_count() {
+        let first_calls =
+            parse_calls("select region, count(*) as c from ice.sales.fact_a group by region");
+        let pin = branch_pin();
+        let mut read = |_: &str, _: &AggregateSqlCalls, _: sqlparser::ast::Query| {
+            panic!("invalid branch shape must fail before reading")
+        };
+
+        let error = prepare_branch_union_aggregate_first_refresh_chunks(
+            "select region, count(*) as c from ice.sales.fact_a group by region \
+             union \
+             select area, count(*) as c from ice.sales.fact_b group by area",
+            2,
+            &first_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut read,
+        )
+        .expect_err("UNION DISTINCT must fail");
+        assert!(error.contains("supports UNION ALL only"), "{error}");
+
+        let error = prepare_branch_union_aggregate_first_refresh_chunks(
+            branch_select_sql(),
+            3,
+            &first_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut read,
+        )
+        .expect_err("branch count mismatch must fail");
+        assert!(error.contains("expected 3 branches, found 2"), "{error}");
+    }
+
+    #[test]
+    fn branch_rejects_first_branch_call_contract_drift_before_reading() {
+        let select_sql = branch_select_sql();
+        let wrong_calls =
+            parse_calls("select region, sum(amount) as c from ice.sales.fact_a group by region");
+        let pin = branch_pin();
+
+        let error = prepare_branch_union_aggregate_first_refresh_chunks(
+            select_sql,
+            2,
+            &wrong_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut |_, _, _| panic!("contract drift must fail before reading"),
+        )
+        .expect_err("first branch contract drift must fail");
+
+        assert!(error.contains("first branch calls drifted"), "{error}");
+    }
+
+    #[test]
+    fn branch_rejects_layout_shape_drift() {
+        let select_sql = branch_select_sql();
+        let first_calls = first_branch_calls(select_sql);
+        let pin = branch_pin();
+        let mut reads = 0;
+
+        let error = prepare_branch_union_aggregate_first_refresh_chunks(
+            select_sql,
+            2,
+            &first_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut |_, _, _| {
+                let branch = reads;
+                reads += 1;
+                let source_name = if branch == 0 { "region" } else { "area" };
+                let mut layout = count_layout(source_name);
+                if branch == 1 {
+                    layout.visible_columns[0].nullable = false;
+                }
+                Ok(AggregateStateRead {
+                    result: count_result(source_name, branch as i64 + 1),
+                    source_layout: layout,
+                })
+            },
+        )
+        .expect_err("layout nullability drift must fail");
+
+        assert_eq!(reads, 2);
+        assert!(error.contains("branch 1 layout shape mismatch"), "{error}");
+    }
+
+    #[test]
+    fn branch_callback_failure_returns_error_without_partial_output() {
+        let select_sql = branch_select_sql();
+        let first_calls = first_branch_calls(select_sql);
+        let pin = branch_pin();
+        let mut reads = 0;
+
+        let error = prepare_branch_union_aggregate_first_refresh_chunks(
+            select_sql,
+            2,
+            &first_calls,
+            &pin,
+            Some("ice"),
+            "sales",
+            &mut |_, _, _| {
+                let branch = reads;
+                reads += 1;
+                if branch == 1 {
+                    return Err("second branch read failed".to_string());
+                }
+                Ok(AggregateStateRead {
+                    result: count_result("region", 1),
+                    source_layout: count_layout("region"),
+                })
+            },
+        )
+        .expect_err("callback failure must abort the complete preparation");
+
+        assert_eq!(reads, 2);
+        assert_eq!(error, "second branch read failed");
     }
 }
