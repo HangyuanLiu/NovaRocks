@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod common;
-pub(crate) mod native;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks;
+mod endpoint;
+mod error;
+mod options;
+mod runtime_filter;
+
+pub(crate) use endpoint::{decode_fragment_destination, decode_runtime_endpoint};
+pub(crate) use error::StarRocksFragmentDecodeError;
+pub(crate) use options::decode_query_options;
+pub(crate) use runtime_filter::decode_runtime_filter_params;

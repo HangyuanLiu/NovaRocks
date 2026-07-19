@@ -43,6 +43,7 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
 use crate::lower::compat::expr::lower_t_expr;
 use crate::lower::compat::layout::Layout;
+use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId};
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
@@ -442,16 +443,13 @@ pub(crate) fn lower_partition_boundary_key(
     key_nodes: Option<&[exprs::TExprNode]>,
     legacy_key_node: Option<&exprs::TExprNode>,
 ) -> Result<Option<Vec<PartitionKeyValue>>, String> {
-    if let Some(nodes) = key_nodes {
-        if nodes.is_empty() {
-            return Ok(None);
-        }
-        return parse_partition_key_nodes(nodes).map(Some);
+    let Some(nodes) = select_partition_boundary_key(key_nodes, legacy_key_node) else {
+        return Ok(None);
+    };
+    if nodes.is_empty() {
+        return Ok(None);
     }
-    if let Some(node) = legacy_key_node {
-        return parse_partition_key_nodes(std::slice::from_ref(node)).map(Some);
-    }
-    Ok(None)
+    parse_partition_key_nodes(nodes).map(Some)
 }
 
 pub(crate) fn lower_partition_in_keys(

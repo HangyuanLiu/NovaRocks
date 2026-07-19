@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod common;
-pub(crate) mod native;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks;
+pub(crate) mod endpoint;
+pub(crate) mod options;
+pub(crate) mod request;
+pub(crate) mod sink;

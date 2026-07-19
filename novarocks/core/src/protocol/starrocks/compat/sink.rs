@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod common;
-pub(crate) mod native;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks;
+pub(crate) fn select_partition_boundary_key<'a, T>(
+    current: Option<&'a [T]>,
+    legacy: Option<&'a T>,
+) -> Option<&'a [T]> {
+    current.or_else(|| legacy.map(std::slice::from_ref))
+}

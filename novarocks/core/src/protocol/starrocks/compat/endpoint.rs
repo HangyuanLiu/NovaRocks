@@ -15,7 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod common;
-pub(crate) mod native;
-#[cfg(feature = "compat")]
-pub(crate) mod starrocks;
+use crate::thrift::data_sinks::TPlanFragmentDestination;
+use crate::thrift::types::TNetworkAddress;
+
+pub(crate) fn destination_address(
+    destination: &TPlanFragmentDestination,
+) -> Option<&TNetworkAddress> {
+    destination_address_with_field(destination).map(|(address, _)| address)
+}
+
+pub(crate) fn destination_address_with_field(
+    destination: &TPlanFragmentDestination,
+) -> Option<(&TNetworkAddress, &'static str)> {
+    if let Some(address) = destination.brpc_server.as_ref() {
+        return Some((address, "brpc_server"));
+    }
+    destination
+        .deprecated_server
+        .as_ref()
+        .map(|address| (address, "deprecated_server"))
+}

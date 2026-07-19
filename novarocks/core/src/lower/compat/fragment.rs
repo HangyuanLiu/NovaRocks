@@ -48,7 +48,11 @@ use crate::lower::compat::node::{Lowered, lower_plan};
 use crate::lower::compat::type_lowering::{
     native_primitive_type_from_desc, render_schema_from_type_desc,
 };
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::{
+    decode_fragment_destination, decode_query_options, decode_runtime_filter_params,
+};
+use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
@@ -166,33 +170,22 @@ fn unique_id_from_exec_params(exec_params: &internal_service::TPlanFragmentExecP
 }
 
 fn runtime_destination_from_thrift(
-    dest: data_sinks::TPlanFragmentDestination,
+    dest: &data_sinks::TPlanFragmentDestination,
+    path: FieldPath,
 ) -> Result<FragmentDestination, String> {
-    let endpoint = if dest.fragment_instance_id.lo == -1 {
-        RuntimeEndpoint::new("pseudo-destination", 1)?
-    } else {
-        let addr = dest
-            .brpc_server
-            .as_ref()
-            .or(dest.deprecated_server.as_ref())
-            .ok_or_else(|| "DATA_STREAM_SINK destination missing brpc_server".to_string())?;
-        RuntimeEndpoint::from_network_address(addr)?
-    };
-    Ok(FragmentDestination::new(
-        UniqueId {
-            hi: dest.fragment_instance_id.hi,
-            lo: dest.fragment_instance_id.lo,
-        },
-        endpoint,
-    ))
+    decode_fragment_destination(dest, path).map_err(|error| error.to_string())
 }
 
 fn runtime_destinations_from_thrift(
     destinations: Vec<data_sinks::TPlanFragmentDestination>,
+    path: FieldPath,
 ) -> Result<Vec<FragmentDestination>, String> {
     destinations
-        .into_iter()
-        .map(runtime_destination_from_thrift)
+        .iter()
+        .enumerate()
+        .map(|(index, destination)| {
+            runtime_destination_from_thrift(destination, path.clone().index(index))
+        })
         .collect()
 }
 
@@ -225,6 +218,7 @@ fn lower_stream_partition_exprs(
 fn data_stream_input_from_compat(
     stream: &data_sinks::TDataStreamSink,
     destinations: Vec<data_sinks::TPlanFragmentDestination>,
+    destinations_path: FieldPath,
     arena: &mut ExprArena,
     layout: &crate::lower::compat::layout::Layout,
     last_query_id: Option<&str>,
@@ -240,7 +234,7 @@ fn data_stream_input_from_compat(
         Vec::new(),
         partition_exprs,
         stream.output_columns.clone().unwrap_or_default(),
-        runtime_destinations_from_thrift(destinations)?,
+        runtime_destinations_from_thrift(destinations, destinations_path)?,
     )
 }
 
@@ -262,11 +256,18 @@ fn multi_cast_inputs_from_compat(
         .sinks
         .iter()
         .zip(multi_cast.destinations.iter())
-        .map(|(stream, destinations)| {
+        .enumerate()
+        .map(|(branch_index, (stream, destinations))| {
             Ok((
                 data_stream_input_from_compat(
                     stream,
                     destinations.clone(),
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("output_sink")
+                        .field("multi_cast_stream_sink")
+                        .field("destinations")
+                        .index(branch_index),
                     arena,
                     layout,
                     last_query_id,
@@ -297,10 +298,17 @@ fn split_inputs_from_compat(
     sinks
         .iter()
         .zip(destinations)
-        .map(|(stream, destinations)| {
+        .enumerate()
+        .map(|(branch_index, (stream, destinations))| {
             data_stream_input_from_compat(
                 stream,
                 destinations,
+                FieldPath::root("exec_plan_fragment")
+                    .field("fragment")
+                    .field("output_sink")
+                    .field("split_stream_sink")
+                    .field("destinations")
+                    .index(branch_index),
                 arena,
                 layout,
                 last_query_id,
@@ -320,7 +328,8 @@ fn iceberg_router_input_from_compat(
     let branches = router
         .branches
         .iter()
-        .map(|branch| {
+        .enumerate()
+        .map(|(branch_index, branch)| {
             let branch_kind = branch_kind_from_thrift(branch.branch_kind)?;
             Ok(IcebergChangeStreamRouterBranchFactoryInput {
                 branch_id: branch.branch_id,
@@ -328,6 +337,13 @@ fn iceberg_router_input_from_compat(
                 stream_sink: data_stream_input_from_compat(
                     &branch.stream_sink,
                     branch.destinations.clone(),
+                    FieldPath::root("exec_plan_fragment")
+                        .field("fragment")
+                        .field("output_sink")
+                        .field("iceberg_change_stream_router_sink")
+                        .field("branches")
+                        .index(branch_index)
+                        .field("destinations"),
                     arena,
                     layout,
                     last_query_id,
@@ -804,7 +820,7 @@ fn runtime_query_options_from_thrift(
     query_opts: Option<&internal_service::TQueryOptions>,
 ) -> Result<Option<QueryOptions>, String> {
     query_opts
-        .map(|opts| QueryOptions::from_thrift(Some(opts)))
+        .map(|opts| decode_query_options(Some(opts)).map_err(|error| error.to_string()))
         .transpose()
 }
 
@@ -824,7 +840,15 @@ fn runtime_filter_params_from_thrift(
 ) -> Result<Option<RuntimeFilterParams>, String> {
     exec_params
         .and_then(|params| params.runtime_filter_params.as_ref())
-        .map(RuntimeFilterParams::from_thrift)
+        .map(|params| {
+            decode_runtime_filter_params(
+                params,
+                FieldPath::root("exec_plan_fragment")
+                    .field("params")
+                    .field("runtime_filter_params"),
+            )
+            .map_err(|error| error.to_string())
+        })
         .transpose()
 }
 
@@ -990,6 +1014,9 @@ pub(crate) fn execute_fragment(
                 let sink_input = data_stream_input_from_compat(
                     stream_sink,
                     exec_params.destinations.clone().unwrap_or_default(),
+                    FieldPath::root("exec_plan_fragment")
+                        .field("params")
+                        .field("destinations"),
                     &mut exec_plan.arena,
                     &lowered.layout,
                     last_query_id,
@@ -1363,4 +1390,94 @@ pub(crate) fn execute_fragment(
     }
 
     Err("unsupported fragment: missing plan".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::compat::layout::Layout;
+    use crate::thrift::partitions::{TDataPartition, TPartitionType};
+
+    fn unpartitioned_stream_sink() -> data_sinks::TDataStreamSink {
+        data_sinks::TDataStreamSink::new(
+            7,
+            TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn destination_without_endpoint() -> data_sinks::TPlanFragmentDestination {
+        data_sinks::TPlanFragmentDestination::new(types::TUniqueId::new(11, 12), None, None, None)
+    }
+
+    fn empty_layout() -> Layout {
+        Layout {
+            order: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn multicast_nested_destination_reports_fragment_branch_path() {
+        let stream = unpartitioned_stream_sink();
+        let multi_cast = data_sinks::TMultiCastDataStreamSink::new(
+            vec![stream.clone(), stream],
+            vec![vec![], vec![destination_without_endpoint()]],
+        );
+        let error = multi_cast_inputs_from_compat(
+            &multi_cast,
+            &mut ExprArena::default(),
+            &empty_layout(),
+            None,
+            None,
+        )
+        .err()
+        .expect("nested destination without an endpoint must be rejected");
+
+        assert_eq!(
+            error,
+            "starrocks protocol error at exec_plan_fragment.fragment.output_sink.multi_cast_stream_sink.destinations[1][0].brpc_server (missing field): destination requires brpc_server or deprecated_server"
+        );
+    }
+
+    #[test]
+    fn router_branch_destination_reports_fragment_branch_path() {
+        let stream = unpartitioned_stream_sink();
+        let router = data_sinks::TIcebergChangeStreamRouterSink::new(
+            23,
+            None,
+            vec![
+                data_sinks::TIcebergChangeStreamRouterBranch::new(
+                    0,
+                    data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV,
+                    stream.clone(),
+                    vec![],
+                ),
+                data_sinks::TIcebergChangeStreamRouterBranch::new(
+                    1,
+                    data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA,
+                    stream,
+                    vec![destination_without_endpoint()],
+                ),
+            ],
+        );
+        let error = iceberg_router_input_from_compat(
+            &router,
+            &mut ExprArena::default(),
+            &empty_layout(),
+            None,
+            None,
+        )
+        .err()
+        .expect("router destination without an endpoint must be rejected");
+
+        assert_eq!(
+            error,
+            "starrocks protocol error at exec_plan_fragment.fragment.output_sink.iceberg_change_stream_router_sink.branches[1].destinations[0].brpc_server (missing field): destination requires brpc_server or deprecated_server"
+        );
+    }
 }

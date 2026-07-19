@@ -28,6 +28,12 @@ use crate::common::types::UniqueId;
 use crate::lower::compat::fragment::execute_fragment;
 use crate::lower::compat::node::hdfs_scan::cache_iceberg_table_locations;
 use crate::lower::compat::node::lower_row_pos_descs;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::compat::endpoint::destination_address;
+use crate::protocol::starrocks::compat::request::backfill_per_node_scan_ranges;
+use crate::protocol::starrocks::decode::{
+    decode_query_options, decode_runtime_endpoint, decode_runtime_filter_params,
+};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{ProfileUnit, Profiler};
@@ -36,9 +42,7 @@ use crate::runtime::query_context::{
     observe_total_fragments, query_context_manager, query_expire_durations,
     resolve_desc_tbl_for_instance,
 };
-use crate::runtime::query_options::QueryOptions;
 use crate::runtime::result_buffer;
-use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::service::fe_report;
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
@@ -103,9 +107,7 @@ fn validate_destinations(
 ) -> Result<(), String> {
     for (idx, dest) in dests.iter().enumerate() {
         validate_network_address(
-            dest.brpc_server
-                .as_ref()
-                .or(dest.deprecated_server.as_ref()),
+            destination_address(dest),
             "missing destination address",
             &format!("{field_name}[{idx}]"),
         )?;
@@ -198,50 +200,6 @@ fn validate_internal_addresses(
         }
     }
     Ok(())
-}
-
-// TODO(novarocks): Align with StarRocks BE by plumbing
-// `node_to_per_driver_seq_scan_ranges` through scan lowering and morsel scheduling directly.
-// Current implementation is a compatibility shim:
-// FE may send scan ranges only via `node_to_per_driver_seq_scan_ranges` in pipeline mode.
-// We fill missing/no-concrete `per_node_scan_ranges[node_id]` by flattening per-driver ranges so
-// existing lowering paths can consume scan ranges deterministically.
-// "no-concrete" means all entries are `empty=true` placeholders.
-fn backfill_per_node_scan_ranges(exec_params: &mut internal_service::TPlanFragmentExecParams) {
-    fn has_concrete_scan_range(ranges: &[internal_service::TScanRangeParams]) -> bool {
-        ranges.iter().any(|range| !range.empty.unwrap_or(false))
-    }
-
-    let Some(node_to_per_driver) = exec_params.node_to_per_driver_seq_scan_ranges.as_ref() else {
-        return;
-    };
-    let mut to_insert = Vec::new();
-    for (node_id, per_driver) in node_to_per_driver {
-        let existing = exec_params.per_node_scan_ranges.get(node_id);
-        let need_backfill = existing
-            .map(|ranges| !has_concrete_scan_range(ranges))
-            .unwrap_or(true);
-        if !need_backfill {
-            continue;
-        }
-        let flattened = per_driver
-            .values()
-            .flat_map(|ranges| ranges.iter().cloned())
-            .collect::<Vec<_>>();
-        if flattened.is_empty() {
-            if existing.is_none() {
-                to_insert.push((*node_id, Vec::new()));
-            }
-            continue;
-        }
-        to_insert.push((*node_id, flattened));
-    }
-    if to_insert.is_empty() {
-        return;
-    }
-    for (node_id, ranges) in to_insert {
-        exec_params.per_node_scan_ranges.insert(node_id, ranges);
-    }
 }
 
 fn append_incremental_scan_ranges(
@@ -778,7 +736,8 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
     let sender_counts = collect_exchange_sender_counts(common, &unique);
     let mut sender_counts_applied = false;
     if let Some(query_id) = common_query_id {
-        let common_query_opts_native = QueryOptions::from_thrift(common_query_opts)?;
+        let common_query_opts_native =
+            decode_query_options(common_query_opts).map_err(|error| error.to_string())?;
         let (delivery_expire, query_expire) =
             query_expire_durations(Some(&common_query_opts_native));
         let require_existing = common_desc_tbl.map(desc_tbl_is_cached).unwrap_or(false);
@@ -860,7 +819,8 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             query_id_for_batch = Some(query_id);
         }
 
-        let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+        let query_opts_native =
+            decode_query_options(query_opts).map_err(|error| error.to_string())?;
         let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
         let require_existing = one
             .desc_tbl
@@ -913,8 +873,11 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             None
         };
         if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
-            let report_endpoint =
-                crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&report_addr)?;
+            let report_endpoint = decode_runtime_endpoint(
+                &report_addr,
+                FieldPath::root("exec_plan_fragment").field("novarocks_report_addr"),
+            )
+            .map_err(|error| error.to_string())?;
             fe_report::register_novarocks_instance(
                 finst_id,
                 query_id,
@@ -961,7 +924,13 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         prepare_fragment_row_position_metadata(mgr.as_ref(), query_id, &fragment)?;
         prepare_lookup_lifecycle(mgr.as_ref(), query_id, &fragment, &exec_params)?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
-            let params = RuntimeFilterParams::from_thrift(&params)?;
+            let params = decode_runtime_filter_params(
+                &params,
+                FieldPath::root("exec_plan_fragment")
+                    .field("params")
+                    .field("runtime_filter_params"),
+            )
+            .map_err(|error| error.to_string())?;
             mgr.set_runtime_filter_params(query_id, params)?;
         }
         spawn_exec_fragment(
@@ -1044,7 +1013,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         .and_then(|g| g.last_query_id.as_deref())
         .map(|s| s.to_string());
     let session_time_zone = query_globals.and_then(|g| g.time_zone.clone());
-    let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+    let query_opts_native = decode_query_options(query_opts).map_err(|error| error.to_string())?;
     let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
     let mgr = query_context_manager();
     let require_existing = one
@@ -1091,8 +1060,11 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         None
     };
     if let (Some(report_addr), Some(backend_num)) = (novarocks_report_addr, backend_num) {
-        let report_endpoint =
-            crate::runtime::endpoint::RuntimeEndpoint::from_network_address(&report_addr)?;
+        let report_endpoint = decode_runtime_endpoint(
+            &report_addr,
+            FieldPath::root("exec_plan_fragment").field("novarocks_report_addr"),
+        )
+        .map_err(|error| error.to_string())?;
         fe_report::register_novarocks_instance(
             finst_id,
             query_id,
@@ -1134,7 +1106,13 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     prepare_fragment_row_position_metadata(mgr.as_ref(), query_id, &fragment)?;
     prepare_lookup_lifecycle(mgr.as_ref(), query_id, &fragment, &params)?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
-        let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
+        let rf_params = decode_runtime_filter_params(
+            &rf_params,
+            FieldPath::root("exec_plan_fragment")
+                .field("params")
+                .field("runtime_filter_params"),
+        )
+        .map_err(|error| error.to_string())?;
         mgr.set_runtime_filter_params(query_id, rf_params)?;
     }
     spawn_exec_fragment(
@@ -1187,7 +1165,7 @@ pub(crate) fn execute_plan_fragment_sync(
     let query_globals = one.query_globals.as_ref();
     let last_query_id = query_globals.and_then(|g| g.last_query_id.as_deref());
     let session_time_zone = query_globals.and_then(|g| g.time_zone.as_deref());
-    let query_opts_native = QueryOptions::from_thrift(query_opts)?;
+    let query_opts_native = decode_query_options(query_opts).map_err(|error| error.to_string())?;
     let (delivery_expire, query_expire) = query_expire_durations(Some(&query_opts_native));
     let mgr = query_context_manager();
     let require_existing = one
@@ -1221,7 +1199,13 @@ pub(crate) fn execute_plan_fragment_sync(
     backfill_per_node_scan_ranges(&mut params);
     validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
-        let rf_params = RuntimeFilterParams::from_thrift(&rf_params)?;
+        let rf_params = decode_runtime_filter_params(
+            &rf_params,
+            FieldPath::root("exec_plan_fragment")
+                .field("params")
+                .field("runtime_filter_params"),
+        )
+        .map_err(|error| error.to_string())?;
         mgr.set_runtime_filter_params(query_id, rf_params)?;
     }
 

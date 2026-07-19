@@ -18,8 +18,6 @@
 use std::net::SocketAddr;
 
 use crate::common::types::UniqueId;
-#[cfg(feature = "compat")]
-use crate::thrift::types;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeEndpoint {
@@ -70,11 +68,6 @@ impl RuntimeEndpoint {
 
     pub(crate) fn as_host_port(&self) -> String {
         format!("{}:{}", self.host, self.port)
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn from_network_address(addr: &types::TNetworkAddress) -> Result<Self, String> {
-        Self::new(addr.hostname.clone(), addr.port)
     }
 }
 

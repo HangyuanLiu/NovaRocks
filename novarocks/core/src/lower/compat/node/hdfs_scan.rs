@@ -46,6 +46,7 @@ use crate::novarocks_connectors::{
     HdfsScanConfig, OrcScanConfig, ParquetScanConfig, ScanConfig,
 };
 use crate::novarocks_logging::{debug, warn};
+use crate::protocol::starrocks::decode::decode_query_options;
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot,
 };
@@ -62,7 +63,7 @@ fn runtime_query_options_from_thrift(
     query_opts: Option<&internal_service::TQueryOptions>,
 ) -> Result<Option<crate::runtime::query_options::QueryOptions>, String> {
     query_opts
-        .map(|opts| crate::runtime::query_options::QueryOptions::from_thrift(Some(opts)))
+        .map(|opts| decode_query_options(Some(opts)).map_err(|error| error.to_string()))
         .transpose()
 }
 
