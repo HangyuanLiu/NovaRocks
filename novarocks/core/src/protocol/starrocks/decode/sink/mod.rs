@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod fragment;
 pub(crate) mod iceberg;
 #[cfg(feature = "compat")]
 pub(crate) mod starrocks;

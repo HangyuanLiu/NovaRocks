@@ -704,6 +704,7 @@ mod tests {
                 data_sequence_number: None,
                 modification_time: None,
                 datacache_options: None,
+                candidate_node: None,
                 included_positions: Vec::new(),
                 serialized_split: None,
                 use_iceberg_jni_metadata_reader: false,

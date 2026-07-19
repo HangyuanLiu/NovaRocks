@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,22 +25,23 @@ use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
 use crate::common::ids::SlotId;
-#[cfg(feature = "compat")]
-use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
+use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
 use crate::fs::scan_context::FileScanRange;
-use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids, slot_name_from_desc,
 };
 use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
-#[cfg(feature = "compat")]
-use crate::service::stream_load_registry;
-use crate::thrift::{descriptors, internal_service, plan_nodes, types};
+use crate::runtime::fragment::instance::ScanAssignments;
+use crate::runtime::scan_range::{BrokerFileFormat, ScanRange};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 #[derive(Clone, Debug)]
 struct CsvReadOptions {
@@ -55,6 +57,130 @@ struct CsvReadOptions {
 struct JsonReadOptions {
     strip_outer_array: bool,
     jsonpaths: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BrokerFileProgramFacts {
+    source_tuple_id: i32,
+    source_slot_ids: Vec<i32>,
+    output_exprs: BTreeMap<i32, ExprId>,
+    column_separator: i8,
+    row_delimiter: i8,
+    multi_column_separator: Option<String>,
+    multi_row_delimiter: Option<String>,
+    skip_header: i64,
+    trim_space: bool,
+    enclose: Option<i8>,
+    escape: Option<i8>,
+}
+
+pub(crate) fn decode_broker_file_program_facts(
+    nodes: &[plan_nodes::TPlanNode],
+    raw_ranges: &BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
+    arena: &mut ExprArena,
+    _nodes_path: FieldPath,
+    raw_ranges_path: FieldPath,
+) -> Result<BTreeMap<i32, BrokerFileProgramFacts>, StarRocksFragmentDecodeError> {
+    let mut output = BTreeMap::new();
+    for (_node_index, node) in nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.node_type == plan_nodes::TPlanNodeType::FILE_SCAN_NODE)
+    {
+        let ranges_path = raw_ranges_path.clone().map_key(node.node_id.to_string());
+        let ranges = raw_ranges.get(&node.node_id).ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                ranges_path.clone(),
+                format!(
+                    "FILE_SCAN_NODE node_id={} missing per-node ranges",
+                    node.node_id
+                ),
+            )
+        })?;
+        let mut shared: Option<(&plan_nodes::TBrokerScanRangeParams, FieldPath)> = None;
+        for (range_index, range) in ranges.iter().enumerate() {
+            let broker_path = ranges_path
+                .clone()
+                .index(range_index)
+                .field("scan_range")
+                .field("broker_scan_range");
+            let broker = range.scan_range.broker_scan_range.as_ref().ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    broker_path.clone(),
+                    format!(
+                        "FILE_SCAN_NODE node_id={} range is not broker_scan_range",
+                        node.node_id
+                    ),
+                )
+            })?;
+            if let Some((previous, _)) = shared.as_ref() {
+                if *previous != &broker.params {
+                    return Err(StarRocksFragmentDecodeError::inconsistent(
+                        broker_path.field("params"),
+                        format!(
+                            "FILE_SCAN_NODE node_id={} has inconsistent broker parameters",
+                            node.node_id
+                        ),
+                    ));
+                }
+            } else {
+                shared = Some((&broker.params, broker_path.field("params")));
+            }
+        }
+        let (params, params_path) = shared.ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                ranges_path.clone(),
+                format!(
+                    "FILE_SCAN_NODE node_id={} has no broker parameters",
+                    node.node_id
+                ),
+            )
+        })?;
+        let source_layout = layout_from_slot_ids(params.src_tuple_id, params.src_slot_ids.clone());
+        let exprs_path = params_path.field("expr_of_dest_slot");
+        let exprs = params.expr_of_dest_slot.as_ref().ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                exprs_path.clone(),
+                format!(
+                    "FILE_SCAN_NODE node_id={} missing expr_of_dest_slot",
+                    node.node_id
+                ),
+            )
+        })?;
+        let mut output_exprs = BTreeMap::new();
+        for (slot_id, expr) in exprs {
+            output_exprs.insert(
+                *slot_id,
+                lower_t_expr_with_common_slot_map_at(
+                    expr,
+                    arena,
+                    &source_layout,
+                    None,
+                    None,
+                    None,
+                    exprs_path.clone().map_key(slot_id.to_string()),
+                    None,
+                )?,
+            );
+        }
+        output.insert(
+            node.node_id,
+            BrokerFileProgramFacts {
+                source_tuple_id: params.src_tuple_id,
+                source_slot_ids: params.src_slot_ids.clone(),
+                output_exprs,
+                column_separator: params.column_separator,
+                row_delimiter: params.row_delimiter,
+                multi_column_separator: params.multi_column_separator.clone(),
+                multi_row_delimiter: params.multi_row_delimiter.clone(),
+                skip_header: params.skip_header.unwrap_or_default(),
+                trim_space: params.trim_space.unwrap_or(false),
+                enclose: params.enclose,
+                escape: params.escape,
+            },
+        );
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Debug)]
@@ -327,7 +453,33 @@ pub(crate) fn lower_file_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
+    program_facts: Option<&BrokerFileProgramFacts>,
+    arena: &mut ExprArena,
+    out_layout: Layout,
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    lower_file_scan_node_inner(
+        node,
+        desc_tbl,
+        _tuple_slots,
+        layout_hints,
+        scan_assignments,
+        program_facts,
+        arena,
+        out_layout,
+    )
+    .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(node_path, detail))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_file_scan_node_inner(
+    node: &plan_nodes::TPlanNode,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    scan_assignments: Option<&ScanAssignments>,
+    program_facts: Option<&BrokerFileProgramFacts>,
     arena: &mut ExprArena,
     mut out_layout: Layout,
 ) -> Result<Lowered, String> {
@@ -365,18 +517,30 @@ pub(crate) fn lower_file_scan_node(
     let Some(scan_assignments) = scan_assignments else {
         return Err("FILE_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let scan_ranges = scan_assignments
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
+    let assignment = scan_assignments
+        .get(&FragmentNodeId::new(node.node_id))
+        .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
+    if assignment.kind() != ScanAssignmentKind::BrokerFile {
+        return Err(format!(
+            "FILE_SCAN_NODE node_id={} expected BrokerFile assignment, got {:?}",
+            node.node_id,
+            assignment.kind()
+        ));
+    }
+    let program_facts = program_facts.ok_or_else(|| {
+        format!(
+            "FILE_SCAN_NODE node_id={} missing normalized broker parameters",
+            node.node_id
+        )
+    })?;
 
     let mut ranges = Vec::new();
     let mut next_scan_range_id: i32 = 0;
     let mut has_more = false;
-    let mut params: Option<plan_nodes::TBrokerScanRangeParams> = None;
     let mut format_type: Option<plan_nodes::TFileFormatType> = None;
     let mut json_range_options: Option<(bool, Option<String>)> = None;
 
-    for scan_range_param in scan_ranges {
+    for scan_range_param in assignment.ranges() {
         if scan_range_param.empty.unwrap_or(false) {
             if scan_range_param.has_more.unwrap_or(false) {
                 has_more = true;
@@ -387,131 +551,60 @@ pub(crate) fn lower_file_scan_node(
             has_more = true;
         }
 
-        let broker_scan_range = scan_range_param
-            .scan_range
-            .broker_scan_range
-            .as_ref()
-            .ok_or_else(|| {
-                format!(
-                    "FILE_SCAN_NODE node_id={} missing broker_scan_range in TScanRangeParams",
-                    node.node_id
-                )
-            })?;
-
-        if let Some(existing) = params.as_ref() {
-            if existing != &broker_scan_range.params {
+        let ScanRange::BrokerFile(range_desc) = &scan_range_param.range else {
+            return Err(format!(
+                "FILE_SCAN_NODE node_id={} assignment contains non-broker range",
+                node.node_id
+            ));
+        };
+        let current_format = match range_desc.format {
+            BrokerFileFormat::Csv => plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN,
+            BrokerFileFormat::Json => plan_nodes::TFileFormatType::FORMAT_JSON,
+            other => {
                 return Err(format!(
-                    "FILE_SCAN_NODE node_id={} has inconsistent broker_scan_range params across ranges",
+                    "FILE_SCAN_NODE node_id={} unsupported normalized format {:?}",
+                    node.node_id, other
+                ));
+            }
+        };
+        if let Some(previous) = format_type {
+            if previous != current_format {
+                return Err(format!(
+                    "FILE_SCAN_NODE node_id={} has mixed normalized formats",
                     node.node_id
                 ));
             }
         } else {
-            params = Some(broker_scan_range.params.clone());
+            format_type = Some(current_format);
         }
-
-        for range_desc in &broker_scan_range.ranges {
-            let path = match range_desc.file_type {
-                t if t == types::TFileType::FILE_LOCAL => {
-                    if range_desc.path.trim().is_empty() {
-                        return Err(format!(
-                            "FILE_SCAN_NODE node_id={} empty local file path in range desc",
-                            node.node_id
-                        ));
-                    }
-                    range_desc.path.clone()
-                }
-                t if t == types::TFileType::FILE_STREAM => {
-                    let load_id = range_desc.load_id.as_ref().ok_or_else(|| {
-                        format!(
-                            "FILE_SCAN_NODE node_id={} FILE_STREAM range is missing load_id",
-                            node.node_id
-                        )
-                    })?;
-                    #[cfg(feature = "compat")]
-                    {
-                        stream_load_registry::resolve_stream_load_file_path(load_id).ok_or_else(|| {
-                        format!(
-                            "FILE_SCAN_NODE node_id={} has no registered local file for load_id={}",
-                            node.node_id,
-                            format_uuid(load_id.hi, load_id.lo)
-                        )
-                    })?
-                    }
-                    #[cfg(not(feature = "compat"))]
-                    {
-                        let _ = load_id;
-                        return Err(format!(
-                            "FILE_SCAN_NODE node_id={} FILE_STREAM range requires StarRocks FE compatibility mode",
-                            node.node_id
-                        ));
-                    }
-                }
-                _ => {
+        if current_format == plan_nodes::TFileFormatType::FORMAT_JSON {
+            let current = (range_desc.strip_outer_array, range_desc.jsonpaths.clone());
+            if let Some(previous) = &json_range_options {
+                if previous != &current {
                     return Err(format!(
-                        "FILE_SCAN_NODE node_id={} unsupported file type {:?}",
-                        node.node_id, range_desc.file_type
-                    ));
-                }
-            };
-            if let Some(prev) = format_type {
-                if prev != range_desc.format_type {
-                    return Err(format!(
-                        "FILE_SCAN_NODE node_id={} mixed format types: {:?} vs {:?}",
-                        node.node_id, prev, range_desc.format_type
+                        "FILE_SCAN_NODE node_id={} has inconsistent JSON range options",
+                        node.node_id
                     ));
                 }
             } else {
-                format_type = Some(range_desc.format_type);
+                json_range_options = Some(current);
             }
-
-            if range_desc.format_type == plan_nodes::TFileFormatType::FORMAT_JSON {
-                let current = (
-                    range_desc.strip_outer_array.unwrap_or(false),
-                    range_desc.jsonpaths.clone(),
-                );
-                if let Some(prev) = &json_range_options {
-                    if prev != &current {
-                        return Err(format!(
-                            "FILE_SCAN_NODE node_id={} has inconsistent json range options across ranges",
-                            node.node_id
-                        ));
-                    }
-                } else {
-                    json_range_options = Some(current);
-                }
-            }
-
-            if let Some(compression) = range_desc.compression_type
-                && compression != types::TCompressionType::NO_COMPRESSION
-                && compression != types::TCompressionType::DEFAULT_COMPRESSION
-                && compression != types::TCompressionType::UNKNOWN_COMPRESSION
-            {
-                return Err(format!(
-                    "FILE_SCAN_NODE node_id={} unsupported compression type {:?}",
-                    node.node_id, compression
-                ));
-            }
-
-            ranges.push(FileScanRange {
-                path,
-                file_len: range_desc.file_size.unwrap_or_default().max(0) as u64,
-                offset: range_desc.start_offset.max(0) as u64,
-                length: if range_desc.size > 0 {
-                    range_desc.size as u64
-                } else {
-                    0
-                },
-                scan_range_id: next_scan_range_id,
-                first_row_id: None,
-                data_sequence_number: None,
-                ivm_change_op: None,
-                included_positions: None,
-                external_datacache: None,
-                delete_files: Vec::new(),
-                iceberg_file_pruning: None,
-            });
-            next_scan_range_id = next_scan_range_id.saturating_add(1);
         }
+        ranges.push(FileScanRange {
+            path: range_desc.path.clone(),
+            file_len: range_desc.file_size.max(0) as u64,
+            offset: range_desc.offset.max(0) as u64,
+            length: range_desc.length.max(0) as u64,
+            scan_range_id: next_scan_range_id,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        });
+        next_scan_range_id = next_scan_range_id.saturating_add(1);
     }
     if has_more {
         return Err(format!(
@@ -526,13 +619,6 @@ pub(crate) fn lower_file_scan_node(
             node.node_id
         )
     })?;
-    let params = params.ok_or_else(|| {
-        format!(
-            "FILE_SCAN_NODE node_id={} missing broker scan range params",
-            node.node_id
-        )
-    })?;
-
     if format_type != plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN
         && format_type != plan_nodes::TFileFormatType::FORMAT_JSON
     {
@@ -542,30 +628,21 @@ pub(crate) fn lower_file_scan_node(
         ));
     }
 
-    let source_layout = layout_from_slot_ids(params.src_tuple_id, params.src_slot_ids.clone());
-    let source_slot_ids: Vec<SlotId> = params
-        .src_slot_ids
+    let source_slot_ids: Vec<SlotId> = program_facts
+        .source_slot_ids
         .iter()
         .map(|slot_id| SlotId::try_from(*slot_id))
         .collect::<Result<_, _>>()?;
 
-    let expr_map = params.expr_of_dest_slot.as_ref().ok_or_else(|| {
-        format!(
-            "FILE_SCAN_NODE node_id={} missing expr_of_dest_slot in broker params",
-            node.node_id
-        )
-    })?;
     let mut output_exprs = Vec::with_capacity(out_layout.order.len());
     for (_, slot_id) in &out_layout.order {
-        let expr = expr_map.get(slot_id).ok_or_else(|| {
+        let expr_id = program_facts.output_exprs.get(slot_id).ok_or_else(|| {
             format!(
                 "FILE_SCAN_NODE node_id={} missing expr_of_dest_slot for slot_id={}",
                 node.node_id, slot_id
             )
         })?;
-        let expr_id =
-            lower_t_expr_with_common_slot_map(expr, arena, &source_layout, None, None, None)?;
-        output_exprs.push(expr_id);
+        output_exprs.push(*expr_id);
     }
 
     let desc_tbl = desc_tbl.ok_or_else(|| {
@@ -587,7 +664,7 @@ pub(crate) fn lower_file_scan_node(
             )
         })?;
         let slot_desc = slot_descs.iter().find(|slot_desc| {
-            slot_desc.parent == Some(params.src_tuple_id)
+            slot_desc.parent == Some(program_facts.source_tuple_id)
                 && slot_desc.id == Some(source_slot_id_i32)
         });
         // Some source slots (e.g. ignored columns in stream load `columns:"k,v2,xx"`)
@@ -643,14 +720,19 @@ pub(crate) fn lower_file_scan_node(
     }
 
     let (csv, json) = if format_type == plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN {
-        let column_delimiter = params.multi_column_separator.clone().unwrap_or_else(|| {
-            String::from_utf8_lossy(&[params.column_separator as u8]).to_string()
-        });
-        let row_delimiter = params
+        let column_delimiter = program_facts
+            .multi_column_separator
+            .clone()
+            .unwrap_or_else(|| {
+                String::from_utf8_lossy(&[program_facts.column_separator as u8]).to_string()
+            });
+        let row_delimiter = program_facts
             .multi_row_delimiter
             .clone()
-            .unwrap_or_else(|| String::from_utf8_lossy(&[params.row_delimiter as u8]).to_string());
-        let skip_header = params.skip_header.unwrap_or_default();
+            .unwrap_or_else(|| {
+                String::from_utf8_lossy(&[program_facts.row_delimiter as u8]).to_string()
+            });
+        let skip_header = program_facts.skip_header;
         if skip_header < 0 {
             return Err(format!(
                 "FILE_SCAN_NODE node_id={} invalid negative skip_header={}",
@@ -662,9 +744,9 @@ pub(crate) fn lower_file_scan_node(
                 column_delimiter,
                 row_delimiter,
                 skip_header: skip_header as usize,
-                trim_space: params.trim_space.unwrap_or(false),
-                enclose: params.enclose.map(|value| value as u8),
-                escape: params.escape.map(|value| value as u8),
+                trim_space: program_facts.trim_space,
+                enclose: program_facts.enclose.map(|value| value as u8),
+                escape: program_facts.escape.map(|value| value as u8),
             }),
             None,
         )

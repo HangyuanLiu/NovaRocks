@@ -132,6 +132,10 @@ impl DataStreamSinkProgram {
     pub(crate) const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
     }
+
+    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.partition_arena
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +261,10 @@ impl MultiCastDataStreamSinkProgram {
     pub(crate) const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
     }
+
+    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.partition_arena
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +328,10 @@ impl SplitDataStreamSinkProgram {
     pub(crate) const fn arena(&self) -> &ExprArena {
         &self.arena
     }
+
+    pub(crate) fn arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.arena
+    }
 }
 
 #[derive(Clone)]
@@ -362,6 +374,10 @@ impl IcebergTableSinkProgram {
             arena: self.arena.clone(),
             plan: self.plan.clone(),
         }
+    }
+
+    pub(crate) fn arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.arena
     }
 }
 
@@ -452,6 +468,10 @@ impl IcebergChangeStreamRouterProgram {
 
     pub(crate) const fn partition_arena(&self) -> &ExprArena {
         &self.partition_arena
+    }
+
+    pub(crate) fn partition_arena_mut(&mut self) -> &mut ExprArena {
+        &mut self.partition_arena
     }
 }
 

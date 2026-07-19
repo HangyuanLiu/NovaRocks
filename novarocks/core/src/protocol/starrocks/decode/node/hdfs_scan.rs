@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
+use crate::cache::{CacheOptions, DataCacheContext, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::connector::iceberg::delete_file::{
@@ -32,11 +32,11 @@ use crate::connector::iceberg::{
     build_projected_output_schema_from_descriptor,
 };
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetReadCachePolicy, ParquetSlotKind, VariantPathPruningPredicate, VariantPathSpec,
 };
-use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, FileFormatConfig, FileScanRange, HdfsIcebergRuntimePruningConfig,
     HdfsScanConfig, OrcScanConfig, ParquetScanConfig, ScanConfig,
@@ -51,8 +51,10 @@ use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
 use crate::runtime::descriptor_snapshot::{
     DescriptorLogicalType, DescriptorSlot, DescriptorSnapshot, IcebergTableLocationMap,
 };
+use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::query_options::QueryOptions;
-use crate::thrift::{descriptors, exprs, internal_service, plan_nodes, runtime_filter, types};
+use crate::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
+use crate::thrift::{descriptors, exprs, plan_nodes, runtime_filter, types};
 
 fn next_hidden_slot_id(visible_slot_ids: &[SlotId]) -> Result<SlotId, String> {
     let max_slot = visible_slot_ids
@@ -72,34 +74,6 @@ fn advance_hidden_slot_id(slot_id: SlotId) -> Result<SlotId, String> {
         .checked_add(1)
         .map(SlotId::new)
         .ok_or_else(|| "cannot allocate hidden HDFS scan slot id".to_string())
-}
-
-fn iceberg_file_content_from_thrift(
-    scan_node_label: &str,
-    file_content: crate::thrift::types::TIcebergFileContent,
-) -> Result<IcebergFileContent, String> {
-    match file_content {
-        crate::thrift::types::TIcebergFileContent::DATA => Ok(IcebergFileContent::Data),
-        crate::thrift::types::TIcebergFileContent::POSITION_DELETES => {
-            Ok(IcebergFileContent::PositionDeletes)
-        }
-        crate::thrift::types::TIcebergFileContent::EQUALITY_DELETES => {
-            Ok(IcebergFileContent::EqualityDeletes)
-        }
-        other => Err(format!(
-            "{scan_node_label} received unexpected iceberg delete file_content {other:?}"
-        )),
-    }
-}
-
-fn iceberg_file_format_from_thrift(
-    format: crate::thrift::descriptors::THdfsFileFormat,
-) -> IcebergFileFormat {
-    match format {
-        crate::thrift::descriptors::THdfsFileFormat::PARQUET => IcebergFileFormat::Parquet,
-        crate::thrift::descriptors::THdfsFileFormat::UNKNOWN => IcebergFileFormat::Unknown,
-        _ => IcebergFileFormat::Unknown,
-    }
 }
 
 fn hdfs_scan_file_format_from_thrift(
@@ -165,53 +139,6 @@ fn simple_topn_probe_slot_ref(probe_expr: &exprs::TExpr) -> Option<&exprs::TSlot
     node.slot_ref.as_ref()
 }
 
-fn convert_scan_range_delete_files(
-    scan_node_label: &str,
-    hdfs_range: &crate::thrift::plan_nodes::THdfsScanRange,
-) -> Result<Vec<IcebergDeleteFileSpec>, String> {
-    let Some(delete_files) = hdfs_range.delete_files.as_ref() else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(delete_files.len());
-    for del in delete_files {
-        let file_content = del.file_content.ok_or_else(|| {
-            format!("{scan_node_label} iceberg delete file is missing file_content")
-        })?;
-        let file_content = iceberg_file_content_from_thrift(scan_node_label, file_content)?;
-        let path = del
-            .full_path
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                format!("{scan_node_label} iceberg position-delete file has empty full_path")
-            })?
-            .to_string();
-        let thrift_format = del
-            .file_format
-            .unwrap_or(crate::thrift::descriptors::THdfsFileFormat::PARQUET);
-        let file_format = iceberg_file_format_from_thrift(thrift_format);
-        if file_format != IcebergFileFormat::Parquet {
-            return Err(format!(
-                "{scan_node_label} iceberg position-delete file {path} has unsupported format \
-                 {file_format:?}; only PARQUET is supported"
-            ));
-        }
-        let length = del
-            .length
-            .and_then(|v| if v > 0 { Some(v as u64) } else { None });
-        out.push(IcebergDeleteFileSpec {
-            path,
-            file_format,
-            file_content,
-            length,
-            content_offset: None,
-            content_size_in_bytes: None,
-        });
-    }
-    Ok(out)
-}
-
 fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
     Field::new(name, DataType::Int64, nullable).with_metadata(HashMap::from([(
         PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -219,18 +146,16 @@ fn iceberg_reserved_field(name: &str, nullable: bool, field_id: i32) -> Field {
     )]))
 }
 
-fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
-    let cfg = match novarocks_app_config() {
-        Ok(cfg) => cfg,
-        Err(_) => return Ok(()),
-    };
-    let rewrite = &cfg.runtime.path_rewrite;
-    if !rewrite.enable {
+fn apply_path_rewrite(
+    ranges: &mut [FileScanRange],
+    rewrite: Option<&crate::protocol::starrocks::decode::instance::StarRocksPathRewriteFacts>,
+) -> Result<(), String> {
+    let Some(rewrite) = rewrite else {
         return Ok(());
-    }
+    };
 
-    let from = rewrite.from_prefix.trim();
-    let to = rewrite.to_prefix.trim();
+    let from = rewrite.from_prefix().trim();
+    let to = rewrite.to_prefix().trim();
     if from.is_empty() || to.is_empty() {
         return Err(
             "path rewrite enabled but runtime.path_rewrite.from_prefix/to_prefix is empty"
@@ -311,6 +236,7 @@ fn file_cache_flags_from_query_options(query_opts: &QueryOptions) -> (bool, bool
 /// native lake tablets).
 fn resolve_cloud_object_store_config<S>(
     cloud_props: Option<&std::collections::BTreeMap<S, S>>,
+    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String>
 where
     S: std::borrow::Borrow<str> + Ord,
@@ -328,56 +254,8 @@ where
     };
 
     let mut cfg = credentials.to_object_store_config();
-    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+    decode_facts.object_store_defaults().apply_to(&mut cfg);
     Ok(Some(cfg))
-}
-
-fn validate_included_positions_full_file_range(
-    node_id: i32,
-    hdfs_range: &plan_nodes::THdfsScanRange,
-    offset: u64,
-    length: u64,
-    file_len: u64,
-) -> Result<(), String> {
-    if hdfs_range.included_positions.is_none() {
-        return Ok(());
-    }
-    if offset == 0 && length == file_len {
-        return Ok(());
-    }
-    Err(format!(
-        "HDFS_SCAN_NODE node_id={node_id} included_positions requires a full-file scan range, got offset={offset} length={length} file_length={file_len}"
-    ))
-}
-
-fn iceberg_file_pruning_from_hdfs_range(
-    is_iceberg_table: bool,
-    hdfs_range: &plan_nodes::THdfsScanRange,
-    hive_column_names: Option<&[String]>,
-) -> Option<crate::connector::iceberg::file_pruning::IcebergFilePruningMetadata> {
-    if !is_iceberg_table {
-        return None;
-    }
-    crate::connector::iceberg::file_pruning_wire::iceberg_file_pruning_metadata_from_thrift(
-        hdfs_range,
-        hive_column_names?,
-    )
-}
-
-fn scan_ranges_have_extended_column(
-    scan_ranges: &[internal_service::TScanRangeParams],
-    slot_id: SlotId,
-) -> Result<bool, String> {
-    let slot_id = i32::try_from(slot_id.as_u32())
-        .map_err(|_| format!("extended column slot_id={slot_id} exceeds i32"))?;
-    Ok(scan_ranges.iter().any(|params| {
-        params
-            .scan_range
-            .hdfs_scan_range
-            .as_ref()
-            .and_then(|range| range.extended_columns.as_ref())
-            .is_some_and(|extended_columns| extended_columns.contains_key(&slot_id))
-    }))
 }
 
 #[derive(Clone, Debug)]
@@ -845,11 +723,12 @@ pub(crate) fn lower_hdfs_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
     query_opts: &QueryOptions,
     connectors: &ConnectorRegistry,
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
+    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -922,9 +801,16 @@ pub(crate) fn lower_hdfs_scan_node(
     let Some(scan_assignments) = scan_assignments else {
         return Err("HDFS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let scan_ranges = scan_assignments
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
+    let assignment = scan_assignments
+        .get(&FragmentNodeId::new(node.node_id))
+        .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
+    if assignment.kind() != ScanAssignmentKind::File {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} expected File assignment, got {:?}",
+            node.node_id,
+            assignment.kind()
+        ));
+    }
 
     let mut slot_ids = Vec::with_capacity(out_layout.order.len());
     let mut read_columns = HdfsScanReadColumns::default();
@@ -1061,7 +947,9 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
         if crate::exec::row_position::is_change_op(&name)
-            && scan_ranges_have_extended_column(scan_ranges, slot_id)?
+            && assignment.ranges().iter().any(|range| {
+                matches!(&range.range, ScanRange::File(file) if file.ivm_change_op.is_some())
+            })
         {
             if !logical.is_int8() {
                 return Err(format!(
@@ -1143,19 +1031,9 @@ pub(crate) fn lower_hdfs_scan_node(
     let datacache_requested =
         cache_options.enable_scan_datacache || cache_options.enable_populate_datacache;
     if datacache_requested {
-        let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-        let cache_cfg = &cfg.runtime.cache;
-        if !cache_cfg.datacache_enable {
+        if !decode_facts.datacache_available() {
             warn!(
-                "HDFS_SCAN_NODE node_id={} requested datacache (scan={}, populate={}) but runtime.cache.datacache_enable=false; fallback to remote read without datacache",
-                node.node_id,
-                cache_options.enable_scan_datacache,
-                cache_options.enable_populate_datacache
-            );
-            cache_options.disable_external_datacache();
-        } else if DataCacheManager::instance().block_cache().is_none() {
-            warn!(
-                "HDFS_SCAN_NODE node_id={} requested datacache (scan={}, populate={}) but block cache is unavailable; fallback to remote read without datacache",
+                "HDFS_SCAN_NODE node_id={} requested datacache (scan={}, populate={}) but explicit decoder facts report it unavailable; fallback to remote read without datacache",
                 node.node_id,
                 cache_options.enable_scan_datacache,
                 cache_options.enable_populate_datacache
@@ -1189,18 +1067,21 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut has_more = false;
     let mut scan_format: Option<descriptors::THdfsFileFormat> = None;
     let mut next_scan_range_id: i32 = 0;
-    for p in scan_ranges {
+    for p in assignment.ranges() {
         if p.empty.unwrap_or(false) {
             if p.has_more.unwrap_or(false) {
                 has_more = true;
             }
             continue;
         }
-        let Some(hdfs_range) = p.scan_range.hdfs_scan_range.as_ref() else {
-            continue;
+        let ScanRange::File(hdfs_range) = &p.range else {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} assignment contains non-file range",
+                node.node_id
+            ));
         };
         if is_iceberg_metadata_scan {
-            if !hdfs_range.use_iceberg_jni_metadata_reader.unwrap_or(false) {
+            if !hdfs_range.use_iceberg_jni_metadata_reader {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} expected Iceberg metadata scan range with use_iceberg_jni_metadata_reader=true",
                     node.node_id
@@ -1250,36 +1131,25 @@ pub(crate) fn lower_hdfs_scan_node(
             });
             continue;
         }
-        if hdfs_range.use_paimon_jni_reader.unwrap_or(false) {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support Paimon JNI reader; require raw parquet/orc scan ranges",
-                node.node_id
-            ));
-        }
-        if hdfs_range
-            .paimon_split_info
-            .as_ref()
-            .is_some_and(|s| !s.is_empty())
-            || hdfs_range
-                .paimon_predicate_info
-                .as_ref()
-                .is_some_and(|s| !s.is_empty())
-        {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support Paimon split/predicate info; require raw parquet/orc scan ranges",
-                node.node_id
-            ));
-        }
-        if hdfs_range.paimon_deletion_file.is_some() {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support deletion files (append-only only)",
-                node.node_id
-            ));
-        }
-        let mut iceberg_delete_files = convert_scan_range_delete_files(
-            &format!("HDFS_SCAN_NODE node_id={}", node.node_id),
-            hdfs_range,
-        )?;
+        let mut iceberg_delete_files = hdfs_range
+            .delete_files
+            .iter()
+            .map(|file| IcebergDeleteFileSpec {
+                path: file.full_path.clone().unwrap_or_default(),
+                file_format: IcebergFileFormat::Parquet,
+                file_content: match file.file_content {
+                    crate::runtime::scan_range::IcebergFileContent::PositionDeletes => {
+                        IcebergFileContent::PositionDeletes
+                    }
+                    crate::runtime::scan_range::IcebergFileContent::EqualityDeletes => {
+                        IcebergFileContent::EqualityDeletes
+                    }
+                },
+                length: file.length.and_then(|value| u64::try_from(value).ok()),
+                content_offset: None,
+                content_size_in_bytes: None,
+            })
+            .collect::<Vec<_>>();
         if let Some(dv) = hdfs_range.deletion_vector_descriptor.as_ref() {
             let path = dv
                 .path_or_inline_dv
@@ -1309,49 +1179,29 @@ pub(crate) fn lower_hdfs_scan_node(
                 path, None, offset, size,
             ));
         }
-        if hdfs_range
-            .delete_column_slot_ids
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-        {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support delete columns (append-only only)",
-                node.node_id
-            ));
-        }
-        let file_format = hdfs_range.file_format.as_ref().ok_or_else(|| {
-            format!(
-                "HDFS_SCAN_NODE node_id={} missing file_format in scan range",
-                node.node_id
-            )
-        })?;
-        if *file_format != descriptors::THdfsFileFormat::PARQUET
-            && *file_format != descriptors::THdfsFileFormat::ORC
-        {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} unsupported file_format {:?}",
-                node.node_id, file_format
-            ));
-        }
-        if row_position_spec.is_some() && *file_format != descriptors::THdfsFileFormat::PARQUET {
+        let file_format = match hdfs_range.file_format {
+            RuntimeFileFormat::Parquet => descriptors::THdfsFileFormat::PARQUET,
+            RuntimeFileFormat::Orc => descriptors::THdfsFileFormat::ORC,
+        };
+        if row_position_spec.is_some() && file_format != descriptors::THdfsFileFormat::PARQUET {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} row position requires PARQUET scan ranges, got {:?}",
                 node.node_id, file_format
             ));
         }
         if let Some(prev) = scan_format.as_ref() {
-            if prev != file_format {
+            if prev != &file_format {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} mixed file formats: {:?} vs {:?}",
                     node.node_id, prev, file_format
                 ));
             }
         } else {
-            scan_format = Some(*file_format);
+            scan_format = Some(file_format);
         }
         if is_paimon {
-            if file_format != &descriptors::THdfsFileFormat::PARQUET
-                && file_format != &descriptors::THdfsFileFormat::ORC
+            if file_format != descriptors::THdfsFileFormat::PARQUET
+                && file_format != descriptors::THdfsFileFormat::ORC
             {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} only supports parquet/orc for Paimon tables",
@@ -1365,22 +1215,21 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
         }
-        let file_len = hdfs_range.file_length.unwrap_or(0);
+        let file_len = hdfs_range.file_length;
         let file_len = if file_len > 0 { file_len as u64 } else { 0 };
-        let offset = hdfs_range.offset.unwrap_or(0);
+        let offset = hdfs_range.offset;
         let offset = if offset >= 0 { offset as u64 } else { 0 };
-        let length = hdfs_range.length.unwrap_or(0);
+        let length = hdfs_range.length;
         let mut length = if length > 0 { length as u64 } else { 0 };
         if length == 0 && file_len > offset {
             length = file_len - offset;
         }
-        validate_included_positions_full_file_range(
-            node.node_id,
-            hdfs_range,
-            offset,
-            length,
-            file_len,
-        )?;
+        if !hdfs_range.included_positions.is_empty() && !(offset == 0 && length == file_len) {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} included_positions requires a full-file range",
+                node.node_id
+            ));
+        }
         let scan_range_id = if row_position_spec.is_some() {
             let id = next_scan_range_id;
             next_scan_range_id = next_scan_range_id.saturating_add(1);
@@ -1402,10 +1251,10 @@ pub(crate) fn lower_hdfs_scan_node(
             let range_datacache_options = hdfs_range.datacache_options.as_ref();
             let candidate_node = hdfs_range
                 .candidate_node
-                .as_ref()
-                .map(|node| node.trim())
-                .filter(|node| !node.is_empty())
-                .map(|node| node.to_string());
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
             let options = ExternalDataCacheRangeOptions {
                 modification_time: hdfs_range.modification_time,
                 enable_populate_datacache: range_datacache_options
@@ -1425,11 +1274,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 None
             }
         };
-        let iceberg_file_pruning = iceberg_file_pruning_from_hdfs_range(
-            is_iceberg_table,
-            hdfs_range,
-            hive_column_names.as_deref(),
-        );
+        let iceberg_file_pruning = None;
 
         // data_sequence_number is populated from THdfsScanRange field 38
         // when the NovaRocks iceberg codegen path (standalone SQL) fills it in.
@@ -1437,12 +1282,7 @@ pub(crate) fn lower_hdfs_scan_node(
         // None, which is acceptable: the incremental morsel builder also
         // produces None for FE-driven ranges (see build_incremental_morsels).
         let data_sequence_number = hdfs_range.data_sequence_number;
-        let ivm_change_op =
-            crate::runtime::change_op::extract_change_op_from_hdfs_range_extended_columns(
-                node.node_id,
-                hdfs_range,
-                iceberg_virtual_change_op_slot,
-            )?;
+        let ivm_change_op = hdfs_range.ivm_change_op;
         if iceberg_virtual_change_op_slot.is_some() && ivm_change_op.is_none() {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} __change_op virtual slot requires every scan range to carry extended_columns",
@@ -1460,7 +1300,8 @@ pub(crate) fn lower_hdfs_scan_node(
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
-                included_positions: hdfs_range.included_positions.clone(),
+                included_positions: (!hdfs_range.included_positions.is_empty())
+                    .then(|| hdfs_range.included_positions.clone()),
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
                 iceberg_file_pruning: iceberg_file_pruning.clone(),
@@ -1489,7 +1330,8 @@ pub(crate) fn lower_hdfs_scan_node(
                 first_row_id,
                 data_sequence_number,
                 ivm_change_op,
-                included_positions: hdfs_range.included_positions.clone(),
+                included_positions: (!hdfs_range.included_positions.is_empty())
+                    .then(|| hdfs_range.included_positions.clone()),
                 external_datacache,
                 delete_files: iceberg_delete_files,
                 iceberg_file_pruning,
@@ -1535,7 +1377,7 @@ pub(crate) fn lower_hdfs_scan_node(
         });
     }
     let original_range_count = ranges.len();
-    apply_path_rewrite(&mut ranges)?;
+    apply_path_rewrite(&mut ranges, decode_facts.path_rewrite())?;
     let mut enable_page_index = query_opts.enable_parquet_reader_page_index;
 
     let pruning_predicates = parse_hdfs_scan_pruning_predicates(
@@ -1582,7 +1424,7 @@ pub(crate) fn lower_hdfs_scan_node(
 
     debug!("HDFS_SCAN using batch_size: {:?}", batch_size);
 
-    let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
+    let external_datacache = DataCacheContext::external(cache_options.clone());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
     if is_iceberg_table && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
@@ -1750,7 +1592,7 @@ pub(crate) fn lower_hdfs_scan_node(
         .cloud_configuration
         .as_ref()
         .and_then(|c| c.cloud_properties.as_ref());
-    let object_store_config = resolve_cloud_object_store_config(cloud_props)?;
+    let object_store_config = resolve_cloud_object_store_config(cloud_props, decode_facts)?;
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {
         ranges,

@@ -48,6 +48,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     out_layout: Layout,
+    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 ) -> Result<Lowered, String> {
     let payload = node.iceberg_delta_scan_node.as_ref().ok_or_else(|| {
         format!(
@@ -81,6 +82,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let object_store_config = object_store_config_from_cloud_configuration(
         plan.cloud_configuration.as_ref(),
         &table_payload.table_location,
+        decode_facts,
     )?;
 
     let output_chunk_schema: ChunkSchemaRef = if out_layout.order.is_empty() {
@@ -422,6 +424,7 @@ fn lower_delete_visibility_content(
 fn object_store_config_from_cloud_configuration(
     cloud: Option<&crate::thrift::cloud_configuration::TCloudConfiguration>,
     _table_location: &str,
+    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 ) -> Result<Option<crate::fs::object_store::ObjectStoreConfig>, String> {
     let Some(cloud) = cloud else {
         return Ok(None);
@@ -439,6 +442,6 @@ fn object_store_config_from_cloud_configuration(
     };
 
     let mut config = credentials.to_object_store_config();
-    crate::fs::object_store::apply_object_store_runtime_defaults(&mut config);
+    decode_facts.object_store_defaults().apply_to(&mut config);
     Ok(Some(config))
 }

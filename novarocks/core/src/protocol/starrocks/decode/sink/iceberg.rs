@@ -43,12 +43,42 @@ use crate::exec::row_position::{
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
 use crate::fs::object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
-use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::Layout;
+use crate::protocol::starrocks::decode::{
+    StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
+};
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 
 type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
+
+#[derive(Debug)]
+pub(crate) enum IcebergSinkDecodeError {
+    Sink(String),
+    Protocol(StarRocksFragmentDecodeError),
+}
+
+impl IcebergSinkDecodeError {
+    pub(crate) fn into_fragment(self, sink_path: FieldPath) -> StarRocksFragmentDecodeError {
+        match self {
+            Self::Sink(detail) => StarRocksFragmentDecodeError::invalid_value(sink_path, detail),
+            Self::Protocol(error) => error,
+        }
+    }
+}
+
+impl From<String> for IcebergSinkDecodeError {
+    fn from(detail: String) -> Self {
+        Self::Sink(detail)
+    }
+}
+
+impl From<StarRocksFragmentDecodeError> for IcebergSinkDecodeError {
+    fn from(error: StarRocksFragmentDecodeError) -> Self {
+        Self::Protocol(error)
+    }
+}
 
 pub(crate) fn iceberg_sink_mode_for_type(t: data_sinks::TDataSinkType) -> IcebergSinkMode {
     match t {
@@ -67,7 +97,9 @@ pub(crate) fn lower_iceberg_sink_factory_input(
     desc_tbl: &descriptors::TDescriptorTable,
     last_query_id: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<IcebergSinkFactoryInput, String> {
+    sink_path: FieldPath,
+    output_exprs_path: FieldPath,
+) -> Result<IcebergSinkFactoryInput, IcebergSinkDecodeError> {
     let mut arena = ExprArena::default();
     let lowered_output_exprs = lower_output_exprs(
         output_exprs,
@@ -75,6 +107,7 @@ pub(crate) fn lower_iceberg_sink_factory_input(
         layout,
         last_query_id,
         external_dependencies,
+        output_exprs_path,
     )?;
 
     let thrift_iceberg_table = resolve_iceberg_table(desc_tbl, sink.target_table_id)?;
@@ -130,7 +163,8 @@ pub(crate) fn lower_iceberg_sink_factory_input(
                     "iceberg sink output expr count mismatch: exprs={} columns={}",
                     output_exprs.len(),
                     target_schema.fields().len()
-                ));
+                )
+                .into());
             }
             (Arc::clone(&target_schema), target_schema, Vec::new())
         }
@@ -148,7 +182,8 @@ pub(crate) fn lower_iceberg_sink_factory_input(
             if !partition_column_names.is_empty() {
                 return Err(
                     "iceberg equality-delete sink currently supports only unpartitioned tables"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             }
             validate_equality_delete_unpartitioned_target_metadata(
@@ -162,7 +197,8 @@ pub(crate) fn lower_iceberg_sink_factory_input(
                     (one per equality-key column); got {}",
                     schema.fields().len(),
                     output_exprs.len(),
-                ));
+                )
+                .into());
             }
             (Arc::clone(&schema), schema, columns)
         }
@@ -199,6 +235,7 @@ pub(crate) fn lower_iceberg_sink_factory_input(
         layout,
         last_query_id,
         external_dependencies,
+        sink_path.field("partition_exprs"),
     )?;
 
     let table_location = sink
@@ -272,13 +309,24 @@ fn lower_output_exprs(
     layout: &Layout,
     last_query_id: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<Vec<ExprId>, String> {
+    path: FieldPath,
+) -> Result<Vec<ExprId>, StarRocksFragmentDecodeError> {
     if output_exprs.is_empty() {
-        return Err("iceberg sink missing output exprs".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            path,
+            "iceberg sink missing output exprs",
+        ));
     }
     let mut ids = Vec::with_capacity(output_exprs.len());
-    for expr in output_exprs {
-        let id = lower_t_expr(expr, arena, layout, last_query_id, external_dependencies)?;
+    for (index, expr) in output_exprs.iter().enumerate() {
+        let id = lower_t_expr_at(
+            expr,
+            arena,
+            layout,
+            last_query_id,
+            external_dependencies,
+            path.clone().index(index),
+        )?;
         ids.push(id);
     }
     Ok(ids)
@@ -290,10 +338,18 @@ fn lower_partition_exprs(
     layout: &Layout,
     last_query_id: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<Vec<ExprId>, String> {
+    path: FieldPath,
+) -> Result<Vec<ExprId>, StarRocksFragmentDecodeError> {
     let mut ids = Vec::with_capacity(partition_exprs.len());
-    for expr in partition_exprs {
-        let id = lower_t_expr(expr, arena, layout, last_query_id, external_dependencies)?;
+    for (index, expr) in partition_exprs.iter().enumerate() {
+        let id = lower_t_expr_at(
+            expr,
+            arena,
+            layout,
+            last_query_id,
+            external_dependencies,
+            path.clone().index(index),
+        )?;
         ids.push(id);
     }
     Ok(ids)

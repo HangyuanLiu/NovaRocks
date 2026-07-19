@@ -25,7 +25,9 @@ use crate::exec::node::analytic::{
     WindowFunctionSpec, WindowType,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::starrocks::decode::expr::{lower_expr_node, lower_t_expr};
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_at};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
@@ -40,41 +42,58 @@ pub(crate) fn lower_analytic_node(
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.field("analytic_node");
     let Some(analytic) = node.analytic_node.as_ref() else {
-        return Err("ANALYTIC_EVAL_NODE missing analytic_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "ANALYTIC_EVAL_NODE missing analytic_node payload",
+        ));
     };
 
     // Lower partition/order expressions against child layout.
     let mut partition_exprs = Vec::with_capacity(analytic.partition_exprs.len());
-    for e in &analytic.partition_exprs {
-        partition_exprs.push(lower_t_expr(
+    for (expr_index, e) in analytic.partition_exprs.iter().enumerate() {
+        partition_exprs.push(lower_t_expr_at(
             e,
             arena,
             &child.layout,
             last_query_id,
             fe_addr,
+            payload_path
+                .clone()
+                .field("partition_exprs")
+                .index(expr_index),
         )?);
     }
     let mut order_by_exprs = Vec::with_capacity(analytic.order_by_exprs.len());
-    for e in &analytic.order_by_exprs {
-        order_by_exprs.push(lower_t_expr(
+    for (expr_index, e) in analytic.order_by_exprs.iter().enumerate() {
+        order_by_exprs.push(lower_t_expr_at(
             e,
             arena,
             &child.layout,
             last_query_id,
             fe_addr,
+            payload_path
+                .clone()
+                .field("order_by_exprs")
+                .index(expr_index),
         )?);
     }
 
     let mut functions = Vec::with_capacity(analytic.analytic_functions.len());
-    for e in &analytic.analytic_functions {
+    for (function_index, e) in analytic.analytic_functions.iter().enumerate() {
         functions.push(lower_window_function(
             e,
             arena,
             &child.layout,
             last_query_id,
             fe_addr,
+            payload_path
+                .clone()
+                .field("analytic_functions")
+                .index(function_index),
         )?);
     }
 
@@ -82,35 +101,53 @@ pub(crate) fn lower_analytic_node(
         .window
         .as_ref()
         .map(lower_window_frame)
-        .transpose()?;
+        .transpose()
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(payload_path.clone().field("window"), error)
+        })?;
 
     // Validate RANGE window constraints aligned with StarRocks BE.
     if let Some(w) = window.as_ref()
         && matches!(w.window_type, WindowType::Range)
     {
         if w.start.is_some() {
-            return Err("RANGE window must have UNBOUNDED PRECEDING start".to_string());
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("window").field("window_start"),
+                "RANGE window must have UNBOUNDED PRECEDING start",
+            ));
         }
         if let Some(end) = w.end.as_ref()
             && !matches!(end, WindowBoundary::CurrentRow)
         {
-            return Err("RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING".to_string());
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("window").field("window_end"),
+                "RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING",
+            ));
         }
         if order_by_exprs.is_empty() {
-            return Err("RANGE window requires non-empty order_by_exprs".to_string());
+            return Err(StarRocksFragmentDecodeError::missing(
+                payload_path.clone().field("order_by_exprs"),
+                "RANGE window requires non-empty order_by_exprs",
+            ));
         }
     }
 
     let output_tuple_id = analytic.output_tuple_id;
-    let output_slot_ids = tuple_slots
-        .get(&output_tuple_id)
-        .ok_or_else(|| format!("missing tuple_slots for output_tuple_id={output_tuple_id}"))?;
+    let output_slot_ids = tuple_slots.get(&output_tuple_id).ok_or_else(|| {
+        StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone().field("output_tuple_id"),
+            format!("missing tuple_slots for output_tuple_id={output_tuple_id}"),
+        )
+    })?;
     if output_slot_ids.len() != functions.len() {
-        return Err(format!(
-            "analytic output tuple slots mismatch: output_tuple_id={} slots={} functions={}",
-            output_tuple_id,
-            output_slot_ids.len(),
-            functions.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("analytic_functions"),
+            format!(
+                "analytic output tuple slots mismatch: output_tuple_id={} slots={} functions={}",
+                output_tuple_id,
+                output_slot_ids.len(),
+                functions.len()
+            ),
         ));
     }
 
@@ -131,23 +168,31 @@ pub(crate) fn lower_analytic_node(
     for (tuple_id, slot_id) in &out_layout.order {
         if *tuple_id == output_tuple_id {
             let func_idx = slot_to_func.get(slot_id).copied().ok_or_else(|| {
-                format!(
-                    "analytic output layout refers to unknown output slot: tuple_id={} slot_id={}",
-                    tuple_id, slot_id
+                StarRocksFragmentDecodeError::invalid_value(
+                    payload_path.clone().field("output_tuple_id"),
+                    format!(
+                        "analytic output layout refers to unknown output slot: tuple_id={} slot_id={}",
+                        tuple_id, slot_id
+                    ),
                 )
             })?;
             output_columns.push(AnalyticOutputColumn::Window(func_idx));
             continue;
         }
         if child_slot_ids.contains(slot_id) {
-            output_columns.push(AnalyticOutputColumn::InputSlotId(SlotId::try_from(
-                *slot_id,
-            )?));
+            output_columns.push(AnalyticOutputColumn::InputSlotId(
+                SlotId::try_from(*slot_id).map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+                })?,
+            ));
             continue;
         }
-        return Err(format!(
-            "analytic output layout refers to unknown column: tuple_id={} slot_id={}",
-            tuple_id, slot_id
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone(),
+            format!(
+                "analytic output layout refers to unknown column: tuple_id={} slot_id={}",
+                tuple_id, slot_id
+            ),
         ));
     }
 
@@ -161,7 +206,11 @@ pub(crate) fn lower_analytic_node(
                 functions,
                 window,
                 output_columns,
-                output_chunk_schema: chunk_schema_for_layout(desc_tbl, out_layout)?,
+                output_chunk_schema: chunk_schema_for_layout(desc_tbl, out_layout).map_err(
+                    |error| {
+                        StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+                    },
+                )?,
             }),
         },
         layout: out_layout.clone(),
@@ -228,15 +277,20 @@ fn lower_window_function(
     layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<WindowFunctionSpec, String> {
-    let root = e
-        .nodes
-        .first()
-        .ok_or_else(|| "empty analytic function expr".to_string())?;
-    let fn_ = root
-        .fn_
-        .as_ref()
-        .ok_or_else(|| "analytic function missing fn".to_string())?;
+    expr_path: FieldPath,
+) -> Result<WindowFunctionSpec, StarRocksFragmentDecodeError> {
+    let root = e.nodes.first().ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            expr_path.clone().field("nodes").index(0),
+            "empty analytic function expr",
+        )
+    })?;
+    let fn_ = root.fn_.as_ref().ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            expr_path.clone().field("nodes").index(0).field("fn"),
+            "analytic function missing fn",
+        )
+    })?;
     let fn_name = fn_.name.function_name.to_lowercase();
     let fn_base = fn_name.split('|').next().unwrap_or(fn_name.as_str());
     let ignore_nulls = fn_.ignore_nulls.unwrap_or(false);
@@ -273,7 +327,13 @@ fn lower_window_function(
         "corr" => WindowFunctionKind::Corr,
         "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
             let aggregate_fn = fn_.aggregate_fn.as_ref();
-            let (name_is_asc_order, name_nulls_first) = parse_array_agg_name_metadata(&fn_name)?;
+            let (name_is_asc_order, name_nulls_first) = parse_array_agg_name_metadata(&fn_name)
+                .map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(
+                        expr_path.clone().field("nodes").index(0).field("fn"),
+                        error,
+                    )
+                })?;
             let is_distinct = match fn_base {
                 "array_agg_distinct" | "array_unique_agg" => true,
                 _ => aggregate_fn
@@ -294,10 +354,13 @@ fn lower_window_function(
                     )
                 };
             if is_asc_order.len() != nulls_first.len() {
-                return Err(format!(
-                    "array_agg order metadata length mismatch: is_asc_order={} nulls_first={}",
-                    is_asc_order.len(),
-                    nulls_first.len()
+                return Err(StarRocksFragmentDecodeError::inconsistent(
+                    expr_path.clone().field("nodes").index(0).field("fn"),
+                    format!(
+                        "array_agg order metadata length mismatch: is_asc_order={} nulls_first={}",
+                        is_asc_order.len(),
+                        nulls_first.len()
+                    ),
                 ));
             }
             WindowFunctionKind::ArrayAgg {
@@ -308,29 +371,36 @@ fn lower_window_function(
         }
         "approx_top_k" => WindowFunctionKind::ApproxTopK,
         other => {
-            return Err(format!("unsupported window function: {}", other));
+            return Err(StarRocksFragmentDecodeError::unsupported(
+                expr_path.clone().field("nodes").index(0).field("fn"),
+                format!("unsupported window function: {}", other),
+            ));
         }
     };
 
     let return_type = arrow_type_from_desc(&root.type_)
         .or_else(|| arrow_type_from_desc(&fn_.ret_type))
         .ok_or_else(|| {
-            format!(
-                "unsupported window function return type: node={:?} fn={:?}",
-                root.type_, fn_.ret_type
+            StarRocksFragmentDecodeError::unsupported(
+                expr_path.clone().field("nodes").index(0).field("type"),
+                format!(
+                    "unsupported window function return type: node={:?} fn={:?}",
+                    root.type_, fn_.ret_type
+                ),
             )
         })?;
 
     let mut args = Vec::new();
     let mut idx = 1usize;
     for _ in 0..root.num_children {
-        args.push(lower_expr_node(
+        args.push(lower_expr_node_at(
             &e.nodes,
             &mut idx,
             arena,
             layout,
             last_query_id,
             fe_addr,
+            expr_path.clone(),
         )?);
     }
     if matches!(
@@ -341,10 +411,13 @@ fn lower_window_function(
             | WindowFunctionKind::MinBy
             | WindowFunctionKind::MinByV2
     ) {
-        args = pack_window_function_inputs(args, arena)?;
+        args = pack_window_function_inputs(args, arena).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), error)
+        })?;
     }
 
-    validate_window_function_signature(&kind, &args, &return_type, arena)?;
+    validate_window_function_signature(&kind, &args, &return_type, arena)
+        .map_err(|error| StarRocksFragmentDecodeError::invalid_value(expr_path, error))?;
 
     Ok(WindowFunctionSpec {
         kind,

@@ -20,7 +20,9 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_layout_with_nullable_tuples,
 };
@@ -36,11 +38,16 @@ pub(crate) fn lower_nestloop_join_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("nestloop_join_node");
     if children.len() != 2 {
-        return Err(format!(
-            "NESTLOOP_JOIN_NODE expected 2 children, got {}",
-            children.len()
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            node_path.field("num_children"),
+            format!(
+                "NESTLOOP_JOIN_NODE expected 2 children, got {}",
+                children.len()
+            ),
         ));
     }
 
@@ -48,12 +55,18 @@ pub(crate) fn lower_nestloop_join_node(
     let left_in = it.next().expect("left");
     let right_in = it.next().expect("right");
     let Some(nl) = node.nestloop_join_node.as_ref() else {
-        return Err("NESTLOOP_JOIN_NODE missing nestloop_join_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "NESTLOOP_JOIN_NODE missing nestloop_join_node payload",
+        ));
     };
 
-    let op = nl
-        .join_op
-        .ok_or_else(|| "NESTLOOP_JOIN_NODE missing join_op".to_string())?;
+    let op = nl.join_op.ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            payload_path.clone().field("join_op"),
+            "NESTLOOP_JOIN_NODE missing join_op",
+        )
+    })?;
     // RIGHT_SEMI / RIGHT_ANTI for nestloop are implemented by swapping the
     // probe and build inputs and reusing the LEFT_SEMI / LEFT_ANTI code path.
     // Semantics match: "output rows from side X that have any matching row on
@@ -76,8 +89,11 @@ pub(crate) fn lower_nestloop_join_node(
             (left_in, right_in, NestedLoopJoinType::NullAwareLeftAnti)
         }
         other => {
-            return Err(format!(
-                "unsupported NESTLOOP_JOIN_NODE join_op={other:?} (supported: INNER/CROSS/LEFT_OUTER/RIGHT_OUTER/FULL_OUTER/LEFT_SEMI/RIGHT_SEMI/LEFT_ANTI/RIGHT_ANTI/NULL_AWARE_LEFT_ANTI)"
+            return Err(StarRocksFragmentDecodeError::unsupported(
+                payload_path.clone().field("join_op"),
+                format!(
+                    "unsupported NESTLOOP_JOIN_NODE join_op={other:?} (supported: INNER/CROSS/LEFT_OUTER/RIGHT_OUTER/FULL_OUTER/LEFT_SEMI/RIGHT_SEMI/LEFT_ANTI/RIGHT_ANTI/NULL_AWARE_LEFT_ANTI)"
+                ),
             ));
         }
     };
@@ -91,12 +107,22 @@ pub(crate) fn lower_nestloop_join_node(
     let mut join_conjunct: Option<crate::exec::expr::ExprId> = None;
     if let Some(exprs) = nl.join_conjuncts.as_ref().filter(|v| !v.is_empty()) {
         let mut lowered = Vec::with_capacity(exprs.len());
-        for e in exprs {
-            lowered.push(lower_t_expr(e, arena, &layout, last_query_id, fe_addr)?);
+        for (index, e) in exprs.iter().enumerate() {
+            lowered.push(lower_t_expr_at(
+                e,
+                arena,
+                &layout,
+                last_query_id,
+                fe_addr,
+                payload_path.clone().field("join_conjuncts").index(index),
+            )?);
         }
         let mut it = lowered.into_iter();
         let Some(first) = it.next() else {
-            return Err("NESTLOOP_JOIN_NODE join_conjuncts is empty".to_string());
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("join_conjuncts"),
+                "NESTLOOP_JOIN_NODE join_conjuncts is empty",
+            ));
         };
         let mut acc = first;
         for next in it {
@@ -117,16 +143,30 @@ pub(crate) fn lower_nestloop_join_node(
     };
 
     let Some(desc_tbl) = desc_tbl else {
-        return Err("NESTLOOP_JOIN_NODE requires desc_tbl for schema".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            node_path.clone().field("row_tuples"),
+            "NESTLOOP_JOIN_NODE requires desc_tbl for schema",
+        ));
     };
-    let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout)?;
-    let right_chunk_schema = chunk_schema_for_layout(desc_tbl, &right.layout)?;
+    let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout).map_err(|detail| {
+        StarRocksFragmentDecodeError::invalid_value(node_path.clone().field("row_tuples"), detail)
+    })?;
+    let right_chunk_schema =
+        chunk_schema_for_layout(desc_tbl, &right.layout).map_err(|detail| {
+            StarRocksFragmentDecodeError::invalid_value(
+                node_path.clone().field("row_tuples"),
+                detail,
+            )
+        })?;
     let join_scope_chunk_schema = chunk_schema_for_layout_with_nullable_tuples(
         desc_tbl,
         &layout,
         &node.row_tuples,
         &node.nullable_tuples,
-    )?;
+    )
+    .map_err(|detail| {
+        StarRocksFragmentDecodeError::invalid_value(node_path.field("row_tuples"), detail)
+    })?;
 
     Ok(Lowered {
         node: ExecNode {

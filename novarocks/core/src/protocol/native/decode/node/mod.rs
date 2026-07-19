@@ -228,6 +228,14 @@ impl NativePlanDecodeContext {
             .expect("decode test scan ranges");
         let kind = match ranges.first().map(|params| &params.range) {
             Some(ScanRange::File(_)) => ScanAssignmentKind::File,
+            #[cfg(feature = "compat")]
+            Some(ScanRange::BrokerFile(_)) => {
+                panic!("native test scan assignment cannot contain a StarRocks broker-file range")
+            }
+            #[cfg(feature = "compat")]
+            Some(ScanRange::SchemaSelection(_)) => {
+                panic!("native test scan assignment cannot contain a StarRocks schema selection")
+            }
             Some(ScanRange::StarRocksTablet(_)) => ScanAssignmentKind::StarRocksTablet,
             None => panic!("test scan assignment requires at least one range"),
         };

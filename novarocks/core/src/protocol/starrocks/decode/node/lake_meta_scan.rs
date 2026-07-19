@@ -37,11 +37,11 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::{
-    LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageRequest, LakeMetaTabletRequest,
-    StarRocksExternalDependencyDraft,
+    DraftDependencyValue, LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageFacts,
+    LakeMetaStorageRequest, LakeMetaTabletRequest, StarRocksExternalDependencyDraft,
 };
 use crate::runtime::query_context::QueryId;
-use crate::thrift::{descriptors, internal_service, plan_nodes, types};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MetaMetricKind {
@@ -76,6 +76,40 @@ struct MetaColumnMinMax {
     max: Option<MetaScalarValue>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LakeMetaValuesPatch {
+    dependency_id: u64,
+    node_id: i32,
+    template: LakeMetaValuesTemplate,
+}
+
+impl LakeMetaValuesPatch {
+    pub(crate) const fn dependency_id(&self) -> u64 {
+        self.dependency_id
+    }
+
+    pub(crate) const fn node_id(&self) -> i32 {
+        self.node_id
+    }
+
+    pub(crate) fn materialize(&self, facts: &LakeMetaStorageFacts) -> Result<Chunk, String> {
+        self.template.materialize(facts)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LakeMetaValuesTemplate {
+    output_schema: Arc<Schema>,
+    output_chunk_schema: Arc<ChunkSchema>,
+    slot_ids: Vec<i32>,
+    metric_by_slot: HashMap<i32, MetaMetricKind>,
+    column_requests: Vec<LakeMetaColumnRequest>,
+    min_max_type_by_column: HashMap<String, DataType>,
+    min_partition_id: Option<i64>,
+    max_partition_id: Option<i64>,
+    table_id: i64,
+}
+
 /// Lower a LAKE_META_SCAN_NODE to a one-row `ValuesNode`.
 ///
 /// The FE side must provide tablet ids, versions, schema id, row-count hints,
@@ -92,7 +126,7 @@ pub(crate) fn lower_lake_meta_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_ranges: Option<&[crate::protocol::starrocks::decode::LakeMetaScanRangeFact]>,
     query_id: Option<QueryId>,
     db_name_hint: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
@@ -147,12 +181,12 @@ pub(crate) fn lower_lake_meta_scan_node(
     let output_schema =
         rewrite_meta_output_schema(&base_output_schema, &out_layout, &metric_by_slot)?;
 
-    let scan_assignments = scan_assignments.ok_or_else(|| {
-        "LAKE_META_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string()
+    let scan_ranges = scan_ranges.ok_or_else(|| {
+        format!(
+            "LAKE_META_SCAN_NODE node_id={} missing normalized range facts",
+            node.node_id
+        )
     })?;
-    let scan_ranges = scan_assignments
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
 
     let mut tablet_versions: HashMap<i64, i64> = HashMap::new();
     let mut tablet_row_count_hints: HashMap<i64, i64> = HashMap::new();
@@ -162,60 +196,50 @@ pub(crate) fn lower_lake_meta_scan_node(
     let mut max_partition_id: Option<i64> = None;
     let mut has_more = false;
     for p in scan_ranges {
-        if p.empty.unwrap_or(false) {
-            if p.has_more.unwrap_or(false) {
+        if p.empty {
+            if p.has_more {
                 has_more = true;
             }
             continue;
         }
-        let Some(internal) = p.scan_range.internal_scan_range.as_ref() else {
-            return Err(format!(
-                "LAKE_META_SCAN_NODE node_id={} has scan range without internal_scan_range",
-                node.node_id
-            ));
-        };
-        if internal.tablet_id <= 0 {
+        if p.tablet_id <= 0 {
             return Err(format!(
                 "LAKE_META_SCAN_NODE has invalid tablet_id={}",
-                internal.tablet_id
+                p.tablet_id
             ));
         }
-        let version = internal
-            .version
-            .parse::<i64>()
-            .map_err(|e| format!("invalid tablet version '{}': {}", internal.version, e))?;
+        let version = p.version;
         if version <= 0 {
             return Err(format!(
                 "LAKE_META_SCAN_NODE has non-positive version for tablet_id={}: {}",
-                internal.tablet_id, version
+                p.tablet_id, version
             ));
         }
-        if let Some(existing_version) = tablet_versions.insert(internal.tablet_id, version)
+        if let Some(existing_version) = tablet_versions.insert(p.tablet_id, version)
             && existing_version != version
         {
             return Err(format!(
                 "LAKE_META_SCAN_NODE has inconsistent versions for tablet_id={}: {} vs {}",
-                internal.tablet_id, existing_version, version
+                p.tablet_id, existing_version, version
             ));
         }
-        if let Some(row_count) = internal.row_count {
+        if let Some(row_count) = p.row_count {
             if row_count < 0 {
                 return Err(format!(
                     "LAKE_META_SCAN_NODE has negative row_count for tablet_id={}: {}",
-                    internal.tablet_id, row_count
+                    p.tablet_id, row_count
                 ));
             }
-            if let Some(existing_row_count) =
-                tablet_row_count_hints.insert(internal.tablet_id, row_count)
+            if let Some(existing_row_count) = tablet_row_count_hints.insert(p.tablet_id, row_count)
                 && existing_row_count != row_count
             {
                 return Err(format!(
                     "LAKE_META_SCAN_NODE has inconsistent row_count for tablet_id={}: {} vs {}",
-                    internal.tablet_id, existing_row_count, row_count
+                    p.tablet_id, existing_row_count, row_count
                 ));
             }
         }
-        if let Some(partition_id) = internal.partition_id {
+        if let Some(partition_id) = p.partition_id {
             min_partition_id = Some(match min_partition_id {
                 Some(current) => current.min(partition_id),
                 None => partition_id,
@@ -226,19 +250,15 @@ pub(crate) fn lower_lake_meta_scan_node(
             });
         }
         if internal_db_name.is_none() {
-            let candidate = internal.db_name.trim();
-            if !candidate.is_empty() {
-                internal_db_name = Some(candidate.to_string());
-            }
+            internal_db_name = p.db_name.clone();
         }
         if internal_table_name.is_none()
-            && let Some(name) = internal
-                .table_name
-                .as_deref()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
+            && let Some(name) = p.table_name.as_deref()
         {
             internal_table_name = Some(name.to_string());
+        }
+        if p.has_more {
+            has_more = true;
         }
     }
     if has_more {
@@ -368,158 +388,47 @@ pub(crate) fn lower_lake_meta_scan_node(
         tablet_requests,
         column_requests.clone(),
     );
-    let storage_facts = external_dependencies
-        .ok_or_else(|| "LAKE_META_SCAN_NODE missing external dependency draft".to_string())?
-        .lake_meta_storage(&storage_request)?;
-    let total_rows = storage_facts.total_rows;
-
-    let mut dict_words_by_column: HashMap<String, Vec<String>> = HashMap::new();
-    for request in column_requests
-        .iter()
-        .filter(|request| request.kind == LakeMetaColumnKind::Dictionary)
-    {
-        let arrays = storage_facts
-            .column_arrays
-            .get(&request.storage_key())
-            .ok_or_else(|| {
-                format!(
-                    "LAKE_META_SCAN_NODE missing dictionary storage facts for column_id={}",
-                    request.column_id
-                )
-            })?;
-        let mut words = BTreeSet::new();
-        for array in arrays {
-            collect_words_from_column_array(array, &mut words)?;
-        }
-        dict_words_by_column.insert(request.column_id.clone(), words.into_iter().collect());
-    }
-
-    let mut min_max_by_column: HashMap<String, MetaColumnMinMax> = HashMap::new();
-    for (column_id, data_type) in &min_max_type_by_column {
-        let request = LakeMetaColumnRequest {
-            column_id: column_id.clone(),
-            kind: LakeMetaColumnKind::Value(data_type.clone()),
-        };
-        let arrays = storage_facts
-            .column_arrays
-            .get(&request.storage_key())
-            .ok_or_else(|| {
-                format!(
-                    "LAKE_META_SCAN_NODE missing min/max storage facts for column_id={}",
-                    column_id
-                )
-            })?;
-        let mut min_max = MetaColumnMinMax::default();
-        for array in arrays {
-            update_min_max_from_array(array, data_type, &mut min_max)?;
-        }
-        min_max_by_column.insert(column_id.clone(), min_max);
-    }
-
-    let mut columns = Vec::with_capacity(out_layout.order.len());
-    for (idx, (_tuple_id, slot_id)) in out_layout.order.iter().enumerate() {
-        let field = output_schema.field(idx);
-        let slot_key = *slot_id;
-        let metric = metric_by_slot.get(&slot_key).ok_or_else(|| {
-            format!(
-                "LAKE_META_SCAN_NODE output slot_id={} missing metric mapping in id_to_names",
-                slot_id
-            )
-        })?;
-
-        let array: ArrayRef = match metric {
-            MetaMetricKind::Rows { .. } | MetaMetricKind::Count { .. } => {
-                if field.data_type() != &DataType::Int64 {
-                    return Err(format!(
-                        "LAKE_META_SCAN_NODE output slot_id={} requires Int64 for rows/count metrics, got {:?}",
-                        slot_id,
-                        field.data_type()
-                    ));
-                }
-                Arc::new(Int64Array::from(vec![Some(total_rows)]))
-            }
-            MetaMetricKind::DictMerge { column_id } => {
-                match field.data_type() {
-                    DataType::List(item) if matches!(item.data_type(), DataType::Utf8) => {}
-                    other => {
-                        return Err(format!(
-                            "LAKE_META_SCAN_NODE output slot_id={} for dict_merge metric requires List(Utf8), got {:?}",
-                            slot_id, other
-                        ));
-                    }
-                }
-                let words = dict_words_by_column.get(column_id).ok_or_else(|| {
-                    format!(
-                        "LAKE_META_SCAN_NODE missing dict words for column_id={} (slot_id={})",
-                        column_id, slot_id
-                    )
-                })?;
-                build_single_row_utf8_list_array(words)
-            }
-            MetaMetricKind::Min { column_id } => {
-                if is_partition_or_table_meta_metric_column(column_id) {
-                    if field.data_type() != &DataType::Int64 {
-                        return Err(format!(
-                            "LAKE_META_SCAN_NODE output slot_id={} for min metric on {} requires Int64, got {:?}",
-                            slot_id,
-                            column_id,
-                            field.data_type()
-                        ));
-                    }
-                    let value = resolve_meta_i64_min_max_metric(
-                        column_id,
-                        true,
-                        min_partition_id,
-                        max_partition_id,
-                        table_desc.id,
-                    )?;
-                    Arc::new(Int64Array::from(vec![value]))
-                } else {
-                    let min_max = min_max_by_column.get(column_id).ok_or_else(|| {
-                        format!(
-                            "LAKE_META_SCAN_NODE missing collected min/max data for column_id={} (slot_id={})",
-                            column_id, slot_id
-                        )
-                    })?;
-                    build_single_row_scalar_array(field.data_type(), min_max.min.as_ref())?
-                }
-            }
-            MetaMetricKind::Max { column_id } => {
-                if is_partition_or_table_meta_metric_column(column_id) {
-                    if field.data_type() != &DataType::Int64 {
-                        return Err(format!(
-                            "LAKE_META_SCAN_NODE output slot_id={} for max metric on {} requires Int64, got {:?}",
-                            slot_id,
-                            column_id,
-                            field.data_type()
-                        ));
-                    }
-                    let value = resolve_meta_i64_min_max_metric(
-                        column_id,
-                        false,
-                        min_partition_id,
-                        max_partition_id,
-                        table_desc.id,
-                    )?;
-                    Arc::new(Int64Array::from(vec![value]))
-                } else {
-                    let min_max = min_max_by_column.get(column_id).ok_or_else(|| {
-                        format!(
-                            "LAKE_META_SCAN_NODE missing collected min/max data for column_id={} (slot_id={})",
-                            column_id, slot_id
-                        )
-                    })?;
-                    build_single_row_scalar_array(field.data_type(), min_max.max.as_ref())?
-                }
-            }
-        };
-        columns.push(array);
-    }
-
     let output_chunk_schema = chunk_schema_for_meta_output(desc_tbl, &out_layout, &output_schema)?;
-    let batch = RecordBatch::try_new(output_schema, columns)
-        .map_err(|e| format!("LAKE_META_SCAN_NODE build output batch failed: {}", e))?;
-    let chunk = Chunk::try_new_with_chunk_schema(batch, output_chunk_schema)?;
+    let template = LakeMetaValuesTemplate {
+        output_schema,
+        output_chunk_schema,
+        slot_ids: out_layout
+            .order
+            .iter()
+            .map(|(_, slot_id)| *slot_id)
+            .collect(),
+        metric_by_slot,
+        column_requests,
+        min_max_type_by_column,
+        min_partition_id,
+        max_partition_id,
+        table_id: table_desc.id,
+    };
+    let dependencies = external_dependencies
+        .ok_or_else(|| "LAKE_META_SCAN_NODE missing external dependency draft".to_string())?;
+    let (storage_facts, pending_dependency_id) =
+        match dependencies.lake_meta_storage_value(&storage_request)? {
+            DraftDependencyValue::Resolved(facts) => (facts, None),
+            DraftDependencyValue::Pending(id) => (
+                LakeMetaStorageFacts {
+                    total_rows: 0,
+                    column_arrays: storage_request
+                        .columns
+                        .iter()
+                        .map(|column| (column.storage_key(), Vec::new()))
+                        .collect(),
+                },
+                Some(id),
+            ),
+        };
+    let chunk = template.materialize(&storage_facts)?;
+    if let Some(dependency_id) = pending_dependency_id {
+        dependencies.record_lake_meta_values_patch(LakeMetaValuesPatch {
+            dependency_id,
+            node_id: node.node_id,
+            template,
+        });
+    }
 
     Ok(Lowered {
         node: ExecNode {
@@ -530,6 +439,136 @@ pub(crate) fn lower_lake_meta_scan_node(
         },
         layout: out_layout,
     })
+}
+
+impl LakeMetaValuesTemplate {
+    fn materialize(&self, storage_facts: &LakeMetaStorageFacts) -> Result<Chunk, String> {
+        let mut dict_words_by_column: HashMap<String, Vec<String>> = HashMap::new();
+        for request in self
+            .column_requests
+            .iter()
+            .filter(|request| request.kind == LakeMetaColumnKind::Dictionary)
+        {
+            let arrays = storage_facts
+                .column_arrays
+                .get(&request.storage_key())
+                .ok_or_else(|| {
+                    format!(
+                        "LAKE_META_SCAN_NODE missing dictionary storage facts for column_id={}",
+                        request.column_id
+                    )
+                })?;
+            let mut words = BTreeSet::new();
+            for array in arrays {
+                collect_words_from_column_array(array, &mut words)?;
+            }
+            dict_words_by_column.insert(request.column_id.clone(), words.into_iter().collect());
+        }
+
+        let mut min_max_by_column: HashMap<String, MetaColumnMinMax> = HashMap::new();
+        for (column_id, data_type) in &self.min_max_type_by_column {
+            let request = LakeMetaColumnRequest {
+                column_id: column_id.clone(),
+                kind: LakeMetaColumnKind::Value(data_type.clone()),
+            };
+            let arrays = storage_facts
+                .column_arrays
+                .get(&request.storage_key())
+                .ok_or_else(|| {
+                    format!(
+                        "LAKE_META_SCAN_NODE missing min/max storage facts for column_id={}",
+                        column_id
+                    )
+                })?;
+            let mut min_max = MetaColumnMinMax::default();
+            for array in arrays {
+                update_min_max_from_array(array, data_type, &mut min_max)?;
+            }
+            min_max_by_column.insert(column_id.clone(), min_max);
+        }
+
+        let mut columns = Vec::with_capacity(self.slot_ids.len());
+        for (idx, slot_id) in self.slot_ids.iter().enumerate() {
+            let field = self.output_schema.field(idx);
+            let metric = self.metric_by_slot.get(slot_id).ok_or_else(|| {
+                format!(
+                    "LAKE_META_SCAN_NODE output slot_id={} missing metric mapping in id_to_names",
+                    slot_id
+                )
+            })?;
+            let array: ArrayRef = match metric {
+                MetaMetricKind::Rows { .. } | MetaMetricKind::Count { .. } => {
+                    if field.data_type() != &DataType::Int64 {
+                        return Err(format!(
+                            "LAKE_META_SCAN_NODE output slot_id={} requires Int64 for rows/count metrics, got {:?}",
+                            slot_id,
+                            field.data_type()
+                        ));
+                    }
+                    Arc::new(Int64Array::from(vec![Some(storage_facts.total_rows)]))
+                }
+                MetaMetricKind::DictMerge { column_id } => {
+                    if !matches!(field.data_type(), DataType::List(item) if matches!(item.data_type(), DataType::Utf8))
+                    {
+                        return Err(format!(
+                            "LAKE_META_SCAN_NODE output slot_id={} for dict_merge metric requires List(Utf8), got {:?}",
+                            slot_id,
+                            field.data_type()
+                        ));
+                    }
+                    let words = dict_words_by_column.get(column_id).ok_or_else(|| {
+                        format!(
+                            "LAKE_META_SCAN_NODE missing dict words for column_id={} (slot_id={})",
+                            column_id, slot_id
+                        )
+                    })?;
+                    build_single_row_utf8_list_array(words)
+                }
+                MetaMetricKind::Min { column_id } | MetaMetricKind::Max { column_id }
+                    if is_partition_or_table_meta_metric_column(column_id) =>
+                {
+                    if field.data_type() != &DataType::Int64 {
+                        return Err(format!(
+                            "LAKE_META_SCAN_NODE output slot_id={} for min/max metric on {} requires Int64, got {:?}",
+                            slot_id,
+                            column_id,
+                            field.data_type()
+                        ));
+                    }
+                    let value = resolve_meta_i64_min_max_metric(
+                        column_id,
+                        matches!(metric, MetaMetricKind::Min { .. }),
+                        self.min_partition_id,
+                        self.max_partition_id,
+                        self.table_id,
+                    )?;
+                    Arc::new(Int64Array::from(vec![value]))
+                }
+                MetaMetricKind::Min { column_id } => {
+                    let min_max = min_max_by_column.get(column_id).ok_or_else(|| {
+                        format!(
+                            "LAKE_META_SCAN_NODE missing collected min/max data for column_id={} (slot_id={})",
+                            column_id, slot_id
+                        )
+                    })?;
+                    build_single_row_scalar_array(field.data_type(), min_max.min.as_ref())?
+                }
+                MetaMetricKind::Max { column_id } => {
+                    let min_max = min_max_by_column.get(column_id).ok_or_else(|| {
+                        format!(
+                            "LAKE_META_SCAN_NODE missing collected min/max data for column_id={} (slot_id={})",
+                            column_id, slot_id
+                        )
+                    })?;
+                    build_single_row_scalar_array(field.data_type(), min_max.max.as_ref())?
+                }
+            };
+            columns.push(array);
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), columns)
+            .map_err(|error| format!("LAKE_META_SCAN_NODE build output batch failed: {error}"))?;
+        Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.output_chunk_schema))
+    }
 }
 
 fn build_single_row_utf8_list_array(words: &[String]) -> ArrayRef {

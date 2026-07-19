@@ -382,6 +382,7 @@ fn decode_file_scan_range(
                 enable_populate_datacache: options.enable_populate_datacache,
                 priority: options.priority,
             }),
+        candidate_node: None,
         included_positions: src.included_positions.clone(),
         serialized_split: src.serialized_split.clone(),
         use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader,

@@ -23,11 +23,15 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::debug;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::schema::{
     chunk_slot_schema_from_optional_type_desc, chunk_slot_schema_from_type_desc,
 };
 
-use crate::protocol::starrocks::decode::expr::{lower_t_expr, lower_t_expr_with_common_slot_map};
+use crate::protocol::starrocks::decode::expr::{
+    lower_t_expr_at, lower_t_expr_with_common_slot_map_at,
+};
 use crate::protocol::starrocks::decode::layout::{
     Layout, layout_from_slot_ids, slot_display_name_from_desc,
 };
@@ -119,7 +123,9 @@ pub(crate) fn lower_project_node(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("project_node");
     let Some(project) = node.project_node.as_ref() else {
         return Ok(child);
     };
@@ -198,14 +204,18 @@ pub(crate) fn lower_project_node(
     if out_layout.order.is_empty() {
         if !output_slot_ids.is_empty() {
             let Some(slot_map) = slot_map else {
-                return Err("project node has output_slot_ids but missing slot_map".to_string());
+                return Err(StarRocksFragmentDecodeError::missing(
+                    payload_path.clone().field("slot_map"),
+                    "project node has output_slot_ids but missing slot_map",
+                ));
             };
             out_layout = layout_from_slot_ids(output_tuple_id, slot_map.keys().copied());
         } else {
             let Some(common_map) = common_map else {
-                return Err(
-                    "project node has empty slot_map and missing common_slot_map".to_string(),
-                );
+                return Err(StarRocksFragmentDecodeError::missing(
+                    payload_path.clone().field("common_slot_map"),
+                    "project node has empty slot_map and missing common_slot_map",
+                ));
             };
             out_layout = layout_from_slot_ids(output_tuple_id, common_map.keys().copied());
         }
@@ -250,63 +260,113 @@ pub(crate) fn lower_project_node(
     // These are evaluated first so outputs can reference their slots.
     if let Some(common_map) = common_map {
         for (&slot_id, texpr) in common_map.iter() {
-            let expr_id = lower_t_expr_with_common_slot_map(
+            let common_map_path =
+                if project_common_map.is_some_and(|map| map.contains_key(&slot_id)) {
+                    payload_path.clone().field("common_slot_map")
+                } else {
+                    node_path.clone().field("common").field("heavy_exprs")
+                };
+            let expr_path = common_map_path.clone().map_key(slot_id.to_string());
+            let expr_id = lower_t_expr_with_common_slot_map_at(
                 texpr,
                 arena,
                 &out_layout,
                 last_query_id,
                 fe_addr,
                 Some(common_map),
+                expr_path.clone(),
+                Some(common_map_path),
             )?;
             exprs.push(expr_id);
-            expr_slot_ids.push(SlotId::try_from(slot_id)?);
-            expr_slot_schemas.push(project_slot_schema_from_expr(
-                desc_tbl,
-                output_tuple_id,
-                slot_id,
-                texpr,
-            )?);
+            expr_slot_ids.push(SlotId::try_from(slot_id).map_err(|detail| {
+                StarRocksFragmentDecodeError::out_of_range(expr_path.clone(), detail)
+            })?);
+            expr_slot_schemas.push(
+                project_slot_schema_from_expr(desc_tbl, output_tuple_id, slot_id, texpr).map_err(
+                    |detail| StarRocksFragmentDecodeError::invalid_value(expr_path, detail),
+                )?,
+            );
         }
     }
     let num_common = exprs.len();
 
     // Step 2: Lower output expressions in output layout order.
     for &(_out_tuple_id, slot_id) in &out_layout.order {
-        let texpr = slot_map
-            .and_then(|m| m.get(&slot_id))
-            .or_else(|| common_map.and_then(|m| m.get(&slot_id)))
-            .ok_or_else(|| {
+        let (texpr, expr_path) = if let Some(texpr) = slot_map.and_then(|m| m.get(&slot_id)) {
+            (
+                texpr,
+                payload_path
+                    .clone()
+                    .field("slot_map")
+                    .map_key(slot_id.to_string()),
+            )
+        } else if let Some(texpr) = common_map.and_then(|m| m.get(&slot_id)) {
+            let map_path = if project_common_map.is_some_and(|map| map.contains_key(&slot_id)) {
+                payload_path.clone().field("common_slot_map")
+            } else {
+                node_path.clone().field("common").field("heavy_exprs")
+            };
+            (texpr, map_path.map_key(slot_id.to_string()))
+        } else {
+            return Err(StarRocksFragmentDecodeError::missing(
+                payload_path
+                    .clone()
+                    .field("slot_map")
+                    .map_key(slot_id.to_string()),
                 format!(
                     "slot_id {} in output layout not found in slot_map/common_slot_map",
                     slot_id
-                )
-            })?;
+                ),
+            ));
+        };
 
         let expr_id = if let Some(map) = resolution_common_map.as_ref() {
-            lower_t_expr_with_common_slot_map(
+            let common_map_path = if project_common_map.is_some_and(|map| !map.is_empty()) {
+                Some(payload_path.clone().field("common_slot_map"))
+            } else if heavy_common_map.is_some_and(|map| !map.is_empty()) {
+                Some(node_path.clone().field("common").field("heavy_exprs"))
+            } else {
+                None
+            };
+            lower_t_expr_with_common_slot_map_at(
                 texpr,
                 arena,
                 &out_layout,
                 last_query_id,
                 fe_addr,
                 Some(map),
+                expr_path.clone(),
+                common_map_path,
             )?
         } else {
-            lower_t_expr(texpr, arena, &out_layout, last_query_id, fe_addr)?
+            lower_t_expr_at(
+                texpr,
+                arena,
+                &out_layout,
+                last_query_id,
+                fe_addr,
+                expr_path.clone(),
+            )?
         };
         exprs.push(expr_id);
-        expr_slot_ids.push(SlotId::try_from(slot_id)?);
-        expr_slot_schemas.push(project_slot_schema_from_expr(
-            desc_tbl,
-            output_tuple_id,
-            slot_id,
-            texpr,
-        )?);
+        expr_slot_ids.push(SlotId::try_from(slot_id).map_err(|detail| {
+            StarRocksFragmentDecodeError::out_of_range(expr_path.clone(), detail)
+        })?);
+        expr_slot_schemas.push(
+            project_slot_schema_from_expr(desc_tbl, output_tuple_id, slot_id, texpr)
+                .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(expr_path, detail))?,
+        );
     }
 
     // output_indices = [num_common, num_common+1, ..., exprs.len()-1]
     let output_indices: Vec<usize> = (num_common..exprs.len()).collect();
-    let output_chunk_schema = project_output_chunk_schema(&expr_slot_schemas, &output_indices)?;
+    let output_chunk_schema = project_output_chunk_schema(&expr_slot_schemas, &output_indices)
+        .map_err(|detail| {
+            StarRocksFragmentDecodeError::invalid_value(
+                node_path.clone().field("row_tuples"),
+                detail,
+            )
+        })?;
 
     Ok(Lowered {
         node: ExecNode {

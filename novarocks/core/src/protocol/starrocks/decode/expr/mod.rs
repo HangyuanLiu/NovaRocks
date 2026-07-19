@@ -40,6 +40,8 @@ mod subfield;
 
 use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::schema::chunk_field_schema_from_type_desc;
 use arrow::datatypes::DataType;
 use std::collections::{BTreeMap, HashMap};
@@ -81,6 +83,7 @@ struct CommonSlotLoweringCtx<'a> {
     /// Those "slots" are not materialized columns coming from upstream chunks, so we must inline
     /// (lower) the mapped expression instead of producing ExprNode::SlotId(slot_id).
     map: Option<&'a BTreeMap<types::TSlotId, exprs::TExpr>>,
+    map_path: Option<FieldPath>,
     cache: HashMap<types::TSlotId, ExprId>,
     stack: Vec<types::TSlotId>,
     // PLACEHOLDER_EXPR replacement used by DICT_EXPR lowering.
@@ -139,6 +142,13 @@ fn missing_type_descriptor_err(node: &exprs::TExprNode) -> String {
         "unsupported or missing expr type descriptor for node_type={:?}",
         node.node_type
     )
+}
+
+fn invalid_expr_value<T>(
+    path: FieldPath,
+    result: Result<T, String>,
+) -> Result<T, StarRocksFragmentDecodeError> {
+    result.map_err(|detail| StarRocksFragmentDecodeError::invalid_value(path, detail))
 }
 
 fn merge_prefer_non_null_type(
@@ -240,12 +250,25 @@ fn lower_dict_expr_node(
     last_query_id: Option<&str>,
     fe_addr: Option<&StarRocksExternalDependencyDraft>,
     ctx: &mut CommonSlotLoweringCtx<'_>,
-) -> Result<ExprId, String> {
+    expr_path: &FieldPath,
+    node_path: &FieldPath,
+) -> Result<ExprId, StarRocksFragmentDecodeError> {
     if node.num_children <= 0 {
-        return Err("DICT_EXPR expects at least one child".to_string());
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            node_path.clone().field("num_children"),
+            "DICT_EXPR expects at least one child",
+        ));
     }
-    let dict_child =
-        lower_expr_node_impl(nodes, idx, arena, input_layout, last_query_id, fe_addr, ctx)?;
+    let dict_child = lower_expr_node_impl(
+        nodes,
+        idx,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        ctx,
+        expr_path,
+    )?;
 
     let mut inserted_override = None;
     let dict_slot_id = match arena.node(dict_child) {
@@ -262,8 +285,12 @@ fn lower_dict_expr_node(
             },
             DataType::Utf8,
         );
-        let raw_slot_id = i32::try_from(slot_id.as_u32())
-            .map_err(|_| format!("slot id {} overflows i32", slot_id))?;
+        let raw_slot_id = i32::try_from(slot_id.as_u32()).map_err(|_| {
+            StarRocksFragmentDecodeError::out_of_range(
+                node_path.clone(),
+                format!("slot id {} overflows i32", slot_id),
+            )
+        })?;
         ctx.placeholder_overrides.insert(raw_slot_id, decoded_expr);
         inserted_override = Some(raw_slot_id);
     }
@@ -277,6 +304,7 @@ fn lower_dict_expr_node(
             last_query_id,
             fe_addr,
             ctx,
+            expr_path,
         )?);
     }
     if let Some(raw_slot_id) = inserted_override {
@@ -289,7 +317,12 @@ fn lower_dict_expr_node(
     let output_type = match resolve_node_data_type(node) {
         Some(data_type) => data_type,
         None if cfg!(test) => DataType::Null,
-        None => return Err(missing_type_descriptor_err(node)),
+        None => {
+            return Err(StarRocksFragmentDecodeError::missing(
+                node_path.clone().field("type"),
+                missing_type_descriptor_err(node),
+            ));
+        }
     };
     let mapped_type = arena
         .data_type(mapped_expr)
@@ -311,7 +344,36 @@ pub(crate) fn lower_t_expr(
     last_query_id: Option<&str>,
     fe_addr: Option<&StarRocksExternalDependencyDraft>,
 ) -> Result<ExprId, String> {
-    lower_t_expr_with_common_slot_map(expr, arena, input_layout, last_query_id, fe_addr, None)
+    lower_t_expr_at(
+        expr,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        FieldPath::root("expr"),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Lower a complete Thrift expression while preserving the exact wire path of every flat node.
+pub(crate) fn lower_t_expr_at(
+    expr: &exprs::TExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&StarRocksExternalDependencyDraft>,
+    expr_path: FieldPath,
+) -> Result<ExprId, StarRocksFragmentDecodeError> {
+    lower_t_expr_with_common_slot_map_at(
+        expr,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        None,
+        expr_path,
+        None,
+    )
 }
 
 pub(crate) fn lower_t_expr_with_common_slot_map(
@@ -322,14 +384,42 @@ pub(crate) fn lower_t_expr_with_common_slot_map(
     fe_addr: Option<&StarRocksExternalDependencyDraft>,
     common_slot_map: Option<&BTreeMap<types::TSlotId, exprs::TExpr>>,
 ) -> Result<ExprId, String> {
+    lower_t_expr_with_common_slot_map_at(
+        expr,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        common_slot_map,
+        FieldPath::root("expr"),
+        None,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Path-aware variant used by the production fragment decoder.
+///
+/// `common_slot_map_path` is the owner path of `common_slot_map`; when a slot is inlined, errors
+/// are reported under that map key instead of under the SLOT_REF that referenced it.
+pub(crate) fn lower_t_expr_with_common_slot_map_at(
+    expr: &exprs::TExpr,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&StarRocksExternalDependencyDraft>,
+    common_slot_map: Option<&BTreeMap<types::TSlotId, exprs::TExpr>>,
+    expr_path: FieldPath,
+    common_slot_map_path: Option<FieldPath>,
+) -> Result<ExprId, StarRocksFragmentDecodeError> {
     let mut idx = 0usize;
     let mut ctx = CommonSlotLoweringCtx {
         map: common_slot_map,
+        map_path: common_slot_map_path,
         cache: HashMap::new(),
         stack: Vec::new(),
         placeholder_overrides: HashMap::new(),
     };
-    lower_expr_node_impl(
+    let root = lower_expr_node_impl(
         &expr.nodes,
         &mut idx,
         arena,
@@ -337,7 +427,15 @@ pub(crate) fn lower_t_expr_with_common_slot_map(
         last_query_id,
         fe_addr,
         &mut ctx,
-    )
+        &expr_path,
+    )?;
+    if idx != expr.nodes.len() {
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            expr_path.field("nodes").index(idx),
+            "trailing expression node after complete root expression",
+        ));
+    }
+    Ok(root)
 }
 
 /// Lower a single TExprNode to ExprId in the arena.
@@ -350,8 +448,31 @@ pub(crate) fn lower_expr_node(
     last_query_id: Option<&str>,
     fe_addr: Option<&StarRocksExternalDependencyDraft>,
 ) -> Result<ExprId, String> {
+    lower_expr_node_at(
+        nodes,
+        idx,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        FieldPath::root("expr"),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Lower one subtree from a flat node list, retaining the caller-provided expression owner path.
+pub(crate) fn lower_expr_node_at(
+    nodes: &[exprs::TExprNode],
+    idx: &mut usize,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&StarRocksExternalDependencyDraft>,
+    expr_path: FieldPath,
+) -> Result<ExprId, StarRocksFragmentDecodeError> {
     let mut ctx = CommonSlotLoweringCtx {
         map: None,
+        map_path: None,
         cache: HashMap::new(),
         stack: Vec::new(),
         placeholder_overrides: HashMap::new(),
@@ -364,6 +485,7 @@ pub(crate) fn lower_expr_node(
         last_query_id,
         fe_addr,
         &mut ctx,
+        &expr_path,
     )
 }
 
@@ -375,11 +497,23 @@ fn lower_expr_node_impl(
     last_query_id: Option<&str>,
     fe_addr: Option<&StarRocksExternalDependencyDraft>,
     ctx: &mut CommonSlotLoweringCtx<'_>,
-) -> Result<ExprId, String> {
-    let node = nodes
-        .get(*idx)
-        .ok_or_else(|| "invalid expr node index".to_string())?;
+    expr_path: &FieldPath,
+) -> Result<ExprId, StarRocksFragmentDecodeError> {
+    let node_index = *idx;
+    let node_path = expr_path.clone().field("nodes").index(node_index);
+    let node = nodes.get(node_index).ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            node_path.clone(),
+            format!("missing expression node at flat index {node_index}"),
+        )
+    })?;
     *idx += 1;
+    if node.num_children < 0 {
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            node_path.clone().field("num_children"),
+            format!("negative expression child count {}", node.num_children),
+        ));
+    }
     if node.node_type == exprs::TExprNodeType::DICT_EXPR {
         return lower_dict_expr_node(
             node,
@@ -390,6 +524,8 @@ fn lower_expr_node_impl(
             last_query_id,
             fe_addr,
             ctx,
+            expr_path,
+            &node_path,
         );
     }
     let mut children = Vec::with_capacity(node.num_children as usize);
@@ -402,6 +538,7 @@ fn lower_expr_node_impl(
             last_query_id,
             fe_addr,
             ctx,
+            expr_path,
         )?);
     }
 
@@ -416,7 +553,12 @@ fn lower_expr_node_impl(
             // Production lowering must not guess a fallback type.
             DataType::Null
         }
-        None => return Err(missing_type_descriptor_err(node)),
+        None => {
+            return Err(StarRocksFragmentDecodeError::missing(
+                node_path.clone().field("type"),
+                missing_type_descriptor_err(node),
+            ));
+        }
     };
     let id = match node.node_type {
         // Literal expressions
@@ -430,25 +572,41 @@ fn lower_expr_node_impl(
             || t == exprs::TExprNodeType::FLOAT_LITERAL
             || t == exprs::TExprNodeType::LARGE_INT_LITERAL =>
         {
-            lower_literal(node, arena, data_type)?
+            invalid_expr_value(node_path.clone(), lower_literal(node, arena, data_type))?
         }
         // Slot reference
         t if t == exprs::TExprNodeType::SLOT_REF => {
-            if let Some(slot) = node.slot_ref.as_ref()
-                && let Some(map) = ctx.map
+            let slot = node.slot_ref.as_ref().ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    node_path.clone().field("slot_ref"),
+                    "SLOT_REF expression node is missing slot_ref payload",
+                )
+            })?;
+            if let Some(map) = ctx.map
                 && let Some(common_expr) = map.get(&slot.slot_id)
             {
                 if let Some(cached) = ctx.cache.get(&slot.slot_id) {
                     return Ok(*cached);
                 }
                 if ctx.stack.contains(&slot.slot_id) {
-                    return Err(format!(
-                        "common_slot_map contains a cycle at slot_id={}",
-                        slot.slot_id
+                    return Err(StarRocksFragmentDecodeError::invalid_value(
+                        ctx.map_path
+                            .clone()
+                            .unwrap_or_else(|| node_path.clone())
+                            .map_key(slot.slot_id.to_string()),
+                        format!(
+                            "common_slot_map contains a cycle at slot_id={}",
+                            slot.slot_id
+                        ),
                     ));
                 }
                 ctx.stack.push(slot.slot_id);
                 let mut sub_idx = 0usize;
+                let common_expr_path = ctx
+                    .map_path
+                    .clone()
+                    .unwrap_or_else(|| node_path.clone())
+                    .map_key(slot.slot_id.to_string());
                 let lowered = lower_expr_node_impl(
                     &common_expr.nodes,
                     &mut sub_idx,
@@ -457,98 +615,262 @@ fn lower_expr_node_impl(
                     last_query_id,
                     fe_addr,
                     ctx,
+                    &common_expr_path,
                 )?;
+                if sub_idx != common_expr.nodes.len() {
+                    return Err(StarRocksFragmentDecodeError::invalid_value(
+                        common_expr_path.field("nodes").index(sub_idx),
+                        "trailing expression node after complete common-slot expression",
+                    ));
+                }
                 ctx.stack.pop();
                 ctx.cache.insert(slot.slot_id, lowered);
                 return Ok(lowered);
             }
-            lower_slot_ref(node, arena, input_layout, data_type)?
+            invalid_expr_value(
+                node_path.clone().field("slot_ref"),
+                lower_slot_ref(node, arena, input_layout, data_type),
+            )?
         }
         // Placeholder reference used by FE global-dict rewritten expressions.
         // It behaves like a slot reference with slot id carried in `vslot_ref`.
         t if t == exprs::TExprNodeType::PLACEHOLDER_EXPR => {
-            let slot_id = node
-                .vslot_ref
-                .as_ref()
-                .and_then(|v| v.slot_id)
-                .ok_or_else(|| "PLACEHOLDER_EXPR missing vslot_ref.slot_id".to_string())?;
+            let placeholder = node.vslot_ref.as_ref().ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    node_path.clone().field("vslot_ref"),
+                    "PLACEHOLDER_EXPR missing vslot_ref",
+                )
+            })?;
+            let slot_id = placeholder.slot_id.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    node_path.clone().field("vslot_ref").field("slot_id"),
+                    "PLACEHOLDER_EXPR missing vslot_ref.slot_id",
+                )
+            })?;
             if let Some(rewritten_expr) = ctx.placeholder_overrides.get(&slot_id) {
                 return Ok(*rewritten_expr);
             }
-            let slot_id = SlotId::try_from(slot_id)?;
+            let slot_id = SlotId::try_from(slot_id).map_err(|detail| {
+                StarRocksFragmentDecodeError::invalid_value(
+                    node_path.clone().field("vslot_ref").field("slot_id"),
+                    detail,
+                )
+            })?;
             arena.push_typed(crate::exec::expr::ExprNode::SlotId(slot_id), data_type)
         }
         // Cast expression
         t if t == exprs::TExprNodeType::CAST_EXPR => {
             let target_primitive = primitive_type_from_desc(&node.type_);
-            lower_cast(
-                &children,
-                arena,
-                data_type,
-                target_primitive,
-                node.child_type,
+            invalid_expr_value(
+                node_path.clone(),
+                lower_cast(
+                    &children,
+                    arena,
+                    data_type,
+                    target_primitive,
+                    node.child_type,
+                ),
             )?
         }
         // Arithmetic expression
-        t if t == exprs::TExprNodeType::ARITHMETIC_EXPR => {
-            lower_arithmetic(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::ARITHMETIC_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_arithmetic(node, &children, arena, data_type),
+        )?,
         // Binary predicate
-        t if t == exprs::TExprNodeType::BINARY_PRED => {
-            lower_binary_pred(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::BINARY_PRED => invalid_expr_value(
+            node_path.clone(),
+            lower_binary_pred(node, &children, arena, data_type),
+        )?,
         // Compound predicate
-        t if t == exprs::TExprNodeType::COMPOUND_PRED => {
-            lower_compound_pred(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::COMPOUND_PRED => invalid_expr_value(
+            node_path.clone(),
+            lower_compound_pred(node, &children, arena, data_type),
+        )?,
         // Is null predicate
-        t if t == exprs::TExprNodeType::IS_NULL_PRED => {
-            lower_is_null_pred(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::IS_NULL_PRED => invalid_expr_value(
+            node_path.clone(),
+            lower_is_null_pred(node, &children, arena, data_type),
+        )?,
         // Like predicate
-        t if t == exprs::TExprNodeType::LIKE_PRED => {
-            lower_like_pred(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::LIKE_PRED => invalid_expr_value(
+            node_path.clone(),
+            lower_like_pred(node, &children, arena, data_type),
+        )?,
         // Info function
-        t if t == exprs::TExprNodeType::INFO_FUNC => lower_info_func(node, arena, data_type)?,
+        t if t == exprs::TExprNodeType::INFO_FUNC => invalid_expr_value(
+            node_path.clone().field("info_func"),
+            lower_info_func(node, arena, data_type),
+        )?,
         // Function call / legacy compute function call
         t if t == exprs::TExprNodeType::FUNCTION_CALL
             || t == exprs::TExprNodeType::COMPUTE_FUNCTION_CALL =>
         {
-            lower_function_call(node, &children, arena, data_type, last_query_id, fe_addr)?
+            invalid_expr_value(
+                node_path.clone().field("fn"),
+                lower_function_call(node, &children, arena, data_type, last_query_id, fe_addr),
+            )?
         }
         // Array expression
-        t if t == exprs::TExprNodeType::ARRAY_EXPR => lower_array_expr(children, arena, data_type)?,
+        t if t == exprs::TExprNodeType::ARRAY_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_array_expr(children, arena, data_type),
+        )?,
         // Map expression
-        t if t == exprs::TExprNodeType::MAP_EXPR => lower_map_expr(&children, arena, data_type)?,
+        t if t == exprs::TExprNodeType::MAP_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_map_expr(&children, arena, data_type),
+        )?,
         // Lambda function expression
-        t if t == exprs::TExprNodeType::LAMBDA_FUNCTION_EXPR => {
-            lower_lambda_function(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::LAMBDA_FUNCTION_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_lambda_function(node, &children, arena, data_type),
+        )?,
         // Case expression
-        t if t == exprs::TExprNodeType::CASE_EXPR => lower_case(node, children, arena, data_type)?,
+        t if t == exprs::TExprNodeType::CASE_EXPR => invalid_expr_value(
+            node_path.clone().field("case_expr"),
+            lower_case(node, children, arena, data_type),
+        )?,
         // In predicate
-        t if t == exprs::TExprNodeType::IN_PRED => lower_in_pred(node, children, arena, data_type)?,
+        t if t == exprs::TExprNodeType::IN_PRED => invalid_expr_value(
+            node_path.clone().field("in_predicate"),
+            lower_in_pred(node, children, arena, data_type),
+        )?,
         // Array element expression
-        t if t == exprs::TExprNodeType::ARRAY_ELEMENT_EXPR => {
-            lower_array_element_expr(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::ARRAY_ELEMENT_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_array_element_expr(node, &children, arena, data_type),
+        )?,
         // Map element expression
-        t if t == exprs::TExprNodeType::MAP_ELEMENT_EXPR => {
-            lower_map_element_expr(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::MAP_ELEMENT_EXPR => invalid_expr_value(
+            node_path.clone(),
+            lower_map_element_expr(node, &children, arena, data_type),
+        )?,
         // Struct/JSON subfield expression
-        t if t == exprs::TExprNodeType::SUBFIELD_EXPR => {
-            lower_subfield_expr(node, &children, arena, data_type)?
-        }
+        t if t == exprs::TExprNodeType::SUBFIELD_EXPR => invalid_expr_value(
+            node_path.clone().field("used_subfield_names"),
+            lower_subfield_expr(node, &children, arena, data_type),
+        )?,
         // Clone expression
-        t if t == exprs::TExprNodeType::CLONE_EXPR => lower_clone(&children, arena, data_type)?,
+        t if t == exprs::TExprNodeType::CLONE_EXPR => {
+            invalid_expr_value(node_path.clone(), lower_clone(&children, arena, data_type))?
+        }
         t => {
-            return Err(format!("unsupported expr node type: {:?}", t));
+            return Err(StarRocksFragmentDecodeError::unsupported(
+                node_path.clone().field("node_type"),
+                format!("unsupported expr node type: {:?}", t),
+            ));
         }
     };
     if let Ok(field_schema) = chunk_field_schema_from_type_desc("_expr", true, node.type_.clone()) {
         arena.set_field_schema(id, field_schema);
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use crate::protocol::common::error::ProtocolErrorKind;
+
+    fn test_node(node_type: exprs::TExprNodeType, num_children: i32) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type,
+            type_: types::TTypeDesc::new(Vec::<types::TTypeNode>::new()),
+            opcode: None,
+            num_children,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: -1,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn lower_error(expr: exprs::TExpr) -> StarRocksFragmentDecodeError {
+        lower_t_expr_at(
+            &expr,
+            &mut ExprArena::default(),
+            &Layout {
+                order: Vec::new(),
+                index: HashMap::new(),
+            },
+            None,
+            None,
+            FieldPath::root("owner").field("predicate"),
+        )
+        .expect_err("expression should be malformed")
+    }
+
+    #[test]
+    fn missing_child_reports_next_flat_node_path() {
+        let error = lower_error(exprs::TExpr {
+            nodes: vec![test_node(exprs::TExprNodeType::CAST_EXPR, 1)],
+        });
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(protocol.path().to_string(), "owner.predicate.nodes[1]");
+    }
+
+    #[test]
+    fn child_payload_reports_child_flat_node_path() {
+        let error = lower_error(exprs::TExpr {
+            nodes: vec![
+                test_node(exprs::TExprNodeType::CAST_EXPR, 1),
+                test_node(exprs::TExprNodeType::SLOT_REF, 0),
+            ],
+        });
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            protocol.path().to_string(),
+            "owner.predicate.nodes[1].slot_ref"
+        );
+    }
+
+    #[test]
+    fn trailing_node_reports_first_trailing_flat_node_path() {
+        let error = lower_error(exprs::TExpr {
+            nodes: vec![
+                test_node(exprs::TExprNodeType::NULL_LITERAL, 0),
+                test_node(exprs::TExprNodeType::NULL_LITERAL, 0),
+            ],
+        });
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(protocol.path().to_string(), "owner.predicate.nodes[1]");
+    }
 }

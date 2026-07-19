@@ -23,14 +23,16 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::runtime_filter::RuntimeFilterType;
 
 use crate::novarocks_logging::warn;
-use crate::protocol::starrocks::decode::expr::{lower_expr_node, lower_t_expr};
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_at};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
 use crate::runtime::query_options::QueryOptions;
 use crate::thrift::descriptors;
 
-use crate::thrift::{exprs, plan_nodes, runtime_filter, types};
+use crate::thrift::{exprs, plan_nodes, runtime_filter};
 use arrow::datatypes::{DataType, Field, Fields};
 
 /// Lower an AGGREGATION_NODE plan node to a `Lowered` ExecNode.
@@ -43,22 +45,31 @@ pub(crate) fn lower_aggregate_node(
     out_layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.field("agg_node");
     let Some(agg) = node.agg_node.as_ref() else {
-        return Err("AGGREGATION_NODE missing agg_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "AGGREGATION_NODE missing agg_node payload",
+        ));
     };
 
     // Grouping keys
     let mut group_by =
         Vec::with_capacity(agg.grouping_exprs.as_ref().map(|v| v.len()).unwrap_or(0));
     if let Some(exprs) = &agg.grouping_exprs {
-        for e in exprs {
-            group_by.push(lower_t_expr(
+        for (expr_index, e) in exprs.iter().enumerate() {
+            group_by.push(lower_t_expr_at(
                 e,
                 arena,
                 &child.layout,
                 last_query_id,
                 fe_addr,
+                payload_path
+                    .clone()
+                    .field("grouping_exprs")
+                    .index(expr_index),
             )?);
         }
     }
@@ -66,17 +77,26 @@ pub(crate) fn lower_aggregate_node(
         if let Some(dt) = arena.data_type(*expr_id)
             && matches!(dt, arrow::datatypes::DataType::LargeBinary)
         {
-            return Err("VARIANT is not supported in GROUP BY".to_string());
+            return Err(StarRocksFragmentDecodeError::unsupported(
+                payload_path.clone().field("grouping_exprs"),
+                "VARIANT is not supported in GROUP BY",
+            ));
         }
     }
 
     // Agg functions
     let mut functions = Vec::new();
-    for e in &agg.aggregate_functions {
-        let root = e
-            .nodes
-            .first()
-            .ok_or_else(|| "empty agg expr".to_string())?;
+    for (function_index, e) in agg.aggregate_functions.iter().enumerate() {
+        let function_path = payload_path
+            .clone()
+            .field("aggregate_functions")
+            .index(function_index);
+        let root = e.nodes.first().ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                function_path.clone().field("nodes").index(0),
+                "empty agg expr",
+            )
+        })?;
         let is_merge = root
             .agg_expr
             .as_ref()
@@ -86,8 +106,19 @@ pub(crate) fn lower_aggregate_node(
             .fn_
             .as_ref()
             .map(|f| f.name.function_name.to_lowercase())
-            .ok_or_else(|| "agg expr missing function name".to_string())?;
-        let (fn_name, order) = encode_aggregate(root, &fn_name_raw, query_opts)?;
+            .ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    function_path.clone().field("nodes").index(0).field("fn"),
+                    "agg expr missing function name",
+                )
+            })?;
+        let (fn_name, order) =
+            encode_aggregate(root, &fn_name_raw, query_opts).map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(
+                    function_path.clone().field("nodes").index(0).field("fn"),
+                    error,
+                )
+            })?;
         let rewrite_ds_hll_merge_to_union =
             !agg.need_finalize && fn_name_raw == "ds_hll_count_distinct_merge";
         let fn_name = if rewrite_ds_hll_merge_to_union {
@@ -95,7 +126,12 @@ pub(crate) fn lower_aggregate_node(
         } else {
             fn_name
         };
-        let mut type_sig = agg_type_signature_from_node(root)?;
+        let mut type_sig = agg_type_signature_from_node(root).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                function_path.clone().field("nodes").index(0).field("fn"),
+                error,
+            )
+        })?;
         if rewrite_ds_hll_merge_to_union
             && let Some(intermediate_type) = type_sig.intermediate_type.clone()
         {
@@ -106,17 +142,21 @@ pub(crate) fn lower_aggregate_node(
         let mut args = Vec::new();
         let mut idx = 1; // Skip root
         for _ in 0..root.num_children {
-            args.push(lower_expr_node(
+            args.push(lower_expr_node_at(
                 &e.nodes,
                 &mut idx,
                 arena,
                 &child.layout,
                 last_query_id,
                 fe_addr,
+                function_path.clone(),
             )?);
         }
 
-        let inputs = select_aggregate_inputs(&fn_name_raw, is_merge, args, arena)?;
+        let inputs =
+            select_aggregate_inputs(&fn_name_raw, is_merge, args, arena).map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(function_path.clone(), error)
+            })?;
         let func = AggFunction {
             name: fn_name.clone(),
             inputs,
@@ -128,24 +168,38 @@ pub(crate) fn lower_aggregate_node(
     }
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
     let desc_tbl = desc_tbl.ok_or_else(|| {
-        "aggregate node lowering requires descriptor table for output chunk schema".to_string()
+        StarRocksFragmentDecodeError::missing(
+            payload_path.clone(),
+            "aggregate node lowering requires descriptor table for output chunk schema",
+        )
     })?;
-    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout).map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+    })?;
 
     // Parse TopN runtime filter specs from the aggregation node.
     let mut topn_rf_specs = Vec::new();
     if let Some(filters) = agg.build_runtime_filters.as_ref().filter(|v| !v.is_empty()) {
-        for desc in filters {
+        for (filter_index, desc) in filters.iter().enumerate() {
+            let filter_path = payload_path
+                .clone()
+                .field("build_runtime_filters")
+                .index(filter_index);
             if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
                 continue;
             }
-            let filter_id = desc
-                .filter_id
-                .ok_or_else(|| "topn runtime filter missing filter_id".to_string())?;
-            let expr_order = desc
-                .expr_order
-                .ok_or_else(|| format!("topn runtime filter {} missing expr_order", filter_id))?
-                as usize;
+            let filter_id = desc.filter_id.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    filter_path.clone().field("filter_id"),
+                    "topn runtime filter missing filter_id",
+                )
+            })?;
+            let expr_order = desc.expr_order.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    filter_path.clone().field("expr_order"),
+                    format!("topn runtime filter {} missing expr_order", filter_id),
+                )
+            })? as usize;
 
             // Convert the build expression type at the lowering boundary.
             let build_type_desc = desc
@@ -154,19 +208,28 @@ pub(crate) fn lower_aggregate_node(
                 .and_then(|expr| expr.nodes.first())
                 .map(|node| &node.type_)
                 .ok_or_else(|| {
-                    format!("topn runtime filter {} missing build_expr type", filter_id)
+                    StarRocksFragmentDecodeError::missing(
+                        filter_path.clone().field("build_expr"),
+                        format!("topn runtime filter {} missing build_expr type", filter_id),
+                    )
                 })?;
             let build_data_type = arrow_type_from_desc(build_type_desc).ok_or_else(|| {
-                format!(
-                    "topn runtime filter {} unsupported build_expr type descriptor: {:?}",
-                    filter_id, build_type_desc
+                StarRocksFragmentDecodeError::unsupported(
+                    filter_path.clone().field("build_expr"),
+                    format!(
+                        "topn runtime filter {} unsupported build_expr type descriptor: {:?}",
+                        filter_id, build_type_desc
+                    ),
                 )
             })?;
             let build_type =
                 RuntimeFilterType::from_arrow_data_type(&build_data_type).map_err(|e| {
-                    format!(
-                        "topn runtime filter {} unsupported build_expr type: data_type={:?} err={}",
-                        filter_id, build_data_type, e
+                    StarRocksFragmentDecodeError::unsupported(
+                        filter_path.clone().field("build_expr"),
+                        format!(
+                            "topn runtime filter {} unsupported build_expr type: data_type={:?} err={}",
+                            filter_id, build_data_type, e
+                        ),
                     )
                 })?;
 

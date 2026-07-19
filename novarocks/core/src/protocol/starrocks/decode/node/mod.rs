@@ -56,45 +56,57 @@ use crate::novarocks_connectors::ConnectorRegistry;
 use crate::novarocks_logging::warn;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_for_row_tuples};
-use crate::thrift::{
-    data, descriptors, exprs, internal_service, plan_nodes, runtime_filter, types,
-};
+use crate::thrift::{data, descriptors, exprs, plan_nodes, runtime_filter, types};
 
-pub(crate) type StarRocksScanRangeAssignments =
-    BTreeMap<i32, Vec<internal_service::TScanRangeParams>>;
-
-struct StarRocksPlanDecodeContext<'a> {
+pub(crate) struct StarRocksPlanDecodeContext<'a> {
     query_id: Option<crate::runtime::query_context::QueryId>,
     fragment_instance_id: Option<crate::common::types::UniqueId>,
-    scan_ranges: Option<&'a StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&'a crate::runtime::fragment::instance::ScanAssignments>,
+    broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
+    lake_scan_program_facts:
+        Option<&'a BTreeMap<i32, crate::protocol::starrocks::decode::LakeScanProgramFacts>>,
+    lake_meta_scan_range_facts:
+        Option<&'a BTreeMap<i32, Vec<crate::protocol::starrocks::decode::LakeMetaScanRangeFact>>>,
     per_exchange_sender_counts: Option<&'a BTreeMap<i32, i32>>,
     batch_sender_counts: &'a HashMap<i32, usize>,
     query_options: crate::runtime::query_options::QueryOptions,
+    decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 }
 
 impl<'a> StarRocksPlanDecodeContext<'a> {
-    fn new(
-        exec_params: Option<&'a internal_service::TPlanFragmentExecParams>,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        query_id: Option<crate::runtime::query_context::QueryId>,
+        fragment_instance_id: Option<crate::common::types::UniqueId>,
+        scan_assignments: Option<&'a crate::runtime::fragment::instance::ScanAssignments>,
+        broker_file_program_facts: Option<&'a BTreeMap<i32, BrokerFileProgramFacts>>,
+        lake_scan_program_facts: Option<
+            &'a BTreeMap<i32, crate::protocol::starrocks::decode::LakeScanProgramFacts>,
+        >,
+        lake_meta_scan_range_facts: Option<
+            &'a BTreeMap<i32, Vec<crate::protocol::starrocks::decode::LakeMetaScanRangeFact>>,
+        >,
+        per_exchange_sender_counts: Option<&'a BTreeMap<i32, i32>>,
         batch_sender_counts: &'a HashMap<i32, usize>,
-        query_options: Option<&internal_service::TQueryOptions>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            query_id: exec_params.map(|params| crate::runtime::query_context::QueryId {
-                hi: params.query_id.hi,
-                lo: params.query_id.lo,
-            }),
-            fragment_instance_id: exec_params.map(|params| crate::common::types::UniqueId {
-                hi: params.fragment_instance_id.hi,
-                lo: params.fragment_instance_id.lo,
-            }),
-            scan_ranges: exec_params.map(|params| &params.per_node_scan_ranges),
-            per_exchange_sender_counts: exec_params.map(|params| &params.per_exch_num_senders),
+        query_options: crate::runtime::query_options::QueryOptions,
+        decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    ) -> Self {
+        Self {
+            query_id,
+            fragment_instance_id,
+            scan_assignments,
+            broker_file_program_facts,
+            lake_scan_program_facts,
+            lake_meta_scan_range_facts,
+            per_exchange_sender_counts,
             batch_sender_counts,
-            query_options: crate::protocol::starrocks::decode::decode_query_options(query_options)
-                .map_err(|error| error.to_string())?,
-        })
+            query_options,
+            decode_facts,
+        }
     }
 }
 
@@ -108,13 +120,15 @@ pub(crate) use empty_set::lower_empty_set_node;
 pub(crate) use exchange::lower_exchange_node;
 pub(crate) use exchange::resolve_exchange_sender_count;
 pub(crate) use fetch::lower_fetch_node;
-pub(crate) use file_scan::lower_file_scan_node;
+pub(crate) use file_scan::{
+    BrokerFileProgramFacts, decode_broker_file_program_facts, lower_file_scan_node,
+};
 pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
 pub(crate) use jdbc_scan::lower_jdbc_scan_node;
 #[cfg(feature = "compat")]
-pub(crate) use lake_meta_scan::lower_lake_meta_scan_node;
+pub(crate) use lake_meta_scan::{LakeMetaValuesPatch, lower_lake_meta_scan_node};
 #[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
 pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
@@ -124,6 +138,7 @@ pub(crate) use project::lower_project_node;
 pub(crate) use raw_values::lower_raw_values_node;
 pub(crate) use repeat::lower_repeat_node;
 pub(crate) use schema_scan::lower_schema_scan_node;
+pub(crate) use schema_scan::supported_schema_scan_requires_ranges;
 pub(crate) use select::lower_select_node;
 pub(crate) use set_op::{lower_except_node, lower_intersect_node};
 pub(crate) use sort::lower_sort_node;
@@ -191,23 +206,29 @@ pub(crate) fn lower_plan(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     query_global_dicts: Option<&[data::TGlobalDict]>,
     query_global_dict_exprs: Option<&BTreeMap<i32, exprs::TExpr>>,
-    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-    batch_sender_counts: &HashMap<i32, usize>,
-    query_opts: Option<&internal_service::TQueryOptions>,
+    context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
     connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
-    let context = StarRocksPlanDecodeContext::new(exec_params, batch_sender_counts, query_opts)?;
+    query_global_dicts_path: FieldPath,
+    query_global_dict_exprs_path: FieldPath,
+    plan_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
     let mut idx = 0usize;
     let global_common_slot_map = collect_global_common_slot_map(&plan.nodes);
-    let query_global_dict_map =
-        build_query_global_dict_map(query_global_dicts, query_global_dict_exprs)?;
+    let query_global_dict_map = build_query_global_dict_map(
+        query_global_dicts,
+        query_global_dict_exprs,
+        query_global_dicts_path.clone(),
+        query_global_dict_exprs_path,
+    )?;
     let mut arena_query_global_dicts = HashMap::new();
     for (slot_id, dict) in &query_global_dict_map {
-        let slot_id = SlotId::try_from(*slot_id)?;
+        let slot_id = SlotId::try_from(*slot_id).map_err(|detail| {
+            StarRocksFragmentDecodeError::invalid_value(query_global_dicts_path.clone(), detail)
+        })?;
         arena_query_global_dicts.insert(slot_id, dict.clone());
     }
     arena.set_query_global_dicts(arena_query_global_dicts);
@@ -218,16 +239,20 @@ pub(crate) fn lower_plan(
         tuple_slots,
         desc_tbl,
         &query_global_dict_map,
-        &context,
+        context,
         db_name,
         connectors,
         layout_hints,
         &global_common_slot_map,
         last_query_id,
         fe_addr,
+        &plan_path,
     )?;
     if idx != plan.nodes.len() {
-        // best-effort: ignore trailing nodes
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            plan_path.field("nodes").index(idx),
+            "trailing plan node is not reachable from the root",
+        ));
     }
     Ok({
         // Apply limit at root if present.
@@ -241,6 +266,32 @@ struct LowerNodeFrame {
     children: Vec<Lowered>,
 }
 
+enum NodeLeafDecodeError {
+    Legacy(String),
+    Typed(StarRocksFragmentDecodeError),
+}
+
+impl NodeLeafDecodeError {
+    fn into_fragment(self, node_path: FieldPath) -> StarRocksFragmentDecodeError {
+        match self {
+            Self::Legacy(detail) => StarRocksFragmentDecodeError::invalid_value(node_path, detail),
+            Self::Typed(error) => error,
+        }
+    }
+}
+
+impl From<String> for NodeLeafDecodeError {
+    fn from(detail: String) -> Self {
+        Self::Legacy(detail)
+    }
+}
+
+impl From<StarRocksFragmentDecodeError> for NodeLeafDecodeError {
+    fn from(error: StarRocksFragmentDecodeError) -> Self {
+        Self::Typed(error)
+    }
+}
+
 impl LowerNodeFrame {
     fn new(node_index: usize, expected_children: usize) -> Self {
         Self {
@@ -251,11 +302,17 @@ impl LowerNodeFrame {
     }
 }
 
-fn expected_children(node: &plan_nodes::TPlanNode) -> Result<usize, String> {
+fn expected_children(
+    node: &plan_nodes::TPlanNode,
+    node_path: &FieldPath,
+) -> Result<usize, StarRocksFragmentDecodeError> {
     if node.num_children < 0 {
-        return Err(format!(
-            "invalid plan node: node_id={} has negative num_children={}",
-            node.node_id, node.num_children
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            node_path.clone().field("num_children"),
+            format!(
+                "node_id={} has negative num_children={}",
+                node.node_id, node.num_children
+            ),
         ));
     }
     Ok(node.num_children as usize)
@@ -275,28 +332,49 @@ fn lower_node(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    plan_path: &FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
     let root_index = *idx;
-    let root_node = nodes
-        .get(root_index)
-        .ok_or_else(|| "invalid plan node index".to_string())?;
+    let root_node = nodes.get(root_index).ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            plan_path.clone().field("nodes").index(root_index),
+            "missing root plan node",
+        )
+    })?;
     *idx += 1;
 
     let mut stack = vec![LowerNodeFrame::new(
         root_index,
-        expected_children(root_node)?,
+        expected_children(
+            root_node,
+            &plan_path.clone().field("nodes").index(root_index),
+        )?,
     )];
 
     while let Some(frame) = stack.last_mut() {
         if frame.children.len() < frame.expected_children {
             let child_index = *idx;
-            let child_node = nodes
-                .get(child_index)
-                .ok_or_else(|| "invalid plan node index".to_string())?;
+            let child_node = nodes.get(child_index).ok_or_else(|| {
+                StarRocksFragmentDecodeError::invalid_value(
+                    plan_path
+                        .clone()
+                        .field("nodes")
+                        .index(frame.node_index)
+                        .field("num_children"),
+                    format!(
+                        "declared child {} is missing at flat node index {}",
+                        frame.children.len(),
+                        child_index
+                    ),
+                )
+            })?;
             *idx += 1;
             stack.push(LowerNodeFrame::new(
                 child_index,
-                expected_children(child_node)?,
+                expected_children(
+                    child_node,
+                    &plan_path.clone().field("nodes").index(child_index),
+                )?,
             ));
             continue;
         }
@@ -317,6 +395,7 @@ fn lower_node(
             global_common_slot_map,
             last_query_id,
             fe_addr,
+            plan_path.clone().field("nodes").index(frame.node_index),
         )?;
         if let Some(parent) = stack.last_mut() {
             parent.children.push(lowered);
@@ -342,7 +421,43 @@ fn lower_node_with_children(
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    lower_node_with_children_typed(
+        node,
+        children,
+        arena,
+        tuple_slots,
+        desc_tbl,
+        query_global_dict_map,
+        context,
+        db_name,
+        connectors,
+        layout_hints,
+        global_common_slot_map,
+        last_query_id,
+        fe_addr,
+        node_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_node_with_children_typed(
+    node: &plan_nodes::TPlanNode,
+    children: Vec<Lowered>,
+    arena: &mut ExprArena,
+    tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    query_global_dict_map: &QueryGlobalDictMap,
+    context: &StarRocksPlanDecodeContext<'_>,
+    db_name: Option<&str>,
+    connectors: &ConnectorRegistry,
+    layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
+    last_query_id: Option<&str>,
+    fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
     let mut out_layout = layout_for_row_tuples(&node.row_tuples, tuple_slots);
     // Some plan nodes carry multiple tuples in `row_tuples` (e.g. aggregate intermediate vs output).
     // For execution output layouts we should align with the node's declared output tuple id when available.
@@ -361,45 +476,95 @@ fn lower_node_with_children(
     {
         out_layout = layout_for_row_tuples(&exchange.input_row_tuples, tuple_slots);
     }
-    let mut lowered = match node.node_type {
-        t if t == plan_nodes::TPlanNodeType::EXCHANGE_NODE => lower_exchange_node(
-            children,
-            node,
-            desc_tbl.ok_or_else(|| {
-                format!(
-                    "EXCHANGE_NODE missing descriptor table for node_id={}",
-                    node.node_id
-                )
-            })?,
-            context.fragment_instance_id,
-            context
-                .per_exchange_sender_counts
-                .and_then(|counts| counts.get(&node.node_id).copied()),
-            context.batch_sender_counts,
-            arena,
-            &out_layout,
-            last_query_id,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::SELECT_NODE => lower_select_node(children)?,
-        t if t == plan_nodes::TPlanNodeType::REPEAT_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "REPEAT_NODE expected 1 child, got {}",
-                    children.len()
-                ));
+    let mut lowered = (|| -> Result<Lowered, NodeLeafDecodeError> {
+        Ok(match node.node_type {
+            t if t == plan_nodes::TPlanNodeType::EXCHANGE_NODE => lower_exchange_node(
+                children,
+                node,
+                desc_tbl.ok_or_else(|| {
+                    format!(
+                        "EXCHANGE_NODE missing descriptor table for node_id={}",
+                        node.node_id
+                    )
+                })?,
+                context.fragment_instance_id,
+                context
+                    .per_exchange_sender_counts
+                    .and_then(|counts| counts.get(&node.node_id).copied()),
+                context.batch_sender_counts,
+                arena,
+                &out_layout,
+                last_query_id,
+                fe_addr,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::SELECT_NODE => lower_select_node(children)?,
+            t if t == plan_nodes::TPlanNodeType::REPEAT_NODE => {
+                if children.len() != 1 {
+                    return Err(
+                        format!("REPEAT_NODE expected 1 child, got {}", children.len()).into(),
+                    );
+                }
+                let child = children.into_iter().next().expect("child");
+                lower_repeat_node(child, node, out_layout, tuple_slots)?
             }
-            let child = children.into_iter().next().expect("child");
-            lower_repeat_node(child, node, out_layout, tuple_slots)?
-        }
-        t if t == plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE => {
-            let desc_tbl = desc_tbl.ok_or_else(|| {
-                format!(
-                    "CHANGE_EVENT_EXPAND_NODE node_id={} requires descriptor table",
-                    node.node_id
-                )
-            })?;
-            lower_change_event_expand_node(
+            t if t == plan_nodes::TPlanNodeType::CHANGE_EVENT_EXPAND_NODE => {
+                let desc_tbl = desc_tbl.ok_or_else(|| {
+                    format!(
+                        "CHANGE_EVENT_EXPAND_NODE node_id={} requires descriptor table",
+                        node.node_id
+                    )
+                })?;
+                lower_change_event_expand_node(
+                    children,
+                    node,
+                    out_layout,
+                    arena,
+                    desc_tbl,
+                    last_query_id,
+                    fe_addr,
+                    node_path.clone(),
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::PROJECT_NODE => {
+                if children.len() != 1 {
+                    return Err(
+                        format!("PROJECT_NODE expected 1 child, got {}", children.len()).into(),
+                    );
+                }
+                let child = children.into_iter().next().expect("child");
+                let desc_tbl =
+                    desc_tbl.ok_or_else(|| "PROJECT_NODE requires descriptor table".to_string())?;
+                lower_project_node(
+                    child,
+                    node,
+                    out_layout,
+                    arena,
+                    desc_tbl,
+                    global_common_slot_map,
+                    last_query_id,
+                    fe_addr,
+                    node_path.clone(),
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::DECODE_NODE => {
+                if children.len() != 1 {
+                    return Err(
+                        format!("DECODE_NODE expected 1 child, got {}", children.len()).into(),
+                    );
+                }
+                let child = children.into_iter().next().expect("child");
+                lower_decode_node(
+                    child,
+                    node,
+                    out_layout,
+                    arena,
+                    desc_tbl,
+                    query_global_dict_map,
+                    node_path.clone(),
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::UNION_NODE => lower_union_node(
                 children,
                 node,
                 out_layout,
@@ -407,277 +572,278 @@ fn lower_node_with_children(
                 desc_tbl,
                 last_query_id,
                 fe_addr,
-            )?
-        }
-        t if t == plan_nodes::TPlanNodeType::PROJECT_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "PROJECT_NODE expected 1 child, got {}",
-                    children.len()
-                ));
-            }
-            let child = children.into_iter().next().expect("child");
-            let desc_tbl =
-                desc_tbl.ok_or_else(|| "PROJECT_NODE requires descriptor table".to_string())?;
-            lower_project_node(
-                child,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::INTERSECT_NODE => lower_intersect_node(
+                children,
                 node,
                 out_layout,
                 arena,
                 desc_tbl,
-                global_common_slot_map,
                 last_query_id,
                 fe_addr,
-            )?
-        }
-        t if t == plan_nodes::TPlanNodeType::DECODE_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "DECODE_NODE expected 1 child, got {}",
-                    children.len()
-                ));
-            }
-            let child = children.into_iter().next().expect("child");
-            lower_decode_node(
-                child,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::EXCEPT_NODE => lower_except_node(
+                children,
                 node,
                 out_layout,
                 arena,
                 desc_tbl,
-                query_global_dict_map,
-            )?
-        }
-        t if t == plan_nodes::TPlanNodeType::UNION_NODE => lower_union_node(
-            children,
-            node,
-            out_layout,
-            arena,
-            desc_tbl,
-            last_query_id,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::INTERSECT_NODE => lower_intersect_node(
-            children,
-            node,
-            out_layout,
-            arena,
-            desc_tbl,
-            last_query_id,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::EXCEPT_NODE => lower_except_node(
-            children,
-            node,
-            out_layout,
-            arena,
-            desc_tbl,
-            last_query_id,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::EMPTY_SET_NODE => {
-            lower_empty_set_node(node, &out_layout, desc_tbl)?
-        }
-        t if t == plan_nodes::TPlanNodeType::RAW_VALUES_NODE => {
-            lower_raw_values_node(node, &mut out_layout)?
-        }
-        t if t == plan_nodes::TPlanNodeType::LOOKUP_NODE => {
-            lower_lookup_node(children, node, out_layout, desc_tbl)?
-        }
-        t if t == plan_nodes::TPlanNodeType::SCHEMA_SCAN_NODE => {
-            if !children.is_empty() {
-                return Err(format!(
-                    "SCHEMA_SCAN_NODE expected 0 children, got {}",
-                    children.len()
-                ));
-            }
-            lower_schema_scan_node(node, &out_layout, desc_tbl, context.scan_ranges, fe_addr)?
-        }
-        t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
-            lower_fetch_node(children, node, out_layout, desc_tbl)?
-        }
-        t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => lower_mysql_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            &context.query_options,
-            connectors,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            context.scan_ranges,
-            arena,
-            out_layout,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => lower_jdbc_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            &context.query_options,
-            connectors,
-            db_name,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            context.scan_ranges,
-            &context.query_options,
-            connectors,
-            query_global_dict_map,
-            out_layout,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
-            if !children.is_empty() {
-                return Err(format!(
-                    "ICEBERG_DELTA_SCAN_NODE expected 0 children, got {}",
-                    children.len()
-                ));
-            }
-            lower_iceberg_delta_scan_node(node, desc_tbl, out_layout)?
-        }
-        t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
-            #[cfg(feature = "compat")]
-            {
-                lower_lake_scan_node(
-                    node,
-                    desc_tbl,
-                    tuple_slots,
-                    layout_hints,
-                    context.scan_ranges,
-                    context.query_id,
-                    &context.query_options,
-                    arena,
-                    connectors,
-                    query_global_dict_map,
-                    db_name,
-                    fe_addr,
-                )?
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                return Err("LAKE_SCAN_NODE requires the compat feature".to_string());
-            }
-        }
-        t if t == plan_nodes::TPlanNodeType::LAKE_META_SCAN_NODE => {
-            #[cfg(feature = "compat")]
-            {
-                lower_lake_meta_scan_node(
-                    node,
-                    desc_tbl,
-                    tuple_slots,
-                    layout_hints,
-                    context.scan_ranges,
-                    context.query_id,
-                    db_name,
-                    fe_addr,
-                )?
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                return Err("LAKE_META_SCAN_NODE requires the compat feature".to_string());
-            }
-        }
-        t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => {
-            #[cfg(feature = "compat")]
-            {
-                lower_starrocks_scan_node(
-                    node,
-                    desc_tbl,
-                    tuple_slots,
-                    layout_hints,
-                    &context.query_options,
-                    connectors,
-                    query_global_dict_map,
-                )?
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                return Err("OLAP_SCAN_NODE requires the compat feature".to_string());
-            }
-        }
-        t if t == plan_nodes::TPlanNodeType::AGGREGATION_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "AGGREGATION_NODE expected 1 child, got {}",
-                    children.len()
-                ));
-            }
-            let child = children.into_iter().next().expect("child");
-            lower_aggregate_node(
-                child,
-                node,
-                arena,
-                desc_tbl,
-                &context.query_options,
-                &out_layout,
                 last_query_id,
                 fe_addr,
-            )?
-        }
-        t if t == plan_nodes::TPlanNodeType::HASH_JOIN_NODE => {
-            lower_hash_join_node(children, node, arena, desc_tbl, last_query_id, fe_addr)?
-        }
-        t if t == plan_nodes::TPlanNodeType::CROSS_JOIN_NODE => {
-            lower_cross_join_node(children, node, desc_tbl)?
-        }
-        t if t == plan_nodes::TPlanNodeType::NESTLOOP_JOIN_NODE => {
-            lower_nestloop_join_node(children, node, arena, desc_tbl, last_query_id, fe_addr)?
-        }
-        t if t == plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE => {
-            lower_assert_num_rows_node(children, node, &mut out_layout)?
-        }
-        t if t == plan_nodes::TPlanNodeType::SORT_NODE => lower_sort_node(
-            children,
-            node,
-            arena,
-            out_layout,
-            desc_tbl,
-            last_query_id,
-            fe_addr,
-        )?,
-        t if t == plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "ANALYTIC_EVAL_NODE expected 1 child, got {}",
-                    children.len()
-                ));
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::EMPTY_SET_NODE => {
+                lower_empty_set_node(node, &out_layout, desc_tbl)?
             }
-            let child = children.into_iter().next().expect("child");
-            lower_analytic_node(
-                child,
-                node,
-                arena,
-                &out_layout,
-                desc_tbl.ok_or_else(|| {
-                    format!(
-                        "ANALYTIC_EVAL_NODE node_id={} requires descriptor table",
-                        node.node_id
+            t if t == plan_nodes::TPlanNodeType::RAW_VALUES_NODE => {
+                lower_raw_values_node(node, &mut out_layout)?
+            }
+            t if t == plan_nodes::TPlanNodeType::LOOKUP_NODE => {
+                lower_lookup_node(children, node, out_layout, desc_tbl)?
+            }
+            t if t == plan_nodes::TPlanNodeType::SCHEMA_SCAN_NODE => {
+                if !children.is_empty() {
+                    return Err(format!(
+                        "SCHEMA_SCAN_NODE expected 0 children, got {}",
+                        children.len()
                     )
-                })?,
+                    .into());
+                }
+                lower_schema_scan_node(
+                    node,
+                    &out_layout,
+                    desc_tbl,
+                    context.scan_assignments,
+                    fe_addr,
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
+                lower_fetch_node(children, node, out_layout, desc_tbl)?
+            }
+            t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => lower_mysql_scan_node(
+                node,
+                desc_tbl,
                 tuple_slots,
+                &context.query_options,
+                connectors,
+            )?,
+            t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
+                node,
+                desc_tbl,
+                tuple_slots,
+                layout_hints,
+                context.scan_assignments,
+                context
+                    .broker_file_program_facts
+                    .and_then(|facts| facts.get(&node.node_id)),
+                arena,
+                out_layout,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => lower_jdbc_scan_node(
+                node,
+                desc_tbl,
+                tuple_slots,
+                layout_hints,
+                &context.query_options,
+                connectors,
+                db_name,
+                context.decode_facts,
+            )?,
+            t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
+                node,
+                desc_tbl,
+                tuple_slots,
+                layout_hints,
+                context.scan_assignments,
+                &context.query_options,
+                connectors,
+                query_global_dict_map,
+                out_layout,
+                context.decode_facts,
+            )?,
+            t if t == plan_nodes::TPlanNodeType::ICEBERG_DELTA_SCAN_NODE => {
+                if !children.is_empty() {
+                    return Err(format!(
+                        "ICEBERG_DELTA_SCAN_NODE expected 0 children, got {}",
+                        children.len()
+                    )
+                    .into());
+                }
+                lower_iceberg_delta_scan_node(node, desc_tbl, out_layout, context.decode_facts)?
+            }
+            t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
+                #[cfg(feature = "compat")]
+                {
+                    lower_lake_scan_node(
+                        node,
+                        desc_tbl,
+                        tuple_slots,
+                        layout_hints,
+                        context.scan_assignments,
+                        context
+                            .lake_scan_program_facts
+                            .and_then(|facts| facts.get(&node.node_id)),
+                        context.query_id,
+                        &context.query_options,
+                        arena,
+                        connectors,
+                        query_global_dict_map,
+                        db_name,
+                        fe_addr,
+                    )?
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    return Err("LAKE_SCAN_NODE requires the compat feature"
+                        .to_string()
+                        .into());
+                }
+            }
+            t if t == plan_nodes::TPlanNodeType::LAKE_META_SCAN_NODE => {
+                #[cfg(feature = "compat")]
+                {
+                    lower_lake_meta_scan_node(
+                        node,
+                        desc_tbl,
+                        tuple_slots,
+                        layout_hints,
+                        context
+                            .lake_meta_scan_range_facts
+                            .and_then(|facts| facts.get(&node.node_id))
+                            .map(Vec::as_slice),
+                        context.query_id,
+                        db_name,
+                        fe_addr,
+                    )?
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    return Err("LAKE_META_SCAN_NODE requires the compat feature"
+                        .to_string()
+                        .into());
+                }
+            }
+            t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => {
+                #[cfg(feature = "compat")]
+                {
+                    lower_starrocks_scan_node(
+                        node,
+                        desc_tbl,
+                        tuple_slots,
+                        layout_hints,
+                        &context.query_options,
+                        connectors,
+                        query_global_dict_map,
+                    )?
+                }
+                #[cfg(not(feature = "compat"))]
+                {
+                    return Err("OLAP_SCAN_NODE requires the compat feature"
+                        .to_string()
+                        .into());
+                }
+            }
+            t if t == plan_nodes::TPlanNodeType::AGGREGATION_NODE => {
+                if children.len() != 1 {
+                    return Err(format!(
+                        "AGGREGATION_NODE expected 1 child, got {}",
+                        children.len()
+                    )
+                    .into());
+                }
+                let child = children.into_iter().next().expect("child");
+                lower_aggregate_node(
+                    child,
+                    node,
+                    arena,
+                    desc_tbl,
+                    &context.query_options,
+                    &out_layout,
+                    last_query_id,
+                    fe_addr,
+                    node_path.clone(),
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::HASH_JOIN_NODE => lower_hash_join_node(
+                children,
+                node,
+                arena,
+                desc_tbl,
                 last_query_id,
                 fe_addr,
-            )?
-        }
-        t if t == plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE => {
-            if children.len() != 1 {
-                return Err(format!(
-                    "TABLE_FUNCTION_NODE expected 1 child, got {}",
-                    children.len()
-                ));
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::CROSS_JOIN_NODE => {
+                lower_cross_join_node(children, node, desc_tbl)?
             }
-            let child = children.into_iter().next().expect("child");
-            lower_table_function_node(child, node, out_layout, desc_tbl)?
-        }
-        t => {
-            return Err(format!("unsupported plan node type: {:?}", t));
-        }
-    };
+            t if t == plan_nodes::TPlanNodeType::NESTLOOP_JOIN_NODE => lower_nestloop_join_node(
+                children,
+                node,
+                arena,
+                desc_tbl,
+                last_query_id,
+                fe_addr,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE => {
+                lower_assert_num_rows_node(children, node, &mut out_layout)?
+            }
+            t if t == plan_nodes::TPlanNodeType::SORT_NODE => lower_sort_node(
+                children,
+                node,
+                arena,
+                out_layout,
+                desc_tbl,
+                last_query_id,
+                fe_addr,
+                node_path.clone(),
+            )?,
+            t if t == plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE => {
+                if children.len() != 1 {
+                    return Err(format!(
+                        "ANALYTIC_EVAL_NODE expected 1 child, got {}",
+                        children.len()
+                    )
+                    .into());
+                }
+                let child = children.into_iter().next().expect("child");
+                lower_analytic_node(
+                    child,
+                    node,
+                    arena,
+                    &out_layout,
+                    desc_tbl.ok_or_else(|| {
+                        format!(
+                            "ANALYTIC_EVAL_NODE node_id={} requires descriptor table",
+                            node.node_id
+                        )
+                    })?,
+                    tuple_slots,
+                    last_query_id,
+                    fe_addr,
+                    node_path.clone(),
+                )?
+            }
+            t if t == plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE => {
+                if children.len() != 1 {
+                    return Err(format!(
+                        "TABLE_FUNCTION_NODE expected 1 child, got {}",
+                        children.len()
+                    )
+                    .into());
+                }
+                let child = children.into_iter().next().expect("child");
+                lower_table_function_node(child, node, out_layout, desc_tbl)?
+            }
+            t => {
+                return Err(format!("unsupported plan node type: {:?}", t).into());
+            }
+        })
+    })()
+    .map_err(|error| error.into_fragment(node_path.clone()))?;
 
     // Attach probe runtime filter specs to scan nodes only.
     // Exchange source nodes are cross-fragment data channels; attaching RF
@@ -686,22 +852,22 @@ fn lower_node_with_children(
     // hangs.  Runtime filters should be applied at the scan level in the
     // producing fragment instead.
     if is_scan_node_type(node.node_type)
-        && let Some(specs) = node
+        && node
             .probe_runtime_filters
             .as_ref()
-            .filter(|v| !v.is_empty())
-            .map(|_| {
-                lower_probe_runtime_filter_specs(
-                    node,
-                    arena,
-                    &lowered.layout,
-                    last_query_id,
-                    fe_addr,
-                )
-            })
-        && !specs.is_empty()
+            .is_some_and(|descs| !descs.is_empty())
     {
-        attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
+        let specs = lower_probe_runtime_filter_specs(
+            node,
+            arena,
+            &lowered.layout,
+            last_query_id,
+            fe_addr,
+            &node_path,
+        )?;
+        if !specs.is_empty() {
+            attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
+        }
     }
 
     // Apply conjuncts (predicates/filters) if present
@@ -731,14 +897,16 @@ fn lower_node_with_children(
 
         // Combine multiple conjuncts with AND logic
         let mut conjunct_ids = Vec::new();
-        for conj in conjuncts {
-            let conj_id = lower_t_expr_with_common_slot_map(
+        for (index, conj) in conjuncts.iter().enumerate() {
+            let conj_id = lower_t_expr_with_common_slot_map_at(
                 conj,
                 arena,
                 &lowered.layout,
                 last_query_id,
                 fe_addr,
                 common_slot_map,
+                node_path.clone().field("conjuncts").index(index),
+                Some(node_path.clone()),
             )?;
             conjunct_ids.push(conj_id);
         }
@@ -853,18 +1021,19 @@ fn lower_probe_runtime_filter_specs(
     layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Vec<RuntimeFilterProbeSpec> {
+    node_path: &FieldPath,
+) -> Result<Vec<RuntimeFilterProbeSpec>, StarRocksFragmentDecodeError> {
     let Some(descs) = node
         .probe_runtime_filters
         .as_ref()
         .filter(|v| !v.is_empty())
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let common_slot_map = common_slot_map_for_node(node);
     let mut specs = Vec::new();
     let mut seen = HashSet::new();
-    for desc in descs {
+    for (desc_index, desc) in descs.iter().enumerate() {
         let Some(filter_id) = desc.filter_id else {
             warn!(
                 "probe runtime filter missing filter_id: node_id={}",
@@ -884,23 +1053,21 @@ fn lower_probe_runtime_filter_specs(
         let Some(expr) = targets.get(&node.node_id) else {
             continue;
         };
-        let expr_id = match lower_t_expr_with_common_slot_map(
+        let expr_id = lower_t_expr_with_common_slot_map_at(
             expr,
             arena,
             layout,
             last_query_id,
             fe_addr,
             common_slot_map,
-        ) {
-            Ok(id) => id,
-            Err(err) => {
-                warn!(
-                    "probe runtime filter expr lowering failed: node_id={} filter_id={} err={}",
-                    node.node_id, filter_id, err
-                );
-                continue;
-            }
-        };
+            node_path
+                .clone()
+                .field("probe_runtime_filters")
+                .index(desc_index)
+                .field("plan_node_id_to_target_expr")
+                .map_key(node.node_id.to_string()),
+            Some(node_path.clone()),
+        )?;
         let slot_id = match arena.node(expr_id) {
             Some(ExprNode::SlotId(slot_id)) => *slot_id,
             _ => {
@@ -925,7 +1092,7 @@ fn lower_probe_runtime_filter_specs(
             });
         }
     }
-    specs
+    Ok(specs)
 }
 
 fn find_first_slot_id(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {

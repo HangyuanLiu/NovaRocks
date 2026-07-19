@@ -31,7 +31,9 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::info;
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, slot_arrow_type_lookup,
 };
@@ -84,29 +86,42 @@ pub(crate) fn build_scan_query_global_dicts(
 pub(crate) fn build_query_global_dict_map(
     query_global_dicts: Option<&[data::TGlobalDict]>,
     query_global_dict_exprs: Option<&BTreeMap<i32, exprs::TExpr>>,
-) -> Result<QueryGlobalDictMap, String> {
+    query_global_dicts_path: FieldPath,
+    query_global_dict_exprs_path: FieldPath,
+) -> Result<QueryGlobalDictMap, StarRocksFragmentDecodeError> {
     let mut out = QueryGlobalDictMap::new();
     let Some(dicts) = query_global_dicts else {
         return Ok(out);
     };
-    for dict in dicts {
-        let column_id = dict
-            .column_id
-            .ok_or_else(|| "query_global_dict missing column_id".to_string())?;
-        let strings = dict
-            .strings
-            .as_ref()
-            .ok_or_else(|| format!("query_global_dict column_id={} missing strings", column_id))?;
-        let ids = dict
-            .ids
-            .as_ref()
-            .ok_or_else(|| format!("query_global_dict column_id={} missing ids", column_id))?;
+    for (dict_index, dict) in dicts.iter().enumerate() {
+        let dict_path = query_global_dicts_path.clone().index(dict_index);
+        let column_id = dict.column_id.ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                dict_path.clone().field("column_id"),
+                "query_global_dict missing column_id",
+            )
+        })?;
+        let strings = dict.strings.as_ref().ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                dict_path.clone().field("strings"),
+                format!("query_global_dict column_id={} missing strings", column_id),
+            )
+        })?;
+        let ids = dict.ids.as_ref().ok_or_else(|| {
+            StarRocksFragmentDecodeError::missing(
+                dict_path.clone().field("ids"),
+                format!("query_global_dict column_id={} missing ids", column_id),
+            )
+        })?;
         if strings.len() != ids.len() {
-            return Err(format!(
-                "query_global_dict column_id={} strings/ids length mismatch: {} vs {}",
-                column_id,
-                strings.len(),
-                ids.len()
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                dict_path.clone().field("ids"),
+                format!(
+                    "query_global_dict column_id={} strings/ids length mismatch: {} vs {}",
+                    column_id,
+                    strings.len(),
+                    ids.len()
+                ),
             ));
         }
         let mut dict_values = HashMap::with_capacity(ids.len());
@@ -115,26 +130,35 @@ pub(crate) fn build_query_global_dict_map(
             if let Some(existing) = dict_values.insert(*id, value.clone())
                 && existing != *value
             {
-                return Err(format!(
-                    "query_global_dict column_id={} duplicate id {} maps to different strings",
-                    column_id, id
+                return Err(StarRocksFragmentDecodeError::inconsistent(
+                    dict_path.clone().field("ids"),
+                    format!(
+                        "query_global_dict column_id={} duplicate id {} maps to different strings",
+                        column_id, id
+                    ),
                 ));
             }
             if let Some(existing_id) = value_to_id.insert(value.clone(), *id)
                 && existing_id != *id
             {
-                return Err(format!(
-                    "query_global_dict column_id={} duplicate string maps to different ids: existing_id={}, new_id={}",
-                    column_id, existing_id, id
+                return Err(StarRocksFragmentDecodeError::inconsistent(
+                    dict_path.clone().field("strings"),
+                    format!(
+                        "query_global_dict column_id={} duplicate string maps to different ids: existing_id={}, new_id={}",
+                        column_id, existing_id, id
+                    ),
                 ));
             }
         }
         if let Some(existing) = out.insert(column_id, Arc::new(dict_values)) {
-            return Err(format!(
-                "query_global_dict column_id={} appears more than once in the same fragment (existing_size={}, new_size={})",
-                column_id,
-                existing.len(),
-                ids.len()
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                dict_path.field("column_id"),
+                format!(
+                    "query_global_dict column_id={} appears more than once in the same fragment (existing_size={}, new_size={})",
+                    column_id,
+                    existing.len(),
+                    ids.len()
+                ),
             ));
         }
     }
@@ -148,7 +172,10 @@ pub(crate) fn build_query_global_dict_map(
             if out.contains_key(target_slot) {
                 continue;
             }
-            if let Some(derived_dict) = derive_query_global_dict_expr(expr, &out)? {
+            let expr_path = query_global_dict_exprs_path
+                .clone()
+                .map_key(target_slot.to_string());
+            if let Some(derived_dict) = derive_query_global_dict_expr(expr, &out, expr_path)? {
                 out.insert(*target_slot, Arc::new(derived_dict));
                 continue;
             }
@@ -490,8 +517,11 @@ fn array_value_to_bytes(array: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>,
 fn derive_query_global_dict_expr(
     dict_expr: &exprs::TExpr,
     dict_map: &QueryGlobalDictMap,
-) -> Result<Option<HashMap<i32, Vec<u8>>>, String> {
-    let Some((source_slot, mapped_expr)) = extract_dict_expr_source_and_mapped(dict_expr)? else {
+    expr_path: FieldPath,
+) -> Result<Option<HashMap<i32, Vec<u8>>>, StarRocksFragmentDecodeError> {
+    let Some((source_slot, mapped_expr)) = extract_dict_expr_source_and_mapped(dict_expr)
+        .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail))?
+    else {
         return Ok(None);
     };
     let Some(source_dict) = dict_map.get(&source_slot) else {
@@ -513,9 +543,13 @@ fn derive_query_global_dict_expr(
         return Ok(Some(HashMap::new()));
     }
 
-    let slot_inputs = collect_expr_slot_inputs(&mapped_expr)?;
+    let slot_inputs = collect_expr_slot_inputs(&mapped_expr)
+        .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail))?;
     if slot_inputs.is_empty() {
-        return Err("derived dict expression has no slot inputs".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            expr_path.clone(),
+            "derived dict expression has no slot inputs",
+        ));
     }
     if slot_inputs
         .iter()
@@ -529,26 +563,36 @@ fn derive_query_global_dict_expr(
     for (slot_id, data_type) in &slot_inputs {
         let field = Field::new(format!("slot_{}", slot_id), data_type.clone(), true);
         fields.push(field);
-        columns.push(build_slot_array_for_dict_entries(data_type, &dict_entries)?);
+        columns.push(
+            build_slot_array_for_dict_entries(data_type, &dict_entries).map_err(|detail| {
+                StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail)
+            })?,
+        );
     }
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| format!("failed to build dict expr input batch: {}", e))?;
+        .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail))?;
     let slot_ids = slot_inputs
         .iter()
         .map(|(slot_id, _)| {
-            let slot_id_u32 = u32::try_from(*slot_id)
-                .map_err(|_| format!("slot id {} overflows u32", slot_id))?;
+            let slot_id_u32 = u32::try_from(*slot_id).map_err(|_| {
+                StarRocksFragmentDecodeError::out_of_range(
+                    expr_path.clone(),
+                    format!("slot id {} overflows u32", slot_id),
+                )
+            })?;
             Ok(SlotId::new(slot_id_u32))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, StarRocksFragmentDecodeError>>()?;
     let chunk = Chunk::new_with_chunk_schema(
         batch,
-        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)?,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids).map_err(
+            |detail| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail),
+        )?,
     );
 
     let mut arena = ExprArena::default();
-    let mapped_expr_id = lower_t_expr(
+    let mapped_expr_id = lower_t_expr_at(
         &mapped_expr,
         &mut arena,
         &Layout {
@@ -557,12 +601,17 @@ fn derive_query_global_dict_expr(
         },
         None,
         None,
+        expr_path.clone(),
     )?;
-    let mapped_array = arena.eval(mapped_expr_id, &chunk)?;
+    let mapped_array = arena
+        .eval(mapped_expr_id, &chunk)
+        .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail))?;
 
     let mut derived = HashMap::with_capacity(dict_entries.len());
     for (row, (code, original)) in dict_entries.iter().enumerate() {
-        let mapped_value = array_value_to_bytes(&mapped_array, row)?;
+        let mapped_value = array_value_to_bytes(&mapped_array, row).map_err(|detail| {
+            StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), detail)
+        })?;
         if let Some(value) = mapped_value {
             derived.insert(*code, value);
             continue;
@@ -627,6 +676,26 @@ fn validate_dict_decode_input_type(
 }
 
 pub(crate) fn lower_decode_node(
+    child: Lowered,
+    node: &plan_nodes::TPlanNode,
+    out_layout: Layout,
+    arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    query_global_dict_map: &QueryGlobalDictMap,
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    lower_decode_node_inner(
+        child,
+        node,
+        out_layout,
+        arena,
+        desc_tbl,
+        query_global_dict_map,
+    )
+    .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(node_path, detail))
+}
+
+fn lower_decode_node_inner(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
     out_layout: Layout,

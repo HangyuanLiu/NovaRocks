@@ -23,7 +23,9 @@ use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::common::ids::SlotId;
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
@@ -40,16 +42,21 @@ pub(crate) fn lower_sort_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("sort_node");
     if children.len() != 1 {
-        return Err(format!(
-            "SORT_NODE expected 1 child, got {}",
-            children.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            node_path,
+            format!("SORT_NODE expected 1 child, got {}", children.len()),
         ));
     }
     let child = children.into_iter().next().expect("child");
     let Some(sort) = node.sort_node.as_ref() else {
-        return Err("SORT_NODE missing sort_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "SORT_NODE missing sort_node payload",
+        ));
     };
     let info = &sort.sort_info;
 
@@ -68,6 +75,7 @@ pub(crate) fn lower_sort_node(
         sort,
         last_query_id,
         fe_addr,
+        payload_path.clone(),
     )?;
 
     let order_by = build_sort_order_by(
@@ -77,6 +85,7 @@ pub(crate) fn lower_sort_node(
         &format!("SORT_NODE node_id={}", node.node_id),
         last_query_id,
         fe_addr,
+        payload_path.clone().field("sort_info"),
     )?;
 
     let limit = if node.limit >= 0 {
@@ -87,26 +96,46 @@ pub(crate) fn lower_sort_node(
 
     let offset = match sort.offset.unwrap_or(0) {
         v if v < 0 => {
-            return Err(format!("SORT_NODE offset must be >= 0, got {v}"));
+            return Err(StarRocksFragmentDecodeError::out_of_range(
+                payload_path.clone().field("offset"),
+                format!("SORT_NODE offset must be >= 0, got {v}"),
+            ));
         }
         v => v as usize,
     };
 
     let use_top_n = sort.use_top_n;
-    let topn_type = parse_sort_topn_type(sort, node.node_id)?;
+    let topn_type = parse_sort_topn_type(sort, node.node_id).map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_enum(payload_path.clone().field("topn_type"), error)
+    })?;
     // StarRocks enforces `offset == 0` for rank-based topn semantics.
     // Keep the same invariant so execution does not need fallback behavior.
     if use_top_n && topn_type != SortTopNType::RowNumber && offset != 0 {
-        return Err(format!(
-            "SORT_NODE node_id={} topn_type {:?} requires offset=0, got {}",
-            node.node_id, topn_type, offset
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("offset"),
+            format!(
+                "SORT_NODE node_id={} topn_type {:?} requires offset=0, got {}",
+                node.node_id, topn_type, offset
+            ),
         ));
     }
 
     let max_buffered_rows =
-        parse_optional_positive_i64(sort.max_buffered_rows, node.node_id, "max_buffered_rows")?;
+        parse_optional_positive_i64(sort.max_buffered_rows, node.node_id, "max_buffered_rows")
+            .map_err(|error| {
+                StarRocksFragmentDecodeError::out_of_range(
+                    payload_path.clone().field("max_buffered_rows"),
+                    error,
+                )
+            })?;
     let max_buffered_bytes =
-        parse_optional_positive_i64(sort.max_buffered_bytes, node.node_id, "max_buffered_bytes")?;
+        parse_optional_positive_i64(sort.max_buffered_bytes, node.node_id, "max_buffered_bytes")
+            .map_err(|error| {
+                StarRocksFragmentDecodeError::out_of_range(
+                    payload_path.clone().field("max_buffered_bytes"),
+                    error,
+                )
+            })?;
 
     // Per-partition TopN (StarRocks PartitionSort). partition_exprs are grouping
     // keys; partition_limit caps rows per group. Compiled like ordering exprs but
@@ -115,8 +144,18 @@ pub(crate) fn lower_sort_node(
         None => Vec::new(),
         Some(exprs) => {
             let mut out = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                let expr_id = lower_t_expr(e, arena, &sort_input_layout, last_query_id, fe_addr)?;
+            for (expr_index, e) in exprs.iter().enumerate() {
+                let expr_id = lower_t_expr_at(
+                    e,
+                    arena,
+                    &sort_input_layout,
+                    last_query_id,
+                    fe_addr,
+                    payload_path
+                        .clone()
+                        .field("partition_exprs")
+                        .index(expr_index),
+                )?;
                 out.push(SortExpression {
                     expr: expr_id,
                     asc: true,
@@ -140,9 +179,12 @@ pub(crate) fn lower_sort_node(
         Some(v) => Some(v as usize),
     };
     if partition_limit.is_some() && !use_top_n {
-        return Err(format!(
-            "SORT_NODE node_id={} partition_limit requires use_top_n=true",
-            node.node_id
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("partition_limit"),
+            format!(
+                "SORT_NODE node_id={} partition_limit requires use_top_n=true",
+                node.node_id
+            ),
         ));
     }
     // Partition-TopN is intentionally decoupled from the global limit: the per-partition
@@ -150,9 +192,12 @@ pub(crate) fn lower_sort_node(
     // when there is no global limit. Only reject the combination when BOTH partition_limit
     // and global limit are absent — that would be an unconstrained TopN with no limit at all.
     if use_top_n && limit.is_none() && partition_limit.is_none() {
-        return Err(format!(
-            "SORT_NODE node_id={} use_top_n=true requires node.limit >= 0",
-            node.node_id
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("use_top_n"),
+            format!(
+                "SORT_NODE node_id={} use_top_n=true requires node.limit >= 0",
+                node.node_id
+            ),
         ));
     }
 
@@ -220,26 +265,40 @@ fn build_sort_order_by(
     node_label: &str,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Vec<SortExpression>, String> {
+    sort_info_path: FieldPath,
+) -> Result<Vec<SortExpression>, StarRocksFragmentDecodeError> {
     let key_count = info.ordering_exprs.len();
     if info.is_asc_order.len() != key_count {
-        return Err(format!(
-            "{node_label} sort_info.is_asc_order length mismatch: ordering_exprs={} is_asc_order={}",
-            key_count,
-            info.is_asc_order.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            sort_info_path.clone().field("is_asc_order"),
+            format!(
+                "{node_label} sort_info.is_asc_order length mismatch: ordering_exprs={} is_asc_order={}",
+                key_count,
+                info.is_asc_order.len()
+            ),
         ));
     }
     if info.nulls_first.len() != key_count {
-        return Err(format!(
-            "{node_label} sort_info.nulls_first length mismatch: ordering_exprs={} nulls_first={}",
-            key_count,
-            info.nulls_first.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            sort_info_path.clone().field("nulls_first"),
+            format!(
+                "{node_label} sort_info.nulls_first length mismatch: ordering_exprs={} nulls_first={}",
+                key_count,
+                info.nulls_first.len()
+            ),
         ));
     }
 
     let mut order_by = Vec::with_capacity(key_count);
     for (i, expr) in info.ordering_exprs.iter().enumerate() {
-        let expr_id = lower_t_expr(expr, arena, input_layout, last_query_id, fe_addr)?;
+        let expr_id = lower_t_expr_at(
+            expr,
+            arena,
+            input_layout,
+            last_query_id,
+            fe_addr,
+            sort_info_path.clone().field("ordering_exprs").index(i),
+        )?;
         order_by.push(SortExpression {
             expr: expr_id,
             asc: info.is_asc_order[i],
@@ -258,8 +317,10 @@ fn normalize_sort_input(
     sort: &plan_nodes::TSortNode,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<(ExecNode, Layout, Layout), String> {
-    let effective_out_layout = normalize_sort_output_layout(&child.layout, out_layout)?;
+    sort_path: FieldPath,
+) -> Result<(ExecNode, Layout, Layout), StarRocksFragmentDecodeError> {
+    let effective_out_layout = normalize_sort_output_layout(&child.layout, out_layout)
+        .map_err(|error| StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error))?;
     let original_child_layout = child.layout.clone();
     let mut child = child;
 
@@ -273,6 +334,7 @@ fn normalize_sort_input(
             desc_tbl,
             last_query_id,
             fe_addr,
+            sort_path.clone(),
         )?;
     }
 
@@ -285,9 +347,12 @@ fn normalize_sort_input(
     let mut child_slot_set = std::collections::HashSet::<types::TSlotId>::new();
     for (_t, slot_id) in &child.layout.order {
         if !child_slot_set.insert(*slot_id) {
-            return Err(format!(
-                "SORT_NODE child layout has duplicate slot_id={}, cannot build a stable mapping",
-                slot_id
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                sort_path.clone(),
+                format!(
+                    "SORT_NODE child layout has duplicate slot_id={}, cannot build a stable mapping",
+                    slot_id
+                ),
             ));
         }
     }
@@ -296,12 +361,17 @@ fn normalize_sort_input(
     let mut exprs = Vec::with_capacity(effective_out_layout.order.len());
     for (tuple_id, slot_id) in &effective_out_layout.order {
         if !child_slot_set.contains(slot_id) {
-            return Err(format!(
-                "SORT_NODE output layout refers to missing child slot: tuple_id={} slot_id={}",
-                tuple_id, slot_id
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                sort_path.clone(),
+                format!(
+                    "SORT_NODE output layout refers to missing child slot: tuple_id={} slot_id={}",
+                    tuple_id, slot_id
+                ),
             ));
         }
-        let slot_id = SlotId::try_from(*slot_id)?;
+        let slot_id = SlotId::try_from(*slot_id).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error)
+        })?;
         exprs.push(arena.push(ExprNode::SlotId(slot_id)));
     }
 
@@ -315,15 +385,24 @@ fn normalize_sort_input(
                 .order
                 .iter()
                 .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error)
+                })?,
             expr_slot_schemas: None,
             output_indices: None,
             output_chunk_schema: chunk_schema_for_layout(
                 desc_tbl.ok_or_else(|| {
-                    "SORT_NODE requires desc_tbl for projection chunk schema".to_string()
+                    StarRocksFragmentDecodeError::missing(
+                        sort_path.clone(),
+                        "SORT_NODE requires desc_tbl for projection chunk schema",
+                    )
                 })?,
                 &effective_out_layout,
-            )?,
+            )
+            .map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error)
+            })?,
         }),
     };
 
@@ -345,95 +424,133 @@ fn build_sort_tuple_projection(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    sort_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
     let sort_tuple_exprs = sort.sort_info.sort_tuple_slot_exprs.as_ref().ok_or_else(|| {
-        format!(
-            "SORT_NODE node_id={} output column count mismatch: child={} sort={} and sort_tuple_slot_exprs is missing",
-            node_id,
-            child.layout.order.len(),
-            out_layout.order.len()
+        StarRocksFragmentDecodeError::missing(
+            sort_path.clone().field("sort_info").field("sort_tuple_slot_exprs"),
+            format!(
+                "SORT_NODE node_id={} output column count mismatch: child={} sort={} and sort_tuple_slot_exprs is missing",
+                node_id,
+                child.layout.order.len(),
+                out_layout.order.len()
+            ),
         )
     })?;
 
     if sort_tuple_exprs.len() > out_layout.order.len() {
-        return Err(format!(
-            "SORT_NODE node_id={} sort_tuple_slot_exprs longer than output layout: exprs={} out_layout={}",
-            node_id,
-            sort_tuple_exprs.len(),
-            out_layout.order.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            sort_path
+                .clone()
+                .field("sort_info")
+                .field("sort_tuple_slot_exprs"),
+            format!(
+                "SORT_NODE node_id={} sort_tuple_slot_exprs longer than output layout: exprs={} out_layout={}",
+                node_id,
+                sort_tuple_exprs.len(),
+                out_layout.order.len()
+            ),
         ));
     }
 
     let mut exprs = Vec::with_capacity(out_layout.order.len());
-    for expr in sort_tuple_exprs {
-        exprs.push(lower_t_expr(
+    for (expr_index, expr) in sort_tuple_exprs.iter().enumerate() {
+        exprs.push(lower_t_expr_at(
             expr,
             arena,
             &child.layout,
             last_query_id,
             fe_addr,
+            sort_path
+                .clone()
+                .field("sort_info")
+                .field("sort_tuple_slot_exprs")
+                .index(expr_index),
         )?);
     }
 
     if exprs.len() < out_layout.order.len() {
         let pre_agg_exprs = sort.pre_agg_exprs.as_ref().ok_or_else(|| {
-            format!(
-                "SORT_NODE node_id={} has {} output slots but only {} sort_tuple_slot_exprs and missing pre_agg_exprs",
-                node_id,
-                out_layout.order.len(),
-                exprs.len()
+            StarRocksFragmentDecodeError::missing(
+                sort_path.clone().field("pre_agg_exprs"),
+                format!(
+                    "SORT_NODE node_id={} has {} output slots but only {} sort_tuple_slot_exprs and missing pre_agg_exprs",
+                    node_id,
+                    out_layout.order.len(),
+                    exprs.len()
+                ),
             )
         })?;
         let pre_agg_slots = sort.pre_agg_output_slot_id.as_ref().ok_or_else(|| {
-            format!(
-                "SORT_NODE node_id={} has {} output slots but only {} sort_tuple_slot_exprs and missing pre_agg_output_slot_id",
-                node_id,
-                out_layout.order.len(),
-                exprs.len()
+            StarRocksFragmentDecodeError::missing(
+                sort_path.clone().field("pre_agg_output_slot_id"),
+                format!(
+                    "SORT_NODE node_id={} has {} output slots but only {} sort_tuple_slot_exprs and missing pre_agg_output_slot_id",
+                    node_id,
+                    out_layout.order.len(),
+                    exprs.len()
+                ),
             )
         })?;
         if pre_agg_exprs.len() != pre_agg_slots.len() {
-            return Err(format!(
-                "SORT_NODE node_id={} pre_agg length mismatch: pre_agg_exprs={} pre_agg_output_slot_id={}",
-                node_id,
-                pre_agg_exprs.len(),
-                pre_agg_slots.len()
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                sort_path.clone().field("pre_agg_exprs"),
+                format!(
+                    "SORT_NODE node_id={} pre_agg length mismatch: pre_agg_exprs={} pre_agg_output_slot_id={}",
+                    node_id,
+                    pre_agg_exprs.len(),
+                    pre_agg_slots.len()
+                ),
             ));
         }
 
         let mut passthrough_by_slot = std::collections::HashMap::<types::TSlotId, _>::new();
-        for (slot_id, agg_expr) in pre_agg_slots.iter().zip(pre_agg_exprs.iter()) {
+        for (expr_index, (slot_id, agg_expr)) in
+            pre_agg_slots.iter().zip(pre_agg_exprs.iter()).enumerate()
+        {
             let passthrough = lower_pre_agg_fallback_expr(
                 agg_expr,
                 arena,
                 &child.layout,
                 last_query_id,
                 fe_addr,
-                node_id,
+                sort_path.clone().field("pre_agg_exprs").index(expr_index),
             )?;
             if passthrough_by_slot.insert(*slot_id, passthrough).is_some() {
-                return Err(format!(
-                    "SORT_NODE node_id={} duplicate pre_agg_output_slot_id={}",
-                    node_id, slot_id
+                return Err(StarRocksFragmentDecodeError::inconsistent(
+                    sort_path
+                        .clone()
+                        .field("pre_agg_output_slot_id")
+                        .index(expr_index),
+                    format!(
+                        "SORT_NODE node_id={} duplicate pre_agg_output_slot_id={}",
+                        node_id, slot_id
+                    ),
                 ));
             }
         }
 
         for (_tuple_id, slot_id) in out_layout.order.iter().skip(exprs.len()) {
             let passthrough = passthrough_by_slot.remove(slot_id).ok_or_else(|| {
-                format!(
-                    "SORT_NODE node_id={} cannot materialize output slot_id={} from pre_agg metadata",
-                    node_id, slot_id
+                StarRocksFragmentDecodeError::invalid_value(
+                    sort_path.clone().field("pre_agg_output_slot_id"),
+                    format!(
+                        "SORT_NODE node_id={} cannot materialize output slot_id={} from pre_agg metadata",
+                        node_id, slot_id
+                    ),
                 )
             })?;
             exprs.push(passthrough);
         }
 
         if !passthrough_by_slot.is_empty() {
-            return Err(format!(
-                "SORT_NODE node_id={} has unused pre_agg_output_slot_id values: {:?}",
-                node_id,
-                passthrough_by_slot.keys().collect::<Vec<_>>()
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                sort_path.clone().field("pre_agg_output_slot_id"),
+                format!(
+                    "SORT_NODE node_id={} has unused pre_agg_output_slot_id values: {:?}",
+                    node_id,
+                    passthrough_by_slot.keys().collect::<Vec<_>>()
+                ),
             ));
         }
     }
@@ -442,7 +559,8 @@ fn build_sort_tuple_projection(
         .order
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error))?;
 
     let projected = ExecNode {
         kind: ExecNodeKind::Project(ProjectNode {
@@ -455,10 +573,16 @@ fn build_sort_tuple_projection(
             output_indices: None,
             output_chunk_schema: chunk_schema_for_layout(
                 desc_tbl.ok_or_else(|| {
-                    "SORT_NODE requires desc_tbl for tuple projection chunk schema".to_string()
+                    StarRocksFragmentDecodeError::missing(
+                        sort_path.clone(),
+                        "SORT_NODE requires desc_tbl for tuple projection chunk schema",
+                    )
                 })?,
                 out_layout,
-            )?,
+            )
+            .map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(sort_path.clone(), error)
+            })?,
         }),
     };
 
@@ -474,12 +598,12 @@ fn lower_pre_agg_fallback_expr(
     input_layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-    node_id: i32,
-) -> Result<crate::exec::expr::ExprId, String> {
+    expr_path: FieldPath,
+) -> Result<crate::exec::expr::ExprId, StarRocksFragmentDecodeError> {
     let Some(root) = agg_expr.nodes.first() else {
-        return Err(format!(
-            "SORT_NODE node_id={} pre_agg_expr has empty nodes",
-            node_id
+        return Err(StarRocksFragmentDecodeError::missing(
+            expr_path.clone().field("nodes").index(0),
+            "SORT_NODE pre_agg_expr has empty nodes",
         ));
     };
     if root.num_children <= 0 {
@@ -491,18 +615,30 @@ fn lower_pre_agg_fallback_expr(
         if fn_name == "count" {
             return Ok(arena.push(ExprNode::Literal(crate::exec::expr::LiteralValue::Int8(1))));
         }
-        return Err(format!(
-            "SORT_NODE node_id={} pre_agg_expr root has no children",
-            node_id
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            expr_path
+                .clone()
+                .field("nodes")
+                .index(0)
+                .field("num_children"),
+            "SORT_NODE pre_agg_expr root has no children",
         ));
     }
 
     let first_child_start = 1usize;
-    let first_child_end = subtree_end(&agg_expr.nodes, first_child_start)?;
+    let first_child_end = subtree_end(&agg_expr.nodes, first_child_start)
+        .map_err(|error| StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), error))?;
     let child_expr = exprs::TExpr {
         nodes: agg_expr.nodes[first_child_start..first_child_end].to_vec(),
     };
-    let child_id = lower_t_expr(&child_expr, arena, input_layout, last_query_id, fe_addr)?;
+    let child_id = lower_t_expr_at(
+        &child_expr,
+        arena,
+        input_layout,
+        last_query_id,
+        fe_addr,
+        expr_path.clone(),
+    )?;
 
     // Cast the passthrough to the aggregate's declared output type if they differ.
     // For example, sum(INT) has BIGINT output type but the raw passthrough is INT.
@@ -515,9 +651,12 @@ fn lower_pre_agg_fallback_expr(
                 agg_output_type,
                 DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8
             ) {
-                return Err(format!(
-                    "SORT_NODE node_id={node_id} pre-agg passthrough declares opaque aggregate state {:?} but child expression is {:?}; source descriptor must be raw/return-typed or runtime must serialize",
-                    agg_output_type, child_type
+                return Err(StarRocksFragmentDecodeError::unsupported(
+                    expr_path.clone().field("nodes").index(0).field("type"),
+                    format!(
+                        "SORT_NODE pre-agg passthrough declares opaque aggregate state {:?} but child expression is {:?}; source descriptor must be raw/return-typed or runtime must serialize",
+                        agg_output_type, child_type
+                    ),
                 ));
             }
             if !matches!(agg_output_type, DataType::Null) {

@@ -20,6 +20,7 @@ pub(crate) mod descriptor;
 mod endpoint;
 mod error;
 pub(crate) mod expr;
+mod instance;
 pub(crate) mod layout;
 pub(crate) mod node;
 mod options;
@@ -27,16 +28,31 @@ mod runtime_filter;
 pub(crate) mod runtime_filter_pushdown;
 pub(crate) mod schema;
 pub(crate) mod sink;
+mod submission;
 pub(crate) mod type_lowering;
 
 pub(crate) use dependency::{
-    LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageFacts, LakeMetaStorageRequest,
-    LakeMetaTabletRequest, StarRocksExternalDependency, StarRocksExternalDependencyDraft,
+    DraftDependencyValue, FragmentExprArenaOwner, LakeMetaColumnKind, LakeMetaColumnRequest,
+    LakeMetaStorageFacts, LakeMetaStorageRequest, LakeMetaTabletRequest,
+    StarRocksExternalDependency, StarRocksExternalDependencyDraft, StarRocksResolvedDependencies,
+    StarRocksResolvedDependencyValue,
 };
 pub(crate) use endpoint::{decode_fragment_destination, decode_runtime_endpoint};
-pub(crate) use error::StarRocksFragmentDecodeError;
+pub(crate) use error::{
+    StarRocksDependencyContractError, StarRocksDependencyContractErrorKind,
+    StarRocksFragmentDecodeError,
+};
+pub(crate) use instance::{
+    LakeMetaScanRangeFact, LakeScanProgramFacts, StarRocksDecodeFacts, StarRocksJdbcFacts,
+    StarRocksObjectStoreDefaults, StarRocksPathRewriteFacts, decode_lake_meta_scan_range_facts,
+    decode_lake_scan_program_facts, decode_scan_contracts_and_assignments,
+};
 pub(crate) use options::decode_query_options;
 pub(crate) use runtime_filter::decode_runtime_filter_params;
+pub(crate) use submission::{
+    DecodedStarRocksFragment, StarRocksDecodeInput, StarRocksFragmentDraft,
+    StarRocksSubmissionMetadata, finish_fragment_submission, prepare_fragment_submission,
+};
 
 pub(crate) fn decode_expression_for_layout(
     expr: &crate::thrift::exprs::TExpr,

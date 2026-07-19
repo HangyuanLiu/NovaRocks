@@ -24,11 +24,13 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::warn;
 
 use crate::common::config::exchange_wait_ms;
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
 use crate::runtime::exchange;
-use crate::thrift::{descriptors, plan_nodes, types};
+use crate::thrift::{descriptors, plan_nodes};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -44,14 +46,22 @@ pub(crate) fn lower_exchange_node(
     out_layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("exchange_node");
     if children.is_empty() {
         let fragment_instance_id = fragment_instance_id.ok_or_else(|| {
-            "EXCHANGE_NODE missing fragment instance id for exchange receiver".to_string()
+            StarRocksFragmentDecodeError::missing(
+                node_path.clone(),
+                "EXCHANGE_NODE missing fragment instance id for exchange receiver",
+            )
         })?;
 
         let expected =
-            resolve_exchange_sender_count(node.node_id, per_exchange_count, batch_sender_counts)?;
+            resolve_exchange_sender_count(node.node_id, per_exchange_count, batch_sender_counts)
+                .map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+                })?;
         if per_exchange_count.is_none() {
             warn!(
                 target: "novarocks::exec",
@@ -68,7 +78,10 @@ pub(crate) fn lower_exchange_node(
         };
         let exchange_timeout_ms = exchange_wait_ms();
 
-        let expected_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
+        let expected_chunk_schema =
+            chunk_schema_for_layout(desc_tbl, out_layout).map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(node_path.clone(), error)
+            })?;
         let mut out = ExecNode {
             kind: ExecNodeKind::ExchangeSource(
                 ExchangeSourceNode::new(
@@ -87,7 +100,10 @@ pub(crate) fn lower_exchange_node(
         if let Some(exch) = node.exchange_node.as_ref() {
             let offset = match exch.offset.unwrap_or(0) {
                 v if v < 0 => {
-                    return Err(format!("EXCHANGE_NODE offset must be >= 0, got {v}"));
+                    return Err(StarRocksFragmentDecodeError::out_of_range(
+                        payload_path.clone().field("offset"),
+                        format!("EXCHANGE_NODE offset must be >= 0, got {v}"),
+                    ));
                 }
                 v => v as usize,
             };
@@ -99,6 +115,7 @@ pub(crate) fn lower_exchange_node(
                     &format!("EXCHANGE_NODE node_id={}", node.node_id),
                     last_query_id,
                     fe_addr,
+                    payload_path.clone().field("sort_info"),
                 )?;
 
                 let limit = if node.limit >= 0 {
@@ -142,9 +159,12 @@ pub(crate) fn lower_exchange_node(
         // Sender Exchange (if it appears in plan tree? usually it's a sink)
         // Or maybe a pass-through?
         if children.len() != 1 {
-            return Err(format!(
-                "EXCHANGE_NODE expected 0 or 1 child, got {}",
-                children.len()
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                node_path,
+                format!(
+                    "EXCHANGE_NODE expected 0 or 1 child, got {}",
+                    children.len()
+                ),
             ));
         }
         Ok(children.into_iter().next().expect("child"))
@@ -180,26 +200,40 @@ fn build_sort_order_by(
     node_label: &str,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Vec<SortExpression>, String> {
+    sort_info_path: FieldPath,
+) -> Result<Vec<SortExpression>, StarRocksFragmentDecodeError> {
     let key_count = info.ordering_exprs.len();
     if info.is_asc_order.len() != key_count {
-        return Err(format!(
-            "{node_label} sort_info.is_asc_order length mismatch: ordering_exprs={} is_asc_order={}",
-            key_count,
-            info.is_asc_order.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            sort_info_path.clone().field("is_asc_order"),
+            format!(
+                "{node_label} sort_info.is_asc_order length mismatch: ordering_exprs={} is_asc_order={}",
+                key_count,
+                info.is_asc_order.len()
+            ),
         ));
     }
     if info.nulls_first.len() != key_count {
-        return Err(format!(
-            "{node_label} sort_info.nulls_first length mismatch: ordering_exprs={} nulls_first={}",
-            key_count,
-            info.nulls_first.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            sort_info_path.clone().field("nulls_first"),
+            format!(
+                "{node_label} sort_info.nulls_first length mismatch: ordering_exprs={} nulls_first={}",
+                key_count,
+                info.nulls_first.len()
+            ),
         ));
     }
 
     let mut order_by = Vec::with_capacity(key_count);
     for (i, expr) in info.ordering_exprs.iter().enumerate() {
-        let expr_id = lower_t_expr(expr, arena, input_layout, last_query_id, fe_addr)?;
+        let expr_id = lower_t_expr_at(
+            expr,
+            arena,
+            input_layout,
+            last_query_id,
+            fe_addr,
+            sort_info_path.clone().field("ordering_exprs").index(i),
+        )?;
         order_by.push(SortExpression {
             expr: expr_id,
             asc: info.is_asc_order[i],

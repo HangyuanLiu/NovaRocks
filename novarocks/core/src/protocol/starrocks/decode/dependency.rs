@@ -21,8 +21,56 @@ use std::collections::BTreeMap;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
+#[cfg(feature = "compat")]
+use super::node::LakeMetaValuesPatch;
+use crate::exec::expr::ExprId;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_context::QueryId;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FragmentExprArenaOwner {
+    Plan,
+    DataStream,
+    MultiCastDataStream,
+    SplitDataStream,
+    IcebergTable,
+    IcebergChangeStreamRouter,
+    StarRocksOutputProjection,
+    StarRocksPartition,
+    StarRocksIndexPredicate { index: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnedExprId {
+    owner: FragmentExprArenaOwner,
+    expr_id: ExprId,
+}
+
+impl OwnedExprId {
+    pub(crate) const fn owner(self) -> FragmentExprArenaOwner {
+        self.owner
+    }
+
+    pub(crate) const fn expr_id(self) -> ExprId {
+        self.expr_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QueryProfilePatch {
+    dependency_id: u64,
+    target: OwnedExprId,
+}
+
+impl QueryProfilePatch {
+    pub(crate) const fn dependency_id(self) -> u64 {
+        self.dependency_id
+    }
+
+    pub(crate) const fn target(self) -> OwnedExprId {
+        self.target
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StarRocksExternalDependency {
@@ -125,11 +173,55 @@ pub(crate) struct LakeMetaStorageFacts {
     pub(crate) column_arrays: BTreeMap<String, Vec<ArrayRef>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum StarRocksResolvedDependencyValue {
+    QueryProfile(String),
+    LakeMetaStorage(LakeMetaStorageFacts),
+}
+
+impl StarRocksResolvedDependencyValue {
+    pub(crate) const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::QueryProfile(_) => "query_profile",
+            Self::LakeMetaStorage(_) => "lake_meta_storage",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StarRocksResolvedDependencies(BTreeMap<u64, StarRocksResolvedDependencyValue>);
+
+impl StarRocksResolvedDependencies {
+    pub(crate) fn new(values: BTreeMap<u64, StarRocksResolvedDependencyValue>) -> Self {
+        Self(values)
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        id: u64,
+        value: StarRocksResolvedDependencyValue,
+    ) -> Option<StarRocksResolvedDependencyValue> {
+        self.0.insert(id, value)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &StarRocksResolvedDependencyValue)> {
+        self.0.iter()
+    }
+
+    pub(crate) fn get(&self, id: u64) -> Option<&StarRocksResolvedDependencyValue> {
+        self.0.get(&id)
+    }
+}
+
 pub(crate) struct StarRocksExternalDependencyDraft {
     frontend_endpoint: Option<RuntimeEndpoint>,
     resolved_query_profiles: BTreeMap<String, String>,
     resolved_lake_meta_storage: BTreeMap<u64, LakeMetaStorageFacts>,
     requirements: RefCell<BTreeMap<u64, StarRocksExternalDependency>>,
+    query_profile_owner: RefCell<FragmentExprArenaOwner>,
+    query_profile_patches: RefCell<Vec<QueryProfilePatch>>,
+    #[cfg(feature = "compat")]
+    lake_meta_values_patches: RefCell<Vec<LakeMetaValuesPatch>>,
 }
 
 impl StarRocksExternalDependencyDraft {
@@ -142,6 +234,10 @@ impl StarRocksExternalDependencyDraft {
             resolved_query_profiles,
             resolved_lake_meta_storage: BTreeMap::new(),
             requirements: RefCell::new(BTreeMap::new()),
+            query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
+            query_profile_patches: RefCell::new(Vec::new()),
+            #[cfg(feature = "compat")]
+            lake_meta_values_patches: RefCell::new(Vec::new()),
         }
     }
 
@@ -155,6 +251,10 @@ impl StarRocksExternalDependencyDraft {
             resolved_query_profiles,
             resolved_lake_meta_storage,
             requirements: RefCell::new(BTreeMap::new()),
+            query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
+            query_profile_patches: RefCell::new(Vec::new()),
+            #[cfg(feature = "compat")]
+            lake_meta_values_patches: RefCell::new(Vec::new()),
         }
     }
 
@@ -182,6 +282,47 @@ impl StarRocksExternalDependencyDraft {
         // placeholder keeps discovery type-correct; the fragment decoder must
         // never publish or execute a draft that recorded this requirement.
         Ok(String::new())
+    }
+
+    pub(crate) fn query_profile_value(
+        &self,
+        query_id: &str,
+    ) -> Result<DraftDependencyValue<String>, String> {
+        if let Some(profile) = self.resolved_query_profiles.get(query_id) {
+            return Ok(DraftDependencyValue::Resolved(profile.clone()));
+        }
+        let id = stable_dependency_id("query-profile", query_id);
+        let requirement = StarRocksExternalDependency::QueryProfile {
+            id,
+            query_id: query_id.to_string(),
+        };
+        self.insert_requirement(requirement)?;
+        Ok(DraftDependencyValue::Pending(id))
+    }
+
+    pub(crate) fn record_query_profile_slot(&self, dependency_id: u64, expr_id: ExprId) {
+        let owner = *self.query_profile_owner.borrow();
+        self.query_profile_patches
+            .borrow_mut()
+            .push(QueryProfilePatch {
+                dependency_id,
+                target: OwnedExprId { owner, expr_id },
+            });
+    }
+
+    pub(crate) fn query_profile_patches(&self) -> Vec<QueryProfilePatch> {
+        self.query_profile_patches.borrow().clone()
+    }
+
+    pub(crate) fn with_expr_arena_owner<T>(
+        &self,
+        owner: FragmentExprArenaOwner,
+        lower: impl FnOnce() -> T,
+    ) -> T {
+        let previous = self.query_profile_owner.replace(owner);
+        let result = lower();
+        self.query_profile_owner.replace(previous);
+        result
     }
 
     pub(crate) fn lake_meta_storage(
@@ -218,9 +359,51 @@ impl StarRocksExternalDependencyDraft {
         })
     }
 
+    #[cfg(feature = "compat")]
+    pub(crate) fn lake_meta_storage_value(
+        &self,
+        request: &LakeMetaStorageRequest,
+    ) -> Result<DraftDependencyValue<LakeMetaStorageFacts>, String> {
+        if let Some(facts) = self.resolved_lake_meta_storage.get(&request.id()) {
+            return Ok(DraftDependencyValue::Resolved(facts.clone()));
+        }
+        self.insert_requirement(StarRocksExternalDependency::LakeMetaStorage {
+            id: request.id(),
+            request: request.clone(),
+        })?;
+        Ok(DraftDependencyValue::Pending(request.id()))
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn record_lake_meta_values_patch(&self, patch: LakeMetaValuesPatch) {
+        self.lake_meta_values_patches.borrow_mut().push(patch);
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn lake_meta_values_patches(&self) -> Vec<LakeMetaValuesPatch> {
+        self.lake_meta_values_patches.borrow().clone()
+    }
+
     pub(crate) fn external_dependencies(&self) -> Vec<StarRocksExternalDependency> {
         self.requirements.borrow().values().cloned().collect()
     }
+
+    fn insert_requirement(&self, requirement: StarRocksExternalDependency) -> Result<(), String> {
+        let id = requirement.id();
+        let mut requirements = self.requirements.borrow_mut();
+        if let Some(existing) = requirements.get(&id)
+            && existing != &requirement
+        {
+            return Err(format!("external dependency id collision for id={id}"));
+        }
+        requirements.insert(id, requirement);
+        Ok(())
+    }
+}
+
+pub(crate) enum DraftDependencyValue<T> {
+    Resolved(T),
+    Pending(u64),
 }
 
 fn stable_dependency_id(kind: &str, key: &str) -> u64 {

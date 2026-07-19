@@ -21,6 +21,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::scan::ScanNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -29,6 +30,8 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, schema_for_layout,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::runtime::fragment::instance::ScanAssignments;
+use crate::runtime::scan_range::ScanRange;
 use crate::thrift::descriptors;
 use crate::thrift::plan_nodes;
 
@@ -42,7 +45,7 @@ pub(crate) fn lower_schema_scan_node(
     node: &plan_nodes::TPlanNode,
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
     external_dependencies: Option<
         &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
     >,
@@ -117,11 +120,20 @@ fn schema_table_requires_scan_ranges(table: &SchemaTable) -> bool {
     )
 }
 
+pub(crate) fn supported_schema_scan_requires_ranges(node: &plan_nodes::TPlanNode) -> Option<bool> {
+    let schema_scan = node.schema_scan_node.as_ref()?;
+    let table = SchemaTable::from_table_name(&schema_scan.table_name)?;
+    if matches!(table, SchemaTable::Be(BeSchemaTable::Unsupported(_))) {
+        return None;
+    }
+    Some(schema_table_requires_scan_ranges(&table))
+}
+
 fn lower_supported_schema_scan_node(
     node: &plan_nodes::TPlanNode,
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
     external_dependencies: Option<
         &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
     >,
@@ -140,11 +152,8 @@ fn lower_supported_schema_scan_node(
         chunk_schema_for_layout(desc_tbl, out_layout)?
     };
     let context = SchemaScanContext::from_thrift(schema_scan);
-    let should_scan = if require_scan_ranges {
-        schema_scan_selected_for_current_fragment(node.node_id, scan_assignments)?
-    } else {
-        schema_scan_selected_if_present(node.node_id, scan_assignments)?
-    };
+    let _ = require_scan_ranges;
+    let should_scan = schema_scan_selected(node.node_id, scan_assignments)?;
     let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
         table,
         context,
@@ -165,56 +174,30 @@ fn lower_supported_schema_scan_node(
     })
 }
 
-fn schema_scan_selected_for_current_fragment(
+fn schema_scan_selected(
     node_id: i32,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
 ) -> Result<bool, String> {
-    let scan_assignments = scan_assignments.ok_or_else(|| {
-        "SCHEMA_SCAN_NODE for be_* tables requires exec_params.per_node_scan_ranges".to_string()
-    })?;
-    let scan_ranges = scan_assignments
-        .get(&node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={node_id}"))?;
-    if scan_ranges
-        .iter()
-        .any(|scan_range| scan_range.has_more.unwrap_or(false))
-    {
+    let assignments = scan_assignments
+        .ok_or_else(|| "SCHEMA_SCAN_NODE requires typed scan assignments".to_string())?;
+    let assignment = assignments
+        .get(&FragmentNodeId::new(node_id))
+        .ok_or_else(|| format!("SCHEMA_SCAN_NODE node_id={node_id} missing typed assignment"))?;
+    if assignment.kind() != ScanAssignmentKind::SchemaSelection {
         return Err(format!(
-            "SCHEMA_SCAN_NODE node_id={} has incremental scan ranges which are not supported",
-            node_id
+            "SCHEMA_SCAN_NODE node_id={node_id} expected SchemaSelection assignment, got {:?}",
+            assignment.kind()
         ));
     }
-    if scan_ranges.is_empty() {
-        return Ok(true);
-    }
-    Ok(scan_ranges
-        .iter()
-        .any(|scan_range| !scan_range.empty.unwrap_or(false)))
-}
-
-fn schema_scan_selected_if_present(
-    node_id: i32,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
-) -> Result<bool, String> {
-    let Some(scan_assignments) = scan_assignments else {
-        return Ok(true);
-    };
-    let Some(scan_ranges) = scan_assignments.get(&node_id) else {
-        return Ok(true);
-    };
-    if scan_ranges
-        .iter()
-        .any(|scan_range| scan_range.has_more.unwrap_or(false))
-    {
+    let [range] = assignment.ranges() else {
         return Err(format!(
-            "SCHEMA_SCAN_NODE node_id={} has incremental scan ranges which are not supported",
-            node_id
+            "SCHEMA_SCAN_NODE node_id={node_id} requires exactly one selection range"
         ));
-    }
-    if scan_ranges.is_empty() {
-        return Ok(true);
-    }
-    Ok(scan_ranges
-        .iter()
-        .any(|scan_range| !scan_range.empty.unwrap_or(false)))
+    };
+    let ScanRange::SchemaSelection(selection) = &range.range else {
+        return Err(format!(
+            "SCHEMA_SCAN_NODE node_id={node_id} assignment payload is not SchemaSelection"
+        ));
+    };
+    Ok(selection.selected)
 }

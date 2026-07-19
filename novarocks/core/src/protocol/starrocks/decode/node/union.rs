@@ -29,7 +29,9 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::thrift::descriptors;
 
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids,
 };
@@ -45,9 +47,14 @@ pub(crate) fn lower_union_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("union_node");
     let Some(un) = node.union_node.as_ref() else {
-        return Err("UNION_NODE missing union_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path.clone(),
+            "UNION_NODE missing union_node payload",
+        ));
     };
     if out_layout.order.is_empty() {
         let tuple_id = un.tuple_id;
@@ -64,9 +71,19 @@ pub(crate) fn lower_union_node(
         .order
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("tuple_id"),
+                error,
+            )
+        })?;
     let output_chunk_schema = if let Some(desc_tbl) = desc_tbl {
-        Some(chunk_schema_for_layout(desc_tbl, &out_layout)?)
+        Some(
+            chunk_schema_for_layout(desc_tbl, &out_layout).map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+            })?,
+        )
     } else {
         None
     };
@@ -77,24 +94,55 @@ pub(crate) fn lower_union_node(
         let row_count = un.const_expr_lists.len();
         let col_count = un.const_expr_lists[0].len();
         let mut columns = vec![Vec::with_capacity(row_count); col_count];
-        let dummy_chunk = empty_chunk_with_rows(1)?;
-        for row_exprs in &un.const_expr_lists {
+        let dummy_chunk = empty_chunk_with_rows(1).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("const_expr_lists"),
+                error,
+            )
+        })?;
+        for (row_index, row_exprs) in un.const_expr_lists.iter().enumerate() {
+            let row_path = payload_path
+                .clone()
+                .field("const_expr_lists")
+                .index(row_index);
             if row_exprs.len() != col_count {
-                return Err("UNION_NODE const_expr_lists column size mismatch".to_string());
+                return Err(StarRocksFragmentDecodeError::inconsistent(
+                    row_path,
+                    "UNION_NODE const_expr_lists column size mismatch",
+                ));
             }
             for (col_idx, e) in row_exprs.iter().enumerate() {
-                let expr_id = lower_t_expr(e, arena, &out_layout, last_query_id, fe_addr)?;
-                let array = arena.eval(expr_id, &dummy_chunk)?;
-                let expr_type = arena
-                    .data_type(expr_id)
-                    .cloned()
-                    .ok_or_else(|| "UNION const expr missing inferred data type".to_string())?;
-                let normalized = normalize_const_array(&array, &expr_type)?;
+                let expr_path = row_path.clone().index(col_idx);
+                let expr_id = lower_t_expr_at(
+                    e,
+                    arena,
+                    &out_layout,
+                    last_query_id,
+                    fe_addr,
+                    expr_path.clone(),
+                )?;
+                let array = arena.eval(expr_id, &dummy_chunk).map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(expr_path.clone(), error)
+                })?;
+                let expr_type = arena.data_type(expr_id).cloned().ok_or_else(|| {
+                    StarRocksFragmentDecodeError::invalid_value(
+                        expr_path.clone(),
+                        "UNION const expr missing inferred data type",
+                    )
+                })?;
+                let normalized = normalize_const_array(&array, &expr_type).map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(expr_path, error)
+                })?;
                 columns[col_idx].push(normalized);
             }
         }
         let slot_ids = output_slots.clone();
-        let chunk = chunk_from_const_arrays(columns, row_count, &slot_ids)?;
+        let chunk = chunk_from_const_arrays(columns, row_count, &slot_ids).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("const_expr_lists"),
+                error,
+            )
+        })?;
         inputs.push(ExecNode {
             kind: ExecNodeKind::Values(ValuesNode {
                 chunk,
@@ -105,26 +153,39 @@ pub(crate) fn lower_union_node(
 
     if !children.is_empty() {
         if un.result_expr_lists.is_empty() {
-            return Err(
-                "UNION_NODE requires result_expr_lists for materialized children".to_string(),
-            );
-        }
-        if un.result_expr_lists.len() != children.len() {
-            return Err(format!(
-                "UNION_NODE result_expr_lists size mismatch: expr_lists={} children={}",
-                un.result_expr_lists.len(),
-                children.len()
+            return Err(StarRocksFragmentDecodeError::missing(
+                payload_path.clone().field("result_expr_lists"),
+                "UNION_NODE requires result_expr_lists for materialized children",
             ));
         }
-        for (child, expr_list) in children.into_iter().zip(un.result_expr_lists.iter()) {
+        if un.result_expr_lists.len() != children.len() {
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                payload_path.clone().field("result_expr_lists"),
+                format!(
+                    "UNION_NODE result_expr_lists size mismatch: expr_lists={} children={}",
+                    un.result_expr_lists.len(),
+                    children.len()
+                ),
+            ));
+        }
+        for (child_index, (child, expr_list)) in children
+            .into_iter()
+            .zip(un.result_expr_lists.iter())
+            .enumerate()
+        {
             let mut exprs = Vec::with_capacity(expr_list.len());
-            for e in expr_list {
-                exprs.push(lower_t_expr(
+            for (expr_index, e) in expr_list.iter().enumerate() {
+                exprs.push(lower_t_expr_at(
                     e,
                     arena,
                     &child.layout,
                     last_query_id,
                     fe_addr,
+                    payload_path
+                        .clone()
+                        .field("result_expr_lists")
+                        .index(child_index)
+                        .index(expr_index),
                 )?);
             }
             inputs.push(ExecNode {

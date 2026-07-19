@@ -23,6 +23,7 @@ use crate::connector::starrocks::fe_v2_meta::{
 };
 use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::exec::expr::{ExprArena, ExprNode};
+use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -33,8 +34,6 @@ use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
 use crate::novarocks_logging::{debug, warn};
-use crate::protocol::common::error::FieldPath;
-use crate::protocol::starrocks::decode::decode_runtime_endpoint;
 use crate::protocol::starrocks::decode::expr::parse_min_max_conjuncts;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
@@ -43,8 +42,10 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
+use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
+use crate::runtime::scan_range::ScanRange;
 use crate::thrift::{descriptors, plan_nodes, runtime_filter, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
@@ -58,7 +59,8 @@ pub(crate) fn lower_lake_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&super::StarRocksScanRangeAssignments>,
+    scan_assignments: Option<&ScanAssignments>,
+    program_facts: Option<&crate::protocol::starrocks::decode::LakeScanProgramFacts>,
     query_id: Option<QueryId>,
     query_opts: &QueryOptions,
     arena: &mut ExprArena,
@@ -262,77 +264,58 @@ pub(crate) fn lower_lake_scan_node(
     let Some(scan_assignments) = scan_assignments else {
         return Err("LAKE_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let scan_ranges = scan_assignments
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
+    let assignment = scan_assignments
+        .get(&FragmentNodeId::new(node.node_id))
+        .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
+    if assignment.kind() != ScanAssignmentKind::StarRocksTablet {
+        return Err(format!(
+            "LAKE_SCAN_NODE node_id={} expected StarRocksTablet assignment, got {:?}",
+            node.node_id,
+            assignment.kind()
+        ));
+    }
+    let program_facts = program_facts.ok_or_else(|| {
+        format!(
+            "LAKE_SCAN_NODE node_id={} missing normalized program facts",
+            node.node_id
+        )
+    })?;
 
     let mut ranges = Vec::new();
     let mut refs = Vec::new();
-    let mut internal_db_name: Option<String> = None;
-    let mut internal_table_name: Option<String> = None;
+    let internal_db_name = program_facts.db_name.clone();
+    let internal_table_name = program_facts.table_name.clone();
     let mut has_more = false;
-    for p in scan_ranges {
+    for p in assignment.ranges() {
         if p.empty.unwrap_or(false) {
             if p.has_more.unwrap_or(false) {
                 has_more = true;
             }
             continue;
         }
-        let Some(internal) = p.scan_range.internal_scan_range.as_ref() else {
+        let ScanRange::StarRocksTablet(internal) = &p.range else {
             return Err(format!(
-                "LAKE_SCAN_NODE node_id={} has scan range without internal_scan_range",
+                "LAKE_SCAN_NODE node_id={} assignment contains non-tablet range",
                 node.node_id
             ));
         };
-        let version = internal
-            .version
-            .parse::<i64>()
-            .map_err(|e| format!("invalid tablet version '{}': {}", internal.version, e))?;
+        let version = internal.version;
         if version <= 0 {
             return Err(format!(
                 "invalid non-positive tablet version for tablet_id={}: {}",
                 internal.tablet_id, version
             ));
         }
-        let partition_id = internal.partition_id.ok_or_else(|| {
-            format!(
-                "LAKE_SCAN_NODE missing partition_id in scan range for tablet_id={}",
-                internal.tablet_id
-            )
-        })?;
+        let partition_id = internal.partition_id;
 
         refs.push(LakeScanTabletRef {
             tablet_id: internal.tablet_id,
             partition_id,
             version,
         });
-        if internal_db_name.is_none() {
-            let candidate = internal.db_name.trim();
-            if !candidate.is_empty() {
-                internal_db_name = Some(candidate.to_string());
-            }
-        }
-        if internal_table_name.is_none()
-            && let Some(name) = internal
-                .table_name
-                .as_deref()
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-        {
-            internal_table_name = Some(name.to_string());
-        }
-        let fill_data_cache = internal.fill_data_cache.unwrap_or(true);
-        let skip_page_cache = internal.skip_page_cache.unwrap_or(false);
-        let skip_disk_cache = internal.skip_disk_cache.unwrap_or(false);
-        if !fill_data_cache || skip_page_cache || skip_disk_cache {
-            return Err(format!(
-                "LAKE_SCAN_NODE node_id={} does not support internal-table cache controls yet (fill_data_cache={}, skip_page_cache={}, skip_disk_cache={})",
-                node.node_id, fill_data_cache, skip_page_cache, skip_disk_cache
-            ));
-        }
         ranges.push(StarRocksScanRange {
             tablet_id: internal.tablet_id,
-            partition_id: internal.partition_id,
+            partition_id: Some(internal.partition_id),
             version: Some(version),
         });
     }

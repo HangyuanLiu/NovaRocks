@@ -19,7 +19,9 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids,
 };
@@ -36,9 +38,14 @@ pub(crate) fn lower_intersect_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.field("intersect_node");
     let Some(intersect) = node.intersect_node.as_ref() else {
-        return Err("INTERSECT_NODE missing intersect_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "INTERSECT_NODE missing intersect_node payload",
+        ));
     };
     lower_distinct_set_node(
         children,
@@ -52,6 +59,7 @@ pub(crate) fn lower_intersect_node(
         &intersect.result_expr_lists,
         "INTERSECT_NODE",
         SetOpKind::Intersect,
+        payload_path,
     )
 }
 
@@ -63,9 +71,14 @@ pub(crate) fn lower_except_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.field("except_node");
     let Some(except) = node.except_node.as_ref() else {
-        return Err("EXCEPT_NODE missing except_node payload".to_string());
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path,
+            "EXCEPT_NODE missing except_node payload",
+        ));
     };
     lower_distinct_set_node(
         children,
@@ -79,6 +92,7 @@ pub(crate) fn lower_except_node(
         &except.result_expr_lists,
         "EXCEPT_NODE",
         SetOpKind::Except,
+        payload_path,
     )
 }
 
@@ -94,26 +108,33 @@ fn lower_distinct_set_node(
     result_expr_lists: &[Vec<exprs::TExpr>],
     op_name: &'static str,
     set_op_kind: SetOpKind,
-) -> Result<Lowered, String> {
+    payload_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
     if children.len() < 2 {
-        return Err(format!(
-            "{op_name} expected >=2 children, got {}",
-            children.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("result_expr_lists"),
+            format!("{op_name} expected >=2 children, got {}", children.len()),
         ));
     }
     if out_layout.order.is_empty() {
         let col_count = result_expr_lists.first().map(|r| r.len()).unwrap_or(0);
         if col_count == 0 {
-            return Err(format!("{op_name} cannot infer output columns"));
+            return Err(StarRocksFragmentDecodeError::missing(
+                payload_path.clone().field("result_expr_lists"),
+                format!("{op_name} cannot infer output columns"),
+            ));
         }
         out_layout = layout_from_slot_ids(tuple_id, (0..col_count).map(|i| i as types::TSlotId));
     }
 
     if result_expr_lists.len() != children.len() {
-        return Err(format!(
-            "{op_name} result_expr_lists size mismatch: expr_lists={} children={}",
-            result_expr_lists.len(),
-            children.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("result_expr_lists"),
+            format!(
+                "{op_name} result_expr_lists size mismatch: expr_lists={} children={}",
+                result_expr_lists.len(),
+                children.len()
+            ),
         ));
     }
 
@@ -121,21 +142,42 @@ fn lower_distinct_set_node(
         .order
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    let desc_tbl =
-        desc_tbl.ok_or_else(|| format!("{op_name} lowering requires descriptor table"))?;
-    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("tuple_id"),
+                error,
+            )
+        })?;
+    let desc_tbl = desc_tbl.ok_or_else(|| {
+        StarRocksFragmentDecodeError::missing(
+            payload_path.clone(),
+            format!("{op_name} lowering requires descriptor table"),
+        )
+    })?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout).map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+    })?;
 
     let mut inputs = Vec::with_capacity(children.len());
-    for (child, expr_list) in children.into_iter().zip(result_expr_lists.iter()) {
+    for (child_index, (child, expr_list)) in children
+        .into_iter()
+        .zip(result_expr_lists.iter())
+        .enumerate()
+    {
         let mut exprs = Vec::with_capacity(expr_list.len());
-        for e in expr_list {
-            exprs.push(lower_t_expr(
+        for (expr_index, e) in expr_list.iter().enumerate() {
+            exprs.push(lower_t_expr_at(
                 e,
                 arena,
                 &child.layout,
                 last_query_id,
                 fe_addr,
+                payload_path
+                    .clone()
+                    .field("result_expr_lists")
+                    .index(child_index)
+                    .index(expr_index),
             )?);
         }
         inputs.push(ExecNode {

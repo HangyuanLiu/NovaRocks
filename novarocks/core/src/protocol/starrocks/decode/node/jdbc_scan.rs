@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
 use crate::protocol::starrocks::decode::layout::{
-    chunk_schema_for_layout, jdbc_conn_from_config, layout_for_row_tuples, layout_from_slot_ids,
-    qualify_table_name, resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
+    chunk_schema_for_layout, layout_for_row_tuples, layout_from_slot_ids, qualify_table_name,
+    resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
 };
 use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
 use crate::runtime::query_options::QueryOptions;
@@ -35,6 +35,7 @@ pub(crate) fn lower_jdbc_scan_node(
     query_opts: &QueryOptions,
     connectors: &ConnectorRegistry,
     db_name: Option<&str>,
+    decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {
         return Err(format!(
@@ -89,12 +90,18 @@ pub(crate) fn lower_jdbc_scan_node(
                 )
             }
             Err(_) => {
-                let (jdbc_url, user, pass) = jdbc_conn_from_config()?;
+                let (jdbc_url, user, pass) = decode_facts
+                    .jdbc()
+                    .ok_or_else(|| "missing [jdbc] config (url/user/password)".to_string())?
+                    .connection();
                 (jdbc_url, user, pass, None)
             }
         }
     } else {
-        let (jdbc_url, user, pass) = jdbc_conn_from_config()?;
+        let (jdbc_url, user, pass) = decode_facts
+            .jdbc()
+            .ok_or_else(|| "missing [jdbc] config (url/user/password)".to_string())?
+            .connection();
         (jdbc_url, user, pass, None)
     };
 
@@ -103,7 +110,11 @@ pub(crate) fn lower_jdbc_scan_node(
         .clone()
         .or(jdbc_table_name)
         .ok_or_else(|| "JDBC_SCAN_NODE missing table name".to_string())?;
-    let table = qualify_table_name(table, db_name);
+    let table = qualify_table_name(
+        table,
+        db_name,
+        decode_facts.jdbc().and_then(|jdbc| jdbc.default_db()),
+    );
 
     let columns = match jdbc.columns.as_ref().filter(|c| !c.is_empty()) {
         Some(cols) => cols.clone(),

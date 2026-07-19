@@ -23,12 +23,47 @@ use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StarRocksDependencyContractError {
+    kind: StarRocksDependencyContractErrorKind,
+    dependency_id: u64,
     detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StarRocksDependencyContractErrorKind {
+    Missing,
+    Extra,
+    WrongKind,
+}
+
+impl StarRocksDependencyContractError {
+    pub(crate) fn new(
+        kind: StarRocksDependencyContractErrorKind,
+        dependency_id: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            dependency_id,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> StarRocksDependencyContractErrorKind {
+        self.kind
+    }
+
+    pub(crate) const fn dependency_id(&self) -> u64 {
+        self.dependency_id
+    }
 }
 
 impl fmt::Display for StarRocksDependencyContractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StarRocks dependency contract error: {}", self.detail)
+        write!(
+            f,
+            "StarRocks dependency contract error ({:?}, id={}): {}",
+            self.kind, self.dependency_id, self.detail
+        )
     }
 }
 
@@ -68,6 +103,10 @@ impl StarRocksFragmentDecodeError {
 
     pub(crate) fn unsupported(path: FieldPath, detail: impl fmt::Display) -> Self {
         Self::protocol_error(path, ProtocolErrorKind::Unsupported, detail)
+    }
+
+    pub(crate) fn inconsistent(path: FieldPath, detail: impl fmt::Display) -> Self {
+        Self::protocol_error(path, ProtocolErrorKind::InconsistentFields, detail)
     }
 
     fn protocol_error(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {

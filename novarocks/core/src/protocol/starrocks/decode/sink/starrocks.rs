@@ -40,16 +40,46 @@ use crate::connector::starrocks::sink::plan::{
 };
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNodeKind, ExecPlan};
+use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
-use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::Layout;
+use crate::protocol::starrocks::decode::{
+    FragmentExprArenaOwner, StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
+};
 use crate::runtime::fragment::instance::StarRocksTableSinkAssignment;
 use crate::thrift::{data_sinks, descriptors, exprs, types};
 use crate::types::arrow_thrift::thrift_desc_to_arrow_type;
 
 const LOAD_OP_COLUMN: &str = "__op";
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
+
+#[derive(Debug)]
+pub(crate) enum StarRocksTableSinkDecodeError {
+    Sink(String),
+    Protocol(StarRocksFragmentDecodeError),
+}
+
+impl StarRocksTableSinkDecodeError {
+    pub(crate) fn into_fragment(self, sink_path: FieldPath) -> StarRocksFragmentDecodeError {
+        match self {
+            Self::Sink(detail) => StarRocksFragmentDecodeError::invalid_value(sink_path, detail),
+            Self::Protocol(error) => error,
+        }
+    }
+}
+
+impl From<String> for StarRocksTableSinkDecodeError {
+    fn from(detail: String) -> Self {
+        Self::Sink(detail)
+    }
+}
+
+impl From<StarRocksFragmentDecodeError> for StarRocksTableSinkDecodeError {
+    fn from(error: StarRocksFragmentDecodeError) -> Self {
+        Self::Protocol(error)
+    }
+}
 
 pub(crate) fn lower_starrocks_table_sink(
     sink: &data_sinks::TOlapTableSink,
@@ -59,7 +89,10 @@ pub(crate) fn lower_starrocks_table_sink(
     last_query_id: Option<&str>,
     session_time_zone: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<(StarRocksTableSinkProgram, StarRocksTableSinkAssignment), String> {
+    sink_path: FieldPath,
+    output_exprs_path: FieldPath,
+) -> Result<(StarRocksTableSinkProgram, StarRocksTableSinkAssignment), StarRocksTableSinkDecodeError>
+{
     let keys_type = lower_keys_type(sink.keys_type)?;
     let write_indexes = resolve_sink_write_index_selections(sink)?;
     let primary_schema_id = write_indexes
@@ -72,14 +105,25 @@ pub(crate) fn lower_starrocks_table_sink(
     let output_expr_slot_name_map =
         lower_output_expr_slot_name_map(&sink.schema, primary_schema_id, output_exprs)?;
     let output_expr_slot_ids = resolve_output_expr_slot_ids_for_write(output_exprs)?;
-    let output_projection = lower_output_projection(
-        sink,
-        output_exprs,
-        layout,
-        session_time_zone,
-        last_query_id,
-        external_dependencies,
-    )?;
+    let lower_output = || {
+        lower_output_projection(
+            sink,
+            output_exprs,
+            layout,
+            session_time_zone,
+            last_query_id,
+            external_dependencies,
+            output_exprs_path,
+        )
+    };
+    let output_projection = if let Some(dependencies) = external_dependencies {
+        dependencies.with_expr_arena_owner(
+            FragmentExprArenaOwner::StarRocksOutputProjection,
+            lower_output,
+        )?
+    } else {
+        lower_output()?
+    };
     let slot_name_overrides = if output_expr_slot_name_map.is_empty() {
         None
     } else {
@@ -99,8 +143,20 @@ pub(crate) fn lower_starrocks_table_sink(
     let frontend = external_dependencies
         .and_then(StarRocksExternalDependencyDraft::frontend_endpoint)
         .cloned();
-    let schema = lower_sink_schema(&sink.schema, keys_type, session_time_zone)?;
-    let partition = lower_sink_partition(&sink.partition, session_time_zone, slot_id_overrides)?;
+    let schema = lower_sink_schema(
+        &sink.schema,
+        keys_type,
+        session_time_zone,
+        external_dependencies,
+        sink_path.clone().field("schema"),
+    )?;
+    let partition = lower_sink_partition(
+        &sink.partition,
+        session_time_zone,
+        slot_id_overrides,
+        external_dependencies,
+        sink_path.field("partition"),
+    )?;
     let location = lower_sink_location(&sink.location);
     let nodes = lower_sink_nodes(&sink.nodes_info)?;
     let literal_partition_values =
@@ -173,7 +229,9 @@ fn lower_sink_schema(
     schema: &descriptors::TOlapTableSchemaParam,
     keys_type: StarRocksKeysType,
     session_time_zone: Option<&str>,
-) -> Result<SinkSchemaDescriptor, String> {
+    external_dependencies: Option<&StarRocksExternalDependencyDraft>,
+    schema_path: FieldPath,
+) -> Result<SinkSchemaDescriptor, StarRocksTableSinkDecodeError> {
     let slot_descs = schema
         .slot_descs
         .iter()
@@ -193,7 +251,8 @@ fn lower_sink_schema(
     let indexes = schema
         .indexes
         .iter()
-        .map(|index| {
+        .enumerate()
+        .map(|(index_idx, index)| {
             let schema_id = index.schema_id.filter(|v| *v > 0).unwrap_or(index.id);
             let tablet_schema = build_sink_tablet_schema(schema, schema_id, keys_type)?;
             Ok(SinkIndexDescriptor {
@@ -203,13 +262,31 @@ fn lower_sink_schema(
                 tablet_schema,
                 column_to_expr_value: lower_column_to_expr_value(index),
                 is_shadow: index.is_shadow.unwrap_or(false),
-                where_clause: lower_optional_predicate(
-                    index.where_clause.as_ref(),
-                    session_time_zone,
-                )?,
+                where_clause: {
+                    let lower = || {
+                        lower_optional_predicate(
+                            index.where_clause.as_ref(),
+                            session_time_zone,
+                            external_dependencies,
+                            schema_path
+                                .clone()
+                                .field("indexes")
+                                .index(index_idx)
+                                .field("where_clause"),
+                        )
+                    };
+                    if let Some(dependencies) = external_dependencies {
+                        dependencies.with_expr_arena_owner(
+                            FragmentExprArenaOwner::StarRocksIndexPredicate { index: index_idx },
+                            lower,
+                        )?
+                    } else {
+                        lower()?
+                    }
+                },
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, StarRocksTableSinkDecodeError>>()?;
 
     Ok(SinkSchemaDescriptor {
         slot_descs,
@@ -220,7 +297,9 @@ fn lower_sink_schema(
 fn lower_optional_predicate(
     expr: Option<&exprs::TExpr>,
     session_time_zone: Option<&str>,
-) -> Result<Option<SinkPredicatePlan>, String> {
+    external_dependencies: Option<&StarRocksExternalDependencyDraft>,
+    expr_path: FieldPath,
+) -> Result<Option<SinkPredicatePlan>, StarRocksTableSinkDecodeError> {
     let Some(expr) = expr.filter(|expr| !expr.nodes.is_empty()) else {
         return Ok(None);
     };
@@ -230,7 +309,14 @@ fn lower_optional_predicate(
         order: Vec::new(),
         index: HashMap::new(),
     };
-    let expr_id = lower_t_expr(expr, &mut arena, &empty_layout, None, None)?;
+    let expr_id = lower_t_expr_at(
+        expr,
+        &mut arena,
+        &empty_layout,
+        None,
+        external_dependencies,
+        expr_path,
+    )?;
     Ok(Some(SinkPredicatePlan {
         arena: Arc::new(arena),
         expr_id,
@@ -281,15 +367,27 @@ fn lower_sink_partition(
     partition: &descriptors::TOlapTablePartitionParam,
     session_time_zone: Option<&str>,
     slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
-) -> Result<SinkPartitionDescriptor, String> {
+    external_dependencies: Option<&StarRocksExternalDependencyDraft>,
+    partition_path: FieldPath,
+) -> Result<SinkPartitionDescriptor, StarRocksTableSinkDecodeError> {
     let partition_exprs = if let Some(exprs) = partition.partition_exprs.as_ref()
         && !exprs.is_empty()
     {
-        Some(Arc::new(lower_partition_expr_plan(
-            exprs,
-            session_time_zone,
-            slot_id_overrides,
-        )?))
+        let lower = || {
+            lower_partition_expr_plan(
+                exprs,
+                session_time_zone,
+                slot_id_overrides,
+                external_dependencies,
+                partition_path.clone().field("partition_exprs"),
+            )
+        };
+        let plan = if let Some(dependencies) = external_dependencies {
+            dependencies.with_expr_arena_owner(FragmentExprArenaOwner::StarRocksPartition, lower)?
+        } else {
+            lower()?
+        };
+        Some(Arc::new(plan))
     } else {
         None
     };
@@ -366,7 +464,9 @@ fn lower_partition_expr_plan(
     exprs: &[exprs::TExpr],
     session_time_zone: Option<&str>,
     slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
-) -> Result<PartitionExprPlan, String> {
+    external_dependencies: Option<&StarRocksExternalDependencyDraft>,
+    exprs_path: FieldPath,
+) -> Result<PartitionExprPlan, StarRocksTableSinkDecodeError> {
     let mut arena = ExprArena::default();
     arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
     let mut expr_ids = Vec::with_capacity(exprs.len());
@@ -374,12 +474,19 @@ fn lower_partition_expr_plan(
         order: Vec::new(),
         index: HashMap::new(),
     };
-    for expr in exprs {
+    for (expr_idx, expr) in exprs.iter().enumerate() {
         let mut rewritten_expr = expr.clone();
         if let Some(overrides) = slot_id_overrides {
             remap_partition_expr_slot_ids(&mut rewritten_expr, overrides)?;
         }
-        let expr_id = lower_t_expr(&rewritten_expr, &mut arena, &empty_layout, None, None)?;
+        let expr_id = lower_t_expr_at(
+            &rewritten_expr,
+            &mut arena,
+            &empty_layout,
+            None,
+            external_dependencies,
+            exprs_path.clone().index(expr_idx),
+        )?;
         expr_ids.push(expr_id);
     }
     Ok(PartitionExprPlan { arena, expr_ids })
@@ -685,7 +792,8 @@ fn lower_output_projection(
     session_time_zone: Option<&str>,
     last_query_id: Option<&str>,
     external_dependencies: Option<&StarRocksExternalDependencyDraft>,
-) -> Result<Option<SinkOutputProjectionPlan>, String> {
+    output_exprs_path: FieldPath,
+) -> Result<Option<SinkOutputProjectionPlan>, StarRocksTableSinkDecodeError> {
     let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
         return Ok(None);
     };
@@ -707,19 +815,21 @@ fn lower_output_projection(
             "OLAP_TABLE_SINK output projection slot count mismatch: slots={} output_exprs={}",
             output_slots.len(),
             output_exprs.len()
-        ));
+        )
+        .into());
     }
 
     let mut arena = ExprArena::default();
     arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
     let mut expr_ids = Vec::with_capacity(output_exprs.len());
-    for expr in output_exprs {
-        let expr_id = lower_t_expr(
+    for (expr_idx, expr) in output_exprs.iter().enumerate() {
+        let expr_id = lower_t_expr_at(
             expr,
             &mut arena,
             layout,
             last_query_id,
             external_dependencies,
+            output_exprs_path.clone().index(expr_idx),
         )?;
         expr_ids.push(expr_id);
     }
@@ -1452,6 +1562,7 @@ mod tests {
     use crate::connector::starrocks::sink::plan::{
         StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
     };
+    use crate::protocol::common::error::FieldPath;
     use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::thrift::{data_sinks, descriptors, types};
@@ -1601,6 +1712,8 @@ mod tests {
             None,
             None,
             Some(&dependencies),
+            FieldPath::root("olap_table_sink"),
+            FieldPath::root("output_exprs"),
         )
         .expect("OLAP sink decode");
 

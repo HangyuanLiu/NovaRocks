@@ -25,7 +25,9 @@ use crate::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::protocol::starrocks::decode::expr::lower_t_expr;
+use crate::protocol::common::error::FieldPath;
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
+use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::sql::common::ChangeStreamBranchKind;
@@ -39,32 +41,46 @@ pub(crate) fn lower_change_event_expand_node(
     desc_tbl: &descriptors::TDescriptorTable,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-) -> Result<Lowered, String> {
+    node_path: FieldPath,
+) -> Result<Lowered, StarRocksFragmentDecodeError> {
+    let payload_path = node_path.clone().field("change_event_expand_node");
     if children.len() != 1 {
-        return Err(format!(
-            "CHANGE_EVENT_EXPAND_NODE expected 1 child, got {}",
-            children.len()
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            node_path,
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE expected 1 child, got {}",
+                children.len()
+            ),
         ));
     }
     let child = children.into_iter().next().expect("child");
     let payload = node.change_event_expand_node.as_ref().ok_or_else(|| {
-        format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} missing change_event_expand_node payload",
-            node.node_id
+        StarRocksFragmentDecodeError::missing(
+            payload_path.clone(),
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} missing change_event_expand_node payload",
+                node.node_id
+            ),
         )
     })?;
     if payload.output_slot_ids.is_empty() {
-        return Err(format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} output_slot_ids is empty",
-            node.node_id
+        return Err(StarRocksFragmentDecodeError::missing(
+            payload_path.clone().field("output_slot_ids"),
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} output_slot_ids is empty",
+                node.node_id
+            ),
         ));
     }
 
     let output_set: HashSet<types::TSlotId> = payload.output_slot_ids.iter().copied().collect();
     if output_set.len() != payload.output_slot_ids.len() {
-        return Err(format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} output_slot_ids contains duplicates",
-            node.node_id
+        return Err(StarRocksFragmentDecodeError::inconsistent(
+            payload_path.clone().field("output_slot_ids"),
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} output_slot_ids contains duplicates",
+                node.node_id
+            ),
         ));
     }
     require_route_slot_in_outputs(
@@ -72,12 +88,21 @@ pub(crate) fn lower_change_event_expand_node(
         payload.change_op_slot_id,
         &output_set,
         node.node_id,
-    )?;
+    )
+    .map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone().field("change_op_slot_id"),
+            error,
+        )
+    })?;
     if let Some(data_route_slot_id) = payload.data_route_slot_id {
         if data_route_slot_id == payload.change_op_slot_id {
-            return Err(format!(
-                "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} and data_route_slot_id {} must be distinct",
-                node.node_id, payload.change_op_slot_id, data_route_slot_id
+            return Err(StarRocksFragmentDecodeError::inconsistent(
+                payload_path.clone().field("data_route_slot_id"),
+                format!(
+                    "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} and data_route_slot_id {} must be distinct",
+                    node.node_id, payload.change_op_slot_id, data_route_slot_id
+                ),
             ));
         }
         require_route_slot_in_outputs(
@@ -85,39 +110,65 @@ pub(crate) fn lower_change_event_expand_node(
             data_route_slot_id,
             &output_set,
             node.node_id,
-        )?;
+        )
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("data_route_slot_id"),
+                error,
+            )
+        })?;
     }
 
     let mut events = Vec::with_capacity(payload.events.len());
     for (event_idx, event) in payload.events.iter().enumerate() {
-        let branch_kind = change_event_branch_kind_from_thrift(event.branch_kind)?;
+        let event_path = payload_path.clone().field("events").index(event_idx);
+        let branch_kind =
+            change_event_branch_kind_from_thrift(event.branch_kind).map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_enum(
+                    event_path.clone().field("branch_kind"),
+                    error,
+                )
+            })?;
         if matches!(
             branch_kind,
             ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData
         ) && payload.data_route_slot_id.is_none()
         {
-            return Err(format!(
-                "CHANGE_EVENT_EXPAND_NODE node_id={} data branch {:?} requires data_route_slot_id",
-                node.node_id, branch_kind
+            return Err(StarRocksFragmentDecodeError::missing(
+                payload_path.clone().field("data_route_slot_id"),
+                format!(
+                    "CHANGE_EVENT_EXPAND_NODE node_id={} data branch {:?} requires data_route_slot_id",
+                    node.node_id, branch_kind
+                ),
             ));
         }
         let predicate = event
             .predicate
             .as_ref()
-            .map(|expr| lower_t_expr(expr, arena, &child.layout, last_query_id, fe_addr))
-            .transpose()
-            .map_err(|err| {
-                format!(
-                    "CHANGE_EVENT_EXPAND_NODE node_id={} failed to lower predicate for event {}: {}",
-                    node.node_id, event_idx, err
+            .map(|expr| {
+                lower_t_expr_at(
+                    expr,
+                    arena,
+                    &child.layout,
+                    last_query_id,
+                    fe_addr,
+                    event_path.clone().field("predicate"),
                 )
-            })?;
+            })
+            .transpose()?;
         let mut assignments = Vec::with_capacity(event.assignments.len());
-        for assignment in &event.assignments {
+        for (assignment_index, assignment) in event.assignments.iter().enumerate() {
+            let assignment_path = event_path
+                .clone()
+                .field("assignments")
+                .index(assignment_index);
             if !output_set.contains(&assignment.output_slot_id) {
-                return Err(format!(
-                    "CHANGE_EVENT_EXPAND_NODE node_id={} assignment output slot {} is not in output_slot_ids",
-                    node.node_id, assignment.output_slot_id
+                return Err(StarRocksFragmentDecodeError::invalid_value(
+                    assignment_path.clone().field("output_slot_id"),
+                    format!(
+                        "CHANGE_EVENT_EXPAND_NODE node_id={} assignment output slot {} is not in output_slot_ids",
+                        node.node_id, assignment.output_slot_id
+                    ),
                 ));
             }
             let expr = event_assignment_expr(
@@ -126,10 +177,15 @@ pub(crate) fn lower_change_event_expand_node(
                 &child.layout,
                 last_query_id,
                 fe_addr,
-                node.node_id,
+                assignment_path.clone(),
             )?;
             assignments.push(ChangeEventRuntimeOutputExpr {
-                output_slot_id: SlotId::try_from(assignment.output_slot_id)?,
+                output_slot_id: SlotId::try_from(assignment.output_slot_id).map_err(|error| {
+                    StarRocksFragmentDecodeError::invalid_value(
+                        assignment_path.field("output_slot_id"),
+                        error,
+                    )
+                })?,
                 expr,
             });
         }
@@ -145,41 +201,78 @@ pub(crate) fn lower_change_event_expand_node(
         .iter()
         .copied()
         .map(SlotId::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-    let layout = output_layout_for_slots(&out_layout, &payload.output_slot_ids)?;
-    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
-    let change_op_slot_id = SlotId::try_from(payload.change_op_slot_id)?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("output_slot_ids"),
+                error,
+            )
+        })?;
+    let layout =
+        output_layout_for_slots(&out_layout, &payload.output_slot_ids).map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("output_slot_ids"),
+                error,
+            )
+        })?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout).map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_value(payload_path.clone(), error)
+    })?;
+    let change_op_slot_id = SlotId::try_from(payload.change_op_slot_id).map_err(|error| {
+        StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone().field("change_op_slot_id"),
+            error,
+        )
+    })?;
     let change_op_slot = output_chunk_schema.slot(change_op_slot_id).ok_or_else(|| {
-        format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} is missing from output schema",
-            node.node_id, payload.change_op_slot_id
+        StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone().field("change_op_slot_id"),
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} is missing from output schema",
+                node.node_id, payload.change_op_slot_id
+            ),
         )
     })?;
     if change_op_slot.data_type() != &DataType::Int8 {
-        return Err(format!(
-            "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} must be TINYINT/Int8, got {:?}",
-            node.node_id,
-            payload.change_op_slot_id,
-            change_op_slot.data_type()
+        return Err(StarRocksFragmentDecodeError::invalid_value(
+            payload_path.clone().field("change_op_slot_id"),
+            format!(
+                "CHANGE_EVENT_EXPAND_NODE node_id={} change_op_slot_id {} must be TINYINT/Int8, got {:?}",
+                node.node_id,
+                payload.change_op_slot_id,
+                change_op_slot.data_type()
+            ),
         ));
     }
     let data_route_slot_id = payload
         .data_route_slot_id
         .map(SlotId::try_from)
-        .transpose()?;
+        .transpose()
+        .map_err(|error| {
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("data_route_slot_id"),
+                error,
+            )
+        })?;
     if let Some(data_route_slot_id) = data_route_slot_id {
         let data_route_slot = output_chunk_schema.slot(data_route_slot_id).ok_or_else(|| {
-            format!(
-                "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} is missing from output schema",
-                node.node_id, data_route_slot_id
+            StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("data_route_slot_id"),
+                format!(
+                    "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} is missing from output schema",
+                    node.node_id, data_route_slot_id
+                ),
             )
         })?;
         if !is_signed_integer_route_type(data_route_slot.data_type()) {
-            return Err(format!(
-                "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} must be a signed integer route type, got {:?}",
-                node.node_id,
-                data_route_slot_id,
-                data_route_slot.data_type()
+            return Err(StarRocksFragmentDecodeError::invalid_value(
+                payload_path.clone().field("data_route_slot_id"),
+                format!(
+                    "CHANGE_EVENT_EXPAND_NODE node_id={} data_route_slot_id {} must be a signed integer route type, got {:?}",
+                    node.node_id,
+                    data_route_slot_id,
+                    data_route_slot.data_type()
+                ),
             ));
         }
     }
@@ -228,19 +321,22 @@ fn event_assignment_expr(
     input_layout: &Layout,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
-    node_id: i32,
-) -> Result<Option<ExprId>, String> {
+    assignment_path: FieldPath,
+) -> Result<Option<ExprId>, StarRocksFragmentDecodeError> {
     assignment
         .expr
         .as_ref()
-        .map(|expr| lower_t_expr(expr, arena, input_layout, last_query_id, fe_addr))
-        .transpose()
-        .map_err(|err| {
-            format!(
-                "CHANGE_EVENT_EXPAND_NODE node_id={} failed to lower assignment for output slot {}: {}",
-                node_id, assignment.output_slot_id, err
+        .map(|expr| {
+            lower_t_expr_at(
+                expr,
+                arena,
+                input_layout,
+                last_query_id,
+                fe_addr,
+                assignment_path.field("expr"),
             )
         })
+        .transpose()
 }
 
 fn change_event_branch_kind_from_thrift(

@@ -21,7 +21,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::novarocks_config::config as novarocks_app_config;
 use crate::protocol::starrocks::decode::schema::chunk_slot_schema_from_type_desc;
 use crate::thrift::descriptors;
 use crate::thrift::exprs;
@@ -605,25 +604,17 @@ pub(crate) fn find_tuple_descriptor(
         .ok_or_else(|| format!("missing tuple_descriptor for tuple_id={tuple_id}"))
 }
 
-pub(crate) fn jdbc_conn_from_config() -> Result<(String, Option<String>, Option<String>), String> {
-    let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-    let jdbc = cfg
-        .jdbc_config()
-        .ok_or_else(|| "missing [jdbc] config (url/user/password)".to_string())?;
-    Ok((jdbc.url.clone(), jdbc.user.clone(), jdbc.password.clone()))
-}
-
-pub(crate) fn qualify_table_name(table: String, db_name: Option<&str>) -> String {
+pub(crate) fn qualify_table_name(
+    table: String,
+    db_name: Option<&str>,
+    default_db: Option<&str>,
+) -> String {
     if table.contains('.') {
         return table;
     }
-    let cfg_db = novarocks_app_config()
-        .ok()
-        .and_then(|c| c.jdbc_config().and_then(|j| j.default_db.clone()));
     let db = db_name
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or(cfg_db);
+        .or(default_db.filter(|s| !s.is_empty()));
     let Some(db) = db else { return table };
     format!("{db}.{table}")
 }

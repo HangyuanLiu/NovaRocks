@@ -18,7 +18,7 @@ use crate::common::largeint;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function};
 use arrow::datatypes::DataType;
 
-use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
+use crate::protocol::starrocks::decode::{DraftDependencyValue, StarRocksExternalDependencyDraft};
 use crate::thrift::exprs;
 
 fn is_numeric_like_type(data_type: &DataType) -> bool {
@@ -232,8 +232,19 @@ pub(crate) fn lower_function_call(
         if arg.is_empty() {
             Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type))
         } else {
-            let profile = external_dependencies.query_profile(arg)?;
-            Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(profile)), data_type))
+            match external_dependencies.query_profile_value(arg)? {
+                DraftDependencyValue::Resolved(profile) => {
+                    Ok(arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(profile)), data_type))
+                }
+                DraftDependencyValue::Pending(dependency_id) => {
+                    let expr_id = arena.push_typed(
+                        ExprNode::Literal(LiteralValue::Utf8(String::new())),
+                        data_type,
+                    );
+                    external_dependencies.record_query_profile_slot(dependency_id, expr_id);
+                    Ok(expr_id)
+                }
+            }
         }
     } else {
         // Use function registry for standard functions

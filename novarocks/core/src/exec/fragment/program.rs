@@ -85,6 +85,10 @@ impl FragmentProgramOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanAssignmentKind {
     File,
+    #[cfg(feature = "compat")]
+    BrokerFile,
+    #[cfg(feature = "compat")]
+    SchemaSelection,
     StarRocksTablet,
 }
 
@@ -269,6 +273,10 @@ impl FragmentSinkSpec {
         &self.program
     }
 
+    pub(crate) fn program_mut(&mut self) -> &mut FragmentSinkProgram {
+        &mut self.program
+    }
+
     pub(crate) const fn kind(&self) -> FragmentSinkKind {
         self.kind
     }
@@ -339,8 +347,16 @@ impl FragmentProgram {
         &self.plan
     }
 
+    pub(crate) fn plan_mut(&mut self) -> &mut ExecPlan {
+        &mut self.plan
+    }
+
     pub(crate) const fn sink(&self) -> &FragmentSinkSpec {
         &self.sink
+    }
+
+    pub(crate) fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
+        &mut self.sink
     }
 
     pub(crate) const fn program_options(&self) -> &FragmentProgramOptions {

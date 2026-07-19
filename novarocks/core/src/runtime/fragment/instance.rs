@@ -92,14 +92,15 @@ impl ScanAssignments {
         let mut bound_assignments = BTreeMap::new();
         for (node_id, (kind, ranges)) in assignments {
             for (index, range) in ranges.iter().enumerate() {
-                let matches_kind = matches!(
-                    (kind, &range.range),
-                    (ScanAssignmentKind::File, ScanRange::File(_))
-                        | (
-                            ScanAssignmentKind::StarRocksTablet,
-                            ScanRange::StarRocksTablet(_)
-                        )
-                );
+                let matches_kind = match (kind, &range.range) {
+                    (ScanAssignmentKind::File, ScanRange::File(_)) => true,
+                    #[cfg(feature = "compat")]
+                    (ScanAssignmentKind::BrokerFile, ScanRange::BrokerFile(_)) => true,
+                    #[cfg(feature = "compat")]
+                    (ScanAssignmentKind::SchemaSelection, ScanRange::SchemaSelection(_)) => true,
+                    (ScanAssignmentKind::StarRocksTablet, ScanRange::StarRocksTablet(_)) => true,
+                    _ => false,
+                };
                 if !matches_kind {
                     return Err(FragmentBindingError::new(
                         FragmentBindingTarget::ScanNode(node_id.get()),
@@ -366,6 +367,7 @@ mod tests {
             data_sequence_number: None,
             modification_time: None,
             datacache_options: None,
+            candidate_node: None,
             included_positions: Vec::new(),
             serialized_split: None,
             use_iceberg_jni_metadata_reader: false,

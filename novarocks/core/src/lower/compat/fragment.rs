@@ -18,43 +18,29 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-use thrift::OrderedFloat;
-
-use crate::common::thrift::thrift_compact_serialize;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::novarocks_connectors::ConnectorRegistry;
 
+use crate::cache::DataCacheManager;
 use crate::common::config::debug_exec_node_output;
-use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
-use crate::exec::fragment::program::FragmentSinkSpec;
-use crate::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-    IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
-    IcebergTableSinkProgram, MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
-};
-use crate::exec::operators::{
-    DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
-    IcebergChangeStreamRouterSinkFactoryInput,
-};
 use crate::exec::pipeline::executor::execute_compat_plan_with_pipeline_with_root_sink_dop;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::starrocks::decode::layout::{
     build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, lower_plan};
-use crate::protocol::starrocks::decode::type_lowering::{
-    native_primitive_type_from_desc, render_schema_from_type_desc,
+use crate::protocol::starrocks::decode::node::{StarRocksPlanDecodeContext, lower_plan};
+use crate::protocol::starrocks::decode::sink::fragment::{
+    DecodedStarRocksFragmentSink, decode_fragment_sink,
 };
 use crate::protocol::starrocks::decode::{
-    StarRocksExternalDependency, StarRocksExternalDependencyDraft, decode_fragment_destination,
-    decode_query_options, decode_runtime_endpoint, decode_runtime_filter_params,
+    StarRocksDecodeFacts, StarRocksExternalDependency, StarRocksExternalDependencyDraft,
+    StarRocksJdbcFacts, StarRocksObjectStoreDefaults, StarRocksPathRewriteFacts,
+    decode_fragment_destination, decode_query_options, decode_runtime_endpoint,
+    decode_runtime_filter_params,
 };
-use crate::runtime::endpoint::FragmentDestination;
-use crate::runtime::fragment::instance::FragmentSinkAssignment;
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
 };
@@ -64,9 +50,7 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-use crate::service::result_batch_wire::{ResultProjection, ResultSinkConfig};
-use crate::thrift::{data, data_sinks, descriptors, internal_service, planner, types};
-use crate::types::PrimitiveType;
+use crate::thrift::{descriptors, internal_service, planner, types};
 
 enum FragmentDecodeAttempt<T> {
     Ready(T),
@@ -219,1024 +203,98 @@ fn unique_id_from_exec_params(exec_params: &internal_service::TPlanFragmentExecP
     }
 }
 
-fn runtime_destination_from_thrift(
-    dest: &data_sinks::TPlanFragmentDestination,
-    path: FieldPath,
-) -> Result<FragmentDestination, String> {
-    decode_fragment_destination(dest, path).map_err(|error| error.to_string())
-}
-
-fn runtime_destinations_from_thrift(
-    destinations: Vec<data_sinks::TPlanFragmentDestination>,
-    path: FieldPath,
-) -> Result<Vec<FragmentDestination>, String> {
-    destinations
-        .iter()
-        .enumerate()
-        .map(|(index, destination)| {
-            runtime_destination_from_thrift(destination, path.clone().index(index))
-        })
-        .collect()
-}
-
-fn lower_stream_partition_exprs(
-    stream: &data_sinks::TDataStreamSink,
-    arena: &mut ExprArena,
-    layout: &crate::protocol::starrocks::decode::layout::Layout,
-    last_query_id: Option<&str>,
-    external_dependencies: Option<
-        &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
-    >,
-) -> Result<Vec<crate::exec::expr::ExprId>, String> {
-    let partition_type =
-        crate::protocol::starrocks::decode::sink::decode_data_stream_partition_type(
-            stream.output_partition.type_,
-        )?;
-    if !partition_type.requires_exprs() {
-        return Ok(Vec::new());
+fn require_exec_params_for_sink(
+    sink: &crate::thrift::data_sinks::TDataSink,
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> Result<(), String> {
+    if exec_params.is_some() {
+        return Ok(());
     }
-    stream
-        .output_partition
-        .partition_exprs
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .map(|(idx, expr)| {
-            crate::protocol::starrocks::decode::expr::lower_t_expr(
-                expr,
-                arena,
-                layout,
-                last_query_id,
-                external_dependencies,
-            )
-            .map_err(|err| format!("DATA_STREAM_SINK partition expr[{idx}]: {err}"))
-        })
-        .collect()
+    let label = match sink.type_ {
+        crate::thrift::data_sinks::TDataSinkType::DATA_STREAM_SINK => "DATA_STREAM_SINK",
+        crate::thrift::data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
+            "MULTI_CAST_DATA_STREAM_SINK"
+        }
+        crate::thrift::data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK => {
+            "SPLIT_DATA_STREAM_SINK"
+        }
+        crate::thrift::data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
+            "ICEBERG_CHANGE_STREAM_ROUTER_SINK"
+        }
+        _ => return Ok(()),
+    };
+    Err(format!("{label} requires exec_params"))
 }
 
-fn data_stream_input_from_compat(
-    stream: &data_sinks::TDataStreamSink,
-    destinations: Vec<data_sinks::TPlanFragmentDestination>,
-    destinations_path: FieldPath,
-    arena: &mut ExprArena,
-    layout: &crate::protocol::starrocks::decode::layout::Layout,
-    last_query_id: Option<&str>,
-    external_dependencies: Option<
-        &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
-    >,
-) -> Result<DataStreamSinkFactoryInput, String> {
-    let partition_exprs =
-        lower_stream_partition_exprs(stream, arena, layout, last_query_id, external_dependencies)?;
-    let partition_type =
-        crate::protocol::starrocks::decode::sink::decode_data_stream_partition_type(
-            stream.output_partition.type_,
-        )?;
-    DataStreamSinkFactoryInput::try_new(
-        stream.dest_node_id,
-        partition_type,
-        Vec::new(),
-        partition_exprs,
-        stream.output_columns.clone().unwrap_or_default(),
-        runtime_destinations_from_thrift(destinations, destinations_path)?,
-    )
-}
-
-fn multi_cast_inputs_from_compat(
-    multi_cast: &data_sinks::TMultiCastDataStreamSink,
-    arena: &mut ExprArena,
-    layout: &crate::protocol::starrocks::decode::layout::Layout,
-    last_query_id: Option<&str>,
-    external_dependencies: Option<
-        &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
-    >,
-) -> Result<Vec<(DataStreamSinkFactoryInput, Option<i64>)>, String> {
-    if multi_cast.sinks.len() != multi_cast.destinations.len() {
-        return Err(format!(
-            "MULTI_CAST_DATA_STREAM_SINK: sinks size {} != destinations size {}",
-            multi_cast.sinks.len(),
-            multi_cast.destinations.len()
-        ));
-    }
-    multi_cast
-        .sinks
-        .iter()
-        .zip(multi_cast.destinations.iter())
-        .enumerate()
-        .map(|(branch_index, (stream, destinations))| {
-            Ok((
-                data_stream_input_from_compat(
-                    stream,
-                    destinations.clone(),
-                    FieldPath::root("exec_plan_fragment")
-                        .field("fragment")
-                        .field("output_sink")
-                        .field("multi_cast_stream_sink")
-                        .field("destinations")
-                        .index(branch_index),
-                    arena,
-                    layout,
-                    last_query_id,
-                    external_dependencies,
-                )?,
-                stream.limit,
-            ))
-        })
-        .collect()
-}
-
-fn split_inputs_from_compat(
-    split: &data_sinks::TSplitDataStreamSink,
-    arena: &mut ExprArena,
-    layout: &crate::protocol::starrocks::decode::layout::Layout,
-    last_query_id: Option<&str>,
-    external_dependencies: Option<
-        &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
-    >,
-) -> Result<Vec<DataStreamSinkFactoryInput>, String> {
-    let sinks = split.sinks.as_ref().cloned().unwrap_or_default();
-    let destinations = split.destinations.as_ref().cloned().unwrap_or_default();
-    if sinks.len() != destinations.len() {
-        return Err(format!(
-            "SPLIT_DATA_STREAM_SINK: sinks size {} != destinations size {}",
-            sinks.len(),
-            destinations.len()
-        ));
-    }
-    sinks
-        .iter()
-        .zip(destinations)
-        .enumerate()
-        .map(|(branch_index, (stream, destinations))| {
-            data_stream_input_from_compat(
-                stream,
-                destinations,
-                FieldPath::root("exec_plan_fragment")
-                    .field("fragment")
-                    .field("output_sink")
-                    .field("split_stream_sink")
-                    .field("destinations")
-                    .index(branch_index),
-                arena,
-                layout,
-                last_query_id,
-                external_dependencies,
-            )
-        })
-        .collect()
-}
-
-fn iceberg_router_input_from_compat(
-    router: &data_sinks::TIcebergChangeStreamRouterSink,
-    arena: &mut ExprArena,
-    layout: &crate::protocol::starrocks::decode::layout::Layout,
-    last_query_id: Option<&str>,
-    external_dependencies: Option<
-        &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
-    >,
-) -> Result<IcebergChangeStreamRouterSinkFactoryInput, String> {
-    let branches = router
-        .branches
-        .iter()
-        .enumerate()
-        .map(|(branch_index, branch)| {
-            let branch_kind = branch_kind_from_thrift(branch.branch_kind)?;
-            Ok(IcebergChangeStreamRouterBranchFactoryInput {
-                branch_id: branch.branch_id,
-                branch_kind,
-                stream_sink: data_stream_input_from_compat(
-                    &branch.stream_sink,
-                    branch.destinations.clone(),
-                    FieldPath::root("exec_plan_fragment")
-                        .field("fragment")
-                        .field("output_sink")
-                        .field("iceberg_change_stream_router_sink")
-                        .field("branches")
-                        .index(branch_index)
-                        .field("destinations"),
-                    arena,
-                    layout,
-                    last_query_id,
-                    external_dependencies,
-                )?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(IcebergChangeStreamRouterSinkFactoryInput {
-        change_op_slot_id: router.change_op_slot_id,
-        data_route_slot_id: router.data_route_slot_id,
-        branches,
-    })
-}
-
-struct DecodedCompatFragmentSink {
-    spec: FragmentSinkSpec,
-    assignment: FragmentSinkAssignment,
-    fragment_instance_id: UniqueId,
-    exchange_finst_id: Option<(i64, i64)>,
-    result_override: Option<(ResultSinkConfig, Option<Vec<ResultProjection>>)>,
-    root_sink_dop: Option<i32>,
-}
-
-fn exchange_finst_id(
+fn snapshot_decode_facts(
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-) -> Option<(i64, i64)> {
-    exec_params.map(|params| {
-        (
-            params.fragment_instance_id.hi,
-            params.fragment_instance_id.lo,
-        )
-    })
-}
-
-fn fragment_instance_id_or_zero(
-    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-) -> UniqueId {
-    exec_params
-        .map(unique_id_from_exec_params)
-        .unwrap_or(UniqueId { hi: 0, lo: 0 })
-}
-
-fn static_branch_from_factory_input(
-    input: DataStreamSinkFactoryInput,
-    limit: Option<i64>,
-) -> Result<(DataStreamSinkBranchProgram, Vec<FragmentDestination>), String> {
-    let program = DataStreamSinkBranchProgram::try_new(
-        input.dest_node_id,
-        input.output_exprs,
-        input.output_partition_type,
-        input.output_partition_exprs,
-        input.output_columns,
-        limit,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok((program, input.destinations))
-}
-
-fn static_stream_from_factory_input(
-    input: DataStreamSinkFactoryInput,
-    limit: Option<i64>,
-    arena: ExprArena,
-) -> Result<(DataStreamSinkProgram, Vec<FragmentDestination>), String> {
-    let program = DataStreamSinkProgram::try_new(
-        input.dest_node_id,
-        input.output_exprs,
-        input.output_partition_type,
-        input.output_partition_exprs,
-        input.output_columns,
-        limit,
-        arena,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok((program, input.destinations))
-}
-
-fn decoded_compat_sink(
-    program: FragmentSinkProgram,
-    assignment: FragmentSinkAssignment,
-    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-) -> Result<DecodedCompatFragmentSink, String> {
-    Ok(DecodedCompatFragmentSink {
-        spec: FragmentSinkSpec::try_new(program).map_err(|error| error.to_string())?,
-        assignment,
-        fragment_instance_id: fragment_instance_id_or_zero(exec_params),
-        exchange_finst_id: exchange_finst_id(exec_params),
-        result_override: None,
-        root_sink_dop: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_fragment_sink(
-    sink: &data_sinks::TDataSink,
-    fragment: &planner::TPlanFragment,
-    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-    desc_tbl: Option<&descriptors::TDescriptorTable>,
-    arena: &mut ExprArena,
-    lowered: &Lowered,
-    last_query_id: Option<&str>,
-    session_time_zone: Option<&str>,
-    external_dependencies: &StarRocksExternalDependencyDraft,
-) -> Result<DecodedCompatFragmentSink, String> {
-    match sink.type_ {
-        data_sinks::TDataSinkType::DATA_STREAM_SINK => {
-            let stream_sink = sink
-                .stream_sink
-                .as_ref()
-                .ok_or_else(|| "DATA_STREAM_SINK missing stream_sink payload".to_string())?;
-            let exec_params =
-                exec_params.ok_or_else(|| "DATA_STREAM_SINK requires exec_params".to_string())?;
-            let input = data_stream_input_from_compat(
-                stream_sink,
-                exec_params.destinations.clone().unwrap_or_default(),
-                FieldPath::root("exec_plan_fragment")
-                    .field("params")
-                    .field("destinations"),
-                arena,
-                &lowered.layout,
-                last_query_id,
-                Some(external_dependencies),
-            )?;
-            let (program, destinations) =
-                static_stream_from_factory_input(input, stream_sink.limit, arena.clone())?;
-            decoded_compat_sink(
-                FragmentSinkProgram::DataStream(program),
-                FragmentSinkAssignment::StreamDestinations {
-                    destinations,
-                    sender_id: exec_params.sender_id,
-                },
-                Some(exec_params),
-            )
-        }
-        data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
-            let multi_cast = sink.multi_cast_stream_sink.as_ref().ok_or_else(|| {
-                "MULTI_CAST_DATA_STREAM_SINK missing multi_cast_stream_sink payload".to_string()
-            })?;
-            let exec_params = exec_params
-                .ok_or_else(|| "MULTI_CAST_DATA_STREAM_SINK requires exec_params".to_string())?;
-            let inputs = multi_cast_inputs_from_compat(
-                multi_cast,
-                arena,
-                &lowered.layout,
-                last_query_id,
-                Some(external_dependencies),
-            )?;
-            let (programs, groups): (Vec<_>, Vec<_>) = inputs
-                .into_iter()
-                .map(|(input, limit)| static_branch_from_factory_input(input, limit))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .unzip();
-            let program = MultiCastDataStreamSinkProgram::try_new(programs, arena.clone())
-                .map_err(|error| error.to_string())?;
-            decoded_compat_sink(
-                FragmentSinkProgram::MultiCastDataStream(program),
-                FragmentSinkAssignment::DestinationGroups {
-                    groups,
-                    sender_id: exec_params.sender_id,
-                },
-                Some(exec_params),
-            )
-        }
-        data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK => {
-            let split = sink.split_stream_sink.as_ref().ok_or_else(|| {
-                "SPLIT_DATA_STREAM_SINK missing split_stream_sink payload".to_string()
-            })?;
-            let exec_params = exec_params
-                .ok_or_else(|| "SPLIT_DATA_STREAM_SINK requires exec_params".to_string())?;
-            let split_exprs = split
-                .split_exprs
-                .as_ref()
-                .ok_or_else(|| "SPLIT_DATA_STREAM_SINK missing split_exprs payload".to_string())?;
-            let split_expr_ids = split_exprs
-                .iter()
-                .map(|expr| {
-                    crate::protocol::starrocks::decode::expr::lower_t_expr(
-                        expr,
-                        arena,
-                        &lowered.layout,
-                        last_query_id,
-                        Some(external_dependencies),
-                    )
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let inputs = split_inputs_from_compat(
-                split,
-                arena,
-                &lowered.layout,
-                last_query_id,
-                Some(external_dependencies),
-            )?;
-            let (programs, groups): (Vec<_>, Vec<_>) = inputs
-                .into_iter()
-                .map(|input| static_branch_from_factory_input(input, None))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .unzip();
-            let program =
-                SplitDataStreamSinkProgram::try_new(programs, split_expr_ids, arena.clone())
-                    .map_err(|error| error.to_string())?;
-            decoded_compat_sink(
-                FragmentSinkProgram::SplitDataStream(program),
-                FragmentSinkAssignment::DestinationGroups {
-                    groups,
-                    sender_id: exec_params.sender_id,
-                },
-                Some(exec_params),
-            )
-        }
-        data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
-            let router = sink
-                .iceberg_change_stream_router_sink
-                .as_ref()
-                .ok_or_else(|| {
-                    "ICEBERG_CHANGE_STREAM_ROUTER_SINK missing iceberg_change_stream_router_sink"
-                        .to_string()
-                })?;
-            let exec_params = exec_params.ok_or_else(|| {
-                "ICEBERG_CHANGE_STREAM_ROUTER_SINK requires exec_params".to_string()
-            })?;
-            let input = iceberg_router_input_from_compat(
-                router,
-                arena,
-                &lowered.layout,
-                last_query_id,
-                Some(external_dependencies),
-            )?;
-            let change_op_slot_id = SlotId::try_from(input.change_op_slot_id)
-                .map_err(|error| format!("invalid change_op_slot_id: {error}"))?;
-            let data_route_slot_id = input
-                .data_route_slot_id
-                .map(SlotId::try_from)
-                .transpose()
-                .map_err(|error| format!("invalid data_route_slot_id: {error}"))?;
-            let (branches, groups): (Vec<_>, Vec<_>) = input
-                .branches
-                .into_iter()
-                .map(|branch| {
-                    let (stream, destinations) =
-                        static_branch_from_factory_input(branch.stream_sink, None)?;
-                    Ok((
-                        IcebergChangeStreamRouterBranchProgram::new(
-                            branch.branch_id,
-                            branch.branch_kind,
-                            stream,
-                        ),
-                        destinations,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?
-                .into_iter()
-                .unzip();
-            let program = IcebergChangeStreamRouterProgram::try_new(
-                change_op_slot_id,
-                data_route_slot_id,
-                branches,
-                arena.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            decoded_compat_sink(
-                FragmentSinkProgram::IcebergChangeStreamRouter(program),
-                FragmentSinkAssignment::DestinationGroups {
-                    groups,
-                    sender_id: exec_params.sender_id,
-                },
-                Some(exec_params),
-            )
-        }
-        data_sinks::TDataSinkType::RESULT_SINK => {
-            let result_sink = sink
-                .result_sink
-                .as_ref()
-                .ok_or_else(|| "RESULT_SINK missing result_sink payload".to_string())?;
-            let mut decoded = decoded_compat_sink(
-                FragmentSinkProgram::Result,
-                FragmentSinkAssignment::None,
-                exec_params,
-            )?;
-            decoded.result_override = Some((
-                result_sink_config_from_thrift(result_sink)?,
-                result_projections_from_thrift_exprs(fragment.output_exprs.as_ref())?,
-            ));
-            Ok(decoded)
-        }
-        data_sinks::TDataSinkType::NOOP_SINK | data_sinks::TDataSinkType::SCHEMA_TABLE_SINK => {
-            decoded_compat_sink(
-                FragmentSinkProgram::Noop,
-                FragmentSinkAssignment::None,
-                exec_params,
-            )
-        }
-        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-        | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-        | data_sinks::TDataSinkType::ICEBERG_DV_SINK
-        | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => {
-            let sink_type_name = iceberg_sink_type_name(sink.type_);
-            let iceberg_sink = sink
-                .iceberg_table_sink
-                .as_ref()
-                .ok_or_else(|| format!("{sink_type_name} missing iceberg_table_sink payload"))?;
-            let output_exprs = fragment
-                .output_exprs
-                .as_ref()
-                .ok_or_else(|| format!("{sink_type_name} missing output_exprs"))?;
-            let desc_tbl =
-                desc_tbl.ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
-            let sink_mode =
-                crate::protocol::starrocks::decode::sink::iceberg::iceberg_sink_mode_for_type(
-                    sink.type_,
-                );
-            let input = crate::protocol::starrocks::decode::sink::iceberg::lower_iceberg_sink_factory_input(
-                iceberg_sink,
-                sink_mode,
-                output_exprs,
-                &lowered.layout,
-                desc_tbl,
-                last_query_id,
-                Some(external_dependencies),
-            )?;
-            let program = IcebergTableSinkProgram::try_from_factory_input(input)
-                .map_err(|error| error.to_string())?;
-            let mut decoded = decoded_compat_sink(
-                FragmentSinkProgram::IcebergTable(program),
-                FragmentSinkAssignment::None,
-                exec_params,
-            )?;
-            decoded.root_sink_dop = (sink_mode
-                == crate::connector::iceberg::IcebergSinkMode::DeletionVectors)
-                .then_some(1);
-            Ok(decoded)
-        }
-        data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
-            #[cfg(feature = "compat")]
-            {
-                let olap_sink = sink
-                    .olap_table_sink
-                    .as_ref()
-                    .ok_or_else(|| "OLAP_TABLE_SINK missing olap_table_sink payload".to_string())?;
-                let draft_plan = ExecPlan {
-                    arena: arena.clone(),
-                    root: lowered.node.clone(),
+) -> Result<StarRocksDecodeFacts, String> {
+    let mut stream_load_paths = BTreeMap::new();
+    if let Some(exec_params) = exec_params {
+        for ranges in exec_params.per_node_scan_ranges.values() {
+            for params in ranges {
+                let Some(broker) = params.scan_range.broker_scan_range.as_ref() else {
+                    continue;
                 };
-                let (program, assignment) = crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_table_sink(
-                    olap_sink,
-                    fragment.output_exprs.as_deref(),
-                    Some(&draft_plan),
-                    Some(&lowered.layout),
-                    last_query_id,
-                    session_time_zone,
-                    Some(external_dependencies),
-                )?;
-                decoded_compat_sink(
-                    FragmentSinkProgram::StarRocksTable(program),
-                    FragmentSinkAssignment::StarRocksTable(assignment),
-                    exec_params,
-                )
+                for range in &broker.ranges {
+                    if range.file_type != types::TFileType::FILE_STREAM {
+                        continue;
+                    }
+                    let load_id = range
+                        .load_id
+                        .as_ref()
+                        .ok_or_else(|| "FILE_STREAM range is missing load_id".to_string())?;
+                    let path = crate::service::stream_load_registry::resolve_stream_load_file_path(
+                        load_id,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "no registered local file for FILE_STREAM load_id={}:{}",
+                            load_id.hi, load_id.lo
+                        )
+                    })?;
+                    stream_load_paths.insert(
+                        UniqueId {
+                            hi: load_id.hi,
+                            lo: load_id.lo,
+                        },
+                        path,
+                    );
+                }
             }
-            #[cfg(not(feature = "compat"))]
-            Err("OLAP_TABLE_SINK requires the compat feature".to_string())
         }
-        other => Err(format!(
-            "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, ICEBERG_CHANGE_STREAM_ROUTER_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
-            other
-        )),
-    }
-}
-
-fn branch_kind_from_thrift(
-    value: data_sinks::TIcebergChangeStreamRouterBranchKind,
-) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
-    use crate::sql::common::ChangeStreamBranchKind;
-
-    match value {
-        data_sinks::TIcebergChangeStreamRouterBranchKind::DELETE_DV => {
-            Ok(ChangeStreamBranchKind::DeleteDv)
-        }
-        data_sinks::TIcebergChangeStreamRouterBranchKind::REUSE_DATA => {
-            Ok(ChangeStreamBranchKind::ReuseData)
-        }
-        data_sinks::TIcebergChangeStreamRouterBranchKind::FRESH_DATA => {
-            Ok(ChangeStreamBranchKind::FreshData)
-        }
-        _ => Err(format!(
-            "unsupported Iceberg change-stream router branch kind {}",
-            value.0
-        )),
-    }
-}
-
-fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
-    match t {
-        data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => "ICEBERG_DELETE_SINK",
-        data_sinks::TDataSinkType::ICEBERG_DV_SINK => "ICEBERG_DV_SINK",
-        data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => "ICEBERG_EQUALITY_DELETE_SINK",
-        _ => "ICEBERG_TABLE_SINK",
-    }
-}
-
-fn result_sink_config_from_thrift(
-    result_sink: &data_sinks::TResultSink,
-) -> Result<ResultSinkConfig, String> {
-    let sink_type = result_sink
-        .type_
-        .unwrap_or(data_sinks::TResultSinkType::MYSQL_PROTOCAL);
-    match sink_type {
-        t if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(ResultSinkConfig::mysql()),
-        t if t == data_sinks::TResultSinkType::HTTP_PROTOCAL => {
-            let format = result_sink
-                .format
-                .unwrap_or(data_sinks::TResultSinkFormatType::JSON);
-            if format != data_sinks::TResultSinkFormatType::JSON {
-                return Err(format!(
-                    "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
-                    format
-                ));
-            }
-            Ok(ResultSinkConfig::http_json())
-        }
-        t if t == data_sinks::TResultSinkType::STATISTIC => {
-            Ok(ResultSinkConfig::statistic(thrift_statistic_row_encoder))
-        }
-        other => Err(format!("unsupported RESULT_SINK type {:?}", other)),
-    }
-}
-
-const STATISTIC_DATA_VERSION_V1: i32 = 1;
-const STATISTIC_HISTOGRAM_VERSION: i32 = 2;
-const STATISTIC_TABLE_VERSION: i32 = 3;
-const STATISTIC_BATCH_VERSION: i32 = 4;
-const STATISTIC_EXTERNAL_VERSION: i32 = 5;
-const STATISTIC_EXTERNAL_QUERY_VERSION: i32 = 6;
-const STATISTIC_EXTERNAL_HISTOGRAM_VERSION: i32 = 7;
-const STATISTIC_EXTERNAL_QUERY_VERSION_V2: i32 = 8;
-const STATISTIC_BATCH_VERSION_V5: i32 = 9;
-const STATISTIC_DATA_VERSION_V2: i32 = 10;
-const STATISTIC_PARTITION_VERSION: i32 = 11;
-const STATISTIC_MULTI_COLUMN_VERSION: i32 = 12;
-const STATISTIC_QUERY_MULTI_COLUMN_VERSION: i32 = 13;
-const STATISTIC_PARTITION_VERSION_V2: i32 = 20;
-const STATISTIC_DICT_VERSION: i32 = 101;
-
-fn field_bytes<'a>(
-    fields: &'a [Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<&'a [u8]>, String> {
-    let value = fields
-        .get(idx)
-        .ok_or_else(|| format!("missing field {field_name} at column {idx}"))?;
-    Ok(value.as_deref())
-}
-
-fn field_optional_i64(
-    fields: &[Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<i64>, String> {
-    let Some(raw) = field_bytes(fields, idx, field_name)? else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(raw)
-        .map_err(|e| format!("field {field_name} is not valid UTF-8: {e}"))?;
-    text.parse::<i64>()
-        .map(Some)
-        .map_err(|e| format!("field {field_name} parse i64 failed: {e}"))
-}
-
-fn field_optional_f64(
-    fields: &[Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<f64>, String> {
-    let Some(raw) = field_bytes(fields, idx, field_name)? else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(raw)
-        .map_err(|e| format!("field {field_name} is not valid UTF-8: {e}"))?;
-    text.parse::<f64>()
-        .map(Some)
-        .map_err(|e| format!("field {field_name} parse f64 failed: {e}"))
-}
-
-fn field_optional_string(
-    fields: &[Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<String>, String> {
-    let Some(raw) = field_bytes(fields, idx, field_name)? else {
-        return Ok(None);
-    };
-    let text = std::str::from_utf8(raw)
-        .map_err(|e| format!("field {field_name} is not valid UTF-8: {e}"))?;
-    Ok(Some(text.to_string()))
-}
-
-fn normalize_hll_hex_payload(raw: &[u8]) -> Vec<u8> {
-    if raw.len().is_multiple_of(2) && raw.iter().all(|b| b.is_ascii_hexdigit()) {
-        return raw.to_vec();
-    }
-    hex::encode_upper(raw).into_bytes()
-}
-
-fn field_optional_hll_hex_bytes(
-    fields: &[Option<Vec<u8>>],
-    idx: usize,
-    field_name: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    let Some(raw) = field_bytes(fields, idx, field_name)? else {
-        return Ok(None);
-    };
-    Ok(Some(normalize_hll_hex_payload(raw)))
-}
-
-fn decode_dict_base64(input: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(input)
-        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(input))
-        .map_err(|e| format!("decode dict base64 failed: {e}"))
-}
-
-fn parse_global_dict_json(raw: &str) -> Result<data::TGlobalDict, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("parse dict json failed: {e}"))?;
-    let strings_list = value
-        .get("2")
-        .and_then(|v| v.get("lst"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "dict json missing 2.lst".to_string())?;
-    let ids_list = value
-        .get("3")
-        .and_then(|v| v.get("lst"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "dict json missing 3.lst".to_string())?;
-
-    if strings_list.len() < 2 || ids_list.len() < 2 {
-        return Err("dict json list is too short".to_string());
-    }
-    let string_type = strings_list[0]
-        .as_str()
-        .ok_or_else(|| "dict strings type is not string".to_string())?;
-    if !string_type.eq_ignore_ascii_case("str") {
-        return Err(format!("dict strings type mismatch: {string_type}"));
-    }
-    let ids_type = ids_list[0]
-        .as_str()
-        .ok_or_else(|| "dict ids type is not string".to_string())?;
-    if !ids_type.eq_ignore_ascii_case("i32") {
-        return Err(format!("dict ids type mismatch: {ids_type}"));
     }
 
-    let mut strings = Vec::with_capacity(strings_list.len().saturating_sub(2));
-    for item in strings_list.iter().skip(2) {
-        let encoded = item
-            .as_str()
-            .ok_or_else(|| "dict encoded string item is not string".to_string())?;
-        strings.push(decode_dict_base64(encoded)?);
-    }
-
-    let mut ids = Vec::with_capacity(ids_list.len().saturating_sub(2));
-    for item in ids_list.iter().skip(2) {
-        let id = item
-            .as_i64()
-            .ok_or_else(|| "dict id item is not integer".to_string())?;
-        let id = i32::try_from(id).map_err(|_| "dict id overflows i32".to_string())?;
-        ids.push(id);
-    }
-
-    Ok(data::TGlobalDict::new(None, Some(strings), Some(ids), None))
-}
-
-fn rows_to_statistic_data(
-    version: i32,
-    fields: &[Option<Vec<u8>>],
-) -> Result<data::TStatisticData, String> {
-    let cols = fields.len();
-    let mut out = data::TStatisticData::default();
-    match version {
-        STATISTIC_DICT_VERSION => {
-            if cols != 3 {
-                return Err(format!(
-                    "statistic version {version} expects 3 columns, got {cols}"
-                ));
-            }
-            out.meta_version = field_optional_i64(fields, 1, "meta_version")?;
-            if let Some(dict_json) = field_optional_string(fields, 2, "dict_json")? {
-                out.dict = Some(parse_global_dict_json(&dict_json)?);
-            }
-        }
-        STATISTIC_DATA_VERSION_V1 => {
-            if cols != 11 {
-                return Err(format!(
-                    "statistic version {version} expects 11 columns, got {cols}"
-                ));
-            }
-            out.update_time = field_optional_string(fields, 1, "update_time")?;
-            out.db_id = field_optional_i64(fields, 2, "db_id")?;
-            out.table_id = field_optional_i64(fields, 3, "table_id")?;
-            out.column_name = field_optional_string(fields, 4, "column_name")?;
-            out.row_count = field_optional_i64(fields, 5, "row_count")?;
-            out.data_size = field_optional_f64(fields, 6, "data_size")?.map(OrderedFloat);
-            out.count_distinct = field_optional_i64(fields, 7, "count_distinct")?;
-            out.null_count = field_optional_i64(fields, 8, "null_count")?;
-            out.max = field_optional_string(fields, 9, "max")?;
-            out.min = field_optional_string(fields, 10, "min")?;
-        }
-        STATISTIC_DATA_VERSION_V2 => {
-            if cols != 12 {
-                return Err(format!(
-                    "statistic version {version} expects 12 columns, got {cols}"
-                ));
-            }
-            out.update_time = field_optional_string(fields, 1, "update_time")?;
-            out.db_id = field_optional_i64(fields, 2, "db_id")?;
-            out.table_id = field_optional_i64(fields, 3, "table_id")?;
-            out.column_name = field_optional_string(fields, 4, "column_name")?;
-            out.row_count = field_optional_i64(fields, 5, "row_count")?;
-            out.data_size = field_optional_f64(fields, 6, "data_size")?.map(OrderedFloat);
-            out.count_distinct = field_optional_i64(fields, 7, "count_distinct")?;
-            out.null_count = field_optional_i64(fields, 8, "null_count")?;
-            out.max = field_optional_string(fields, 9, "max")?;
-            out.min = field_optional_string(fields, 10, "min")?;
-            out.collection_size = field_optional_i64(fields, 11, "collection_size")?;
-        }
-        STATISTIC_HISTOGRAM_VERSION => {
-            if cols != 5 {
-                return Err(format!(
-                    "statistic version {version} expects 5 columns, got {cols}"
-                ));
-            }
-            out.db_id = field_optional_i64(fields, 1, "db_id")?;
-            out.table_id = field_optional_i64(fields, 2, "table_id")?;
-            out.column_name = field_optional_string(fields, 3, "column_name")?;
-            out.histogram = field_optional_string(fields, 4, "histogram")?;
-        }
-        STATISTIC_EXTERNAL_HISTOGRAM_VERSION => {
-            if cols != 3 {
-                return Err(format!(
-                    "statistic version {version} expects 3 columns, got {cols}"
-                ));
-            }
-            out.column_name = field_optional_string(fields, 1, "column_name")?;
-            out.histogram = field_optional_string(fields, 2, "histogram")?;
-        }
-        STATISTIC_TABLE_VERSION => {
-            if cols != 3 {
-                return Err(format!(
-                    "statistic version {version} expects 3 columns, got {cols}"
-                ));
-            }
-            out.partition_id = field_optional_i64(fields, 1, "partition_id")?;
-            out.row_count = field_optional_i64(fields, 2, "row_count")?;
-        }
-        STATISTIC_BATCH_VERSION => {
-            if cols != 9 {
-                return Err(format!(
-                    "statistic version {version} expects 9 columns, got {cols}"
-                ));
-            }
-            out.partition_id = field_optional_i64(fields, 1, "partition_id")?;
-            out.column_name = field_optional_string(fields, 2, "column_name")?;
-            out.row_count = field_optional_i64(fields, 3, "row_count")?;
-            out.data_size = field_optional_f64(fields, 4, "data_size")?.map(OrderedFloat);
-            out.hll = field_optional_hll_hex_bytes(fields, 5, "hll")?;
-            out.null_count = field_optional_i64(fields, 6, "null_count")?;
-            out.max = field_optional_string(fields, 7, "max")?;
-            out.min = field_optional_string(fields, 8, "min")?;
-        }
-        STATISTIC_BATCH_VERSION_V5 => {
-            if cols != 10 {
-                return Err(format!(
-                    "statistic version {version} expects 10 columns, got {cols}"
-                ));
-            }
-            out.partition_id = field_optional_i64(fields, 1, "partition_id")?;
-            out.column_name = field_optional_string(fields, 2, "column_name")?;
-            out.row_count = field_optional_i64(fields, 3, "row_count")?;
-            out.data_size = field_optional_f64(fields, 4, "data_size")?.map(OrderedFloat);
-            out.hll = field_optional_hll_hex_bytes(fields, 5, "hll")?;
-            out.null_count = field_optional_i64(fields, 6, "null_count")?;
-            out.max = field_optional_string(fields, 7, "max")?;
-            out.min = field_optional_string(fields, 8, "min")?;
-            out.collection_size = field_optional_i64(fields, 9, "collection_size")?;
-        }
-        STATISTIC_PARTITION_VERSION => {
-            if cols != 4 {
-                return Err(format!(
-                    "statistic version {version} expects 4 columns, got {cols}"
-                ));
-            }
-            out.partition_id = field_optional_i64(fields, 1, "partition_id")?;
-            out.column_name = field_optional_string(fields, 2, "column_name")?;
-            out.count_distinct = field_optional_i64(fields, 3, "count_distinct")?;
-        }
-        STATISTIC_PARTITION_VERSION_V2 => {
-            if cols != 6 {
-                return Err(format!(
-                    "statistic version {version} expects 6 columns, got {cols}"
-                ));
-            }
-            out.partition_id = field_optional_i64(fields, 1, "partition_id")?;
-            out.column_name = field_optional_string(fields, 2, "column_name")?;
-            out.count_distinct = field_optional_i64(fields, 3, "count_distinct")?;
-            out.null_count = field_optional_i64(fields, 4, "null_count")?;
-            out.row_count = field_optional_i64(fields, 5, "row_count")?;
-        }
-        STATISTIC_EXTERNAL_VERSION => {
-            if cols != 9 {
-                return Err(format!(
-                    "statistic version {version} expects 9 columns, got {cols}"
-                ));
-            }
-            out.partition_name = field_optional_string(fields, 1, "partition_name")?;
-            out.column_name = field_optional_string(fields, 2, "column_name")?;
-            out.row_count = field_optional_i64(fields, 3, "row_count")?;
-            out.data_size = field_optional_f64(fields, 4, "data_size")?.map(OrderedFloat);
-            out.hll = field_optional_hll_hex_bytes(fields, 5, "hll")?;
-            out.null_count = field_optional_i64(fields, 6, "null_count")?;
-            out.max = field_optional_string(fields, 7, "max")?;
-            out.min = field_optional_string(fields, 8, "min")?;
-        }
-        STATISTIC_EXTERNAL_QUERY_VERSION => {
-            if cols != 8 {
-                return Err(format!(
-                    "statistic version {version} expects 8 columns, got {cols}"
-                ));
-            }
-            out.column_name = field_optional_string(fields, 1, "column_name")?;
-            out.row_count = field_optional_i64(fields, 2, "row_count")?;
-            out.data_size = field_optional_f64(fields, 3, "data_size")?.map(OrderedFloat);
-            out.count_distinct = field_optional_i64(fields, 4, "count_distinct")?;
-            out.null_count = field_optional_i64(fields, 5, "null_count")?;
-            out.max = field_optional_string(fields, 6, "max")?;
-            out.min = field_optional_string(fields, 7, "min")?;
-        }
-        STATISTIC_EXTERNAL_QUERY_VERSION_V2 => {
-            if cols != 9 {
-                return Err(format!(
-                    "statistic version {version} expects 9 columns, got {cols}"
-                ));
-            }
-            out.column_name = field_optional_string(fields, 1, "column_name")?;
-            out.row_count = field_optional_i64(fields, 2, "row_count")?;
-            out.data_size = field_optional_f64(fields, 3, "data_size")?.map(OrderedFloat);
-            out.count_distinct = field_optional_i64(fields, 4, "count_distinct")?;
-            out.null_count = field_optional_i64(fields, 5, "null_count")?;
-            out.max = field_optional_string(fields, 6, "max")?;
-            out.min = field_optional_string(fields, 7, "min")?;
-            out.update_time = field_optional_string(fields, 8, "update_time")?;
-        }
-        STATISTIC_MULTI_COLUMN_VERSION => {
-            if cols != 3 {
-                return Err(format!(
-                    "statistic version {version} expects 3 columns, got {cols}"
-                ));
-            }
-            out.column_name = field_optional_string(fields, 1, "column_name")?;
-            out.count_distinct = field_optional_i64(fields, 2, "count_distinct")?;
-        }
-        STATISTIC_QUERY_MULTI_COLUMN_VERSION => {
-            if cols != 5 {
-                return Err(format!(
-                    "statistic version {version} expects 5 columns, got {cols}"
-                ));
-            }
-            out.db_id = field_optional_i64(fields, 1, "db_id")?;
-            out.table_id = field_optional_i64(fields, 2, "table_id")?;
-            out.column_name = field_optional_string(fields, 3, "column_name")?;
-            out.count_distinct = field_optional_i64(fields, 4, "count_distinct")?;
-        }
-        _ => {
-            return Err(format!("unsupported statistic version: {version}"));
-        }
-    }
-    Ok(out)
-}
-
-fn thrift_statistic_row_encoder(
-    version: i32,
-    fields: &[Option<Vec<u8>>],
-) -> Result<Vec<u8>, String> {
-    let row_sd = rows_to_statistic_data(version, fields)?;
-    thrift_compact_serialize(&row_sd)
-}
-
-fn result_projection_from_thrift_expr(
-    expr: &crate::thrift::exprs::TExpr,
-    idx: usize,
-) -> Result<ResultProjection, String> {
-    let root = expr
-        .nodes
-        .first()
-        .ok_or_else(|| format!("RESULT_SINK output_exprs[{idx}] is empty"))?;
-    if root.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
-        return Err(format!(
-            "RESULT_SINK output_exprs[{idx}] unsupported node_type {:?} (expected SLOT_REF)",
-            root.node_type
-        ));
-    }
-    let slot = root
-        .slot_ref
-        .as_ref()
-        .ok_or_else(|| format!("RESULT_SINK output_exprs[{idx}] missing slot_ref payload"))?;
-    Ok(ResultProjection {
-        slot_id: SlotId::try_from(slot.slot_id)?,
-        primitive: native_primitive_type_from_desc(&root.type_).unwrap_or(PrimitiveType::Invalid),
-        field_schema: render_schema_from_type_desc(&root.type_)?,
-    })
-}
-
-fn result_projections_from_thrift_exprs(
-    output_exprs: Option<&Vec<crate::thrift::exprs::TExpr>>,
-) -> Result<Option<Vec<ResultProjection>>, String> {
-    let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
-        return Ok(None);
-    };
-    output_exprs
-        .iter()
-        .enumerate()
-        .map(|(idx, expr)| result_projection_from_thrift_expr(expr, idx))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    let config = crate::common::app_config::config().map_err(|error| error.to_string())?;
+    let rewrite = &config.runtime.path_rewrite;
+    let path_rewrite = rewrite.enable.then(|| {
+        StarRocksPathRewriteFacts::new(rewrite.from_prefix.clone(), rewrite.to_prefix.clone())
+    });
+    let datacache_available = config.runtime.cache.datacache_enable
+        && DataCacheManager::instance().block_cache().is_some();
+    let jdbc = config.jdbc_config().map(|jdbc| {
+        StarRocksJdbcFacts::new(
+            jdbc.url.clone(),
+            jdbc.user.clone(),
+            jdbc.password.clone(),
+            jdbc.default_db.clone(),
+        )
+    });
+    let object_storage = &config.runtime.object_storage;
+    let object_store_defaults = StarRocksObjectStoreDefaults::new(
+        object_storage.retry_max_times,
+        object_storage.retry_min_delay_ms,
+        object_storage.retry_max_delay_ms,
+        object_storage.timeout_ms,
+        object_storage.io_timeout_ms,
+    );
+    Ok(StarRocksDecodeFacts::new(
+        stream_load_paths,
+        path_rewrite,
+        datacache_available,
+        jdbc,
+        object_store_defaults,
+    ))
 }
 
 #[cfg(feature = "compat")]
@@ -1306,6 +364,9 @@ pub(crate) fn execute_fragment(
     mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
     typed_result_sink: bool,
 ) -> Result<FragmentOutput, String> {
+    if let Some(sink) = fragment.output_sink.as_ref() {
+        require_exec_params_for_sink(sink, exec_params)?;
+    }
     let runtime_fe_addr = fe_addr
         .map(|address| {
             decode_runtime_endpoint(
@@ -1411,6 +472,68 @@ pub(crate) fn execute_fragment(
             let decode_result = {
                 let _lower_timer = profiler.as_ref().map(|p| p.scoped_timer("LowerPlanTime"));
                 (|| {
+                    let decode_facts = snapshot_decode_facts(exec_params)?;
+                    let empty_scan_ranges = BTreeMap::new();
+                    let raw_scan_ranges = exec_params
+                        .map(|params| &params.per_node_scan_ranges)
+                        .unwrap_or(&empty_scan_ranges);
+                    let (_, scan_assignments) =
+                        crate::protocol::starrocks::decode::decode_scan_contracts_and_assignments(
+                            &plan.nodes,
+                            raw_scan_ranges,
+                            &decode_facts,
+                            FieldPath::root("exec_plan_fragment")
+                                .field("params")
+                                .field("per_node_scan_ranges"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let broker_file_program_facts =
+                        crate::protocol::starrocks::decode::node::decode_broker_file_program_facts(
+                            &plan.nodes,
+                            raw_scan_ranges,
+                            &mut arena,
+                            FieldPath::root("exec_plan_fragment")
+                                .field("fragment")
+                                .field("plan")
+                                .field("nodes"),
+                            FieldPath::root("exec_plan_fragment")
+                                .field("params")
+                                .field("per_node_scan_ranges"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let lake_scan_program_facts =
+                        crate::protocol::starrocks::decode::decode_lake_scan_program_facts(
+                            &plan.nodes,
+                            raw_scan_ranges,
+                            FieldPath::root("exec_plan_fragment")
+                                .field("params")
+                                .field("per_node_scan_ranges"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let lake_meta_scan_range_facts =
+                        crate::protocol::starrocks::decode::decode_lake_meta_scan_range_facts(
+                            &plan.nodes,
+                            raw_scan_ranges,
+                            FieldPath::root("exec_plan_fragment")
+                                .field("params")
+                                .field("per_node_scan_ranges"),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let plan_context = StarRocksPlanDecodeContext::new(
+                        exec_params.map(|params| QueryId {
+                            hi: params.query_id.hi,
+                            lo: params.query_id.lo,
+                        }),
+                        exec_params.map(unique_id_from_exec_params),
+                        Some(&scan_assignments),
+                        Some(&broker_file_program_facts),
+                        Some(&lake_scan_program_facts),
+                        Some(&lake_meta_scan_range_facts),
+                        exec_params.map(|params| &params.per_exch_num_senders),
+                        batch_exchange_sender_counts,
+                        decode_query_options(query_opts).map_err(|error| error.to_string())?,
+                        &decode_facts,
+                    );
                     let lowered = lower_plan(
                         plan,
                         &mut arena,
@@ -1418,26 +541,56 @@ pub(crate) fn execute_fragment(
                         desc_tbl,
                         fragment.query_global_dicts.as_deref(),
                         fragment.query_global_dict_exprs.as_ref(),
-                        exec_params,
-                        batch_exchange_sender_counts,
-                        query_opts,
+                        &plan_context,
                         db_name,
                         &connectors,
                         &layout_hints,
                         last_query_id,
                         Some(&external_dependencies),
-                    )?;
+                        FieldPath::root("exec_plan_fragment")
+                            .field("fragment")
+                            .field("query_global_dicts"),
+                        FieldPath::root("exec_plan_fragment")
+                            .field("fragment")
+                            .field("query_global_dict_exprs"),
+                        FieldPath::root("exec_plan_fragment")
+                            .field("fragment")
+                            .field("plan"),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let destinations = exec_params
+                        .and_then(|params| params.destinations.as_deref())
+                        .unwrap_or(&[])
+                        .iter()
+                        .enumerate()
+                        .map(|(index, destination)| {
+                            decode_fragment_destination(
+                                destination,
+                                FieldPath::root("exec_plan_fragment")
+                                    .field("params")
+                                    .field("destinations")
+                                    .index(index),
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let prepared_sink = decode_fragment_sink(
                         sink,
                         fragment,
-                        exec_params,
+                        &destinations,
+                        exec_params.and_then(|params| params.sender_id),
                         desc_tbl,
                         &mut arena,
                         &lowered,
                         last_query_id,
                         session_time_zone,
                         &external_dependencies,
-                    )?;
+                        FieldPath::root("exec_plan_fragment")
+                            .field("fragment")
+                            .field("output_sink"),
+                        FieldPath::root("exec_plan_fragment").field("fragment"),
+                    )
+                    .map_err(|error| error.to_string())?;
                     Ok((lowered, prepared_sink))
                 })()
             };
@@ -1492,14 +645,21 @@ pub(crate) fn execute_fragment(
         );
         let root_plan_node_id = plan.nodes.first().map(|n| n.node_id).unwrap_or(-1);
 
-        let DecodedCompatFragmentSink {
+        let DecodedStarRocksFragmentSink {
             spec,
             assignment,
-            fragment_instance_id,
-            exchange_finst_id,
             result_override,
             root_sink_dop,
         } = prepared_sink;
+        let fragment_instance_id = exec_params
+            .map(unique_id_from_exec_params)
+            .unwrap_or(UniqueId { hi: 0, lo: 0 });
+        let exchange_finst_id = exec_params.map(|params| {
+            (
+                params.fragment_instance_id.hi,
+                params.fragment_instance_id.lo,
+            )
+        });
         let sink_factory = materialize_fragment_sink_components_with_result(
             &spec,
             &assignment,
@@ -1535,7 +695,14 @@ pub(crate) fn execute_fragment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::fragment::sink::FragmentSinkProgram;
     use crate::protocol::starrocks::decode::layout::Layout;
+    use crate::protocol::starrocks::decode::node::Lowered;
+    use crate::protocol::starrocks::decode::sink::fragment::{
+        iceberg_router_input_from_compat, multi_cast_inputs_from_compat,
+    };
+    use crate::runtime::fragment::instance::FragmentSinkAssignment;
+    use crate::thrift::data_sinks;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
     use crate::thrift::partitions::{TDataPartition, TPartitionType};
 
@@ -1671,6 +838,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn distributed_stream_sinks_without_exec_params_preserve_fail_fast_boundary() {
+        for (sink_type, label) in [
+            (
+                data_sinks::TDataSinkType::DATA_STREAM_SINK,
+                "DATA_STREAM_SINK",
+            ),
+            (
+                data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+                "MULTI_CAST_DATA_STREAM_SINK",
+            ),
+            (
+                data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK,
+                "SPLIT_DATA_STREAM_SINK",
+            ),
+            (
+                data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK,
+                "ICEBERG_CHANGE_STREAM_ROUTER_SINK",
+            ),
+        ] {
+            let sink = data_sink_with_split(sink_type, None);
+            let error = require_exec_params_for_sink(&sink, None)
+                .expect_err("distributed stream sink must require exec params");
+            assert_eq!(error, format!("{label} requires exec_params"));
+        }
+    }
+
     fn bool_literal_expr(value: bool) -> TExpr {
         let bool_type = crate::types::arrow_thrift::thrift_type_desc_from_primitive(
             types::TPrimitiveType::BOOLEAN,
@@ -1791,20 +985,43 @@ mod tests {
         let lowered = empty_lowered();
         let mut profiles = BTreeMap::new();
         let mut resolver_calls = 0;
+        let destinations = exec_params
+            .destinations
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(|(index, destination)| {
+                decode_fragment_destination(
+                    destination,
+                    FieldPath::root("exec_plan_fragment")
+                        .field("params")
+                        .field("destinations")
+                        .index(index),
+                )
+                .expect("test destination")
+            })
+            .collect::<Vec<_>>();
 
         let draft = StarRocksExternalDependencyDraft::new(None, profiles.clone());
         let first = decode_fragment_sink(
             &sink,
             &fragment,
-            Some(&exec_params),
+            &destinations,
+            exec_params.sender_id,
             None,
             &mut ExprArena::default(),
             &lowered,
             None,
             None,
             &draft,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink"),
+            FieldPath::root("exec_plan_fragment").field("fragment"),
         );
-        let first = classify_fragment_decode_attempt(first, &draft);
+        let first =
+            classify_fragment_decode_attempt(first.map_err(|error| error.to_string()), &draft);
         let retry = process_fragment_decode_attempt(first, |dependency| {
             resolver_calls += 1;
             let StarRocksExternalDependency::QueryProfile { query_id, .. } = dependency else {
@@ -1820,15 +1037,21 @@ mod tests {
         let second = decode_fragment_sink(
             &sink,
             &fragment,
-            Some(&exec_params),
+            &destinations,
+            exec_params.sender_id,
             None,
             &mut ExprArena::default(),
             &lowered,
             None,
             None,
             &draft,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink"),
+            FieldPath::root("exec_plan_fragment").field("fragment"),
         );
-        let second = classify_fragment_decode_attempt(second, &draft);
+        let second =
+            classify_fragment_decode_attempt(second.map_err(|error| error.to_string()), &draft);
         let ready = process_fragment_decode_attempt(second, |_| {
             resolver_calls += 1;
             Ok(true)
@@ -1852,6 +1075,7 @@ mod tests {
         let decoded = decode_fragment_sink(
             &sink,
             &fragment,
+            &[],
             None,
             None,
             &mut ExprArena::default(),
@@ -1859,6 +1083,10 @@ mod tests {
             None,
             None,
             &draft,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink"),
+            FieldPath::root("exec_plan_fragment").field("fragment"),
         )
         .expect("schema table sink");
 
@@ -1881,17 +1109,39 @@ mod tests {
         let exec_params = test_exec_params();
         let lowered = empty_lowered();
         let draft = StarRocksExternalDependencyDraft::new(None, BTreeMap::new());
+        let destinations = exec_params
+            .destinations
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(|(index, destination)| {
+                decode_fragment_destination(
+                    destination,
+                    FieldPath::root("exec_plan_fragment")
+                        .field("params")
+                        .field("destinations")
+                        .index(index),
+                )
+                .expect("test destination")
+            })
+            .collect::<Vec<_>>();
 
         let decoded = decode_fragment_sink(
             &sink,
             &fragment,
-            Some(&exec_params),
+            &destinations,
+            exec_params.sender_id,
             None,
             &mut ExprArena::default(),
             &lowered,
             None,
             None,
             &draft,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink"),
+            FieldPath::root("exec_plan_fragment").field("fragment"),
         )
         .expect("split sink");
 
@@ -1909,6 +1159,46 @@ mod tests {
     }
 
     #[test]
+    fn split_nested_destination_reports_fragment_branch_path() {
+        let stream = unpartitioned_stream_sink();
+        let split = data_sinks::TSplitDataStreamSink::new(
+            vec![stream.clone(), stream],
+            vec![vec![], vec![destination_without_endpoint()]],
+            vec![bool_literal_expr(true), bool_literal_expr(false)],
+        );
+        let sink = data_sink_with_split(
+            data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK,
+            Some(split),
+        );
+        let fragment = test_fragment(sink.clone());
+        let draft = StarRocksExternalDependencyDraft::new(None, BTreeMap::new());
+        let error = match decode_fragment_sink(
+            &sink,
+            &fragment,
+            &[],
+            None,
+            None,
+            &mut ExprArena::default(),
+            &empty_lowered(),
+            None,
+            None,
+            &draft,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink"),
+            FieldPath::root("exec_plan_fragment").field("fragment"),
+        ) {
+            Ok(_) => panic!("nested split destination without endpoint must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "starrocks protocol error at exec_plan_fragment.fragment.output_sink.split_stream_sink.destinations[1][0].brpc_server (missing field): destination requires brpc_server or deprecated_server"
+        );
+    }
+
+    #[test]
     fn multicast_nested_destination_reports_fragment_branch_path() {
         let stream = unpartitioned_stream_sink();
         let multi_cast = data_sinks::TMultiCastDataStreamSink::new(
@@ -1917,6 +1207,10 @@ mod tests {
         );
         let error = multi_cast_inputs_from_compat(
             &multi_cast,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink")
+                .field("multi_cast_stream_sink"),
             &mut ExprArena::default(),
             &empty_layout(),
             None,
@@ -1926,7 +1220,7 @@ mod tests {
         .expect("nested destination without an endpoint must be rejected");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "starrocks protocol error at exec_plan_fragment.fragment.output_sink.multi_cast_stream_sink.destinations[1][0].brpc_server (missing field): destination requires brpc_server or deprecated_server"
         );
     }
@@ -1954,6 +1248,10 @@ mod tests {
         );
         let error = iceberg_router_input_from_compat(
             &router,
+            FieldPath::root("exec_plan_fragment")
+                .field("fragment")
+                .field("output_sink")
+                .field("iceberg_change_stream_router_sink"),
             &mut ExprArena::default(),
             &empty_layout(),
             None,
@@ -1963,7 +1261,7 @@ mod tests {
         .expect("router destination without an endpoint must be rejected");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "starrocks protocol error at exec_plan_fragment.fragment.output_sink.iceberg_change_stream_router_sink.branches[1].destinations[0].brpc_server (missing field): destination requires brpc_server or deprecated_server"
         );
     }
