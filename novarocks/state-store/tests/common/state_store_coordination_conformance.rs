@@ -2955,26 +2955,48 @@ async fn contention_round(
         )
         .expect("contention manager");
         let resource = resource.clone();
+        let attempt = attempt();
+        let operation_id = OperationId::new_v7();
         contenders.spawn(async move {
-            manager
-                .acquire(resource, attempt(), OperationId::new_v7())
-                .await
+            let result = manager
+                .acquire(resource.clone(), attempt, operation_id)
+                .await;
+            (manager, resource, attempt, operation_id, result)
         });
     }
     let mut winner = None;
     let mut contended = 0;
+    let mut definite_conflicts = Vec::new();
     while let Some(result) = contenders.join_next().await {
-        match result
-            .expect("join contention contender")
-            .expect("contention contender reaches a typed outcome")
-        {
-            AcquireOutcome::Acquired(guard) => {
+        let (manager, resource, attempt, operation_id, result) =
+            result.expect("join contention contender");
+        match result {
+            Ok(AcquireOutcome::Acquired(guard)) => {
                 assert!(winner.replace(guard).is_none(), "only one lease winner");
             }
-            AcquireOutcome::Contended(_) => contended += 1,
-            AcquireOutcome::AwaitingTakeover(_) => {
+            Ok(AcquireOutcome::Contended(_)) => contended += 1,
+            Ok(AcquireOutcome::AwaitingTakeover(_)) => {
                 panic!("fresh/released resource must not require takeover observation")
             }
+            Err(error) if error.kind() == CoordinationErrorKind::OperationNotCommitted => {
+                assert_eq!(
+                    error.transaction_id(),
+                    Some(derive_transaction_id(operation_id, 1))
+                );
+                definite_conflicts.push((manager, resource, attempt));
+            }
+            Err(error) => panic!("contention contender failed unexpectedly: {error:?}"),
+        }
+    }
+    assert!(winner.is_some(), "one high-contention winner");
+    for (manager, resource, attempt) in definite_conflicts {
+        match manager
+            .acquire(resource, attempt, OperationId::new_v7())
+            .await
+            .expect("retry definite contention conflict")
+        {
+            AcquireOutcome::Contended(_) => contended += 1,
+            outcome => panic!("retry must observe the committed winner: {outcome:?}"),
         }
     }
     assert_eq!(contended, 7);
