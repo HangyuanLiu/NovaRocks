@@ -19,11 +19,14 @@
 mod codec;
 #[allow(dead_code)]
 mod error;
+mod gate;
 mod metrics;
 #[allow(dead_code)]
 mod model;
+mod operation;
 
 pub use error::{CoordinationError, CoordinationErrorKind};
+pub use gate::{IncarnationGate, WriteAdmission};
 pub use metrics::{
     COORDINATION_OPERATION_COUNT, COORDINATION_OUTCOME_COUNT, CoordinationMetrics,
     CoordinationMetricsSnapshot, CoordinationOperation, CoordinationOutcome,

@@ -42,6 +42,46 @@ use common::state_store_conformance::{
     PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_gate_suite() {
+    common::state_store_coordination_conformance::incarnation_gate_lifecycle(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::concurrent_bootstrap_converges(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::stale_snapshots_cannot_mutate(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::incarnation_overflow_fails_closed(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::identity_mismatch_is_corruption(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::recovery_is_operation_scoped(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::commit_unknown_uses_authoritative_read_back(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::cancelled_mutation_recovers_with_same_operation(
+        &conformance_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::admission_read_conflicts_with_restore(
+        &conformance_factory(),
+    )
+    .await;
+}
+
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
 }

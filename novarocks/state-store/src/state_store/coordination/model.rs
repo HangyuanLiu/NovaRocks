@@ -21,6 +21,7 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use super::error::CoordinationError;
+use crate::{OperationId, VersionToken};
 
 const MAX_RESOURCE_KEY_BYTES: usize = 8 * 1024;
 const MAX_HOLDER_ID_BYTES: usize = 256;
@@ -198,13 +199,31 @@ pub enum ControlPlaneMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPlaneSnapshot {
+    store_id: Uuid,
+    cluster_id: String,
     incarnation: ControlPlaneIncarnation,
     mode: ControlPlaneMode,
+    last_operation_id: OperationId,
+    version: VersionToken,
 }
 
 impl ControlPlaneSnapshot {
-    pub(crate) const fn new(incarnation: ControlPlaneIncarnation, mode: ControlPlaneMode) -> Self {
-        Self { incarnation, mode }
+    pub(crate) fn new(
+        store_id: Uuid,
+        cluster_id: String,
+        incarnation: ControlPlaneIncarnation,
+        mode: ControlPlaneMode,
+        last_operation_id: OperationId,
+        version: VersionToken,
+    ) -> Self {
+        Self {
+            store_id,
+            cluster_id,
+            incarnation,
+            mode,
+            last_operation_id,
+            version,
+        }
     }
 
     pub const fn incarnation(&self) -> ControlPlaneIncarnation {
@@ -213,6 +232,22 @@ impl ControlPlaneSnapshot {
 
     pub const fn mode(&self) -> ControlPlaneMode {
         self.mode
+    }
+
+    pub(crate) const fn store_id(&self) -> Uuid {
+        self.store_id
+    }
+
+    pub(crate) fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub(crate) const fn last_operation_id(&self) -> OperationId {
+        self.last_operation_id
+    }
+
+    pub(crate) fn version(&self) -> &VersionToken {
+        &self.version
     }
 }
 

@@ -81,6 +81,34 @@ impl CoordinationError {
         )
     }
 
+    pub(crate) const fn not_bootstrapped() -> Self {
+        Self::new(
+            CoordinationErrorKind::NotBootstrapped,
+            "control plane is not bootstrapped",
+        )
+    }
+
+    pub(crate) const fn write_closed() -> Self {
+        Self::new(
+            CoordinationErrorKind::WriteClosed,
+            "control plane writes are closed",
+        )
+    }
+
+    pub(crate) const fn fence_lost() -> Self {
+        Self::new(
+            CoordinationErrorKind::FenceLost,
+            "coordination fence is no longer current",
+        )
+    }
+
+    pub(crate) const fn incarnation_changed() -> Self {
+        Self::new(
+            CoordinationErrorKind::IncarnationChanged,
+            "control plane incarnation changed",
+        )
+    }
+
     pub fn operation_not_committed(transaction_id: TransactionId) -> Self {
         Self {
             kind: CoordinationErrorKind::OperationNotCommitted,
