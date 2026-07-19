@@ -122,7 +122,13 @@ use crate::mv::refresh::planning::{
 };
 use crate::mv::refresh::projection_first_refresh::{
     prepare_projection_first_refresh_chunks, prepare_projection_full_read_sql,
-    prepare_union_projection_first_refresh_chunks, prepare_union_projection_full_read_sql,
+    prepare_union_projection_first_refresh_chunks,
+};
+use crate::mv::refresh::repartition::{
+    RepartitionChunkPayload, RepartitionShape, execute_join_repartition_write,
+    prepare_aggregate_repartition_payload, prepare_projection_repartition_payload,
+    prepare_union_projection_repartition_payload, select_repartition_shape,
+    write_repartition_chunk_payload,
 };
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
@@ -2692,72 +2698,6 @@ pub(crate) fn refresh_iceberg_mv(
         .map_err(|error| error.message)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RepartitionSupport {
-    ProjectionFilterSingleBase,
-    AggregateSingleBase,
-    JoinProjectionFilter,
-    JoinAggregate,
-    FanInAggregate,
-    UnionProjectionFilter,
-}
-
-impl RepartitionSupport {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::ProjectionFilterSingleBase => "projection/filter single-base",
-            Self::AggregateSingleBase => "aggregate single-base",
-            Self::JoinProjectionFilter => "join projection/filter",
-            Self::JoinAggregate => "join aggregate",
-            Self::FanInAggregate => "fan-in aggregate",
-            Self::UnionProjectionFilter => "UNION ALL projection/filter",
-        }
-    }
-}
-
-fn validate_repartition_support(caps: &RefreshCapabilities) -> Result<RepartitionSupport, String> {
-    match (&caps.snapshot_policy, caps.has_agg_state, &caps.identity) {
-        (BaseSnapshotPolicy::SingleBase, false, RefreshIdentity::BaseRowId) => {
-            Ok(RepartitionSupport::ProjectionFilterSingleBase)
-        }
-        (BaseSnapshotPolicy::SingleBase, true, RefreshIdentity::GroupRowId) => {
-            Ok(RepartitionSupport::AggregateSingleBase)
-        }
-        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, false, RefreshIdentity::JoinRowKey) => {
-            Ok(RepartitionSupport::JoinProjectionFilter)
-        }
-        (BaseSnapshotPolicy::JoinPairPartialInitialSkip, true, RefreshIdentity::GroupRowId) => {
-            Ok(RepartitionSupport::JoinAggregate)
-        }
-        (BaseSnapshotPolicy::AllBasesRequired, true, RefreshIdentity::GroupRowId) => {
-            Ok(RepartitionSupport::FanInAggregate)
-        }
-        (BaseSnapshotPolicy::AllBasesRequired, false, RefreshIdentity::BranchScoped(inner))
-            if matches!(inner.as_ref(), RefreshIdentity::BaseRowId) =>
-        {
-            Ok(RepartitionSupport::UnionProjectionFilter)
-        }
-        _ => Err(format!(
-            "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support identity={:?}, snapshot_policy={:?}, aggregate_state={}; supported shapes are projection/filter single-base, aggregate single-base, join projection/filter, join aggregate, fan-in aggregate, and UNION ALL projection/filter",
-            caps.identity, caps.snapshot_policy, caps.has_agg_state
-        )),
-    }
-}
-
-fn validate_repartition_rebuild_wired(
-    support: &RepartitionSupport,
-    _target: &IcebergMvTarget,
-) -> Result<(), String> {
-    match support {
-        RepartitionSupport::ProjectionFilterSingleBase
-        | RepartitionSupport::AggregateSingleBase
-        | RepartitionSupport::JoinProjectionFilter
-        | RepartitionSupport::JoinAggregate
-        | RepartitionSupport::FanInAggregate
-        | RepartitionSupport::UnionProjectionFilter => Ok(()),
-    }
-}
-
 pub(crate) fn repartition_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
@@ -2788,13 +2728,12 @@ pub(crate) fn repartition_iceberg_mv(
         )
     })?;
     let caps = RefreshCapabilities::from_schema_contract(schema_contract)?;
-    let support = validate_repartition_support(&caps).map_err(|err| {
+    let support = select_repartition_shape(&caps).map_err(|err| {
         format!(
             "{err}; target={}.{}.{}",
             target.catalog, target.namespace, target.table
         )
     })?;
-    validate_repartition_rebuild_wired(&support, &target)?;
 
     let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
     validate_target_snapshot(&target, &mv_definition, &target_loaded.table)?;
@@ -2804,7 +2743,7 @@ pub(crate) fn repartition_iceberg_mv(
     let select_query = parse_mv_select_query(&mv_definition.select_sql)?;
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&select_query, current_catalog, current_database);
-    let join_repartition_aliases = if matches!(support, RepartitionSupport::JoinProjectionFilter) {
+    let join_repartition_aliases = if matches!(support, RepartitionShape::JoinProjectionFilter) {
         let aliases = crate::mv::aggregate_state::aggregate_sql_calls::extract_join_aliases(
             &canonical_select_query,
         )?;
@@ -2856,7 +2795,7 @@ pub(crate) fn repartition_iceberg_mv(
     )?;
 
     let payload = match &support {
-        RepartitionSupport::ProjectionFilterSingleBase => {
+        RepartitionShape::ProjectionFilterSingleBase => {
             let [_base_ref] = base_refs.as_slice() else {
                 abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(format!(
@@ -2864,56 +2803,20 @@ pub(crate) fn repartition_iceberg_mv(
                     base_refs.len()
                 ));
             };
-            let physical_full_select_sql = match prepare_projection_full_read_sql(
-                &mv_definition.select_sql,
-                &pin,
-                current_catalog,
-                current_database,
-            ) {
-                Ok(sql) => sql,
-                Err(err) => {
-                    abort_iceberg_mv_refresh(state, refresh_id)?;
-                    return Err(err);
-                }
+            let mut read = |physical_sql: &str| {
+                run_mv_full_select_chunks_with_catalog(
+                    state,
+                    current_catalog,
+                    current_database,
+                    physical_sql,
+                )
             };
-            match collect_repartition_rebuild_payload(
-                state,
-                current_catalog,
-                current_database,
-                &physical_full_select_sql,
-                &pin,
-            ) {
-                Ok(payload) => Some(payload),
-                Err(err) => {
-                    abort_iceberg_mv_refresh(state, refresh_id)?;
-                    return Err(err);
-                }
-            }
-        }
-        RepartitionSupport::AggregateSingleBase
-        | RepartitionSupport::JoinAggregate
-        | RepartitionSupport::FanInAggregate => match build_aggregate_repartition_payload(
-            state,
-            current_catalog,
-            current_database,
-            &mv_definition.select_sql,
-            &pin,
-        ) {
-            Ok(payload) => Some(payload),
-            Err(err) => {
-                abort_iceberg_mv_refresh(state, refresh_id)?;
-                return Err(err);
-            }
-        },
-        RepartitionSupport::UnionProjectionFilter => {
-            match build_union_projection_repartition_payload(
-                state,
-                current_catalog,
-                current_database,
+            match prepare_projection_repartition_payload(
                 &mv_definition.select_sql,
-                &canonical_select_query,
-                schema_contract,
                 &pin,
+                current_catalog,
+                current_database,
+                &mut read,
             ) {
                 Ok(payload) => Some(payload),
                 Err(err) => {
@@ -2922,7 +2825,77 @@ pub(crate) fn repartition_iceberg_mv(
                 }
             }
         }
-        RepartitionSupport::JoinProjectionFilter => None,
+        RepartitionShape::AggregateSingleBase
+        | RepartitionShape::JoinAggregate
+        | RepartitionShape::FanInAggregate => {
+            let calls =
+                match crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+                    &select_query,
+                ) {
+                    Ok(calls) => calls,
+                    Err(err) => {
+                        abort_iceberg_mv_refresh(state, refresh_id)?;
+                        return Err(err);
+                    }
+                };
+            let mut read =
+                |visible_sql: &str,
+                 actual_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
+                 state_query: sqlparser::ast::Query| {
+                    read_aggregate_state_for_refresh(
+                        state,
+                        current_catalog,
+                        current_database,
+                        visible_sql,
+                        actual_calls,
+                        state_query,
+                    )
+                };
+            match prepare_aggregate_repartition_payload(
+                &mv_definition.select_sql,
+                &calls,
+                &pin,
+                current_catalog,
+                current_database,
+                &mut read,
+            ) {
+                Ok(payload) => Some(payload),
+                Err(err) => {
+                    abort_iceberg_mv_refresh(state, refresh_id)?;
+                    return Err(err);
+                }
+            }
+        }
+        RepartitionShape::UnionProjectionFilter => {
+            let branch_count = schema_contract
+                .branch
+                .as_ref()
+                .map(|branch| branch.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(&canonical_select_query) as usize);
+            let mut read = |physical_sql: &str| {
+                run_mv_full_select_chunks_with_catalog(
+                    state,
+                    current_catalog,
+                    current_database,
+                    physical_sql,
+                )
+            };
+            match prepare_union_projection_repartition_payload(
+                &mv_definition.select_sql,
+                branch_count,
+                &pin,
+                current_catalog,
+                current_database,
+                &mut read,
+            ) {
+                Ok(payload) => Some(payload),
+                Err(err) => {
+                    abort_iceberg_mv_refresh(state, refresh_id)?;
+                    return Err(err);
+                }
+            }
+        }
+        RepartitionShape::JoinProjectionFilter => None,
     };
 
     let updated_table =
@@ -2960,7 +2933,7 @@ pub(crate) fn repartition_iceberg_mv(
     };
     let base_snapshots_for_intent = payload
         .as_ref()
-        .map(|payload| payload.base_snapshots.clone())
+        .map(|payload| payload.base_snapshots().clone())
         .unwrap_or_else(|| pin.to_snapshot_map());
     let intent = MvRepartitionOperationIntent::new(
         previous_partition_contract.cloned(),
@@ -2982,7 +2955,7 @@ pub(crate) fn repartition_iceberg_mv(
         ));
     }
 
-    if let RepartitionSupport::JoinProjectionFilter = support {
+    if let RepartitionShape::JoinProjectionFilter = support {
         let aliases = join_repartition_aliases
             .as_ref()
             .ok_or_else(|| "join repartition aliases were not extracted".to_string())
@@ -8933,71 +8906,6 @@ fn read_aggregate_state_for_refresh(
     })
 }
 
-fn build_aggregate_repartition_payload(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    select_sql: &str,
-    pin: &RefreshSnapshotPin,
-) -> Result<RepartitionRebuildPayload, String> {
-    let select_query = parse_mv_select_query(select_sql)?;
-    let calls = crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
-        &select_query,
-    )?;
-    let mut read =
-        |visible_sql: &str,
-         actual_calls: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-         state_query: sqlparser::ast::Query| {
-            read_aggregate_state_for_refresh(
-                state,
-                current_catalog,
-                current_database,
-                visible_sql,
-                actual_calls,
-                state_query,
-            )
-        };
-    let chunks = prepare_aggregate_first_refresh_chunks(
-        select_sql,
-        &calls,
-        pin,
-        current_catalog,
-        current_database,
-        &mut read,
-    )?;
-    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
-}
-
-fn build_union_projection_repartition_payload(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    select_sql: &str,
-    canonical_select_query: &sqlparser::ast::Query,
-    schema_contract: &mv_schema::MvSchemaContract,
-    pin: &RefreshSnapshotPin,
-) -> Result<RepartitionRebuildPayload, String> {
-    let branch_count = schema_contract
-        .branch
-        .as_ref()
-        .map(|branch| branch.branch_count as usize)
-        .unwrap_or_else(|| union_branch_count(canonical_select_query) as usize);
-    let physical_full_select_sql = prepare_union_projection_full_read_sql(
-        select_sql,
-        branch_count,
-        pin,
-        current_catalog,
-        current_database,
-    )?;
-    let chunks = run_mv_full_select_chunks_with_catalog(
-        state,
-        current_catalog,
-        current_database,
-        &physical_full_select_sql,
-    )?;
-    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
-}
-
 fn alias_aggregate_refresh_group_key_projection(
     query: &mut sqlparser::ast::Query,
     ctx: &IcebergMvRefreshContext,
@@ -9100,18 +9008,82 @@ fn build_aggregate_layout_for_refresh_select_sql(
     build_aggregate_layout_from_analysis(calls, &visible_analysis)
 }
 
-struct RepartitionRebuildPayload {
+struct FullRefreshChunkPayload {
     chunks: Vec<crate::exec::chunk::Chunk>,
     base_snapshots: BTreeMap<String, i64>,
     base_table_uuids: BTreeMap<String, String>,
 }
 
-impl RepartitionRebuildPayload {
-    fn from_chunks(chunks: Vec<crate::exec::chunk::Chunk>, pin: &RefreshSnapshotPin) -> Self {
-        Self {
-            chunks,
-            base_snapshots: pin.to_snapshot_map(),
-            base_table_uuids: pin.to_table_uuid_map(),
+enum RebuildChunkPayload {
+    FullRefresh(FullRefreshChunkPayload),
+    Repartition(RepartitionChunkPayload),
+}
+
+struct PreparedRebuildChunkWrite {
+    data_files: Vec<iceberg::spec::DataFile>,
+    total_rows: i64,
+    base_snapshots: BTreeMap<String, i64>,
+    base_table_uuids: BTreeMap<String, String>,
+}
+
+impl RebuildChunkPayload {
+    fn total_rows(&self) -> i64 {
+        match self {
+            Self::FullRefresh(payload) => payload
+                .chunks
+                .iter()
+                .map(|chunk| chunk.batch.num_rows() as i64)
+                .sum(),
+            Self::Repartition(payload) => payload.total_rows(),
+        }
+    }
+
+    fn base_snapshots(&self) -> &BTreeMap<String, i64> {
+        match self {
+            Self::FullRefresh(payload) => &payload.base_snapshots,
+            Self::Repartition(payload) => payload.base_snapshots(),
+        }
+    }
+
+    fn base_table_uuids(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::FullRefresh(payload) => &payload.base_table_uuids,
+            Self::Repartition(payload) => payload.base_table_uuids(),
+        }
+    }
+
+    async fn prepare_write(
+        self,
+        table: &iceberg::table::Table,
+    ) -> Result<PreparedRebuildChunkWrite, String> {
+        match self {
+            Self::FullRefresh(payload) => {
+                let total_rows = payload
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.batch.num_rows() as i64)
+                    .sum();
+                let data_files = if total_rows == 0 {
+                    Vec::new()
+                } else {
+                    write_chunks_as_iceberg_data_files(table, &payload.chunks).await?
+                };
+                Ok(PreparedRebuildChunkWrite {
+                    data_files,
+                    total_rows,
+                    base_snapshots: payload.base_snapshots,
+                    base_table_uuids: payload.base_table_uuids,
+                })
+            }
+            Self::Repartition(payload) => {
+                let prepared = write_repartition_chunk_payload(table, payload).await?;
+                Ok(PreparedRebuildChunkWrite {
+                    data_files: prepared.data_files,
+                    total_rows: prepared.total_rows,
+                    base_snapshots: prepared.base_snapshots,
+                    base_table_uuids: prepared.base_table_uuids,
+                })
+            }
         }
     }
 }
@@ -9120,22 +9092,6 @@ impl RepartitionRebuildPayload {
 struct RepartitionDefaultSpecRestore {
     new_default_spec_id: i32,
     old_default_spec_id: i32,
-}
-
-fn collect_repartition_rebuild_payload(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    physical_full_select_sql: &str,
-    pin: &RefreshSnapshotPin,
-) -> Result<RepartitionRebuildPayload, String> {
-    let chunks = run_mv_full_select_chunks_with_catalog(
-        state,
-        current_catalog,
-        current_database,
-        physical_full_select_sql,
-    )?;
-    Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9148,15 +9104,11 @@ fn commit_rebuild_payload(
     staging_branch: &str,
     refresh_id: i64,
     mv_definition: &StoredMvDefinition,
-    payload: RepartitionRebuildPayload,
+    payload: RebuildChunkPayload,
     partition_contract: Option<&mv_schema::MvPartitionContract>,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let total_rows: i64 = payload
-        .chunks
-        .iter()
-        .map(|chunk| chunk.batch.num_rows() as i64)
-        .sum();
+    let total_rows = payload.total_rows();
     let ident = match iceberg_mv_table_ident(target) {
         Ok(ident) => ident,
         Err(err) => {
@@ -9182,8 +9134,8 @@ fn commit_rebuild_payload(
             // the base watermark, so it is a Full refresh.
             RefreshTechnique::Full,
             build_mv_refresh_provenance_bases(
-                &payload.base_snapshots,
-                &payload.base_table_uuids,
+                payload.base_snapshots(),
+                payload.base_table_uuids(),
                 &mv_definition.last_refresh_snapshots,
             ),
             mv_definition_fingerprint(&mv_definition.select_sql),
@@ -9243,31 +9195,35 @@ fn commit_rebuild_payload(
             );
         }
     };
-    let new_snapshot_id = match data_block_on(async {
-        let data_files = if payload
-            .chunks
-            .iter()
-            .all(|chunk| chunk.batch.num_rows() == 0)
-        {
-            Vec::new()
-        } else {
-            write_chunks_as_iceberg_data_files(&target_table, &payload.chunks).await?
-        };
-        Ok::<Result<i64, CommitServiceError>, String>(
-            commit_overwrite_iceberg_mv_with_ref(
-                &target_table,
-                iceberg_catalog,
-                target_entry,
-                &ident,
-                data_files,
-                staging_branch,
-                marker,
-            )
-            .await,
-        )
-    }) {
-        Ok(Ok(Ok(snapshot_id))) => snapshot_id,
-        Ok(Ok(Err(err))) => {
+    let prepared = match data_block_on(payload.prepare_write(&target_table)) {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(err)) | Err(err) => {
+            return Err(
+                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    repartition_restore,
+                ),
+            );
+        }
+    };
+    debug_assert_eq!(prepared.total_rows, total_rows);
+    let total_rows = prepared.total_rows;
+    let new_snapshot_id = match data_block_on(commit_overwrite_iceberg_mv_with_ref(
+        &target_table,
+        iceberg_catalog,
+        target_entry,
+        &ident,
+        prepared.data_files,
+        staging_branch,
+        marker,
+    )) {
+        Ok(Ok(snapshot_id)) => snapshot_id,
+        Ok(Err(err)) => {
             return Err(
                 handle_iceberg_mv_commit_service_error_with_repartition_restore(
                     state,
@@ -9280,7 +9236,7 @@ fn commit_rebuild_payload(
                 ),
             );
         }
-        Ok(Err(err)) | Err(err) => {
+        Err(err) => {
             return Err(
                 handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
                     state,
@@ -9299,7 +9255,7 @@ fn commit_rebuild_payload(
         refresh_id,
         new_snapshot_id,
         total_rows,
-        payload.base_table_uuids.clone(),
+        prepared.base_table_uuids.clone(),
     )?;
     let published_snapshot_id = match publish_iceberg_mv_refresh(
         state,
@@ -9331,8 +9287,8 @@ fn commit_rebuild_payload(
             state,
             refresh_id,
             total_rows,
-            payload.base_snapshots,
-            payload.base_table_uuids,
+            prepared.base_snapshots,
+            prepared.base_table_uuids,
             published_snapshot_id,
             partition_contract,
             IcebergMvPartitionStateFinalize::Clear,
@@ -9342,8 +9298,8 @@ fn commit_rebuild_payload(
             state,
             refresh_id,
             total_rows,
-            payload.base_snapshots,
-            payload.base_table_uuids,
+            prepared.base_snapshots,
+            prepared.base_table_uuids,
             published_snapshot_id,
         )?;
     }
@@ -9360,7 +9316,7 @@ fn commit_repartition_rebuild_payload(
     staging_branch: &str,
     refresh_id: i64,
     mv_definition: &StoredMvDefinition,
-    payload: RepartitionRebuildPayload,
+    payload: RepartitionChunkPayload,
     partition_contract: &mv_schema::MvPartitionContract,
     repartition_restore: Option<RepartitionDefaultSpecRestore>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -9373,7 +9329,7 @@ fn commit_repartition_rebuild_payload(
         staging_branch,
         refresh_id,
         mv_definition,
-        payload,
+        RebuildChunkPayload::Repartition(payload),
         Some(partition_contract),
         repartition_restore,
     )
@@ -9408,7 +9364,7 @@ fn rebuild_iceberg_mv(
             return Err(err.into());
         }
     };
-    let payload = RepartitionRebuildPayload {
+    let payload = FullRefreshChunkPayload {
         chunks,
         base_snapshots: base_snapshot_id
             .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
@@ -9424,7 +9380,7 @@ fn rebuild_iceberg_mv(
         staging_branch,
         refresh_id,
         mv_definition,
-        payload,
+        RebuildChunkPayload::FullRefresh(payload),
         partition_contract,
         None,
     )
@@ -10564,8 +10520,8 @@ fn repartition_iceberg_join_mv_overwrite(
             );
         }
     };
-    let logical_plan = match plan_join_first_refresh_logical(state, ctx, left_ref, right_ref) {
-        Ok(plan) => plan,
+    let (plan, factory) = match plan_canonical_select_for_imv(state, ctx) {
+        Ok(planned) => planned,
         Err(err) => {
             return Err(
                 handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
@@ -10574,53 +10530,46 @@ fn repartition_iceberg_join_mv_overwrite(
                     target_entry,
                     staging_branch,
                     refresh_id,
-                    err,
+                    err.message,
                     Some(repartition_restore),
                 ),
             );
         }
     };
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalPlan {
-        plan,
-        factory,
-        change_stream,
-    } = logical_plan;
-    let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
-        plan,
-        factory,
-        &connectors_snapshot,
-    )
-    .map_err(|err| {
-        handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-            state,
-            target,
-            target_entry,
-            staging_branch,
-            refresh_id,
-            err,
-            Some(repartition_restore),
-        )
-    })?;
     let target_backend = iceberg_mv_target_backend(target);
-    let populated = execute_imv_change_stream_write(
-        state,
-        &target_backend,
-        target_table.clone(),
+    let populated = execute_join_repartition_write(
+        &target_table,
         &ident,
-        CommitOpKind::Overwrite,
-        ImvRefreshPlannedChangeStream {
-            optimized_tree: planned_query.optimized_tree,
-            output_columns: planned_query.output_columns,
-            change_stream,
-            producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
-            mv_refresh_ctx: Some(ctx),
-        },
         staging_branch,
+        &ctx.rewrite,
+        left_ref,
+        right_ref,
+        crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory },
+        |logical| {
+            let connectors_snapshot = state
+                .connectors
+                .read()
+                .expect("standalone connector registry read lock")
+                .clone();
+            let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
+                logical.plan,
+                logical.factory,
+                &connectors_snapshot,
+            )?;
+            execute_imv_change_stream_writer(
+                state,
+                &target_backend,
+                &target_table,
+                ImvRefreshPlannedChangeStream {
+                    optimized_tree: planned_query.optimized_tree,
+                    output_columns: planned_query.output_columns,
+                    change_stream: logical.change_stream,
+                    producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
+                    mv_refresh_ctx: Some(ctx),
+                },
+                staging_branch,
+            )
+        },
     )
     .map_err(|err| {
         IcebergMvRefreshExecutionError::from(
@@ -12093,21 +12042,6 @@ fn incremental_refresh_iceberg_join_mv(
         select_join_incremental_refresh_mode(left_has_delete_changes, right_has_delete_changes)
     };
     execute_join_delta_branches_logical(state, ctx, mode, branches)
-}
-
-fn plan_join_first_refresh_logical(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    left_ref: &TableIdentity,
-    right_ref: &TableIdentity,
-) -> Result<crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalPlan, String> {
-    let (plan, factory) = plan_canonical_select_for_imv(state, ctx).map_err(|e| e.message)?;
-    crate::mv::refresh::join_first_refresh::build_join_first_refresh_logical_plan(
-        &ctx.rewrite,
-        left_ref,
-        right_ref,
-        crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory },
-    )
 }
 
 fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
@@ -14854,8 +14788,8 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&projection).expect("projection/filter support"),
-            RepartitionSupport::ProjectionFilterSingleBase
+            select_repartition_shape(&projection).expect("projection/filter support"),
+            RepartitionShape::ProjectionFilterSingleBase
         );
 
         let aggregate = RefreshCapabilities {
@@ -14867,8 +14801,8 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&aggregate).expect("aggregate support"),
-            RepartitionSupport::AggregateSingleBase
+            select_repartition_shape(&aggregate).expect("aggregate support"),
+            RepartitionShape::AggregateSingleBase
         );
     }
 
@@ -14883,8 +14817,8 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&join).expect("join projection/filter support"),
-            RepartitionSupport::JoinProjectionFilter
+            select_repartition_shape(&join).expect("join projection/filter support"),
+            RepartitionShape::JoinProjectionFilter
         );
     }
 
@@ -14899,8 +14833,8 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&join_aggregate).expect("join aggregate support"),
-            RepartitionSupport::JoinAggregate
+            select_repartition_shape(&join_aggregate).expect("join aggregate support"),
+            RepartitionShape::JoinAggregate
         );
 
         let fan_in_aggregate = RefreshCapabilities {
@@ -14912,8 +14846,8 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&fan_in_aggregate).expect("fan-in aggregate support"),
-            RepartitionSupport::FanInAggregate
+            select_repartition_shape(&fan_in_aggregate).expect("fan-in aggregate support"),
+            RepartitionShape::FanInAggregate
         );
 
         let union_projection = RefreshCapabilities {
@@ -14925,30 +14859,9 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
         assert_eq!(
-            validate_repartition_support(&union_projection).expect("union projection support"),
-            RepartitionSupport::UnionProjectionFilter
+            select_repartition_shape(&union_projection).expect("union projection support"),
+            RepartitionShape::UnionProjectionFilter
         );
-    }
-
-    #[test]
-    fn repartition_support_wired_guard_accepts_all_supported_shapes() {
-        let target = IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_join_aggregate".to_string(),
-        };
-
-        for support in [
-            RepartitionSupport::ProjectionFilterSingleBase,
-            RepartitionSupport::AggregateSingleBase,
-            RepartitionSupport::JoinProjectionFilter,
-            RepartitionSupport::JoinAggregate,
-            RepartitionSupport::FanInAggregate,
-            RepartitionSupport::UnionProjectionFilter,
-        ] {
-            validate_repartition_rebuild_wired(&support, &target)
-                .unwrap_or_else(|err| panic!("{} rebuild should be wired: {err}", support.label()));
-        }
     }
 
     #[test]
@@ -14962,7 +14875,7 @@ mod tests {
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
 
-        let err = validate_repartition_support(&invalid).expect_err("shape must be rejected");
+        let err = select_repartition_shape(&invalid).expect_err("shape must be rejected");
         assert!(err.contains("UnsupportedRepartitionShape"));
         assert!(err.contains("JoinRowKey"));
         assert!(err.contains("AllBasesRequired"));
@@ -14976,7 +14889,7 @@ mod tests {
             apply_key_value_type: ApplyKeyValueType::BranchUtf8,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         };
-        let err = validate_repartition_support(&branch_union_aggregate)
+        let err = select_repartition_shape(&branch_union_aggregate)
             .expect_err("branch UNION ALL aggregate repartition is unsupported");
         assert!(err.contains("UnsupportedRepartitionShape"));
         assert!(err.contains("BranchScoped"));
@@ -19484,14 +19397,14 @@ mod tests {
         let physical_full_select_sql =
             prepare_projection_full_read_sql(&mv.select_sql, &pin, Some("ice"), &env.current_db)
                 .expect("prepare physical select with pin");
-        let payload = collect_repartition_rebuild_payload(
+        let chunks = run_mv_full_select_chunks_with_catalog(
             &env.state,
             Some("ice"),
             &env.current_db,
             &physical_full_select_sql,
-            &pin,
         )
         .expect("collect repartition payload");
+        let payload = RepartitionChunkPayload::from_chunks(chunks, &pin);
 
         let staging_branch = format!(
             "__nova_mv_repartition_publish_mismatch_{}",

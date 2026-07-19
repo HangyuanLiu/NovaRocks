@@ -28,6 +28,7 @@ pub(crate) mod non_join_incremental;
 pub(crate) mod pin;
 pub(crate) mod planning;
 pub(crate) mod projection_first_refresh;
+pub(crate) mod repartition;
 pub(crate) mod scan_binding;
 pub(crate) mod snapshot;
 pub(crate) mod target_apply;
