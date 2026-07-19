@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::coordinator::prepare::scan::{
@@ -40,7 +42,11 @@ impl ScanBindingResolver for IcebergMvRefreshContext {
             &scan.table.source,
             |table, snapshot_id| self.version_scan_source(table, snapshot_id),
             |target_scan| self.target_state_scan_source(target_scan),
-            |target_scan| self.target_locator_scan_source(target_scan),
+            |target_scan| {
+                self.target_bindings
+                    .target_apply()
+                    .resolve_locator_scan(target_scan)
+            },
             |table, from_snapshot_id, to_snapshot_id| {
                 build_iceberg_delta_scan_runtime_plan(table, from_snapshot_id, to_snapshot_id, self)
             },

@@ -52,10 +52,6 @@ use crate::connector::iceberg::operation_lifecycle::{
 use crate::engine::mv::analysis_adapter::{
     analyze_mv_select, descriptor_from_loaded, now_ms, validate_ivm_primary_key,
 };
-use crate::engine::mv::iceberg_target_apply::{
-    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
-    find_apply_key_field_id_by_column, iceberg_mv_physical_select_sql, join_apply_key_table_column,
-};
 use crate::engine::mv::lifecycle::{
     BackendRefreshPlan, IcebergRefreshOutcome, IcebergRefreshPlan, RefreshError, RefreshPlan,
 };
@@ -116,6 +112,11 @@ use crate::mv::refresh::planning::{
 };
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
+};
+use crate::mv::refresh::target_apply::{
+    apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
+    expose_physical_apply_key_for_locator_registration, find_apply_key_field_id_by_column,
+    iceberg_mv_physical_select_sql, join_apply_key_table_column,
 };
 use crate::mv::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
@@ -8544,7 +8545,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
     physical_sql: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
@@ -8812,7 +8813,7 @@ fn commit_first_refresh_iceberg_aggregate_chunks(
     refresh_label: &str,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -10954,7 +10955,7 @@ fn repartition_iceberg_join_mv_overwrite(
     repartition_restore: RepartitionDefaultSpecRestore,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -11192,7 +11193,7 @@ fn first_refresh_iceberg_join_mv(
     right_ref: &TableIdentity,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     if let Err(err) = ensure_iceberg_mv_staging_branch(
@@ -13487,7 +13488,7 @@ fn execute_join_delta_branches_logical(
     }
     let logical_plan = build_join_incremental_refresh_logical_plan(state, ctx, route)?;
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let mv_definition = &*ctx.rewrite.mv_definition;
@@ -13798,7 +13799,7 @@ fn execute_append_only_join_delta_branches(
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
@@ -14506,7 +14507,7 @@ fn build_join_delta_target_locator_table_def(
     };
     table_def.name =
         crate::engine::mv::iceberg_join_branch::JOIN_DELTA_TARGET_LOCATOR_TABLE.to_string();
-    crate::engine::mv::iceberg_target_apply::expose_physical_apply_key_for_locator_registration(
+    expose_physical_apply_key_for_locator_registration(
         table_def,
         target_table,
         JOIN_APPLY_KEY_COLUMN_NAME,
@@ -15364,7 +15365,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let target = &ctx.application_target;
-    let target_entry = &*ctx.target_entry;
+    let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
     let current_database = ctx.rewrite.current_database.as_str();
@@ -16732,7 +16733,7 @@ mod tests {
 
     #[test]
     fn iceberg_join_mv_uses_join_apply_key_column() {
-        let column = crate::engine::mv::iceberg_target_apply::join_apply_key_table_column();
+        let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
         assert_eq!(
             column.name,
             crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME

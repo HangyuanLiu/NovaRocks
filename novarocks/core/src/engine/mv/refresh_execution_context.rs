@@ -26,17 +26,19 @@ use std::sync::Arc;
 
 use crate::catalog::identifier::TableIdentity;
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
+#[cfg(test)]
+use crate::connector::iceberg::scan_model::IcebergSchemaDef;
 use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
-    IcebergSchemaFieldDef, IcebergTableInfo,
+    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergTableInfo,
 };
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
+use crate::mv::refresh::target_apply::IcebergMvTargetBindings;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
-use crate::sql::planner::table::{
-    IcebergMvTargetLocatorScan, IcebergMvTargetStateScan, ScanSource,
-};
+#[cfg(test)]
+use crate::sql::planner::table::IcebergMvTargetLocatorScan;
+use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
 use mv_schema::MvSchemaContract;
 
 use super::iceberg_refresh::IcebergMvTarget;
@@ -49,10 +51,9 @@ pub(crate) struct IcebergMvRefreshContext {
     /// moves the create/refresh application flow onto canonical identities.
     /// SQL and rewrite consumers must use `rewrite.target` instead.
     pub(super) application_target: IcebergMvTarget,
-    pub target_entry: Arc<IcebergCatalogEntry>,
+    pub(crate) target_bindings: IcebergMvTargetBindings,
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
-    pub target_table: iceberg::table::Table,
     pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
     pub pruning_limits: MvRefreshPruningLimits,
 }
@@ -293,13 +294,15 @@ impl IcebergMvRefreshContext {
         )?;
         let base_catalog_entries = collect_base_catalog_entries(iceberg_catalogs, &base_refs)?;
 
+        let rewrite = Arc::new(rewrite);
+        let target_bindings =
+            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)?;
         Ok(Self {
-            rewrite: Arc::new(rewrite),
+            rewrite,
             application_target: target,
-            target_entry,
+            target_bindings,
             base_catalog_entries,
             iceberg_catalog,
-            target_table,
             affected_partitions,
             pruning_limits,
         })
@@ -474,10 +477,10 @@ impl IcebergMvRefreshContext {
             ));
         }
 
-        let files = match self.rewrite.target_snapshot_id {
-            Some(snapshot_id) => data_files_at_snapshot(&self.target_table, snapshot_id)?,
-            None => Vec::new(),
-        };
+        let files = self
+            .target_bindings
+            .runtime()
+            .data_files_at_frozen_snapshot()?;
         let files = if let Some(allow_list) = target_partition_allow_list {
             filter_target_state_files_by_partition(
                 self.rewrite.schema_contract.as_ref(),
@@ -489,92 +492,13 @@ impl IcebergMvRefreshContext {
             files
         };
         Ok(ScanSource::IcebergDataFiles {
-            table: target_table_info(self, scan)?,
+            table: self.target_bindings.runtime().table_info()?,
             files,
-            cloud_properties: self.target_entry.cloud_properties_map(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        })
-    }
-
-    pub(crate) fn target_locator_scan_source(
-        &self,
-        scan: &IcebergMvTargetLocatorScan,
-    ) -> Result<ScanSource, String> {
-        let target = &self.rewrite.target;
-        if !scan.catalog.eq_ignore_ascii_case(&target.catalog)
-            || !scan.database.eq_ignore_ascii_case(&target.namespace)
-            || !scan.table.eq_ignore_ascii_case(&target.table)
-        {
-            return Err(format!(
-                "Iceberg target-locator scan {} does not match MV refresh target {}.{}.{}",
-                scan.fqn(),
-                target.catalog,
-                target.namespace,
-                target.table
-            ));
-        }
-        if scan.target_table_uuid != self.rewrite.target_table_uuid {
-            return Err(format!(
-                "Iceberg target-locator scan {} target uuid mismatch: scan={} context={}",
-                scan.fqn(),
-                scan.target_table_uuid,
-                self.rewrite.target_table_uuid
-            ));
-        }
-        if scan.target_snapshot_id != self.rewrite.target_snapshot_id {
-            return Err(format!(
-                "Iceberg target-locator scan {} target snapshot mismatch: scan={:?} context={:?}",
-                scan.fqn(),
-                scan.target_snapshot_id,
-                self.rewrite.target_snapshot_id
-            ));
-        }
-        let expected_apply_key = &self
-            .rewrite
-            .schema_contract
-            .target
-            .hidden_apply_key
-            .column_name;
-        if !scan
-            .apply_key_column
-            .eq_ignore_ascii_case(expected_apply_key)
-        {
-            return Err(format!(
-                "Iceberg target-locator scan {} apply-key column mismatch: scan={} contract={}",
-                scan.fqn(),
-                scan.apply_key_column,
-                expected_apply_key
-            ));
-        }
-        match (
-            scan.branch_id_column.as_deref(),
-            self.rewrite
-                .schema_contract
-                .branch
-                .as_ref()
-                .map(|branch| branch.branch_id_column.column_name.as_str()),
-        ) {
-            (Some(scan_branch), Some(contract_branch))
-                if scan_branch.eq_ignore_ascii_case(contract_branch) => {}
-            (None, None) => {}
-            (scan_branch, contract_branch) => {
-                return Err(format!(
-                    "Iceberg target-locator scan {} branch column mismatch: scan={:?} contract={:?}",
-                    scan.fqn(),
-                    scan_branch,
-                    contract_branch
-                ));
-            }
-        }
-
-        let files = match self.rewrite.target_snapshot_id {
-            Some(snapshot_id) => data_files_at_snapshot(&self.target_table, snapshot_id)?,
-            None => Vec::new(),
-        };
-        Ok(ScanSource::IcebergDataFiles {
-            table: target_locator_table_info(self, scan)?,
-            files,
-            cloud_properties: self.target_entry.cloud_properties_map(),
+            cloud_properties: self
+                .target_bindings
+                .runtime()
+                .target_entry()
+                .cloud_properties_map(),
             binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         })
     }
@@ -631,7 +555,7 @@ impl IcebergMvRefreshContext {
 #[cfg(test)]
 pub(crate) fn bind_target_state_file_positions(
     mut source: ScanSource,
-    matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
+    matched_positions: &[crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet],
     target: &str,
 ) -> Result<ScanSource, String> {
     let ScanSource::IcebergDataFiles { files, .. } = &mut source else {
@@ -906,99 +830,6 @@ fn data_file_with_stats_to_info(
     }
 }
 
-fn target_table_info(
-    ctx: &IcebergMvRefreshContext,
-    scan: &IcebergMvTargetStateScan,
-) -> Result<IcebergTableInfo, String> {
-    target_table_info_for_target(ctx, &scan.catalog, &scan.database, &scan.table)
-}
-
-fn target_locator_table_info(
-    ctx: &IcebergMvRefreshContext,
-    scan: &IcebergMvTargetLocatorScan,
-) -> Result<IcebergTableInfo, String> {
-    target_table_info_for_target(ctx, &scan.catalog, &scan.database, &scan.table)
-}
-
-fn target_table_info_for_target(
-    ctx: &IcebergMvRefreshContext,
-    catalog: &str,
-    database: &str,
-    table: &str,
-) -> Result<IcebergTableInfo, String> {
-    let metadata = ctx.target_table.metadata();
-    Ok(IcebergTableInfo {
-        catalog: catalog.to_string(),
-        namespace: database.to_string(),
-        table: table.to_string(),
-        table_uuid: Some(metadata.uuid().to_string()),
-        current_snapshot_id: metadata.current_snapshot_id(),
-        schema_id: metadata.current_schema_id(),
-        location: metadata.location().to_string(),
-        schema: iceberg_schema_def(metadata.current_schema()),
-        serialized_metadata: Some(
-            serde_json::to_string(metadata)
-                .map_err(|err| format!("serialize iceberg target table metadata failed: {err}"))?,
-        ),
-        serialized_metadata_rows: None,
-    })
-}
-
-fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
-    IcebergSchemaDef {
-        fields: schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-    }
-}
-
-fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
-    let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    let write_default_json = field.write_default.as_ref().and_then(|literal| {
-        literal
-            .clone()
-            .try_into_json(field.field_type.as_ref())
-            .ok()
-            .map(|json| json.to_string())
-    });
-    IcebergSchemaFieldDef {
-        field_id: field.id,
-        name: field.name.clone(),
-        initial_default: field.initial_default.clone(),
-        write_default: field.write_default.clone(),
-        initial_default_json,
-        write_default_json,
-        children: iceberg_type_children(field.field_type.as_ref()),
-    }
-}
-
-fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef> {
-    match ty {
-        iceberg::spec::Type::Struct(struct_ty) => struct_ty
-            .fields()
-            .iter()
-            .map(|field| iceberg_field_def(field.as_ref()))
-            .collect(),
-        iceberg::spec::Type::List(list_ty) => {
-            vec![iceberg_field_def(list_ty.element_field.as_ref())]
-        }
-        iceberg::spec::Type::Map(map_ty) => vec![
-            iceberg_field_def(map_ty.key_field.as_ref()),
-            iceberg_field_def(map_ty.value_field.as_ref()),
-        ],
-        iceberg::spec::Type::Primitive(_) => vec![],
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests_support {
     use std::sync::Arc;
@@ -1113,9 +944,9 @@ pub(crate) mod tests_support {
             .id
     }
 
-    fn rewrite_context_for_target_fixture(
+    pub(crate) fn rewrite_context_for_target_fixture(
         target_table: &iceberg::table::Table,
-        target_snapshot_id: i64,
+        target_snapshot_id: Option<i64>,
     ) -> Arc<IcebergMvRewriteContext> {
         let metadata = target_table.metadata();
         let target_schema = metadata.current_schema().clone();
@@ -1143,7 +974,7 @@ pub(crate) mod tests_support {
                 query,
                 base_refs,
                 pin,
-                Some(target_snapshot_id),
+                target_snapshot_id,
                 metadata.uuid().to_string(),
                 target_schema,
                 Some(Arc::new(contract)),
@@ -1155,16 +986,22 @@ pub(crate) mod tests_support {
     pub(crate) fn refresh_context_for_target_fixture(
         fixture: &TargetLocatorRefreshFixture,
     ) -> IcebergMvRefreshContext {
+        let rewrite = rewrite_context_for_target_fixture(
+            &fixture.target_table,
+            Some(fixture.target_snapshot_id),
+        );
+        let target_bindings = IcebergMvTargetBindings::from_rewrite_context(
+            &rewrite,
+            fixture.target_entry.clone(),
+            fixture.target_table.clone(),
+        )
+        .expect("target fixture bindings");
         IcebergMvRefreshContext {
-            rewrite: rewrite_context_for_target_fixture(
-                &fixture.target_table,
-                fixture.target_snapshot_id,
-            ),
+            rewrite,
             application_target: make_application_target(),
-            target_entry: fixture.target_entry.clone(),
+            target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog: fixture.iceberg_catalog.clone(),
-            target_table: fixture.target_table.clone(),
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
             ),
@@ -1173,7 +1010,10 @@ pub(crate) mod tests_support {
     }
 
     pub(crate) fn target_fixture_table_info(ctx: &IcebergMvRefreshContext) -> IcebergTableInfo {
-        target_table_info_for_target(ctx, "tgt", "db", "mv").expect("target fixture table info")
+        ctx.target_bindings
+            .runtime()
+            .table_info()
+            .expect("target fixture table info")
     }
 
     pub(crate) fn make_application_target() -> IcebergMvTarget {
@@ -1190,13 +1030,15 @@ pub(crate) mod tests_support {
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
     ) -> IcebergMvRefreshContext {
+        let target_bindings =
+            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)
+                .expect("target bindings");
         IcebergMvRefreshContext {
             rewrite,
             application_target: make_application_target(),
-            target_entry,
+            target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
-            target_table,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "engine test context",
             ),
@@ -1267,6 +1109,8 @@ pub(crate) mod tests_support {
         .expect("aggregate metadata")
         .metadata;
         let target_uuid = metadata.uuid().to_string();
+        let target_schema = metadata.current_schema().clone();
+        let target_schema_id = metadata.current_schema_id();
         let target_table = iceberg::table::Table::builder()
             .file_io(iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
@@ -1279,16 +1123,20 @@ pub(crate) mod tests_support {
 
         let mut contract = make_schema_contract();
         contract.target.table_uuid = target_uuid.clone();
-        contract.target.schema_id_at_create = 7;
+        contract.target.schema_id_at_create = target_schema_id;
+        for visible in &mut contract.target.visible_columns {
+            visible.target_field_id = target_field_id(target_schema.as_ref(), &visible.output_name);
+        }
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
+        contract.target.hidden_apply_key.target_field_id =
+            target_field_id(target_schema.as_ref(), "__row_id__");
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
         contract.aggregate = Some(AggregateStateContract {
             state_layout_version: 1,
             row_id_column_name: "__row_id__".to_string(),
             state_columns: vec![AggregateStateColumnContract {
                 column_name: "__agg_state_v".to_string(),
-                target_field_id: 200,
+                target_field_id: target_field_id(target_schema.as_ref(), "__agg_state_v"),
                 type_signature: "varbinary".to_string(),
                 nullable: false,
                 role: AggregateStateRoleContract::Single,
@@ -1308,7 +1156,7 @@ pub(crate) mod tests_support {
                 Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
                 None,
                 target_uuid.clone(),
-                schema,
+                target_schema,
                 Some(Arc::new(contract)),
             )
             .expect("aggregate rewrite context"),
@@ -1321,13 +1169,15 @@ pub(crate) mod tests_support {
             .iter()
             .map(|column| column.column.name.clone())
             .collect();
+        let target_bindings =
+            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)
+                .expect("aggregate target bindings");
         let ctx = IcebergMvRefreshContext {
             rewrite,
             application_target: make_application_target(),
-            target_entry,
+            target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
-            target_table,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
             ),
@@ -1491,6 +1341,17 @@ pub(crate) mod tests_support {
         .into_iter()
         .collect();
         let mut schema_contract = (*base.schema_contract).clone();
+        let target_schema = loaded.table.metadata().current_schema().clone();
+        let target_uuid = loaded.table.metadata().uuid().to_string();
+        schema_contract.target.table_uuid = target_uuid.clone();
+        schema_contract.target.schema_id_at_create = loaded.table.metadata().current_schema_id();
+        for visible in &mut schema_contract.target.visible_columns {
+            visible.target_field_id = target_field_id(target_schema.as_ref(), &visible.output_name);
+        }
+        schema_contract.target.hidden_apply_key.target_field_id = target_field_id(
+            target_schema.as_ref(),
+            &schema_contract.target.hidden_apply_key.column_name,
+        );
         for base_contract in &mut schema_contract.bases {
             if base_contract.table_fqn.eq_ignore_ascii_case("ice.db.l") {
                 base_contract.table_uuid = left_lineage.table_uuid.clone();
@@ -1522,8 +1383,8 @@ pub(crate) mod tests_support {
                 Arc::clone(&base.base_refs),
                 Arc::new(pin),
                 Some(target_snapshot_id),
-                loaded.table.metadata().uuid().to_string(),
-                Arc::clone(&base.target_schema),
+                target_uuid,
+                target_schema,
                 Some(Arc::new(schema_contract)),
             )
             .expect("join projection refresh rewrite context"),
@@ -1531,16 +1392,18 @@ pub(crate) mod tests_support {
 
         let mut base_catalog_entries = BTreeMap::new();
         base_catalog_entries.insert("ice".to_string(), base_entry);
+        let target_bindings =
+            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, loaded.table)
+                .expect("join projection target bindings");
 
         (
             warehouse,
             IcebergMvRefreshContext {
                 rewrite,
                 application_target: make_application_target(),
-                target_entry,
+                target_bindings,
                 base_catalog_entries,
                 iceberg_catalog,
-                target_table: loaded.table,
                 affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                     "test context",
                 ),
@@ -1613,8 +1476,8 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::rewrite::context::tests_support::{
-        dummy_rewrite_context, make_mv_definition, make_pin, make_ref, make_schema_contract,
-        make_target_schema, parse_query,
+        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target_schema,
+        parse_query,
     };
 
     use super::tests_support::*;
@@ -1879,7 +1742,9 @@ mod tests {
         };
 
         let source = ctx
-            .target_locator_scan_source(&scan)
+            .target_bindings
+            .target_apply()
+            .resolve_locator_scan(&scan)
             .expect("target locator source");
 
         let ScanSource::IcebergDataFiles {
@@ -1923,7 +1788,9 @@ mod tests {
         };
 
         let err = ctx
-            .target_locator_scan_source(&scan)
+            .target_bindings
+            .target_apply()
+            .resolve_locator_scan(&scan)
             .expect_err("apply-key mismatch should fail");
 
         assert!(err.contains("apply-key column mismatch"), "got: {err}");
@@ -1983,7 +1850,7 @@ mod tests {
     #[test]
     fn bind_target_state_file_positions_keeps_only_matched_files() {
         let positions = vec![
-            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+            crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet {
                 referenced_data_file: "s3://bucket/mv/data-b.parquet".to_string(),
                 positions: vec![2, 8, 13],
             },
@@ -2022,7 +1889,7 @@ mod tests {
     #[test]
     fn bind_target_state_file_positions_rejects_missing_files() {
         let positions = vec![
-            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+            crate::engine::mv::iceberg_target_apply_oracle::TargetRowPositionSet {
                 referenced_data_file: "s3://bucket/mv/missing.parquet".to_string(),
                 positions: vec![1],
             },
@@ -2083,13 +1950,16 @@ mod tests {
             ))
             .build()
             .expect("target table");
+        let rewrite = rewrite_context_for_target_fixture(&target_table, None);
+        let target_bindings =
+            IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)
+                .expect("target bindings");
         let mut ctx = IcebergMvRefreshContext {
-            rewrite: dummy_rewrite_context(),
+            rewrite,
             application_target: make_application_target(),
-            target_entry,
+            target_bindings,
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
-            target_table,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
             ),
