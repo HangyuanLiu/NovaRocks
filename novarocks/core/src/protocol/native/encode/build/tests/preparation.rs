@@ -1,0 +1,132 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+
+struct SentinelDeltaResolver {
+    calls: AtomicUsize,
+}
+
+impl crate::coordinator::prepare::scan::ScanBindingResolver for SentinelDeltaResolver {
+    fn resolve_scan(
+        &self,
+        node_id: i32,
+        scan: &PlanScanNode,
+    ) -> Result<Option<crate::coordinator::prepare::scan::ResolvedScanExecution>, String> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(node_id, 10);
+        assert!(matches!(
+            scan.table.source,
+            ScanSource::IcebergDeltaTable {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+                ..
+            }
+        ));
+        Ok(Some(
+            crate::coordinator::prepare::scan::ResolvedScanExecution::IcebergDelta(
+                crate::coordinator::prepare::scan::ResolvedIcebergDeltaScan {
+                    runtime_plan: crate::coordinator::prepare::scan::IcebergDeltaScanRuntimePlan {
+                        table_location: "s3://bucket/test_table".to_string(),
+                        data_columns: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                        change_files: Vec::new(),
+                        delete_side: None,
+                    },
+                },
+            ),
+        ))
+    }
+}
+
+#[test]
+fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
+    let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
+        iceberg_scan_plan(Some(vec!["id"])),
+        |draft| {
+            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
+                panic!("root must be scan");
+            };
+            scan.table.source = ScanSource::IcebergDeltaTable {
+                table: iceberg_table_info(),
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            };
+        },
+    );
+    let before = format!("{plan:#?}");
+    let resolver = SentinelDeltaResolver {
+        calls: AtomicUsize::new(0),
+    };
+
+    let result = build_for_test(TestBuildRequest {
+        distributed_plan: &plan,
+        catalog: &EmptyCatalog,
+        connectors: &ConnectorRegistry::new(),
+        scan_binding_resolver: Some(&resolver),
+    })
+    .expect("build prepared delta fragment");
+
+    assert_eq!(
+        resolver.calls.load(Ordering::Relaxed),
+        1,
+        "delta binding must resolve once"
+    );
+    assert_eq!(format!("{plan:#?}"), before);
+    let ranges = result
+        .0
+        .scheduling_view()
+        .scan_ranges(0, 10)
+        .expect("delta sentinel range by original node id");
+    assert_eq!(ranges.len(), 1);
+    let file = native_file_range(&ranges[0]);
+    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
+    assert!(file.use_iceberg_jni_metadata_reader);
+}
+
+#[test]
+fn fragment_build_reports_missing_delta_resolver_before_encoding() {
+    let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
+        iceberg_scan_plan(Some(vec!["id"])),
+        |draft| {
+            let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
+                panic!("root must be scan");
+            };
+            scan.table.source = ScanSource::IcebergDeltaTable {
+                table: iceberg_table_info(),
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            };
+        },
+    );
+
+    let err = match build_for_test(TestBuildRequest::result(
+        &plan,
+        &EmptyCatalog,
+        &ConnectorRegistry::new(),
+        None,
+    )) {
+        Ok(_) => panic!("delta scan without resolver must fail during preparation"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("IcebergDeltaTable"), "{err}");
+    assert!(err.contains("node_id=10"), "{err}");
+    assert!(err.contains("from_snapshot_id=6"), "{err}");
+    assert!(err.contains("to_snapshot_id=7"), "{err}");
+    assert!(err.contains("requires scan binding resolver"), "{err}");
+}

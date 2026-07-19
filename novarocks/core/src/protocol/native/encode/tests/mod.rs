@@ -15,22 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-mod boundary_schema;
-#[cfg(test)]
-mod build;
-mod bundle;
 mod expr;
-mod iceberg_delta_scan;
-mod iceberg_literal_json;
-pub(crate) mod instance;
-pub(crate) mod plan;
+mod instance;
+mod integration;
 
-#[cfg(test)]
-pub(crate) use bundle::{NativeBundleTestDrift, corrupt_native_fragment_bundle_for_execution_test};
-pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
-pub(crate) use instance::encode_instance_params;
-pub(crate) use plan::encode_data_partition;
+use arrow::datatypes::DataType;
 
-#[cfg(test)]
-mod tests;
+use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::common::LiteralValue;
+
+fn column_expr(id: u32, name: &str, data_type: DataType) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: ColumnId::new_for_test(id),
+            qualifier: Some("t".to_string()),
+            column: name.to_string(),
+        },
+        data_type,
+        nullable: true,
+    }
+}
+
+fn int_expr(value: i64) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::Int(value)),
+        data_type: DataType::Int64,
+        nullable: false,
+    }
+}
