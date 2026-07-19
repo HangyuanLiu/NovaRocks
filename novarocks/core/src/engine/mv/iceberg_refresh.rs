@@ -66,6 +66,9 @@ use crate::engine::mv::refresh_io::{
     run_mv_full_select_chunks_with_catalog, single_snapshot_map, single_table_uuid_map,
 };
 use crate::engine::mv::refresh_pin_adapter::capture_refresh_snapshot_pin;
+use crate::engine::mv::schema_validation_adapter::{
+    validate_current_join_schema_contract, validate_current_schema_contract,
+};
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergCommitOutcomeRecord, IcebergOperationFactUpdate,
@@ -80,7 +83,7 @@ use crate::meta::repository::mv::{
 };
 use crate::mv::aggregate_state::mv_shape::UnionBranchKind;
 use crate::mv::aggregate_state::physical_column::validate_unique_aggregate_physical_column_names;
-use crate::mv::analysis::rebind::{RebindColumn, rewrite_select_sql_for_rebind};
+use crate::mv::analysis::rebind::rewrite_select_sql_for_rebind;
 use crate::mv::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
@@ -106,6 +109,9 @@ use crate::mv::refresh::contract::ImvRefreshContract;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, RefreshDecision, decide_refresh,
+};
+use crate::mv::schema_validation::{
+    BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
 };
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_result::record_batch_to_chunk;
@@ -660,18 +666,10 @@ fn validate_aggregate_schema_contract_for_base(
             base_ref.fqn()
         ));
     }
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(()),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Err(format!(
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(()),
+        ContractDecision::CompatibleSafeWithRebind { .. } => Err(format!(
             "iceberg aggregate-over-UNION-ALL MV requires schema rebind for base {}, which is not supported for fan-in aggregate refresh; rebuild or recreate the MV",
             base_ref.fqn()
         )),
@@ -724,42 +722,25 @@ fn validate_branch_union_contract(
             target.catalog, target.namespace, target.table
         ));
     }
-    let target_fields = target_table
-        .metadata()
-        .current_schema()
-        .as_struct()
-        .fields();
-    let branch_field = target_fields
-        .iter()
-        .find(|field| field.id == branch_contract.branch_id_column.target_field_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id field id {} is missing from target schema",
-                target.catalog,
-                target.namespace,
-                target.table,
-                branch_contract.branch_id_column.target_field_id
-            )
-        })?;
-    if !branch_field
-        .name
-        .eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
-    {
-        return Err(format!(
-            "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column renamed externally to {}; recreate the MV",
-            target.catalog, target.namespace, target.table, branch_field.name
-        ));
-    }
-    if !branch_field.required {
-        return Err(format!(
+    match validate_branch_id_field(
+        &branch_contract.branch_id_column,
+        target_table.metadata().current_schema(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(BranchFieldValidationError::Missing { field_id }) => Err(format!(
+            "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id field id {field_id} is missing from target schema",
+            target.catalog, target.namespace, target.table
+        )),
+        Err(BranchFieldValidationError::Renamed { actual, .. }) => Err(format!(
+            "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column renamed externally to {actual}; recreate the MV",
+            target.catalog, target.namespace, target.table
+        )),
+        Err(BranchFieldValidationError::NotRequired) => Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column must be required",
             target.catalog, target.namespace, target.table
-        ));
-    }
-    match branch_field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int) => Ok(()),
-        other => Err(format!(
-            "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column must be Int, got {other}",
+        )),
+        Err(BranchFieldValidationError::WrongType { actual, .. }) => Err(format!(
+            "iceberg branch UNION ALL aggregate MV {}.{}.{} branch id column must be Int, got {actual}",
             target.catalog, target.namespace, target.table
         )),
     }
@@ -847,49 +828,28 @@ fn validate_union_projection_schema_contract_for_base(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         ));
     }
-    let target_fields = target_table
-        .metadata()
-        .current_schema()
-        .as_struct()
-        .fields();
-    let branch_field = target_fields
-        .iter()
-        .find(|field| field.id == branch_contract.branch_id_column.target_field_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id field id {} is missing from target schema",
-                iceberg_target.catalog,
-                iceberg_target.namespace,
-                iceberg_target.table,
-                branch_contract.branch_id_column.target_field_id
-            )
-        })?;
-    if !branch_field
-        .name
-        .eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
-    {
-        return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column renamed externally to {}; recreate the MV",
-            iceberg_target.catalog,
-            iceberg_target.namespace,
-            iceberg_target.table,
-            branch_field.name
-        ));
-    }
-    if !branch_field.required {
-        return Err(format!(
-            "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be required",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ));
-    }
-    match branch_field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int) => {}
-        other => {
-            return Err(format!(
-                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be Int, got {other}",
+    if let Err(error) = validate_branch_id_field(
+        &branch_contract.branch_id_column,
+        target_table.metadata().current_schema(),
+    ) {
+        return Err(match error {
+            BranchFieldValidationError::Missing { field_id } => format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id field id {field_id} is missing from target schema",
                 iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-            ));
-        }
+            ),
+            BranchFieldValidationError::Renamed { actual, .. } => format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column renamed externally to {actual}; recreate the MV",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            ),
+            BranchFieldValidationError::NotRequired => format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be required",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            ),
+            BranchFieldValidationError::WrongType { actual, .. } => format!(
+                "iceberg UNION ALL projection/filter MV {}.{}.{} branch id column must be Int, got {actual}",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            ),
+        });
     }
 
     let mut base_contract = schema_contract.clone();
@@ -907,18 +867,10 @@ fn validate_union_projection_schema_contract_for_base(
                 base_ref.fqn()
             )
         })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(()),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Err(format!(
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(()),
+        ContractDecision::CompatibleSafeWithRebind { .. } => Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} requires schema rebind, which is not supported for UNION ALL refresh; rebuild or recreate the MV",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         )),
@@ -3320,7 +3272,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         let descriptor =
             MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())?;
         let descriptor_contract = descriptor.schema_contract_typed()?;
-        crate::engine::mv::schema_contract::ensure_descriptor_schema_contract_matches(
+        crate::engine::mv::metadata_consistency::ensure_descriptor_schema_contract_matches(
             descriptor_contract.as_ref(),
             dispatch_schema_contract,
         )?;
@@ -3330,7 +3282,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
         // skip.
         if let Some(current) = loaded.table.metadata().current_snapshot() {
             if let Some(prov) = MvProvenanceV1::from_snapshot_summary(current)? {
-                crate::engine::mv::schema_contract::ensure_summary_watermark_matches_store(
+                crate::engine::mv::metadata_consistency::ensure_summary_watermark_matches_store(
                     &prov.bases,
                     &mv_definition.last_refresh_snapshots,
                 )?;
@@ -3565,17 +3517,15 @@ fn refresh_iceberg_mv_with_planned_partitions(
     // current snapshot id unchanged. validate_schema_contract subsumes the earlier
     // ensure_base_row_lineage_contract check (it already enforces v3 +
     // row-lineage).
-    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+    let effective_definition = match validate_current_schema_contract(
         schema_contract,
         &loaded.table,
         &target_loaded.table,
     ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+        ContractDecision::Incompatible(err) => {
             return Err(format!("{err}").into());
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -3587,9 +3537,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
             def.select_sql = rewritten_sql;
             def
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-            mv_definition.clone()
-        }
+        ContractDecision::CompatibleSafe => mv_definition.clone(),
     };
     let mv_definition = &effective_definition;
     let pinned_full_select_sql =
@@ -4211,17 +4159,15 @@ fn refresh_single_aggregate_iceberg_mv(
         .ok_or_else(|| format!("missing refresh pin for {}", base_ref.fqn()))?;
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let mut rebind_happened = false;
-    let effective_definition = match crate::engine::mv::schema_contract::validate_schema_contract(
+    let effective_definition = match validate_current_schema_contract(
         schema_contract,
         &loaded.table,
         target_table,
     ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+        ContractDecision::Incompatible(err) => {
             return Err(format!("{err}").into());
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -4234,9 +4180,7 @@ fn refresh_single_aggregate_iceberg_mv(
             rebind_happened = true;
             def
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {
-            mv_definition.clone()
-        }
+        ContractDecision::CompatibleSafe => mv_definition.clone(),
     };
     let mv_definition = &effective_definition;
     // Canonicalize once; reused for both reclassification (rebind branch) and
@@ -4832,19 +4776,20 @@ fn refresh_join_aggregate_iceberg_mv(
 
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    let decision = validate_join_schema_contract(
+    let decision = validate_current_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ],
         target_table,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let rebind_happened = matches!(
         decision,
-        JoinSchemaContractDecision::CompatibleSafeWithRebind { .. }
+        JoinContractDecision::CompatibleSafeWithRebind { .. }
     );
-    let effective_definition = decision.into_definition(mv_definition)?;
+    let effective_definition = apply_join_schema_contract_decision(decision, mv_definition)?;
     let mv_definition = &effective_definition;
     // Canonicalize once; reused for both reclassification (rebind branch) and
     // ctx construction below.
@@ -5327,11 +5272,15 @@ pub(crate) fn plan_iceberg_mv_refresh(
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ];
-        match validate_join_schema_contract(schema_contract, &join_bases, &target_loaded.table)
-            .map_err(RefreshError::user)?
+        match validate_current_join_schema_contract(
+            schema_contract,
+            &join_bases,
+            &target_loaded.table,
+        )
+        .map_err(|error| RefreshError::user(error.to_string()))?
         {
-            JoinSchemaContractDecision::CompatibleSafe
-            | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+            JoinContractDecision::CompatibleSafe
+            | JoinContractDecision::CompatibleSafeWithRebind { .. } => {}
         }
         let left_current = left_loaded
             .table
@@ -5511,18 +5460,11 @@ pub(crate) fn plan_iceberg_mv_refresh(
 
     let current_snapshot_id = current_snapshot_id_before_pin;
     let loaded = pre_pin_loaded;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        &target_loaded.table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+    match validate_current_schema_contract(schema_contract, &loaded.table, &target_loaded.table) {
+        ContractDecision::Incompatible(err) => {
             return Err(RefreshError::user(format!("{err}")));
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        }
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => {}
+        ContractDecision::CompatibleSafeWithRebind { .. } | ContractDecision::CompatibleSafe => {}
     }
 
     let refresh_decision = decide_refresh(
@@ -5976,18 +5918,12 @@ fn plan_iceberg_aggregate_mv_refresh(
             };
             let loaded =
                 load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
-            match crate::engine::mv::schema_contract::validate_schema_contract(
-                schema_contract,
-                &loaded.table,
-                target_table,
-            ) {
-                crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
+            match validate_current_schema_contract(schema_contract, &loaded.table, target_table) {
+                ContractDecision::Incompatible(err) => {
                     return Err(RefreshError::user(format!("{err}")));
                 }
-                crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-                | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-                    ..
-                } => {}
+                ContractDecision::CompatibleSafe
+                | ContractDecision::CompatibleSafeWithRebind { .. } => {}
             }
             let current = expected_main_snapshot_id_from_table(&loaded.table);
             let previous = mv_definition
@@ -6069,7 +6005,7 @@ fn plan_iceberg_aggregate_mv_refresh(
                 load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
             let right_loaded =
                 load_current_iceberg_base_table(state, right_ref).map_err(RefreshError::user)?;
-            match validate_join_schema_contract(
+            match validate_current_join_schema_contract(
                 schema_contract,
                 &[
                     (left_ref, &left_loaded.table),
@@ -6077,10 +6013,10 @@ fn plan_iceberg_aggregate_mv_refresh(
                 ],
                 target_table,
             )
-            .map_err(RefreshError::user)?
+            .map_err(|error| RefreshError::user(error.to_string()))?
             {
-                JoinSchemaContractDecision::CompatibleSafe
-                | JoinSchemaContractDecision::CompatibleSafeWithRebind { .. } => {}
+                JoinContractDecision::CompatibleSafe
+                | JoinContractDecision::CompatibleSafeWithRebind { .. } => {}
             }
 
             let mut snapshot_pins = BTreeMap::new();
@@ -10051,9 +9987,15 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ];
-        return match validate_join_schema_contract(schema_contract, &join_bases, target_table)? {
-            JoinSchemaContractDecision::CompatibleSafe => Ok(None),
-            JoinSchemaContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+        return match validate_current_join_schema_contract(
+            schema_contract,
+            &join_bases,
+            target_table,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            JoinContractDecision::CompatibleSafe => Ok(None),
+            JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
                 rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns).map(Some)
             }
         };
@@ -10079,18 +10021,10 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
         return Ok(None);
     };
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        &loaded.table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe => Ok(None),
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            rebound_columns,
-        } => {
+    match validate_current_schema_contract(schema_contract, &loaded.table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe => Ok(None),
+        ContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
             tracing::info!(
                 target = ?target,
                 rebound = ?rebound_columns,
@@ -10121,18 +10055,11 @@ fn ensure_schema_contract_compatible_for_refresh(
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
 ) -> Result<(), String> {
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        schema_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
+    match validate_current_schema_contract(schema_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {
+            Ok(())
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Ok(()),
     }
 }
 
@@ -10151,16 +10078,18 @@ fn validate_repartition_schema_contract(
         };
         let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
         let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-        match validate_join_schema_contract(
+        match validate_current_join_schema_contract(
             schema_contract,
             &[
                 (left_ref, &left_loaded.table),
                 (right_ref, &right_loaded.table),
             ],
             target_table,
-        )? {
-            JoinSchemaContractDecision::CompatibleSafe => {}
-            JoinSchemaContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+        )
+        .map_err(|error| error.to_string())?
+        {
+            JoinContractDecision::CompatibleSafe => {}
+            JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
                 if schema_contract.aggregate.is_some() {
                     return Err(format!(
                         "iceberg join aggregate MV repartition requires schema rebind for {rebound_columns:?}, which is not supported during repartition; recreate the MV"
@@ -10254,18 +10183,11 @@ fn validate_repartition_base_schema_contract(
                 base_ref.fqn()
             )
         })?;
-    match crate::engine::mv::schema_contract::validate_schema_contract(
-        &base_contract,
-        base_table,
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            Err(format!("{err}"))
+    match validate_current_schema_contract(&base_contract, base_table, target_table) {
+        ContractDecision::Incompatible(err) => Err(format!("{err}")),
+        ContractDecision::CompatibleSafe | ContractDecision::CompatibleSafeWithRebind { .. } => {
+            Ok(())
         }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => Ok(()),
     }
 }
 
@@ -10331,7 +10253,9 @@ fn refresh_iceberg_join_mv(
         (left_ref, &left_loaded_before_pin.table),
         (right_ref, &right_loaded_before_pin.table),
     ];
-    let _ = validate_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)?;
+    let _ =
+        validate_current_join_schema_contract(schema_contract, &pre_pin_join_bases, target_table)
+            .map_err(|error| error.to_string())?;
 
     match decide_refresh(
         BaseSnapshotPolicy::JoinPairPartialInitialSkip,
@@ -10368,15 +10292,16 @@ fn refresh_iceberg_join_mv(
 
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    let effective_definition = validate_join_schema_contract(
+    let decision = validate_current_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ],
         target_table,
-    )?
-    .into_definition(mv_definition)?;
+    )
+    .map_err(|error| error.to_string())?;
+    let effective_definition = apply_join_schema_contract_decision(decision, mv_definition)?;
     let mv_definition = &effective_definition;
 
     let left_current = pin
@@ -10601,136 +10526,19 @@ fn validate_refresh_pin_table_uuids_for_operation(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum JoinSchemaContractDecision {
-    CompatibleSafe,
-    CompatibleSafeWithRebind { rebound_columns: Vec<RebindColumn> },
-}
-
-impl JoinSchemaContractDecision {
-    fn into_definition(
-        self,
-        mv_definition: &StoredMvDefinition,
-    ) -> Result<StoredMvDefinition, String> {
-        match self {
-            Self::CompatibleSafe => Ok(mv_definition.clone()),
-            Self::CompatibleSafeWithRebind { rebound_columns } => {
-                let rewritten_sql =
-                    rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
-                let mut def = mv_definition.clone();
-                def.select_sql = rewritten_sql;
-                Ok(def)
-            }
+fn apply_join_schema_contract_decision(
+    decision: JoinContractDecision,
+    mv_definition: &StoredMvDefinition,
+) -> Result<StoredMvDefinition, String> {
+    match decision {
+        JoinContractDecision::CompatibleSafe => Ok(mv_definition.clone()),
+        JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => {
+            let rewritten_sql =
+                rewrite_select_sql_for_rebind(&mv_definition.select_sql, &rebound_columns)?;
+            let mut definition = mv_definition.clone();
+            definition.select_sql = rewritten_sql;
+            Ok(definition)
         }
-    }
-}
-
-fn validate_join_base_schema_contract_for_rebind(
-    base_fqn: &str,
-    base_contract: &mv_schema::BaseContract,
-    current_schema: &iceberg::spec::Schema,
-) -> Result<Vec<RebindColumn>, String> {
-    let current_schema = current_schema.as_struct();
-    let mut rebound = Vec::new();
-    for record in &base_contract.schema_at_create.fields {
-        let Some(field) = current_schema
-            .fields()
-            .iter()
-            .find(|field| field.id == record.field_id)
-        else {
-            return Err(format!(
-                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) was dropped from {}; recreate the MV",
-                record.name_at_create, record.field_id, base_fqn
-            ));
-        };
-        if format!("{}", field.field_type) != record.type_signature {
-            return Err(format!(
-                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed type from {} to {}; recreate the MV",
-                record.name_at_create, record.field_id, record.type_signature, field.field_type
-            ));
-        }
-        if field.required != record.required {
-            return Err(format!(
-                "iceberg join MV refresh blocked: base column \"{}\" (field id {}) changed nullability; recreate the MV",
-                record.name_at_create, record.field_id
-            ));
-        }
-        if !field.name.eq_ignore_ascii_case(&record.name_at_create) {
-            rebound.push(RebindColumn {
-                base_table_fqn: base_fqn.to_string(),
-                field_id: record.field_id,
-                name_at_create: record.name_at_create.clone(),
-                current_name: field.name.clone(),
-            });
-        }
-    }
-    Ok(rebound)
-}
-
-fn validate_join_schema_contract(
-    contract: &mv_schema::MvSchemaContract,
-    bases: &[(&TableIdentity, &iceberg::table::Table); 2],
-    target_table: &iceberg::table::Table,
-) -> Result<JoinSchemaContractDecision, String> {
-    contract
-        .ensure_self_consistent()
-        .map_err(|e| format!("Iceberg join MV schema contract is self-inconsistent: {e}"))?;
-    if contract.bases.len() != 2 {
-        return Err(format!(
-            "Iceberg join MV schema contract requires two base contracts, got {}",
-            contract.bases.len()
-        ));
-    }
-    if contract.target.table_uuid != target_table.metadata().uuid().to_string() {
-        return Err(
-            "iceberg join MV refresh blocked: target table identity changed; recreate the MV"
-                .to_string(),
-        );
-    }
-    let mut rebound_columns = Vec::new();
-    for (base_ref, table) in bases {
-        ensure_base_row_lineage_contract(table, &base_ref.fqn())?;
-        let base_contract = contract
-            .bases
-            .iter()
-            .find(|base| base.table_fqn.eq_ignore_ascii_case(&base_ref.fqn()))
-            .ok_or_else(|| {
-                format!(
-                    "Iceberg join MV schema contract missing base {}",
-                    base_ref.fqn()
-                )
-            })?;
-        if base_contract.table_uuid != table.metadata().uuid().to_string() {
-            return Err(format!(
-                "iceberg join MV refresh blocked: base table identity changed for {}; recreate the MV",
-                base_ref.fqn()
-            ));
-        }
-        rebound_columns.extend(validate_join_base_schema_contract_for_rebind(
-            &base_ref.fqn(),
-            base_contract,
-            table.metadata().current_schema(),
-        )?);
-    }
-    let left_schema = bases[0].1.metadata().current_schema();
-    match crate::engine::mv::schema_contract::validate_schema_contract_with_base_schema(
-        contract,
-        bases[0].1,
-        left_schema.as_ref(),
-        target_table,
-    ) {
-        crate::engine::mv::schema_contract::ContractDecision::Incompatible(err) => {
-            return Err(format!("{err}"));
-        }
-        crate::engine::mv::schema_contract::ContractDecision::CompatibleSafe
-        | crate::engine::mv::schema_contract::ContractDecision::CompatibleSafeWithRebind {
-            ..
-        } => {}
-    }
-    if rebound_columns.is_empty() {
-        Ok(JoinSchemaContractDecision::CompatibleSafe)
-    } else {
-        Ok(JoinSchemaContractDecision::CompatibleSafeWithRebind { rebound_columns })
     }
 }
 
@@ -10822,15 +10630,16 @@ fn build_join_projection_repartition_context(
     let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
     let left_loaded = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded = load_current_iceberg_base_table(state, right_ref)?;
-    let effective_definition = validate_join_schema_contract(
+    let decision = validate_current_join_schema_contract(
         schema_contract,
         &[
             (left_ref, &left_loaded.table),
             (right_ref, &right_loaded.table),
         ],
         schema_validation_target_table,
-    )?
-    .into_definition(mv_definition)?;
+    )
+    .map_err(|error| error.to_string())?;
+    let effective_definition = apply_join_schema_contract_decision(decision, mv_definition)?;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&effective_definition.select_sql)?,
         current_catalog,
@@ -16374,42 +16183,186 @@ mod tests {
         assert!(is_imv_change_op_output_column(&output));
     }
 
-    #[test]
-    fn join_base_schema_contract_returns_rebind_for_rename() {
-        let ty = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_contract = mv_schema::BaseContract {
-            table_fqn: "ice.db.fact".to_string(),
-            table_uuid: "uuid".to_string(),
-            alias_at_create: Some("f".to_string()),
-            schema_id_at_create: 1,
-            schema_at_create: mv_schema::BaseSchemaSnapshot {
-                fields: vec![mv_schema::BaseFieldRecord {
-                    field_id: 2,
-                    name_at_create: "dim_id".to_string(),
-                    type_signature: format!("{ty}"),
-                    required: false,
+    fn branch_field_test_contract(
+        source: mv_schema::ApplyKeySource,
+    ) -> mv_schema::MvSchemaContract {
+        let aggregate = (source == mv_schema::ApplyKeySource::GroupRowId).then(|| {
+            mv_schema::AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
+                state_columns: vec![mv_schema::AggregateStateColumnContract {
+                    column_name: "__agg_state_count".to_string(),
+                    target_field_id: 3,
+                    type_signature: "long".to_string(),
+                    nullable: false,
+                    role: mv_schema::AggregateStateRoleContract::Single,
                 }],
-            },
+            }
+        });
+        let hidden_name = match source {
+            mv_schema::ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
+            mv_schema::ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
+            mv_schema::ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
         };
-        let current_schema = iceberg::spec::Schema::builder()
+        mv_schema::MvSchemaContract {
+            contract_version: if aggregate.is_some() { 3 } else { 1 },
+            base: test_base_contract("ice.db.base"),
+            bases: vec![test_base_contract("ice.db.base")],
+            output: mv_schema::OutputContract {
+                columns: Vec::new(),
+                filter: None,
+            },
+            join: None,
+            aggregate,
+            branch: Some(mv_schema::BranchUnionContract {
+                branch_id_column: mv_schema::BranchIdColumnContract {
+                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+                    target_field_id: 2,
+                },
+                branch_count: 2,
+                inner_apply_key_source: source,
+            }),
+            target: mv_schema::TargetContract {
+                table_fqn: "ice.db.mv".to_string(),
+                table_uuid: "target-uuid".to_string(),
+                schema_id_at_create: 1,
+                visible_columns: Vec::new(),
+                hidden_apply_key: mv_schema::HiddenApplyKeyContract {
+                    column_name: hidden_name.to_string(),
+                    target_field_id: 10,
+                    source,
+                },
+                partition: None,
+            },
+        }
+    }
+
+    fn branch_field_test_table(
+        branch_field: Option<iceberg::spec::NestedField>,
+    ) -> iceberg::table::Table {
+        use iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type,
+        };
+
+        let mut fields = vec![StdArc::new(NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Int),
+        ))];
+        fields.extend(branch_field.map(StdArc::new));
+        let schema = Schema::builder()
             .with_schema_id(2)
-            .with_fields(vec![std::sync::Arc::new(
-                iceberg::spec::NestedField::optional(2, "new_dim_id", ty),
-            )])
+            .with_fields(fields)
             .build()
-            .expect("schema");
-
-        let rebound = validate_join_base_schema_contract_for_rebind(
-            "ice.db.fact",
-            &base_contract,
-            &current_schema,
+            .expect("branch field test schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/ebd16b-branch-field".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::from([(
+                "write.row-lineage".to_string(),
+                "true".to_string(),
+            )]),
         )
-        .expect("compatible");
+        .expect("branch field table metadata builder")
+        .build()
+        .expect("branch field table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .identifier(
+                iceberg::TableIdent::from_strs(["db", "branch_target"])
+                    .expect("branch field table ident"),
+            )
+            .file_io(iceberg::io::FileIO::new_with_fs())
+            .metadata(metadata)
+            .build()
+            .expect("branch field test table")
+    }
 
-        assert_eq!(rebound.len(), 1);
-        assert_eq!(rebound[0].base_table_fqn, "ice.db.fact");
-        assert_eq!(rebound[0].name_at_create, "dim_id");
-        assert_eq!(rebound[0].current_name, "new_dim_id");
+    fn branch_field_cases() -> Vec<(iceberg::table::Table, &'static str)> {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+
+        vec![
+            (branch_field_test_table(None), "missing"),
+            (
+                branch_field_test_table(Some(NestedField::required(
+                    2,
+                    "renamed_branch",
+                    Type::Primitive(PrimitiveType::Int),
+                ))),
+                "renamed",
+            ),
+            (
+                branch_field_test_table(Some(NestedField::optional(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    Type::Primitive(PrimitiveType::Int),
+                ))),
+                "not-required",
+            ),
+            (
+                branch_field_test_table(Some(NestedField::required(
+                    2,
+                    BRANCH_ID_COLUMN_NAME,
+                    Type::Primitive(PrimitiveType::Long),
+                ))),
+                "wrong-type",
+            ),
+        ]
+    }
+
+    #[test]
+    fn branch_union_aggregate_branch_field_errors_preserve_exact_messages() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        };
+        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::GroupRowId);
+        let expected = [
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id field id 2 is missing from target schema",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be required",
+            "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column must be Int, got long",
+        ];
+
+        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
+            let error =
+                validate_branch_union_contract(&target, &contract, 2, &table).expect_err(label);
+            assert_eq!(error, expected, "case={label}");
+        }
+    }
+
+    #[test]
+    fn union_projection_branch_field_errors_preserve_exact_messages() {
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "mv".to_string(),
+        };
+        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::BaseRowId);
+        let base_ref = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "base".to_string(),
+        };
+        let expected = [
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id field id 2 is missing from target schema",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be required",
+            "iceberg UNION ALL projection/filter MV ice.db.mv branch id column must be Int, got long",
+        ];
+
+        for ((table, label), expected) in branch_field_cases().into_iter().zip(expected) {
+            let error = validate_union_projection_schema_contract_for_base(
+                &target, &contract, 2, &base_ref, &table, &table,
+            )
+            .expect_err(label);
+            assert_eq!(error, expected, "case={label}");
+        }
     }
 
     #[test]

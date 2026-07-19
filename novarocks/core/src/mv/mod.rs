@@ -23,3 +23,4 @@ pub(crate) mod partition;
 pub mod persistence;
 pub(crate) mod refresh;
 pub(crate) mod rewrite;
+pub(crate) mod schema_validation;
