@@ -33,9 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::identifier::TableIdentity;
 use crate::common::engine_error::EngineError;
-use crate::connector::iceberg::changes::{
-    IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
-};
+use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::iceberg::commit::mv_provenance::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
@@ -110,6 +108,9 @@ use crate::mv::refresh::execution::{
     validate_refresh_execution,
 };
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
+use crate::mv::refresh::non_join_incremental::{
+    NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
+};
 use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
@@ -3777,7 +3778,7 @@ fn refresh_iceberg_union_projection_mv(
                                 target.catalog, target.namespace, target.table
                             )
                         })?;
-                    Ok(RewriteMergeBaseChange {
+                    Ok(NonJoinBaseChange {
                         base_ref,
                         previous_snapshot_id,
                         current_snapshot_id: *current_snapshot_id,
@@ -4110,7 +4111,7 @@ fn refresh_single_aggregate_iceberg_mv(
 /// multi-base pin, exactly like `refresh_join_aggregate_iceberg_mv` does for
 /// its two bases. This orchestration just pins/loads every fan-in base, builds
 /// one refresh context over all of them, and drives the shared aggregate merge
-/// with one `RewriteMergeBaseChange` per base.
+/// with one canonical `NonJoinBaseChange` per base.
 ///
 /// Structurally this mirrors `refresh_iceberg_union_projection_mv` (multi-base
 /// first/metadata/incremental dispatch) but uses the aggregate contract
@@ -4417,7 +4418,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
                                 target.catalog, target.namespace, target.table
                             )
                         })?;
-                    Ok(RewriteMergeBaseChange {
+                    Ok(NonJoinBaseChange {
                         base_ref,
                         previous_snapshot_id,
                         current_snapshot_id: *current_snapshot_id,
@@ -14230,14 +14231,6 @@ fn build_imv_change_stream_branches_for_test(
     }
 }
 
-struct RewriteMergeBaseChange<'a> {
-    base_ref: &'a TableIdentity,
-    previous_snapshot_id: i64,
-    current_snapshot_id: i64,
-    base_table: &'a iceberg::table::Table,
-    current_table_uuid: &'a str,
-}
-
 #[derive(Clone, Copy)]
 enum FullRebuildSelectPreparation<'a> {
     Projection {
@@ -14249,22 +14242,6 @@ enum FullRebuildSelectPreparation<'a> {
     LegacyVisible {
         select_sql: &'a str,
     },
-}
-
-fn rewrite_refresh_snapshot_map(changes: &[RewriteMergeBaseChange<'_>]) -> BTreeMap<String, i64> {
-    changes
-        .iter()
-        .map(|change| (change.base_ref.fqn(), change.current_snapshot_id))
-        .collect()
-}
-
-fn rewrite_refresh_table_uuid_map(
-    changes: &[RewriteMergeBaseChange<'_>],
-) -> BTreeMap<String, String> {
-    changes
-        .iter()
-        .map(|change| (change.base_ref.fqn(), change.current_table_uuid.to_string()))
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14279,7 +14256,7 @@ fn incremental_refresh_iceberg_mv(
     full_rebuild_select: FullRebuildSelectPreparation<'_>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let change = RewriteMergeBaseChange {
+    let change = NonJoinBaseChange {
         base_ref,
         previous_snapshot_id,
         current_snapshot_id,
@@ -14295,11 +14272,42 @@ fn incremental_refresh_iceberg_mv(
     )
 }
 
+fn validate_non_join_change_plan_before_intent(
+    plan: NonJoinIncrementalChangePlan,
+    change_count: usize,
+    allow_full_rebuild: bool,
+    has_pinned_full_select: bool,
+    target: &IcebergMvTarget,
+) -> Result<NonJoinIncrementalChangePlan, String> {
+    let NonJoinIncrementalChangePlan::FullRebuild { reason, .. } = &plan else {
+        return Ok(plan);
+    };
+    if !allow_full_rebuild {
+        return Err(format!(
+            "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if change_count != 1 {
+        return Err(format!(
+            "iceberg MV {}.{}.{} cannot fall back to full rebuild for multi-base incremental refresh: {reason}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    if !has_pinned_full_select {
+        return Err(format!(
+            "iceberg MV {}.{}.{} full rebuild fallback requires pinned full SELECT",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    Ok(plan)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv_with_changes(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-    changes: &[RewriteMergeBaseChange<'_>],
+    changes: &[NonJoinBaseChange<'_>],
     full_rebuild_select: Option<FullRebuildSelectPreparation<'_>>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
@@ -14312,172 +14320,128 @@ fn incremental_refresh_iceberg_mv_with_changes(
     let mv_definition = &*ctx.rewrite.mv_definition;
     let apply_key = options.apply_key;
     let rewrite_evidence = rewrite_merge_refresh_evidence(apply_key);
-    if changes.is_empty() {
-        return Err(
-            "iceberg MV incremental refresh requires at least one base change"
-                .to_string()
-                .into(),
-        );
-    }
-    let snapshots = rewrite_refresh_snapshot_map(changes);
-    let table_uuids = rewrite_refresh_table_uuid_map(changes);
-    // 1. Plan the change batch. If the standard Iceberg diff cannot be planned
-    // safely, rebuild instead of risking an incorrect incremental result.
-    let mut has_insert_changes = false;
-    let mut has_delete_changes = false;
-    for change in changes {
-        let batch = match plan_changes(
-            change.base_table,
-            change.previous_snapshot_id,
-            Some(change.current_snapshot_id),
-            &[],
-        ) {
-            Ok(batch) => batch,
-            Err(err) => match policy_signal_from_change_error(&err) {
-                IcebergChangePolicySignal::FullRefresh { reason } => {
-                    if !apply_key.allow_full_rebuild_on_policy_full_refresh {
-                        return Err(format!(
-                            "iceberg aggregate MV {}.{}.{} cannot refresh incrementally and automatic full rebuild is disabled: {reason}",
-                            target.catalog, target.namespace, target.table
-                        )
-                        .into());
-                    }
-                    let [change] = changes else {
-                        return Err(format!(
-                            "iceberg MV {}.{}.{} cannot fall back to full rebuild for multi-base incremental refresh: {reason}",
-                            target.catalog, target.namespace, target.table
-                        )
-                        .into());
-                    };
-                    let full_rebuild_select = full_rebuild_select.ok_or_else(|| {
-                        format!(
-                            "iceberg MV {}.{}.{} full rebuild fallback requires full SELECT preparation",
-                            target.catalog, target.namespace, target.table
-                        )
-                    })?;
-                    let physical_full_select_sql = match full_rebuild_select {
-                        FullRebuildSelectPreparation::Projection {
-                            select_sql,
-                            pin,
-                            current_catalog,
-                            current_database,
-                        } => prepare_projection_full_read_sql(
-                            select_sql,
-                            pin,
-                            current_catalog,
-                            current_database,
-                        )?,
-                        FullRebuildSelectPreparation::LegacyVisible { select_sql } => {
-                            iceberg_mv_physical_select_sql(select_sql)?
-                        }
-                    };
-                    tracing::info!(
-                        "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
-                        target.catalog,
-                        target.namespace,
-                        target.table
-                    );
-                    let staging_branch = format!(
-                        "__nova_mv_refresh_{}_{}",
-                        mv_definition.mv_id,
-                        uuid::Uuid::new_v4().simple()
-                    );
-                    let refresh_id = begin_staged_iceberg_mv_refresh_intent(
-                        state,
-                        target,
-                        mv_definition.mv_id,
-                        expected_main_snapshot_id,
-                        snapshots.clone(),
-                        &staging_branch,
-                    )?;
-                    return rebuild_iceberg_mv(
-                        state,
-                        target,
-                        target_entry,
-                        iceberg_catalog,
-                        expected_main_snapshot_id,
-                        &staging_branch,
-                        refresh_id,
-                        current_database,
-                        mv_definition,
-                        &physical_full_select_sql,
-                        change.base_ref,
-                        Some(change.current_snapshot_id),
-                        change.current_table_uuid,
-                        None,
-                    );
-                }
-                IcebergChangePolicySignal::Unsupported { reason } => {
-                    return Err(format!(
-                        "iceberg-stored materialized view refresh unsupported: {reason}"
-                    )
-                    .into());
-                }
-                IcebergChangePolicySignal::Incremental => {
-                    return Err(
-                        "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
-                            .to_string()
-                            .into(),
-                    );
-                }
-            },
-        };
-        if batch.current_snapshot_id != change.current_snapshot_id {
-            return Err(format!(
-                "iceberg mv incremental refresh: change batch snapshot mismatch for {} (expected {}, got {})",
-                change.base_ref.fqn(),
-                change.current_snapshot_id,
-                batch.current_snapshot_id,
-            )
-            .into());
+    // 1. Canonical change planning runs before any refresh intent or staging
+    // branch is created. Engine consumes the typed plan and owns lifecycle policy.
+    let change_plan = validate_non_join_change_plan_before_intent(
+        plan_non_join_incremental_changes(changes)?,
+        changes.len(),
+        apply_key.allow_full_rebuild_on_policy_full_refresh,
+        full_rebuild_select.is_some(),
+        target,
+    )?;
+    let (lineage, has_delete_changes) = match change_plan {
+        NonJoinIncrementalChangePlan::MetadataOnly(lineage) => {
+            let snapshots = &lineage.snapshots;
+            let table_uuids = &lineage.table_uuids;
+            // 2. Empty delta: advance lineage without committing a data-carrying
+            // Iceberg snapshot. This must run before any staging-branch work.
+            tracing::info!(
+                snapshots = ?snapshots,
+                "iceberg mv {}.{}.{}: incremental refresh delta has 0 rows; \
+                 advancing lineage without new iceberg snapshot",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            let refresh_id =
+                begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
+            // W4/M6: the base watermark advanced but the delta is empty, so no data
+            // snapshot is committed. Advance the lake watermark with a data-free
+            // snapshot so the storage table's current-snapshot provenance keeps up
+            // with the SQLite watermark; use its id as the recorded target snapshot
+            // when committed.
+            let target_snapshot_id = advance_lake_watermark_via_data_free_snapshot(
+                target,
+                target_entry,
+                iceberg_catalog,
+                mv_definition,
+                refresh_id,
+                snapshots,
+                table_uuids,
+            )?
+            .map(Ok)
+            .unwrap_or_else(|| recorded_target_snapshot_id(target, mv_definition))?;
+            finalize_iceberg_mv_refresh_with_partition_state(
+                state,
+                refresh_id,
+                mv_definition.last_refresh_rows.unwrap_or(0),
+                snapshots.clone(),
+                table_uuids.clone(),
+                target_snapshot_id,
+                IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
+            )?;
+            return Ok(StatementResult::Ok);
         }
-        has_insert_changes |= !batch.inserts.is_empty();
-        has_delete_changes |= !batch.deletes.is_empty()
-            || !batch.equality_deletes.is_empty()
-            || !batch.deleted_data_files.is_empty();
-    }
-    let is_empty_delta = !has_insert_changes && !has_delete_changes;
-
-    // 2. Empty delta: advance lineage without committing a data-carrying Iceberg
-    // snapshot. This must run before any staging-branch work.
-    if is_empty_delta {
-        tracing::info!(
-            snapshots = ?snapshots,
-            "iceberg mv {}.{}.{}: incremental refresh delta has 0 rows; \
-             advancing lineage without new iceberg snapshot",
-            target.catalog,
-            target.namespace,
-            target.table
-        );
-        let refresh_id =
-            begin_iceberg_mv_refresh_intent(state, mv_definition.mv_id, snapshots.clone())?;
-        // W4/M6: the base watermark advanced but the delta is empty, so no data
-        // snapshot is committed. Advance the lake watermark with a data-free
-        // snapshot so the storage table's current-snapshot provenance keeps up
-        // with the SQLite watermark; use its id as the recorded target snapshot
-        // when committed.
-        let target_snapshot_id = advance_lake_watermark_via_data_free_snapshot(
-            target,
-            target_entry,
-            iceberg_catalog,
-            mv_definition,
-            refresh_id,
-            &snapshots,
-            &table_uuids,
-        )?
-        .map(Ok)
-        .unwrap_or_else(|| recorded_target_snapshot_id(target, mv_definition))?;
-        finalize_iceberg_mv_refresh_with_partition_state(
-            state,
-            refresh_id,
-            mv_definition.last_refresh_rows.unwrap_or(0),
-            snapshots.clone(),
-            table_uuids.clone(),
-            target_snapshot_id,
-            IcebergMvPartitionStateFinalize::FromAffected(&ctx.affected_partitions),
-        )?;
-        return Ok(StatementResult::Ok);
-    }
+        NonJoinIncrementalChangePlan::FullRebuild { lineage, reason } => {
+            let [change] = changes else {
+                return Err(
+                    "iceberg MV full rebuild plan violated the validated single-base contract"
+                        .to_string()
+                        .into(),
+                );
+            };
+            let full_rebuild_select = full_rebuild_select.ok_or_else(|| {
+                "iceberg MV full rebuild plan lost its validated pinned full SELECT".to_string()
+            })?;
+            let physical_full_select_sql = match full_rebuild_select {
+                FullRebuildSelectPreparation::Projection {
+                    select_sql,
+                    pin,
+                    current_catalog,
+                    current_database,
+                } => prepare_projection_full_read_sql(
+                    select_sql,
+                    pin,
+                    current_catalog,
+                    current_database,
+                )?,
+                FullRebuildSelectPreparation::LegacyVisible { select_sql } => {
+                    iceberg_mv_physical_select_sql(select_sql)?
+                }
+            };
+            tracing::info!(
+                "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
+                target.catalog,
+                target.namespace,
+                target.table
+            );
+            let staging_branch = format!(
+                "__nova_mv_refresh_{}_{}",
+                mv_definition.mv_id,
+                uuid::Uuid::new_v4().simple()
+            );
+            let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+                state,
+                target,
+                mv_definition.mv_id,
+                expected_main_snapshot_id,
+                lineage.snapshots,
+                &staging_branch,
+            )?;
+            return rebuild_iceberg_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                expected_main_snapshot_id,
+                &staging_branch,
+                refresh_id,
+                current_database,
+                mv_definition,
+                &physical_full_select_sql,
+                change.base_ref,
+                Some(change.current_snapshot_id),
+                change.current_table_uuid,
+                None,
+            );
+        }
+        NonJoinIncrementalChangePlan::ChangeStream {
+            lineage,
+            has_delete_changes,
+        } => (lineage, has_delete_changes),
+    };
+    let snapshots = lineage.snapshots;
+    let table_uuids = lineage.table_uuids;
 
     // 3. Begin the staging branch and pre-load the target Iceberg table.
     let staging_branch = format!(
@@ -23783,6 +23747,73 @@ mod tests {
                 .keys()
                 .any(|name| name.starts_with("__nova_mv_refresh_")),
             "failed writer staging branch must be dropped"
+        );
+    }
+
+    #[test]
+    fn multi_base_full_rebuild_policy_is_rejected_before_staging_intent() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let refresh_count_before = load_all_mv_refreshes(&env.state).len();
+        let reason = "previous snapshot is not reachable";
+        let plan = NonJoinIncrementalChangePlan::FullRebuild {
+            lineage: crate::mv::refresh::non_join_incremental::NonJoinLineage {
+                snapshots: BTreeMap::from([
+                    ("ice.sales.orders".to_string(), 20),
+                    ("ice.sales.customers".to_string(), 30),
+                ]),
+                table_uuids: BTreeMap::from([
+                    ("ice.sales.orders".to_string(), "uuid-orders".to_string()),
+                    (
+                        "ice.sales.customers".to_string(),
+                        "uuid-customers".to_string(),
+                    ),
+                ]),
+            },
+            reason: reason.to_string(),
+        };
+
+        let err = validate_non_join_change_plan_before_intent(plan, 2, true, true, &target)
+            .expect_err("multi-base full rebuild must be rejected");
+
+        assert!(err.contains("multi-base incremental refresh"), "{err}");
+        assert!(
+            err.contains(reason),
+            "policy reason must be preserved: {err}"
+        );
+        assert_eq!(
+            load_all_mv_refreshes(&env.state).len(),
+            refresh_count_before,
+            "pre-intent policy rejection must not create a refresh row"
+        );
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        assert_eq!(mv.active_refresh_id, None);
+        assert!(!mv.refresh_in_progress);
+        let entry = env
+            .state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get("ice")
+            .expect("catalog");
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .expect("load target");
+        assert!(
+            !loaded
+                .table
+                .metadata()
+                .refs()
+                .keys()
+                .any(|name| name.starts_with("__nova_mv_refresh_")),
+            "pre-intent policy rejection must not create a staging ref"
         );
     }
 
