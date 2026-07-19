@@ -95,7 +95,7 @@ impl CoordinationError {
         )
     }
 
-    pub(crate) const fn clock_unsafe() -> Self {
+    pub const fn clock_unsafe() -> Self {
         Self::new(CoordinationErrorKind::ClockUnsafe, "lease clock is unsafe")
     }
 

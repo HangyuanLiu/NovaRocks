@@ -734,9 +734,7 @@ mod tests {
             if self.wall_readable {
                 Ok(10_000)
             } else {
-                Err(CoordinationError::commit_uncertain(TransactionId::from(
-                    Uuid::now_v7(),
-                )))
+                Err(CoordinationError::clock_unsafe())
             }
         }
 

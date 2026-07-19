@@ -95,6 +95,22 @@ impl LeaseClock for ManualLeaseClock {
     }
 }
 
+struct UnreadableLeaseClock;
+
+impl LeaseClock for UnreadableLeaseClock {
+    fn wall_time_millis(&self) -> Result<u64, CoordinationError> {
+        Err(CoordinationError::clock_unsafe())
+    }
+
+    fn monotonic_time_millis(&self) -> u64 {
+        0
+    }
+
+    fn health(&self) -> ClockHealth {
+        ClockHealth::Healthy
+    }
+}
+
 struct OneAcquireConflictStore {
     inner: Arc<dyn StateStore>,
     commit_barrier: Arc<Barrier>,
@@ -911,6 +927,34 @@ pub async fn basic_acquire_contention_and_high_watermark(factory: &StateStoreFac
         writes_before,
         "candidate limit must be rejected before staging provider mutation"
     );
+}
+
+pub async fn external_lease_clock_error_is_clock_unsafe(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    IncarnationGate::new(Arc::clone(&fixture.store))
+        .bootstrap(OperationId::new_v7())
+        .await
+        .expect("bootstrap coordination control");
+    let manager = LeaseManager::new(
+        Arc::clone(&fixture.store),
+        holder(b"clock-error-holder"),
+        Arc::new(UnreadableLeaseClock),
+        lease_settings(),
+    )
+    .expect("manager");
+
+    let error = manager
+        .acquire(
+            resource(b"clock-error-resource"),
+            attempt(),
+            OperationId::new_v7(),
+        )
+        .await
+        .expect_err("external clock error must be propagated as clock unsafe");
+
+    assert_eq!(error.kind(), CoordinationErrorKind::ClockUnsafe);
+    assert_eq!(error.transaction_id(), None);
+    assert_eq!(error.to_string(), "ClockUnsafe: lease clock is unsafe");
 }
 
 pub async fn concurrent_acquire_exactly_one_winner(factory: &StateStoreFactory) {

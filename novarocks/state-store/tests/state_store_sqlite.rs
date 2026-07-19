@@ -95,6 +95,10 @@ async fn coordination_acquire_suite() {
     .await;
     common::state_store_coordination_conformance::concurrent_acquire_exactly_one_winner(&factory)
         .await;
+    common::state_store_coordination_conformance::external_lease_clock_error_is_clock_unsafe(
+        &factory,
+    )
+    .await;
 }
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {

@@ -106,6 +106,18 @@ fn validated_millis(name: &'static str, duration: Duration) -> Result<u64, Coord
             _ => "lease observation window must be nonzero",
         }));
     }
+    if !duration.subsec_nanos().is_multiple_of(1_000_000) {
+        return Err(CoordinationError::invalid_request(match name {
+            "lease duration" => "lease duration must be a nonzero whole number of milliseconds",
+            "renew interval" => {
+                "lease renew interval must be a nonzero whole number of milliseconds"
+            }
+            "maximum clock skew" => {
+                "maximum clock skew must be a nonzero whole number of milliseconds"
+            }
+            _ => "lease observation window must be a nonzero whole number of milliseconds",
+        }));
+    }
     u64::try_from(duration.as_millis()).map_err(|_| {
         CoordinationError::invalid_request("lease duration exceeds the millisecond range")
     })
@@ -136,6 +148,60 @@ mod tests {
                 CoordinationErrorKind::InvalidRequest
             );
         }
+    }
+
+    #[test]
+    fn settings_reject_submillisecond_and_fractional_millisecond_durations() {
+        for duration in [Duration::from_nanos(1), Duration::from_micros(1_500)] {
+            assert_non_integral_duration(
+                LeaseSettings::new(
+                    duration,
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                ),
+                "lease duration",
+            );
+            assert_non_integral_duration(
+                LeaseSettings::new(
+                    Duration::from_millis(2),
+                    duration,
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                ),
+                "lease renew interval",
+            );
+            assert_non_integral_duration(
+                LeaseSettings::new(
+                    Duration::from_millis(2),
+                    Duration::from_millis(1),
+                    duration,
+                    Duration::from_millis(1),
+                ),
+                "maximum clock skew",
+            );
+            assert_non_integral_duration(
+                LeaseSettings::new(
+                    Duration::from_millis(2),
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                    duration,
+                ),
+                "lease observation window",
+            );
+        }
+    }
+
+    fn assert_non_integral_duration(
+        result: Result<LeaseSettings, crate::coordination::CoordinationError>,
+        field: &str,
+    ) {
+        let error = result.expect_err("non-integral millisecond duration must fail closed");
+        assert_eq!(error.kind(), CoordinationErrorKind::InvalidRequest);
+        assert_eq!(
+            error.to_string(),
+            format!("InvalidRequest: {field} must be a nonzero whole number of milliseconds")
+        );
     }
 
     #[test]
