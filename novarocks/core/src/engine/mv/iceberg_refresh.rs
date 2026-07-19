@@ -13566,45 +13566,62 @@ struct ImvRefreshPlannedChangeStream<'a> {
 }
 
 #[cfg(test)]
-fn imv_change_stream_execution_failure_for_test() -> &'static std::sync::Mutex<Option<String>> {
-    static FAILURE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-        std::sync::OnceLock::new();
-    FAILURE.get_or_init(|| std::sync::Mutex::new(None))
+std::thread_local! {
+    static IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST: std::cell::RefCell<
+        Option<crate::coordinator::execution::CoordinatedQueryResult>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
-struct ImvChangeStreamExecutionFailureGuard;
+struct ImvChangeStreamExecutionResultGuard {
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
 #[cfg(test)]
-impl Drop for ImvChangeStreamExecutionFailureGuard {
+impl Drop for ImvChangeStreamExecutionResultGuard {
     fn drop(&mut self) {
-        *imv_change_stream_execution_failure_for_test()
-            .lock()
-            .expect("IMV change-stream failure test lock") = None;
+        IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
     }
 }
 
 #[cfg(test)]
-fn install_imv_change_stream_execution_failure_for_test(
-    message: &str,
-) -> ImvChangeStreamExecutionFailureGuard {
-    let mut failure = imv_change_stream_execution_failure_for_test()
-        .lock()
-        .expect("IMV change-stream failure test lock");
-    assert!(
-        failure.is_none(),
-        "IMV change-stream failure already installed"
-    );
-    *failure = Some(message.to_string());
-    ImvChangeStreamExecutionFailureGuard
+fn install_imv_change_stream_execution_result_for_test(
+    result: crate::coordinator::execution::CoordinatedQueryResult,
+) -> ImvChangeStreamExecutionResultGuard {
+    IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| {
+        let replaced = slot.borrow_mut().replace(result);
+        assert!(
+            replaced.is_none(),
+            "IMV change-stream execution result already installed for this test thread"
+        );
+    });
+    ImvChangeStreamExecutionResultGuard {
+        _not_send: std::marker::PhantomData,
+    }
 }
 
 #[cfg(test)]
-fn take_imv_change_stream_execution_failure_for_test() -> Option<String> {
-    imv_change_stream_execution_failure_for_test()
-        .lock()
-        .expect("IMV change-stream failure test lock")
-        .take()
+fn take_imv_change_stream_execution_result_for_test()
+-> Option<crate::coordinator::execution::CoordinatedQueryResult> {
+    IMV_CHANGE_STREAM_EXECUTION_RESULT_FOR_TEST.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn imv_change_stream_writer_abort_result_for_test(
+    reason: &str,
+) -> crate::coordinator::execution::CoordinatedQueryResult {
+    let mut abort =
+        crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
+    abort.reason = reason.to_string();
+    crate::coordinator::execution::CoordinatedQueryResult {
+        query_result: crate::runtime::query_result::QueryResult::empty(),
+        write_commit: None,
+        write_abort: Some(abort),
+        fragment_profiles: Vec::new(),
+        runtime_filter_dormancy_proof: None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13660,8 +13677,8 @@ fn execute_imv_change_stream_write(
                 None,
             )?;
             #[cfg(test)]
-            if let Some(message) = take_imv_change_stream_execution_failure_for_test() {
-                return Err(message);
+            if let Some(result) = take_imv_change_stream_execution_result_for_test() {
+                return executed_change_stream_write_from_result(result, planned.commit_plan);
             }
             #[cfg(test)]
             if let Some(result) =
@@ -23700,6 +23717,77 @@ mod tests {
     }
 
     #[test]
+    fn change_stream_writer_result_rejects_writer_abort() {
+        let result = imv_change_stream_writer_abort_result_for_test("injected writer abort");
+
+        let err = executed_change_stream_write_from_result(
+            result,
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(
+                BTreeMap::new(),
+            ),
+        )
+        .err()
+        .expect("writer abort must fail conversion");
+
+        assert_eq!(err, "injected writer abort");
+    }
+
+    #[test]
+    fn change_stream_writer_result_requires_writer_commit() {
+        let result = crate::coordinator::execution::CoordinatedQueryResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_commit: None,
+            write_abort: None,
+            fragment_profiles: Vec::new(),
+            runtime_filter_dormancy_proof: None,
+        };
+
+        let err = executed_change_stream_write_from_result(
+            result,
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::new(
+                BTreeMap::new(),
+            ),
+        )
+        .err()
+        .expect("missing writer commit must fail conversion");
+
+        assert_eq!(
+            err,
+            "IMV change-stream write completed without writer commit"
+        );
+    }
+
+    #[test]
+    fn change_stream_writer_result_override_is_test_thread_local() {
+        let _main_guard = install_imv_change_stream_execution_result_for_test(
+            imv_change_stream_writer_abort_result_for_test("main-thread abort"),
+        );
+
+        let worker_reason = std::thread::spawn(|| {
+            assert!(
+                take_imv_change_stream_execution_result_for_test().is_none(),
+                "worker must not observe another test thread's override"
+            );
+            let _worker_guard = install_imv_change_stream_execution_result_for_test(
+                imv_change_stream_writer_abort_result_for_test("worker-thread abort"),
+            );
+            take_imv_change_stream_execution_result_for_test()
+                .and_then(|result| result.write_abort)
+                .map(|abort| abort.reason)
+                .expect("worker override")
+        })
+        .join()
+        .expect("worker thread");
+
+        assert_eq!(worker_reason, "worker-thread abort");
+        let main_reason = take_imv_change_stream_execution_result_for_test()
+            .and_then(|result| result.write_abort)
+            .map(|abort| abort.reason)
+            .expect("main-thread override");
+        assert_eq!(main_reason, "main-thread abort");
+    }
+
+    #[test]
     fn change_stream_writer_error_aborts_staged_intent_and_drops_staging_branch() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
         create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
@@ -23709,8 +23797,8 @@ mod tests {
                 .expect("target snapshot before failed refresh");
 
         insert_into_iceberg_table(&env.state, "ice", "sales", "orders", &[(2, "b")]);
-        let _failure = install_imv_change_stream_execution_failure_for_test(
-            "injected change-stream writer failure",
+        let _failure = install_imv_change_stream_execution_result_for_test(
+            imv_change_stream_writer_abort_result_for_test("injected change-stream writer failure"),
         );
         let refresh = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
         let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &refresh)

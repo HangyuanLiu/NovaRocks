@@ -138,36 +138,66 @@ fn reduce_non_join_incremental_facts(
 
     let mut has_insert_changes = false;
     let mut has_delete_changes = false;
+    let mut hard_errors = BTreeMap::new();
+    let mut full_rebuild_reasons = BTreeMap::new();
     for fact in facts {
         let batch = match fact.result {
             Ok(batch) => batch,
             Err(err) => match policy_signal_from_change_error(&err) {
                 IcebergChangePolicySignal::FullRefresh { reason } => {
-                    return Ok(NonJoinIncrementalChangePlan::FullRebuild { lineage, reason });
+                    full_rebuild_reasons.insert(fact.base_fqn, reason);
+                    continue;
                 }
                 IcebergChangePolicySignal::Unsupported { reason } => {
-                    return Err(format!(
-                        "iceberg-stored materialized view refresh unsupported: {reason}"
-                    ));
+                    hard_errors.insert(
+                        fact.base_fqn,
+                        format!("iceberg-stored materialized view refresh unsupported: {reason}"),
+                    );
+                    continue;
                 }
                 IcebergChangePolicySignal::Incremental => {
-                    return Err(
+                    hard_errors.insert(
+                        fact.base_fqn,
                         "iceberg-stored materialized view refresh produced invalid incremental policy from change planner"
                             .to_string(),
                     );
+                    continue;
                 }
             },
         };
         if batch.current_snapshot_id != fact.current_snapshot_id {
-            return Err(format!(
-                "iceberg mv incremental refresh: change batch snapshot mismatch for {} (expected {}, got {})",
-                fact.base_fqn, fact.current_snapshot_id, batch.current_snapshot_id
-            ));
+            hard_errors.insert(
+                fact.base_fqn.clone(),
+                format!(
+                    "iceberg mv incremental refresh: change batch snapshot mismatch for {} (expected {}, got {})",
+                    fact.base_fqn, fact.current_snapshot_id, batch.current_snapshot_id
+                ),
+            );
+            continue;
         }
         has_insert_changes |= batch.has_inserts;
         has_delete_changes |= batch.has_position_deletes
             || batch.has_equality_deletes
             || batch.has_deleted_data_files;
+    }
+
+    if let Some((_, err)) = hard_errors.into_iter().next() {
+        return Err(err);
+    }
+    if !full_rebuild_reasons.is_empty() {
+        let reason = if full_rebuild_reasons.len() == 1 {
+            full_rebuild_reasons
+                .into_values()
+                .next()
+                .expect("one full-rebuild reason")
+        } else {
+            full_rebuild_reasons
+                .into_iter()
+                .map(|(base_fqn, reason)| format!("{base_fqn}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Ok(NonJoinIncrementalChangePlan::FullRebuild { lineage, reason });
     }
 
     if !has_insert_changes && !has_delete_changes {
@@ -297,6 +327,44 @@ mod tests {
     }
 
     #[test]
+    fn multiple_full_rebuild_reasons_are_stable_across_input_order() {
+        let lineage_broken = fact(
+            "z.db.lineage",
+            2,
+            Err(ChangeError::LineageBroken {
+                previous_snapshot: 1,
+            }),
+        );
+        let unsafe_replace = fact(
+            "a.db.replace",
+            3,
+            Err(ChangeError::ReplaceValidationFailed {
+                snapshot_id: 3,
+                reason: "records changed".to_string(),
+            }),
+        );
+
+        let forward =
+            reduce_non_join_incremental_facts(vec![lineage_broken.clone(), unsafe_replace.clone()])
+                .expect("forward full rebuild");
+        let reverse = reduce_non_join_incremental_facts(vec![unsafe_replace, lineage_broken])
+            .expect("reverse full rebuild");
+
+        assert_eq!(forward, reverse);
+        let NonJoinIncrementalChangePlan::FullRebuild { reason, .. } = forward else {
+            panic!("expected full rebuild");
+        };
+        assert!(
+            reason.contains("a.db.replace: replace snapshot"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("z.db.lineage: previous snapshot"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn schema_and_unsupported_errors_remain_explicit_errors() {
         for error in [
             ChangeError::SchemaEvolutionUnsupported {
@@ -310,6 +378,48 @@ mod tests {
             let err = reduce_non_join_incremental_facts(vec![fact("c.db.t", 2, Err(error))])
                 .expect_err("unsupported change");
             assert!(err.contains("refresh unsupported"), "{err}");
+        }
+    }
+
+    #[test]
+    fn hard_errors_are_not_masked_by_full_rebuild_in_either_input_order() {
+        for (label, hard_fact, expected) in [
+            (
+                "unsupported change",
+                fact(
+                    "c.db.unsupported",
+                    3,
+                    Err(ChangeError::SchemaEvolutionUnsupported {
+                        detail: "column type changed".to_string(),
+                    }),
+                ),
+                "refresh unsupported",
+            ),
+            (
+                "endpoint mismatch",
+                fact("c.db.mismatch", 3, Ok(batch(2))),
+                "expected 3, got 2",
+            ),
+        ] {
+            for full_rebuild_first in [true, false] {
+                let full_rebuild_fact = fact(
+                    "c.db.full_rebuild",
+                    4,
+                    Err(ChangeError::LineageBroken {
+                        previous_snapshot: 1,
+                    }),
+                );
+                let facts = if full_rebuild_first {
+                    vec![full_rebuild_fact, hard_fact.clone()]
+                } else {
+                    vec![hard_fact.clone(), full_rebuild_fact]
+                };
+                let err = reduce_non_join_incremental_facts(facts).expect_err(label);
+                assert!(
+                    err.contains(expected),
+                    "{label} must win regardless of input order: {err}"
+                );
+            }
         }
     }
 
