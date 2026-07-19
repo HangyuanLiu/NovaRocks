@@ -45,39 +45,43 @@ use common::state_store_conformance::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordination_gate_suite() {
     common::state_store_coordination_conformance::incarnation_gate_lifecycle(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::concurrent_bootstrap_converges(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::stale_snapshots_cannot_mutate(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::incarnation_overflow_fails_closed(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::identity_mismatch_is_corruption(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::recovery_is_operation_scoped(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::commit_unknown_uses_authoritative_read_back(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::cancelled_mutation_recovers_with_same_operation(
-        &conformance_factory(),
+        &coordination_factory(),
+    )
+    .await;
+    common::state_store_coordination_conformance::unresolved_bootstrap_without_visible_record_is_uncertain(
+        &coordination_factory(),
     )
     .await;
     common::state_store_coordination_conformance::admission_read_conflicts_with_restore(
-        &conformance_factory(),
+        &coordination_factory(),
     )
     .await;
 }
@@ -160,6 +164,16 @@ async fn read_state_record(
 }
 
 fn conformance_factory() -> StateStoreFactory {
+    state_store_factory(1_024)
+}
+
+fn coordination_factory() -> StateStoreFactory {
+    // The current control read+put upper bound is 1,039 bytes. Keep the ordinary
+    // provider conformance limit at 1 KiB and widen only this coordination fixture.
+    state_store_factory(2 * 1_024)
+}
+
+fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
     let temp = Arc::new(TempDir::new().expect("conformance temp dir"));
     std::rc::Rc::new(move || {
         let temp = Arc::clone(&temp);
@@ -175,7 +189,7 @@ fn conformance_factory() -> StateStoreFactory {
                         max_value_bytes: Some(128),
                         max_page_size: Some(10),
                         max_transaction_operations: Some(8),
-                        max_transaction_bytes: Some(1_024),
+                        max_transaction_bytes: Some(max_transaction_bytes),
                         transaction_deadline_ms: Some(250),
                         runner_max_attempts: Some(3),
                     },

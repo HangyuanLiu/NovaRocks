@@ -343,6 +343,46 @@ pub async fn cancelled_mutation_recovers_with_same_operation(factory: &StateStor
     }
 }
 
+pub async fn unresolved_bootstrap_without_visible_record_is_uncertain(factory: &StateStoreFactory) {
+    let fixture = open_fixture(factory).await;
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::CancelWaiterBeforeApply)
+        .await;
+    let gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    let operation_id = OperationId::new_v7();
+    let transaction_id = derive_transaction_id(operation_id, 1);
+    let waiter = tokio::spawn(async move { gate.bootstrap(operation_id).await });
+    control.wait_dispatched().await;
+
+    assert_eq!(
+        fixture
+            .store
+            .resolve_commit(&transaction_id)
+            .await
+            .expect("resolve held bootstrap"),
+        CommitResolution::Unresolved
+    );
+    let recovery_gate = IncarnationGate::new(Arc::clone(&fixture.store));
+    assert_eq!(
+        recovery_gate.load().await.unwrap_err().kind(),
+        CoordinationErrorKind::NotBootstrapped
+    );
+    let error = recovery_gate
+        .recover_bootstrap(operation_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), CoordinationErrorKind::CommitUncertain);
+    assert_eq!(error.transaction_id(), Some(transaction_id));
+
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    control.wait_waiter_cancelled().await;
+    control.release_response().await;
+    control.wait_inner_dropped().await;
+    control.allow_provider_progress().await;
+}
+
 pub async fn admission_read_conflicts_with_restore(factory: &StateStoreFactory) {
     let fixture = open_fixture(factory).await;
     let gate = IncarnationGate::new(Arc::clone(&fixture.store));

@@ -34,6 +34,21 @@ const REOPEN_PURPOSE: &str = "open control plane writes";
 const TRANSACTION_ID_BYTES: usize = 16;
 const MUTATION_KIND_BYTES: usize = 1;
 const PRECONDITION_KIND_BYTES: usize = 1;
+const V1_NAMESPACE_BYTES: usize = 5 + 16;
+const V1_RECORD_TAG_BYTES: usize = 1;
+const V1_CHANGE_TAG_BYTES: usize = 1;
+const V1_COMMIT_TAG_BYTES: usize = 1;
+const V1_HIGH_WATERMARK_KEY_BYTES: usize = 2;
+const V1_RECORD_FORMAT_BYTES: usize = 1;
+const V1_PENDING_TAG_BYTES: usize = 1;
+const V1_COMMITTED_TAG_BYTES: usize = 1;
+const V1_RESERVATION_TOKEN_BYTES: usize = 16;
+const V1_REVISION_BYTES: usize = 10;
+const V1_SEQUENCE_BYTES: usize = 4;
+const V1_VERSIONSTAMP_TRAILER_BYTES: usize = 4;
+const V1_PROVISIONAL_VERSION_TAG_BYTES: usize = 22;
+const V1_PROVISIONAL_OPERATION_BYTES: usize = 8;
+const V1_PERSISTED_VERSION_BYTES: usize = 16;
 
 pub struct IncarnationGate {
     store: Arc<dyn StateStore>,
@@ -86,7 +101,7 @@ impl IncarnationGate {
         Err(candidate_mismatch(
             certainty,
             transaction_id,
-            current.record.incarnation,
+            Some(current.record.incarnation),
             candidate.incarnation,
         ))
     }
@@ -263,14 +278,22 @@ impl IncarnationGate {
             .identity()
             .await
             .map_err(CoordinationError::from_state_store)?;
-        let current = self.load_for_identity(&identity).await?;
+        let current = self.try_load_for_identity(&identity).await?;
+        let Some(current) = current else {
+            return Err(candidate_mismatch(
+                certainty,
+                transaction_id,
+                None,
+                candidate.incarnation,
+            ));
+        };
         if current.record == candidate {
             return Ok(current.snapshot);
         }
         Err(candidate_mismatch(
             certainty,
             transaction_id,
-            current.record.incarnation,
+            Some(current.record.incarnation),
             candidate.incarnation,
         ))
     }
@@ -279,6 +302,15 @@ impl IncarnationGate {
         &self,
         identity: &StoreIdentity,
     ) -> Result<LoadedControl, CoordinationError> {
+        self.try_load_for_identity(identity)
+            .await?
+            .ok_or_else(CoordinationError::not_bootstrapped)
+    }
+
+    async fn try_load_for_identity(
+        &self,
+        identity: &StoreIdentity,
+    ) -> Result<Option<LoadedControl>, CoordinationError> {
         let key = control_storage_key()?;
         let mut transaction = self
             .store
@@ -293,7 +325,9 @@ impl IncarnationGate {
             .abort()
             .await
             .map_err(CoordinationError::from_state_store)?;
-        let record = record.ok_or_else(CoordinationError::not_bootstrapped)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
         let control = decode_control(&record.value)?;
         validate_identity(&control, identity)?;
         let snapshot = ControlPlaneSnapshot::new(
@@ -304,10 +338,10 @@ impl IncarnationGate {
             control.last_operation_id,
             record.version,
         );
-        Ok(LoadedControl {
+        Ok(Some(LoadedControl {
             record: control,
             snapshot,
-        })
+        }))
     }
 
     async fn classify_invalid_expected(
@@ -434,24 +468,108 @@ fn validate_write_limits(
             "coordination mutation exceeds state store limits",
         ));
     }
-    let transaction_bytes = TRANSACTION_ID_BYTES
-        .checked_add(MUTATION_KIND_BYTES)
-        .and_then(|bytes| bytes.checked_add(PRECONDITION_KIND_BYTES))
-        .and_then(|bytes| bytes.checked_add(key.as_bytes().len()))
-        .and_then(|bytes| bytes.checked_add(key.as_bytes().len()))
-        .and_then(|bytes| bytes.checked_add(value.as_bytes().len()))
-        .and_then(|bytes| {
-            bytes.checked_add(expected_version.map_or(0, |version| version.as_bytes().len()))
-        })
-        .ok_or_else(|| {
-            CoordinationError::limit_exceeded("coordination mutation exceeds state store limits")
-        })?;
+    let transaction_bytes = coordination_transaction_upper_bound(
+        key.as_bytes().len(),
+        value.as_bytes().len(),
+        expected_version.map_or(0, |version| version.as_bytes().len()),
+        expected_version.is_some(),
+    )?;
     if transaction_bytes > limits.max_transaction_bytes {
         return Err(CoordinationError::limit_exceeded(
             "coordination mutation exceeds state store limits",
         ));
     }
     Ok(())
+}
+
+fn coordination_transaction_upper_bound(
+    key_bytes: usize,
+    value_bytes: usize,
+    version_bytes: usize,
+    includes_control_read: bool,
+) -> Result<usize, CoordinationError> {
+    // Use one neutral v1 durability ceiling for every provider. The categories below
+    // include the largest current namespace/envelope representation without selecting
+    // an implementation at runtime.
+    let record_key_bytes = checked_budget_add(V1_NAMESPACE_BYTES, V1_RECORD_TAG_BYTES)?;
+    let record_key_bytes = checked_budget_add(record_key_bytes, key_bytes)?;
+    let record_conflict_bytes = exact_conflict_bytes(record_key_bytes)?;
+
+    let commit_key_bytes = checked_budget_add(V1_NAMESPACE_BYTES, V1_COMMIT_TAG_BYTES)?;
+    let commit_key_bytes = checked_budget_add(commit_key_bytes, TRANSACTION_ID_BYTES)?;
+    let commit_conflict_bytes = exact_conflict_bytes(commit_key_bytes)?;
+    let high_watermark_key_bytes =
+        checked_budget_add(V1_NAMESPACE_BYTES, V1_HIGH_WATERMARK_KEY_BYTES)?;
+    let high_watermark_conflict_bytes = exact_conflict_bytes(high_watermark_key_bytes)?;
+
+    let mut fixed_envelope_bytes = commit_key_bytes;
+    fixed_envelope_bytes = checked_budget_add(
+        fixed_envelope_bytes,
+        checked_budget_add(V1_PENDING_TAG_BYTES, V1_RESERVATION_TOKEN_BYTES)?,
+    )?;
+    fixed_envelope_bytes = checked_budget_add(
+        fixed_envelope_bytes,
+        checked_budget_mul(commit_conflict_bytes, 2)?,
+    )?;
+    fixed_envelope_bytes = checked_budget_add(fixed_envelope_bytes, commit_key_bytes)?;
+    fixed_envelope_bytes = checked_budget_add(
+        fixed_envelope_bytes,
+        checked_budget_add(
+            checked_budget_add(V1_COMMITTED_TAG_BYTES, V1_REVISION_BYTES)?,
+            V1_VERSIONSTAMP_TRAILER_BYTES,
+        )?,
+    )?;
+    fixed_envelope_bytes = checked_budget_add(fixed_envelope_bytes, commit_conflict_bytes)?;
+    fixed_envelope_bytes = checked_budget_add(fixed_envelope_bytes, high_watermark_key_bytes)?;
+    fixed_envelope_bytes = checked_budget_add(
+        fixed_envelope_bytes,
+        checked_budget_add(V1_REVISION_BYTES, V1_VERSIONSTAMP_TRAILER_BYTES)?,
+    )?;
+    fixed_envelope_bytes = checked_budget_add(fixed_envelope_bytes, high_watermark_conflict_bytes)?;
+
+    let mut bytes = fixed_envelope_bytes;
+    if includes_control_read {
+        bytes = checked_budget_add(bytes, record_conflict_bytes)?;
+    }
+
+    bytes = checked_budget_add(bytes, MUTATION_KIND_BYTES)?;
+    bytes = checked_budget_add(bytes, key_bytes)?;
+    bytes = checked_budget_add(bytes, value_bytes)?;
+    bytes = checked_budget_add(bytes, PRECONDITION_KIND_BYTES)?;
+    bytes = checked_budget_add(bytes, version_bytes)?;
+
+    bytes = checked_budget_add(bytes, record_key_bytes)?;
+    bytes = checked_budget_add(bytes, V1_RECORD_FORMAT_BYTES)?;
+    bytes = checked_budget_add(bytes, V1_PERSISTED_VERSION_BYTES)?;
+    bytes = checked_budget_add(bytes, value_bytes)?;
+
+    bytes = checked_budget_add(bytes, V1_NAMESPACE_BYTES)?;
+    bytes = checked_budget_add(bytes, V1_CHANGE_TAG_BYTES)?;
+    bytes = checked_budget_add(bytes, V1_REVISION_BYTES)?;
+    bytes = checked_budget_add(bytes, V1_SEQUENCE_BYTES)?;
+    bytes = checked_budget_add(bytes, V1_VERSIONSTAMP_TRAILER_BYTES)?;
+    bytes = checked_budget_add(bytes, key_bytes)?;
+
+    bytes = checked_budget_add(bytes, checked_budget_mul(record_conflict_bytes, 2)?)?;
+    bytes = checked_budget_add(bytes, V1_PROVISIONAL_VERSION_TAG_BYTES)?;
+    bytes = checked_budget_add(bytes, TRANSACTION_ID_BYTES)?;
+    checked_budget_add(bytes, V1_PROVISIONAL_OPERATION_BYTES)
+}
+
+fn exact_conflict_bytes(key_bytes: usize) -> Result<usize, CoordinationError> {
+    checked_budget_add(checked_budget_mul(key_bytes, 2)?, 1)
+}
+
+fn checked_budget_add(total: usize, increment: usize) -> Result<usize, CoordinationError> {
+    total.checked_add(increment).ok_or_else(write_limit_error)
+}
+
+fn checked_budget_mul(value: usize, multiplier: usize) -> Result<usize, CoordinationError> {
+    value.checked_mul(multiplier).ok_or_else(write_limit_error)
+}
+
+fn write_limit_error() -> CoordinationError {
+    CoordinationError::limit_exceeded("coordination mutation exceeds state store limits")
 }
 
 #[cfg(test)]
@@ -463,7 +581,7 @@ mod tests {
     use bytes::Bytes;
     use uuid::Uuid;
 
-    use super::{IncarnationGate, validate_write_limits};
+    use super::{IncarnationGate, coordination_transaction_upper_bound, validate_write_limits};
     use crate::coordination::CoordinationErrorKind;
     use crate::{
         ChangePage, ChangePollRequest, CommitResolution, Key, OperationId, ReadTransaction,
@@ -471,17 +589,57 @@ mod tests {
         TransactionId, Value, VersionToken, WriteTransaction,
     };
 
+    fn complete_v1_write_budget(
+        key_bytes: usize,
+        value_bytes: usize,
+        version_bytes: usize,
+        includes_control_read: bool,
+    ) -> usize {
+        let namespace_bytes = 5 + 16;
+        let record_key_bytes = namespace_bytes + 1 + key_bytes;
+        let exact_record_conflict_bytes = 2 * record_key_bytes + 1;
+        let commit_key_bytes = namespace_bytes + 1 + 16;
+        let exact_commit_conflict_bytes = 2 * commit_key_bytes + 1;
+        let high_watermark_key_bytes = namespace_bytes + 2;
+        let exact_high_watermark_conflict_bytes = 2 * high_watermark_key_bytes + 1;
+        let fixed_envelope_bytes = commit_key_bytes
+            + (1 + 16)
+            + 2 * exact_commit_conflict_bytes
+            + commit_key_bytes
+            + (1 + 10 + 4)
+            + exact_commit_conflict_bytes
+            + high_watermark_key_bytes
+            + (10 + 4)
+            + exact_high_watermark_conflict_bytes;
+        let control_read_bytes = includes_control_read
+            .then_some(exact_record_conflict_bytes)
+            .unwrap_or(0);
+        let logical_mutation_bytes = 1 + key_bytes + value_bytes + 1 + version_bytes;
+        let durable_record_bytes = record_key_bytes + 1 + 16 + value_bytes;
+        let change_entry_bytes = namespace_bytes + 1 + 10 + 4 + 4 + key_bytes;
+        let precondition_and_write_conflicts = 2 * exact_record_conflict_bytes;
+        let provisional_version_bytes = 22 + 16 + 8;
+
+        fixed_envelope_bytes
+            + control_read_bytes
+            + logical_mutation_bytes
+            + durable_record_bytes
+            + change_entry_bytes
+            + precondition_and_write_conflicts
+            + provisional_version_bytes
+    }
+
     #[test]
-    fn encoded_control_mutation_is_validated_before_provider_write() {
+    fn encoded_control_mutation_uses_complete_conservative_boundary() {
         let key = Key::try_from(Bytes::from_static(b"control-key")).expect("key");
         let value = Value::try_from(Bytes::from_static(b"control-value")).expect("value");
         let version = VersionToken::try_from(Bytes::from_static(b"version")).expect("version");
-        let exact_bytes = 16
-            + 1
-            + 1
-            + key.as_bytes().len() * 2
-            + value.as_bytes().len()
-            + version.as_bytes().len();
+        let exact_bytes = complete_v1_write_budget(
+            key.as_bytes().len(),
+            value.as_bytes().len(),
+            version.as_bytes().len(),
+            true,
+        );
         let mut limits = StateStoreLimits {
             max_transaction_bytes: exact_bytes,
             ..StateStoreLimits::default()
@@ -497,9 +655,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conservative_budget_overflow_is_limit_exceeded() {
+        assert_eq!(
+            coordination_transaction_upper_bound(usize::MAX, 1, 1, true)
+                .unwrap_err()
+                .kind(),
+            CoordinationErrorKind::LimitExceeded
+        );
+    }
+
     struct LimitedStore {
         limits: StateStoreLimits,
         begin_writes: AtomicUsize,
+        identity: StoreIdentity,
     }
 
     #[async_trait]
@@ -537,11 +706,7 @@ mod tests {
         }
 
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-            Ok(StoreIdentity {
-                store_id: Uuid::now_v7(),
-                cluster_id: "limited-cluster".to_owned(),
-                initial_incarnation: 1,
-            })
+            Ok(self.identity.clone())
         }
 
         async fn resolve_commit(
@@ -560,6 +725,44 @@ mod tests {
                 ..StateStoreLimits::default()
             },
             begin_writes: AtomicUsize::new(0),
+            identity: StoreIdentity {
+                store_id: Uuid::now_v7(),
+                cluster_id: "limited-cluster".to_owned(),
+                initial_incarnation: 1,
+            },
+        });
+        let gate_store: Arc<dyn StateStore> = store.clone();
+        let gate = IncarnationGate::new(gate_store);
+
+        assert_eq!(
+            gate.bootstrap(OperationId::new_v7())
+                .await
+                .unwrap_err()
+                .kind(),
+            CoordinationErrorKind::LimitExceeded
+        );
+        assert_eq!(store.begin_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn coordination_budget_rejects_before_begin_write() {
+        let key_bytes = b"\0novarocks/cp/v1/control".len();
+        let value_bytes = 1 + 16 + 4 + b"limited-cluster".len() + 8 + 1 + 16;
+        let previous_estimate = 16 + 1 + 1 + key_bytes * 2 + value_bytes;
+        let complete_budget = complete_v1_write_budget(key_bytes, value_bytes, 0, false);
+        let tightened_budget = previous_estimate + 1;
+        assert!(tightened_budget < complete_budget);
+        let store = Arc::new(LimitedStore {
+            limits: StateStoreLimits {
+                max_transaction_bytes: tightened_budget,
+                ..StateStoreLimits::default()
+            },
+            begin_writes: AtomicUsize::new(0),
+            identity: StoreIdentity {
+                store_id: Uuid::now_v7(),
+                cluster_id: "limited-cluster".to_owned(),
+                initial_incarnation: 1,
+            },
         });
         let gate_store: Arc<dyn StateStore> = store.clone();
         let gate = IncarnationGate::new(gate_store);

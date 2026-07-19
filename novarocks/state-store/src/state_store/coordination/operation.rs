@@ -67,13 +67,13 @@ pub(crate) async fn recover_commit(
 pub(crate) fn candidate_mismatch(
     certainty: ReadBackCertainty,
     transaction_id: TransactionId,
-    current: ControlPlaneIncarnation,
+    current: Option<ControlPlaneIncarnation>,
     candidate: ControlPlaneIncarnation,
 ) -> CoordinationError {
     if certainty == ReadBackCertainty::Unresolved {
         return CoordinationError::commit_uncertain(transaction_id);
     }
-    if current != candidate {
+    if current.is_some_and(|current| current != candidate) {
         return CoordinationError::incarnation_changed();
     }
     CoordinationError::fence_lost()
@@ -101,7 +101,7 @@ mod tests {
         let error = candidate_mismatch(
             ReadBackCertainty::Unresolved,
             transaction_id,
-            incarnation(3),
+            Some(incarnation(3)),
             incarnation(2),
         );
 
@@ -115,7 +115,7 @@ mod tests {
             candidate_mismatch(
                 ReadBackCertainty::Confirmed,
                 transaction_id(),
-                incarnation(3),
+                Some(incarnation(3)),
                 incarnation(2),
             )
             .kind(),
@@ -125,7 +125,7 @@ mod tests {
             candidate_mismatch(
                 ReadBackCertainty::Confirmed,
                 transaction_id(),
-                incarnation(2),
+                Some(incarnation(2)),
                 incarnation(2),
             )
             .kind(),
