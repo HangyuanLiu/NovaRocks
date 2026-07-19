@@ -59,6 +59,7 @@ mod lifecycle_tests {
         StarRocksTableRefreshOutcome, StarRocksTableRefreshPlan,
     };
     use crate::mv::model::{MvStorageEngine, MvTarget, RefreshMode};
+    use crate::mv::refresh::planning::RefreshPlanContract;
 
     #[derive(Default)]
     struct Calls {
@@ -111,19 +112,21 @@ mod lifecycle_tests {
                 return Err(err.clone());
             }
             Ok(RefreshPlan {
-                mv_id: Some(1),
-                target: req.target,
-                storage_engine: MvStorageEngine::StarRocks,
-                mode: RefreshMode::Incremental,
-                base_refs: vec![TableIdentity {
-                    catalog: "ice".to_string(),
-                    namespace: "ns".to_string(),
-                    table: "base".to_string(),
-                }],
-                snapshot_pins: Default::default(),
-                affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
-                    "mock MV backend does not plan affected partitions",
-                ),
+                contract: RefreshPlanContract {
+                    mv_id: Some(1),
+                    target: req.target,
+                    storage_engine: MvStorageEngine::StarRocks,
+                    mode: RefreshMode::Incremental,
+                    base_refs: vec![TableIdentity {
+                        catalog: "ice".to_string(),
+                        namespace: "ns".to_string(),
+                        table: "base".to_string(),
+                    }],
+                    snapshot_pins: Default::default(),
+                    affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
+                        "mock MV backend does not plan affected partitions",
+                    ),
+                },
                 backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {
                     stmt: req.statement,
                     current_catalog: req.current_catalog,
@@ -142,8 +145,8 @@ mod lifecycle_tests {
                 return Err(err.clone());
             }
             Ok(RefreshOutcome {
-                mv_id: plan.mv_id,
-                target: plan.target.clone(),
+                mv_id: plan.contract.mv_id,
+                target: plan.contract.target.clone(),
                 rows: Some(0),
                 base_snapshots: Default::default(),
                 base_table_uuids: Default::default(),

@@ -104,11 +104,14 @@ impl MvBackend for IcebergMvBackend {
             ));
         };
         let state = self.state().map_err(RefreshError::pre_commit)?;
-        let outcome =
-            crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh(&state, plan_payload)?;
+        let outcome = crate::engine::mv::iceberg_refresh::execute_iceberg_mv_refresh(
+            &state,
+            plan_payload,
+            &plan.contract.affected_partitions,
+        )?;
         Ok(RefreshOutcome {
-            mv_id: plan.mv_id,
-            target: plan.target.clone(),
+            mv_id: plan.contract.mv_id,
+            target: plan.contract.target.clone(),
             rows: None,
             base_snapshots: Default::default(),
             base_table_uuids: Default::default(),
