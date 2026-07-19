@@ -14345,13 +14345,14 @@ fn execute_imv_change_stream_write(
         .write_commit
         .as_ref()
         .ok_or_else(|| "IMV change-stream write completed without writer commit".to_string())?;
-    let routed = crate::engine::iceberg_change_stream_write::route_change_stream_writer_reports(
-        &collector,
-        table.metadata(),
-        write_commit,
-        &commit_plan,
-    )
-    .map_err(|err| err.into_parts().0)?;
+    let routed =
+        crate::connector::iceberg::change_stream_routing::route_change_stream_writer_reports(
+            &collector,
+            table.metadata(),
+            write_commit,
+            &commit_plan,
+        )
+        .map_err(|err| err.into_parts().0)?;
     routed.inject(&collector);
     Ok(result)
 }

@@ -1048,8 +1048,9 @@ struct MorUpdateChangeStreamExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
     commit_executor: IcebergWriteCommitExecutor,
-    commit_plan:
-        Mutex<Option<crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan>>,
+    commit_plan: Mutex<
+        Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
+    >,
 }
 
 struct MorMergeChangeStreamExecutor {
@@ -1057,8 +1058,9 @@ struct MorMergeChangeStreamExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
     commit_executor: IcebergWriteCommitExecutor,
-    commit_plan:
-        Mutex<Option<crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan>>,
+    commit_plan: Mutex<
+        Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
+    >,
 }
 
 impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {

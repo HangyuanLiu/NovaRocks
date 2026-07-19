@@ -3097,7 +3097,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::coordinator::prepare::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     pub(crate) commit_plan:
-        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
+        crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
     #[cfg(test)]
     pub(crate) topology:
         crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
@@ -3139,10 +3139,9 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         &distributed_plan,
         &prepared,
     )?;
-    let commit_plan =
-        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan::from_topology(
-            &topology,
-        )?;
+    let commit_plan = crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::from_topology(
+        &topology,
+    )?;
     Ok(PlannedIcebergChangeStreamWrite {
         prepared,
         native_bundle,

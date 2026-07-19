@@ -48,7 +48,7 @@ pub(crate) struct DmlPreExpandKeyedAssert {
 pub(crate) struct DmlChangeStreamWriteExecution {
     pub(crate) result: CoordinatedQueryResult,
     pub(crate) commit_plan:
-        crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
+        crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +313,7 @@ pub(crate) fn plan_dml_change_stream_write(
 
 fn dml_change_stream_write_execution(
     result: CoordinatedQueryResult,
-    commit_plan: crate::engine::iceberg_change_stream_write::ChangeStreamWriterCommitPlan,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
 ) -> Result<DmlChangeStreamWriteExecution, String> {
     if let Some(abort) = result.write_abort.as_ref() {
         return Err(abort.reason.clone());

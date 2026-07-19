@@ -21,6 +21,9 @@ use opendal::Operator;
 
 use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::catalog::registry::block_on_iceberg;
+use crate::connector::iceberg::change_stream_routing::{
+    ChangeStreamWriterCommitPlan, route_change_stream_writer_reports,
+};
 use crate::connector::iceberg::commit::{
     AbortLog, CleanupAttempt, CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError,
     CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
@@ -32,9 +35,6 @@ use crate::coordinator::execution::CoordinatedQueryResult;
 use crate::coordinator::write::report::WriteCommitInput;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::iceberg_change_stream_write::{
-    ChangeStreamWriterCommitPlan, route_change_stream_writer_reports,
-};
 use crate::meta::repository::iceberg_operation::{
     CreateIcebergOperationRequest, IcebergOperationFactUpdate, IcebergOperationKind,
     IcebergOperationState, IcebergOperationTarget,
