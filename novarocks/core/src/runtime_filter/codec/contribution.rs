@@ -162,6 +162,33 @@ impl From<ContributionSizeError> for ContributionCodecError {
     }
 }
 
+pub(crate) fn max_encoded_len_for_contribution_budget(
+    max_contribution_bytes: usize,
+) -> Result<usize, ContributionCodecError> {
+    HEADER_LEN
+        .checked_add(max_contribution_bytes)
+        .ok_or(ContributionCodecError::LengthOverflow)
+}
+
+pub(crate) fn semantic_contribution_bytes(
+    contribution: &RuntimeFilterContribution,
+) -> Result<usize, ContributionCodecError> {
+    match contribution {
+        RuntimeFilterContribution::Membership(delta) => delta
+            .canonical_encoded_len()
+            .map_err(ContributionCodecError::from),
+        RuntimeFilterContribution::OrderedBound(update) => update
+            .canonical_contribution_bytes()
+            .ok_or(ContributionCodecError::LengthOverflow),
+        RuntimeFilterContribution::TopKSummary(summary) => summary
+            .canonical_contribution_bytes()
+            .ok_or(ContributionCodecError::LengthOverflow),
+        RuntimeFilterContribution::FinalDomain(shard) => shard
+            .canonical_contribution_bytes()
+            .ok_or(ContributionCodecError::LengthOverflow),
+    }
+}
+
 pub(crate) fn encoded_contribution_len(
     contribution: &RuntimeFilterContribution,
     expectation: ContributionCodecExpectation<'_>,
@@ -1528,6 +1555,43 @@ mod tests {
             final_stream,
             final_sequence,
         }
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_codec_limits_cover_all_variants() {
+        let fixtures = conformance_fixtures();
+
+        for (contribution, expectation) in fixtures.cases() {
+            let semantic_bytes = semantic_contribution_bytes(contribution).unwrap();
+            assert!(semantic_bytes > 0);
+            let wire_ceiling = max_encoded_len_for_contribution_budget(semantic_bytes).unwrap();
+            let encoded = encode_contribution(contribution, expectation, wire_ceiling).unwrap();
+
+            assert_eq!(wire_ceiling, HEADER_LEN + semantic_bytes);
+            assert!(encoded.payload().len() <= wire_ceiling);
+        }
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_separates_wire_and_semantic_limits() {
+        let fixtures = conformance_fixtures();
+        let contribution = &fixtures.ordered;
+        let expectation = ContributionCodecExpectation::OrderedBound(&fixtures.ordered_contract);
+        let semantic_bytes = semantic_contribution_bytes(contribution).unwrap();
+        let semantic_budget = semantic_bytes - 1;
+        let wire_ceiling = max_encoded_len_for_contribution_budget(semantic_budget).unwrap();
+        let encoded = encode_contribution(contribution, expectation, wire_ceiling).unwrap();
+
+        assert!(encoded.payload().len() <= wire_ceiling);
+        assert!(semantic_contribution_bytes(contribution).unwrap() > semantic_budget);
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_checked_wire_ceiling_overflow_is_rejected() {
+        assert_eq!(
+            max_encoded_len_for_contribution_budget(usize::MAX),
+            Err(ContributionCodecError::LengthOverflow)
+        );
     }
 
     #[test]

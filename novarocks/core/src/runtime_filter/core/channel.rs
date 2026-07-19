@@ -667,6 +667,39 @@ impl RuntimeFilterChannel {
         Ok(SubmitOutcome::Applied)
     }
 
+    pub(crate) fn preflight_remote_open(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        partition_id: PartitionId,
+    ) -> Result<(), RuntimeContractViolation> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let existing =
+            instance_ref(&state, binding_id, fragment_instance_id)?.local_partition_count();
+        if let Some(existing) = existing
+            && existing != local_partition_count
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::PartitionCountConflict,
+                "producer instance reopened with a different partition count",
+            ));
+        }
+        if local_partition_count == 0 {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidPartitionCount,
+                "local partition count must be non-zero",
+            ));
+        }
+        if partition_id.get() >= local_partition_count {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidPartition,
+                "producer partition is outside the declared local partition count",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn authorize_submit(
         &self,
         binding_id: BindingId,
@@ -3811,6 +3844,47 @@ mod tests {
             RuntimeContractViolationKind::InvalidPartition
         );
         assert_eq!(account.current.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_open_preflight_prioritizes_existing_count_conflict_without_mutation() {
+        let (channel, _, _) = one_channel();
+        channel
+            .open_producer(BindingId::new(10), uid(10), 2)
+            .unwrap();
+
+        assert_eq!(
+            channel
+                .preflight_remote_open(BindingId::new(10), uid(10), 1, PartitionId::new(1),)
+                .unwrap_err()
+                .kind(),
+            RuntimeContractViolationKind::PartitionCountConflict
+        );
+        assert_eq!(
+            channel
+                .open_producer(BindingId::new(10), uid(10), 2)
+                .unwrap(),
+            SubmitOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn remote_open_preflight_rejects_new_invalid_partition_without_mutation() {
+        let (channel, _, _) = one_channel();
+
+        assert_eq!(
+            channel
+                .preflight_remote_open(BindingId::new(10), uid(10), 1, PartitionId::new(1),)
+                .unwrap_err()
+                .kind(),
+            RuntimeContractViolationKind::InvalidPartition
+        );
+        assert_eq!(
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::common::types::UniqueId;
+use crate::runtime_filter::codec::contribution::max_encoded_len_for_contribution_budget;
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
 use crate::runtime_filter::materializer::bloom::BloomHashContract;
 use crate::runtime_filter::model::contract::{
@@ -90,6 +91,82 @@ pub(super) struct ProducerRoute {
     pub(super) expected_instances: BTreeSet<UniqueId>,
     pub(super) kind: ProducerPortKind,
     pub(super) final_domain_seed: Option<FinalDomainAuthoritySeed>,
+    inbound_contract: InboundProducerContract,
+}
+
+impl ProducerRoute {
+    pub(super) const fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    pub(super) const fn inbound_contract(&self) -> &InboundProducerContract {
+        &self.inbound_contract
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum InboundProducerContract {
+    Membership {
+        schema: ArtifactMembershipSchema,
+        limits: InboundContributionLimits,
+    },
+    OrderedBound {
+        contract: Arc<RuntimeOrderContract>,
+        limits: InboundContributionLimits,
+    },
+    TopKSummary {
+        contract: Arc<RuntimeTopKSummaryContract>,
+        limits: InboundContributionLimits,
+    },
+    FinalDomain {
+        contract: Arc<RuntimeCompletionFenceContract>,
+        limits: InboundContributionLimits,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InboundContributionLimits {
+    max_contribution_bytes: usize,
+    max_encoded_bytes: usize,
+}
+
+impl InboundContributionLimits {
+    pub(super) const fn max_contribution_bytes(self) -> usize {
+        self.max_contribution_bytes
+    }
+
+    pub(super) const fn max_encoded_bytes(self) -> usize {
+        self.max_encoded_bytes
+    }
+}
+
+impl InboundProducerContract {
+    pub(super) const fn limits(&self) -> InboundContributionLimits {
+        match self {
+            Self::Membership { limits, .. }
+            | Self::OrderedBound { limits, .. }
+            | Self::TopKSummary { limits, .. }
+            | Self::FinalDomain { limits, .. } => *limits,
+        }
+    }
+
+    pub(super) fn schema_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Membership { schema, .. } => schema.digest().bytes(),
+            Self::OrderedBound { contract, .. } => contract.digest().bytes(),
+            Self::TopKSummary { contract, .. } => contract.digest().bytes(),
+            Self::FinalDomain { contract, .. } => contract.digest().bytes(),
+        }
+    }
+
+    pub(super) const fn port_kind(&self) -> ProducerPortKind {
+        match self {
+            Self::Membership { .. } => ProducerPortKind::Membership,
+            Self::OrderedBound { .. } => ProducerPortKind::OrderedBound,
+            Self::TopKSummary { .. } => ProducerPortKind::TopKSummary,
+            Self::FinalDomain { .. } => ProducerPortKind::FinalDomain,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -529,6 +606,7 @@ impl DeploymentRegistry {
                 &view,
                 &built.channels,
                 &built.final_domain_seeds,
+                &built.inbound_contracts,
                 self.events.clone(),
             )?;
             Ok::<_, InstallContractError>((built.channels, routing, role_router))
@@ -1062,6 +1140,7 @@ fn build_routing(
     view: &RuntimeFilterInstallView,
     channels: &BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
     final_domain_seeds: &BTreeMap<ChannelId, FinalDomainAuthoritySeed>,
+    inbound_contracts: &BTreeMap<ChannelId, InboundProducerContract>,
     events: Arc<dyn RuntimeFilterEventSink>,
 ) -> Result<RoutingBuild, InstallContractError> {
     let mut build = RoutingBuild {
@@ -1084,6 +1163,12 @@ fn build_routing(
             install_error(
                 InstallContractErrorKind::UnsupportedChannelContract,
                 "temporary installed graph is missing a validated channel",
+            )
+        })?;
+        let inbound_contract = inbound_contracts.get(channel_id).cloned().ok_or_else(|| {
+            install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "temporary installed graph is missing an inbound producer contract",
             )
         })?;
         let mut capability_routes =
@@ -1111,6 +1196,7 @@ fn build_routing(
                         ReductionRequirement::MergeTopKSummary(_) => ProducerPortKind::TopKSummary,
                     },
                     final_domain_seed: final_domain_seeds.get(channel_id).cloned(),
+                    inbound_contract: inbound_contract.clone(),
                 },
             );
         }
@@ -1775,6 +1861,7 @@ fn compute_deadlines(
 struct BuiltChannels {
     channels: BTreeMap<ChannelId, Arc<RuntimeFilterChannel>>,
     final_domain_seeds: BTreeMap<ChannelId, FinalDomainAuthoritySeed>,
+    inbound_contracts: BTreeMap<ChannelId, InboundProducerContract>,
 }
 
 fn build_channels(
@@ -1784,6 +1871,7 @@ fn build_channels(
 ) -> Result<BuiltChannels, InstallContractError> {
     let mut channels = BTreeMap::new();
     let mut final_domain_seeds = BTreeMap::new();
+    let mut inbound_contracts = BTreeMap::new();
     for (channel_id, deployment) in view.channels() {
         let final_domain_contract = match (
             deployment.logical_domain(),
@@ -1835,15 +1923,119 @@ fn build_channels(
                 error.to_string(),
             )
         })?;
+        let inbound_contract =
+            build_inbound_producer_contract(deployment, final_domain_contract.as_ref())?;
         channels.insert(*channel_id, Arc::new(channel));
         if let Some(contract) = final_domain_contract {
             final_domain_seeds.insert(*channel_id, FinalDomainAuthoritySeed::new(contract));
         }
+        inbound_contracts.insert(*channel_id, inbound_contract);
     }
     Ok(BuiltChannels {
         channels,
         final_domain_seeds,
+        inbound_contracts,
     })
+}
+
+fn build_inbound_producer_contract(
+    deployment: &RuntimeFilterChannelDeployment,
+    final_domain_contract: Option<&Arc<RuntimeCompletionFenceContract>>,
+) -> Result<InboundProducerContract, InstallContractError> {
+    let max_contribution_bytes = usize::try_from(deployment.policy().max_contribution_bytes)
+        .map_err(|_| {
+            install_error(
+                InstallContractErrorKind::InvalidPolicy,
+                "maximum contribution bytes do not fit the platform size",
+            )
+        })?;
+    let limits = InboundContributionLimits {
+        max_contribution_bytes,
+        max_encoded_bytes: max_encoded_len_for_contribution_budget(max_contribution_bytes)
+            .map_err(|_| {
+                install_error(
+                    InstallContractErrorKind::InvalidPolicy,
+                    "maximum contribution bytes overflow the contribution wire ceiling",
+                )
+            })?,
+    };
+
+    match (
+        deployment.logical_domain(),
+        deployment.reduction_requirement(),
+        deployment.completion_requirement(),
+    ) {
+        (
+            RuntimeFilterLogicalDomain::Membership { .. },
+            ReductionRequirement::SetUnion,
+            CompletionRequirement::FencedFinalDomain(_),
+        ) => {
+            let contract = final_domain_contract.cloned().ok_or_else(|| {
+                install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "fenced-final channel is missing its installed completion-fence contract",
+                )
+            })?;
+            Ok(InboundProducerContract::FinalDomain { contract, limits })
+        }
+        (
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            },
+            ReductionRequirement::SetUnion,
+            _,
+        ) => {
+            let schema =
+                ArtifactMembershipSchema::new(value_type, *null_semantics).map_err(|_| {
+                    install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        "membership channel has an unsupported inbound membership schema",
+                    )
+                })?;
+            Ok(InboundProducerContract::Membership { schema, limits })
+        }
+        (
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            ReductionRequirement::TightenOrderedBound,
+            _,
+        ) => {
+            let contract = RuntimeOrderContract::try_from_plan(plan).map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!("ordered channel has an invalid inbound order contract: {error:?}"),
+                )
+            })?;
+            Ok(InboundProducerContract::OrderedBound {
+                contract: Arc::new(contract),
+                limits,
+            })
+        }
+        (
+            RuntimeFilterLogicalDomain::OrderedBound(plan),
+            ReductionRequirement::MergeTopKSummary(requirement),
+            _,
+        ) => {
+            let contract = RuntimeTopKSummaryContract::try_from_plan(plan, requirement).map_err(
+                |error| {
+                    install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "ordered channel has an invalid inbound top-k summary contract: {error:?}"
+                        ),
+                    )
+                },
+            )?;
+            Ok(InboundProducerContract::TopKSummary {
+                contract: Arc::new(contract),
+                limits,
+            })
+        }
+        _ => Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "validated deployment has no compatible inbound producer contract",
+        )),
+    }
 }
 
 fn install_views_equivalent(
@@ -1939,8 +2131,8 @@ mod tests {
     use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
     use super::{
-        DeploymentRegistry, EventEmitter, RuntimeOrderContract, validate_channel_contract,
-        validate_view,
+        DeploymentRegistry, EventEmitter, InboundProducerContract, RuntimeCompletionFenceContract,
+        RuntimeOrderContract, RuntimeTopKSummaryContract, validate_channel_contract, validate_view,
     };
 
     #[derive(Default)]
@@ -2393,6 +2585,132 @@ mod tests {
             installed.producer(BindingId::new(10)).unwrap().kind,
             crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary
         );
+    }
+
+    fn assert_installed_inbound_contract(
+        registry: &DeploymentRegistry,
+        expected_kind: crate::runtime_filter::port::producer::ProducerPortKind,
+        expected_digest: [u8; 32],
+    ) {
+        let installed = registry.active_installation().unwrap();
+        let route = installed.producer(BindingId::new(10)).unwrap();
+        let contract = route.inbound_contract();
+
+        assert_eq!(route.channel_id(), ChannelId::new(1));
+        assert_eq!(contract.port_kind(), expected_kind);
+        assert_eq!(contract.schema_digest(), expected_digest);
+        assert_eq!(contract.limits().max_contribution_bytes(), 1024);
+        assert_eq!(contract.limits().max_encoded_bytes(), 1072);
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_freezes_membership_schema_and_limits() {
+        let deployment = channel(1, 10, 20, 30, 40);
+        let expected_digest = match deployment.logical_domain() {
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            } => ArtifactMembershipSchema::new(value_type, *null_semantics)
+                .unwrap()
+                .digest()
+                .bytes(),
+            RuntimeFilterLogicalDomain::OrderedBound(_) => unreachable!(),
+        };
+        let registry = registry();
+        registry.install(view([(1, deployment)])).unwrap();
+
+        assert_installed_inbound_contract(
+            &registry,
+            crate::runtime_filter::port::producer::ProducerPortKind::Membership,
+            expected_digest,
+        );
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_freezes_ordered_contract_and_limits() {
+        let deployment = ordered_deployment_fixture().0;
+        let expected_digest = match deployment.logical_domain() {
+            RuntimeFilterLogicalDomain::OrderedBound(plan) => {
+                RuntimeOrderContract::try_from_plan(plan)
+                    .unwrap()
+                    .digest()
+                    .bytes()
+            }
+            RuntimeFilterLogicalDomain::Membership { .. } => unreachable!(),
+        };
+        let registry = registry();
+        registry.install(view([(1, deployment)])).unwrap();
+
+        assert_installed_inbound_contract(
+            &registry,
+            crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound,
+            expected_digest,
+        );
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_freezes_topk_contract_and_limits() {
+        let deployment = topk_deployment_fixture().0;
+        let expected_digest = match (
+            deployment.logical_domain(),
+            deployment.reduction_requirement(),
+        ) {
+            (
+                RuntimeFilterLogicalDomain::OrderedBound(plan),
+                ReductionRequirement::MergeTopKSummary(requirement),
+            ) => RuntimeTopKSummaryContract::try_from_plan(plan, requirement)
+                .unwrap()
+                .digest()
+                .bytes(),
+            _ => unreachable!(),
+        };
+        let registry = registry();
+        registry.install(view([(1, deployment)])).unwrap();
+
+        assert_installed_inbound_contract(
+            &registry,
+            crate::runtime_filter::port::producer::ProducerPortKind::TopKSummary,
+            expected_digest,
+        );
+    }
+
+    #[test]
+    fn installed_inbound_producer_contract_shares_final_domain_contract_and_limits() {
+        let deployment = fenced_final_channel();
+        let expected_schema = match deployment.logical_domain() {
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics,
+            } => ArtifactMembershipSchema::new(value_type, *null_semantics).unwrap(),
+            RuntimeFilterLogicalDomain::OrderedBound(_) => unreachable!(),
+        };
+        let expected_digest = RuntimeCompletionFenceContract::try_from_install(
+            uid(0),
+            DeploymentEpoch::new(9),
+            ChannelId::new(1),
+            CompletionFenceKind::CommittedDomainFrozen,
+            &expected_schema,
+        )
+        .unwrap()
+        .digest()
+        .bytes();
+        let registry = registry();
+        registry.install(view([(1, deployment)])).unwrap();
+
+        assert_installed_inbound_contract(
+            &registry,
+            crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
+            expected_digest,
+        );
+        let installed = registry.active_installation().unwrap();
+        let route = installed.producer(BindingId::new(10)).unwrap();
+        let InboundProducerContract::FinalDomain { contract, .. } = route.inbound_contract() else {
+            panic!("installed route must retain the final-domain contract")
+        };
+        assert!(Arc::ptr_eq(
+            contract,
+            &route.final_domain_seed.as_ref().unwrap().contract
+        ));
     }
 
     #[test]
