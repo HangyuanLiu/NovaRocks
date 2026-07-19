@@ -1292,8 +1292,13 @@ pub async fn basic_acquire_contention_and_high_watermark(factory: &StateStoreFac
     assert_eq!(right.token().resource_epoch().get(), 1);
 
     let writes_before = state_store_operation_total(&fixture.store, StateStoreOperation::Put);
+    let oversized_resource_bytes = fixture.store.limits().max_value_bytes;
     let oversized = manager_a
-        .acquire(resource(vec![b'x'; 80]), attempt(), OperationId::new_v7())
+        .acquire(
+            resource(vec![b'x'; oversized_resource_bytes]),
+            attempt(),
+            OperationId::new_v7(),
+        )
         .await
         .expect_err("encoded candidate exceeds fixture value limit");
     assert_eq!(oversized.kind(), CoordinationErrorKind::LimitExceeded);

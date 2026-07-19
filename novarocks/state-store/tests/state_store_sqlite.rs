@@ -48,6 +48,15 @@ async fn coordination_suite() {
     common::state_store_coordination_conformance::run_coordination_conformance(factory).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordination_candidate_limit_uses_provider_limit() {
+    let factory = state_store_factory(16 * 1_024, 1_899);
+    common::state_store_coordination_conformance::basic_acquire_contention_and_high_watermark(
+        &factory,
+    )
+    .await;
+}
+
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid key")
 }
@@ -126,16 +135,16 @@ async fn read_state_record(
 }
 
 fn conformance_factory() -> StateStoreFactory {
-    state_store_factory(1_024)
+    state_store_factory(1_024, 128)
 }
 
 fn coordination_factory() -> StateStoreFactory {
     // The current control read+put upper bound is 1,039 bytes. Keep the ordinary
     // provider conformance limit at 1 KiB and widen only this coordination fixture.
-    state_store_factory(2 * 1_024)
+    state_store_factory(2 * 1_024, 128)
 }
 
-fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
+fn state_store_factory(max_transaction_bytes: usize, max_value_bytes: usize) -> StateStoreFactory {
     let keepalive = Arc::new(Mutex::new(Vec::<Arc<TempDir>>::new()));
     std::rc::Rc::new(move || {
         let keepalive = Arc::clone(&keepalive);
@@ -153,7 +162,7 @@ fn state_store_factory(max_transaction_bytes: usize) -> StateStoreFactory {
                     cluster_id: "conformance-cluster".to_owned(),
                     limits: StateStoreLimitOverrides {
                         max_key_bytes: Some(64),
-                        max_value_bytes: Some(128),
+                        max_value_bytes: Some(max_value_bytes),
                         max_page_size: Some(10),
                         max_transaction_operations: Some(8),
                         max_transaction_bytes: Some(max_transaction_bytes),
