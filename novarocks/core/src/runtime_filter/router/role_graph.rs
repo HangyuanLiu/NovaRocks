@@ -516,9 +516,14 @@ mod tests {
 
     #[test]
     fn contribution_authorization_rejects_an_edge_targeting_another_participant() {
+        // A participant's routing shard only ever holds inbound edges that target itself, so an
+        // inbound producer edge whose Aggregator target is a remote participant is rejected while
+        // building the shard. That construction guard is the reachable enforcement point; the
+        // matching `InboundTargetMismatch` branch inside `authorize_contribution` is defensive and
+        // cannot be reached through a validly-constructed shard.
         let producer = RuntimeFilterRouteRole::Producer(BindingId::new(10));
-        let router = manual_router(
-            2,
+        let channel = RuntimeFilterChannelRoutingView::new(
+            ChannelId::new(1),
             BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
             BTreeMap::from([((BindingId::new(10), finst(7)), pid(7))]),
             vec![edge(
@@ -534,22 +539,20 @@ mod tests {
                 BTreeSet::from([RuntimeFilterEnvelopeKind::Contribution]),
             )],
             Vec::new(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
-            router
-                .authorize_contribution(
-                    DeploymentEpoch::new(9),
-                    ChannelId::new(1),
-                    BindingId::new(10),
-                    finst(7),
-                    RuntimeFilterEnvelopeKind::Contribution,
-                )
-                .unwrap_err(),
-            RuntimeFilterRouteContractError::InboundTargetMismatch {
+            RuntimeFilterRoutingShard::new(
+                DeploymentEpoch::new(9),
+                pid(2),
+                BTreeMap::from([(ChannelId::new(1), channel)]),
+            )
+            .unwrap_err(),
+            RuntimeFilterRouteContractError::InvalidIncidentEdge {
                 channel: ChannelId::new(1),
                 edge: RouteEdgeId::new(6),
-                local_participant: pid(2),
+                detail: "inbound target is not local",
             }
         );
     }

@@ -1493,9 +1493,8 @@ mod tests {
         RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::routing::{
-        RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView,
-        RuntimeFilterRoutePeer, RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
-        RuntimeFilterRoutingShard,
+        RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
+        RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,

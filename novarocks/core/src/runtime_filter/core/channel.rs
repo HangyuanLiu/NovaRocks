@@ -46,9 +46,9 @@ use crate::runtime_filter::port::support::{
     RetainedMemoryReservation, RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
 use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
-use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
 #[cfg(test)]
 use crate::runtime_filter::port::value_domain::MembershipValues;
+use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};
 use super::error::ChannelBuildError;

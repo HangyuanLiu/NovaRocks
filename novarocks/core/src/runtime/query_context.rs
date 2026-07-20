@@ -3358,7 +3358,13 @@ mod runtime_filter_service_lifecycle_tests {
             ),
             before.2
         );
-        assert_eq!(guard.finst_to_query.get(&finst_id), Some(&active_query_id));
+        assert_eq!(
+            guard
+                .finst_to_query
+                .get(&finst_id)
+                .map(|execution| execution.query_id()),
+            Some(active_query_id)
+        );
     }
 
     #[test]
@@ -3502,7 +3508,7 @@ mod runtime_filter_service_lifecycle_tests {
             guard
                 .finst_to_query
                 .values()
-                .filter(|qid| **qid == query_id)
+                .filter(|execution| execution.query_id() == query_id)
                 .count(),
             0
         );
