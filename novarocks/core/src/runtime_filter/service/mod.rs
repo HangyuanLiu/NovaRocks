@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod consumer_ingress;
 mod inbound;
 mod materialization;
 mod memory;
@@ -34,7 +35,7 @@ mod m4_conformance_tests;
 pub(crate) mod registry;
 mod subscription;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -48,7 +49,7 @@ use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::RouteEdgeId;
+use crate::runtime_filter::port::identity::{LogicalVersion, RouteEdgeId};
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
@@ -66,6 +67,9 @@ use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemo
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
+pub(crate) use self::consumer_ingress::{
+    InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
+};
 pub(crate) use self::inbound::{
     InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
 };
@@ -1108,6 +1112,13 @@ pub(crate) struct RuntimeFilterService {
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
+    // Consumer-ingress delivery idempotency ledger: the stable `(route_edge, version)`
+    // identities already delivered into local subscriptions. An exact replay of an
+    // already-delivered identity is answered `Duplicate` and is never re-delivered.
+    // This is the logical delivery identity (M2C spec §7.7), distinct from M3's transport
+    // dedupe. It is currently unbounded per query (reclaimed at query teardown); M3 will
+    // subsume it into the per-channel, MemTracker-accounted, bounded dedupe set.
+    delivered_versions: Mutex<BTreeSet<(RouteEdgeId, LogicalVersion)>>,
 }
 
 pub(super) struct OpenedProducer {
@@ -1165,6 +1176,7 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
             operation: Mutex::new(()),
+            delivered_versions: Mutex::new(BTreeSet::new()),
         }
     }
 

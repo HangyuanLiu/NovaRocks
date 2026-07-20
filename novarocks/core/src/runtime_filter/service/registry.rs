@@ -402,6 +402,25 @@ impl InstalledDeployment {
             .unwrap_or(&[])
     }
 
+    /// Install-owned consumer profile authority for an inbound delivery edge.
+    ///
+    /// The consumer-ingress dispatch uses this to recover the profile the wire
+    /// codec must decode against: it is the single capability group whose
+    /// authorized delivery scope contains `route_edge_id`. This never inspects the
+    /// subscription map; it reads only the frozen artifact plan.
+    pub(super) fn profile_for_route(
+        &self,
+        channel_id: ChannelId,
+        route_edge_id: RouteEdgeId,
+    ) -> Option<&ConsumerArtifactProfile> {
+        self.artifact_channels.get(&channel_id).and_then(|plan| {
+            plan.groups()
+                .iter()
+                .find(|group| group.route_edges().contains(&route_edge_id))
+                .map(CapabilityGroup::profile)
+        })
+    }
+
     fn invalidate_artifact_publication(&self) -> BTreeMap<ChannelId, Vec<RouteEdgeId>> {
         let keys = self
             .artifact_channels
