@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn contribution_authorization_rejects_an_edge_targeting_another_participant() {
+    fn routing_shard_construction_rejects_an_inbound_edge_targeting_another_participant() {
         // A participant's routing shard only ever holds inbound edges that target itself, so an
         // inbound producer edge whose Aggregator target is a remote participant is rejected while
         // building the shard. That construction guard is the reachable enforcement point; the
