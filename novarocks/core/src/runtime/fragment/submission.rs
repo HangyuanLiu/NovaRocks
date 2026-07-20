@@ -27,7 +27,6 @@ use crate::exec::fragment::error::{
 };
 use crate::exec::fragment::program::{
     FragmentNodeId, FragmentProgram, FragmentSinkAssignmentKind, FragmentSinkAssignmentRequirement,
-    RuntimeFilterId,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
@@ -62,7 +61,7 @@ impl FragmentSubmission {
         validate_scan_assignments(&program, &instance)?;
         validate_exchange_assignments(&program, &instance)?;
         validate_sink_assignment(&program, &instance)?;
-        validate_runtime_filter_params(&program, &instance)?;
+        validate_runtime_filter_params(&instance)?;
 
         Ok(Self { program, instance })
     }
@@ -552,7 +551,6 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
 }
 
 fn validate_runtime_filter_params(
-    program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
 ) -> Result<(), FragmentBindingError> {
     let params = instance.runtime_filter_params();
@@ -565,18 +563,16 @@ fn validate_runtime_filter_params(
             ));
         }
     }
-    for raw_id in params.id_to_prober_params().keys() {
-        let id = RuntimeFilterId::new(*raw_id);
-        if !program.runtime_filters().build_filters().contains(&id) {
-            return Err(FragmentBindingError::new(
-                FragmentBindingTarget::RuntimeFilter(*raw_id),
-                FragmentBindingErrorKind::RuntimeFilterMismatch,
-                format!(
-                    "runtime filter {raw_id} has remote probers but is not a local build filter"
-                ),
-            ));
-        }
-    }
+    // Do NOT require `id_to_prober_params` keys to be a subset of this fragment's local
+    // build filters. `id_to_prober_params` is the query-global runtime-filter route table
+    // that the coordinator installs on the top (RF-coordinator) fragment for filters built
+    // anywhere in the query (StarRocks FE does this in
+    // DefaultCoordinator#setGlobalRuntimeFilterParams, targeting the top fragment). The top
+    // fragment is typically a result sink that builds no filter at all yet carries the whole
+    // route table, so its keys are intentionally not local build filters. Prober endpoint/ID
+    // validity is enforced at decode time (RuntimeFilterParams::from_thrift / native decode)
+    // and in the internal-service address checks; the per-fragment invariant here is limited
+    // to the builder-count sanity check above.
     Ok(())
 }
 
@@ -1907,13 +1903,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_remote_prober_for_non_build_filter() {
+    fn accepts_query_global_prober_route_without_local_build_filter() {
+        // The top fragment acts as the runtime-filter coordinator: it carries the
+        // query-global id_to_prober_params route table (plus builder counts) for filters
+        // that are built in *other* fragments, without building any of them locally. This
+        // mirrors StarRocks FE `setGlobalRuntimeFilterParams`, which installs the whole
+        // route table on the top fragment (DefaultCoordinator#setId_to_prober_params), not
+        // on each build-side fragment. Requiring every prober-routed filter to have a local
+        // builder is therefore wrong and rejects valid FE plans (e.g. sc07 skew split join).
         let program = program_with(
             values_plan(7),
             result_sink(),
             BTreeMap::new(),
             BTreeMap::new(),
-            BTreeSet::from([RuntimeFilterId::new(11)]),
+            BTreeSet::new(),
         );
         let instance = instance_with(
             FragmentContractVersion::CURRENT,
@@ -1922,14 +1925,14 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             FragmentSinkAssignment::None,
-            BTreeMap::from([(13, vec![prober_destination()])]),
-            BTreeMap::new(),
+            BTreeMap::from([
+                (13, vec![prober_destination()]),
+                (17, vec![prober_destination()]),
+            ]),
+            BTreeMap::from([(13, 2), (17, 3)]),
         );
-        assert_error(
-            FragmentSubmission::try_new(program, instance),
-            FragmentBindingTarget::RuntimeFilter(13),
-            FragmentBindingErrorKind::RuntimeFilterMismatch,
-        );
+        FragmentSubmission::try_new(program, instance)
+            .expect("query-global prober route on coordinator fragment");
     }
 
     #[test]
@@ -2361,8 +2364,8 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::from([(exchange_id, 1)]),
             FragmentSinkAssignment::None,
-            BTreeMap::from([(13, vec![prober_destination()])]),
             BTreeMap::new(),
+            BTreeMap::from([(13, 0)]),
         );
 
         assert_runtime_state_absent(query, finst, exchange_key, rf_key);
@@ -2370,7 +2373,7 @@ mod tests {
         assert_error(
             FragmentSubmission::try_new(Arc::clone(&program), instance),
             FragmentBindingTarget::RuntimeFilter(13),
-            FragmentBindingErrorKind::RuntimeFilterMismatch,
+            FragmentBindingErrorKind::InvalidAssignment,
         );
         assert_eq!(Arc::strong_count(&program), before);
         assert_runtime_state_absent(query, finst, exchange_key, rf_key);
