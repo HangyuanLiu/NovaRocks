@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod inbound;
 mod materialization;
 mod memory;
 mod producer;
@@ -46,13 +47,17 @@ use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
     ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
-    RuntimeContractViolation, RuntimeContractViolationKind, TopKSummaryProducerAdapter,
+    RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 
+pub(crate) use self::inbound::{
+    InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
+};
 #[cfg(test)]
 use self::materialization::run_materialization_jobs;
 use self::materialization::{
@@ -1015,7 +1020,25 @@ pub(crate) struct RuntimeFilterService {
     producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), ProducerHandleWeak>>,
     #[cfg(test)]
     producer_test_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
+    // Deterministic inbound-lifecycle seams. Each is a one-shot hook taken and run
+    // at a fixed point so a test can pin an admission/submit/cancel interleaving.
+    // They are compiled and read only under `cfg(test)`; the production path never
+    // observes them. Lock context matters: `after_inbound_open_admission` fires while the
+    // `operation` lock is still held, so its installed closure MUST be non-blocking — a
+    // blocking closure would deadlock a concurrent cancel/install that needs `operation`.
+    // `before_inbound_typed_dispatch` and the cancel seam fire after the lock is released.
+    #[cfg(test)]
+    after_inbound_open_admission: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_inbound_typed_dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
+}
+
+pub(super) struct OpenedProducer {
+    pub(super) handle: ProducerHandle,
+    pub(super) outcome: SubmitOutcome,
 }
 
 impl RuntimeFilterService {
@@ -1061,6 +1084,12 @@ impl RuntimeFilterService {
             producer_handles: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             producer_test_handles: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            after_inbound_open_admission: Mutex::new(None),
+            #[cfg(test)]
+            before_inbound_typed_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            after_registry_cancel_before_channel_cancel: Mutex::new(None),
             operation: Mutex::new(()),
         }
     }
@@ -1089,6 +1118,25 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
+        Ok(self
+            .open_producer_locked(
+                &installed,
+                binding_id,
+                fragment_instance_id,
+                local_partition_count,
+                requested,
+            )?
+            .handle)
+    }
+
+    pub(super) fn open_producer_locked(
+        &self,
+        installed: &Arc<InstalledDeployment>,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        requested: ProducerPortKind,
+    ) -> Result<OpenedProducer, RuntimeContractViolation> {
         let route = installed.producer(binding_id).ok_or_else(|| {
             violation(
                 RuntimeContractViolationKind::UnauthorizedBinding,
@@ -1107,9 +1155,10 @@ impl RuntimeFilterService {
                 "requested producer port does not match the installed channel contract",
             ));
         }
-        route
-            .channel
-            .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
+        let outcome =
+            route
+                .channel
+                .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
         let key = (binding_id, fragment_instance_id);
         let mut handles = self
             .producer_handles
@@ -1123,7 +1172,7 @@ impl RuntimeFilterService {
                 ));
             }
             if let Some(handle) = cached.upgrade() {
-                return Ok(handle);
+                return Ok(OpenedProducer { handle, outcome });
             }
         }
         let final_domain_authority = if requested == ProducerPortKind::FinalDomain {
@@ -1175,7 +1224,7 @@ impl RuntimeFilterService {
             }
         };
         handles.insert(key, handle.downgrade());
-        Ok(handle)
+        Ok(OpenedProducer { handle, outcome })
     }
 
     pub(crate) fn subscribe(
@@ -1262,6 +1311,8 @@ impl RuntimeFilterService {
             self.registry.cancel()
         };
         if let Some(cancelled) = installed {
+            #[cfg(test)]
+            self.fire_after_registry_cancel_before_channel_cancel();
             for (channel_id, channel) in cancelled.installed().channels() {
                 let action = channel.cancel();
                 let action = if matches!(action, ChannelAction::None) {
@@ -1396,6 +1447,69 @@ impl RuntimeFilterService {
     fn set_after_commit_before_publish_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         self.registry.set_after_commit_before_publish_hook(hook);
     }
+
+    #[cfg(test)]
+    fn set_after_inbound_open_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .after_inbound_open_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_inbound_typed_dispatch_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_inbound_typed_dispatch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_after_registry_cancel_before_channel_cancel_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .after_registry_cancel_before_channel_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn fire_after_inbound_open_admission(&self) {
+        let hook = self
+            .after_inbound_open_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn fire_before_inbound_typed_dispatch(&self) {
+        let hook = self
+            .before_inbound_typed_dispatch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn fire_after_registry_cancel_before_channel_cancel(&self) {
+        let hook = self
+            .after_registry_cancel_before_channel_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 impl Drop for RuntimeFilterService {
@@ -1418,6 +1532,185 @@ fn violation(
     RuntimeContractViolation::new(kind, detail)
 }
 
+// Shared production-compiler test fixture. It lives in its own module (rather than
+// `mod tests`) so both `service::tests` and `service::inbound::tests` can build the
+// same three-backend `AllOf` deployment from the real `deployment::compiler::compile`
+// entry, never a hand-written routing shard.
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use arrow::datatypes::DataType;
+
+    use crate::common::types::UniqueId;
+    use crate::coordinator::cluster::LiveBackendSnapshot;
+    use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::compiler::compile;
+    use crate::runtime_filter::deployment::{
+        RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
+    };
+    use crate::runtime_filter::model::contract::*;
+    use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::graph::{
+        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
+    use crate::runtime_filter::port::identity::*;
+    use crate::runtime_filter::port::install::*;
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::planner::distributed::{
+        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
+
+    pub(super) fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let consumer_binding = BindingId::new(11);
+        let witness = CoverageWitnessId::new(1);
+        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
+        let contributions = BTreeSet::from([
+            ContributionKind::ValueDomainDelta,
+            ContributionKind::ProducerClosed,
+        ]);
+        let capabilities = BTreeSet::from([
+            ArtifactCapability::Membership,
+            ArtifactCapability::EmptyDomain,
+        ]);
+        let expression = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id,
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: contributions.clone(),
+                required_consumer_capabilities: capabilities.clone(),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 1024,
+                    deadline_ms: 100,
+                    max_retries: 1,
+                },
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: producer_binding,
+                channel_id,
+                coverage_witness_id: Some(witness),
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(2),
+                    node_id: PlanNodeId::new(1),
+                },
+                expression: expression.clone(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: contributions,
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    join_key_ordinal: 0,
+                }),
+            })
+            .unwrap();
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: consumer_binding,
+                channel_id,
+                coverage_witness_id: None,
+                location: PlanLocation {
+                    fragment_id: PlanFragmentId::new(1),
+                    node_id: PlanNodeId::new(2),
+                },
+                expression,
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities,
+                    activation: ConsumerActivation::BlockingSnapshot,
+                    target:
+                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
+                }),
+            })
+            .unwrap();
+
+        let placement = |fragment_id: u32,
+                         instance_index: usize,
+                         backend_idx: usize,
+                         finst_id: UniqueId,
+                         endpoint: &str| FragmentInstancePlacement {
+            fragment_id,
+            instance_index,
+            finst_id,
+            backend_idx,
+            endpoint: RuntimeEndpoint::from_socket_addr(endpoint.parse().unwrap()),
+            scan_ranges: BTreeMap::new(),
+            destinations: Vec::new(),
+            per_exch_num_senders: BTreeMap::new(),
+        };
+        let local_producer = UniqueId { hi: 1, lo: 3 };
+        let remote_producer = UniqueId { hi: 1, lo: 4 };
+        let scheduling = SchedulingPlan {
+            root_fragment_id: 1,
+            by_fragment: BTreeMap::from([
+                (
+                    1,
+                    vec![
+                        placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }, "10.0.0.2:9060"),
+                        placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }, "10.0.0.11:9060"),
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        placement(2, 0, 2, local_producer, "10.0.0.2:9060"),
+                        placement(2, 1, 7, remote_producer, "10.0.0.7:9060"),
+                    ],
+                ),
+            ]),
+            root_finst_id: UniqueId { hi: 1, lo: 1 },
+            root_backend_idx: 2,
+        };
+        let edges = vec![FragmentEdge {
+            source_fragment_id: 2,
+            target_fragment_id: 1,
+            target_exchange_node_id: 1,
+            output_partition: DataPartition::unpartitioned(),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+            output_slot_ids: Vec::new(),
+        }];
+        let backends = LiveBackendSnapshot::new(vec![
+            (2, "10.0.0.2:9060".parse().unwrap()),
+            (7, "10.0.0.7:9060".parse().unwrap()),
+            (11, "10.0.0.11:9060".parse().unwrap()),
+        ]);
+        let policy = RuntimeFilterDeploymentPolicy {
+            core_budget: RuntimeFilterCoreBudget::new(8192),
+            replica_redundancy: 2,
+            materialization: MaterializationPolicy::for_test(),
+        };
+        compile(
+            &graph,
+            &scheduling,
+            &edges,
+            &backends,
+            &policy,
+            DeploymentEpoch::new(9),
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1431,11 +1724,9 @@ mod tests {
     use crate::coordinator::cluster::LiveBackendSnapshot;
     use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
+    use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
     use crate::runtime_filter::deployment::compiler::compile;
     use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
-    use crate::runtime_filter::deployment::{
-        RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
-    };
     use crate::runtime_filter::materializer::codec::{ArtifactDecodeExpectations, decode_leaf};
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
@@ -1462,7 +1753,10 @@ mod tests {
         InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
         RuntimeContractViolationKind, SubmitOutcome,
     };
-    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
+    use crate::runtime_filter::port::routing::{
+        RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
+        RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
+    };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
         BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
@@ -1477,9 +1771,6 @@ mod tests {
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-    use crate::sql::planner::distributed::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-    };
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
@@ -2028,158 +2319,12 @@ mod tests {
         RuntimeFilterParticipantInstall::new(core_view, routing_shard)
     }
 
-    fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
-        let channel_id = ChannelId::new(5);
-        let producer_binding = BindingId::new(10);
-        let consumer_binding = BindingId::new(11);
-        let witness = CoverageWitnessId::new(1);
-        let coverage = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
-        let contributions = BTreeSet::from([
-            ContributionKind::ValueDomainDelta,
-            ContributionKind::ProducerClosed,
-        ]);
-        let capabilities = BTreeSet::from([
-            ArtifactCapability::Membership,
-            ArtifactCapability::EmptyDomain,
-        ]);
-        let expression = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let mut graph = RuntimeFilterGraph::default();
-        graph
-            .insert_channel(RuntimeFilterChannelSpec {
-                channel_id,
-                logical_domain: RuntimeFilterLogicalDomain::Membership {
-                    value_type: DataType::Int64,
-                    null_semantics: NullSemantics::NeverMatches,
-                },
-                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
-                availability_coverage: coverage.clone(),
-                terminal_coverage: coverage,
-                reduction_requirement: ReductionRequirement::SetUnion,
-                allowed_contribution_kinds: contributions.clone(),
-                required_consumer_capabilities: capabilities.clone(),
-                policy: RuntimeFilterPolicyRequirement {
-                    max_contribution_bytes: 1024,
-                    max_artifact_bytes: 1024,
-                    deadline_ms: 100,
-                    max_retries: 1,
-                },
-            })
-            .unwrap();
-        graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: producer_binding,
-                channel_id,
-                coverage_witness_id: Some(witness),
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(2),
-                    node_id: PlanNodeId::new(1),
-                },
-                expression: expression.clone(),
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                    contribution_kinds: contributions,
-                    completion_requirement: CompletionRequirement::ProducerClosed,
-                    join_key_ordinal: 0,
-                }),
-            })
-            .unwrap();
-        graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: consumer_binding,
-                channel_id,
-                coverage_witness_id: None,
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(1),
-                    node_id: PlanNodeId::new(2),
-                },
-                expression,
-                apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-                    capabilities,
-                    activation: ConsumerActivation::BlockingSnapshot,
-                    target:
-                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
-                }),
-            })
-            .unwrap();
-
-        let placement = |fragment_id: u32,
-                         instance_index: usize,
-                         backend_idx: usize,
-                         finst_id: UniqueId,
-                         endpoint: &str| FragmentInstancePlacement {
-            fragment_id,
-            instance_index,
-            finst_id,
-            backend_idx,
-            endpoint: RuntimeEndpoint::from_socket_addr(endpoint.parse().unwrap()),
-            scan_ranges: BTreeMap::new(),
-            destinations: Vec::new(),
-            per_exch_num_senders: BTreeMap::new(),
-        };
-        let local_producer = UniqueId { hi: 1, lo: 3 };
-        let remote_producer = UniqueId { hi: 1, lo: 4 };
-        let scheduling = SchedulingPlan {
-            root_fragment_id: 1,
-            by_fragment: BTreeMap::from([
-                (
-                    1,
-                    vec![
-                        placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }, "10.0.0.2:9060"),
-                        placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }, "10.0.0.11:9060"),
-                    ],
-                ),
-                (
-                    2,
-                    vec![
-                        placement(2, 0, 2, local_producer, "10.0.0.2:9060"),
-                        placement(2, 1, 7, remote_producer, "10.0.0.7:9060"),
-                    ],
-                ),
-            ]),
-            root_finst_id: UniqueId { hi: 1, lo: 1 },
-            root_backend_idx: 2,
-        };
-        let edges = vec![FragmentEdge {
-            source_fragment_id: 2,
-            target_fragment_id: 1,
-            target_exchange_node_id: 1,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
-        }];
-        let backends = LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
-        ]);
-        let policy = RuntimeFilterDeploymentPolicy {
-            core_budget: RuntimeFilterCoreBudget::new(8192),
-            replica_redundancy: 2,
-            materialization: MaterializationPolicy::for_test(),
-        };
-        compile(
-            &graph,
-            &scheduling,
-            &edges,
-            &backends,
-            &policy,
-            DeploymentEpoch::new(9),
-        )
-        .unwrap()
-    }
-
-    fn compiled_three_backend_all_of_aggregator_install()
+    pub(super) fn compiled_three_backend_all_of_aggregator_install()
     -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
         let remote_producer = UniqueId { hi: 1, lo: 4 };
-        let mut plan = compiled_three_backend_all_of_plan();
+        let mut plan = super::test_support::compiled_three_backend_all_of_plan();
         let aggregator = plan
             .routing_shards
             .iter()
@@ -2209,6 +2354,71 @@ mod tests {
             producer_binding,
             remote_producer,
         )
+    }
+
+    pub(super) fn inbound_loopback_install_for_test(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterParticipantInstall {
+        let epoch = DeploymentEpoch::new(9);
+        let participant = RuntimeFilterParticipantId::new(3);
+        let channel_id = channel.channel_id();
+        let mut local_roles = BTreeSet::from([RuntimeFilterRouteRole::Aggregator]);
+        let mut producer_instances = BTreeMap::new();
+        let mut inbound_edges = Vec::new();
+        let mut outbound_edges = Vec::new();
+        for (index, (binding_id, producer)) in channel.producers().iter().enumerate() {
+            local_roles.insert(RuntimeFilterRouteRole::Producer(*binding_id));
+            for fragment_instance_id in producer.expected_fragment_instances() {
+                producer_instances.insert((*binding_id, *fragment_instance_id), participant);
+            }
+            let edge = RuntimeFilterRoutingEdgeView::new(
+                channel_id,
+                RouteEdgeId::new(u32::try_from(index).unwrap() + 1),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Producer(*binding_id),
+                ),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Aggregator,
+                ),
+                RuntimeFilterRoutePeer::Loopback,
+                BTreeSet::from([
+                    RuntimeFilterEnvelopeKind::Contribution,
+                    RuntimeFilterEnvelopeKind::ProducerClosed,
+                ]),
+            )
+            .unwrap();
+            inbound_edges.push(edge.clone());
+            outbound_edges.push(edge);
+        }
+        local_roles.extend(
+            channel
+                .consumers()
+                .keys()
+                .copied()
+                .map(RuntimeFilterRouteRole::Consumer),
+        );
+        let routing_channel = RuntimeFilterChannelRoutingView::new(
+            channel_id,
+            local_roles,
+            producer_instances,
+            inbound_edges,
+            outbound_edges,
+        )
+        .unwrap();
+        let routing_shard = RuntimeFilterRoutingShard::new(
+            epoch,
+            participant,
+            BTreeMap::from([(channel_id, routing_channel)]),
+        )
+        .unwrap();
+        let core_view = RuntimeFilterInstallView::new(
+            epoch,
+            participant,
+            BTreeMap::from([(channel_id, channel)]),
+        );
+        RuntimeFilterParticipantInstall::new(core_view, routing_shard)
     }
 
     fn view(
@@ -3633,7 +3843,7 @@ mod tests {
 
     #[test]
     fn compiler_participant_installs_all_succeed() {
-        let plan = compiled_three_backend_all_of_plan();
+        let plan = super::test_support::compiled_three_backend_all_of_plan();
         let installs = RuntimeFilterDeploymentExtension::new()
             .participant_installs(&plan)
             .expect("compiler projections pair into participant installs");

@@ -52,6 +52,7 @@ pub(crate) mod metrics_http;
 pub(crate) mod native_fragment_service;
 pub mod report_worker;
 pub(crate) mod result_batch_wire;
+pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
 #[cfg(feature = "compat")]
 pub(crate) mod starrocks_fragment_dependency_resolver;

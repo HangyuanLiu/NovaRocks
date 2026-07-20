@@ -154,6 +154,13 @@ impl RoleRouter {
                 });
             }
         };
+        if edge.target().participant_id() != self.shard.local_participant_id() {
+            return Err(RuntimeFilterRouteContractError::InboundTargetMismatch {
+                channel: channel_id,
+                edge: edge.route_edge_id(),
+                local_participant: self.shard.local_participant_id(),
+            });
+        }
         if !matches!(
             kind,
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
@@ -505,6 +512,49 @@ mod tests {
         assert_eq!(edge.route_edge_id(), RouteEdgeId::new(2));
         assert_eq!(edge.source().participant_id(), pid(7));
         assert_eq!(edge.target().role(), RuntimeFilterRouteRole::Aggregator);
+    }
+
+    #[test]
+    fn routing_shard_construction_rejects_an_inbound_edge_targeting_another_participant() {
+        // A participant's routing shard only ever holds inbound edges that target itself, so an
+        // inbound producer edge whose Aggregator target is a remote participant is rejected while
+        // building the shard. That construction guard is the reachable enforcement point; the
+        // matching `InboundTargetMismatch` branch inside `authorize_contribution` is defensive and
+        // cannot be reached through a validly-constructed shard.
+        let producer = RuntimeFilterRouteRole::Producer(BindingId::new(10));
+        let channel = RuntimeFilterChannelRoutingView::new(
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+            BTreeMap::from([((BindingId::new(10), finst(7)), pid(7))]),
+            vec![edge(
+                6,
+                7,
+                producer,
+                11,
+                RuntimeFilterRouteRole::Aggregator,
+                RuntimeFilterRoutePeer::Remote {
+                    participant_id: pid(7),
+                    endpoint: RuntimeEndpoint::new("10.0.0.7", 9060).unwrap(),
+                },
+                BTreeSet::from([RuntimeFilterEnvelopeKind::Contribution]),
+            )],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            RuntimeFilterRoutingShard::new(
+                DeploymentEpoch::new(9),
+                pid(2),
+                BTreeMap::from([(ChannelId::new(1), channel)]),
+            )
+            .unwrap_err(),
+            RuntimeFilterRouteContractError::InvalidIncidentEdge {
+                channel: ChannelId::new(1),
+                edge: RouteEdgeId::new(6),
+                detail: "inbound target is not local",
+            }
+        );
     }
 
     #[test]

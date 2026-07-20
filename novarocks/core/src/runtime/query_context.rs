@@ -802,6 +802,14 @@ impl QueryContextManager {
         manager
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
     fn clean_loop(self: Arc<Self>) {
         while !self.stopped.load(Ordering::Relaxed) {
             self.clean_expired();
@@ -1304,6 +1312,22 @@ impl QueryContextManager {
                     .get(&query_id)
                     .and_then(|ctx| ctx.cache_options())
             })
+    }
+
+    pub(crate) fn runtime_filter_service_for_ingress(
+        &self,
+        query_id: QueryId,
+    ) -> Option<Arc<RuntimeFilterService>> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if let Some(context) = guard.active.get(&query_id) {
+            if !context.has_no_active_instances() || !context.is_query_expired() {
+                return Some(context.runtime_filter_service());
+            }
+            return None;
+        }
+        guard.second_chance.get(&query_id).and_then(|context| {
+            (!context.is_delivery_expired()).then(|| context.runtime_filter_service())
+        })
     }
 
     pub(crate) fn set_lake_tablet_paths(
@@ -2945,7 +2969,7 @@ mod row_position_descriptor_tests {
 mod runtime_filter_service_lifecycle_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex, Weak, mpsc};
+    use std::sync::{Arc, Barrier, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
@@ -3129,6 +3153,366 @@ mod runtime_filter_service_lifecycle_tests {
                 .expect("shutdown event"),
             "runtime filter shutdown must run after releasing the manager lock"
         );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_returns_active_service_without_mutation() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9101);
+        manager
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .expect("query context");
+        let (before_service, before_fragments, before_deadlines) = {
+            let guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get(&query_id).expect("active query");
+            (
+                context.runtime_filter_service(),
+                (context.num_fragments, context.num_active_fragments),
+                (context.delivery_deadline, context.query_deadline),
+            )
+        };
+
+        let found = manager
+            .runtime_filter_service_for_ingress(query_id)
+            .expect("active query service");
+
+        assert!(Arc::ptr_eq(&before_service, &found));
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("active query");
+        assert_eq!(
+            (context.num_fragments, context.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (context.delivery_deadline, context.query_deadline),
+            before_deadlines
+        );
+        assert!(!guard.second_chance.contains_key(&query_id));
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_returns_unexpired_second_chance_without_mutation() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9102);
+        register(&manager, query_id);
+        manager.finish_fragment(query_id);
+        let (before_service, before_fragments, before_deadlines) = {
+            let guard = manager.inner.lock().expect("query manager");
+            let context = guard
+                .second_chance
+                .get(&query_id)
+                .expect("second-chance query");
+            (
+                context.runtime_filter_service(),
+                (context.num_fragments, context.num_active_fragments),
+                (context.delivery_deadline, context.query_deadline),
+            )
+        };
+
+        let found = manager
+            .runtime_filter_service_for_ingress(query_id)
+            .expect("second-chance query service");
+
+        assert!(Arc::ptr_eq(&before_service, &found));
+        let guard = manager.inner.lock().expect("query manager");
+        assert!(!guard.active.contains_key(&query_id));
+        let context = guard
+            .second_chance
+            .get(&query_id)
+            .expect("second-chance query");
+        assert_eq!(
+            (context.num_fragments, context.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (context.delivery_deadline, context.query_deadline),
+            before_deadlines
+        );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_rejects_expired_second_chance_without_mutation() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9103);
+        register(&manager, query_id);
+        manager.finish_fragment(query_id);
+        let (before_service, before_fragments, before_deadlines) = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard
+                .second_chance
+                .get_mut(&query_id)
+                .expect("second-chance query");
+            context.delivery_deadline = Instant::now() - Duration::from_millis(1);
+            (
+                context.runtime_filter_service(),
+                (context.num_fragments, context.num_active_fragments),
+                (context.delivery_deadline, context.query_deadline),
+            )
+        };
+
+        assert!(
+            manager
+                .runtime_filter_service_for_ingress(query_id)
+                .is_none()
+        );
+
+        let guard = manager.inner.lock().expect("query manager");
+        assert!(!guard.active.contains_key(&query_id));
+        let context = guard
+            .second_chance
+            .get(&query_id)
+            .expect("second-chance query");
+        assert!(Arc::ptr_eq(
+            &before_service,
+            &context.runtime_filter_service()
+        ));
+        assert_eq!(
+            (context.num_fragments, context.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (context.delivery_deadline, context.query_deadline),
+            before_deadlines
+        );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_absent_query_does_not_mutate_manager() {
+        let manager = QueryContextManager::new_for_test();
+        let active_query_id = query_id(9104);
+        let second_chance_query_id = query_id(9105);
+        let absent_query_id = query_id(9106);
+        let finst_id = uid(9107);
+        register(&manager, active_query_id);
+        register(&manager, second_chance_query_id);
+        manager.finish_fragment(second_chance_query_id);
+        manager.register_finst(finst_id, active_query_id);
+        let before = {
+            let guard = manager.inner.lock().expect("query manager");
+            let active = guard.active.get(&active_query_id).expect("active query");
+            let second_chance = guard
+                .second_chance
+                .get(&second_chance_query_id)
+                .expect("second-chance query");
+            (
+                (
+                    guard.active.len(),
+                    guard.second_chance.len(),
+                    guard.finst_to_query.len(),
+                ),
+                (
+                    active.num_fragments,
+                    active.num_active_fragments,
+                    active.delivery_deadline,
+                    active.query_deadline,
+                ),
+                (
+                    second_chance.num_fragments,
+                    second_chance.num_active_fragments,
+                    second_chance.delivery_deadline,
+                    second_chance.query_deadline,
+                ),
+            )
+        };
+
+        assert!(
+            manager
+                .runtime_filter_service_for_ingress(absent_query_id)
+                .is_none()
+        );
+
+        let guard = manager.inner.lock().expect("query manager");
+        let active = guard.active.get(&active_query_id).expect("active query");
+        let second_chance = guard
+            .second_chance
+            .get(&second_chance_query_id)
+            .expect("second-chance query");
+        assert_eq!(
+            (
+                guard.active.len(),
+                guard.second_chance.len(),
+                guard.finst_to_query.len(),
+            ),
+            before.0
+        );
+        assert_eq!(
+            (
+                active.num_fragments,
+                active.num_active_fragments,
+                active.delivery_deadline,
+                active.query_deadline,
+            ),
+            before.1
+        );
+        assert_eq!(
+            (
+                second_chance.num_fragments,
+                second_chance.num_active_fragments,
+                second_chance.delivery_deadline,
+                second_chance.query_deadline,
+            ),
+            before.2
+        );
+        assert_eq!(
+            guard
+                .finst_to_query
+                .get(&finst_id)
+                .map(|execution| execution.query_id()),
+            Some(active_query_id)
+        );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_rejects_expired_claim_only_active_context() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9108);
+        manager
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .expect("claim-only query context");
+        let (before_service, before_fragments, before_deadlines) = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("active query");
+            context.query_deadline = Instant::now() - Duration::from_millis(1);
+            (
+                context.runtime_filter_service(),
+                (context.num_fragments, context.num_active_fragments),
+                (context.delivery_deadline, context.query_deadline),
+            )
+        };
+
+        assert!(
+            manager
+                .runtime_filter_service_for_ingress(query_id)
+                .is_none()
+        );
+
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("active query");
+        assert!(Arc::ptr_eq(
+            &before_service,
+            &context.runtime_filter_service()
+        ));
+        assert_eq!(
+            (context.num_fragments, context.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (context.delivery_deadline, context.query_deadline),
+            before_deadlines
+        );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_returns_active_fragment_past_query_deadline() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9109);
+        register(&manager, query_id);
+        let (before_service, before_fragments, before_deadlines) = {
+            let mut guard = manager.inner.lock().expect("query manager");
+            let context = guard.active.get_mut(&query_id).expect("active query");
+            context.query_deadline = Instant::now() - Duration::from_millis(1);
+            (
+                context.runtime_filter_service(),
+                (context.num_fragments, context.num_active_fragments),
+                (context.delivery_deadline, context.query_deadline),
+            )
+        };
+
+        let found = manager
+            .runtime_filter_service_for_ingress(query_id)
+            .expect("active fragment service");
+
+        assert!(Arc::ptr_eq(&before_service, &found));
+        let guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get(&query_id).expect("active query");
+        assert_eq!(
+            (context.num_fragments, context.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (context.delivery_deadline, context.query_deadline),
+            before_deadlines
+        );
+    }
+
+    #[test]
+    fn runtime_filter_ingress_lookup_cleanup_wins_without_recreating_context() {
+        let manager = QueryContextManager::new_for_test();
+        let query_id = query_id(9110);
+        manager
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .expect("claim-only query context");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut guard = manager.inner.lock().expect("query manager");
+        let context = guard.active.get_mut(&query_id).expect("active query");
+        context.query_deadline = Instant::now() - Duration::from_millis(1);
+        let before_service = context.runtime_filter_service();
+        let before_fragments = (context.num_fragments, context.num_active_fragments);
+        let before_deadlines = (context.delivery_deadline, context.query_deadline);
+        let (lookup_tx, lookup_rx) = mpsc::sync_channel(1);
+        let lookup = {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                lookup_tx
+                    .send(
+                        manager
+                            .runtime_filter_service_for_ingress(query_id)
+                            .is_none(),
+                    )
+                    .expect("lookup result receiver");
+            })
+        };
+        barrier.wait();
+        let removed = guard.active.remove(&query_id).expect("expired query");
+        drop(guard);
+
+        removed.runtime_filter_service().shutdown();
+        assert_eq!(
+            (removed.num_fragments, removed.num_active_fragments),
+            before_fragments
+        );
+        assert_eq!(
+            (removed.delivery_deadline, removed.query_deadline),
+            before_deadlines
+        );
+        drop(removed);
+        manager.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+
+        assert!(
+            lookup_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("lookup must complete")
+        );
+        lookup.join().expect("lookup thread");
+        let guard = manager.inner.lock().expect("query manager");
+        assert!(!guard.active.contains_key(&query_id));
+        assert!(!guard.second_chance.contains_key(&query_id));
+        assert_eq!(
+            guard
+                .finst_to_query
+                .values()
+                .filter(|execution| execution.query_id() == query_id)
+                .count(),
+            0
+        );
+        assert_eq!(Arc::strong_count(&before_service), 1);
     }
 
     #[test]

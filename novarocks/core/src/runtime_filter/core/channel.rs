@@ -46,6 +46,8 @@ use crate::runtime_filter::port::support::{
     RetainedMemoryReservation, RuntimeFilterMemoryAccount, TemporaryContributionLease,
 };
 use crate::runtime_filter::port::topk_summary::{RuntimeTopKSummaryContract, TopKSummary};
+#[cfg(test)]
+use crate::runtime_filter::port::value_domain::MembershipValues;
 use crate::runtime_filter::port::value_domain::{LogicalSnapshot, ValueDomainDelta};
 
 use super::coverage::{CoverageProgress, WitnessProgress, evaluate};
@@ -101,6 +103,15 @@ pub(crate) enum ChannelAction {
         order: u64,
         events: Vec<RuntimeFilterEvent>,
     },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProducerIngressCoreSnapshot {
+    pub(crate) local_partition_count: Option<u32>,
+    pub(crate) materialized_partition_count: usize,
+    pub(crate) terminal_progress: TerminalProgress,
+    pub(crate) membership_values: Option<MembershipValues>,
 }
 
 impl ChannelAction {
@@ -665,6 +676,59 @@ impl RuntimeFilterChannel {
         let instance = instance_mut(&mut state, binding_id, fragment_instance_id)?;
         instance.open(local_partition_count);
         Ok(SubmitOutcome::Applied)
+    }
+
+    pub(crate) fn preflight_remote_open(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        partition_id: PartitionId,
+    ) -> Result<(), RuntimeContractViolation> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let existing =
+            instance_ref(&state, binding_id, fragment_instance_id)?.local_partition_count();
+        if let Some(existing) = existing
+            && existing != local_partition_count
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::PartitionCountConflict,
+                "producer instance reopened with a different partition count",
+            ));
+        }
+        if local_partition_count == 0 {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidPartitionCount,
+                "local partition count must be non-zero",
+            ));
+        }
+        if partition_id.get() >= local_partition_count {
+            return Err(violation(
+                RuntimeContractViolationKind::InvalidPartition,
+                "producer partition is outside the declared local partition count",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_ingress_core_snapshot(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> ProducerIngressCoreSnapshot {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let instance = instance_ref(&state, binding_id, fragment_instance_id)
+            .expect("test observes an installed producer");
+        ProducerIngressCoreSnapshot {
+            local_partition_count: instance.local_partition_count(),
+            materialized_partition_count: instance.materialized_partition_count(),
+            terminal_progress: instance.progress,
+            membership_values: state
+                .reducer
+                .as_ref()
+                .map(|reducer| reducer.domain().values().clone()),
+        }
     }
 
     pub(crate) fn authorize_submit(
@@ -3338,7 +3402,10 @@ mod tests {
         LogicalSnapshot, MembershipValues, ValueDomainDelta,
     };
 
-    use super::{ChannelAction, ChannelTerminal, FinalDomainRejection, RuntimeFilterChannel};
+    use super::{
+        ChannelAction, ChannelTerminal, FinalDomainRejection, RuntimeFilterChannel,
+        TerminalProgress,
+    };
 
     #[derive(Default)]
     struct Account {
@@ -3811,6 +3878,61 @@ mod tests {
             RuntimeContractViolationKind::InvalidPartition
         );
         assert_eq!(account.current.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_open_preflight_prioritizes_existing_count_conflict_without_mutation() {
+        let (channel, _, _) = one_channel();
+        channel
+            .open_producer(BindingId::new(10), uid(10), 2)
+            .unwrap();
+
+        assert_eq!(
+            channel
+                .preflight_remote_open(BindingId::new(10), uid(10), 1, PartitionId::new(1),)
+                .unwrap_err()
+                .kind(),
+            RuntimeContractViolationKind::PartitionCountConflict
+        );
+        assert_eq!(
+            channel
+                .open_producer(BindingId::new(10), uid(10), 2)
+                .unwrap(),
+            SubmitOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn remote_open_preflight_rejects_new_invalid_partition_without_mutation() {
+        let (channel, _, _) = one_channel();
+
+        assert_eq!(
+            channel
+                .preflight_remote_open(BindingId::new(10), uid(10), 1, PartitionId::new(1),)
+                .unwrap_err()
+                .kind(),
+            RuntimeContractViolationKind::InvalidPartition
+        );
+        assert_eq!(
+            channel
+                .open_producer(BindingId::new(10), uid(10), 1)
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn producer_ingress_core_snapshot_is_read_only() {
+        let (channel, _, _) = one_channel();
+
+        let before = channel.producer_ingress_core_snapshot(BindingId::new(10), uid(10));
+        let after = channel.producer_ingress_core_snapshot(BindingId::new(10), uid(10));
+
+        assert_eq!(before, after);
+        assert_eq!(before.local_partition_count, None);
+        assert_eq!(before.materialized_partition_count, 0);
+        assert_eq!(before.terminal_progress, TerminalProgress::Pending);
+        assert!(before.membership_values.is_some());
     }
 
     #[test]
