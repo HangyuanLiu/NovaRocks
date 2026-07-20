@@ -16,4 +16,5 @@
 // under the License.
 
 pub(crate) mod loopback;
+pub(crate) mod remote;
 pub(crate) mod role_graph;

@@ -359,6 +359,10 @@ impl InstalledDeployment {
             .map(|(channel_id, channel)| (*channel_id, channel.clone()))
     }
 
+    pub(super) fn epoch(&self) -> DeploymentEpoch {
+        self.install.epoch()
+    }
+
     pub(super) fn router(&self) -> &LoopbackRouter {
         &self.router
     }
