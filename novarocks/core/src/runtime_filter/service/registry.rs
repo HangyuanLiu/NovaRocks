@@ -500,6 +500,18 @@ enum RegistryState {
     Cancelled(Option<Arc<InstalledDeployment>>),
 }
 
+/// Inbound-dispatch admission classification of the registry state, resolved
+/// under a single lock so a concurrent `install` transition cannot make a caller
+/// observe a torn `active`-then-`cancelled` view. `Cancelled` and `Absent` are
+/// distinct so the inbound path can surface a cancel/shutdown race as
+/// `[service-unavailable]` while a never-installed deployment stays
+/// `[deployment-unavailable]`.
+pub(super) enum DispatchAdmission {
+    Active(Arc<InstalledDeployment>),
+    Cancelled,
+    Absent,
+}
+
 pub(super) struct DeploymentRegistry {
     query_id: UniqueId,
     clock: Arc<dyn RuntimeFilterClock>,
@@ -780,6 +792,22 @@ impl DeploymentRegistry {
             RegistryState::Uninstalled
             | RegistryState::Installing(_)
             | RegistryState::Cancelled(_) => None,
+        }
+    }
+
+    /// Classify the state for inbound producer admission under a single lock:
+    /// `Active` for a `Publishing`/`Installed` snapshot dispatch may open against,
+    /// `Cancelled` for a deployment that was installed and then cancelled/shut
+    /// down (a cancel/shutdown race), and `Absent` when no deployment has reached
+    /// the installed snapshot yet.
+    pub(super) fn dispatch_admission(&self) -> DispatchAdmission {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        match &*state {
+            RegistryState::Publishing { installed, .. } | RegistryState::Installed(installed) => {
+                DispatchAdmission::Active(installed.clone())
+            }
+            RegistryState::Cancelled(_) => DispatchAdmission::Cancelled,
+            RegistryState::Uninstalled | RegistryState::Installing(_) => DispatchAdmission::Absent,
         }
     }
 

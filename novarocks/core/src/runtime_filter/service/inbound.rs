@@ -29,7 +29,7 @@ use crate::runtime_filter::port::producer::{
 use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
 use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
 
-use super::registry::InboundProducerContract;
+use super::registry::{DispatchAdmission, InboundProducerContract};
 use super::{OpenedProducer, RuntimeFilterService};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,12 +110,21 @@ impl RuntimeFilterService {
             .operation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let installed = self.registry.active_installation().ok_or_else(|| {
-            ingress_error(
-                InboundProducerDispatchErrorKind::DeploymentUnavailable,
-                "runtime filter deployment is not active",
-            )
-        })?;
+        let installed = match self.registry.dispatch_admission() {
+            DispatchAdmission::Active(installed) => installed,
+            DispatchAdmission::Cancelled => {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::ServiceUnavailable,
+                    "runtime filter service is cancelled or shut down",
+                ));
+            }
+            DispatchAdmission::Absent => {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::DeploymentUnavailable,
+                    "runtime filter deployment is not active",
+                ));
+            }
+        };
         installed
             .role_router()
             .authorize_contribution(
@@ -219,13 +228,19 @@ impl RuntimeFilterService {
                 contract.port_kind(),
             )
             .map_err(map_producer_error)?;
+        #[cfg(test)]
+        self.fire_after_inbound_open_admission();
         if outcome == SubmitOutcome::TerminalNoop {
             drop(operation);
             return Ok(InboundProducerDispatchOutcome::Accepted);
         }
         let partition_id = route.partition_id();
         let sequence = route.sequence();
+        // Never hold `operation` across the typed submit/close: cancel/shutdown
+        // must be free to linearize against the Channel lock, not this mutex.
         drop(operation);
+        #[cfg(test)]
+        self.fire_before_inbound_typed_dispatch();
 
         let outcome = match (handle, contribution) {
             (
@@ -340,18 +355,21 @@ const fn dispatch_outcome(outcome: SubmitOutcome) -> InboundProducerDispatchOutc
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex, Weak, mpsc};
+    use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
 
     use crate::common::types::UniqueId;
+    use crate::runtime::query_context::{QueryContextManager, QueryId};
     use crate::runtime_filter::codec::contribution::{
         ContributionCodecExpectation, RuntimeFilterContribution, encode_contribution,
         semantic_contribution_bytes,
     };
     use crate::runtime_filter::core::channel::{ProducerIngressCoreSnapshot, RuntimeFilterChannel};
     use crate::runtime_filter::core::coverage::CoverageProgress;
+    use crate::runtime_filter::core::state::TerminalProgress;
+    use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
         ConsumerActivation, ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder,
@@ -374,7 +392,7 @@ mod tests {
     };
     use crate::runtime_filter::port::install::{
         ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget,
+        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
     };
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
@@ -384,6 +402,7 @@ mod tests {
         InstallOutcome, RuntimeContractViolation, RuntimeContractViolationKind,
     };
     use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
+    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
     use crate::runtime_filter::port::support::{
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
@@ -392,10 +411,16 @@ mod tests {
         ContributionRouteIdentity, ProducerOpenMetadata, RuntimeFilterEnvelope,
         RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     };
+    use crate::runtime_filter::port::transport::{
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelopeIngress,
+    };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use crate::runtime_filter::service::registry::InboundProducerContract as InstalledInboundContract;
+    use crate::runtime_filter::service::test_support::compiled_three_backend_all_of_plan;
     use crate::runtime_filter::service::tests::{
         inbound_loopback_install_for_test, ordered_update,
     };
+    use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
 
     use super::InboundProducerDispatchErrorKind::{
         CodecContract, DeploymentUnavailable, ProducerContract, RouteContract, ServiceUnavailable,
@@ -1968,9 +1993,11 @@ mod tests {
         assert!(mapped.to_string().contains("[route-contract]"));
     }
 
-    // ServiceUnavailable is only minted by open_producer / subscribe when no installation is
-    // active; the dispatch producer-submit path holds a live installation and cannot reach it.
-    // Assert the production error mapping still classifies it under the stable prefix.
+    // ServiceUnavailable has two production sources: the dispatch admission gate maps a
+    // Cancelled deployment to it (see dispatch_inbound_producer), and the open/submit layer
+    // mints it via `service_cancelled` on the typed submit/preflight/open path. This test
+    // covers the latter mapping (map_producer_error) under the stable prefix; race 1
+    // (remote_producer_ingress_lifecycle_*) covers the admission-gate source end to end.
     #[test]
     fn inbound_producer_dispatch_maps_service_unavailable_to_service_contract() {
         let mapped = map_producer_error(RuntimeContractViolation::new(
@@ -2023,5 +2050,720 @@ mod tests {
         ] {
             assert_eq!(kind.prefix(), prefix);
         }
+    }
+
+    // ==========================================================================================
+    // Task 5: compiler-produced remote producer proof + deterministic lifecycle/concurrency.
+    // ==========================================================================================
+
+    // Bounded rendezvous budget: a missed cross-thread signal fails the test instead of hanging
+    // the whole suite.
+    const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // Production-shaped 1FE+3BE remote producer proof. The real deployment compiler projects an
+    // aggregator install whose inbound edge authorizes a contribution from a *remote* producer
+    // source; that composite is installed into a `new_for_test` query manager and driven through
+    // the production query-scoped ingress. There is no live network sender (that is M3); the
+    // producer envelope is handed to the aggregator's in-process ingress.
+    struct ThreeBackendIngressFixture {
+        ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+        service: Arc<RuntimeFilterService>,
+        channel: Arc<RuntimeFilterChannel>,
+        source_participant: RuntimeFilterParticipantId,
+        aggregator_participant: RuntimeFilterParticipantId,
+        transport_query_id: UniqueId,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        channel_id: ChannelId,
+        deployment_epoch: DeploymentEpoch,
+        schema_digest: [u8; 32],
+        contribution_payload: Vec<u8>,
+    }
+
+    impl ThreeBackendIngressFixture {
+        fn compile_and_install() -> Self {
+            let manager_query_id = QueryId { hi: 92, lo: 1 };
+            let transport_query_id = UniqueId { hi: 92, lo: 1 };
+            let channel_id = ChannelId::new(5);
+            let remote_binding_id = BindingId::new(10);
+            let remote_finst = UniqueId { hi: 1, lo: 4 };
+
+            let plan = compiled_three_backend_all_of_plan();
+            let deployment_epoch = plan.epoch;
+            let installs = RuntimeFilterDeploymentExtension::new()
+                .participant_installs(&plan)
+                .expect("compiler projections pair into participant installs");
+            let aggregator_participant = plan
+                .routing_shards
+                .iter()
+                .find_map(|(participant, shard)| {
+                    shard
+                        .channel(channel_id)
+                        .filter(|channel| {
+                            channel
+                                .local_roles()
+                                .contains(&RuntimeFilterRouteRole::Aggregator)
+                        })
+                        .map(|_| *participant)
+                })
+                .expect("compiler produced an aggregator participant");
+            let source_participant = plan.routing_shards[&aggregator_participant]
+                .channel(channel_id)
+                .unwrap()
+                .producer_participant(remote_binding_id, remote_finst)
+                .expect("compiler routed the remote producer source");
+            assert_ne!(
+                source_participant, aggregator_participant,
+                "the compiler must route a remote producer source distinct from the aggregator"
+            );
+            let (_, aggregator_install) = installs
+                .into_iter()
+                .find(|(participant, _)| *participant == aggregator_participant)
+                .expect("aggregator participant owns a composite install");
+
+            let manager = QueryContextManager::new_for_test();
+            manager
+                .ensure_native_context(
+                    manager_query_id,
+                    false,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                )
+                .expect("register the native query context");
+            let service = manager
+                .runtime_filter_service_for_ingress(manager_query_id)
+                .expect("registered query exposes a runtime filter service");
+            assert_eq!(
+                service.install(aggregator_install).unwrap(),
+                InstallOutcome::Installed,
+            );
+
+            let installed = service
+                .registry
+                .active_installation()
+                .expect("aggregator install is active");
+            let producer = installed
+                .producer(remote_binding_id)
+                .expect("aggregator installs the remote producer binding");
+            let channel = Arc::clone(&producer.channel);
+            let schema = match producer.inbound_contract() {
+                InstalledInboundContract::Membership { schema, .. } => schema.clone(),
+                _ => panic!("the compiler fixture installs a membership producer"),
+            };
+            let max_encoded = producer.inbound_contract().limits().max_encoded_bytes();
+            let (schema_digest, contribution_payload) = encode_contribution(
+                &RuntimeFilterContribution::Membership(ValueDomainDelta::new(
+                    MembershipValues::int64([4242]),
+                    false,
+                )),
+                ContributionCodecExpectation::Membership(&schema),
+                max_encoded,
+            )
+            .unwrap()
+            .into_parts();
+
+            let ingress =
+                query_scoped_runtime_filter_envelope_ingress_with_manager(Arc::clone(&manager));
+            Self {
+                ingress,
+                service,
+                channel,
+                source_participant,
+                aggregator_participant,
+                transport_query_id,
+                binding_id: remote_binding_id,
+                fragment_instance_id: remote_finst,
+                channel_id,
+                deployment_epoch,
+                schema_digest,
+                contribution_payload,
+            }
+        }
+
+        fn envelope(
+            &self,
+            kind: RuntimeFilterEnvelopeKind,
+            sequence: u64,
+            payload: Vec<u8>,
+        ) -> RuntimeFilterEnvelope {
+            let route = ContributionRouteIdentity::try_new(
+                self.binding_id,
+                self.fragment_instance_id,
+                PartitionId::new(0),
+                ProducerSequence::new(sequence),
+            )
+            .unwrap();
+            RuntimeFilterEnvelope::try_new(
+                kind,
+                self.transport_query_id,
+                self.channel_id,
+                self.deployment_epoch,
+                RuntimeFilterRouteIdentity::contribution(route),
+                Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                &self.schema_digest,
+                payload,
+            )
+            .unwrap()
+        }
+
+        fn contribution(&self) -> RuntimeFilterEnvelope {
+            self.envelope(
+                RuntimeFilterEnvelopeKind::Contribution,
+                0,
+                self.contribution_payload.clone(),
+            )
+        }
+
+        fn producer_closed(&self) -> RuntimeFilterEnvelope {
+            self.envelope(RuntimeFilterEnvelopeKind::ProducerClosed, 1, Vec::new())
+        }
+
+        fn ingress_snapshot(&self) -> ProducerIngressCoreSnapshot {
+            self.channel
+                .producer_ingress_core_snapshot(self.binding_id, self.fragment_instance_id)
+        }
+    }
+
+    // Part A: the whole chain (remote finst union -> RoleRouter authority -> installed expectation
+    // -> open -> dispatch) forms one path through the production query-scoped ingress.
+    #[test]
+    fn remote_producer_ingress_compiler_fixture_reaches_aggregator_core() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+        assert_ne!(fixture.source_participant, fixture.aggregator_participant);
+
+        assert_eq!(
+            fixture
+                .ingress
+                .accept(fixture.contribution())
+                .accept_status(),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        let after_contribution = fixture.ingress_snapshot();
+        assert_eq!(after_contribution.local_partition_count, Some(1));
+        assert_eq!(after_contribution.materialized_partition_count, 1);
+        assert_eq!(
+            after_contribution.membership_values,
+            Some(MembershipValues::int64([4242])),
+            "the remote finst contribution must reach the aggregator reducer domain"
+        );
+
+        assert_eq!(
+            fixture
+                .ingress
+                .accept(fixture.producer_closed())
+                .accept_status(),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        assert_eq!(
+            fixture.ingress_snapshot().terminal_progress,
+            TerminalProgress::Satisfied,
+            "the producer-close must advance the producer instance to Satisfied"
+        );
+    }
+
+    // Part B, race 1: cancel wins before admission -> Rejected([service-unavailable]).
+    #[test]
+    fn remote_producer_ingress_lifecycle_cancel_before_admission_is_service_unavailable() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+        // Cancel fully lands (registry Cancelled + channels cancelled) before any dispatch.
+        fixture.service.cancel();
+
+        let result = fixture.ingress.accept(fixture.contribution());
+        assert_eq!(result.accept_status(), RuntimeFilterAcceptStatus::Rejected);
+        let reason = result
+            .rejection_reason()
+            .expect("a rejected ingress result carries a reason");
+        assert!(
+            reason.contains("[service-unavailable]"),
+            "cancel-before-admission must reject as service-unavailable: {reason}"
+        );
+        assert_eq!(
+            fixture.ingress_snapshot().local_partition_count,
+            None,
+            "a rejected admission must never open the producer instance"
+        );
+    }
+
+    // Part B, race 2: admission done, submit linearizes before channel cancel -> Accepted.
+    #[test]
+    fn remote_producer_ingress_lifecycle_submit_before_channel_cancel_is_accepted() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        fixture
+            .service
+            .set_after_inbound_open_admission_hook(Arc::new(move || {
+                admitted_tx.send(()).unwrap();
+            }));
+        // Hold the per-channel cancel until the submit has linearized, so the channel is still
+        // collecting when the contribution reaches Core.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        fixture
+            .service
+            .set_after_registry_cancel_before_channel_cancel_hook(Arc::new(move || {
+                let _ = release_rx.lock().unwrap().recv_timeout(LIFECYCLE_TIMEOUT);
+            }));
+
+        let (status_tx, status_rx) = mpsc::channel();
+        let dispatch = {
+            let ingress = Arc::clone(&fixture.ingress);
+            let contribution = fixture.contribution();
+            std::thread::spawn(move || {
+                status_tx
+                    .send(ingress.accept(contribution).accept_status())
+                    .unwrap();
+            })
+        };
+
+        admitted_rx
+            .recv_timeout(LIFECYCLE_TIMEOUT)
+            .expect("dispatch admission never completed");
+        let cancel = {
+            let service = Arc::clone(&fixture.service);
+            std::thread::spawn(move || service.cancel())
+        };
+
+        assert_eq!(
+            status_rx
+                .recv_timeout(LIFECYCLE_TIMEOUT)
+                .expect("the submit never completed"),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        assert_eq!(
+            fixture.ingress_snapshot().membership_values,
+            Some(MembershipValues::int64([4242])),
+            "a submit that linearizes before the channel cancel must reach the reducer domain"
+        );
+
+        release_tx.send(()).unwrap();
+        cancel.join().expect("cancel thread panicked");
+        dispatch.join().expect("dispatch thread panicked");
+    }
+
+    // Part B, race 3: admission done, submit blocked until channel shutdown completes ->
+    // Accepted(TerminalNoop).
+    #[test]
+    fn remote_producer_ingress_lifecycle_submit_after_channel_shutdown_is_terminal_noop() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        fixture
+            .service
+            .set_after_inbound_open_admission_hook(Arc::new(move || {
+                admitted_tx.send(()).unwrap();
+            }));
+        // Park the typed submit until the channel shutdown has fully completed.
+        let (cancelled_tx, cancelled_rx) = mpsc::channel::<()>();
+        let cancelled_rx = Mutex::new(cancelled_rx);
+        fixture
+            .service
+            .set_before_inbound_typed_dispatch_hook(Arc::new(move || {
+                let _ = cancelled_rx.lock().unwrap().recv_timeout(LIFECYCLE_TIMEOUT);
+            }));
+
+        let (status_tx, status_rx) = mpsc::channel();
+        let dispatch = {
+            let ingress = Arc::clone(&fixture.ingress);
+            let contribution = fixture.contribution();
+            std::thread::spawn(move || {
+                status_tx
+                    .send(ingress.accept(contribution).accept_status())
+                    .unwrap();
+            })
+        };
+
+        admitted_rx
+            .recv_timeout(LIFECYCLE_TIMEOUT)
+            .expect("dispatch admission never completed");
+        let cancel = {
+            let service = Arc::clone(&fixture.service);
+            std::thread::spawn(move || {
+                service.cancel();
+                cancelled_tx.send(()).unwrap();
+            })
+        };
+
+        assert_eq!(
+            status_rx
+                .recv_timeout(LIFECYCLE_TIMEOUT)
+                .expect("the submit never resumed after channel shutdown"),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        let after = fixture.ingress_snapshot();
+        assert_eq!(
+            after.local_partition_count,
+            Some(1),
+            "admission opened the producer instance before the shutdown"
+        );
+        assert_ne!(
+            after.membership_values,
+            Some(MembershipValues::int64([4242])),
+            "a submit after channel shutdown is a terminal no-op and must not reach the reducer"
+        );
+        assert!(
+            fixture.channel.is_terminal(),
+            "the channel is terminal once the shutdown has completed"
+        );
+        cancel.join().expect("cancel thread panicked");
+        dispatch.join().expect("dispatch thread panicked");
+    }
+
+    // Part B, race 4: registry already Cancelled but the per-channel cancel has not finished ->
+    // no registry revival, no delivery past the cancelled publish gate, no deadlock. The window is
+    // NOT forced to a terminal no-op: admission classifies it as service-unavailable.
+    #[test]
+    fn remote_producer_ingress_lifecycle_registry_cancelled_channel_cancel_pending_window() {
+        let fixture = ThreeBackendIngressFixture::compile_and_install();
+
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        fixture
+            .service
+            .set_after_registry_cancel_before_channel_cancel_hook(Arc::new(move || {
+                parked_tx.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv_timeout(LIFECYCLE_TIMEOUT);
+            }));
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let cancel = {
+            let service = Arc::clone(&fixture.service);
+            std::thread::spawn(move || {
+                service.cancel();
+                returned_tx.send(()).unwrap();
+            })
+        };
+
+        parked_rx
+            .recv_timeout(LIFECYCLE_TIMEOUT)
+            .expect("cancel never reached the per-channel window");
+        assert!(
+            fixture.service.registry.active_installation().is_none(),
+            "the registry stays cancelled inside the window"
+        );
+        let result = fixture.ingress.accept(fixture.contribution());
+        assert_eq!(
+            result.accept_status(),
+            RuntimeFilterAcceptStatus::Rejected,
+            "a dispatch inside the cancelled window must not be delivered"
+        );
+        assert!(
+            result
+                .rejection_reason()
+                .is_some_and(|reason| reason.contains("[service-unavailable]")),
+            "the cancelled window rejects as service-unavailable, never a forced terminal no-op"
+        );
+        assert_eq!(
+            fixture.ingress_snapshot().local_partition_count,
+            None,
+            "the cancelled window neither revives the registry nor opens a producer instance"
+        );
+
+        release_tx.send(()).unwrap();
+        returned_rx
+            .recv_timeout(LIFECYCLE_TIMEOUT)
+            .expect("cancel deadlocked finishing the per-channel window");
+        cancel.join().expect("cancel thread panicked");
+    }
+
+    // Part B, race 5: a legal dispatch admitted during Publishing still sees the install's
+    // DeploymentInstalled event published before its own Core contribution event, because both
+    // flow through the single existing EventEmitter FIFO.
+    #[test]
+    fn remote_producer_ingress_lifecycle_publishing_dispatch_orders_install_before_core_events() {
+        let events = Arc::new(RecordingEvents::default());
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            SERVICE_QID,
+            Arc::new(Clock),
+            events.clone(),
+            Arc::new(Memory),
+        ));
+        let (digest, payload) = encode(
+            &membership_contribution(7),
+            ContributionCodecExpectation::Membership(&membership_schema()),
+        );
+
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        service.set_after_inbound_open_admission_hook(Arc::new(move || {
+            admitted_tx.send(()).unwrap();
+        }));
+        let (publishing_tx, publishing_rx) = mpsc::channel();
+        let admitted_rx = Mutex::new(admitted_rx);
+        service.set_after_commit_before_publish_hook(Arc::new(move || {
+            // Publishing is committed; release the racing dispatch and wait until it has admitted
+            // (its Core batch is reserved behind the install batch) before publishing.
+            publishing_tx.send(()).unwrap();
+            let _ = admitted_rx.lock().unwrap().recv_timeout(LIFECYCLE_TIMEOUT);
+        }));
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let dispatch = {
+            let service = Arc::clone(&service);
+            std::thread::spawn(move || {
+                if publishing_rx.recv_timeout(LIFECYCLE_TIMEOUT).is_err() {
+                    return;
+                }
+                let outcome = service.dispatch_inbound_producer(contribution_env(
+                    PRODUCER_BINDING,
+                    PRODUCER_FINST,
+                    0,
+                    0,
+                    1,
+                    digest,
+                    payload,
+                ));
+                let _ = result_tx.send(outcome);
+            })
+        };
+
+        assert_eq!(
+            service
+                .install(inbound_loopback_install_for_test(membership_deployment(
+                    4096
+                )))
+                .unwrap(),
+            InstallOutcome::Installed,
+        );
+        assert_eq!(
+            result_rx
+                .recv_timeout(LIFECYCLE_TIMEOUT)
+                .expect("the publishing-window dispatch never completed")
+                .expect("the publishing-window dispatch returned a contract error"),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        dispatch.join().expect("dispatch thread panicked");
+
+        let recorded = events.0.lock().unwrap();
+        let installed_at = recorded
+            .iter()
+            .position(|event| matches!(event, RuntimeFilterEvent::DeploymentInstalled { .. }))
+            .expect("the install publishes a DeploymentInstalled event");
+        let core_at = recorded
+            .iter()
+            .position(|event| matches!(event, RuntimeFilterEvent::DeltaAccepted { .. }))
+            .expect("the racing contribution publishes a Core delta event");
+        assert!(
+            installed_at < core_at,
+            "DeploymentInstalled must publish before the Core contribution event \
+             (install {installed_at} vs core {core_at})"
+        );
+    }
+
+    // Part B, race 6: identical reentrant installs from an event sink never deadlock, on the same
+    // thread and while waiting on a cross-thread install.
+    struct ReentrantIdenticalInstallSink {
+        service: Mutex<Weak<RuntimeFilterService>>,
+        install: Mutex<Option<RuntimeFilterParticipantInstall>>,
+        outcome: mpsc::Sender<InstallOutcome>,
+    }
+
+    impl RuntimeFilterEventSink for ReentrantIdenticalInstallSink {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if !matches!(event, RuntimeFilterEvent::DeploymentInstalled { .. }) {
+                return;
+            }
+            let Some(install) = self.install.lock().unwrap().take() else {
+                return;
+            };
+            let Some(service) = self.service.lock().unwrap().upgrade() else {
+                return;
+            };
+            self.outcome
+                .send(service.install(install).unwrap())
+                .unwrap();
+        }
+    }
+
+    struct CrossThreadIdenticalInstallSink {
+        service: Mutex<Weak<RuntimeFilterService>>,
+        install: Mutex<Option<RuntimeFilterParticipantInstall>>,
+        outcome: mpsc::Sender<Option<InstallOutcome>>,
+    }
+
+    impl RuntimeFilterEventSink for CrossThreadIdenticalInstallSink {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if !matches!(event, RuntimeFilterEvent::DeploymentInstalled { .. }) {
+                return;
+            }
+            let Some(install) = self.install.lock().unwrap().take() else {
+                return;
+            };
+            let Some(service) = self.service.lock().unwrap().upgrade() else {
+                return;
+            };
+            let (worker_tx, worker_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = worker_tx.send(service.install(install));
+            });
+            self.outcome
+                .send(
+                    worker_rx
+                        .recv_timeout(LIFECYCLE_TIMEOUT)
+                        .ok()
+                        .and_then(Result::ok),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_producer_ingress_lifecycle_reentrant_identical_install_does_not_deadlock() {
+        // Same-thread: the event sink re-installs the identical composite while the install's own
+        // DeploymentInstalled event drains on this thread; the reentry is idempotent and must not
+        // wait on its own batch.
+        {
+            let composite = inbound_loopback_install_for_test(membership_deployment(4096));
+            let (reentrant_tx, reentrant_rx) = mpsc::channel();
+            let sink = Arc::new(ReentrantIdenticalInstallSink {
+                service: Mutex::new(Weak::new()),
+                install: Mutex::new(Some(composite.clone())),
+                outcome: reentrant_tx,
+            });
+            let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+                SERVICE_QID,
+                Arc::new(Clock),
+                sink.clone(),
+                Arc::new(Memory),
+            ));
+            *sink.service.lock().unwrap() = Arc::downgrade(&service);
+            let (outer_tx, outer_rx) = mpsc::channel();
+            {
+                let service = Arc::clone(&service);
+                std::thread::spawn(move || outer_tx.send(service.install(composite)).unwrap());
+            }
+            assert_eq!(
+                reentrant_rx
+                    .recv_timeout(LIFECYCLE_TIMEOUT)
+                    .expect("same-thread reentrant identical install deadlocked"),
+                InstallOutcome::AlreadyInstalled,
+            );
+            assert_eq!(
+                outer_rx
+                    .recv_timeout(LIFECYCLE_TIMEOUT)
+                    .expect("outer install never finished")
+                    .unwrap(),
+                InstallOutcome::Installed,
+            );
+        }
+
+        // Cross-thread: the event sink blocks on a different thread performing the identical
+        // install; that install observes the logical commit and returns idempotently.
+        {
+            let composite = inbound_loopback_install_for_test(membership_deployment(4096));
+            let (reentrant_tx, reentrant_rx) = mpsc::channel();
+            let sink = Arc::new(CrossThreadIdenticalInstallSink {
+                service: Mutex::new(Weak::new()),
+                install: Mutex::new(Some(composite.clone())),
+                outcome: reentrant_tx,
+            });
+            let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+                SERVICE_QID,
+                Arc::new(Clock),
+                sink.clone(),
+                Arc::new(Memory),
+            ));
+            *sink.service.lock().unwrap() = Arc::downgrade(&service);
+            let (outer_tx, outer_rx) = mpsc::channel();
+            {
+                let service = Arc::clone(&service);
+                std::thread::spawn(move || outer_tx.send(service.install(composite)).unwrap());
+            }
+            assert_eq!(
+                reentrant_rx
+                    .recv_timeout(LIFECYCLE_TIMEOUT)
+                    .expect("cross-thread identical install wait deadlocked"),
+                Some(InstallOutcome::AlreadyInstalled),
+            );
+            assert_eq!(
+                outer_rx
+                    .recv_timeout(LIFECYCLE_TIMEOUT)
+                    .expect("outer install never finished")
+                    .unwrap(),
+                InstallOutcome::Installed,
+            );
+        }
+    }
+
+    // Part B, race 7: an AnyOf channel already driven terminal by another producer answers a
+    // never-opened late producer's Contribution AND ProducerClosed with open-level TerminalNoop
+    // (Accepted) and installs no partition count (the instance stays unopened).
+    #[test]
+    fn remote_producer_ingress_lifecycle_anyof_terminal_late_producer_is_terminal_noop() {
+        let (service, _events) = install(membership_anyof_deployment());
+        let digest_a = installed_digest(&service, PRODUCER_BINDING);
+        let digest_b = installed_digest(&service, PRODUCER_B_BINDING);
+
+        // Closing producer A satisfies the AnyOf terminal coverage; producer B is never opened.
+        assert_eq!(
+            service
+                .dispatch_inbound_producer(closed_env(
+                    PRODUCER_BINDING,
+                    PRODUCER_FINST,
+                    0,
+                    0,
+                    1,
+                    digest_a,
+                ))
+                .unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        assert!(channel_of(&service, PRODUCER_B_BINDING).is_terminal());
+
+        let b_partition_count = || {
+            channel_of(&service, PRODUCER_B_BINDING)
+                .producer_ingress_core_snapshot(
+                    BindingId::new(PRODUCER_B_BINDING),
+                    PRODUCER_B_FINST,
+                )
+                .local_partition_count
+        };
+
+        // A late Contribution to the never-opened producer B short-circuits at open-level
+        // TerminalNoop: Accepted, instance stays unopened, no submit continues.
+        let (digest, payload) = encode(
+            &membership_contribution(9),
+            ContributionCodecExpectation::Membership(&membership_schema()),
+        );
+        assert_eq!(digest, digest_b);
+        assert_eq!(
+            service
+                .dispatch_inbound_producer(contribution_env(
+                    PRODUCER_B_BINDING,
+                    PRODUCER_B_FINST,
+                    0,
+                    0,
+                    1,
+                    digest,
+                    payload,
+                ))
+                .unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        assert_eq!(
+            b_partition_count(),
+            None,
+            "a late Contribution must not open producer B"
+        );
+
+        // The same holds for a late ProducerClosed to producer B.
+        assert_eq!(
+            service
+                .dispatch_inbound_producer(closed_env(
+                    PRODUCER_B_BINDING,
+                    PRODUCER_B_FINST,
+                    0,
+                    0,
+                    1,
+                    digest_b,
+                ))
+                .unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        assert_eq!(
+            b_partition_count(),
+            None,
+            "a late ProducerClosed must not open producer B"
+        );
     }
 }
