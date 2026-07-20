@@ -71,28 +71,14 @@ pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String,
         return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
     };
 
+    validate_reserved_projection_output_names(
+        select,
+        &[(HIDDEN_APPLY_KEY_COLUMN_NAME, "apply key")],
+    )?;
     for item in &select.projection {
         match item {
-            sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                if expr
-                    .to_string()
-                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                {
-                    return Err(format!(
-                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
-                    ));
-                }
-            }
-            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
-                if alias
-                    .value
-                    .eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
-                {
-                    return Err(format!(
-                        "Iceberg MV output column name {HIDDEN_APPLY_KEY_COLUMN_NAME} is reserved for internal apply key"
-                    ));
-                }
-            }
+            sqlparser::ast::SelectItem::UnnamedExpr(_)
+            | sqlparser::ast::SelectItem::ExprWithAlias { .. } => {}
             sqlparser::ast::SelectItem::Wildcard(_)
             | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => {
                 return Err(
@@ -109,6 +95,31 @@ pub(crate) fn iceberg_mv_physical_select_sql(select_sql: &str) -> Result<String,
             alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
         });
     Ok(stmt.to_string())
+}
+
+pub(crate) fn validate_reserved_projection_output_names(
+    select: &sqlparser::ast::Select,
+    reserved: &[(&str, &str)],
+) -> Result<(), String> {
+    for item in &select.projection {
+        let output_name = match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr) => Some(expr.to_string()),
+            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => None,
+        };
+        let Some(output_name) = output_name else {
+            continue;
+        };
+        for (reserved_name, purpose) in reserved {
+            if output_name.eq_ignore_ascii_case(reserved_name) {
+                return Err(format!(
+                    "Iceberg MV output column name {reserved_name} is reserved for internal {purpose}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn find_apply_key_field_id_by_column(

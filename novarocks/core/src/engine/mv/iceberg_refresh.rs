@@ -19,7 +19,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -110,9 +110,13 @@ use crate::mv::refresh::execution::{
     validate_refresh_execution,
 };
 use crate::mv::refresh::execution_context::IcebergMvRefreshContext;
-use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
+use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::planning::{
     RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline, decide_refresh_plan,
+};
+use crate::mv::refresh::projection_first_refresh::{
+    prepare_projection_first_refresh_chunks, prepare_projection_full_read_sql,
+    prepare_union_projection_first_refresh_chunks, prepare_union_projection_full_read_sql,
 };
 use crate::mv::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
@@ -2650,138 +2654,6 @@ fn recorded_target_snapshot_id(
         })
 }
 
-fn rewrite_full_refresh_select_with_pin_for_scope(
-    select_sql: &str,
-    pin: &RefreshSnapshotPin,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<String, String> {
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
-        .map_err(|e| format!("iceberg MV full refresh pin SELECT normalize error: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("iceberg MV full refresh pin SELECT parse error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("iceberg MV full refresh pin SELECT expects a SELECT query".to_string());
-    };
-    inject_pin_as_for_version_as_of(
-        query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
-    Ok(stmt.to_string())
-}
-
-fn rewrite_full_refresh_select_with_pin(
-    select_sql: &str,
-    pin: &RefreshSnapshotPin,
-    base_ref: &TableIdentity,
-) -> Result<String, String> {
-    rewrite_full_refresh_select_with_pin_for_scope(
-        select_sql,
-        pin,
-        Some(&base_ref.catalog),
-        &base_ref.namespace,
-    )
-}
-
-fn rewrite_union_projection_full_refresh_select_with_pin(
-    select_sql: &str,
-    pin: &RefreshSnapshotPin,
-    branch_count: usize,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<String, String> {
-    let normalized =
-        crate::sql::parser::dialect::normalize_for_raw_parse(select_sql).map_err(|e| {
-            format!("iceberg UNION ALL MV full refresh pin SELECT normalize error: {e}")
-        })?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("iceberg UNION ALL MV full refresh pin SELECT parse error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("iceberg UNION ALL MV full refresh expects a SELECT query".to_string());
-    };
-    inject_pin_as_for_version_as_of(
-        query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
-    let mut next_branch_id = 0_i32;
-    append_union_projection_hidden_columns_to_set_expr(
-        query.body.as_mut(),
-        &mut next_branch_id,
-        branch_count as i32,
-    )?;
-    if next_branch_id != branch_count as i32 {
-        return Err(format!(
-            "iceberg UNION ALL MV full refresh expected {branch_count} branches, rewrote {next_branch_id}"
-        ));
-    }
-    Ok(stmt.to_string())
-}
-
-fn append_union_projection_hidden_columns_to_set_expr(
-    set_expr: &mut sqlparser::ast::SetExpr,
-    next_branch_id: &mut i32,
-    branch_count: i32,
-) -> Result<(), String> {
-    match set_expr {
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            append_union_projection_hidden_columns_to_set_expr(
-                left.as_mut(),
-                next_branch_id,
-                branch_count,
-            )?;
-            append_union_projection_hidden_columns_to_set_expr(
-                right.as_mut(),
-                next_branch_id,
-                branch_count,
-            )
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            append_union_projection_hidden_columns_to_set_expr(
-                query.body.as_mut(),
-                next_branch_id,
-                branch_count,
-            )
-        }
-        sqlparser::ast::SetExpr::Select(select) => {
-            if *next_branch_id >= branch_count {
-                return Err(format!(
-                    "iceberg UNION ALL MV full refresh found more than {branch_count} branches"
-                ));
-            }
-            let branch_id = *next_branch_id;
-            *next_branch_id += 1;
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("_row_id")),
-                    alias: sqlparser::ast::Ident::new(HIDDEN_APPLY_KEY_COLUMN_NAME),
-                });
-            select
-                .projection
-                .push(sqlparser::ast::SelectItem::ExprWithAlias {
-                    expr: sqlparser::ast::Expr::Cast {
-                        kind: sqlparser::ast::CastKind::Cast,
-                        expr: Box::new(sqlparser::ast::Expr::Value(
-                            sqlparser::ast::Value::Number(branch_id.to_string(), false).into(),
-                        )),
-                        data_type: sqlparser::ast::DataType::Int(None),
-                        array: false,
-                        format: None,
-                    },
-                    alias: sqlparser::ast::Ident::new(BRANCH_ID_COLUMN_NAME),
-                });
-            Ok(())
-        }
-        _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
-    }
-}
-
 /// Refresh an iceberg-backed materialized view.
 ///
 /// Strategy dispatch:
@@ -2977,17 +2849,18 @@ pub(crate) fn repartition_iceberg_mv(
 
     let payload = match &support {
         RepartitionSupport::ProjectionFilterSingleBase => {
-            let [base_ref] = base_refs.as_slice() else {
+            let [_base_ref] = base_refs.as_slice() else {
                 abort_iceberg_mv_refresh(state, refresh_id)?;
                 return Err(format!(
                     "ALTER MATERIALIZED VIEW ... REPARTITION projection/filter payload requires exactly one base table, got {}",
                     base_refs.len()
                 ));
             };
-            let pinned_full_select_sql = match rewrite_full_refresh_select_with_pin(
+            let physical_full_select_sql = match prepare_projection_full_read_sql(
                 &mv_definition.select_sql,
                 &pin,
-                base_ref,
+                current_catalog,
+                current_database,
             ) {
                 Ok(sql) => sql,
                 Err(err) => {
@@ -2999,7 +2872,7 @@ pub(crate) fn repartition_iceberg_mv(
                 state,
                 current_catalog,
                 current_database,
-                &pinned_full_select_sql,
+                &physical_full_select_sql,
                 &pin,
             ) {
                 Ok(payload) => Some(payload),
@@ -3539,8 +3412,6 @@ fn refresh_iceberg_mv_with_planned_partitions(
             ContractDecision::CompatibleSafe => mv_definition.clone(),
         };
     let mv_definition = &effective_definition;
-    let pinned_full_select_sql =
-        rewrite_full_refresh_select_with_pin(&mv_definition.select_sql, &pin, base_ref)?;
     let staging_branch = format!(
         "__nova_mv_refresh_{}_{}",
         mv_definition.mv_id,
@@ -3587,15 +3458,31 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
-            first_refresh_iceberg_mv(
+            let chunks = prepare_first_refresh_chunks_or_abort(state, refresh_id, || {
+                let mut read = |physical_sql: &str| {
+                    run_mv_full_select_chunks_with_catalog(
+                        state,
+                        current_catalog,
+                        current_database,
+                        physical_sql,
+                    )
+                };
+                prepare_projection_first_refresh_chunks(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                    &mut read,
+                )
+            })?;
+            commit_first_refresh_iceberg_mv(
                 state,
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                base_ref,
-                cur,
-                &current_table_uuid,
-                &pinned_full_select_sql,
+                single_snapshot_map(base_ref, cur),
+                single_table_uuid_map(base_ref, &current_table_uuid),
+                chunks,
             )
         },
         || {
@@ -3642,7 +3529,12 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 cur,
                 &loaded.table,
                 &current_table_uuid,
-                &pinned_full_select_sql,
+                FullRebuildSelectPreparation::Projection {
+                    select_sql: &ctx.rewrite.mv_definition.select_sql,
+                    pin: &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                },
                 RewriteMergeRefreshOptions {
                     apply_key: refresh_contract.apply_key,
                 },
@@ -3810,13 +3702,6 @@ fn refresh_iceberg_union_projection_mv(
         execution.decision(),
         || Ok(StatementResult::Ok),
         || {
-            let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
-                &ctx.rewrite.mv_definition.select_sql,
-                &pin,
-                branch_count,
-                current_catalog,
-                current_database,
-            )?;
             let staging_branch = format!(
                 "__nova_mv_refresh_{}_{}",
                 mv_definition.mv_id,
@@ -3830,14 +3715,32 @@ fn refresh_iceberg_union_projection_mv(
                 pin.to_snapshot_map(),
                 &staging_branch,
             )?;
-            first_refresh_iceberg_mv_with_physical_sql(
+            let chunks = prepare_first_refresh_chunks_or_abort(state, refresh_id, || {
+                let mut read = |physical_sql: &str| {
+                    run_mv_full_select_chunks_with_catalog(
+                        state,
+                        current_catalog,
+                        current_database,
+                        physical_sql,
+                    )
+                };
+                prepare_union_projection_first_refresh_chunks(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    branch_count,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                    &mut read,
+                )
+            })?;
+            commit_first_refresh_iceberg_mv(
                 state,
                 &ctx,
                 &staging_branch,
                 refresh_id,
                 pin.to_snapshot_map(),
                 pin.to_table_uuid_map(),
-                &full_select_sql,
+                chunks,
             )
         },
         || {
@@ -4188,7 +4091,9 @@ fn refresh_single_aggregate_iceberg_mv(
                 current,
                 &loaded.table,
                 &current_table_uuid,
-                &mv_definition.select_sql,
+                FullRebuildSelectPreparation::LegacyVisible {
+                    select_sql: &mv_definition.select_sql,
+                },
                 RewriteMergeRefreshOptions { apply_key },
             )
         },
@@ -8532,70 +8437,54 @@ fn drop_iceberg_mv_staging_branch(
     Ok(())
 }
 
-/// Execute the first refresh of an iceberg-backed MV.
+fn prepare_first_refresh_chunks_or_abort<F>(
+    state: &Arc<StandaloneState>,
+    refresh_id: i64,
+    prepare: F,
+) -> Result<Vec<crate::exec::chunk::Chunk>, IcebergMvRefreshExecutionError>
+where
+    F: FnOnce() -> Result<Vec<crate::exec::chunk::Chunk>, String>,
+{
+    match prepare() {
+        Ok(chunks) => Ok(chunks),
+        Err(err) => {
+            if let Err(abort_err) = abort_iceberg_mv_refresh(state, refresh_id) {
+                return Err(IcebergMvRefreshExecutionError::pre_commit(format!(
+                    "{err}; additionally failed to abort mv refresh: {abort_err}"
+                )));
+            }
+            Err(IcebergMvRefreshExecutionError::pre_commit(err))
+        }
+    }
+}
+
+/// Commit the prepared chunks for the first refresh of an iceberg-backed MV.
 ///
 /// Steps:
-/// 1. Run the MV's SELECT against the base table.
-/// 2. Write the resulting chunks as Iceberg/Parquet data files.
-/// 3. Commit a fast-append snapshot to the refresh staging branch.
-/// 4. Record staging metadata, publish the staging snapshot to main, and finalize.
+/// 1. Write the prepared chunks as Iceberg/Parquet data files.
+/// 2. Commit a fast-append snapshot to the refresh staging branch.
+/// 3. Record staging metadata, publish the staging snapshot to main, and finalize.
 ///
 /// On failure before the staging commit, repository metadata is aborted. Once
 /// the staging snapshot is committed, repository metadata records the refresh
 /// stage before main is advanced.
 #[allow(clippy::too_many_arguments)]
-fn first_refresh_iceberg_mv(
-    state: &Arc<StandaloneState>,
-    ctx: &IcebergMvRefreshContext,
-    staging_branch: &str,
-    refresh_id: i64,
-    base_ref: &TableIdentity,
-    base_snapshot_id: i64,
-    current_table_uuid: &str,
-    pinned_full_select_sql: &str,
-) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
-    first_refresh_iceberg_mv_with_physical_sql(
-        state,
-        ctx,
-        staging_branch,
-        refresh_id,
-        single_snapshot_map(base_ref, base_snapshot_id),
-        single_table_uuid_map(base_ref, current_table_uuid),
-        &physical_sql,
-    )
-}
-
-fn first_refresh_iceberg_mv_with_physical_sql(
+fn commit_first_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
     snapshots: BTreeMap<String, i64>,
     table_uuids: BTreeMap<String, String>,
-    physical_sql: &str,
+    chunks: Vec<crate::exec::chunk::Chunk>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
     let target = &application_target;
     let target_entry = ctx.target_bindings.runtime().target_entry();
     let iceberg_catalog = &ctx.iceberg_catalog;
     let expected_main_snapshot_id = ctx.rewrite.target_snapshot_id;
-    let current_database = ctx.rewrite.current_database.as_str();
     let mv_definition = &*ctx.rewrite.mv_definition;
 
-    // 1. Run SELECT and collect chunks.
-    let chunks = match run_mv_full_select_chunks_with_catalog(
-        state,
-        Some(&target.catalog),
-        current_database,
-        &physical_sql,
-    ) {
-        Ok(chunks) => chunks,
-        Err(err) => {
-            abort_iceberg_mv_refresh(state, refresh_id)?;
-            return Err(err.into());
-        }
-    };
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
 
     // If the base table is currently empty, do not commit an empty Iceberg
@@ -8613,7 +8502,7 @@ fn first_refresh_iceberg_mv_with_physical_sql(
         return Ok(StatementResult::Ok);
     }
 
-    // 2–3. Write data files and commit snapshot inside an async block.
+    // Write data files and commit snapshot inside an async block.
     let ident = iceberg_mv_table_ident(target)?;
     let refresh_marker = load_iceberg_mv_refresh_marker(state, refresh_id, mv_definition.mv_id)?;
     let marker = build_mv_refresh_provenance(
@@ -9085,10 +8974,10 @@ fn build_union_projection_repartition_payload(
         .as_ref()
         .map(|branch| branch.branch_count as usize)
         .unwrap_or_else(|| union_branch_count(canonical_select_query) as usize);
-    let pinned_full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
+    let physical_full_select_sql = prepare_union_projection_full_read_sql(
         select_sql,
-        pin,
         branch_count,
+        pin,
         current_catalog,
         current_database,
     )?;
@@ -9096,7 +8985,7 @@ fn build_union_projection_repartition_payload(
         state,
         current_catalog,
         current_database,
-        &pinned_full_select_sql,
+        &physical_full_select_sql,
     )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
@@ -9229,15 +9118,14 @@ fn collect_repartition_rebuild_payload(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
-    pinned_full_select_sql: &str,
+    physical_full_select_sql: &str,
     pin: &RefreshSnapshotPin,
 ) -> Result<RepartitionRebuildPayload, String> {
-    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = run_mv_full_select_chunks_with_catalog(
         state,
         current_catalog,
         current_database,
-        &physical_sql,
+        physical_full_select_sql,
     )?;
     Ok(RepartitionRebuildPayload::from_chunks(chunks, pin))
 }
@@ -9494,18 +9382,17 @@ fn rebuild_iceberg_mv(
     refresh_id: i64,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    pinned_full_select_sql: &str,
+    physical_full_select_sql: &str,
     base_ref: &TableIdentity,
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
     partition_contract: Option<&mv_schema::MvPartitionContract>,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
-    let physical_sql = iceberg_mv_physical_select_sql(pinned_full_select_sql)?;
     let chunks = match run_mv_full_select_chunks_with_catalog(
         state,
         Some(&target.catalog),
         current_database,
-        &physical_sql,
+        physical_full_select_sql,
     ) {
         Ok(chunks) => chunks,
         Err(err) => {
@@ -15011,6 +14898,19 @@ struct RewriteMergeBaseChange<'a> {
     current_table_uuid: &'a str,
 }
 
+#[derive(Clone, Copy)]
+enum FullRebuildSelectPreparation<'a> {
+    Projection {
+        select_sql: &'a str,
+        pin: &'a RefreshSnapshotPin,
+        current_catalog: Option<&'a str>,
+        current_database: &'a str,
+    },
+    LegacyVisible {
+        select_sql: &'a str,
+    },
+}
+
 fn rewrite_refresh_snapshot_map(changes: &[RewriteMergeBaseChange<'_>]) -> BTreeMap<String, i64> {
     changes
         .iter()
@@ -15036,7 +14936,7 @@ fn incremental_refresh_iceberg_mv(
     current_snapshot_id: i64,
     base_table: &iceberg::table::Table,
     current_table_uuid: &str,
-    pinned_full_select_sql: &str,
+    full_rebuild_select: FullRebuildSelectPreparation<'_>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let change = RewriteMergeBaseChange {
@@ -15050,7 +14950,7 @@ fn incremental_refresh_iceberg_mv(
         state,
         ctx,
         &[change],
-        Some(pinned_full_select_sql),
+        Some(full_rebuild_select),
         options,
     )
 }
@@ -15060,7 +14960,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     changes: &[RewriteMergeBaseChange<'_>],
-    pinned_full_select_sql: Option<&str>,
+    full_rebuild_select: Option<FullRebuildSelectPreparation<'_>>,
     options: RewriteMergeRefreshOptions,
 ) -> Result<StatementResult, IcebergMvRefreshExecutionError> {
     let application_target = IcebergMvTarget::from(&ctx.rewrite.target);
@@ -15109,12 +15009,28 @@ fn incremental_refresh_iceberg_mv_with_changes(
                         )
                         .into());
                     };
-                    let pinned_full_select_sql = pinned_full_select_sql.ok_or_else(|| {
+                    let full_rebuild_select = full_rebuild_select.ok_or_else(|| {
                         format!(
-                            "iceberg MV {}.{}.{} full rebuild fallback requires pinned full SELECT",
+                            "iceberg MV {}.{}.{} full rebuild fallback requires full SELECT preparation",
                             target.catalog, target.namespace, target.table
                         )
                     })?;
+                    let physical_full_select_sql = match full_rebuild_select {
+                        FullRebuildSelectPreparation::Projection {
+                            select_sql,
+                            pin,
+                            current_catalog,
+                            current_database,
+                        } => prepare_projection_full_read_sql(
+                            select_sql,
+                            pin,
+                            current_catalog,
+                            current_database,
+                        )?,
+                        FullRebuildSelectPreparation::LegacyVisible { select_sql } => {
+                            iceberg_mv_physical_select_sql(select_sql)?
+                        }
+                    };
                     tracing::info!(
                         "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
                         target.catalog,
@@ -15144,7 +15060,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
                         refresh_id,
                         current_database,
                         mv_definition,
-                        pinned_full_select_sql,
+                        &physical_full_select_sql,
                         change.base_ref,
                         Some(change.current_snapshot_id),
                         change.current_table_uuid,
@@ -21091,18 +21007,18 @@ mod tests {
         assert_eq!(old_spec.fields()[0].name, "id_bucket_16");
 
         let base_refs = parse_iceberg_table_refs(&mv.base_table_refs).expect("base refs");
-        let [base_ref] = base_refs.as_slice() else {
+        let [_base_ref] = base_refs.as_slice() else {
             panic!("expected single base ref");
         };
         let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
-        let pinned_full_select_sql =
-            rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
-                .expect("rewrite select with pin");
+        let physical_full_select_sql =
+            prepare_projection_full_read_sql(&mv.select_sql, &pin, Some("ice"), &env.current_db)
+                .expect("prepare physical select with pin");
         let payload = collect_repartition_rebuild_payload(
             &env.state,
             Some("ice"),
             &env.current_db,
-            &pinned_full_select_sql,
+            &physical_full_select_sql,
             &pin,
         )
         .expect("collect repartition payload");
@@ -23084,47 +23000,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_full_refresh_select_with_pin_injects_version_as_of() {
-        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
-        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
-        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
-            .expect("mv definition");
-        let base_refs =
-            parse_iceberg_table_refs(&mv.base_table_refs).expect("parse base table refs");
-        let [base_ref] = base_refs.as_slice() else {
-            panic!("expected single base ref");
-        };
-        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
-        let snapshot_id = pin.get(base_ref).expect("pinned snapshot");
-
-        let rewritten = rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
-            .expect("rewrite select with pin");
-
-        assert!(rewritten.contains("VERSION AS OF"));
-        assert!(rewritten.contains(&snapshot_id.to_string()));
-    }
-
-    #[test]
-    fn rewrite_full_refresh_select_with_pin_injects_all_base_versions() {
-        let pin = RefreshSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.left_orders", 101, "left-uuid"),
-            ("ice.db.right_orders", 202, "right-uuid"),
-        ]);
-
-        let rewritten = rewrite_full_refresh_select_with_pin_for_scope(
-            "SELECT l.id, r.name FROM ice.db.left_orders l JOIN ice.db.right_orders r ON l.rid = r.id",
-            &pin,
-            Some("ice"),
-            "db",
-        )
-        .expect("rewrite select with two pinned bases");
-
-        assert!(rewritten.contains("VERSION AS OF 101"), "{rewritten}");
-        assert!(rewritten.contains("VERSION AS OF 202"), "{rewritten}");
-    }
-
-    #[test]
     fn rewrite_join_full_refresh_uses_tinyint_change_op() {
         let mut query = parse_select_query(
             "SELECT l.id FROM ice.db.left_orders AS l \
@@ -23742,6 +23617,103 @@ mod tests {
     }
 
     #[test]
+    fn projection_first_refresh_preparation_failure_aborts_staged_intent() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
+            .expect("mv definition");
+        let base_refs =
+            parse_iceberg_table_refs(&mv.base_table_refs).expect("parse base table refs");
+        let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
+        let target = IcebergMvTarget {
+            catalog: "ice".to_string(),
+            namespace: "analytics".to_string(),
+            table: "mv_orders".to_string(),
+        };
+        let target_entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        let before =
+            crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
+                .expect("load target before preparation failure");
+        let before_snapshot_id = before
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        let staging_branch = format!(
+            "__nova_mv_refresh_prepare_failure_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let refresh_id = begin_staged_iceberg_mv_refresh_intent(
+            &env.state,
+            &target,
+            mv.mv_id,
+            before_snapshot_id,
+            pin.to_snapshot_map(),
+            &staging_branch,
+        )
+        .expect("begin staged refresh intent");
+
+        let error = prepare_first_refresh_chunks_or_abort(&env.state, refresh_id, || {
+            let mut read =
+                |_physical_sql: &str| Err("projection preparation root cause".to_string());
+            prepare_projection_first_refresh_chunks(
+                &mv.select_sql,
+                &pin,
+                Some("ice"),
+                &env.current_db,
+                &mut read,
+            )
+        })
+        .expect_err("preparation failure must abort staged intent");
+        let error_message = error.into_message();
+        assert!(
+            error_message.contains("projection preparation root cause"),
+            "{error_message}"
+        );
+
+        let provider = env.state.metadata_provider.as_ref().expect("provider");
+        let read = provider.begin_read().expect("read transaction");
+        let refresh = env
+            .state
+            .mv_repo
+            .load_refresh(read.as_ref(), refresh_id)
+            .expect("load refresh")
+            .expect("refresh");
+        assert_eq!(refresh.state, MvRefreshState::Aborted);
+        assert_eq!(refresh.staging_snapshot_id, None);
+        assert_eq!(refresh.published_snapshot_id, None);
+        let definition = env
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), mv.mv_id)
+            .expect("load definition")
+            .expect("definition");
+        assert_eq!(definition.active_refresh_id, None);
+        assert!(!definition.refresh_in_progress);
+        drop(read);
+
+        let after =
+            crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
+                .expect("load target after preparation failure");
+        assert_eq!(
+            after
+                .table
+                .metadata()
+                .current_snapshot()
+                .map(|snapshot| snapshot.snapshot_id()),
+            before_snapshot_id
+        );
+        assert!(
+            !after.table.metadata().refs().contains_key(&staging_branch),
+            "preparation failure must not create a staging ref"
+        );
+    }
+
+    #[test]
     fn rebuild_iceberg_mv_without_partition_contract_uses_ordinary_finalize() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
         create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
@@ -23756,9 +23728,9 @@ mod tests {
         let pin = capture_refresh_snapshot_pin(&env.state, &base_refs).expect("capture pin");
         let base_snapshot_id = pin.get(base_ref).expect("base snapshot");
         let current_table_uuid = pin.uuid(base_ref).expect("base table uuid").to_string();
-        let pinned_full_select_sql =
-            rewrite_full_refresh_select_with_pin(&mv.select_sql, &pin, base_ref)
-                .expect("rewrite select with pin");
+        let physical_full_select_sql =
+            prepare_projection_full_read_sql(&mv.select_sql, &pin, Some("ice"), &env.current_db)
+                .expect("prepare physical select with pin");
 
         let target = IcebergMvTarget {
             catalog: "ice".to_string(),
@@ -23803,7 +23775,7 @@ mod tests {
             refresh_id,
             &env.current_db,
             &mv,
-            &pinned_full_select_sql,
+            &physical_full_select_sql,
             base_ref,
             Some(base_snapshot_id),
             &current_table_uuid,
