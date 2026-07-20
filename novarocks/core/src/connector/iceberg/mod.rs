@@ -17,6 +17,7 @@
 
 pub(crate) mod analyze;
 pub mod catalog;
+pub(crate) mod change_stream_routing;
 pub mod changes;
 pub mod commit;
 #[cfg_attr(test, allow(dead_code))]

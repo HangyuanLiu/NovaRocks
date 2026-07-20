@@ -18,9 +18,11 @@
 pub(crate) mod aggregate_first_refresh;
 pub(crate) mod apply_key;
 pub(crate) mod capabilities;
+pub(crate) mod change_stream_write;
 pub(crate) mod contract;
 pub(crate) mod execution;
 pub(crate) mod execution_context;
+pub(crate) mod non_join_incremental;
 pub(crate) mod pin;
 pub(crate) mod planning;
 pub(crate) mod projection_first_refresh;
