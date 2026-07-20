@@ -247,22 +247,6 @@ pub(crate) fn rewrite_join_delta_coalesce_query_with_branch_queries_and_locator(
     Ok(parsed)
 }
 
-pub(crate) fn rewrite_join_full_refresh_apply_query(
-    query: &sqlparser::ast::Query,
-    full_refresh_query: sqlparser::ast::Query,
-    left_uuid: &str,
-    right_uuid: &str,
-) -> Result<sqlparser::ast::Query, String> {
-    wrap_join_apply_key_query(
-        query,
-        full_refresh_query,
-        left_uuid,
-        right_uuid,
-        "__nr_join_full_refresh_branch",
-        "__nr_join_full_refresh_placeholder",
-    )
-}
-
 pub(crate) fn rewrite_join_delta_append_only_query(
     query: &sqlparser::ast::Query,
     branch_query: sqlparser::ast::Query,
@@ -1152,32 +1136,6 @@ mod tests {
             !rendered.contains("__nr_join_delta_coalesced"),
             "append-only fast path must not use coalesce CTEs: sql={rendered}"
         );
-        assert_final_select_excludes_row_id_columns(&wrapped);
-    }
-
-    #[test]
-    fn join_full_refresh_apply_wrapper_outputs_target_shape() {
-        let full_refresh_query = parse_query(
-            "select l.id, r.label, CAST(1 AS TINYINT) as __change_op, \
-             l._row_id as __nova_left_row_id, r._row_id as __nova_right_row_id \
-             from ns.left__at_11 l join ns.right__at_22 r on l.id = r.id",
-        );
-        let wrapped = rewrite_join_full_refresh_apply_query(
-            &simple_join_query(),
-            full_refresh_query,
-            "left-uuid",
-            "right-uuid",
-        )
-        .expect("full refresh apply rewrite");
-        let rendered = wrapped.to_string();
-
-        assert_sql_contains(&rendered, "join_row_key");
-        assert_sql_contains(&rendered, "'left-uuid'");
-        assert_sql_contains(&rendered, JOIN_LEFT_ROW_ID_COLUMN);
-        assert_sql_contains(&rendered, "'right-uuid'");
-        assert_sql_contains(&rendered, JOIN_RIGHT_ROW_ID_COLUMN);
-        assert_sql_contains(&rendered, "AS __nova_join_row_key");
-        assert_sql_contains(&rendered, "CAST(__change_op AS TINYINT) AS __change_op");
         assert_final_select_excludes_row_id_columns(&wrapped);
     }
 

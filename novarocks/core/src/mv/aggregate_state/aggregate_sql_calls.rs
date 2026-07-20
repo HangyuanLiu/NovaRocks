@@ -48,8 +48,8 @@ pub(crate) struct AggregateSqlCalls {
 /// FROM-side complement to [`extract_aggregate_sql_calls`] for the Iceberg join refresh path.
 ///
 /// Supplies the one execution-load-bearing join field (table aliases) needed by the
-/// de-classified Iceberg join refresh rewriters (`rewrite_join_full_refresh_query`,
-/// `rewrite_join_branch_query`). The aggregate-call content is sourced separately via
+/// Iceberg incremental join refresh rewriter (`rewrite_join_branch_query`). The
+/// aggregate-call content is sourced separately via
 /// [`extract_aggregate_sql_calls`]; this struct carries only the FROM-side aliases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinAliases {
