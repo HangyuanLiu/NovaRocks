@@ -54,10 +54,9 @@ use crate::novarocks_logging::{error, info};
 #[cfg(feature = "compat")]
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
-use crate::service::grpc_runtime_filter_adapter::{
-    default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope,
-};
+use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
+use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
 #[cfg(feature = "compat")]
 use crate::service::stream_load_http;
 use crate::service::{load_tracking_http, metrics_http};
@@ -121,7 +120,7 @@ impl GrpcService {
         Self::with_handlers(
             true,
             report_handler,
-            default_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_envelope_ingress(),
         )
     }
 
@@ -135,7 +134,7 @@ impl GrpcService {
         Self::with_handlers(
             false,
             report_handler,
-            default_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_envelope_ingress(),
         )
     }
 
@@ -1841,21 +1840,43 @@ mod pr3_tests {
     }
 
     #[tokio::test]
-    async fn runtime_filter_envelope_default_full_execution_rejects_unconfigured_ingress() {
+    async fn runtime_filter_envelope_default_full_execution_rejects_unknown_query() {
+        // The default full-execution constructor now installs the query-scoped
+        // producer ingress. An envelope for a query the global manager does not
+        // know is a normal query-unavailable rejection, no longer the
+        // "ingress is not configured" placeholder.
         let response = GrpcService::full_execution()
             .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
             .await
-            .expect("default ingress rejection is a normal response")
+            .expect("query-unavailable rejection is a normal response")
             .into_inner();
 
         assert_eq!(
             response.accept_status,
             proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
         );
-        assert_eq!(
-            response.rejection_reason,
-            "runtime filter envelope ingress is not configured"
+        assert_ne!(
+            response.rejection_reason, "runtime filter envelope ingress is not configured",
+            "default ingress must no longer be the unconfigured placeholder"
         );
+        assert!(
+            response.rejection_reason.contains("[query-unavailable]"),
+            "unknown query must surface the query-unavailable prefix: {}",
+            response.rejection_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_filter_envelope_default_report_only_rejects_before_query_scoped_ingress() {
+        // report-only rejects at the local-execution gate before the query-scoped
+        // ingress is consulted: the response is a gRPC error, not a normal
+        // query-unavailable rejection response.
+        let error = GrpcService::report_only()
+            .transmit_runtime_filter_envelope(Request::new(valid_runtime_filter_envelope()))
+            .await
+            .expect_err("report-only endpoint must reject local envelope ingress");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

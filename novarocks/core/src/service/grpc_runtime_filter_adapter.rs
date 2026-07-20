@@ -30,8 +30,7 @@ use crate::runtime_filter::port::identity::{
 use crate::runtime_filter::port::transport::{
     ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
     RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress,
-    RuntimeFilterEnvelopeKind, RuntimeFilterIngressResult, RuntimeFilterRouteIdentity,
-    RuntimeFilterTransportError,
+    RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportError,
 };
 
 pub(crate) type NativeRuntimeFilterRequest = proto::filter::TransmitRuntimeFilterRequest;
@@ -228,10 +227,6 @@ pub(crate) fn handle_runtime_filter_envelope(
     })
 }
 
-pub(crate) fn default_runtime_filter_envelope_ingress() -> Arc<dyn RuntimeFilterEnvelopeIngress> {
-    Arc::new(DefaultRuntimeFilterEnvelopeIngress)
-}
-
 fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
     let kind = proto::filter::RuntimeFilterEnvelopeKind::try_from(kind)
         .map_err(|_| invalid_argument("runtime filter envelope kind is unknown"))?;
@@ -297,18 +292,6 @@ fn transport_error(error: RuntimeFilterTransportError) -> tonic::Status {
 
 fn invalid_argument(message: impl Into<String>) -> tonic::Status {
     tonic::Status::invalid_argument(message.into())
-}
-
-#[derive(Debug)]
-struct DefaultRuntimeFilterEnvelopeIngress;
-
-impl RuntimeFilterEnvelopeIngress for DefaultRuntimeFilterEnvelopeIngress {
-    fn accept(&self, _envelope: RuntimeFilterEnvelope) -> RuntimeFilterIngressResult {
-        RuntimeFilterIngressResult::rejected(
-            "runtime filter envelope ingress is not configured".to_string(),
-        )
-        .expect("non-empty static rejection reason")
-    }
 }
 
 #[cfg(test)]
@@ -430,7 +413,7 @@ mod tests {
         assert_eq!(decoded.column_type, None);
     }
 
-    use super::{default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope};
+    use super::handle_runtime_filter_envelope;
 
     #[derive(Debug)]
     struct RecordingIngress {
@@ -957,22 +940,6 @@ mod tests {
             assert_eq!(error.code(), Code::InvalidArgument, "{error}");
             assert!(ingress.is_empty());
         }
-    }
-
-    #[test]
-    fn default_ingress_rejects_with_stable_reason() {
-        let ingress = default_runtime_filter_envelope_ingress();
-        let request = valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Artifact);
-        let response = handle_runtime_filter_envelope(ingress, request).unwrap();
-
-        assert_eq!(
-            response.accept_status,
-            proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
-        );
-        assert_eq!(
-            response.rejection_reason,
-            "runtime filter envelope ingress is not configured"
-        );
     }
 
     #[test]
