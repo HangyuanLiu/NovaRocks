@@ -23,6 +23,7 @@ pub(crate) mod contract;
 pub(crate) mod execution;
 pub(crate) mod execution_context;
 pub(crate) mod join_first_refresh;
+pub(crate) mod join_incremental_refresh;
 pub(crate) mod non_join_incremental;
 pub(crate) mod pin;
 pub(crate) mod planning;
