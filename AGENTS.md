@@ -663,6 +663,8 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 ```
 
 Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, etc.
+The `starrocks-compat` suite is special: the runner deploys its own FE + BE
+cluster and needs extra environment — see 8.5 before running it.
 
 **Run specific cases:**
 
@@ -670,6 +672,102 @@ Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, etc
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite tpc-ds --only q10,q35,q69 --mode verify
 ```
+
+### 8.5 StarRocks-Compat Suite (compat CI: runner-managed FE + 3 compat BE)
+
+The `starrocks-compat` suite is the compat CI gate. Unlike every other
+suite, it does NOT connect to a standalone server you started. The runner
+itself deploys an ephemeral cluster per run: one isolated StarRocks FE
+(symlinked from a prebuilt FE home, with a re-rendered `fe.conf` and dynamic
+ports) plus three compat-mode NovaRocks BEs (from a validated compat
+artifact), registers the BEs, waits for topology, runs the cases, and tears
+everything down. **Do not start FE/BE manually for this suite**, and do not
+confuse this flow with the long-lived manual deployment used for FE Java
+development — the two share the FE home directory but nothing else.
+
+**Prerequisites (all hard preflight failures if missing):**
+
+1. **Built StarRocks FE home** at `$HOME/starrocks-on-novarocks/fe`
+   (override with `STARROCKS_FE_HOME`). It must contain `bin/start_fe.sh`
+   and the full `lib/*.jar` set from a StarRocks `./build.sh --fe` build.
+2. **Shared-data keys in the FE home's `conf/fe.conf`.** The runner renders
+   its own isolated `fe.conf` (ports, meta dir, `run_mode = shared_data`)
+   but copies ONLY the builtin-storage-volume keys from the base file and
+   preflights them. The base `fe.conf` must therefore contain a valid block
+   such as:
+
+   ```properties
+   enable_load_volume_from_conf = true
+   cloud_native_storage_type = S3
+   aws_s3_path = <bucket>/starrocks-compat
+   aws_s3_endpoint = http://127.0.0.1:9000   # shared MinIO; see env.sh AWS_S3_ENDPOINT
+   aws_s3_access_key = <from env.sh AWS_S3_ACCESS_KEY_ID>
+   aws_s3_secret_key = <from env.sh AWS_S3_SECRET_ACCESS_KEY>
+   ```
+
+   Endpoint and credentials must match the shared MinIO from
+   `docker/iceberg-rest/runtime/current/env.sh`.
+3. **Shared MinIO running** (`docker/iceberg-rest/up.sh`).
+4. **Java 17+** on PATH (or `JAVA_HOME`).
+5. **>= 5 GB free disk** on the volume holding the repo — the FE refuses to
+   start when the meta dir has less (`MetaHelper.checkMetaDir`).
+6. **Compat artifact + thirdparty toolchain.** BEs run a compat-feature
+   binary described by a manifest. Building it (explicitly or via the
+   runner's auto-build fallback) needs the StarRocks thirdparty environment
+   exported — non-interactive shells do not source `~/.zshrc`:
+
+   ```bash
+   export STARROCKS_THIRDPARTY=$HOME/project/starrocks/thirdparty
+   export STARROCKS_THIRDPARTY_INSTALLED=$HOME/project/starrocks/thirdparty/installed
+   export STARROCKS_HOME=$HOME/project/starrocks
+   export STARROCKS_GCC_HOME=/usr/bin
+   ```
+
+**Environment contract consumed by the runner:**
+
+| Variable | Meaning |
+|----------|---------|
+| `STARROCKS_FE_HOME` | FE home override (default `$HOME/starrocks-on-novarocks/fe`) |
+| `NOVAROCKS_COMPAT_ARTIFACT_MANIFEST` | Path to a prebuilt compat artifact manifest; unset = runner builds one itself (needs thirdparty env) |
+| `NOVAROCKS_COMPAT_ARTIFACT_PROFILE` | Cargo profile the manifest must declare (e.g. `dev`) |
+| `NOVAROCKS_BIN` | Default (non-compat) binary; must be a DIFFERENT binary than the compat artifact (SHA-256 checked) |
+| `NO_PROXY=127.0.0.1,localhost` | Required, as for every suite touching local services |
+
+The manifest also pins `git_head`: it must equal the current repo HEAD, so
+rebuild the artifact after every commit/rebase (a dirty working tree is
+fine — only HEAD is compared).
+
+**Canonical commands:**
+
+```bash
+# 1. Build the compat artifact (after exporting the thirdparty env above)
+tools/ci/build-compat-artifact.sh --profile dev --output-dir /tmp/nr-compat-artifact
+
+# 2. Run the suite
+source docker/iceberg-rest/runtime/current/env.sh
+env NO_PROXY=127.0.0.1,localhost \
+  NOVAROCKS_BIN="$(pwd)/target/debug/novarocks" \
+  NOVAROCKS_COMPAT_ARTIFACT_MANIFEST=/tmp/nr-compat-artifact/manifest.txt \
+  NOVAROCKS_COMPAT_ARTIFACT_PROFILE=dev \
+  cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite starrocks-compat --mode verify -j 1
+```
+
+**Debugging failures:**
+
+- Per-run state lives under `.sql-test-runner-runtime/starrocks-compat-*/`:
+  `fe/log/fe.log` (FE), `be-N.log` (captured BE stdout/stderr), and
+  `be-N/log/novarocks.INFO|WARNING|ERROR` (BE tracing files). The whole
+  directory is deleted during cleanup, so capture what you need while the
+  run is still failing, or instrument locally.
+- `@be_log_contains` / `@be_log_count_at_least` directives read ONLY the
+  captured stdout/stderr (`be-N.log`), never the rotating tracing files.
+  Test-evidence markers in BE code must be emitted with `eprintln!`
+  (see `compat_scan`, `compat_ingress`, `compat_fragment_sink`).
+- On macOS, a BE that registers fine but then drops every connection with
+  zero log output usually died from a signal; check the crash reports in
+  `~/Library/Logs/DiagnosticReports/novarocks-compat-*.ips` (the
+  `faultingThread` stack is in the JSON body).
 
 ---
 
