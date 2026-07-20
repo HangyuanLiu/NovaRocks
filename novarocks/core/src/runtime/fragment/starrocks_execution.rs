@@ -21,7 +21,6 @@ use std::time::Duration;
 use crate::common::config::debug_exec_node_output;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::pipeline::executor::execute_compat_plan_with_pipeline_with_root_sink_dop;
-use crate::novarocks_logging::info;
 use crate::runtime::fragment::error::{FragmentExecutionError, FragmentExecutionErrorKind};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -91,7 +90,10 @@ pub(crate) fn execute_starrocks_submission(
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
     })?;
     if let Some(marker) = materialized_sink_log_marker(program.sink().kind()) {
-        info!("{marker}");
+        // Test-evidence markers go to stderr so the sql-test runner's durable
+        // process-log capture can observe them (matching compat_scan /
+        // compat_ingress); the rotating tracing files are not visible to it.
+        eprintln!("{marker}");
     }
     let _group_execution_scan_dop = metadata.group_execution_scan_dop;
     let exec_plan = program.plan().clone();

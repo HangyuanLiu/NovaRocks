@@ -31,7 +31,9 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -402,7 +404,20 @@ public:
         const size_t actual_threads = std::max<size_t>(1, thread_count);
         workers_.reserve(actual_threads);
         for (size_t i = 0; i < actual_threads; ++i) {
-            workers_.emplace_back([this]() { worker_loop(); });
+            pthread_attr_t attr;
+            if (pthread_attr_init(&attr) != 0) {
+                shutdown();
+                throw std::runtime_error("query rpc pool: pthread_attr_init failed");
+            }
+            pthread_attr_setstacksize(&attr, kWorkerStackBytes);
+            pthread_t worker;
+            const int rc = pthread_create(&worker, &attr, &QueryRpcPool::worker_entry, this);
+            pthread_attr_destroy(&attr);
+            if (rc != 0) {
+                shutdown();
+                throw std::runtime_error("query rpc pool: pthread_create failed");
+            }
+            workers_.push_back(worker);
         }
     }
 
@@ -433,15 +448,26 @@ public:
             stopped_ = true;
         }
         cv_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
+        for (pthread_t worker : workers_) {
+            pthread_join(worker, nullptr);
         }
         workers_.clear();
     }
 
 private:
+    // Tasks on this pool cross the FFI boundary into Rust plan decoding
+    // (novarocks_rs_submit_exec_plan_fragment and friends), whose frames are
+    // large in unoptimized builds. Pin an explicit stack size instead of the
+    // platform default (512 KiB for secondary threads on macOS, typically
+    // 8 MiB on Linux); the default is small enough on macOS that decoding a
+    // trivial one-node plan overflows the stack and kills the process.
+    static constexpr size_t kWorkerStackBytes = 8ull * 1024 * 1024;
+
+    static void* worker_entry(void* arg) {
+        static_cast<QueryRpcPool*>(arg)->worker_loop();
+        return nullptr;
+    }
+
     void worker_loop() {
         while (true) {
             std::function<void()> task;
@@ -471,7 +497,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<std::function<void()>> tasks_;
-    std::vector<std::thread> workers_;
+    std::vector<pthread_t> workers_;
     bool stopped_ = false;
 };
 
