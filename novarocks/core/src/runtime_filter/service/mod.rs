@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod inbound;
 mod materialization;
 mod memory;
 mod producer;
@@ -46,13 +47,17 @@ use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
     ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
-    RuntimeContractViolation, RuntimeContractViolationKind, TopKSummaryProducerAdapter,
+    RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 
+pub(crate) use self::inbound::{
+    InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
+};
 #[cfg(test)]
 use self::materialization::run_materialization_jobs;
 use self::materialization::{
@@ -1018,6 +1023,11 @@ pub(crate) struct RuntimeFilterService {
     operation: Mutex<()>,
 }
 
+pub(super) struct OpenedProducer {
+    pub(super) handle: ProducerHandle,
+    pub(super) outcome: SubmitOutcome,
+}
+
 impl RuntimeFilterService {
     fn new_with_dependencies(
         query_id: UniqueId,
@@ -1089,6 +1099,25 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
+        Ok(self
+            .open_producer_locked(
+                &installed,
+                binding_id,
+                fragment_instance_id,
+                local_partition_count,
+                requested,
+            )?
+            .handle)
+    }
+
+    pub(super) fn open_producer_locked(
+        &self,
+        installed: &Arc<InstalledDeployment>,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        requested: ProducerPortKind,
+    ) -> Result<OpenedProducer, RuntimeContractViolation> {
         let route = installed.producer(binding_id).ok_or_else(|| {
             violation(
                 RuntimeContractViolationKind::UnauthorizedBinding,
@@ -1107,9 +1136,10 @@ impl RuntimeFilterService {
                 "requested producer port does not match the installed channel contract",
             ));
         }
-        route
-            .channel
-            .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
+        let outcome =
+            route
+                .channel
+                .open_producer(binding_id, fragment_instance_id, local_partition_count)?;
         let key = (binding_id, fragment_instance_id);
         let mut handles = self
             .producer_handles
@@ -1123,7 +1153,7 @@ impl RuntimeFilterService {
                 ));
             }
             if let Some(handle) = cached.upgrade() {
-                return Ok(handle);
+                return Ok(OpenedProducer { handle, outcome });
             }
         }
         let final_domain_authority = if requested == ProducerPortKind::FinalDomain {
@@ -1175,7 +1205,7 @@ impl RuntimeFilterService {
             }
         };
         handles.insert(key, handle.downgrade());
-        Ok(handle)
+        Ok(OpenedProducer { handle, outcome })
     }
 
     pub(crate) fn subscribe(
@@ -1462,7 +1492,11 @@ mod tests {
         InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
         RuntimeContractViolationKind, SubmitOutcome,
     };
-    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
+    use crate::runtime_filter::port::routing::{
+        RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView,
+        RuntimeFilterRoutePeer, RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
+        RuntimeFilterRoutingShard,
+    };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
         BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
@@ -2174,7 +2208,7 @@ mod tests {
         .unwrap()
     }
 
-    fn compiled_three_backend_all_of_aggregator_install()
+    pub(super) fn compiled_three_backend_all_of_aggregator_install()
     -> (RuntimeFilterParticipantInstall, BindingId, UniqueId) {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
@@ -2209,6 +2243,71 @@ mod tests {
             producer_binding,
             remote_producer,
         )
+    }
+
+    pub(super) fn inbound_loopback_install_for_test(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterParticipantInstall {
+        let epoch = DeploymentEpoch::new(9);
+        let participant = RuntimeFilterParticipantId::new(3);
+        let channel_id = channel.channel_id();
+        let mut local_roles = BTreeSet::from([RuntimeFilterRouteRole::Aggregator]);
+        let mut producer_instances = BTreeMap::new();
+        let mut inbound_edges = Vec::new();
+        let mut outbound_edges = Vec::new();
+        for (index, (binding_id, producer)) in channel.producers().iter().enumerate() {
+            local_roles.insert(RuntimeFilterRouteRole::Producer(*binding_id));
+            for fragment_instance_id in producer.expected_fragment_instances() {
+                producer_instances.insert((*binding_id, *fragment_instance_id), participant);
+            }
+            let edge = RuntimeFilterRoutingEdgeView::new(
+                channel_id,
+                RouteEdgeId::new(u32::try_from(index).unwrap() + 1),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Producer(*binding_id),
+                ),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Aggregator,
+                ),
+                RuntimeFilterRoutePeer::Loopback,
+                BTreeSet::from([
+                    RuntimeFilterEnvelopeKind::Contribution,
+                    RuntimeFilterEnvelopeKind::ProducerClosed,
+                ]),
+            )
+            .unwrap();
+            inbound_edges.push(edge.clone());
+            outbound_edges.push(edge);
+        }
+        local_roles.extend(
+            channel
+                .consumers()
+                .keys()
+                .copied()
+                .map(RuntimeFilterRouteRole::Consumer),
+        );
+        let routing_channel = RuntimeFilterChannelRoutingView::new(
+            channel_id,
+            local_roles,
+            producer_instances,
+            inbound_edges,
+            outbound_edges,
+        )
+        .unwrap();
+        let routing_shard = RuntimeFilterRoutingShard::new(
+            epoch,
+            participant,
+            BTreeMap::from([(channel_id, routing_channel)]),
+        )
+        .unwrap();
+        let core_view = RuntimeFilterInstallView::new(
+            epoch,
+            participant,
+            BTreeMap::from([(channel_id, channel)]),
+        );
+        RuntimeFilterParticipantInstall::new(core_view, routing_shard)
     }
 
     fn view(

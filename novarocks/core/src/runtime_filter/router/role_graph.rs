@@ -154,6 +154,13 @@ impl RoleRouter {
                 });
             }
         };
+        if edge.target().participant_id() != self.shard.local_participant_id() {
+            return Err(RuntimeFilterRouteContractError::InboundTargetMismatch {
+                channel: channel_id,
+                edge: edge.route_edge_id(),
+                local_participant: self.shard.local_participant_id(),
+            });
+        }
         if !matches!(
             kind,
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
@@ -505,6 +512,46 @@ mod tests {
         assert_eq!(edge.route_edge_id(), RouteEdgeId::new(2));
         assert_eq!(edge.source().participant_id(), pid(7));
         assert_eq!(edge.target().role(), RuntimeFilterRouteRole::Aggregator);
+    }
+
+    #[test]
+    fn contribution_authorization_rejects_an_edge_targeting_another_participant() {
+        let producer = RuntimeFilterRouteRole::Producer(BindingId::new(10));
+        let router = manual_router(
+            2,
+            BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
+            BTreeMap::from([((BindingId::new(10), finst(7)), pid(7))]),
+            vec![edge(
+                6,
+                7,
+                producer,
+                11,
+                RuntimeFilterRouteRole::Aggregator,
+                RuntimeFilterRoutePeer::Remote {
+                    participant_id: pid(7),
+                    endpoint: RuntimeEndpoint::new("10.0.0.7", 9060).unwrap(),
+                },
+                BTreeSet::from([RuntimeFilterEnvelopeKind::Contribution]),
+            )],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            router
+                .authorize_contribution(
+                    DeploymentEpoch::new(9),
+                    ChannelId::new(1),
+                    BindingId::new(10),
+                    finst(7),
+                    RuntimeFilterEnvelopeKind::Contribution,
+                )
+                .unwrap_err(),
+            RuntimeFilterRouteContractError::InboundTargetMismatch {
+                channel: ChannelId::new(1),
+                edge: RouteEdgeId::new(6),
+                local_participant: pid(2),
+            }
+        );
     }
 
     #[test]
