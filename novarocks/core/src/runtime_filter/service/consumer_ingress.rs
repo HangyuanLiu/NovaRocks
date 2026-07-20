@@ -298,10 +298,11 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, encode_artifact_bundle, encode_unavailable,
-        max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+        ArtifactDecodeExpectation, EncodedArtifactFrame, encode_artifact_bundle,
+        encode_unavailable, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
     };
     use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
+    use crate::runtime_filter::materializer::bloom::BloomHashContract;
     use crate::runtime_filter::materializer::range::{
         RangeMaterializationOutcome, RangeMaterializer,
     };
@@ -332,12 +333,12 @@ mod tests {
     };
     use crate::runtime_filter::port::producer::InstallOutcome;
     use crate::runtime_filter::port::routing::{
-        RuntimeFilterChannelRoutingView, RuntimeFilterRouteContractError,
+        RuntimeFilterChannelRoutingView, RuntimeFilterRemoteRoute, RuntimeFilterRouteContractError,
         RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer, RuntimeFilterRouteRole,
         RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
     use crate::runtime_filter::port::subscription::{
-        ArtifactAcquireOutcome, SubscriptionKind, UnavailableReason,
+        ArtifactAcquireOutcome, ArtifactDeliveryOutcome, SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
@@ -350,6 +351,8 @@ mod tests {
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };
+
+    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
     use super::InboundConsumerDispatchErrorKind::{
         CodecContract, DeploymentUnavailable, RouteContract, ServiceUnavailable, StaleEpoch,
@@ -431,6 +434,16 @@ mod tests {
     }
 
     fn membership_channel(max_artifact_bytes: u64) -> RuntimeFilterChannelDeployment {
+        membership_channel_profiled(max_artifact_bytes, membership_profile())
+    }
+
+    // Membership channel whose consumer carries an explicit physical profile. Task 5
+    // uses this to install a consumer that accepts Bitset/Bloom artifacts so the
+    // loopback-equals-remote proof can cover every membership physical repr.
+    fn membership_channel_profiled(
+        max_artifact_bytes: u64,
+        profile: ConsumerArtifactProfile,
+    ) -> RuntimeFilterChannelDeployment {
         let witness = CoverageWitnessId::new(WITNESS);
         RuntimeFilterChannelDeployment::new(
             ChannelId::new(CHANNEL),
@@ -467,7 +480,7 @@ mod tests {
                         ArtifactCapability::Membership,
                         ArtifactCapability::EmptyDomain,
                     ]),
-                    membership_profile(),
+                    profile,
                     RouteEdgeId::new(CONSUMER_ROUTE),
                     BTreeSet::from([consumer_finst()]),
                 ),
@@ -636,7 +649,17 @@ mod tests {
     // --- artifact fixtures --------------------------------------------------------------------
 
     fn membership_bundle(profile: &ConsumerArtifactProfile) -> Arc<ArtifactBundle> {
-        let values = MembershipValues::int64([1, 2, 3]);
+        membership_bundle_values(profile, MembershipValues::int64([1, 2, 3]), 4096)
+    }
+
+    // Materialize a membership bundle for arbitrary values / byte budget so Task 5 can
+    // drive the materializer to each physical repr (ValueSet, Bitset, Bloom, EmptyDomain)
+    // against the matching consumer profile.
+    fn membership_bundle_values(
+        profile: &ConsumerArtifactProfile,
+        values: MembershipValues,
+        max_artifact_bytes: usize,
+    ) -> Arc<ArtifactBundle> {
         let schema =
             ArtifactMembershipSchema::new(&values.data_type(), NullSemantics::NeverMatches)
                 .unwrap();
@@ -650,7 +673,7 @@ mod tests {
             &schema,
             profile,
             MaterializationPolicy::for_test(),
-            4096,
+            max_artifact_bytes,
         )
         .unwrap();
         match Materializer::materialize(
@@ -1306,6 +1329,279 @@ mod tests {
             )
             .kind(),
             CodecContract,
+        );
+    }
+
+    // ==========================================================================================
+    // RFD-4/M2C Task 5 Part A: loopback-equals-remote equivalence (umbrella §10).
+    //
+    // The SAME materialized artifact must land logically equal whether it reaches a
+    // subscription through the in-process loopback leg of the outbound delivery bridge
+    // (`deliver_artifact`, no wire hop) or through a fake-remote encode -> inbound decode
+    // (`encode_artifact_bundle` -> `dispatch_inbound_consumer`). Each repr is proven on two
+    // isolated services installed from the identical channel so the two legs never share
+    // subscription state.
+    // ==========================================================================================
+
+    // A loopback-only delivery scope must never reach the remote sink; if the Router ever
+    // classified a loopback edge as remote this panics rather than silently wire-encoding.
+    struct NoopRemoteSink;
+    impl ArtifactRemoteSink for NoopRemoteSink {
+        fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: EncodedArtifactFrame) {
+            panic!("a loopback-only delivery scope must not reach the remote sink");
+        }
+    }
+
+    fn bitset_profile() -> ConsumerArtifactProfile {
+        ConsumerArtifactProfile::new(
+            BTreeSet::from([
+                ArtifactKind::ValueSet,
+                ArtifactKind::Bitset,
+                ArtifactKind::EmptyDomain,
+            ]),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn bloom_profile() -> ConsumerArtifactProfile {
+        let schema =
+            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
+        let contract = BloomHashContract::new(&schema, MaterializationPolicy::for_test())
+            .unwrap()
+            .digest();
+        ConsumerArtifactProfile::new(
+            BTreeSet::from([
+                ArtifactKind::ValueSet,
+                ArtifactKind::Bitset,
+                ArtifactKind::Bloom,
+                ArtifactKind::EmptyDomain,
+            ]),
+            Some(contract),
+        )
+        .unwrap()
+    }
+
+    // How a delivered artifact is observed from its install-frozen subscription.
+    #[derive(Clone, Copy)]
+    enum DeliveryObserve {
+        Blocking { binding: u32, finst: UniqueId },
+        Live { binding: u32, finst: UniqueId },
+    }
+
+    fn observe_delivered(
+        service: &RuntimeFilterService,
+        observe: DeliveryObserve,
+    ) -> Arc<ArtifactBundle> {
+        match observe {
+            DeliveryObserve::Blocking { binding, finst } => service
+                .subscribe_blocking(BindingId::new(binding), finst)
+                .unwrap()
+                .snapshot()
+                .expect("the blocking subscription must retain the delivered artifact"),
+            DeliveryObserve::Live { binding, finst } => service
+                .subscribe(
+                    BindingId::new(binding),
+                    finst,
+                    SubscriptionKind::NonBlockingLive,
+                )
+                .unwrap()
+                .into_live()
+                .unwrap()
+                .snapshot()
+                .expect("the live subscription must retain the delivered artifact"),
+        }
+    }
+
+    fn assert_bundles_logically_equal(left: &ArtifactBundle, right: &ArtifactBundle) {
+        assert_eq!(left.canonical_digest(), right.canonical_digest());
+        assert_eq!(left.channel_id(), right.channel_id());
+        assert_eq!(left.version(), right.version());
+        assert_eq!(left.profile_id(), right.profile_id());
+        assert_eq!(left.artifacts().len(), right.artifacts().len());
+        for ((left_kind, left_artifact), (right_kind, right_artifact)) in
+            left.artifacts().iter().zip(right.artifacts())
+        {
+            assert_eq!(
+                left_kind, right_kind,
+                "physical repr must match on both legs"
+            );
+            assert_eq!(
+                left_artifact.canonical_bytes(),
+                right_artifact.canonical_bytes(),
+                "membership set / range bound bytes must match on both legs"
+            );
+            assert_eq!(
+                left_artifact.schema_digest(),
+                right_artifact.schema_digest()
+            );
+            assert_eq!(left_artifact.version(), right_artifact.version());
+        }
+    }
+
+    // Core acceptance: deliver `bundle` to `route_edge` on two isolated services, once via
+    // the loopback leg and once via the fake-remote wire hop, and prove both subscriptions
+    // observe the logically-equal artifact.
+    fn assert_loopback_equals_remote(
+        channel: impl Fn() -> RuntimeFilterChannelDeployment,
+        profile: &ConsumerArtifactProfile,
+        bundle: &Arc<ArtifactBundle>,
+        route_edge: u32,
+        observe: DeliveryObserve,
+    ) {
+        // (a) loopback: the outbound bridge routes the in-memory bundle straight into the
+        //     local subscription with no wire encode.
+        let loopback_service = service();
+        install(&loopback_service, channel());
+        let decision = loopback_service
+            .deliver_artifact(
+                ChannelId::new(CHANNEL),
+                profile,
+                vec![RouteEdgeId::new(route_edge)],
+                ArtifactDeliveryOutcome::Published(bundle.clone()),
+                &NoopRemoteSink,
+            )
+            .expect("loopback delivery must route into the local subscription");
+        assert!(
+            decision.remote_routes().is_empty(),
+            "a loopback-only scope must not emit a remote frame"
+        );
+        assert_eq!(
+            decision.loopback_route_edge_ids(),
+            &[RouteEdgeId::new(route_edge)]
+        );
+        let via_loopback = observe_delivered(&loopback_service, observe);
+
+        // (b) remote: encode the identical bundle to a wire frame and feed it back through
+        //     the inbound consumer dispatch (decode -> deliver).
+        let remote_service = service();
+        install(&remote_service, channel());
+        let (digest, payload) = encode_bundle(bundle, profile);
+        assert_eq!(
+            remote_service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    CHANNEL,
+                    EPOCH,
+                    route_edge,
+                    1,
+                    digest,
+                    payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+        let via_remote = observe_delivered(&remote_service, observe);
+
+        // Both legs deliver the same logical artifact as the source materialization.
+        assert_eq!(via_loopback.canonical_digest(), bundle.canonical_digest());
+        assert_eq!(via_remote.canonical_digest(), bundle.canonical_digest());
+        assert_bundles_logically_equal(&via_loopback, &via_remote);
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_membership_value_set() {
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        assert_eq!(bundle.artifacts()[0].0, ArtifactKind::ValueSet);
+        assert_loopback_equals_remote(
+            || membership_channel(4096),
+            &profile,
+            &bundle,
+            CONSUMER_ROUTE,
+            DeliveryObserve::Blocking {
+                binding: CONSUMER_BINDING,
+                finst: consumer_finst(),
+            },
+        );
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_membership_empty_domain() {
+        let profile = membership_profile();
+        let bundle = membership_bundle_values(&profile, MembershipValues::int64([]), 4096);
+        assert_eq!(bundle.artifacts()[0].0, ArtifactKind::EmptyDomain);
+        assert_loopback_equals_remote(
+            || membership_channel(4096),
+            &profile,
+            &bundle,
+            CONSUMER_ROUTE,
+            DeliveryObserve::Blocking {
+                binding: CONSUMER_BINDING,
+                finst: consumer_finst(),
+            },
+        );
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_membership_two_artifacts() {
+        let profile = membership_profile();
+        let bundle = two_artifact_membership_bundle(&profile);
+        assert_eq!(bundle.artifacts().len(), 2);
+        assert_loopback_equals_remote(
+            || membership_channel(4096),
+            &profile,
+            &bundle,
+            CONSUMER_ROUTE,
+            DeliveryObserve::Blocking {
+                binding: CONSUMER_BINDING,
+                finst: consumer_finst(),
+            },
+        );
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_membership_bitset() {
+        let profile = bitset_profile();
+        let bundle = membership_bundle_values(&profile, MembershipValues::int64(100..164), 4096);
+        assert_eq!(bundle.artifacts()[0].0, ArtifactKind::Bitset);
+        assert_loopback_equals_remote(
+            || membership_channel_profiled(4096, bitset_profile()),
+            &profile,
+            &bundle,
+            CONSUMER_ROUTE,
+            DeliveryObserve::Blocking {
+                binding: CONSUMER_BINDING,
+                finst: consumer_finst(),
+            },
+        );
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_membership_bloom() {
+        let profile = bloom_profile();
+        let bundle = membership_bundle_values(
+            &profile,
+            MembershipValues::int64((0..128).map(|value| value * 1_000_000)),
+            512,
+        );
+        assert_eq!(bundle.artifacts()[0].0, ArtifactKind::Bloom);
+        assert_loopback_equals_remote(
+            || membership_channel_profiled(512, bloom_profile()),
+            &profile,
+            &bundle,
+            CONSUMER_ROUTE,
+            DeliveryObserve::Blocking {
+                binding: CONSUMER_BINDING,
+                finst: consumer_finst(),
+            },
+        );
+    }
+
+    #[test]
+    fn consumer_delivery_loopback_equals_remote_range() {
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        assert_eq!(bundle.artifacts()[0].0, ArtifactKind::Range);
+        assert_loopback_equals_remote(
+            ordered_channel,
+            &profile,
+            &bundle,
+            RANGE_ROUTE,
+            DeliveryObserve::Live {
+                binding: RANGE_CONSUMER_BINDING,
+                finst: range_consumer_finst(),
+            },
         );
     }
 
