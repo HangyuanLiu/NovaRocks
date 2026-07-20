@@ -36,6 +36,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
             data_sequence_number: Some(44),
             modification_time: None,
             datacache_options: None,
+            candidate_node: None,
             included_positions: vec![3, 5, 8],
             serialized_split: Some("{\"split\":1}".to_string()),
             use_iceberg_jni_metadata_reader: true,

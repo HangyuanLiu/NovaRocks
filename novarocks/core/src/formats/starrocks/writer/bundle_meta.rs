@@ -23,6 +23,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures::TryStreamExt;
 use prost::Message;
 
+use crate::connector::starrocks::lake::storage_schema_wire::{
+    decode_tablet_schema, encode_tablet_schema,
+};
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::fs_access::resolve_format_path;
 use crate::formats::starrocks::writer::io::read_bytes_if_exists;
 use crate::formats::starrocks::writer::io::write_bytes;
@@ -32,7 +36,7 @@ use crate::formats::starrocks::writer::layout::{
 };
 use crate::fs::access::FsScheme;
 use crate::service::grpc_client::proto::starrocks::{
-    BundleTabletMetadataPb, PagePointerPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
+    BundleTabletMetadataPb, PagePointerPb, RowsetMetadataPb, TabletMetadataPb,
 };
 
 const BUNDLE_METADATA_FOOTER_SIZE: usize = 8;
@@ -45,7 +49,7 @@ fn bundle_meta_write_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> 
 
 pub struct BundleMetaWriteEntry<'a> {
     pub tablet_id: i64,
-    pub schema: &'a TabletSchemaPb,
+    pub schema: &'a StarRocksTabletSchema,
     pub tablet_meta: &'a TabletMetadataPb,
 }
 
@@ -256,7 +260,7 @@ pub fn write_bundle_meta_file(
     tablet_root_path: &str,
     tablet_id: i64,
     version: i64,
-    schema: &TabletSchemaPb,
+    schema: &StarRocksTabletSchema,
     tablet_meta: &TabletMetadataPb,
 ) -> Result<(), String> {
     write_bundle_meta_file_batch(
@@ -300,7 +304,7 @@ pub fn write_bundle_meta_file_batch(
 type BundleWriteState = (
     HashMap<i64, TabletMetadataPb>,
     HashMap<i64, i64>,
-    HashMap<i64, TabletSchemaPb>,
+    HashMap<i64, StarRocksTabletSchema>,
 );
 
 fn load_bundle_meta_write_state(
@@ -318,7 +322,9 @@ fn load_bundle_meta_write_state(
      -> Result<(), String> {
         let (existing_bundle, footer_offset) = decode_bundle_metadata_from_bytes(bytes)?;
         tablet_to_schema.extend(existing_bundle.tablet_to_schema);
-        schemas.extend(existing_bundle.schemas);
+        for (schema_id, schema) in existing_bundle.schemas {
+            schemas.insert(schema_id, decode_tablet_schema(schema)?);
+        }
         for (existing_tablet_id, page) in existing_bundle.tablet_meta_pages {
             let start = page.offset as usize;
             let end = start.saturating_add(page.size as usize);
@@ -375,7 +381,7 @@ fn is_initial_raw_metadata_bytes(bytes: &[u8]) -> Result<bool, String> {
 fn encode_bundle_meta_file_bytes(
     mut tablet_metas: HashMap<i64, TabletMetadataPb>,
     tablet_to_schema: HashMap<i64, i64>,
-    schemas: HashMap<i64, TabletSchemaPb>,
+    schemas: HashMap<i64, StarRocksTabletSchema>,
 ) -> Result<Vec<u8>, String> {
     let mut ordered_tablet_ids = tablet_metas.keys().copied().collect::<Vec<_>>();
     ordered_tablet_ids.sort_unstable();
@@ -400,7 +406,10 @@ fn encode_bundle_meta_file_bytes(
 
     let bundle = BundleTabletMetadataPb {
         tablet_to_schema,
-        schemas,
+        schemas: schemas
+            .into_iter()
+            .map(|(schema_id, schema)| (schema_id, encode_tablet_schema(&schema)))
+            .collect(),
         tablet_meta_pages,
     };
     let bundle_bytes = bundle.encode_to_vec();

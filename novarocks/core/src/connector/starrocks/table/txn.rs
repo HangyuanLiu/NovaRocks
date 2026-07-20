@@ -33,6 +33,7 @@ use crate::connector::starrocks::lake::context::{
 };
 use crate::connector::starrocks::lake::transactions::publish_version;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
+use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };
@@ -47,8 +48,7 @@ use crate::mv::aggregate_state::mv_agg_state::{self, AggregateMvLayout};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    DeleteDataRequest, DeletePredicatePb, KeysType, PublishVersionRequest, TableSchemaKeyPb,
-    TabletSchemaPb,
+    DeleteDataRequest, DeletePredicatePb, PublishVersionRequest, TableSchemaKeyPb,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
@@ -189,7 +189,7 @@ pub(crate) struct StarRocksInsertPlan {
     pub(crate) base_version: i64,
     pub(crate) columns: Vec<ColumnDef>,
     pub(crate) distributed_slot_ids: Vec<SlotId>,
-    pub(crate) tablet_schema: TabletSchemaPb,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
     pub(crate) tablets: Vec<StarRocksInsertTablet>,
 }
 
@@ -485,7 +485,7 @@ pub(crate) fn write_chunks_into_starrocks_partition_for_aggregate_mv_upsert(
     layout: &AggregateMvLayout,
     metadata: MvRefreshWriteMetadata,
 ) -> Result<i64, String> {
-    if plan.tablet_schema.keys_type != Some(KeysType::PrimaryKeys as i32) {
+    if plan.tablet_schema.keys_type != Some(StarRocksKeysType::Primary) {
         return Err(
             "aggregate MV incremental upsert requires PRIMARY_KEYS physical table".to_string(),
         );
@@ -544,7 +544,7 @@ pub(crate) fn delete_starrocks_table_pk_rows(
         table: normalize_identifier(table_name)?,
     };
     let plan = load_physical_insert_plan(state, &resolved, PartitionTarget::Active)?;
-    if plan.tablet_schema.keys_type != Some(KeysType::PrimaryKeys as i32) {
+    if plan.tablet_schema.keys_type != Some(StarRocksKeysType::Primary) {
         return Err(format!(
             "delete_starrocks_table_pk_rows called on non-PRIMARY_KEYS table {database_name}.{table_name}"
         ));

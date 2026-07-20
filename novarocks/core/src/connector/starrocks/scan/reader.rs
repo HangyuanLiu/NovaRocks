@@ -18,7 +18,10 @@
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
-use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
+use crate::connector::starrocks::schema::{
+    LakeScanColumnHint, StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType,
+    StarRocksTabletIndex, StarRocksTabletSchema, StarRocksTypeDesc, StarRocksTypeNode,
+};
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
@@ -31,9 +34,6 @@ use crate::formats::starrocks::plan::{
 };
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_with_output_hints_and_physical_schema_if_any;
 use crate::novarocks_logging::{info, warn};
-use crate::service::grpc_client::proto::starrocks::{
-    AggStateDescPb, ColumnPb, PTypeDesc, PTypeNode, TabletIndexPb, TabletSchemaPb,
-};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use sha2::{Digest, Sha256};
@@ -57,7 +57,7 @@ fn schema_signature_with_hints(
     schema: &SchemaRef,
     chunk_schema: &ChunkSchemaRef,
     output_column_hints: &[StarRocksOutputColumnHint],
-    current_tablet_schema: &TabletSchemaPb,
+    current_tablet_schema: &StarRocksTabletSchema,
 ) -> Result<String, String> {
     if schema.fields().len() != chunk_schema.slots().len() {
         return Err(format!(
@@ -184,14 +184,14 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_type_desc(&mut self, value: &PTypeDesc) {
+    fn push_type_desc(&mut self, value: &StarRocksTypeDesc) {
         self.push_u64(value.types.len() as u64);
         for node in &value.types {
             self.push_type_node(node);
         }
     }
 
-    fn push_type_node(&mut self, value: &PTypeNode) {
+    fn push_type_node(&mut self, value: &StarRocksTypeNode) {
         self.push_i32(value.r#type);
         self.push_bool(value.scalar_type.is_some());
         if let Some(scalar) = value.scalar_type.as_ref() {
@@ -207,7 +207,7 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_agg_state(&mut self, value: &AggStateDescPb) {
+    fn push_agg_state(&mut self, value: &StarRocksAggStateDesc) {
         self.push_optional_string(value.agg_func_name.as_deref());
         self.push_u64(value.arg_types.len() as u64);
         for arg_type in &value.arg_types {
@@ -221,7 +221,7 @@ impl SchemaFingerprintEncoder {
         self.push_optional_i32(value.func_version);
     }
 
-    fn push_column(&mut self, value: &ColumnPb) {
+    fn push_column(&mut self, value: &StarRocksColumnSchema) {
         self.push_i32(value.unique_id);
         self.push_optional_string(value.name.as_deref());
         self.push_string(&value.r#type);
@@ -249,7 +249,7 @@ impl SchemaFingerprintEncoder {
         }
     }
 
-    fn push_table_index(&mut self, value: &TabletIndexPb) {
+    fn push_table_index(&mut self, value: &StarRocksTabletIndex) {
         self.push_optional_i64(value.index_id);
         self.push_optional_string(value.index_name.as_deref());
         self.push_optional_i32(value.index_type);
@@ -260,8 +260,13 @@ impl SchemaFingerprintEncoder {
         self.push_optional_string(value.index_properties.as_deref());
     }
 
-    fn push_tablet_schema(&mut self, value: &TabletSchemaPb) {
-        self.push_optional_i32(value.keys_type);
+    fn push_tablet_schema(&mut self, value: &StarRocksTabletSchema) {
+        self.push_optional_i32(value.keys_type.map(|keys_type| match keys_type {
+            StarRocksKeysType::Duplicate => 0,
+            StarRocksKeysType::Unique => 1,
+            StarRocksKeysType::Aggregate => 2,
+            StarRocksKeysType::Primary => 3,
+        }));
         self.push_u64(value.column.len() as u64);
         for column in &value.column {
             self.push_column(column);
@@ -291,7 +296,7 @@ impl SchemaFingerprintEncoder {
     }
 }
 
-fn tablet_schema_semantic_fingerprint(schema: &TabletSchemaPb) -> String {
+fn tablet_schema_semantic_fingerprint(schema: &StarRocksTabletSchema) -> String {
     let mut encoder = SchemaFingerprintEncoder::default();
     encoder.push_tablet_schema(schema);
     let digest = Sha256::digest(&encoder.bytes);
@@ -345,7 +350,6 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
         meta.schema_id,
         Some(snapshot.tablet_id),
         meta.query_id.clone(),
-        None,
     )
     .map_err(|e| {
         format!(
@@ -353,7 +357,7 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
             meta.db_id, meta.table_id, meta.schema_id, snapshot.tablet_id, e
         )
     })?;
-    let refreshed_schema = build_tablet_schema_pb_from_thrift(&fe_schema)?;
+    let refreshed_schema = fe_schema.tablet_schema;
     let refreshed_schema_id = refreshed_schema.id.unwrap_or(0);
     if refreshed_schema_id > 0 && refreshed_schema_id != meta.schema_id {
         warn!(
@@ -412,6 +416,7 @@ impl StarRocksNativeReader {
         };
         let physical_snapshot = snapshot.clone();
         let snapshot = maybe_refresh_snapshot_schema_for_lake_scan(&snapshot, lake_schema_meta)?;
+        let current_tablet_schema = snapshot.tablet_schema.clone();
         let output_column_hints = build_output_column_hints(
             &snapshot,
             &required_chunk_schema,
@@ -424,7 +429,7 @@ impl StarRocksNativeReader {
             &output_schema,
             &output_chunk_schema,
             &output_column_hints,
-            &snapshot.tablet_schema,
+            &current_tablet_schema,
         )?;
         if use_batch_cache
             && let Some(batch) = native_cache::native_batch_cache_get(
@@ -613,12 +618,6 @@ impl StarRocksNativeReader {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LakeSchemaColumnHint {
-    unique_id: Option<u32>,
-    default_value: Option<String>,
-}
-
 fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -644,44 +643,9 @@ fn build_required_schema_unique_id_map(
     Ok(out)
 }
 
-fn build_lake_schema_column_hints(
-    schema: &crate::thrift::agent_service::TTabletSchema,
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
-    let mut out = HashMap::new();
-    for column in &schema.columns {
-        let normalized_name = normalize_column_name(&column.column_name);
-        if normalized_name.is_empty() {
-            continue;
-        }
-        let unique_id = match column.col_unique_id {
-            Some(v) if v >= 0 => Some(u32::try_from(v).map_err(|_| {
-                format!(
-                    "invalid FE table schema col_unique_id for column '{}': {}",
-                    column.column_name, v
-                )
-            })?),
-            _ => None,
-        };
-        let hint = LakeSchemaColumnHint {
-            unique_id,
-            default_value: column.default_value.clone(),
-        };
-        if let Some(existing) = out.get(&normalized_name)
-            && existing != &hint
-        {
-            return Err(format!(
-                "duplicated FE table schema column with mismatched metadata: column_name={}",
-                column.column_name
-            ));
-        }
-        out.insert(normalized_name, hint);
-    }
-    Ok(out)
-}
-
-fn build_lake_schema_column_hints_from_pb(
-    schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+fn build_lake_schema_column_hints_from_domain(
+    schema: &StarRocksTabletSchema,
+) -> Result<HashMap<String, LakeScanColumnHint>, String> {
     let mut out = HashMap::new();
     for column in &schema.column {
         let Some(name) = column.name.as_deref() else {
@@ -704,7 +668,7 @@ fn build_lake_schema_column_hints_from_pb(
             .default_value
             .as_ref()
             .map(|value| String::from_utf8_lossy(value).into_owned());
-        let hint = LakeSchemaColumnHint {
+        let hint = LakeScanColumnHint {
             unique_id,
             default_value,
         };
@@ -723,7 +687,7 @@ fn build_lake_schema_column_hints_from_pb(
 
 fn build_native_schema_column_hints(
     columns: &[super::op::StarRocksSchemaColumnHint],
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+) -> Result<HashMap<String, LakeScanColumnHint>, String> {
     let mut out = HashMap::new();
     for column in columns {
         let normalized_name = normalize_column_name(&column.name);
@@ -736,7 +700,7 @@ fn build_native_schema_column_hints(
                 column.name, column.unique_id
             )
         })?;
-        let hint = LakeSchemaColumnHint {
+        let hint = LakeScanColumnHint {
             unique_id: Some(unique_id),
             default_value: column.default_value.clone(),
         };
@@ -775,6 +739,7 @@ fn build_output_column_hints(
         ));
     }
     let required_unique_ids = build_required_schema_unique_id_map(required_chunk_schema)?;
+    let snapshot_domain_schema = snapshot.tablet_schema.clone();
     let snapshot_schema_columns = snapshot
         .tablet_schema
         .column
@@ -804,7 +769,7 @@ fn build_output_column_hints(
             let snapshot_schema_id = snapshot.tablet_schema.id.unwrap_or(0);
             if snapshot_schema_id == meta.schema_id {
                 (
-                    build_lake_schema_column_hints_from_pb(&snapshot.tablet_schema)?,
+                    build_lake_schema_column_hints_from_domain(&snapshot_domain_schema)?,
                     false,
                 )
             } else {
@@ -815,7 +780,6 @@ fn build_output_column_hints(
                     meta.schema_id,
                     Some(snapshot.tablet_id),
                     meta.query_id.clone(),
-                    None,
                 )
                 .map_err(|e| {
                     format!(
@@ -823,7 +787,7 @@ fn build_output_column_hints(
                         meta.db_id, meta.table_id, meta.schema_id, e
                     )
                 })?;
-                (build_lake_schema_column_hints(&fe_schema)?, false)
+                (fe_schema.column_hints, false)
             }
         }
     } else {

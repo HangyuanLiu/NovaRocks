@@ -40,10 +40,11 @@ use crate::runtime::runtime_state::RuntimeState;
 use super::builder::build_compat_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop;
 use super::dependency::DependencyManager;
-use super::fragment_context::{FragmentContext, FragmentFeAddress};
+use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
+use crate::runtime::endpoint::RuntimeEndpoint;
 
 use crate::runtime::profile::Profiler;
 
@@ -58,7 +59,7 @@ pub(crate) fn execute_native_plan_with_pipeline(
     pipeline_dop: i32,
     runtime_state: std::sync::Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
 ) -> Result<(), String> {
     execute_native_plan_with_pipeline_with_root_sink_dop(
@@ -87,7 +88,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     pipeline_dop: i32,
     runtime_state: std::sync::Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
@@ -119,7 +120,7 @@ pub(crate) fn execute_compat_plan_with_pipeline(
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
 ) -> Result<(), String> {
     execute_compat_plan_with_pipeline_with_root_sink_dop(
@@ -149,7 +150,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
@@ -187,7 +188,7 @@ fn execute_plan_with_pipeline_in_mode(
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     query_id: Option<crate::runtime::query_context::QueryId>,
-    fe_addr: Option<FragmentFeAddress>,
+    fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
     mode: PipelineExecutionMode,
@@ -320,11 +321,13 @@ fn execute_plan_with_pipeline_in_mode(
     };
 
     let completion = FragmentCompletion::new(all_drivers.len(), Arc::clone(&ctx));
-    if query_id.is_some()
+    let completion_execution = if query_id.is_some()
         && let Some(finst_id) = finst_id
     {
-        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion));
-    }
+        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion))
+    } else {
+        None
+    };
     if let Some(query_id) = query_id
         && query_context_manager().is_query_canceled(query_id)
     {
@@ -349,7 +352,11 @@ fn execute_plan_with_pipeline_in_mode(
         })
         .unwrap_or_else(|| completion.wait());
     if let Some(finst_id) = finst_id {
-        query_context_manager().unregister_fragment_completion(finst_id);
+        if let Some(execution) = completion_execution {
+            query_context_manager().unregister_fragment_completion_execution(finst_id, execution);
+        } else {
+            query_context_manager().unregister_fragment_completion(finst_id);
+        }
     }
     res?;
 

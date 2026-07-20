@@ -21,12 +21,30 @@ use crate::runtime::query_context::query_context_manager;
 use crate::runtime::{exchange, result_buffer};
 
 pub fn cancel(finst_id: UniqueId) {
+    #[cfg(feature = "compat")]
+    if crate::service::starrocks_fragment_transport::starrocks_prelaunch_registry()
+        .cancel_or_run(finst_id, || cancel_runtime(finst_id))
+    {
+        info!(
+            target: "novarocks::exec",
+            finst_id = %finst_id,
+            "cancel request marked StarRocks fragment preparation"
+        );
+        return;
+    }
+    #[cfg(feature = "compat")]
+    return;
+
+    #[cfg(not(feature = "compat"))]
+    cancel_runtime(finst_id);
+}
+
+fn cancel_runtime(finst_id: UniqueId) {
     let mgr = query_context_manager();
-    let query_id = mgr.query_id_by_finst(finst_id);
     let cancel_reason = format!("query canceled by FE: finst={}", finst_id);
-    let mut target_finsts = query_id
-        .map(|qid| mgr.cancel_query(qid, cancel_reason.clone()))
-        .unwrap_or_default();
+    let cancel_result = mgr.cancel_finst(finst_id, cancel_reason);
+    let query_id = cancel_result.query_id;
+    let mut target_finsts = cancel_result.finsts;
     if target_finsts.is_empty() {
         target_finsts.push(finst_id);
     }
@@ -52,10 +70,6 @@ pub fn cancel(finst_id: UniqueId) {
         .collect();
     for h in cleanup {
         let _ = h.join();
-    }
-
-    if query_id.is_none() {
-        mgr.unregister_finst(finst_id);
     }
 }
 

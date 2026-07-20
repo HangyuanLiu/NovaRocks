@@ -569,6 +569,7 @@ fn build_native_file_scan_range_params(
             data_sequence_number,
             modification_time: None,
             datacache_options: None,
+            candidate_node: None,
             included_positions: included_positions.cloned().unwrap_or_default(),
             serialized_split: None,
             use_iceberg_jni_metadata_reader: false,

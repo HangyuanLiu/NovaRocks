@@ -24,10 +24,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
+use crate::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::internal_service;
+use crate::service::starrocks_sink_commit_wire;
 use crate::service::stream_load_registry::{
     register_stream_load_file, unregister_stream_load_file,
 };
@@ -135,8 +137,8 @@ struct TxnContext {
     timeout: Option<i64>,
     prepared_timeout: Option<i32>,
     idle_timeout: Option<i64>,
-    commit_infos: Vec<types::TTabletCommitInfo>,
-    fail_infos: Vec<types::TTabletFailInfo>,
+    commit_infos: Vec<TabletCommitInfo>,
+    fail_infos: Vec<TabletFailInfo>,
     stats: LoadStats,
     created_at: Instant,
     last_active: Instant,
@@ -654,8 +656,8 @@ fn commit_txn(
     db: &str,
     table: &str,
     txn_id: i64,
-    commit_infos: Vec<types::TTabletCommitInfo>,
-    fail_infos: Vec<types::TTabletFailInfo>,
+    commit_infos: Vec<TabletCommitInfo>,
+    fail_infos: Vec<TabletFailInfo>,
     prepared_timeout: Option<i32>,
     prepare_only: bool,
     stats: Option<&LoadStats>,
@@ -690,11 +692,15 @@ fn commit_txn(
         auth.user_ip.clone(),
         txn_id,
         true,
-        Some(commit_infos),
+        Some(starrocks_sink_commit_wire::tablet_commit_infos_to_thrift(
+            commit_infos,
+        )),
         Option::<i64>::None,
         txn_commit_attachment,
         Some(5_000),
-        Some(fail_infos),
+        Some(starrocks_sink_commit_wire::tablet_fail_infos_to_thrift(
+            fail_infos,
+        )),
         prepared_timeout,
     );
     if prepare_only {
@@ -710,8 +716,8 @@ fn rollback_txn(
     table: &str,
     txn_id: i64,
     reason: &str,
-    commit_infos: Vec<types::TTabletCommitInfo>,
-    fail_infos: Vec<types::TTabletFailInfo>,
+    commit_infos: Vec<TabletCommitInfo>,
+    fail_infos: Vec<TabletFailInfo>,
 ) -> Result<TLoadTxnRollbackResult, ApiError> {
     let request = TLoadTxnRollbackRequest::new(
         Option::<String>::None,
@@ -724,16 +730,17 @@ fn rollback_txn(
         Some(reason.to_string()),
         Option::<i64>::None,
         Option::<crate::thrift::frontend_service::TTxnCommitAttachment>::None,
-        Some(fail_infos),
-        Some(commit_infos),
+        Some(starrocks_sink_commit_wire::tablet_fail_infos_to_thrift(
+            fail_infos,
+        )),
+        Some(starrocks_sink_commit_wire::tablet_commit_infos_to_thrift(
+            commit_infos,
+        )),
     );
     with_frontend_client(|client| client.load_txn_rollback(request).map_err(|e| e.to_string()))
 }
 
-fn dedup_extend_commit_infos(
-    target: &mut Vec<types::TTabletCommitInfo>,
-    source: Vec<types::TTabletCommitInfo>,
-) {
+fn dedup_extend_commit_infos(target: &mut Vec<TabletCommitInfo>, source: Vec<TabletCommitInfo>) {
     for info in source {
         let exists = target.iter().any(|current| {
             current.tablet_id == info.tablet_id && current.backend_id == info.backend_id
@@ -744,10 +751,7 @@ fn dedup_extend_commit_infos(
     }
 }
 
-fn dedup_extend_fail_infos(
-    target: &mut Vec<types::TTabletFailInfo>,
-    source: Vec<types::TTabletFailInfo>,
-) {
+fn dedup_extend_fail_infos(target: &mut Vec<TabletFailInfo>, source: Vec<TabletFailInfo>) {
     for info in source {
         let exists = target.iter().any(|current| {
             current.tablet_id == info.tablet_id && current.backend_id == info.backend_id
@@ -1028,8 +1032,8 @@ pub(crate) fn handle_stream_load(
     let mut temp_path: Option<PathBuf> = None;
     let mut stream_load_id: Option<TUniqueId> = None;
     let mut finst_id: Option<crate::common::types::UniqueId> = None;
-    let mut commit_infos: Vec<types::TTabletCommitInfo> = Vec::new();
-    let mut fail_infos: Vec<types::TTabletFailInfo> = Vec::new();
+    let mut commit_infos: Vec<TabletCommitInfo> = Vec::new();
+    let mut fail_infos: Vec<TabletFailInfo> = Vec::new();
     let mut final_error: Option<ApiError> = None;
 
     let work = (|| -> Result<(), ApiError> {
@@ -1805,4 +1809,35 @@ pub(crate) fn finish_stream_load_channel(
     }
     context.last_active = Instant::now();
     TStatus::new(TStatusCode::OK, None)
+}
+
+#[cfg(test)]
+mod sink_commit_domain_tests {
+    use super::dedup_extend_commit_infos;
+    use crate::runtime::sink_commit::TabletCommitInfo;
+
+    #[test]
+    fn stream_load_keeps_domain_tablet_commits_deduplicated_before_wire_encoding() {
+        let mut target = vec![TabletCommitInfo {
+            tablet_id: 101,
+            backend_id: 201,
+        }];
+        dedup_extend_commit_infos(
+            &mut target,
+            vec![
+                TabletCommitInfo {
+                    tablet_id: 101,
+                    backend_id: 201,
+                },
+                TabletCommitInfo {
+                    tablet_id: 102,
+                    backend_id: 201,
+                },
+            ],
+        );
+
+        assert_eq!(target.len(), 2);
+        assert_eq!(target[1].tablet_id, 102);
+        assert_eq!(target[1].backend_id, 201);
+    }
 }

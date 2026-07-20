@@ -26,6 +26,8 @@ use crate::common::network::format_host_for_url;
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
+use crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_transmission;
 
 pub use crate::proto;
 
@@ -341,14 +343,15 @@ pub fn send_chunks(
     })?
 }
 
-pub fn transmit_runtime_filter(
+pub(crate) fn transmit_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: proto::filter::TransmitRuntimeFilterRequest,
+    params: RuntimeFilterTransmission,
 ) -> Result<(), String> {
     let dest_host = dest_host.to_string();
     let port = dest_port;
     let runtime_handle = data_runtime_handle()?;
+    let params = encode_runtime_filter_transmission(params);
     runtime_handle.spawn(async move {
         let ch = match get_or_create_channel(&dest_host, port).await {
             Ok(v) => v,

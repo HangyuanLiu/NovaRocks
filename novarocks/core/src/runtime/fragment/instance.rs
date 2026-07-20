@@ -92,14 +92,15 @@ impl ScanAssignments {
         let mut bound_assignments = BTreeMap::new();
         for (node_id, (kind, ranges)) in assignments {
             for (index, range) in ranges.iter().enumerate() {
-                let matches_kind = matches!(
-                    (kind, &range.range),
-                    (ScanAssignmentKind::File, ScanRange::File(_))
-                        | (
-                            ScanAssignmentKind::StarRocksTablet,
-                            ScanRange::StarRocksTablet(_)
-                        )
-                );
+                let matches_kind = match (kind, &range.range) {
+                    (ScanAssignmentKind::File, ScanRange::File(_)) => true,
+                    #[cfg(feature = "compat")]
+                    (ScanAssignmentKind::BrokerFile, ScanRange::BrokerFile(_)) => true,
+                    #[cfg(feature = "compat")]
+                    (ScanAssignmentKind::SchemaSelection, ScanRange::SchemaSelection(_)) => true,
+                    (ScanAssignmentKind::StarRocksTablet, ScanRange::StarRocksTablet(_)) => true,
+                    _ => false,
+                };
                 if !matches_kind {
                     return Err(FragmentBindingError::new(
                         FragmentBindingTarget::ScanNode(node_id.get()),
@@ -181,6 +182,40 @@ pub(crate) enum FragmentSinkAssignment {
         groups: Vec<Vec<FragmentDestination>>,
         sender_id: Option<i32>,
     },
+    StarRocksTable(StarRocksTableSinkAssignment),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StarRocksTableSinkAssignment {
+    txn_id: i64,
+    load_id: UniqueId,
+    frontend: Option<RuntimeEndpoint>,
+}
+
+impl StarRocksTableSinkAssignment {
+    pub(crate) const fn new(
+        txn_id: i64,
+        load_id: UniqueId,
+        frontend: Option<RuntimeEndpoint>,
+    ) -> Self {
+        Self {
+            txn_id,
+            load_id,
+            frontend,
+        }
+    }
+
+    pub(crate) const fn txn_id(&self) -> i64 {
+        self.txn_id
+    }
+
+    pub(crate) const fn load_id(&self) -> UniqueId {
+        self.load_id
+    }
+
+    pub(crate) const fn frontend(&self) -> Option<&RuntimeEndpoint> {
+        self.frontend.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -332,6 +367,7 @@ mod tests {
             data_sequence_number: None,
             modification_time: None,
             datacache_options: None,
+            candidate_node: None,
             included_positions: Vec::new(),
             serialized_split: None,
             use_iceberg_jni_metadata_reader: false,

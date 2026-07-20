@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use prost::Message;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -24,7 +23,9 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema_bytes;
 use crate::connector::starrocks::lake::transactions::delete_tablet;
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::parser::ast::{
@@ -90,7 +91,7 @@ pub(crate) fn stored_columns_from_physical_columns(
 }
 
 pub(crate) fn patch_tablet_schema_column_flags(
-    schema: &mut crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    schema: &mut StarRocksTabletSchema,
     columns: &[StarRocksPhysicalColumn],
 ) -> Result<(), String> {
     if schema.column.len() != columns.len() {
@@ -237,7 +238,7 @@ pub(crate) fn create_starrocks_table(
         .update_schema_payload(
             txn.as_mut(),
             created.schema.schema_id,
-            tablet_schema_pb.encode_to_vec(),
+            encode_tablet_schema_bytes(&tablet_schema_pb),
         )
         .map_err(|e| format!("update StarRocks table schema metadata failed: {e}"))?;
     state
@@ -925,7 +926,7 @@ pub(crate) fn bootstrap_empty_partition_for_tablets(
     Ok(())
 }
 
-/// Maps the string aggregation representation stored in `ColumnPb.aggregation`
+/// Maps the string aggregation representation stored in `StarRocksColumnSchema.aggregation`
 /// back to the parser-level `ColumnAggregation` enum.
 ///
 /// Returns `None` for `"NONE"` (no aggregation modifier).  Returns an error

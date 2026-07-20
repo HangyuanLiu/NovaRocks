@@ -28,6 +28,10 @@ use opendal::{ErrorKind, Operator};
 use prost::Message;
 
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::starrocks::lake::storage_schema_wire::{
+    decode_tablet_schema, validate_encoded_tablet_schema,
+};
+use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
 use crate::formats::starrocks::fs_access::{
     StarRocksFormatTabletAccess, operator_relative_path_for_tablet_root,
@@ -37,8 +41,7 @@ use crate::formats::starrocks::range_read::{ensure_exact_range_read_len, expecte
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::service::grpc_client::proto::starrocks::{
-    BundleTabletMetadataPb, DelvecPagePb, KeysType, PagePointerPb, RowsetMetadataPb,
-    TabletMetadataPb, TabletSchemaPb,
+    BundleTabletMetadataPb, DelvecPagePb, PagePointerPb, RowsetMetadataPb, TabletMetadataPb,
 };
 
 const METADATA_DIR: &str = "meta";
@@ -115,8 +118,8 @@ pub struct StarRocksTabletSnapshot {
     pub tablet_id: i64,
     pub version: i64,
     pub metadata_path: String,
-    pub tablet_schema: TabletSchemaPb,
-    pub historical_schemas: BTreeMap<i64, TabletSchemaPb>,
+    pub tablet_schema: StarRocksTabletSchema,
+    pub historical_schemas: BTreeMap<i64, StarRocksTabletSchema>,
     pub total_num_rows: u64,
     pub rowset_count: usize,
     pub segment_files: Vec<StarRocksSegmentFile>,
@@ -371,30 +374,31 @@ fn build_standalone_snapshot(
         )
     })?;
     let schema_id = tablet_schema.id.unwrap_or(-1);
-    ensure_supported_keys_type(
-        &tablet_schema,
-        tablet_id,
-        schema_id,
-        "tablet",
-        metadata_path,
-    )?;
+    validate_encoded_tablet_schema(&tablet_schema).map_err(|error| {
+        format!(
+            "invalid tablet schema: tablet_id={tablet_id}, schema_id={schema_id}, schema_kind=tablet, path={metadata_path}, error={error}"
+        )
+    })?;
     for (rowset_schema_id, rowset_schema) in &metadata.historical_schemas {
-        ensure_supported_keys_type(
-            rowset_schema,
-            tablet_id,
-            *rowset_schema_id,
-            "rowset",
-            metadata_path,
-        )?;
+        validate_encoded_tablet_schema(rowset_schema).map_err(|error| {
+            format!(
+                "invalid tablet schema: tablet_id={tablet_id}, schema_id={rowset_schema_id}, schema_kind=rowset, path={metadata_path}, error={error}"
+            )
+        })?;
     }
     let (segment_files, delete_predicates) = collect_segment_files(access, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
     let delvec_meta = collect_delvec_meta(access, &metadata)?;
-    let mut historical_schemas = metadata
+    let historical_schemas_pb = metadata
         .historical_schemas
         .clone()
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    let tablet_schema = decode_tablet_schema(tablet_schema)?;
+    let mut historical_schemas = historical_schemas_pb
+        .into_iter()
+        .map(|(id, schema)| decode_tablet_schema(schema).map(|schema| (id, schema)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     if let Some(schema_id) = tablet_schema.id {
         historical_schemas
             .entry(schema_id)
@@ -441,11 +445,16 @@ fn parse_bundle_snapshot(
     let (segment_files, delete_predicates) = collect_segment_files(access, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
     let delvec_meta = collect_delvec_meta(access, &metadata)?;
-    let mut historical_schemas = metadata
+    let historical_schemas_pb = metadata
         .historical_schemas
         .clone()
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    let tablet_schema = decode_tablet_schema(tablet_schema)?;
+    let mut historical_schemas = historical_schemas_pb
+        .into_iter()
+        .map(|(id, schema)| decode_tablet_schema(schema).map(|schema| (id, schema)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     if let Some(schema_id) = tablet_schema.id {
         historical_schemas
             .entry(schema_id)
@@ -579,7 +588,11 @@ fn hydrate_schema_from_bundle(
             tablet_id, schema_id, metadata_path
         )
     })?;
-    ensure_supported_keys_type(schema, tablet_id, *schema_id, "tablet", metadata_path)?;
+    validate_encoded_tablet_schema(schema).map_err(|error| {
+        format!(
+            "invalid tablet schema: tablet_id={tablet_id}, schema_id={schema_id}, schema_kind=tablet, path={metadata_path}, error={error}"
+        )
+    })?;
 
     metadata.schema = Some(schema.clone());
     metadata
@@ -593,51 +606,14 @@ fn hydrate_schema_from_bundle(
                 tablet_id, rowset_schema_id, metadata_path
             )
         })?;
-        ensure_supported_keys_type(
-            rowset_schema,
-            tablet_id,
-            *rowset_schema_id,
-            "rowset",
-            metadata_path,
-        )?;
+        validate_encoded_tablet_schema(rowset_schema).map_err(|error| {
+            format!(
+                "invalid tablet schema: tablet_id={tablet_id}, schema_id={rowset_schema_id}, schema_kind=rowset, path={metadata_path}, error={error}"
+            )
+        })?;
         metadata
             .historical_schemas
             .insert(*rowset_schema_id, rowset_schema.clone());
-    }
-    Ok(())
-}
-
-fn ensure_supported_keys_type(
-    schema: &TabletSchemaPb,
-    tablet_id: i64,
-    schema_id: i64,
-    schema_kind: &str,
-    metadata_path: &str,
-) -> Result<(), String> {
-    let raw_keys_type = schema.keys_type.ok_or_else(|| {
-        format!(
-            "missing keys_type in tablet schema: tablet_id={}, schema_id={}, schema_kind={}, path={}",
-            tablet_id, schema_id, schema_kind, metadata_path
-        )
-    })?;
-    let keys_type = KeysType::try_from(raw_keys_type).map_err(|_| {
-        format!(
-            "unknown keys_type in tablet schema: tablet_id={}, schema_id={}, schema_kind={}, keys_type={}, path={}",
-            tablet_id, schema_id, schema_kind, raw_keys_type, metadata_path
-        )
-    })?;
-    if !matches!(
-        keys_type,
-        KeysType::DupKeys | KeysType::AggKeys | KeysType::UniqueKeys | KeysType::PrimaryKeys
-    ) {
-        return Err(format!(
-            "unsupported keys_type for rust native starrocks reader: tablet_id={}, schema_id={}, schema_kind={}, keys_type={}, supported=[DUP_KEYS,AGG_KEYS,UNIQUE_KEYS,PRIMARY_KEYS], path={}",
-            tablet_id,
-            schema_id,
-            schema_kind,
-            keys_type.as_str_name(),
-            metadata_path
-        ));
     }
     Ok(())
 }

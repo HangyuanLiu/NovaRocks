@@ -35,6 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::common::app_config;
+use crate::common::types::UniqueId;
 use crate::runtime::exchange;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::result_buffer;
@@ -102,12 +103,15 @@ impl FragmentCompletion {
         self.cv.notify_all();
         drop(st);
 
-        if notify_query
-            && first
-            && let Some(query_id) = self.fragment_ctx.query_id()
-        {
+        if notify_query && first {
             let mgr = query_context_manager();
-            let finsts = mgr.cancel_query(query_id, err.clone());
+            let finsts = if let Some((hi, lo)) = self.fragment_ctx.fragment_instance_id() {
+                mgr.cancel_finst(UniqueId { hi, lo }, err.clone()).finsts
+            } else if let Some(query_id) = self.fragment_ctx.query_id() {
+                mgr.cancel_query(query_id, err.clone())
+            } else {
+                Vec::new()
+            };
             for id in finsts {
                 result_buffer::close_error(id, err.clone());
                 exchange::cancel_fragment(id.hi, id.lo);

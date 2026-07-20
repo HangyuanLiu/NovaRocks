@@ -17,3 +17,5 @@
 
 pub(crate) mod common;
 pub(crate) mod native;
+#[cfg(feature = "compat")]
+pub(crate) mod starrocks;

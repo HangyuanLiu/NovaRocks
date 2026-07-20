@@ -37,6 +37,18 @@ pub(crate) struct SinkLoadStats {
     pub(crate) filtered_rows: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TabletCommitInfo {
+    pub(crate) tablet_id: i64,
+    pub(crate) backend_id: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TabletFailInfo {
+    pub(crate) tablet_id: i64,
+    pub(crate) backend_id: i64,
+}
+
 struct SinkCommitStore {
     mu: Mutex<HashMap<UniqueId, SinkCommitEntry>>,
 }
@@ -45,9 +57,9 @@ struct SinkCommitStore {
 struct SinkCommitEntry {
     iceberg_commits: Vec<IcebergCommitInfo>,
     #[cfg(feature = "compat")]
-    tablet_commit_infos: Vec<crate::thrift::types::TTabletCommitInfo>,
+    tablet_commit_infos: Vec<TabletCommitInfo>,
     #[cfg(feature = "compat")]
-    tablet_fail_infos: Vec<crate::thrift::types::TTabletFailInfo>,
+    tablet_fail_infos: Vec<TabletFailInfo>,
     /// Per-file Theta sketch sets produced by the Iceberg sink for Puffin
     /// NDV statistics. These are not Cloneable (the `ThetaSketchHandle`
     /// holds an underlying `ThetaSketch` that does not implement `Clone`),
@@ -122,25 +134,18 @@ pub(crate) fn take_sketch_sets(finst_id: UniqueId) -> Vec<FileSketchSet> {
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn add_tablet_commit_info(
-    finst_id: UniqueId,
-    info: crate::thrift::types::TTabletCommitInfo,
-) {
+pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
-    let already_exists = entry.tablet_commit_infos.iter().any(|current| {
-        current.tablet_id == info.tablet_id && current.backend_id == info.backend_id
-    });
+    let already_exists = entry.tablet_commit_infos.contains(&info);
     if !already_exists {
         entry.tablet_commit_infos.push(info);
     }
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn list_tablet_commit_infos(
-    finst_id: UniqueId,
-) -> Vec<crate::thrift::types::TTabletCommitInfo> {
+pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TabletCommitInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
@@ -150,25 +155,18 @@ pub(crate) fn list_tablet_commit_infos(
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn add_tablet_fail_info(
-    finst_id: UniqueId,
-    info: crate::thrift::types::TTabletFailInfo,
-) {
+pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
-    let already_exists = entry.tablet_fail_infos.iter().any(|current| {
-        current.tablet_id == info.tablet_id && current.backend_id == info.backend_id
-    });
+    let already_exists = entry.tablet_fail_infos.contains(&info);
     if !already_exists {
         entry.tablet_fail_infos.push(info);
     }
 }
 
 #[cfg(feature = "compat")]
-pub(crate) fn list_tablet_fail_infos(
-    finst_id: UniqueId,
-) -> Vec<crate::thrift::types::TTabletFailInfo> {
+pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TabletFailInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
@@ -433,4 +431,54 @@ pub(crate) fn list_iceberg_writer_reports(
     metadata: &iceberg::spec::TableMetadata,
 ) -> Result<Vec<IcebergWriterReport>, String> {
     iceberg_commit_infos_to_writer_reports(list_iceberg_commits(finst_id), metadata)
+}
+
+#[cfg(all(test, feature = "compat"))]
+mod tests {
+    use super::{
+        TabletCommitInfo, TabletFailInfo, add_tablet_commit_info, add_tablet_fail_info,
+        list_tablet_commit_infos, list_tablet_fail_infos, unregister,
+    };
+    use crate::common::types::UniqueId;
+
+    #[test]
+    fn tablet_domain_records_deduplicate_by_tablet_and_backend() {
+        let finst_id = UniqueId { hi: 41, lo: 42 };
+        unregister(finst_id);
+
+        let commit = TabletCommitInfo {
+            tablet_id: 101,
+            backend_id: 202,
+        };
+        add_tablet_commit_info(finst_id, commit);
+        add_tablet_commit_info(finst_id, commit);
+        add_tablet_commit_info(
+            finst_id,
+            TabletCommitInfo {
+                tablet_id: 101,
+                backend_id: 303,
+            },
+        );
+
+        let fail = TabletFailInfo {
+            tablet_id: 404,
+            backend_id: 505,
+        };
+        add_tablet_fail_info(finst_id, fail);
+        add_tablet_fail_info(finst_id, fail);
+
+        assert_eq!(
+            list_tablet_commit_infos(finst_id),
+            vec![
+                commit,
+                TabletCommitInfo {
+                    tablet_id: 101,
+                    backend_id: 303,
+                },
+            ]
+        );
+        assert_eq!(list_tablet_fail_infos(finst_id), vec![fail]);
+
+        unregister(finst_id);
+    }
 }

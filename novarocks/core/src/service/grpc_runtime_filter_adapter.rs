@@ -17,8 +17,12 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, TimeUnit};
+
 use crate::common::types::UniqueId;
 use crate::proto;
+use crate::proto::common::{PrimitiveType, ScalarType, TypeDesc, type_desc::Kind};
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
@@ -29,6 +33,131 @@ use crate::runtime_filter::port::transport::{
     RuntimeFilterEnvelopeKind, RuntimeFilterIngressResult, RuntimeFilterRouteIdentity,
     RuntimeFilterTransportError,
 };
+
+pub(crate) type NativeRuntimeFilterRequest = proto::filter::TransmitRuntimeFilterRequest;
+pub(crate) type NativeRuntimeFilterResponse = proto::filter::TransmitRuntimeFilterResponse;
+
+pub(crate) fn decode_runtime_filter_transmission(
+    request: proto::filter::TransmitRuntimeFilterRequest,
+) -> Result<RuntimeFilterTransmission, String> {
+    let query_id = request
+        .query_id
+        .ok_or_else(|| "missing query_id for transmit_runtime_filter".to_string())?;
+    RuntimeFilterTransmission::try_new(
+        request.is_partial,
+        UniqueId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        },
+        request.filter_id,
+        request.data,
+        request.build_be_number,
+        request
+            .column_type
+            .as_ref()
+            .and_then(arrow_type_from_common_type_desc),
+    )
+}
+
+pub(crate) fn encode_runtime_filter_transmission(
+    transmission: RuntimeFilterTransmission,
+) -> proto::filter::TransmitRuntimeFilterRequest {
+    proto::filter::TransmitRuntimeFilterRequest {
+        is_partial: transmission.is_partial,
+        query_id: Some(proto::common::UniqueId {
+            hi: transmission.query_id.hi,
+            lo: transmission.query_id.lo,
+        }),
+        filter_id: transmission.filter_id,
+        data: transmission.data,
+        build_be_number: transmission.build_be_number,
+        column_type: transmission
+            .column_type
+            .as_ref()
+            .and_then(arrow_type_to_common_type_desc),
+    }
+}
+
+pub(crate) fn encode_runtime_filter_result(
+    filter_id: i32,
+    result: Result<(), String>,
+) -> proto::filter::TransmitRuntimeFilterResponse {
+    let status = match result {
+        Ok(()) => proto::common::Status {
+            code: 0,
+            message: String::new(),
+        },
+        Err(message) => proto::common::Status { code: 1, message },
+    };
+    proto::filter::TransmitRuntimeFilterResponse {
+        status: Some(status),
+        filter_id,
+    }
+}
+
+fn arrow_type_to_common_type_desc(data_type: &DataType) -> Option<TypeDesc> {
+    let (primitive, precision, scale) = match data_type {
+        DataType::Boolean => (PrimitiveType::Boolean, None, None),
+        DataType::Int8 => (PrimitiveType::Tinyint, None, None),
+        DataType::Int16 => (PrimitiveType::Smallint, None, None),
+        DataType::Int32 => (PrimitiveType::Int, None, None),
+        DataType::Int64 => (PrimitiveType::Bigint, None, None),
+        DataType::Float32 => (PrimitiveType::Float, None, None),
+        DataType::Float64 => (PrimitiveType::Double, None, None),
+        DataType::Date32 => (PrimitiveType::Date, None, None),
+        DataType::Timestamp(_, _) => (PrimitiveType::Datetime, None, None),
+        DataType::Utf8 => (PrimitiveType::Varchar, None, None),
+        DataType::Decimal128(precision, scale) if is_valid_decimal128(*precision, *scale) => (
+            PrimitiveType::Decimal128,
+            Some(i32::from(*precision)),
+            Some(i32::from(*scale)),
+        ),
+        _ => return None,
+    };
+    Some(TypeDesc {
+        kind: Some(Kind::Scalar(ScalarType {
+            r#type: primitive as i32,
+            len: None,
+            precision,
+            scale,
+            time_unit: None,
+        })),
+    })
+}
+
+fn arrow_type_from_common_type_desc(desc: &TypeDesc) -> Option<DataType> {
+    let Kind::Scalar(scalar) = desc.kind.as_ref()? else {
+        return None;
+    };
+    match PrimitiveType::try_from(scalar.r#type).ok()? {
+        PrimitiveType::Boolean => Some(DataType::Boolean),
+        PrimitiveType::Tinyint => Some(DataType::Int8),
+        PrimitiveType::Smallint => Some(DataType::Int16),
+        PrimitiveType::Int => Some(DataType::Int32),
+        PrimitiveType::Bigint => Some(DataType::Int64),
+        PrimitiveType::Float => Some(DataType::Float32),
+        PrimitiveType::Double => Some(DataType::Float64),
+        PrimitiveType::Date => Some(DataType::Date32),
+        PrimitiveType::Datetime => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        PrimitiveType::Varchar | PrimitiveType::Char => Some(DataType::Utf8),
+        PrimitiveType::Decimal128 => {
+            let precision = scalar.precision?;
+            let scale = scalar.scale?;
+            if !(1..=38).contains(&precision) || scale < 0 || scale > precision {
+                return None;
+            }
+            Some(DataType::Decimal128(
+                u8::try_from(precision).ok()?,
+                i8::try_from(scale).ok()?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn is_valid_decimal128(precision: u8, scale: i8) -> bool {
+    (1..=38).contains(&precision) && scale >= 0 && i32::from(scale) <= i32::from(precision)
+}
 
 pub(crate) fn handle_runtime_filter_envelope(
     ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
@@ -188,6 +317,11 @@ mod tests {
 
     use tonic::Code;
 
+    use arrow::datatypes::DataType;
+
+    use super::{decode_runtime_filter_transmission, encode_runtime_filter_transmission};
+    use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
+
     use crate::common::types::UniqueId;
     use crate::proto;
     use crate::runtime_filter::model::contract::{BindingId, ChannelId};
@@ -198,6 +332,103 @@ mod tests {
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
         RuntimeFilterIngressResult,
     };
+
+    #[test]
+    fn legacy_native_runtime_filter_transmission_round_trips_domain_values() {
+        let transmission = RuntimeFilterTransmission {
+            is_partial: true,
+            query_id: UniqueId { hi: 31, lo: 47 },
+            filter_id: 59,
+            data: vec![1, 2, 3],
+            build_be_number: 7,
+            column_type: Some(DataType::Decimal128(18, 2)),
+        };
+
+        let wire = encode_runtime_filter_transmission(transmission.clone());
+        let decoded = decode_runtime_filter_transmission(wire).expect("decode native transmission");
+
+        assert_eq!(decoded, transmission);
+    }
+
+    #[test]
+    fn legacy_native_runtime_filter_transmission_rejects_missing_query_id() {
+        let error = decode_runtime_filter_transmission(
+            crate::proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: false,
+                query_id: None,
+                filter_id: 61,
+                data: vec![9],
+                build_be_number: 0,
+                column_type: None,
+            },
+        )
+        .expect_err("missing query id must fail at native wire boundary");
+
+        assert!(error.contains("query_id"), "{error}");
+    }
+
+    #[test]
+    fn legacy_native_runtime_filter_transmission_rejects_zero_query_id() {
+        let error = decode_runtime_filter_transmission(
+            crate::proto::filter::TransmitRuntimeFilterRequest {
+                is_partial: false,
+                query_id: Some(crate::proto::common::UniqueId { hi: 0, lo: 0 }),
+                filter_id: 63,
+                data: vec![9],
+                build_be_number: 0,
+                column_type: None,
+            },
+        )
+        .expect_err("zero query id must fail at native wire boundary");
+
+        assert!(error.contains("query_id"), "{error}");
+    }
+
+    #[test]
+    fn legacy_native_runtime_filter_types_preserve_supported_subset() {
+        use arrow::datatypes::TimeUnit;
+
+        for column_type in [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Utf8,
+            DataType::Decimal128(38, 9),
+        ] {
+            let transmission = RuntimeFilterTransmission {
+                is_partial: true,
+                query_id: UniqueId { hi: 67, lo: 71 },
+                filter_id: 73,
+                data: vec![8],
+                build_be_number: 2,
+                column_type: Some(column_type.clone()),
+            };
+            let decoded = decode_runtime_filter_transmission(encode_runtime_filter_transmission(
+                transmission,
+            ))
+            .expect("decode supported native type");
+            assert_eq!(decoded.column_type, Some(column_type));
+        }
+
+        let unsupported = RuntimeFilterTransmission {
+            is_partial: true,
+            query_id: UniqueId { hi: 79, lo: 83 },
+            filter_id: 89,
+            data: vec![9],
+            build_be_number: 1,
+            column_type: Some(DataType::Binary),
+        };
+        let decoded =
+            decode_runtime_filter_transmission(encode_runtime_filter_transmission(unsupported))
+                .expect("decode unsupported native type as absent");
+        assert_eq!(decoded.column_type, None);
+    }
 
     use super::{default_runtime_filter_envelope_ingress, handle_runtime_filter_envelope};
 

@@ -231,6 +231,14 @@ fn native_file_range(
 ) -> &crate::runtime::scan_range::FileScanRange {
     match &range.range {
         crate::runtime::scan_range::ScanRange::File(file) => file,
+        #[cfg(feature = "compat")]
+        crate::runtime::scan_range::ScanRange::BrokerFile(_) => {
+            panic!("expected native file range, got StarRocks broker-file range")
+        }
+        #[cfg(feature = "compat")]
+        crate::runtime::scan_range::ScanRange::SchemaSelection(_) => {
+            panic!("expected native file range, got StarRocks schema selection")
+        }
         crate::runtime::scan_range::ScanRange::StarRocksTablet(_) => {
             panic!("expected file range")
         }

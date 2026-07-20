@@ -160,6 +160,22 @@ impl ExprArena {
         self.nodes.get(id.0)
     }
 
+    pub(crate) fn replace_literal(
+        &mut self,
+        id: ExprId,
+        value: LiteralValue,
+    ) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(id.0)
+            .ok_or_else(|| format!("expression id {} is out of bounds", id.0))?;
+        if !matches!(node, ExprNode::Literal(_)) {
+            return Err(format!("expression id {} is not a literal", id.0));
+        }
+        *node = ExprNode::Literal(value);
+        Ok(())
+    }
+
     pub fn data_type(&self, id: ExprId) -> Option<&DataType> {
         self.types.get(id.0)
     }

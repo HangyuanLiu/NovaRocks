@@ -30,7 +30,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 
 const SEGMENT_TRAILER_MAGIC: &[u8; 4] = b"D0R1";
 const PAGE_TYPE_DATA: i32 = 1;
@@ -883,7 +883,7 @@ fn is_positional_generated_field_name(field_name: &str, index: usize) -> bool {
 
 fn align_batch_columns_to_schema_for_native_writer(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<RecordBatch, String> {
     if tablet_schema.column.is_empty() {
         return Ok(batch.clone());
@@ -954,7 +954,7 @@ fn align_batch_columns_to_schema_for_native_writer(
 }
 pub fn build_starrocks_native_segment_bytes(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<Vec<u8>, String> {
     let batch = align_batch_columns_to_schema_for_native_writer(batch, tablet_schema)?;
     if batch.num_rows() == 0 {
@@ -1048,7 +1048,7 @@ pub fn build_starrocks_native_segment_bytes(
 
 fn build_short_key_index_page(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<Option<Vec<u8>>, String> {
     let short_key_indexes = resolve_short_key_indexes(tablet_schema, batch.num_columns())?;
     if short_key_indexes.is_empty() {
@@ -1122,7 +1122,7 @@ fn build_short_key_index_page(
 }
 
 fn resolve_short_key_indexes(
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     num_columns: usize,
 ) -> Result<Vec<usize>, String> {
     let short_key_count = tablet_schema.num_short_key_columns.unwrap_or(0).max(0) as usize;
@@ -1157,7 +1157,7 @@ struct PreparedShortKeyColumn {
 
 fn prepare_short_key_columns(
     batch: &RecordBatch,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     short_key_indexes: &[usize],
 ) -> Result<Vec<PreparedShortKeyColumn>, String> {
     short_key_indexes
@@ -1697,7 +1697,7 @@ fn format_datetime_zone_map(unix_micros: i64) -> Result<Vec<u8>, String> {
 
 fn build_native_column_meta_recursive(
     column: &ArrayRef,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_id: u32,
     unique_id_fallback: u32,
     column_index: usize,
@@ -1750,7 +1750,7 @@ fn build_native_column_meta_recursive(
 
 fn build_native_scalar_column_meta(
     column: &ArrayRef,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_id: u32,
     unique_id_fallback: u32,
     column_index: usize,
@@ -1828,7 +1828,7 @@ fn build_native_scalar_column_meta(
 
 fn build_native_array_column_meta(
     column: &ArrayRef,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_id: u32,
     unique_id_fallback: u32,
     column_index: usize,
@@ -1915,7 +1915,7 @@ fn build_native_array_column_meta(
 
 fn build_native_map_column_meta(
     column: &ArrayRef,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_id: u32,
     unique_id_fallback: u32,
     column_index: usize,
@@ -2012,7 +2012,7 @@ fn build_native_map_column_meta(
 
 fn build_native_struct_column_meta(
     column: &ArrayRef,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_id: u32,
     unique_id_fallback: u32,
     column_index: usize,
@@ -2110,7 +2110,7 @@ fn build_native_struct_column_meta(
     })
 }
 
-fn resolve_column_unique_id(column: &ColumnPb, fallback: u32) -> u32 {
+fn resolve_column_unique_id(column: &StarRocksColumnSchema, fallback: u32) -> u32 {
     u32::try_from(column.unique_id).unwrap_or(fallback)
 }
 
@@ -2119,8 +2119,8 @@ fn build_synthetic_child_column(
     name: String,
     type_name: &str,
     is_nullable: bool,
-) -> ColumnPb {
-    ColumnPb {
+) -> StarRocksColumnSchema {
+    StarRocksColumnSchema {
         unique_id: i32::try_from(unique_id).unwrap_or(i32::MAX),
         name: Some(name),
         r#type: type_name.to_string(),
@@ -2303,7 +2303,7 @@ fn extract_map_storage(
 fn build_segment_zone_map_for_column(
     column: &ArrayRef,
     column_index: usize,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     writer_type: NativeWriterType,
 ) -> Result<ZoneMapWriterPb, String> {
     let column_name = schema_column.name.as_deref().unwrap_or("<unknown>");
@@ -2905,7 +2905,7 @@ fn min_max_binary(array: &BinaryArray) -> Result<(Vec<u8>, Vec<u8>), String> {
 }
 
 fn decimal_meta_from_schema_column(
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     column_index: usize,
     column_name: &str,
 ) -> Result<(u8, i8), String> {
@@ -3077,7 +3077,9 @@ impl NativeWriterType {
     }
 }
 
-fn map_schema_type_to_writer_type(column: &ColumnPb) -> Result<NativeWriterType, String> {
+fn map_schema_type_to_writer_type(
+    column: &StarRocksColumnSchema,
+) -> Result<NativeWriterType, String> {
     let type_name = column.r#type.trim().to_ascii_uppercase();
     let base_type = type_name.split('(').next().unwrap_or(type_name.as_str());
     match base_type {
@@ -3173,7 +3175,7 @@ fn decode_largeint_values(
 fn encode_native_data_page_for_column(
     column: &ArrayRef,
     column_index: usize,
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     writer_type: NativeWriterType,
 ) -> Result<Vec<u8>, String> {
     let column_name = schema_column.name.as_deref().unwrap_or("<unknown>");

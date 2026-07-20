@@ -19,9 +19,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
+use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::partition_key::{PartitionExprPlan, PartitionKeyValue};
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FrontendAddress {
@@ -40,14 +41,75 @@ pub(crate) struct StarRocksSinkFactoryInput {
 }
 
 #[derive(Clone)]
+pub(crate) struct StarRocksTableSinkProgram {
+    pub(crate) name: String,
+    pub(crate) descriptor: StarRocksTableSinkDescriptor,
+    pub(crate) output_projection: Option<SinkOutputProjectionPlan>,
+    pub(crate) output_expr_slot_name_map: HashMap<String, SlotId>,
+    pub(crate) output_expr_slot_ids: Vec<Option<SlotId>>,
+    pub(crate) literal_partition_values: Option<Vec<String>>,
+}
+
+impl std::fmt::Debug for StarRocksTableSinkProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StarRocksTableSinkProgram")
+            .field("name", &self.name)
+            .field("db_id", &self.descriptor.db_id)
+            .field("table_id", &self.descriptor.table_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StarRocksTableSinkProgram {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("StarRocks table sink program name must not be empty".to_string());
+        }
+        if self.descriptor.db_id <= 0 || self.descriptor.table_id <= 0 {
+            return Err(format!(
+                "StarRocks table sink program requires positive db/table ids, got db_id={} table_id={}",
+                self.descriptor.db_id, self.descriptor.table_id
+            ));
+        }
+        if self.descriptor.schema.indexes.is_empty() {
+            return Err(
+                "StarRocks table sink program requires at least one write index".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StarRocksTableSinkDescriptor {
+    pub(crate) db_id: i64,
+    pub(crate) table_id: i64,
+    pub(crate) db_name: Option<String>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) keys_type: StarRocksKeysType,
+    pub(crate) is_lake_table: bool,
+    pub(crate) dynamic_overwrite: bool,
+    pub(crate) partial_update_mode:
+        crate::connector::starrocks::lake::context::PartialUpdateWriteMode,
+    pub(crate) merge_condition: Option<String>,
+    pub(crate) null_expr_in_auto_increment: bool,
+    pub(crate) miss_auto_increment_column: bool,
+    pub(crate) schema: SinkSchemaDescriptor,
+    pub(crate) partition: SinkPartitionDescriptor,
+    pub(crate) location: SinkLocationDescriptor,
+    pub(crate) nodes: SinkNodesDescriptor,
+}
+
+#[derive(Clone)]
 pub(crate) struct StarRocksSinkDescriptor {
     pub(crate) db_id: i64,
     pub(crate) table_id: i64,
     pub(crate) db_name: Option<String>,
     pub(crate) table_name: Option<String>,
     pub(crate) txn_id: i64,
-    pub(crate) load_id: PUniqueId,
-    pub(crate) keys_type: KeysType,
+    pub(crate) load_id: UniqueId,
+    pub(crate) keys_type: StarRocksKeysType,
     pub(crate) is_lake_table: bool,
     pub(crate) dynamic_overwrite: bool,
     pub(crate) partial_update_mode:
@@ -80,7 +142,7 @@ pub(crate) struct SinkIndexDescriptor {
     pub(crate) index_id: i64,
     pub(crate) schema_id: i64,
     pub(crate) column_names: Vec<String>,
-    pub(crate) tablet_schema: TabletSchemaPb,
+    pub(crate) tablet_schema: StarRocksTabletSchema,
     pub(crate) column_to_expr_value: HashMap<String, String>,
     pub(crate) is_shadow: bool,
     pub(crate) where_clause: Option<SinkPredicatePlan>,

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::thrift::descriptors;
+use crate::runtime::descriptor_snapshot::LookupNodesInfo;
 
 #[derive(Clone, Debug)]
 pub struct FetchNode {
@@ -27,6 +27,6 @@ pub struct FetchNode {
     pub node_id: i32,
     pub target_node_id: i32,
     pub row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    pub nodes_info: Option<descriptors::TNodesInfo>,
+    pub nodes_info: Option<LookupNodesInfo>,
     pub output_chunk_schema: ChunkSchemaRef,
 }

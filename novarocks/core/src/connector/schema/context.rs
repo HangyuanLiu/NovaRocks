@@ -15,7 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 #[cfg(feature = "compat")]
-use crate::thrift::{plan_nodes, types};
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaUserRoles {
+    pub(crate) role_id_list: Option<Vec<i64>>,
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaUserIdentity {
+    pub(crate) username: Option<String>,
+    pub(crate) host: Option<String>,
+    pub(crate) is_domain: Option<bool>,
+    pub(crate) is_ephemeral: Option<bool>,
+    pub(crate) current_role_ids: Option<SchemaUserRoles>,
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaFrontend {
+    pub(crate) id: Option<String>,
+    pub(crate) ip: Option<String>,
+    pub(crate) http_port: Option<i32>,
+}
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -30,7 +51,7 @@ pub(crate) struct SchemaScanContext {
     pub(crate) thread_id: Option<i64>,
     pub(crate) user_ip: Option<String>,
     #[cfg(feature = "compat")]
-    pub(crate) current_user_ident: Option<types::TUserIdentity>,
+    pub(crate) current_user_ident: Option<SchemaUserIdentity>,
     pub(crate) catalog_name: Option<String>,
     pub(crate) table_id: Option<i64>,
     pub(crate) partition_id: Option<i64>,
@@ -47,56 +68,13 @@ pub(crate) struct SchemaScanContext {
     pub(crate) log_pattern: Option<String>,
     pub(crate) log_limit: Option<i64>,
     #[cfg(feature = "compat")]
-    pub(crate) frontends: Vec<plan_nodes::TFrontend>,
+    pub(crate) frontends: Vec<SchemaFrontend>,
 }
 
 impl SchemaScanContext {
-    #[cfg(feature = "compat")]
-    pub(crate) fn from_thrift(node: &plan_nodes::TSchemaScanNode) -> Self {
-        Self {
-            table_name: node.table_name.trim().to_ascii_lowercase(),
-            db: normalize_optional_string(node.db.as_ref()),
-            table: normalize_optional_string(node.table.as_ref()),
-            wild: normalize_optional_string(node.wild.as_ref()),
-            user: normalize_optional_string(node.user.as_ref()),
-            ip: normalize_optional_string(node.ip.as_ref()),
-            port: node.port.filter(|value| *value > 0),
-            thread_id: node.thread_id.filter(|value| *value >= 0),
-            user_ip: normalize_optional_string(node.user_ip.as_ref()),
-            #[cfg(feature = "compat")]
-            current_user_ident: node.current_user_ident.clone(),
-            catalog_name: normalize_optional_string(node.catalog_name.as_ref()),
-            table_id: node.table_id.filter(|value| *value > 0),
-            partition_id: node.partition_id.filter(|value| *value > 0),
-            tablet_id: node.tablet_id.filter(|value| *value > 0),
-            txn_id: node.txn_id.filter(|value| *value > 0),
-            job_id: node.job_id.filter(|value| *value >= 0),
-            label: normalize_optional_string(node.label.as_ref()),
-            type_: normalize_optional_string(node.type_.as_ref())
-                .map(|value| value.to_ascii_uppercase()),
-            state: normalize_optional_string(node.state.as_ref())
-                .map(|value| value.to_ascii_uppercase()),
-            limit: node.limit.filter(|value| *value >= 0),
-            log_start_ts: node.log_start_ts.filter(|value| *value > 0),
-            log_end_ts: node.log_end_ts.filter(|value| *value > 0),
-            log_level: normalize_optional_string(node.log_level.as_ref())
-                .map(|value| value.to_ascii_uppercase()),
-            log_pattern: normalize_optional_string(node.log_pattern.as_ref()),
-            log_limit: node.log_limit.filter(|value| *value > 0),
-            #[cfg(feature = "compat")]
-            frontends: node.frontends.clone().unwrap_or_default(),
-        }
-    }
-
     pub(crate) fn limit_as_usize(&self) -> Option<usize> {
         self.limit
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
     }
-}
-
-fn normalize_optional_string(value: Option<&String>) -> Option<String> {
-    value
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
 }

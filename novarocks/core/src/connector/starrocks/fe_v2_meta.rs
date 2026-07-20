@@ -23,7 +23,6 @@ use crate::connector::starrocks::starmgr;
 use crate::connector::starrocks::table_schema_service;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::starlet_shard_registry;
-use crate::thrift::types;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LakeTableIdentity {
@@ -486,22 +485,15 @@ fn collect_missing_tablet_ids(
 }
 
 pub(crate) fn fetch_table_schema_for_lake_scan(
-    fe_addr: Option<&types::TNetworkAddress>,
+    fe_addr: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
     db_id: i64,
     table_id: i64,
     schema_id: i64,
     tablet_id: Option<i64>,
     query_id: Option<UniqueId>,
-    local_schema: Option<&crate::thrift::agent_service::TTabletSchema>,
-) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
+) -> Result<crate::connector::starrocks::schema::LakeScanTableSchema, String> {
     table_schema_service::fetch_table_schema_for_lake_scan(
-        fe_addr,
-        db_id,
-        table_id,
-        schema_id,
-        tablet_id,
-        query_id,
-        local_schema,
+        fe_addr, db_id, table_id, schema_id, tablet_id, query_id,
     )
 }
 

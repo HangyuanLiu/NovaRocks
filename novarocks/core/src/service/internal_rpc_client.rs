@@ -20,7 +20,11 @@ use prost::Message;
 
 use crate::common::types::UniqueId;
 use crate::runtime::query_context::QueryId;
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::service::engine_ffi::NovaRocksRustBuf;
+use crate::service::starrocks_runtime_filter_wire::{
+    StarRocksRuntimeFilterResponse, encode_runtime_filter_transmission,
+};
 
 pub use crate::proto;
 
@@ -110,32 +114,6 @@ fn lookup_close_status_error(status: Option<&proto::starrocks::StatusPb>) -> Res
     status_error(Some(status), "lookup_close")
 }
 
-fn runtime_filter_request_to_compat(
-    params: proto::filter::TransmitRuntimeFilterRequest,
-) -> proto::starrocks::PTransmitRuntimeFilterParams {
-    let column_type = params.column_type.and_then(|desc| {
-        crate::exec::runtime_filter::arrow_type_from_common_type_desc(&desc).and_then(|data_type| {
-            crate::exec::runtime_filter::arrow_type_to_proto_type_desc(&data_type)
-        })
-    });
-
-    proto::starrocks::PTransmitRuntimeFilterParams {
-        is_partial: Some(params.is_partial),
-        query_id: params
-            .query_id
-            .as_ref()
-            .map(|query_id| proto::starrocks::PUniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-        filter_id: Some(params.filter_id),
-        data: Some(params.data),
-        build_be_number: params.is_partial.then_some(params.build_be_number),
-        column_type,
-        ..Default::default()
-    }
-}
-
 fn call_unary<Request, Response>(
     dest_host: &str,
     dest_port: u16,
@@ -221,13 +199,13 @@ pub fn send_chunks(
     status_error(response.status.as_ref(), "transmit_chunk")
 }
 
-pub fn transmit_runtime_filter(
+pub(crate) fn transmit_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: proto::filter::TransmitRuntimeFilterRequest,
+    params: RuntimeFilterTransmission,
 ) -> Result<(), String> {
-    let compat_request = runtime_filter_request_to_compat(params);
-    let response: proto::starrocks::PTransmitRuntimeFilterResult = call_unary(
+    let compat_request = encode_runtime_filter_transmission(params);
+    let response: StarRocksRuntimeFilterResponse = call_unary(
         dest_host,
         dest_port,
         compat_request,

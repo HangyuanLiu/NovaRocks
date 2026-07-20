@@ -39,7 +39,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::proto;
 use crate::runtime::descriptor_snapshot::is_lake_row_position;
-use crate::runtime::descriptor_snapshot_thrift::{LookupNodeInfo, LookupNodesInfo};
+use crate::runtime::descriptor_snapshot::{LookupNodeInfo, LookupNodesInfo};
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
@@ -398,10 +398,5 @@ fn find_node(nodes_info: &LookupNodesInfo, backend_id: i32) -> Option<&LookupNod
 }
 
 fn lookup_async_internal_port(node_info: &LookupNodeInfo) -> Result<u16, String> {
-    u16::try_from(node_info.async_internal_port).map_err(|_| {
-        format!(
-            "lookup async_internal_port {} for backend_id {} is out of u16 range",
-            node_info.async_internal_port, node_info.id
-        )
-    })
+    Ok(node_info.async_internal_port)
 }

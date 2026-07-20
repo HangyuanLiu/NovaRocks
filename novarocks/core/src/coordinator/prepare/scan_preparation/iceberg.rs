@@ -43,6 +43,7 @@ pub(crate) fn build_iceberg_metadata_scan_range_params()
         data_sequence_number: None,
         modification_time: None,
         datacache_options: None,
+        candidate_node: None,
         included_positions: Vec::new(),
         serialized_split: Some(String::new()),
         use_iceberg_jni_metadata_reader: true,

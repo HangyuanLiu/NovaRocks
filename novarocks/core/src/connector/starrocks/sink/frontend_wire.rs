@@ -26,6 +26,7 @@ use crate::connector::starrocks::sink::plan::{
     CreatePartitionResult, FrontendAddress, SinkNodeInfo, SinkPartitionEntry, SinkPartitionIndex,
     SinkTabletLocation,
 };
+use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{
     FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
@@ -220,16 +221,13 @@ fn partition_boundary_key_from_wire(
     key_nodes: Option<&[exprs::TExprNode]>,
     legacy_node: Option<&exprs::TExprNode>,
 ) -> Result<Option<Vec<PartitionKeyValue>>, String> {
-    if let Some(nodes) = key_nodes {
-        if nodes.is_empty() {
-            return Ok(None);
-        }
-        return parse_partition_key_nodes(nodes).map(Some);
+    let Some(nodes) = select_partition_boundary_key(key_nodes, legacy_node) else {
+        return Ok(None);
+    };
+    if nodes.is_empty() {
+        return Ok(None);
     }
-    if let Some(node) = legacy_node {
-        return parse_partition_key_nodes(std::slice::from_ref(node)).map(Some);
-    }
-    Ok(None)
+    parse_partition_key_nodes(nodes).map(Some)
 }
 
 fn partition_in_keys_from_wire(

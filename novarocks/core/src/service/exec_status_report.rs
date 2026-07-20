@@ -24,7 +24,7 @@ use crate::novarocks_logging::debug;
 use crate::proto::{common, novarocks};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
-use crate::runtime::sink_commit_wire;
+use crate::service::starrocks_sink_commit_wire;
 use crate::thrift::{data_cache, frontend_service, runtime_profile, status, types};
 
 pub(crate) struct ExecStatusReportInput {
@@ -45,8 +45,12 @@ pub(crate) fn build_report_params(
 ) -> frontend_service::TReportExecStatusParams {
     let iceberg_commits = sink_commit::list_iceberg_commits(input.finst_id);
     let sink_commit_infos = thrift_sink_commit_infos_for_report(input.finst_id, &iceberg_commits);
-    let tablet_commit_infos = sink_commit::list_tablet_commit_infos(input.finst_id);
-    let tablet_fail_infos = sink_commit::list_tablet_fail_infos(input.finst_id);
+    let tablet_commit_infos = starrocks_sink_commit_wire::tablet_commit_infos_to_thrift(
+        sink_commit::list_tablet_commit_infos(input.finst_id),
+    );
+    let tablet_fail_infos = starrocks_sink_commit_wire::tablet_fail_infos_to_thrift(
+        sink_commit::list_tablet_fail_infos(input.finst_id),
+    );
     let (normal_rows, loaded_bytes, filtered_rows) =
         load_stats_for_report(input.finst_id, &iceberg_commits);
 
@@ -193,8 +197,8 @@ fn thrift_sink_commit_infos_for_report(
 ) -> Vec<types::TSinkCommitInfo> {
     iceberg_commits
         .iter()
-        .filter_map(
-            |info| match sink_commit_wire::sink_commit_info_from_native(info.clone()) {
+        .filter_map(|info| {
+            match starrocks_sink_commit_wire::iceberg_commit_info_to_thrift(info.clone()) {
                 Ok(info) => Some(info),
                 Err(err) => {
                     debug!(
@@ -205,7 +209,66 @@ fn thrift_sink_commit_infos_for_report(
                     );
                     None
                 }
-            },
-        )
+            }
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecStatusReportInput, build_report_params};
+    use crate::common::types::UniqueId;
+    use crate::runtime::query_context::QueryId;
+    use crate::runtime::sink_commit::{self, TabletCommitInfo, TabletFailInfo};
+    use crate::thrift::status::TStatus;
+    use crate::thrift::status_code::TStatusCode;
+
+    #[test]
+    fn thrift_report_caller_encodes_domain_tablet_results_at_service_boundary() {
+        let finst_id = UniqueId {
+            hi: 9_101,
+            lo: 9_102,
+        };
+        sink_commit::register(finst_id);
+        sink_commit::add_tablet_commit_info(
+            finst_id,
+            TabletCommitInfo {
+                tablet_id: 101,
+                backend_id: 201,
+            },
+        );
+        sink_commit::add_tablet_fail_info(
+            finst_id,
+            TabletFailInfo {
+                tablet_id: 102,
+                backend_id: 202,
+            },
+        );
+
+        let report = build_report_params(ExecStatusReportInput {
+            finst_id,
+            query_id: QueryId {
+                hi: 9_001,
+                lo: 9_002,
+            },
+            backend_num: 7,
+            status: TStatus::new(TStatusCode::OK, None),
+            done: true,
+            profile: None,
+            tracking_url: None,
+            load_channel_profile: None,
+            load_datacache_metrics: None,
+            native_profile: None,
+        });
+        sink_commit::unregister(finst_id);
+
+        let commits = report.commit_infos.expect("tablet commits");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].tablet_id, 101);
+        assert_eq!(commits[0].backend_id, 201);
+        let failures = report.fail_infos.expect("tablet failures");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].tablet_id, Some(102));
+        assert_eq!(failures[0].backend_id, Some(202));
+    }
 }

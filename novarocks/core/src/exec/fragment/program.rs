@@ -85,6 +85,10 @@ impl FragmentProgramOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanAssignmentKind {
     File,
+    #[cfg(feature = "compat")]
+    BrokerFile,
+    #[cfg(feature = "compat")]
+    SchemaSelection,
     StarRocksTablet,
 }
 
@@ -185,6 +189,8 @@ pub(crate) enum FragmentSinkKind {
     Noop,
     DataStream,
     MultiCastDataStream,
+    SplitDataStream,
+    StarRocksTable,
     IcebergChangeStreamRouter,
     IcebergTable,
 }
@@ -193,6 +199,7 @@ pub(crate) enum FragmentSinkKind {
 pub(crate) enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups(NonZeroUsize),
+    StarRocksTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +237,19 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
+            FragmentSinkProgram::SplitDataStream(split) => {
+                let count =
+                    non_empty_group_count(FragmentSinkKind::SplitDataStream, split.sinks().len())?;
+                (
+                    FragmentSinkKind::SplitDataStream,
+                    Required(DestinationGroups(count)),
+                )
+            }
+            #[cfg(feature = "compat")]
+            FragmentSinkProgram::StarRocksTable(_) => (
+                FragmentSinkKind::StarRocksTable,
+                Required(FragmentSinkAssignmentKind::StarRocksTable),
+            ),
             FragmentSinkProgram::IcebergTable(_) => (FragmentSinkKind::IcebergTable, None),
             FragmentSinkProgram::IcebergChangeStreamRouter(router) => {
                 let count = non_empty_group_count(
@@ -251,6 +271,10 @@ impl FragmentSinkSpec {
 
     pub(crate) const fn program(&self) -> &FragmentSinkProgram {
         &self.program
+    }
+
+    pub(crate) fn program_mut(&mut self) -> &mut FragmentSinkProgram {
+        &mut self.program
     }
 
     pub(crate) const fn kind(&self) -> FragmentSinkKind {
@@ -323,8 +347,16 @@ impl FragmentProgram {
         &self.plan
     }
 
+    pub(crate) fn plan_mut(&mut self) -> &mut ExecPlan {
+        &mut self.plan
+    }
+
     pub(crate) const fn sink(&self) -> &FragmentSinkSpec {
         &self.sink
+    }
+
+    pub(crate) fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
+        &mut self.sink
     }
 
     pub(crate) const fn program_options(&self) -> &FragmentProgramOptions {

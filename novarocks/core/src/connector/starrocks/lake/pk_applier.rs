@@ -33,6 +33,9 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::txn_log::{
     ensure_rowset_segment_meta_consistency, normalize_rowset_shared_segments,
 };
+use crate::connector::starrocks::schema::{
+    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+};
 use crate::formats::starrocks::metadata::{
     StarRocksSegmentFile, StarRocksTabletSnapshot, load_bundle_segment_footers,
     tablet_operator_relative_path,
@@ -45,8 +48,8 @@ use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path};
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_if_any;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
-    ColumnPb, DelfileWithRowsetId, DelvecMetadataPb, DelvecPagePb, FileMetaPb, KeysType,
-    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, txn_log_pb,
+    DelfileWithRowsetId, DelvecMetadataPb, DelvecPagePb, FileMetaPb, RowsetMetadataPb,
+    TabletMetadataPb, txn_log_pb,
 };
 
 const DELVEC_FORMAT_VERSION_V1: u8 = 0x01;
@@ -69,7 +72,7 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
     metadata: &mut TabletMetadataPb,
     op_write: &txn_log_pb::OpWrite,
     schema_id: i64,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
     apply_version: i64,
@@ -277,7 +280,9 @@ fn preview_encoded_keys(keys: &[Vec<u8>], limit: usize) -> Vec<String> {
     keys.iter().take(limit).map(hex::encode).collect()
 }
 
-fn build_primary_key_output_schema(tablet_schema: &TabletSchemaPb) -> Result<SchemaRef, String> {
+fn build_primary_key_output_schema(
+    tablet_schema: &StarRocksTabletSchema,
+) -> Result<SchemaRef, String> {
     let mut fields = Vec::new();
     for column in &tablet_schema.column {
         if !column.is_key.unwrap_or(false) {
@@ -307,7 +312,7 @@ fn build_primary_key_output_schema(tablet_schema: &TabletSchemaPb) -> Result<Sch
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn primary_key_arrow_type(column: &ColumnPb) -> Result<DataType, String> {
+fn primary_key_arrow_type(column: &StarRocksColumnSchema) -> Result<DataType, String> {
     let raw = column.r#type.trim().to_ascii_uppercase();
     match raw.as_str() {
         "BOOLEAN" => Ok(DataType::Boolean),
@@ -334,7 +339,7 @@ fn primary_key_arrow_type(column: &ColumnPb) -> Result<DataType, String> {
 
 fn build_visible_primary_key_index(
     metadata: &TabletMetadataPb,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
     key_output_schema: &SchemaRef,
@@ -384,7 +389,7 @@ fn build_visible_primary_key_index(
 fn scan_rowset_primary_key_rows(
     rowset: &RowsetMetadataPb,
     rowset_id: u32,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
     key_output_schema: &SchemaRef,
@@ -395,7 +400,7 @@ fn scan_rowset_primary_key_rows(
     let mut output = Vec::with_capacity(rowset.segments.len());
     let object_store_profile = build_metadata_object_store_profile(tablet_root_path, s3_config)?;
     let mut snapshot_schema = tablet_schema.clone();
-    snapshot_schema.keys_type = Some(KeysType::DupKeys as i32);
+    snapshot_schema.keys_type = Some(StarRocksKeysType::Duplicate);
     let has_bundle_offsets = !rowset.bundle_file_offsets.is_empty();
     let has_segment_sizes = !rowset.segment_size.is_empty();
 

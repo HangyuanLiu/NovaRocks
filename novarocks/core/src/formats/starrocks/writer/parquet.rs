@@ -31,6 +31,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::fs_access::resolve_format_path;
 use crate::formats::starrocks::metadata::{StarRocksSegmentFile, StarRocksTabletSnapshot};
 use crate::formats::starrocks::plan::{
@@ -38,7 +39,6 @@ use crate::formats::starrocks::plan::{
     validate_physical_schema_to_output_type,
 };
 use crate::fs::access::FsScheme;
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
 pub fn read_bundle_parquet_snapshot_if_any(
     snapshot: &StarRocksTabletSnapshot,
@@ -64,7 +64,7 @@ pub fn read_bundle_parquet_snapshot_with_output_hints_and_physical_schema_if_any
     snapshot: &StarRocksTabletSnapshot,
     output_schema: SchemaRef,
     output_hints: &[StarRocksOutputColumnHint],
-    physical_fallback_schema: &TabletSchemaPb,
+    physical_fallback_schema: &StarRocksTabletSchema,
 ) -> Result<Option<RecordBatch>, String> {
     read_bundle_parquet_snapshot_impl(
         snapshot,
@@ -78,7 +78,7 @@ fn read_bundle_parquet_snapshot_impl(
     snapshot: &StarRocksTabletSnapshot,
     output_schema: SchemaRef,
     output_hints: Option<&[StarRocksOutputColumnHint]>,
-    physical_fallback_schema: &TabletSchemaPb,
+    physical_fallback_schema: &StarRocksTabletSchema,
 ) -> Result<Option<RecordBatch>, String> {
     if snapshot.segment_files.is_empty() {
         return Ok(None);
@@ -133,8 +133,8 @@ fn read_bundle_parquet_snapshot_impl(
 fn resolve_segment_source_schema<'a>(
     snapshot: &'a StarRocksTabletSnapshot,
     segment: &StarRocksSegmentFile,
-    physical_fallback_schema: &'a TabletSchemaPb,
-) -> Result<&'a TabletSchemaPb, String> {
+    physical_fallback_schema: &'a StarRocksTabletSchema,
+) -> Result<&'a StarRocksTabletSchema, String> {
     let schema_id = match segment.schema_id {
         None => return Ok(physical_fallback_schema),
         Some(schema_id) if schema_id <= 0 => {
@@ -307,8 +307,8 @@ fn align_batch_to_output_schema_with_hints_and_current_schema(
     batch: RecordBatch,
     output_schema: &SchemaRef,
     output_hints: &[StarRocksOutputColumnHint],
-    current_schema: &TabletSchemaPb,
-    physical_schema: &TabletSchemaPb,
+    current_schema: &StarRocksTabletSchema,
+    physical_schema: &StarRocksTabletSchema,
 ) -> Result<RecordBatch, String> {
     if output_hints.len() != output_schema.fields().len() {
         return Err(format!(
@@ -329,8 +329,8 @@ fn align_batch_to_output_schema_inner(
     output_schema: &SchemaRef,
     output_hints: Option<(
         &[StarRocksOutputColumnHint],
-        &TabletSchemaPb,
-        &TabletSchemaPb,
+        &StarRocksTabletSchema,
+        &StarRocksTabletSchema,
     )>,
 ) -> Result<RecordBatch, String> {
     let physical_names_by_unique_id = output_hints
@@ -590,7 +590,10 @@ fn align_batch_to_output_schema_inner(
         .map_err(|e| format!("build aligned batch failed: {}", e))
 }
 
-fn find_schema_column_by_unique_id(schema: &TabletSchemaPb, unique_id: u32) -> Option<&ColumnPb> {
+fn find_schema_column_by_unique_id(
+    schema: &StarRocksTabletSchema,
+    unique_id: u32,
+) -> Option<&StarRocksColumnSchema> {
     schema
         .column
         .iter()
@@ -598,7 +601,7 @@ fn find_schema_column_by_unique_id(schema: &TabletSchemaPb, unique_id: u32) -> O
 }
 
 fn validate_authoritative_current_schema_for_output(
-    current_column: &ColumnPb,
+    current_column: &StarRocksColumnSchema,
     output_field: &Field,
     output_path: &str,
 ) -> Result<(), String> {
@@ -617,7 +620,7 @@ fn validate_authoritative_current_schema_for_output(
 }
 
 fn validate_physical_schema_nullability_for_arrow_field(
-    physical_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
     arrow_field: &Field,
     output_path: &str,
 ) -> Result<(), String> {
@@ -636,7 +639,7 @@ enum ParquetNullabilityBoundary {
 }
 
 fn validate_schema_column_nullability_against_arrow_field(
-    schema_column: &ColumnPb,
+    schema_column: &StarRocksColumnSchema,
     arrow_field: &Field,
     output_path: &str,
     boundary: ParquetNullabilityBoundary,
@@ -702,7 +705,7 @@ fn validate_schema_column_nullability_against_arrow_field(
 }
 
 fn required_physical_column_nullability(
-    physical_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
     output_path: &str,
 ) -> Result<bool, String> {
     physical_column.is_nullable.ok_or_else(|| {
@@ -714,7 +717,7 @@ fn required_physical_column_nullability(
 }
 
 fn build_missing_authoritative_column(
-    current_column: &ColumnPb,
+    current_column: &StarRocksColumnSchema,
     output_type: &DataType,
     row_count: usize,
     output_name: &str,
@@ -746,8 +749,8 @@ fn build_missing_authoritative_column(
 fn find_physical_schema_column<'a>(
     hint: Option<&StarRocksOutputColumnHint>,
     source_name: &str,
-    physical_schema: &'a TabletSchemaPb,
-) -> Option<&'a ColumnPb> {
+    physical_schema: &'a StarRocksTabletSchema,
+) -> Option<&'a StarRocksColumnSchema> {
     let hinted_unique_id = hint.and_then(|hint| match hint.physical_binding {
         StarRocksPhysicalColumnBinding::AuthoritativeUniqueId(unique_id) => Some(unique_id),
         StarRocksPhysicalColumnBinding::LegacyName => hint.schema_unique_id,
@@ -771,7 +774,7 @@ fn find_physical_schema_column<'a>(
 }
 
 fn build_physical_names_by_unique_id(
-    physical_schema: &TabletSchemaPb,
+    physical_schema: &StarRocksTabletSchema,
 ) -> Result<HashMap<u32, String>, String> {
     let mut names = HashMap::new();
     let mut seen_unique_ids = HashMap::<u32, ()>::new();
@@ -815,8 +818,8 @@ fn build_physical_names_by_unique_id(
 }
 
 fn derive_physical_arrow_type_for_output(
-    physical_column: &ColumnPb,
-    current_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
+    current_column: &StarRocksColumnSchema,
     output_type: &DataType,
     output_path: &str,
 ) -> Result<DataType, String> {
@@ -945,7 +948,7 @@ fn derive_physical_arrow_type_for_output(
 }
 
 fn validate_current_schema_matches_output_type(
-    current_column: &ColumnPb,
+    current_column: &StarRocksColumnSchema,
     output_type: &DataType,
     output_path: &str,
 ) -> Result<DataType, String> {
@@ -966,8 +969,8 @@ fn validate_current_schema_matches_output_type(
 }
 
 fn validate_complex_schema_type(
-    physical_column: &ColumnPb,
-    current_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
+    current_column: &StarRocksColumnSchema,
     expected_type: &str,
     output_type: &DataType,
 ) -> Result<(), String> {
@@ -982,8 +985,8 @@ fn validate_complex_schema_type(
 }
 
 fn validate_complex_child_count(
-    physical_column: &ColumnPb,
-    current_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
+    current_column: &StarRocksColumnSchema,
     expected: usize,
     output_path: &str,
 ) -> Result<(), String> {
@@ -999,15 +1002,15 @@ fn validate_complex_child_count(
     Ok(())
 }
 
-fn nonnegative_schema_column_unique_id(column: &ColumnPb) -> Option<u32> {
+fn nonnegative_schema_column_unique_id(column: &StarRocksColumnSchema) -> Option<u32> {
     u32::try_from(column.unique_id).ok()
 }
 
 fn build_complex_children_by_unique_id<'a>(
-    children: &'a [ColumnPb],
+    children: &'a [StarRocksColumnSchema],
     schema_role: &str,
     output_path: &str,
-) -> Result<std::collections::HashMap<u32, (usize, &'a ColumnPb)>, String> {
+) -> Result<std::collections::HashMap<u32, (usize, &'a StarRocksColumnSchema)>, String> {
     let mut by_unique_id = std::collections::HashMap::new();
     for (idx, child) in children.iter().enumerate() {
         let Some(unique_id) = nonnegative_schema_column_unique_id(child) else {
@@ -1023,11 +1026,11 @@ fn build_complex_children_by_unique_id<'a>(
 }
 
 fn align_struct_physical_children<'a>(
-    physical_column: &'a ColumnPb,
-    current_column: &ColumnPb,
+    physical_column: &'a StarRocksColumnSchema,
+    current_column: &StarRocksColumnSchema,
     output_fields: &Fields,
     output_path: &str,
-) -> Result<Vec<(usize, &'a ColumnPb)>, String> {
+) -> Result<Vec<(usize, &'a StarRocksColumnSchema)>, String> {
     if current_column.children_columns.len() != output_fields.len()
         || physical_column.children_columns.len() != current_column.children_columns.len()
     {
@@ -1110,8 +1113,8 @@ fn align_struct_physical_children<'a>(
 
 fn cast_parquet_array_to_output(
     source: ArrayRef,
-    physical_column: &ColumnPb,
-    current_column: &ColumnPb,
+    physical_column: &StarRocksColumnSchema,
+    current_column: &StarRocksColumnSchema,
     output_type: &DataType,
     output_path: &str,
 ) -> Result<ArrayRef, String> {

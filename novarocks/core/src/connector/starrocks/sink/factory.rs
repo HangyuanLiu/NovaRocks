@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
+use crate::common::types::UniqueId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTableIdentity, LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
 };
@@ -33,6 +34,7 @@ use crate::connector::starrocks::lake::TabletWriteContext;
 use crate::connector::starrocks::lake::context::{
     AutoIncrementWritePolicy, PartialUpdateWritePolicy, get_tablet_runtime,
 };
+use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::frontend_wire::create_automatic_partitions;
 use crate::connector::starrocks::sink::operator::{
     OlapSinkFinalizeSharedState, OlapTableSinkOperator,
@@ -44,15 +46,14 @@ use crate::connector::starrocks::sink::plan::{
     FrontendAddress, SinkIndexDescriptor, SinkOutputProjectionPlan, SinkPredicatePlan,
     SinkSchemaDescriptor, SinkSlotDescriptor, StarRocksSinkDescriptor, StarRocksSinkFactoryInput,
 };
-use crate::connector::starrocks::sink::report_wire::TabletCommitInfo;
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing_for_index_id};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
+use crate::runtime::sink_commit::TabletCommitInfo;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
-use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 
 const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
@@ -72,7 +73,7 @@ pub(crate) struct OlapTableSinkPlan {
     pub(crate) db_name: Option<String>,
     pub(crate) table_name: Option<String>,
     pub(crate) txn_id: i64,
-    pub(crate) load_id: PUniqueId,
+    pub(crate) load_id: UniqueId,
     pub(crate) write_format: StarRocksWriteFormat,
     pub(crate) tablet_commit_infos: Vec<TabletCommitInfo>,
     pub(crate) write_targets: HashMap<i64, TabletWriteTarget>,
@@ -187,7 +188,7 @@ impl OlapTableSinkFactory {
                     index.index_id, index.schema_id
                 ));
             }
-            if descriptor.keys_type == KeysType::PrimaryKeys {
+            if descriptor.keys_type == StarRocksKeysType::Primary {
                 info!(
                     target: "novarocks::sink",
                     table_id = descriptor.table_id,
@@ -519,9 +520,9 @@ fn resolve_write_slot_bindings(
     output_expr_slot_map: &HashMap<String, SlotId>,
     output_expr_slot_ids: &[Option<SlotId>],
     projected_output_slot_ids: Option<&[SlotId]>,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<(Vec<Option<SlotId>>, Option<SlotId>), String> {
-    let has_hidden_op_slot = descriptor.keys_type == KeysType::PrimaryKeys
+    let has_hidden_op_slot = descriptor.keys_type == StarRocksKeysType::Primary
         && descriptor.schema.slot_descs.iter().any(|slot| {
             slot.col_name
                 .as_deref()
@@ -630,7 +631,7 @@ fn resolve_write_slot_bindings(
         tablet_schema.column.iter().enumerate().any(|(idx, col)| {
             col.is_key.unwrap_or(false) && out.get(idx).and_then(|v| *v).is_none()
         });
-    if descriptor.keys_type == KeysType::PrimaryKeys {
+    if descriptor.keys_type == StarRocksKeysType::Primary {
         let slot_desc_summary = descriptor
             .schema
             .slot_descs
@@ -686,8 +687,8 @@ fn resolve_effective_tablet_schema_for_index(
     index_id: i64,
     schema_id: i64,
     tablet_ids: &[i64],
-    fallback_schema: &TabletSchemaPb,
-) -> TabletSchemaPb {
+    fallback_schema: &StarRocksTabletSchema,
+) -> StarRocksTabletSchema {
     for tablet_id in tablet_ids {
         let Ok(runtime) = get_tablet_runtime(*tablet_id) else {
             continue;
@@ -714,7 +715,7 @@ fn resolve_effective_tablet_schema_for_index(
 
 fn resolve_auto_increment_write_policy(
     descriptor: &StarRocksSinkDescriptor,
-    tablet_schema: &TabletSchemaPb,
+    tablet_schema: &StarRocksTabletSchema,
 ) -> Result<AutoIncrementWritePolicy, String> {
     let null_expr_in_auto_increment = descriptor.null_expr_in_auto_increment;
     let miss_auto_increment_column = descriptor.miss_auto_increment_column;

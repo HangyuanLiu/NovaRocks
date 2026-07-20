@@ -17,8 +17,8 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::common::types::UniqueId;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::service::grpc_client::proto::starrocks::PUniqueId;
 
 pub const META_DIR: &str = "meta";
 pub const DATA_DIR: &str = "data";
@@ -55,7 +55,7 @@ pub fn build_txn_data_file_name(
     driver_id: i32,
     file_seq: u64,
     write_format: StarRocksWriteFormat,
-    load_id: Option<&PUniqueId>,
+    load_id: Option<&UniqueId>,
 ) -> Result<String, String> {
     if txn_id <= 0 {
         return Err(format!(
@@ -174,7 +174,7 @@ pub fn txn_log_file_path_with_load_id(
     tablet_root_path: &str,
     tablet_id: i64,
     txn_id: i64,
-    load_id: &PUniqueId,
+    load_id: &UniqueId,
 ) -> Result<String, String> {
     if tablet_id <= 0 {
         return Err(format!(

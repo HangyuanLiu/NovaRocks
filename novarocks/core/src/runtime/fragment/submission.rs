@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
+use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -72,6 +73,69 @@ impl FragmentSubmission {
 
     pub(crate) const fn instance(&self) -> &FragmentInstanceSpec {
         &self.instance
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
+        let mut contracts = HashMap::new();
+        collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
+        contracts
+    }
+}
+
+#[cfg(feature = "compat")]
+fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32, Option<SlotId>>) {
+    match &node.kind {
+        ExecNodeKind::Scan(scan) => {
+            if let Some(node_id) = scan.node_id() {
+                output.insert(
+                    node_id,
+                    scan.iceberg_virtual().and_then(|spec| spec.change_op_slot),
+                );
+            }
+        }
+        ExecNodeKind::AssertNumRows(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Project(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Filter(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Repeat(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::ChangeEventExpand(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::UnionAll(value) => {
+            for input in &value.inputs {
+                collect_incremental_scan_contracts(input, output);
+            }
+        }
+        ExecNodeKind::Limit(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Fetch(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Aggregate(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Join(value) => {
+            collect_incremental_scan_contracts(&value.left, output);
+            collect_incremental_scan_contracts(&value.right, output);
+        }
+        ExecNodeKind::NestedLoopJoin(value) => {
+            collect_incremental_scan_contracts(&value.left, output);
+            collect_incremental_scan_contracts(&value.right, output);
+        }
+        ExecNodeKind::Sort(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::TableFunction(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Analytic(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::SetOp(value) => {
+            for input in &value.inputs {
+                collect_incremental_scan_contracts(input, output);
+            }
+        }
+        ExecNodeKind::NativeRuntimeFilterConsumer(value) => {
+            collect_incremental_scan_contracts(&value.input, output)
+        }
+        ExecNodeKind::Values(_)
+        | ExecNodeKind::ExchangeSource(_)
+        | ExecNodeKind::IcebergDeltaScan(_)
+        | ExecNodeKind::LookUp(_) => {}
     }
 }
 
@@ -416,7 +480,7 @@ fn validate_sink_assignment(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
 ) -> Result<(), FragmentBindingError> {
-    use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
+    use FragmentSinkAssignmentKind::{DestinationGroups, StarRocksTable, StreamDestinations};
     use FragmentSinkAssignmentRequirement as Requirement;
     let requirement = program.sink().assignment_requirement();
     let assignment = instance.sink_assignment();
@@ -442,6 +506,9 @@ fn validate_sink_assignment(
                 groups.len()
             ),
         )),
+        (Requirement::Required(StarRocksTable), FragmentSinkAssignment::StarRocksTable(_)) => {
+            Ok(())
+        }
         (Requirement::Required(_), FragmentSinkAssignment::None) => Err(FragmentBindingError::new(
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
@@ -463,12 +530,13 @@ fn validate_sink_assignment(
 }
 
 fn sink_requirement_summary(requirement: FragmentSinkAssignmentRequirement) -> String {
-    use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
+    use FragmentSinkAssignmentKind::{DestinationGroups, StarRocksTable, StreamDestinations};
     use FragmentSinkAssignmentRequirement::{None, Required};
     match requirement {
         None => "none".to_string(),
         Required(StreamDestinations) => "stream_destinations".to_string(),
         Required(DestinationGroups(count)) => format!("destination_groups(count={})", count.get()),
+        Required(StarRocksTable) => "starrocks_table".to_string(),
     }
 }
 
@@ -479,6 +547,7 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
         FragmentSinkAssignment::DestinationGroups { groups, .. } => {
             format!("destination_groups(count={})", groups.len())
         }
+        FragmentSinkAssignment::StarRocksTable(_) => "starrocks_table".to_string(),
     }
 }
 
@@ -523,7 +592,7 @@ mod tests {
     use crate::exec::chunk::{
         Chunk, ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
     };
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::fragment::error::{
         FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
     };
@@ -534,7 +603,7 @@ mod tests {
     };
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-        MultiCastDataStreamSinkProgram,
+        MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
@@ -563,6 +632,7 @@ mod tests {
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
+        StarRocksTableSinkAssignment,
     };
     use crate::runtime::profile::RuntimeProfile;
     use crate::runtime::query_context::QueryId;
@@ -751,6 +821,36 @@ mod tests {
                 .expect("multicast program"),
         ))
         .expect("multicast sink")
+    }
+
+    fn split_sink(branch_count: usize) -> FragmentSinkSpec {
+        let mut arena = ExprArena::default();
+        let split_exprs = (0..branch_count)
+            .map(|_| {
+                arena.push_typed(
+                    ExprNode::Literal(LiteralValue::Bool(true)),
+                    DataType::Boolean,
+                )
+            })
+            .collect();
+        let branches = (0..branch_count)
+            .map(|index| {
+                DataStreamSinkBranchProgram::try_new(
+                    i32::try_from(index).expect("branch index fits i32"),
+                    Vec::new(),
+                    DataStreamPartitionType::Unpartitioned,
+                    Vec::new(),
+                    vec![SlotId::new(1)],
+                    None,
+                )
+                .expect("split stream branch")
+            })
+            .collect();
+        FragmentSinkSpec::try_new(FragmentSinkProgram::SplitDataStream(
+            SplitDataStreamSinkProgram::try_new(branches, split_exprs, arena)
+                .expect("split stream program"),
+        ))
+        .expect("split stream sink")
     }
 
     fn program_with(
@@ -1713,6 +1813,97 @@ mod tests {
             error.detail(),
             "sink expected destination_groups(count=2), got stream_destinations"
         );
+    }
+
+    #[test]
+    fn split_sink_validates_destination_groups_only_in_submission() {
+        let program = program_with(
+            values_plan(7),
+            split_sink(2),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+
+        assert_error(
+            FragmentSubmission::try_new(Arc::clone(&program), empty_instance(46)),
+            FragmentBindingTarget::Sink,
+            FragmentBindingErrorKind::MissingAssignment,
+        );
+        assert_error(
+            FragmentSubmission::try_new(
+                Arc::clone(&program),
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 47),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    FragmentSinkAssignment::DestinationGroups {
+                        groups: vec![Vec::new()],
+                        sender_id: None,
+                    },
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::Sink,
+            FragmentBindingErrorKind::InvalidAssignment,
+        );
+        assert_error(
+            FragmentSubmission::try_new(
+                Arc::clone(&program),
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, 48),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    FragmentSinkAssignment::StreamDestinations {
+                        destinations: Vec::new(),
+                        sender_id: None,
+                    },
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
+            FragmentBindingTarget::Sink,
+            FragmentBindingErrorKind::WrongAssignmentKind,
+        );
+        FragmentSubmission::try_new(
+            program,
+            instance_with(
+                FragmentContractVersion::CURRENT,
+                query_id(1, 2),
+                uid(1, 49),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                FragmentSinkAssignment::DestinationGroups {
+                    groups: vec![Vec::new(), Vec::new()],
+                    sender_id: Some(9),
+                },
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ),
+        )
+        .expect("matching split destination groups");
+    }
+
+    #[test]
+    fn starrocks_table_sink_requires_explicit_assignment_kind() {
+        assert_eq!(
+            FragmentSinkAssignmentRequirement::Required(FragmentSinkAssignmentKind::StarRocksTable),
+            FragmentSinkAssignmentRequirement::Required(FragmentSinkAssignmentKind::StarRocksTable)
+        );
+        let assignment = FragmentSinkAssignment::StarRocksTable(StarRocksTableSinkAssignment::new(
+            41,
+            uid(5, 6),
+            Some(RuntimeEndpoint::new("fe", 9020).expect("frontend endpoint")),
+        ));
+        assert!(matches!(
+            assignment,
+            FragmentSinkAssignment::StarRocksTable(_)
+        ));
     }
 
     #[test]

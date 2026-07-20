@@ -19,7 +19,6 @@ use std::collections::HashMap;
 #[cfg(feature = "compat")]
 use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
-use crate::exec::runtime_filter::arrow_type_from_common_type_desc;
 use crate::novarocks_logging::warn;
 use crate::proto;
 use crate::runtime::exchange;
@@ -27,15 +26,23 @@ use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
+use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
+use crate::service::grpc_runtime_filter_adapter::{
+    NativeRuntimeFilterRequest, NativeRuntimeFilterResponse,
+    decode_runtime_filter_transmission as decode_native_runtime_filter_transmission,
+    encode_runtime_filter_result as encode_native_runtime_filter_result,
+};
+#[cfg(feature = "compat")]
+use crate::service::starrocks_runtime_filter_wire::{
+    StarRocksRuntimeFilterRequest, StarRocksRuntimeFilterResponse,
+    decode_runtime_filter_transmission as decode_starrocks_runtime_filter_transmission,
+    encode_runtime_filter_result as encode_starrocks_runtime_filter_result,
+};
 
 #[cfg(feature = "compat")]
 type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
 type CompatTransmitChunkResponse = proto::starrocks::PTransmitChunkResult; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatTransmitRuntimeFilterRequest = proto::starrocks::PTransmitRuntimeFilterParams; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatTransmitRuntimeFilterResponse = proto::starrocks::PTransmitRuntimeFilterResult; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
 type CompatLookupRequest = proto::starrocks::PLookUpRequest; // cfg(feature = "compat")
 #[cfg(feature = "compat")]
@@ -238,185 +245,111 @@ pub(crate) fn handle_transmit_chunk_compat(
 }
 
 pub(crate) fn handle_transmit_runtime_filter(
-    params: proto::filter::TransmitRuntimeFilterRequest,
-) -> proto::filter::TransmitRuntimeFilterResponse {
+    params: NativeRuntimeFilterRequest,
+) -> NativeRuntimeFilterResponse {
     let filter_id = params.filter_id;
-    let mut response = proto::filter::TransmitRuntimeFilterResponse {
-        status: Some(ok_common_status()),
-        filter_id,
-    };
+    let result = decode_native_runtime_filter_transmission(params).and_then(|params| {
+        handle_runtime_filter_transmission(params, RuntimeFilterIngress::Native)
+    });
+    encode_native_runtime_filter_result(filter_id, result)
+}
 
-    let Some(query_id) = params.query_id.as_ref() else {
-        response.status = Some(error_common_status(
-            "missing query_id for transmit_runtime_filter",
-        ));
-        return response;
-    };
+enum RuntimeFilterIngress {
+    Native,
+    #[cfg(feature = "compat")]
+    StarRocks,
+}
+
+fn handle_runtime_filter_transmission(
+    params: RuntimeFilterTransmission,
+    ingress: RuntimeFilterIngress,
+) -> Result<(), String> {
+    let filter_id = params.filter_id;
     let query_id = QueryId {
-        hi: query_id.hi,
-        lo: query_id.lo,
+        hi: params.query_id.hi,
+        lo: params.query_id.lo,
     };
 
     let (delivery_expire, query_expire) = query_expire_durations(None);
-    if let Err(err) = query_context_manager().ensure_native_context(
-        query_id,
-        false,
-        delivery_expire,
-        query_expire,
-    ) {
-        response.status = Some(error_common_status(err));
-        return response;
-    }
-    response.status = Some(error_common_status(format!(
-        "legacy runtime-filter RPC is disabled for native query_id={query_id} filter_id={filter_id}"
-    )));
-    response
-}
-
-#[cfg(feature = "compat")]
-fn record_pending_runtime_filter_enqueue_result(
-    response: &mut proto::filter::TransmitRuntimeFilterResponse,
-    result: Result<(), String>,
-) {
-    if let Err(err) = result {
-        response.status = Some(error_common_status(err));
-    }
-}
-
-#[cfg(feature = "compat")]
-fn handle_transmit_runtime_filter_compat_common(
-    params: proto::filter::TransmitRuntimeFilterRequest,
-) -> proto::filter::TransmitRuntimeFilterResponse {
-    let filter_id = params.filter_id;
-    let mut response = proto::filter::TransmitRuntimeFilterResponse {
-        status: Some(ok_common_status()),
-        filter_id,
-    };
-    let Some(query_id) = params.query_id.as_ref() else {
-        response.status = Some(error_common_status(
-            "missing query_id for transmit_runtime_filter",
-        ));
-        return response;
-    };
-    let query_id = QueryId {
-        hi: query_id.hi,
-        lo: query_id.lo,
-    };
-
-    let (delivery_expire, query_expire) = query_expire_durations(None);
-    if let Err(err) = query_context_manager().ensure_compat_context(
-        query_id,
-        false,
-        delivery_expire,
-        query_expire,
-    ) {
-        response.status = Some(error_common_status(err));
-        return response;
-    }
-
-    let payload = params.data.as_slice();
-    if payload.is_empty() {
-        response.status = Some(error_common_status(format!(
-            "runtime filter payload is empty: query_id={} filter_id={}",
-            query_id, filter_id
-        )));
-        return response;
-    }
-
-    let build_data_type = params
-        .column_type
-        .as_ref()
-        .and_then(arrow_type_from_common_type_desc);
-
-    if params.is_partial {
-        let worker = match query_context_manager().get_or_create_runtime_filter_worker(query_id) {
-            Ok(worker) => worker,
-            Err(err) => {
-                response.status = Some(error_common_status(err));
-                return response;
-            }
-        };
-        let Some(worker) = worker else {
-            record_pending_runtime_filter_enqueue_result(
-                &mut response,
-                query_context_manager().enqueue_pending_runtime_filter(
-                    query_id,
-                    filter_id,
-                    params.build_be_number,
-                    params.data,
-                    build_data_type,
-                ),
-            );
-            return response;
-        };
-        let build_be_number = params.build_be_number;
-        if let Err(err) =
-            worker.receive_partial(filter_id, payload, build_be_number, build_data_type)
-        {
-            warn!(
-                "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
-                query_id, filter_id, err
-            );
-            response.status = Some(error_common_status(err));
+    match ingress {
+        RuntimeFilterIngress::Native => {
+            query_context_manager().ensure_native_context(
+                query_id,
+                false,
+                delivery_expire,
+                query_expire,
+            )?;
+            Err(format!(
+                "legacy runtime-filter RPC is disabled for native query_id={query_id} filter_id={filter_id}"
+            ))
         }
-        return response;
-    }
+        #[cfg(feature = "compat")]
+        RuntimeFilterIngress::StarRocks => {
+            query_context_manager().ensure_compat_context(
+                query_id,
+                false,
+                delivery_expire,
+                query_expire,
+            )?;
 
-    if let Err(err) = receive_total_runtime_filter(query_id, filter_id, params.is_partial, payload)
-    {
-        warn!(
-            "receive_total_runtime_filter failed: query_id={} filter_id={} err={}",
-            query_id, filter_id, err
-        );
-        response.status = Some(error_common_status(err));
+            let payload = params.data.as_slice();
+            if payload.is_empty() {
+                return Err(format!(
+                    "runtime filter payload is empty: query_id={} filter_id={}",
+                    query_id, filter_id
+                ));
+            }
+
+            let build_data_type = params.column_type.clone();
+
+            if params.is_partial {
+                let worker =
+                    query_context_manager().get_or_create_runtime_filter_worker(query_id)?;
+                let Some(worker) = worker else {
+                    return query_context_manager().enqueue_pending_runtime_filter(
+                        query_id,
+                        filter_id,
+                        params.build_be_number,
+                        params.data,
+                        build_data_type,
+                    );
+                };
+                let build_be_number = params.build_be_number;
+                if let Err(err) =
+                    worker.receive_partial(filter_id, payload, build_be_number, build_data_type)
+                {
+                    warn!(
+                        "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
+                        query_id, filter_id, err
+                    );
+                    return Err(err);
+                }
+                return Ok(());
+            }
+
+            if let Err(err) =
+                receive_total_runtime_filter(query_id, filter_id, params.is_partial, payload)
+            {
+                warn!(
+                    "receive_total_runtime_filter failed: query_id={} filter_id={} err={}",
+                    query_id, filter_id, err
+                );
+                return Err(err);
+            }
+            Ok(())
+        }
     }
-    response
 }
 
 #[cfg(feature = "compat")]
 pub(crate) fn handle_transmit_runtime_filter_compat(
-    params: CompatTransmitRuntimeFilterRequest,
-) -> CompatTransmitRuntimeFilterResponse {
-    let Some(filter_id) = params.filter_id else {
-        return CompatTransmitRuntimeFilterResponse {
-            status: Some(error_status(
-                "missing filter_id for transmit_runtime_filter",
-            )),
-            filter_id: None,
-        };
-    };
-    let column_type = params.column_type.as_ref().and_then(|desc| {
-        crate::exec::runtime_filter::arrow_type_from_proto_type_desc(desc).and_then(|data_type| {
-            crate::exec::runtime_filter::arrow_type_to_common_type_desc(&data_type)
-        })
+    params: StarRocksRuntimeFilterRequest,
+) -> StarRocksRuntimeFilterResponse {
+    let filter_id = params.filter_id;
+    let result = decode_starrocks_runtime_filter_transmission(params).and_then(|params| {
+        handle_runtime_filter_transmission(params, RuntimeFilterIngress::StarRocks)
     });
-    let native = proto::filter::TransmitRuntimeFilterRequest {
-        is_partial: params.is_partial.unwrap_or(false),
-        query_id: params
-            .query_id
-            .as_ref()
-            .map(|query_id| proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-        filter_id,
-        data: params.data.unwrap_or_default(),
-        build_be_number: params.build_be_number.unwrap_or_default(),
-        column_type,
-    };
-    let response = handle_transmit_runtime_filter_compat_common(native);
-    let status = response.status.map(|status| proto::starrocks::StatusPb {
-        status_code: status.code,
-        error_msgs: if status.message.is_empty() {
-            Vec::new()
-        } else {
-            vec![status.message]
-        },
-    });
-    CompatTransmitRuntimeFilterResponse {
-        status,
-        filter_id: Some(response.filter_id),
-    }
+    encode_starrocks_runtime_filter_result(filter_id, result)
 }
 
 fn receive_total_runtime_filter(

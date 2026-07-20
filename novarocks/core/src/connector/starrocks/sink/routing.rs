@@ -38,8 +38,8 @@ use crate::connector::starrocks::sink::partition_key::{
 use crate::connector::starrocks::sink::plan::{
     SinkLocationDescriptor, SinkPartitionDescriptor, StarRocksSinkDescriptor,
 };
-use crate::connector::starrocks::sink::report_wire::{TabletCommitInfo, tablet_commit_info};
 use crate::exec::chunk::Chunk;
+use crate::runtime::sink_commit::TabletCommitInfo;
 
 #[derive(Clone)]
 pub(crate) struct RowRoutingPlan {
@@ -190,7 +190,10 @@ fn build_sink_routing_with_candidates(
                 tablet_id, db_name, table_name, descriptor.table_id
             )
         })?;
-        commit_infos.push(tablet_commit_info(*tablet_id, backend_id));
+        commit_infos.push(TabletCommitInfo {
+            tablet_id: *tablet_id,
+            backend_id,
+        });
         if !partition_map.contains_key(tablet_id) {
             return Err(format!(
                 "missing partition id for tablet {} while building sink refs",

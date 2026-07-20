@@ -18,16 +18,19 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use crate::connector::starrocks::schema::{
+    LakeScanColumnHint, LakeScanTableSchema, StarRocksColumnSchema, StarRocksKeysType,
+    StarRocksTabletSchema,
+};
 use crate::service::grpc_client::proto::starrocks::{
-    ColumnPb, CompactionStrategyPb, CompressionTypePb, KeysType, PersistentIndexTypePb,
-    TabletSchemaPb,
+    CompactionStrategyPb, CompressionTypePb, PersistentIndexTypePb,
 };
 
 pub(crate) fn build_sink_tablet_schema(
     schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
     schema_id: i64,
-    keys_type: KeysType,
-) -> Result<TabletSchemaPb, String> {
+    keys_type: StarRocksKeysType,
+) -> Result<StarRocksTabletSchema, String> {
     if schema.slot_descs.is_empty() {
         return Err("OLAP_TABLE_SINK schema.slot_descs is empty".to_string());
     }
@@ -164,8 +167,8 @@ pub(crate) fn build_sink_tablet_schema(
         ));
     }
 
-    Ok(TabletSchemaPb {
-        keys_type: Some(keys_type as i32),
+    Ok(StarRocksTabletSchema {
+        keys_type: Some(keys_type),
         column: columns.clone(),
         num_short_key_columns: Some(num_short_key_columns),
         num_rows_per_row_block: None,
@@ -185,7 +188,7 @@ pub(crate) fn build_sink_tablet_schema(
 
 pub(crate) fn build_create_tablet_schema(
     request: &crate::thrift::agent_service::TCreateTabletReq,
-) -> Result<TabletSchemaPb, String> {
+) -> Result<StarRocksTabletSchema, String> {
     let schema = &request.tablet_schema;
     if schema.columns.is_empty() {
         return Err(format!(
@@ -331,8 +334,8 @@ pub(crate) fn build_create_tablet_schema(
         .or(schema.compression_level)
         .or(Some(-1));
 
-    Ok(TabletSchemaPb {
-        keys_type: Some(keys_type as i32),
+    Ok(StarRocksTabletSchema {
+        keys_type: Some(keys_type),
         column: columns,
         num_short_key_columns: Some(num_short_key_columns),
         num_rows_per_row_block: None,
@@ -352,7 +355,7 @@ pub(crate) fn build_create_tablet_schema(
 
 pub(crate) fn build_tablet_schema_pb_from_thrift(
     schema: &crate::thrift::agent_service::TTabletSchema,
-) -> Result<TabletSchemaPb, String> {
+) -> Result<StarRocksTabletSchema, String> {
     if schema.columns.is_empty() {
         return Err("schema_change base_tablet_read_schema.columns is empty".to_string());
     }
@@ -490,8 +493,8 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
     let compression_type = map_create_tablet_compression_type(compression)? as i32;
     let compression_level = schema.compression_level.or(Some(-1));
 
-    Ok(TabletSchemaPb {
-        keys_type: Some(keys_type as i32),
+    Ok(StarRocksTabletSchema {
+        keys_type: Some(keys_type),
         column: columns,
         num_short_key_columns: Some(num_short_key_columns),
         num_rows_per_row_block: None,
@@ -509,10 +512,49 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
     })
 }
 
+pub(crate) fn build_lake_scan_table_schema_from_thrift(
+    schema: &crate::thrift::agent_service::TTabletSchema,
+) -> Result<LakeScanTableSchema, String> {
+    let tablet_schema = build_tablet_schema_pb_from_thrift(schema)?;
+    let mut column_hints = HashMap::new();
+    for column in &schema.columns {
+        let normalized_name = column.column_name.trim().to_ascii_lowercase();
+        if normalized_name.is_empty() {
+            continue;
+        }
+        let unique_id = match column.col_unique_id {
+            Some(value) if value >= 0 => Some(u32::try_from(value).map_err(|_| {
+                format!(
+                    "invalid FE table schema col_unique_id for column '{}': {}",
+                    column.column_name, value
+                )
+            })?),
+            _ => None,
+        };
+        let hint = LakeScanColumnHint {
+            unique_id,
+            default_value: column.default_value.clone(),
+        };
+        if let Some(existing) = column_hints.get(&normalized_name)
+            && existing != &hint
+        {
+            return Err(format!(
+                "duplicated FE table schema column with mismatched metadata: column_name={}",
+                column.column_name
+            ));
+        }
+        column_hints.insert(normalized_name, hint);
+    }
+    Ok(LakeScanTableSchema {
+        tablet_schema,
+        column_hints,
+    })
+}
+
 fn resolve_create_tablet_column_pb(
     column: &crate::thrift::descriptors::TColumn,
     column_idx: usize,
-) -> Result<ColumnPb, String> {
+) -> Result<StarRocksColumnSchema, String> {
     if let Some(type_desc) = column.type_desc.as_ref() {
         return build_create_tablet_column_pb_from_type_desc(type_desc, column_idx);
     }
@@ -528,7 +570,7 @@ fn resolve_create_tablet_column_pb(
 fn build_create_tablet_column_pb_from_column_type(
     column_type: &crate::thrift::types::TColumnType,
     column_idx: usize,
-) -> Result<ColumnPb, String> {
+) -> Result<StarRocksColumnSchema, String> {
     let sr_type = map_primitive_to_starrocks_type(column_type.type_).ok_or_else(|| {
         format!(
             "create_tablet has unsupported primitive type {:?} in column {}",
@@ -537,7 +579,7 @@ fn build_create_tablet_column_pb_from_column_type(
     })?;
     let (precision, frac) =
         resolve_decimal_type_attrs(column_type.type_, column_type.precision, column_type.scale);
-    Ok(ColumnPb {
+    Ok(StarRocksColumnSchema {
         unique_id: -1,
         name: None,
         r#type: sr_type.to_string(),
@@ -563,7 +605,7 @@ fn build_create_tablet_column_pb_from_column_type(
 fn build_create_tablet_column_pb_from_type_desc(
     type_desc: &crate::thrift::types::TTypeDesc,
     column_idx: usize,
-) -> Result<ColumnPb, String> {
+) -> Result<StarRocksColumnSchema, String> {
     let nodes = type_desc.types.as_ref().ok_or_else(|| {
         format!(
             "create_tablet column {} has empty type_desc.types",
@@ -595,7 +637,7 @@ fn type_desc_to_column_pb(
     cursor: &mut usize,
     column_idx: usize,
     path: &str,
-    column_pb: &mut ColumnPb,
+    column_pb: &mut StarRocksColumnSchema,
 ) -> Result<(), String> {
     let node = nodes.get(*cursor).ok_or_else(|| {
         format!(
@@ -711,8 +753,8 @@ fn type_desc_to_column_pb(
     ))
 }
 
-fn init_create_tablet_sub_field_pb() -> ColumnPb {
-    ColumnPb {
+fn init_create_tablet_sub_field_pb() -> StarRocksColumnSchema {
+    StarRocksColumnSchema {
         unique_id: -1,
         name: None,
         r#type: String::new(),
@@ -749,7 +791,7 @@ fn resolve_decimal_type_attrs(
     (precision, scale)
 }
 
-fn normalize_column_pb_type_attrs(column: &mut ColumnPb) {
+fn normalize_column_pb_type_attrs(column: &mut StarRocksColumnSchema) {
     if column.length.is_some_and(|v| v < 0) {
         column.length = None;
     }
@@ -769,18 +811,18 @@ fn normalize_column_pb_type_attrs(column: &mut ColumnPb) {
 
 fn map_create_tablet_keys_type(
     keys_type: crate::thrift::types::TKeysType,
-) -> Result<KeysType, String> {
+) -> Result<StarRocksKeysType, String> {
     if keys_type == crate::thrift::types::TKeysType::DUP_KEYS {
-        return Ok(KeysType::DupKeys);
+        return Ok(StarRocksKeysType::Duplicate);
     }
     if keys_type == crate::thrift::types::TKeysType::UNIQUE_KEYS {
-        return Ok(KeysType::UniqueKeys);
+        return Ok(StarRocksKeysType::Unique);
     }
     if keys_type == crate::thrift::types::TKeysType::AGG_KEYS {
-        return Ok(KeysType::AggKeys);
+        return Ok(StarRocksKeysType::Aggregate);
     }
     if keys_type == crate::thrift::types::TKeysType::PRIMARY_KEYS {
-        return Ok(KeysType::PrimaryKeys);
+        return Ok(StarRocksKeysType::Primary);
     }
     Err(format!(
         "unsupported create_tablet keys_type={:?}",
@@ -905,7 +947,7 @@ fn resolve_sink_column_pb(
     column_idx: usize,
     schema_id: i64,
     slot_descs_by_name: &HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>,
-) -> Result<ColumnPb, String> {
+) -> Result<StarRocksColumnSchema, String> {
     if let Some(column_type) = column.column_type.as_ref() {
         return build_create_tablet_column_pb_from_column_type(column_type, column_idx).map_err(
             |err| {
@@ -953,13 +995,13 @@ fn resolve_sink_column_pb(
 fn map_aggregation_type_to_schema_string(
     aggregation_type: Option<crate::thrift::types::TAggregationType>,
     is_key: bool,
-    keys_type: KeysType,
+    keys_type: StarRocksKeysType,
     column_idx: usize,
 ) -> Result<Option<String>, String> {
     if is_key {
         return Ok(None);
     }
-    if aggregation_type.is_none() && keys_type == KeysType::DupKeys {
+    if aggregation_type.is_none() && keys_type == StarRocksKeysType::Duplicate {
         return Ok(None);
     }
     let agg = aggregation_type.ok_or_else(|| {
@@ -1273,5 +1315,74 @@ fn eval_texpr_node(
         }
     } else {
         Err(format!("unsupported TExprNodeType {:?} in define_expr", nt))
+    }
+}
+
+#[cfg(test)]
+mod lake_scan_tests {
+    use super::*;
+    use crate::thrift::{agent_service, descriptors, types};
+
+    #[test]
+    fn lake_scan_schema_preserves_missing_wire_unique_id_in_column_hint() {
+        let column = descriptors::TColumn::new(
+            "k".to_string(),
+            Some(types::TColumnType::new(
+                types::TPrimitiveType::BIGINT,
+                None,
+                None,
+                None,
+                None,
+            )),
+            None,
+            Some(true),
+            Some(false),
+            Some("7".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut negative_unique_id_column = column.clone();
+        negative_unique_id_column.column_name = "v".to_string();
+        negative_unique_id_column.is_key = Some(false);
+        negative_unique_id_column.default_value = Some("8".to_string());
+        negative_unique_id_column.col_unique_id = Some(-1);
+        let schema = agent_service::TTabletSchema::new(
+            1,
+            17,
+            types::TKeysType::DUP_KEYS,
+            types::TStorageType::COLUMN,
+            vec![column, negative_unique_id_column],
+            None,
+            None,
+            None,
+            Some(91),
+            None,
+            None,
+            Some(3),
+            None,
+            None,
+        );
+
+        let decoded = build_lake_scan_table_schema_from_thrift(&schema).expect("decode schema");
+
+        assert_eq!(decoded.tablet_schema.column[0].unique_id, 0);
+        assert_eq!(decoded.column_hints["k"].unique_id, None);
+        assert_eq!(
+            decoded.column_hints["k"].default_value.as_deref(),
+            Some("7")
+        );
+        assert_eq!(decoded.tablet_schema.column[1].unique_id, 1);
+        assert_eq!(decoded.column_hints["v"].unique_id, None);
+        assert_eq!(
+            decoded.column_hints["v"].default_value.as_deref(),
+            Some("8")
+        );
     }
 }

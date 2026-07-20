@@ -35,6 +35,26 @@ impl ScanRangeParams {
         }
     }
 
+    #[cfg(feature = "compat")]
+    pub(crate) fn broker_file(file: BrokerFileScanRange) -> Self {
+        Self {
+            range: ScanRange::BrokerFile(file),
+            volume_id: None,
+            empty: Some(false),
+            has_more: Some(false),
+        }
+    }
+
+    #[cfg(feature = "compat")]
+    pub(crate) fn schema_selection(selected: bool) -> Self {
+        Self {
+            range: ScanRange::SchemaSelection(SchemaScanSelection { selected }),
+            volume_id: None,
+            empty: Some(!selected),
+            has_more: Some(false),
+        }
+    }
+
     #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     pub(crate) fn starrocks_tablet(
         tablet_id: i64,
@@ -54,8 +74,39 @@ impl ScanRangeParams {
 #[derive(Clone, Debug)]
 pub(crate) enum ScanRange {
     File(FileScanRange),
+    #[cfg(feature = "compat")]
+    BrokerFile(BrokerFileScanRange),
+    #[cfg(feature = "compat")]
+    SchemaSelection(SchemaScanSelection),
     #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     StarRocksTablet(StarRocksTabletScanRange),
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaScanSelection {
+    pub(crate) selected: bool,
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerFileFormat {
+    Csv,
+    Json,
+    Parquet,
+    Orc,
+}
+
+#[cfg(feature = "compat")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BrokerFileScanRange {
+    pub(crate) path: String,
+    pub(crate) file_size: i64,
+    pub(crate) offset: i64,
+    pub(crate) length: i64,
+    pub(crate) format: BrokerFileFormat,
+    pub(crate) strip_outer_array: bool,
+    pub(crate) jsonpaths: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +169,7 @@ pub(crate) struct FileScanRange {
     pub(crate) data_sequence_number: Option<i64>,
     pub(crate) modification_time: Option<i64>,
     pub(crate) datacache_options: Option<DatacacheOptions>,
+    pub(crate) candidate_node: Option<String>,
     pub(crate) included_positions: Vec<i64>,
     pub(crate) serialized_split: Option<String>,
     pub(crate) use_iceberg_jni_metadata_reader: bool,

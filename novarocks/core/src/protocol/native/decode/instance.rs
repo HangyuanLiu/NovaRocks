@@ -83,6 +83,10 @@ pub(crate) fn decode_query_options(
         exec_mem_limit: (src.query_mem_limit > 0).then_some(src.query_mem_limit),
         connector_io_tasks_per_scan_operator: (src.connector_io_tasks_per_scan_operator > 0)
             .then_some(src.connector_io_tasks_per_scan_operator),
+        orc_use_column_names: false,
+        enable_file_metacache: false,
+        enable_file_pagecache: false,
+        enable_parquet_reader_page_index: false,
         runtime_filter_scan_wait_time_ms: src.runtime_filter_scan_wait_time_ms,
         runtime_filter_wait_timeout_ms: src.runtime_filter_wait_timeout_ms,
         allow_throw_exception: src.allow_throw_exception,
@@ -378,6 +382,7 @@ fn decode_file_scan_range(
                 enable_populate_datacache: options.enable_populate_datacache,
                 priority: options.priority,
             }),
+        candidate_node: None,
         included_positions: src.included_positions.clone(),
         serialized_split: src.serialized_split.clone(),
         use_iceberg_jni_metadata_reader: src.use_iceberg_jni_metadata_reader,

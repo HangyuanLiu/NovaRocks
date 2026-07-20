@@ -25,6 +25,42 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::exec::row_position::RowPositionType;
 use crate::formats::{FileFormatConfig, parquet::ParquetScanConfig};
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IcebergTableLocationMap(HashMap<i64, String>);
+
+impl IcebergTableLocationMap {
+    pub(crate) fn from_snapshot(snapshot: &DescriptorSnapshot) -> Self {
+        Self(
+            snapshot
+                .iceberg_table_locations()
+                .map(|(table_id, location)| (table_id, location.to_string()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn get(&self, table_id: i64) -> Option<&str> {
+        self.0.get(&table_id).map(String::as_str)
+    }
+
+    pub(crate) fn to_hash_map(&self) -> HashMap<i64, String> {
+        self.0.clone()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LookupNodeInfo {
+    pub(crate) id: i64,
+    pub(crate) option: i64,
+    pub(crate) host: String,
+    pub(crate) async_internal_port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LookupNodesInfo {
+    pub(crate) version: i64,
+    pub(crate) nodes: Vec<LookupNodeInfo>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DescriptorLogicalType {
     Null,

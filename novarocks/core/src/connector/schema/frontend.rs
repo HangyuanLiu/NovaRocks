@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::types::format_uuid;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
@@ -23,6 +24,13 @@ use crate::thrift::{internal_service, status, status_code, types};
 use super::SchemaScanContext;
 
 const FE_TIMEOUT_SECS: u64 = 5;
+
+pub(crate) fn transport_address(
+    endpoint: Option<&RuntimeEndpoint>,
+) -> Option<types::TNetworkAddress> {
+    endpoint
+        .map(|endpoint| types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()))
+}
 
 pub(crate) fn resolve_frontend_addr(
     fe_addr: Option<&types::TNetworkAddress>,
@@ -119,8 +127,17 @@ pub(crate) fn build_auth_info(ctx: &SchemaScanContext) -> frontend_service::TAut
 pub(crate) fn effective_current_user_ident(
     ctx: &SchemaScanContext,
 ) -> Option<types::TUserIdentity> {
-    if let Some(ident) = ctx.current_user_ident.clone() {
-        return Some(ident);
+    if let Some(ident) = ctx.current_user_ident.as_ref() {
+        return Some(types::TUserIdentity::new(
+            ident.username.clone(),
+            ident.host.clone(),
+            ident.is_domain,
+            ident.is_ephemeral,
+            ident
+                .current_role_ids
+                .as_ref()
+                .map(|roles| types::TUserRoles::new(roles.role_id_list.clone())),
+        ));
     }
 
     let username = schema_scan_user(ctx);

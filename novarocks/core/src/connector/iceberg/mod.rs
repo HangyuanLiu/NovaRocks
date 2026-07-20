@@ -46,7 +46,6 @@ pub(crate) mod scan_range;
 pub mod schema;
 pub mod sink;
 pub(crate) mod sink_plan;
-mod state;
 pub(crate) mod stats;
 pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
@@ -67,6 +66,3 @@ pub use schema::{
 };
 pub use sink::IcebergTableSinkFactory;
 pub use sink_plan::IcebergSinkMode;
-pub(crate) use state::{
-    cache_iceberg_table_locations, lookup_iceberg_table_location, snapshot_iceberg_table_locations,
-};
