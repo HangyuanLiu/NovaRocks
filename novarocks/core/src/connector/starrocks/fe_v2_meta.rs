@@ -491,16 +491,9 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     schema_id: i64,
     tablet_id: Option<i64>,
     query_id: Option<UniqueId>,
-    local_schema: Option<&crate::thrift::agent_service::TTabletSchema>,
-) -> Result<crate::thrift::agent_service::TTabletSchema, String> {
+) -> Result<crate::connector::starrocks::schema::LakeScanTableSchema, String> {
     table_schema_service::fetch_table_schema_for_lake_scan(
-        fe_addr,
-        db_id,
-        table_id,
-        schema_id,
-        tablet_id,
-        query_id,
-        local_schema,
+        fe_addr, db_id, table_id, schema_id, tablet_id, query_id,
     )
 }
 

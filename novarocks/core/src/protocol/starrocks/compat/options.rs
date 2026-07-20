@@ -30,6 +30,12 @@ pub(crate) struct NormalizedQueryOptionAliases {
     pub(crate) spill_mem_table_num: Option<i32>,
 }
 
+/// Normalizes query-option aliases from current and historical FE wire shapes.
+///
+/// Current FEs use `query_mem_limit`, `connector_io_tasks_per_scan_operator`, and
+/// nested `spill_options`; older FEs used the corresponding flat legacy fields.
+/// The current field wins whenever both shapes are present. This rule can be
+/// removed after the minimum supported FE version sends only the current shape.
 pub(crate) fn normalize_query_option_aliases(
     options: &TQueryOptions,
 ) -> NormalizedQueryOptionAliases {

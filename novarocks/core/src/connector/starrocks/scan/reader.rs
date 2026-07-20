@@ -18,10 +18,9 @@
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
-use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift;
 use crate::connector::starrocks::schema::{
-    StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletIndex,
-    StarRocksTabletSchema, StarRocksTypeDesc, StarRocksTypeNode,
+    LakeScanColumnHint, StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType,
+    StarRocksTabletIndex, StarRocksTabletSchema, StarRocksTypeDesc, StarRocksTypeNode,
 };
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
@@ -351,7 +350,6 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
         meta.schema_id,
         Some(snapshot.tablet_id),
         meta.query_id.clone(),
-        None,
     )
     .map_err(|e| {
         format!(
@@ -359,7 +357,7 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
             meta.db_id, meta.table_id, meta.schema_id, snapshot.tablet_id, e
         )
     })?;
-    let refreshed_schema = build_tablet_schema_pb_from_thrift(&fe_schema)?;
+    let refreshed_schema = fe_schema.tablet_schema;
     let refreshed_schema_id = refreshed_schema.id.unwrap_or(0);
     if refreshed_schema_id > 0 && refreshed_schema_id != meta.schema_id {
         warn!(
@@ -620,12 +618,6 @@ impl StarRocksNativeReader {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LakeSchemaColumnHint {
-    unique_id: Option<u32>,
-    default_value: Option<String>,
-}
-
 fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -651,44 +643,9 @@ fn build_required_schema_unique_id_map(
     Ok(out)
 }
 
-fn build_lake_schema_column_hints(
-    schema: &crate::thrift::agent_service::TTabletSchema,
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
-    let mut out = HashMap::new();
-    for column in &schema.columns {
-        let normalized_name = normalize_column_name(&column.column_name);
-        if normalized_name.is_empty() {
-            continue;
-        }
-        let unique_id = match column.col_unique_id {
-            Some(v) if v >= 0 => Some(u32::try_from(v).map_err(|_| {
-                format!(
-                    "invalid FE table schema col_unique_id for column '{}': {}",
-                    column.column_name, v
-                )
-            })?),
-            _ => None,
-        };
-        let hint = LakeSchemaColumnHint {
-            unique_id,
-            default_value: column.default_value.clone(),
-        };
-        if let Some(existing) = out.get(&normalized_name)
-            && existing != &hint
-        {
-            return Err(format!(
-                "duplicated FE table schema column with mismatched metadata: column_name={}",
-                column.column_name
-            ));
-        }
-        out.insert(normalized_name, hint);
-    }
-    Ok(out)
-}
-
 fn build_lake_schema_column_hints_from_domain(
     schema: &StarRocksTabletSchema,
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+) -> Result<HashMap<String, LakeScanColumnHint>, String> {
     let mut out = HashMap::new();
     for column in &schema.column {
         let Some(name) = column.name.as_deref() else {
@@ -711,7 +668,7 @@ fn build_lake_schema_column_hints_from_domain(
             .default_value
             .as_ref()
             .map(|value| String::from_utf8_lossy(value).into_owned());
-        let hint = LakeSchemaColumnHint {
+        let hint = LakeScanColumnHint {
             unique_id,
             default_value,
         };
@@ -730,7 +687,7 @@ fn build_lake_schema_column_hints_from_domain(
 
 fn build_native_schema_column_hints(
     columns: &[super::op::StarRocksSchemaColumnHint],
-) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+) -> Result<HashMap<String, LakeScanColumnHint>, String> {
     let mut out = HashMap::new();
     for column in columns {
         let normalized_name = normalize_column_name(&column.name);
@@ -743,7 +700,7 @@ fn build_native_schema_column_hints(
                 column.name, column.unique_id
             )
         })?;
-        let hint = LakeSchemaColumnHint {
+        let hint = LakeScanColumnHint {
             unique_id: Some(unique_id),
             default_value: column.default_value.clone(),
         };
@@ -823,7 +780,6 @@ fn build_output_column_hints(
                     meta.schema_id,
                     Some(snapshot.tablet_id),
                     meta.query_id.clone(),
-                    None,
                 )
                 .map_err(|e| {
                     format!(
@@ -831,7 +787,7 @@ fn build_output_column_hints(
                         meta.db_id, meta.table_id, meta.schema_id, e
                     )
                 })?;
-                (build_lake_schema_column_hints(&fe_schema)?, false)
+                (fe_schema.column_hints, false)
             }
         }
     } else {

@@ -19,7 +19,10 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
+use crate::connector::schema::{
+    BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanOp, SchemaTable,
+    SchemaUserIdentity, SchemaUserRoles,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::scan::ScanNode;
@@ -151,7 +154,7 @@ fn lower_supported_schema_scan_node(
             desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
         chunk_schema_for_layout(desc_tbl, out_layout)?
     };
-    let context = SchemaScanContext::from_thrift(schema_scan);
+    let context = decode_schema_scan_context(schema_scan);
     let _ = require_scan_ranges;
     let should_scan = schema_scan_selected(node.node_id, scan_assignments)?;
     let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
@@ -172,6 +175,70 @@ fn lower_supported_schema_scan_node(
         },
         layout: out_layout.clone(),
     })
+}
+
+fn decode_schema_scan_context(node: &plan_nodes::TSchemaScanNode) -> SchemaScanContext {
+    SchemaScanContext {
+        table_name: node.table_name.trim().to_ascii_lowercase(),
+        db: normalize_optional_string(node.db.as_ref()),
+        table: normalize_optional_string(node.table.as_ref()),
+        wild: normalize_optional_string(node.wild.as_ref()),
+        user: normalize_optional_string(node.user.as_ref()),
+        ip: normalize_optional_string(node.ip.as_ref()),
+        port: node.port.filter(|value| *value > 0),
+        thread_id: node.thread_id.filter(|value| *value >= 0),
+        user_ip: normalize_optional_string(node.user_ip.as_ref()),
+        current_user_ident: node
+            .current_user_ident
+            .as_ref()
+            .map(|identity| SchemaUserIdentity {
+                username: identity.username.clone(),
+                host: identity.host.clone(),
+                is_domain: identity.is_domain,
+                is_ephemeral: identity.is_ephemeral,
+                current_role_ids: identity
+                    .current_role_ids
+                    .as_ref()
+                    .map(|roles| SchemaUserRoles {
+                        role_id_list: roles.role_id_list.clone(),
+                    }),
+            }),
+        catalog_name: normalize_optional_string(node.catalog_name.as_ref()),
+        table_id: node.table_id.filter(|value| *value > 0),
+        partition_id: node.partition_id.filter(|value| *value > 0),
+        tablet_id: node.tablet_id.filter(|value| *value > 0),
+        txn_id: node.txn_id.filter(|value| *value > 0),
+        job_id: node.job_id.filter(|value| *value >= 0),
+        label: normalize_optional_string(node.label.as_ref()),
+        type_: normalize_optional_string(node.type_.as_ref())
+            .map(|value| value.to_ascii_uppercase()),
+        state: normalize_optional_string(node.state.as_ref())
+            .map(|value| value.to_ascii_uppercase()),
+        limit: node.limit.filter(|value| *value >= 0),
+        log_start_ts: node.log_start_ts.filter(|value| *value > 0),
+        log_end_ts: node.log_end_ts.filter(|value| *value > 0),
+        log_level: normalize_optional_string(node.log_level.as_ref())
+            .map(|value| value.to_ascii_uppercase()),
+        log_pattern: normalize_optional_string(node.log_pattern.as_ref()),
+        log_limit: node.log_limit.filter(|value| *value > 0),
+        frontends: node
+            .frontends
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|frontend| SchemaFrontend {
+                id: frontend.id.clone(),
+                ip: frontend.ip.clone(),
+                http_port: frontend.http_port,
+            })
+            .collect(),
+    }
+}
+
+fn normalize_optional_string(value: Option<&String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
 }
 
 fn schema_scan_selected(
@@ -200,4 +267,72 @@ fn schema_scan_selected(
         ));
     };
     Ok(selection.selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thrift::types;
+
+    #[test]
+    fn schema_scan_wire_identity_and_frontends_decode_to_domain_context() {
+        let node = plan_nodes::TSchemaScanNode::new(
+            7,
+            "  Fe_Metrics  ".to_string(),
+            Some("  db1  ".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(types::TUserIdentity::new(
+                Some("alice".to_string()),
+                Some("example.com".to_string()),
+                Some(true),
+                Some(false),
+                Some(types::TUserRoles::new(Some(vec![11, 12]))),
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![plan_nodes::TFrontend::new(
+                Some("fe-1".to_string()),
+                Some("10.0.0.1".to_string()),
+                Some(8030),
+            )]),
+            Some("  default_catalog  ".to_string()),
+        );
+
+        let context = decode_schema_scan_context(&node);
+
+        assert_eq!(context.table_name, "fe_metrics");
+        assert_eq!(context.db.as_deref(), Some("db1"));
+        assert_eq!(context.catalog_name.as_deref(), Some("default_catalog"));
+        let identity = context.current_user_ident.expect("identity");
+        assert_eq!(identity.username.as_deref(), Some("alice"));
+        assert_eq!(identity.host.as_deref(), Some("example.com"));
+        assert_eq!(identity.is_domain, Some(true));
+        assert_eq!(identity.is_ephemeral, Some(false));
+        assert_eq!(
+            identity.current_role_ids.expect("roles").role_id_list,
+            Some(vec![11, 12])
+        );
+        assert_eq!(context.frontends.len(), 1);
+        assert_eq!(context.frontends[0].id.as_deref(), Some("fe-1"));
+        assert_eq!(context.frontends[0].ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!(context.frontends[0].http_port, Some(8030));
+    }
 }

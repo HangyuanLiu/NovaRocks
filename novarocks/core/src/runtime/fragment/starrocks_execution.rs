@@ -21,6 +21,7 @@ use std::time::Duration;
 use crate::common::config::debug_exec_node_output;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::pipeline::executor::execute_compat_plan_with_pipeline_with_root_sink_dop;
+use crate::novarocks_logging::info;
 use crate::runtime::fragment::error::{FragmentExecutionError, FragmentExecutionErrorKind};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -89,6 +90,9 @@ pub(crate) fn execute_starrocks_submission(
     .map_err(|error| {
         FragmentExecutionError::new(FragmentExecutionErrorKind::Sink, error.to_string())
     })?;
+    if let Some(marker) = materialized_sink_log_marker(program.sink().kind()) {
+        info!("{marker}");
+    }
     let _group_execution_scan_dop = metadata.group_execution_scan_dop;
     let exec_plan = program.plan().clone();
     let _timer = context
@@ -115,6 +119,11 @@ pub(crate) fn execute_starrocks_submission(
 
 pub(crate) fn uses_fetch_result_buffer(submission: &FragmentSubmission) -> bool {
     submission.program().sink().kind() == FragmentSinkKind::Result
+}
+
+fn materialized_sink_log_marker(kind: FragmentSinkKind) -> Option<&'static str> {
+    (kind == FragmentSinkKind::SplitDataStream)
+        .then_some("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized")
 }
 
 #[cfg(test)]
@@ -214,5 +223,14 @@ mod tests {
     #[test]
     fn noop_submission_does_not_use_fetch_result_buffer() {
         assert!(!uses_fetch_result_buffer(&noop_values_submission()));
+    }
+
+    #[test]
+    fn split_data_stream_materialization_has_stable_log_marker() {
+        assert_eq!(
+            materialized_sink_log_marker(FragmentSinkKind::SplitDataStream),
+            Some("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized")
+        );
+        assert_eq!(materialized_sink_log_marker(FragmentSinkKind::Noop), None);
     }
 }

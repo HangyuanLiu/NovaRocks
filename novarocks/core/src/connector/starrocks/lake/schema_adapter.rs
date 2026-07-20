@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::connector::starrocks::schema::{
-    StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+    LakeScanColumnHint, LakeScanTableSchema, StarRocksColumnSchema, StarRocksKeysType,
+    StarRocksTabletSchema,
 };
 use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, CompressionTypePb, PersistentIndexTypePb,
@@ -508,6 +509,45 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
         table_indices: Vec::new(),
         compression_level,
         id: schema.id,
+    })
+}
+
+pub(crate) fn build_lake_scan_table_schema_from_thrift(
+    schema: &crate::thrift::agent_service::TTabletSchema,
+) -> Result<LakeScanTableSchema, String> {
+    let tablet_schema = build_tablet_schema_pb_from_thrift(schema)?;
+    let mut column_hints = HashMap::new();
+    for column in &schema.columns {
+        let normalized_name = column.column_name.trim().to_ascii_lowercase();
+        if normalized_name.is_empty() {
+            continue;
+        }
+        let unique_id = match column.col_unique_id {
+            Some(value) if value >= 0 => Some(u32::try_from(value).map_err(|_| {
+                format!(
+                    "invalid FE table schema col_unique_id for column '{}': {}",
+                    column.column_name, value
+                )
+            })?),
+            _ => None,
+        };
+        let hint = LakeScanColumnHint {
+            unique_id,
+            default_value: column.default_value.clone(),
+        };
+        if let Some(existing) = column_hints.get(&normalized_name)
+            && existing != &hint
+        {
+            return Err(format!(
+                "duplicated FE table schema column with mismatched metadata: column_name={}",
+                column.column_name
+            ));
+        }
+        column_hints.insert(normalized_name, hint);
+    }
+    Ok(LakeScanTableSchema {
+        tablet_schema,
+        column_hints,
     })
 }
 
@@ -1275,5 +1315,74 @@ fn eval_texpr_node(
         }
     } else {
         Err(format!("unsupported TExprNodeType {:?} in define_expr", nt))
+    }
+}
+
+#[cfg(test)]
+mod lake_scan_tests {
+    use super::*;
+    use crate::thrift::{agent_service, descriptors, types};
+
+    #[test]
+    fn lake_scan_schema_preserves_missing_wire_unique_id_in_column_hint() {
+        let column = descriptors::TColumn::new(
+            "k".to_string(),
+            Some(types::TColumnType::new(
+                types::TPrimitiveType::BIGINT,
+                None,
+                None,
+                None,
+                None,
+            )),
+            None,
+            Some(true),
+            Some(false),
+            Some("7".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut negative_unique_id_column = column.clone();
+        negative_unique_id_column.column_name = "v".to_string();
+        negative_unique_id_column.is_key = Some(false);
+        negative_unique_id_column.default_value = Some("8".to_string());
+        negative_unique_id_column.col_unique_id = Some(-1);
+        let schema = agent_service::TTabletSchema::new(
+            1,
+            17,
+            types::TKeysType::DUP_KEYS,
+            types::TStorageType::COLUMN,
+            vec![column, negative_unique_id_column],
+            None,
+            None,
+            None,
+            Some(91),
+            None,
+            None,
+            Some(3),
+            None,
+            None,
+        );
+
+        let decoded = build_lake_scan_table_schema_from_thrift(&schema).expect("decode schema");
+
+        assert_eq!(decoded.tablet_schema.column[0].unique_id, 0);
+        assert_eq!(decoded.column_hints["k"].unique_id, None);
+        assert_eq!(
+            decoded.column_hints["k"].default_value.as_deref(),
+            Some("7")
+        );
+        assert_eq!(decoded.tablet_schema.column[1].unique_id, 1);
+        assert_eq!(decoded.column_hints["v"].unique_id, None);
+        assert_eq!(
+            decoded.column_hints["v"].default_value.as_deref(),
+            Some("8")
+        );
     }
 }

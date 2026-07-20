@@ -18,12 +18,22 @@
 use crate::thrift::data_sinks::TPlanFragmentDestination;
 use crate::thrift::types::TNetworkAddress;
 
+/// Selects the destination endpoint across the current and historical wire shapes.
+///
+/// Older FEs populated `deprecated_server`; current FEs populate `brpc_server`.
+/// When both fields are present, `brpc_server` wins. This rule can be removed once
+/// the minimum supported FE version no longer emits `deprecated_server`.
 pub(crate) fn destination_address(
     destination: &TPlanFragmentDestination,
 ) -> Option<&TNetworkAddress> {
     destination_address_with_field(destination).map(|(address, _)| address)
 }
 
+/// Applies the endpoint compatibility rule and reports which wire field won.
+///
+/// `brpc_server` is the current field and takes precedence over the historical
+/// `deprecated_server` field. This diagnostic form can be removed together with
+/// the fallback once the minimum supported FE no longer emits `deprecated_server`.
 pub(crate) fn destination_address_with_field(
     destination: &TPlanFragmentDestination,
 ) -> Option<(&TNetworkAddress, &'static str)> {

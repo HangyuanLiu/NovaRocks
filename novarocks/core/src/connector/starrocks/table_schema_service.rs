@@ -22,6 +22,8 @@ use moka::sync::Cache;
 
 use crate::common::config;
 use crate::common::types::UniqueId;
+use crate::connector::starrocks::lake::schema_adapter::build_lake_scan_table_schema_from_thrift;
+use crate::connector::starrocks::schema::LakeScanTableSchema;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::service::disk_report;
 use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
@@ -297,8 +299,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     schema_id: i64,
     tablet_id: Option<i64>,
     query_id: Option<UniqueId>,
-    local_schema: Option<&TTabletSchema>,
-) -> Result<TTabletSchema, String> {
+) -> Result<LakeScanTableSchema, String> {
     let query_id = query_id.ok_or_else(|| {
         format!(
             "missing query_id for FE getTableSchema scan request: db_id={} table_id={} schema_id={}",
@@ -309,7 +310,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
         "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
             .to_string()
     })?;
-    TableSchemaService::shared().fetch(
+    let schema = TableSchemaService::shared().fetch(
         TableSchemaFetchRequest {
             fe_addr,
             db_id,
@@ -320,8 +321,9 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
             query_id: Some(types::TUniqueId::new(query_id.hi, query_id.lo)),
             txn_id: None,
         },
-        local_schema,
-    )
+        None,
+    )?;
+    build_lake_scan_table_schema_from_thrift(&schema)
 }
 
 fn validate_request(request: &TableSchemaFetchRequest) -> Result<(), String> {

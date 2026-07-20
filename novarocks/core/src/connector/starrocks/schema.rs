@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StarRocksKeysType {
@@ -109,6 +109,18 @@ pub(crate) struct StarRocksTabletSchema {
     pub(crate) table_indices: Vec<StarRocksTabletIndex>,
     pub(crate) compression_level: Option<i32>,
     pub(crate) id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LakeScanColumnHint {
+    pub(crate) unique_id: Option<u32>,
+    pub(crate) default_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LakeScanTableSchema {
+    pub(crate) tablet_schema: StarRocksTabletSchema,
+    pub(crate) column_hints: HashMap<String, LakeScanColumnHint>,
 }
 
 impl StarRocksTabletSchema {

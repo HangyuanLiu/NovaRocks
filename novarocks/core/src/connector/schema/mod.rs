@@ -32,6 +32,8 @@ mod op;
 pub(crate) use be_tablet_write_log_store::BeTabletWriteLoadLogRecord;
 pub(crate) use be_txn_store::BeTxnActiveRecord;
 pub(crate) use context::SchemaScanContext;
+#[cfg(feature = "compat")]
+pub(crate) use context::{SchemaFrontend, SchemaUserIdentity, SchemaUserRoles};
 pub(crate) use op::SchemaScanOp;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

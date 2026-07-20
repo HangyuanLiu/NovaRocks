@@ -36,6 +36,8 @@ use super::chunk_builder::{SchemaRow, SchemaValue, build_chunk, normalize_column
 #[cfg(feature = "compat")]
 use super::fe_tables;
 #[cfg(feature = "compat")]
+use super::frontend;
+#[cfg(feature = "compat")]
 use super::load_tracking_logs;
 #[cfg(feature = "compat")]
 use super::loads;
@@ -71,7 +73,7 @@ impl SchemaScanOp {
 
     fn collect_rows(&self) -> Result<Vec<SchemaRow>, String> {
         #[cfg(feature = "compat")]
-        let fe_addr = schema_scan_frontend_transport_address(self.fe_addr.as_ref());
+        let fe_addr = frontend::transport_address(self.fe_addr.as_ref());
         let mut rows = match &self.table {
             #[cfg(feature = "compat")]
             SchemaTable::Loads => loads::fetch_rows(&self.context, fe_addr.as_ref())?,
@@ -336,15 +338,6 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
-}
-
-#[cfg(feature = "compat")]
-fn schema_scan_frontend_transport_address(
-    endpoint: Option<&RuntimeEndpoint>,
-) -> Option<crate::thrift::types::TNetworkAddress> {
-    endpoint.map(|endpoint| {
-        crate::thrift::types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port())
-    })
 }
 
 #[cfg(not(feature = "compat"))]

@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/// Selects partition-boundary keys across current and historical sink wire shapes.
+///
+/// Current FEs send the repeated `key_nodes` shape; older FEs sent the singular
+/// `key_node` shape. The current repeated field wins when both are present. This
+/// rule can be removed once the minimum supported FE version never sends `key_node`.
 pub(crate) fn select_partition_boundary_key<'a, T>(
     current: Option<&'a [T]>,
     legacy: Option<&'a T>,
