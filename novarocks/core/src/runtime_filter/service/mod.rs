@@ -7380,6 +7380,7 @@ mod tests {
                 .unwrap(),
             ),
             None,
+            None,
             &digest,
             payload,
         )

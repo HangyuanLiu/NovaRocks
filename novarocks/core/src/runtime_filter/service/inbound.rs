@@ -845,6 +845,7 @@ mod tests {
             DeploymentEpoch::new(epoch),
             RuntimeFilterRouteIdentity::contribution(route),
             producer_open.map(|count| ProducerOpenMetadata::try_new(count).unwrap()),
+            None,
             &digest,
             payload,
         )
@@ -1966,6 +1967,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             RuntimeFilterRouteIdentity::contribution(route),
             None,
+            Some(RuntimeFilterAcceptStatus::Accepted),
             &digest,
             Vec::new(),
         )
@@ -2028,6 +2030,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             RuntimeFilterRouteIdentity::contribution(route),
             Some(ProducerOpenMetadata::try_new(1).unwrap()),
+            None,
             &[0; 32],
             vec![1],
         )
@@ -2200,6 +2203,7 @@ mod tests {
                 self.deployment_epoch,
                 RuntimeFilterRouteIdentity::contribution(route),
                 Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                None,
                 &self.schema_digest,
                 payload,
             )

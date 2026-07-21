@@ -346,7 +346,8 @@ mod tests {
     };
     use crate::runtime_filter::port::transport::{
         ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
-        RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+        RuntimeFilterRouteIdentity,
     };
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
@@ -789,6 +790,7 @@ mod tests {
                 .unwrap(),
             ),
             None,
+            None,
             &digest,
             payload,
         )
@@ -1199,6 +1201,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             contribution_route(),
             Some(ProducerOpenMetadata::try_new(1).unwrap()),
+            None,
             &[0; 32],
             vec![1],
         )
@@ -1215,6 +1218,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             contribution_route(),
             Some(ProducerOpenMetadata::try_new(1).unwrap()),
+            None,
             &[0; 32],
             Vec::new(),
         )
@@ -1239,6 +1243,7 @@ mod tests {
                 .unwrap(),
             ),
             None,
+            Some(RuntimeFilterAcceptStatus::Accepted),
             &[0; 32],
             Vec::new(),
         )
