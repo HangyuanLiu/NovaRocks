@@ -16,6 +16,7 @@
 // under the License.
 
 mod consumer_ingress;
+mod dedupe;
 mod inbound;
 mod materialization;
 mod memory;
@@ -36,7 +37,7 @@ mod m4_conformance_tests;
 pub(crate) mod registry;
 mod subscription;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -50,7 +51,7 @@ use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
 use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::{LogicalVersion, RouteEdgeId};
+use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
@@ -70,6 +71,7 @@ use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
 };
+use self::dedupe::IngressDedupe;
 pub(crate) use self::inbound::{
     InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
 };
@@ -1113,13 +1115,13 @@ pub(crate) struct RuntimeFilterService {
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
-    // Consumer-ingress delivery idempotency ledger: the stable `(route_edge, version)`
-    // identities already delivered into local subscriptions. An exact replay of an
-    // already-delivered identity is answered `Duplicate` and is never re-delivered.
-    // This is the logical delivery identity (M2C spec §7.7), distinct from M3's transport
-    // dedupe. It is currently unbounded per query (reclaimed at query teardown); M3 will
-    // subsume it into the per-channel, MemTracker-accounted, bounded dedupe set.
-    delivered_versions: Mutex<BTreeSet<(RouteEdgeId, LogicalVersion)>>,
+    // Unified, per-channel ingress dedupe + `(query, epoch)` tombstone (M3 Task 3).
+    // Both ingress directions consult it; teardown (`cancel`) retires this query/epoch
+    // into its tombstone. It subsumes the former `delivered_versions` ledger (the
+    // consumer logical `(route_edge, version)` idempotency, M2C spec §7.7) and adds the
+    // transport-identity dedupe keyed on the wire route identity incl. transport
+    // sequence. See `dedupe.rs`.
+    dedupe: IngressDedupe,
     // Sender-side reliable transport for the outbound remote leg: buffers each
     // wire-encoded remote frame for ack-release and bounded retry, failing open on
     // deadline. Query-scoped so its in-flight buffer persists across delivery calls.
@@ -1183,7 +1185,7 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
             operation: Mutex::new(()),
-            delivered_versions: Mutex::new(BTreeSet::new()),
+            dedupe: IngressDedupe::new(query_id),
         }
     }
 
@@ -1496,6 +1498,10 @@ impl RuntimeFilterService {
             self.registry.cancel()
         };
         if let Some(cancelled) = installed {
+            // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
+            // teardown is rejected without rebuilding context (M2B3 lookup-only). Both
+            // cancel and normal completion funnel through here (`shutdown` -> `cancel`).
+            self.dedupe.retire_epoch(cancelled.installed().epoch());
             #[cfg(test)]
             self.fire_after_registry_cancel_before_channel_cancel();
             for (channel_id, channel) in cancelled.installed().channels() {

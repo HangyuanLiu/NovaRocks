@@ -41,6 +41,7 @@ use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
 use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
 
 use super::RuntimeFilterService;
+use super::dedupe::{DeliveryAdmission, TombstoneVerdict};
 use super::registry::DispatchAdmission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +138,29 @@ impl RuntimeFilterService {
                 "consumer envelope requires a delivery route identity",
             )
         })?;
+
+        // (query, epoch) tombstone: a late delivery for a retired/stale epoch is rejected
+        // without rebuilding context (M2B3 lookup-only). Consulted before admission so a
+        // stale epoch after cancel is reported as StaleEpoch, not masked as a bare
+        // service-unavailable.
+        match self
+            .dedupe
+            .tombstone_verdict(envelope.query_id(), envelope.deployment_epoch())
+        {
+            TombstoneVerdict::Live => {}
+            TombstoneVerdict::Retired => {
+                return Err(ingress_error(
+                    InboundConsumerDispatchErrorKind::ServiceUnavailable,
+                    "runtime filter query/epoch is retired",
+                ));
+            }
+            TombstoneVerdict::StaleEpoch => {
+                return Err(ingress_error(
+                    InboundConsumerDispatchErrorKind::StaleEpoch,
+                    "runtime filter envelope epoch is older than a retired epoch",
+                ));
+            }
+        }
 
         // Step 2: classify the registry under the operation lock so a concurrent
         // cancel/install cannot expose a torn active-then-cancelled view.
@@ -248,16 +272,26 @@ impl RuntimeFilterService {
         // be free to linearize against the subscription state, not this mutex.
         drop(operation);
 
-        // Step 7: deliver, idempotent by the stable `(route_edge, version)` identity.
-        // The ledger's atomic insert linearizes an exact replay to `Duplicate` and
-        // never re-delivers it into the subscription.
+        // Step 7: deliver, gated by the unified dedupe. Both gates must hold before the
+        // delivery is fanned into the subscription; either one answering `Duplicate`
+        // short-circuits without re-delivering.
+        //   (a) transport-identity gate: an exact wire retry (same route edge + transport
+        //       sequence) is absorbed regardless of its logical content;
+        //   (b) absorbed logical `(route_edge, version)` gate (M2C spec §7.7): the same
+        //       logical version is never delivered twice, even via a distinct transport
+        //       sequence.
         let route_edge_id = route.route_edge_id();
-        let newly_delivered = self
-            .delivered_versions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert((route_edge_id, version));
-        if !newly_delivered {
+        if matches!(
+            self.dedupe.admit_delivery(envelope.channel_id(), route),
+            DeliveryAdmission::Duplicate
+        ) {
+            return Ok(InboundConsumerDispatchOutcome::Duplicate);
+        }
+        if matches!(
+            self.dedupe
+                .admit_delivered_version(envelope.channel_id(), route_edge_id, version),
+            DeliveryAdmission::Duplicate
+        ) {
             return Ok(InboundConsumerDispatchOutcome::Duplicate);
         }
         installed.router().route(&[route_edge_id], &outcome);
@@ -1635,5 +1669,166 @@ mod tests {
         swapped.extend_from_slice(&payload[first_kind..first_end]);
         swapped.extend_from_slice(&payload[second_end..]);
         swapped
+    }
+
+    // ==========================================================================================
+    // RFD-4/M3 Task 3: unified ingress dedupe + (query, epoch) tombstone (consumer side).
+    // ==========================================================================================
+
+    // The consumer transport-identity gate absorbs a wire retry keyed on
+    // (route edge + transport sequence), independent of the logical (route, version)
+    // gate. Delivering an artifact and then an Unavailable at the SAME transport identity
+    // (they carry DIFFERENT logical versions, so the logical gate alone would not catch
+    // it) proves the transport gate: the second is Duplicate and never re-delivered.
+    #[test]
+    fn ingress_dedupe_consumer_transport_retry_is_duplicate_not_redelivered() {
+        let service = service();
+        install(&service, membership_channel(4096));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+        let (un_digest, un_payload) = encode_unavailable(
+            UnavailableReason::ProducerFailed,
+            ArtifactDecodeExpectation::new(&profile),
+            ROOMY,
+        )
+        .unwrap()
+        .into_parts();
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(artifact_env(CONSUMER_ROUTE, 1, digest, payload))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+        let seeded = observe(&service);
+        assert_eq!(seeded.delivery_calls, 1);
+        assert_eq!(seeded.snapshot_digest, Some(bundle.canonical_digest()));
+
+        // Same route edge + same transport sequence (1) as the artifact, but an Unavailable
+        // payload whose logical version (0) differs from the artifact's: the logical gate
+        // alone would deliver it, but the transport-identity gate absorbs it first.
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Unavailable,
+                    CHANNEL,
+                    EPOCH,
+                    CONSUMER_ROUTE,
+                    1,
+                    un_digest,
+                    un_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate,
+        );
+        let after = observe(&service);
+        assert_eq!(
+            after.delivery_calls, 1,
+            "a transport retry must not re-deliver into the subscription"
+        );
+        assert_eq!(after.snapshot_digest, seeded.snapshot_digest);
+    }
+
+    // TRAP A: the absorbed logical (route edge, version) gate must survive the unified
+    // dedupe. Re-delivering the SAME artifact version via a DIFFERENT transport sequence
+    // (so the transport gate does NOT catch it) must still be Duplicate — a transport-only
+    // dedupe would wrongly re-deliver the same logical version.
+    #[test]
+    fn ingress_dedupe_consumer_logical_version_replay_stays_duplicate() {
+        let service = service();
+        install(&service, membership_channel(4096));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(artifact_env(CONSUMER_ROUTE, 1, digest, payload.clone()))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+        let seeded = observe(&service);
+        assert_eq!(seeded.delivery_calls, 1);
+
+        // Same (route edge, version) but a distinct transport sequence (2): the transport
+        // identity is fresh, yet the logical gate still absorbs the replay.
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(artifact_env(CONSUMER_ROUTE, 2, digest, payload))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate,
+        );
+        assert_eq!(
+            observe(&service).delivery_calls,
+            1,
+            "a logical version replay must not re-deliver into the subscription"
+        );
+    }
+
+    // (query, epoch) tombstone: after cancel/completion, a late delivery for an epoch
+    // OLDER than the retired epoch is reported as a stale epoch (not masked as a bare
+    // service-unavailable), and the cancelled registry is never revived (M2B3
+    // lookup-only).
+    #[test]
+    fn ingress_dedupe_consumer_tombstone_stale_epoch_after_cancel_is_rejected() {
+        let service = service();
+        install(&service, membership_channel(4096));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+        service.cancel();
+
+        let error = err(service.dispatch_inbound_consumer(delivery_env(
+            RuntimeFilterEnvelopeKind::Artifact,
+            CHANNEL,
+            EPOCH - 1,
+            CONSUMER_ROUTE,
+            1,
+            digest,
+            payload,
+        )));
+        assert_prefix(&error, StaleEpoch);
+        assert!(
+            service.registry.active_installation().is_none(),
+            "the tombstone must not revive the cancelled registry"
+        );
+    }
+
+    // A late delivery for the retired epoch itself is rejected as service-unavailable
+    // without reviving the cancelled registry or delivering into the subscription.
+    #[test]
+    fn ingress_dedupe_consumer_tombstone_retired_epoch_after_cancel_does_not_revive() {
+        let service = service();
+        install(&service, membership_channel(4096));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        let installed = service.registry.active_installation().unwrap();
+        let handle = service
+            .subscribe_blocking(BindingId::new(CONSUMER_BINDING), consumer_finst())
+            .unwrap();
+        service.cancel();
+        let after_cancel_calls =
+            installed.subscription_delivery_call_count(BindingId::new(CONSUMER_BINDING));
+
+        let error = err(service.dispatch_inbound_consumer(artifact_env(
+            CONSUMER_ROUTE,
+            1,
+            digest,
+            payload,
+        )));
+        assert_prefix(&error, ServiceUnavailable);
+        assert!(
+            service.registry.active_installation().is_none(),
+            "the tombstone must not revive the cancelled registry"
+        );
+        assert_eq!(
+            installed.subscription_delivery_call_count(BindingId::new(CONSUMER_BINDING)),
+            after_cancel_calls,
+            "a tombstoned dispatch must not deliver into the subscription"
+        );
+        let _ = handle;
     }
 }
