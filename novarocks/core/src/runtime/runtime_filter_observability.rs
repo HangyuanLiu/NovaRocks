@@ -270,6 +270,11 @@ impl From<&RuntimeFilterEvent> for RuntimeFilterChannelEventCoordinate {
                 Self::Materialization(*identity)
             }
             RuntimeFilterEvent::LoopbackDelivered { identity, .. } => Self::Route(*identity),
+            // A sender-side transport event names a delivery route, not a local consumer
+            // instance, so it is grouped under its channel coordinate.
+            RuntimeFilterEvent::TransportEnvelope { identity, .. } => {
+                Self::Channel(identity.common())
+            }
             RuntimeFilterEvent::SubscriptionAcquired { identity, .. }
             | RuntimeFilterEvent::SubscriptionTimedOut { identity }
             | RuntimeFilterEvent::SubscriptionUnavailable { identity, .. }

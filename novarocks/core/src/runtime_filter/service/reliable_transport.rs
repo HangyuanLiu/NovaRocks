@@ -35,6 +35,14 @@
 //!   route degrades but the query neither errors nor panics (runtime filters are an
 //!   optimization, never a correctness dependency).
 //!
+//! Every buffered step emits a structured [`RuntimeFilterEvent::TransportEnvelope`]
+//! through the injected [`RuntimeFilterEventSink`] — the SAME RFD-3 lifecycle sink the
+//! Service already emits through, never a second registry — so `Sent` (with the metered
+//! byte size), `Retried`, `Acked` (with the peer's accept status), and deadline
+//! `FailedOpen` are observable. The resource-limit fail-open is emitted by the Service at
+//! the `send` call site instead of here: a resource-refused frame never entered the
+//! buffer, so this module only emits for frames it actually holds.
+//!
 //! Retry and deadline timing are driven by the injected [`RuntimeFilterClock`] and
 //! an explicit `drive_retries(now)` call: there is no background thread and no live
 //! timer here. The live network sender and the production tick loop are RFD-6; this
@@ -50,6 +58,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
+use crate::runtime_filter::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
+    TransportRouteEventIdentity,
+};
 use crate::runtime_filter::port::identity::{ProducerSequence, RouteEdgeId};
 use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
 use crate::runtime_filter::port::support::RuntimeFilterClock;
@@ -179,6 +191,9 @@ struct PendingEntry {
     attempts: u32,
     first_sent_at: Instant,
     last_sent_at: Instant,
+    // The route-level identity the delivery bridge stamped at `send`, carried so retry,
+    // ack, and deadline emissions all key their structured event off the same route.
+    event_identity: TransportRouteEventIdentity,
 }
 
 /// Which self-owned transport ceiling a `send` would exceed. Kept distinct so a
@@ -356,6 +371,10 @@ pub(crate) struct ReliableEnvelopeTransport {
     policy: ReliableTransportPolicy,
     pending: Mutex<PendingBuffer>,
     next_sequence: AtomicU64,
+    // The RFD-3 lifecycle event sink the Service assembles from its own `EventEmitter`.
+    // Structured `TransportEnvelope` events flow through this SAME sink — never a second
+    // registry — so the sender-side transport lifecycle is observable end to end.
+    event_sink: Arc<dyn RuntimeFilterEventSink>,
 }
 
 impl ReliableEnvelopeTransport {
@@ -363,6 +382,7 @@ impl ReliableEnvelopeTransport {
         sink: Arc<dyn ArtifactRemoteSink>,
         clock: Arc<dyn RuntimeFilterClock>,
         policy: ReliableTransportPolicy,
+        event_sink: Arc<dyn RuntimeFilterEventSink>,
     ) -> Self {
         Self {
             sink,
@@ -372,17 +392,33 @@ impl ReliableEnvelopeTransport {
             policy,
             pending: Mutex::new(PendingBuffer::default()),
             next_sequence: AtomicU64::new(1),
+            event_sink,
         }
     }
 
     /// Assemble the production transport for a query: the inert sink (no live sender
-    /// until RFD-6) and the default bounded-retry policy.
-    pub(crate) fn for_query(clock: Arc<dyn RuntimeFilterClock>) -> Self {
+    /// until RFD-6), the default bounded-retry policy, and the query's lifecycle event
+    /// sink so every buffered transport step is observable.
+    pub(crate) fn for_query(
+        clock: Arc<dyn RuntimeFilterClock>,
+        event_sink: Arc<dyn RuntimeFilterEventSink>,
+    ) -> Self {
         Self::new(
             Arc::new(InertArtifactRemoteSink),
             clock,
             ReliableTransportPolicy::default(),
+            event_sink,
         )
+    }
+
+    /// Emit a structured transport lifecycle event through the query's RFD-3 sink.
+    fn emit(&self, identity: TransportRouteEventIdentity, kind: TransportEventKind, bytes: usize) {
+        self.event_sink
+            .record(RuntimeFilterEvent::TransportEnvelope {
+                identity,
+                kind,
+                bytes,
+            });
     }
 
     /// Offer `frame` for reliable delivery to `route`: buffer it for ack-release and
@@ -399,6 +435,7 @@ impl ReliableEnvelopeTransport {
         &self,
         route: &RuntimeFilterRemoteRoute,
         frame: Arc<EncodedArtifactFrame>,
+        identity: TransportRouteEventIdentity,
     ) -> ReliableSendOutcome {
         let sequence = ProducerSequence::new(self.next_sequence.fetch_add(1, Ordering::Relaxed));
         let key = PendingKey {
@@ -406,6 +443,7 @@ impl ReliableEnvelopeTransport {
             sequence,
         };
         let now = self.clock.now();
+        let bytes = frame.payload().len();
         {
             let mut pending = self
                 .pending
@@ -419,18 +457,24 @@ impl ReliableEnvelopeTransport {
                     attempts: 1,
                     first_sent_at: now,
                     last_sent_at: now,
+                    event_identity: identity,
                 },
                 self.policy.max_pending_entries,
                 self.policy.max_pending_bytes,
             ) {
                 // Over a self-owned ceiling: the frame is neither buffered nor put on
-                // the wire. Surface the explicit rejection; the caller degrades the route.
+                // the wire, and NO transport event is emitted here — the frame never
+                // entered the buffer. The Service's `send` call site emits the
+                // resource-limit fail-open event and degrades the route.
                 return ReliableSendOutcome::ResourceLimit(limit);
             }
         }
         // Transmit outside the buffer lock: a re-entrant or blocking sink must not be
         // able to stall a concurrent ack or retry tick that needs the buffer.
         self.resolve_sink().deliver_remote(route, &frame);
+        // Emit once the frame is on the wire and the buffer lock is released — the event
+        // sink is re-entrant and must never stall a concurrent ack or retry tick.
+        self.emit(identity, TransportEventKind::Sent, bytes);
         ReliableSendOutcome::Buffered(key.into_route_identity())
     }
 
@@ -447,16 +491,23 @@ impl ReliableEnvelopeTransport {
             return EnvelopeAckOutcome::Unknown;
         };
         let key = PendingKey::from_delivery(delivery);
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        match pending.entries.remove(&key) {
-            // Already released, or a duplicate / out-of-order ack for an identity that
-            // is no longer in flight. A no-op — never a re-delivery.
-            None => EnvelopeAckOutcome::Unknown,
-            Some(entry) => {
+        let released = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.entries.remove(&key).map(|entry| {
                 pending.release(&entry.frame);
+                (entry.event_identity, entry.frame.payload().len())
+            })
+        };
+        match released {
+            // Already released, or a duplicate / out-of-order ack for an identity that
+            // is no longer in flight. A no-op — never a re-delivery, and no event.
+            None => EnvelopeAckOutcome::Unknown,
+            Some((event_identity, bytes)) => {
+                // Emit the ack (carrying the peer's accept status) outside the buffer lock.
+                self.emit(event_identity, TransportEventKind::Acked(status), bytes);
                 match status {
                     RuntimeFilterAcceptStatus::Accepted => EnvelopeAckOutcome::Released,
                     RuntimeFilterAcceptStatus::Duplicate => EnvelopeAckOutcome::ReleasedOnDuplicate,
@@ -470,8 +521,13 @@ impl ReliableEnvelopeTransport {
     /// the bounded attempt count, and release + fail open any frame past its
     /// deadline. Explicit and side-effect-scoped — no background thread.
     pub(crate) fn drive_retries(&self, now: Instant) -> ReliableTransportTick {
-        let mut to_send: Vec<(RuntimeFilterRemoteRoute, Arc<EncodedArtifactFrame>)> = Vec::new();
-        let mut failed_open: Vec<PendingKey> = Vec::new();
+        let mut to_send: Vec<(
+            RuntimeFilterRemoteRoute,
+            Arc<EncodedArtifactFrame>,
+            TransportRouteEventIdentity,
+            usize,
+        )> = Vec::new();
+        let mut failed_open: Vec<(PendingKey, TransportRouteEventIdentity, usize)> = Vec::new();
         {
             let mut pending = self
                 .pending
@@ -494,14 +550,19 @@ impl ReliableEnvelopeTransport {
                 {
                     entry.attempts += 1;
                     entry.last_sent_at = now;
-                    to_send.push((entry.route.clone(), Arc::clone(&entry.frame)));
+                    to_send.push((
+                        entry.route.clone(),
+                        Arc::clone(&entry.frame),
+                        entry.event_identity,
+                        entry.frame.payload().len(),
+                    ));
                 }
             }
             // Remove the deadline-expired frames, reclaiming their byte accounting.
             for key in expired {
                 if let Some(entry) = pending.entries.remove(&key) {
                     pending.release(&entry.frame);
-                    failed_open.push(key);
+                    failed_open.push((key, entry.event_identity, entry.frame.payload().len()));
                 }
             }
         }
@@ -509,16 +570,25 @@ impl ReliableEnvelopeTransport {
         // within a tick is unspecified (it follows HashMap iteration), so no caller
         // may depend on it; only `failed_open` is sorted below for determinism.
         let sink = self.resolve_sink();
-        for (route, frame) in &to_send {
+        for (route, frame, identity, bytes) in &to_send {
             sink.deliver_remote(route, frame);
+            self.emit(*identity, TransportEventKind::Retried, *bytes);
         }
-        failed_open.sort_unstable();
+        // Sort by delivery key so the tick's `failed_open` order and the deadline events
+        // are deterministic regardless of HashMap iteration order.
+        failed_open.sort_unstable_by_key(|(key, _, _)| *key);
+        let mut failed_identities = Vec::with_capacity(failed_open.len());
+        for (key, identity, bytes) in failed_open {
+            self.emit(
+                identity,
+                TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
+                bytes,
+            );
+            failed_identities.push(key.into_route_identity());
+        }
         ReliableTransportTick {
             retried: to_send.len(),
-            failed_open: failed_open
-                .into_iter()
-                .map(PendingKey::into_route_identity)
-                .collect(),
+            failed_open: failed_identities,
         }
     }
 
@@ -540,7 +610,7 @@ impl ReliableEnvelopeTransport {
     }
 
     #[cfg(test)]
-    fn pending_len(&self) -> usize {
+    pub(super) fn pending_len(&self) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -552,7 +622,7 @@ impl ReliableEnvelopeTransport {
     /// a broadcast frame counts once). Test seam for the self-owned byte ceiling and
     /// the release-to-zero teardown assertion.
     #[cfg(test)]
-    fn pending_bytes(&self) -> usize {
+    pub(super) fn pending_bytes(&self) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -579,14 +649,92 @@ mod tests {
         EnvelopeAckOutcome, ReliableEnvelopeTransport, ReliableSendOutcome,
         ReliableTransportPolicy, TransportResourceLimit,
     };
+    use crate::common::types::UniqueId;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
-    use crate::runtime_filter::model::contract::BindingId;
-    use crate::runtime_filter::port::identity::{RouteEdgeId, RuntimeFilterParticipantId};
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::runtime_filter::port::events::{
+        RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink, TransportEventKind,
+        TransportFailOpenReason, TransportRouteEventIdentity,
+    };
+    use crate::runtime_filter::port::identity::{
+        DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+    };
     use crate::runtime_filter::port::routing::{RuntimeFilterRemoteRoute, RuntimeFilterRouteRole};
     use crate::runtime_filter::port::support::RuntimeFilterClock;
     use crate::runtime_filter::port::transport::RuntimeFilterAcceptStatus;
     use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+
+    /// A no-op lifecycle sink for the Task-2/Task-4 mechanics tests, which assert buffer /
+    /// retry / ack / deadline behavior and do not observe events.
+    struct NoopEvents;
+
+    impl RuntimeFilterEventSink for NoopEvents {
+        fn record(&self, _event: RuntimeFilterEvent) {}
+    }
+
+    /// Recording lifecycle sink used by the `transport_events_*` tests: captures every
+    /// event so a test can assert the transport's structured `TransportEnvelope`
+    /// emissions (kind + byte size + accept status) flow through the existing sink.
+    #[derive(Default)]
+    struct RecordingEvents(Mutex<Vec<RuntimeFilterEvent>>);
+
+    impl RuntimeFilterEventSink for RecordingEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event);
+        }
+    }
+
+    impl RecordingEvents {
+        fn transport_events(
+            &self,
+        ) -> Vec<(TransportRouteEventIdentity, TransportEventKind, usize)> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter_map(|event| match event {
+                    RuntimeFilterEvent::TransportEnvelope {
+                        identity,
+                        kind,
+                        bytes,
+                    } => Some((*identity, *kind, *bytes)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// A stable transport route identity for a given delivery edge. The query /
+    /// participant / channel / epoch coordinates are fixed test constants; only the route
+    /// edge varies, which is what `send`/`on_ack`/`drive_retries` key their events on.
+    fn event_identity(edge: RouteEdgeId) -> TransportRouteEventIdentity {
+        TransportRouteEventIdentity::new(
+            RuntimeFilterEventIdentity::new(
+                UniqueId { hi: 1, lo: 1 },
+                RuntimeFilterParticipantId::new(7),
+                ChannelId::new(5),
+                DeploymentEpoch::new(9),
+            ),
+            edge,
+        )
+    }
+
+    impl ReliableEnvelopeTransport {
+        /// Test convenience: send with a synthetic transport route identity derived from
+        /// the route's own edge, so the Task-2/Task-4 mechanics tests need not thread an
+        /// event identity through every call.
+        fn send_test(
+            &self,
+            route: &RuntimeFilterRemoteRoute,
+            frame: Arc<EncodedArtifactFrame>,
+        ) -> ReliableSendOutcome {
+            self.send(route, frame, event_identity(route.route_edge_id()))
+        }
+    }
 
     /// Drivable fake sink: records every (route edge, frame) it is handed so a test
     /// can assert exact send / retry counts and compare the transmitted bytes.
@@ -647,7 +795,12 @@ mod tests {
     fn harness(policy: ReliableTransportPolicy) -> Harness {
         let sink = Arc::new(RecordingSink::default());
         let clock = Arc::new(ManualClock::new(Instant::now()));
-        let transport = ReliableEnvelopeTransport::new(sink.clone(), clock.clone(), policy);
+        let transport = ReliableEnvelopeTransport::new(
+            sink.clone(),
+            clock.clone(),
+            policy,
+            Arc::new(NoopEvents),
+        );
         Harness {
             transport,
             sink,
@@ -722,7 +875,7 @@ mod tests {
         let payload = frame(1);
 
         let identity = transport
-            .send(&route(30), Arc::clone(&payload))
+            .send_test(&route(30), Arc::clone(&payload))
             .expect_buffered();
 
         // Buffered exactly once.
@@ -747,7 +900,7 @@ mod tests {
             clock,
         } = harness(policy(100, 3, 10_000));
 
-        let identity = transport.send(&route(30), frame(1)).expect_buffered();
+        let identity = transport.send_test(&route(30), frame(1)).expect_buffered();
         assert_eq!(transport.pending_len(), 1);
 
         assert_eq!(
@@ -776,7 +929,7 @@ mod tests {
             clock,
         } = harness(policy(100, 3, 10_000));
 
-        let identity = transport.send(&route(30), frame(1)).expect_buffered();
+        let identity = transport.send_test(&route(30), frame(1)).expect_buffered();
         assert_eq!(
             transport.on_ack(&identity, RuntimeFilterAcceptStatus::Duplicate),
             EnvelopeAckOutcome::ReleasedOnDuplicate
@@ -796,7 +949,7 @@ mod tests {
             clock,
         } = harness(policy(100, 3, 100_000));
 
-        transport.send(&route(30), frame(1));
+        transport.send_test(&route(30), frame(1));
         assert_eq!(sink.count(), 1);
 
         // A tick before the retry interval elapses re-sends nothing.
@@ -834,7 +987,7 @@ mod tests {
             clock,
         } = harness(policy(100, 2, 100_000));
 
-        let identity = transport.send(&route(30), frame(1)).expect_buffered();
+        let identity = transport.send_test(&route(30), frame(1)).expect_buffered();
         assert_eq!(sink.count(), 1);
 
         // One interval → the single allowed retry, reaching the bound of 2 sends.
@@ -875,8 +1028,8 @@ mod tests {
         } = harness(policy(100, 3, 10_000));
 
         // Two envelopes to the SAME route get distinct sequences.
-        let first = transport.send(&route(30), frame(1)).expect_buffered();
-        let second = transport.send(&route(30), frame(2)).expect_buffered();
+        let first = transport.send_test(&route(30), frame(1)).expect_buffered();
+        let second = transport.send_test(&route(30), frame(2)).expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_ne!(
             first.as_delivery().unwrap().sequence(),
@@ -913,7 +1066,7 @@ mod tests {
             clock,
         } = harness(policy(100, 10, 250));
 
-        let identity = transport.send(&route(30), frame(1)).expect_buffered();
+        let identity = transport.send_test(&route(30), frame(1)).expect_buffered();
 
         // A retry fires before the deadline.
         clock.advance(Duration::from_millis(100));
@@ -943,7 +1096,7 @@ mod tests {
             clock,
         } = harness(policy(100, 5, 10_000));
 
-        let identity = transport.send(&route(30), frame(1)).expect_buffered();
+        let identity = transport.send_test(&route(30), frame(1)).expect_buffered();
         assert_eq!(
             transport.on_ack(&identity, RuntimeFilterAcceptStatus::Rejected),
             EnvelopeAckOutcome::Rejected
@@ -969,10 +1122,10 @@ mod tests {
 
         // One serialized frame fans out to two routes.
         let route_a = transport
-            .send(&route(30), Arc::clone(&payload))
+            .send_test(&route(30), Arc::clone(&payload))
             .expect_buffered();
         let route_b = transport
-            .send(&route(31), Arc::clone(&payload))
+            .send_test(&route(31), Arc::clone(&payload))
             .expect_buffered();
 
         // The single frame is shared (not re-serialized): caller + 2 buffered clones.
@@ -1018,14 +1171,14 @@ mod tests {
             clock: _clock,
         } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
 
-        let first = transport.send(&route(30), frame(1)).expect_buffered();
-        let _second = transport.send(&route(31), frame(2)).expect_buffered();
+        let first = transport.send_test(&route(30), frame(1)).expect_buffered();
+        let _second = transport.send_test(&route(31), frame(2)).expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_eq!(sink.count(), 2);
 
         // The third send is refused: not buffered, not put on the wire.
         assert_eq!(
-            transport.send(&route(32), frame(3)),
+            transport.send_test(&route(32), frame(3)),
             ReliableSendOutcome::ResourceLimit(TransportResourceLimit::PendingEntries),
         );
         assert_eq!(
@@ -1041,7 +1194,7 @@ mod tests {
             EnvelopeAckOutcome::Released,
         );
         assert_eq!(transport.pending_len(), 1);
-        let _third = transport.send(&route(32), frame(3)).expect_buffered();
+        let _third = transport.send_test(&route(32), frame(3)).expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_eq!(sink.count(), 3);
     }
@@ -1059,13 +1212,13 @@ mod tests {
         } = harness(policy_bounded(100, 3, 10_000, ROOMY_MAX_ENTRIES, 10));
 
         let _a = transport
-            .send(&route(30), frame_sized(1, 6))
+            .send_test(&route(30), frame_sized(1, 6))
             .expect_buffered();
         assert_eq!(transport.pending_bytes(), 6);
 
         // 6 + 6 = 12 > 10: refused on the byte ceiling.
         assert_eq!(
-            transport.send(&route(31), frame_sized(2, 6)),
+            transport.send_test(&route(31), frame_sized(2, 6)),
             ReliableSendOutcome::ResourceLimit(TransportResourceLimit::SerializedBytes),
         );
         assert_eq!(
@@ -1077,14 +1230,14 @@ mod tests {
 
         // 6 + 4 = 10 == cap: admitted.
         let _b = transport
-            .send(&route(32), frame_sized(3, 4))
+            .send_test(&route(32), frame_sized(3, 4))
             .expect_buffered();
         assert_eq!(transport.pending_bytes(), 10);
         assert_eq!(sink.count(), 2);
 
         // Any further distinct byte is refused.
         assert_eq!(
-            transport.send(&route(33), frame_sized(4, 1)),
+            transport.send_test(&route(33), frame_sized(4, 1)),
             ReliableSendOutcome::ResourceLimit(TransportResourceLimit::SerializedBytes),
         );
     }
@@ -1103,10 +1256,10 @@ mod tests {
         let payload = frame_sized(9, 6);
 
         let route_a = transport
-            .send(&route(30), Arc::clone(&payload))
+            .send_test(&route(30), Arc::clone(&payload))
             .expect_buffered();
         let route_b = transport
-            .send(&route(31), Arc::clone(&payload))
+            .send_test(&route(31), Arc::clone(&payload))
             .expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_eq!(
@@ -1148,10 +1301,10 @@ mod tests {
         ));
 
         let a = transport
-            .send(&route(30), frame_sized(1, 5))
+            .send_test(&route(30), frame_sized(1, 5))
             .expect_buffered();
         let b = transport
-            .send(&route(31), frame_sized(2, 7))
+            .send_test(&route(31), frame_sized(2, 7))
             .expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_eq!(transport.pending_bytes(), 12);
@@ -1164,7 +1317,7 @@ mod tests {
 
         // The deadline fail-open path also reclaims bytes, not just entries.
         let _c = transport
-            .send(&route(32), frame_sized(3, 9))
+            .send_test(&route(32), frame_sized(3, 9))
             .expect_buffered();
         assert_eq!(transport.pending_bytes(), 9);
         clock.advance(Duration::from_millis(300));
@@ -1175,6 +1328,197 @@ mod tests {
             transport.pending_bytes(),
             0,
             "deadline fail-open reclaims buffered bytes"
+        );
+    }
+
+    // ==============================================================================
+    // M3 Task 5: structured transport events flow through the RFD-3 lifecycle sink.
+    // ==============================================================================
+
+    /// A harness whose transport emits into a recording lifecycle sink, so a test can
+    /// assert the structured `TransportEnvelope` stream (kind + byte size + accept status).
+    struct EventsHarness {
+        transport: ReliableEnvelopeTransport,
+        events: Arc<RecordingEvents>,
+        clock: Arc<ManualClock>,
+    }
+
+    fn events_harness(policy: ReliableTransportPolicy) -> EventsHarness {
+        let sink = Arc::new(RecordingSink::default());
+        let events = Arc::new(RecordingEvents::default());
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        let transport =
+            ReliableEnvelopeTransport::new(sink.clone(), clock.clone(), policy, events.clone());
+        EventsHarness {
+            transport,
+            events,
+            clock,
+        }
+    }
+
+    #[test]
+    fn transport_events_send_records_sent_through_the_lifecycle_sink_with_byte_size() {
+        let EventsHarness {
+            transport, events, ..
+        } = events_harness(policy(100, 3, 10_000));
+        let identity = event_identity(RouteEdgeId::new(30));
+
+        transport
+            .send(&route(30), frame_sized(1, 9), identity)
+            .expect_buffered();
+
+        // Exactly one Sent event, keyed by the route identity and carrying the serialized
+        // frame byte size — flowing through the SAME lifecycle sink, not a second registry.
+        assert_eq!(
+            events.transport_events(),
+            vec![(identity, TransportEventKind::Sent, 9)],
+        );
+    }
+
+    #[test]
+    fn transport_events_ack_records_acked_with_the_peer_accept_status() {
+        let EventsHarness {
+            transport, events, ..
+        } = events_harness(policy(100, 3, 10_000));
+        let accepted = event_identity(RouteEdgeId::new(30));
+        let duplicate = event_identity(RouteEdgeId::new(31));
+        let rejected = event_identity(RouteEdgeId::new(32));
+
+        let a = transport
+            .send(&route(30), frame_sized(1, 4), accepted)
+            .expect_buffered();
+        let b = transport
+            .send(&route(31), frame_sized(2, 5), duplicate)
+            .expect_buffered();
+        let c = transport
+            .send(&route(32), frame_sized(3, 6), rejected)
+            .expect_buffered();
+
+        transport.on_ack(&a, RuntimeFilterAcceptStatus::Accepted);
+        transport.on_ack(&b, RuntimeFilterAcceptStatus::Duplicate);
+        transport.on_ack(&c, RuntimeFilterAcceptStatus::Rejected);
+
+        // Each ack emits an Acked event carrying the peer's accept status verbatim; every
+        // one of Accepted / Duplicate / Rejected surfaces (Rejected is never swallowed).
+        let acked: Vec<_> = events
+            .transport_events()
+            .into_iter()
+            .filter(|(_, kind, _)| matches!(kind, TransportEventKind::Acked(_)))
+            .collect();
+        assert_eq!(
+            acked,
+            vec![
+                (
+                    accepted,
+                    TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+                    4,
+                ),
+                (
+                    duplicate,
+                    TransportEventKind::Acked(RuntimeFilterAcceptStatus::Duplicate),
+                    5,
+                ),
+                (
+                    rejected,
+                    TransportEventKind::Acked(RuntimeFilterAcceptStatus::Rejected),
+                    6,
+                ),
+            ],
+        );
+
+        // A duplicate / out-of-order ack for an already-released identity is a no-op and
+        // emits nothing further.
+        transport.on_ack(&a, RuntimeFilterAcceptStatus::Accepted);
+        assert_eq!(
+            events
+                .transport_events()
+                .into_iter()
+                .filter(|(_, kind, _)| matches!(kind, TransportEventKind::Acked(_)))
+                .count(),
+            3,
+        );
+    }
+
+    #[test]
+    fn transport_events_retry_and_deadline_record_retried_then_failed_open() {
+        // retry 100ms, attempt bound 3, deadline 250ms.
+        let EventsHarness {
+            transport,
+            events,
+            clock,
+        } = events_harness(policy(100, 3, 250));
+        let identity = event_identity(RouteEdgeId::new(30));
+
+        transport
+            .send(&route(30), frame_sized(1, 7), identity)
+            .expect_buffered();
+
+        // Two retry intervals → two Retried events (bounded by the attempt count of 3).
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(transport.drive_retries(clock.now()).retried(), 1);
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(transport.drive_retries(clock.now()).retried(), 1);
+
+        // Past the deadline → one FailedOpen(Deadline); the route degrades (no error).
+        clock.advance(Duration::from_millis(100));
+        let tick = transport.drive_retries(clock.now());
+        assert_eq!(tick.failed_open().len(), 1);
+
+        // The full ordered stream: Sent, Retried x2, FailedOpen(Deadline) — every event
+        // keyed by the same route identity and carrying the frame byte size.
+        let kinds: Vec<_> = events
+            .transport_events()
+            .into_iter()
+            .map(|(recorded, kind, bytes)| {
+                assert_eq!(recorded, identity);
+                assert_eq!(bytes, 7);
+                kind
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TransportEventKind::Sent,
+                TransportEventKind::Retried,
+                TransportEventKind::Retried,
+                TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
+            ],
+        );
+    }
+
+    #[test]
+    fn transport_events_resource_limit_send_emits_nothing_from_the_transport() {
+        // A resource-refused send never entered the buffer, so the transport emits NO
+        // event for it — the Service's delivery bridge owns the resource-limit fail-open
+        // event at the `send` call site. Only the first (buffered) send is observed here.
+        let EventsHarness {
+            transport, events, ..
+        } = events_harness(policy_bounded(100, 3, 10_000, 1, ROOMY_MAX_BYTES));
+
+        transport
+            .send(
+                &route(30),
+                frame_sized(1, 4),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .expect_buffered();
+        let refused = transport.send(
+            &route(31),
+            frame_sized(2, 5),
+            event_identity(RouteEdgeId::new(31)),
+        );
+        assert_eq!(
+            refused,
+            ReliableSendOutcome::ResourceLimit(TransportResourceLimit::PendingEntries),
+        );
+
+        assert_eq!(
+            events.transport_events(),
+            vec![(
+                event_identity(RouteEdgeId::new(30)),
+                TransportEventKind::Sent,
+                4,
+            )],
         );
     }
 }
