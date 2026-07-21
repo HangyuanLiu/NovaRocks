@@ -1352,7 +1352,7 @@ mod tests {
     // classified a loopback edge as remote this panics rather than silently wire-encoding.
     struct NoopRemoteSink;
     impl ArtifactRemoteSink for NoopRemoteSink {
-        fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: EncodedArtifactFrame) {
+        fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: &EncodedArtifactFrame) {
             panic!("a loopback-only delivery scope must not reach the remote sink");
         }
     }
@@ -1458,13 +1458,15 @@ mod tests {
         //     local subscription with no wire encode.
         let loopback_service = service();
         install(&loopback_service, channel());
+        // The panicking sink asserts the loopback-only scope never reaches the remote
+        // transport, even though nothing is expected to be transmitted.
+        loopback_service.set_remote_sink_for_test(Arc::new(NoopRemoteSink));
         let decision = loopback_service
             .deliver_artifact(
                 ChannelId::new(CHANNEL),
                 profile,
                 vec![RouteEdgeId::new(route_edge)],
                 ArtifactDeliveryOutcome::Published(bundle.clone()),
-                &NoopRemoteSink,
             )
             .expect("loopback delivery must route into the local subscription");
         assert!(

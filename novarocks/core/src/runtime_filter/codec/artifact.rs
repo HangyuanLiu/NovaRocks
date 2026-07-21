@@ -141,6 +141,17 @@ impl EncodedArtifactFrame {
     pub(crate) fn into_parts(self) -> ([u8; 32], Vec<u8>) {
         (self.profile_digest, self.payload)
     }
+
+    /// Build an opaque frame directly from parts. Reserved for tests that exercise
+    /// transport plumbing (buffering / retry / ack release), which treat the frame
+    /// as already-serialized bytes and never decode it.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(profile_digest: [u8; 32], payload: Vec<u8>) -> Self {
+        Self {
+            profile_digest,
+            payload,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

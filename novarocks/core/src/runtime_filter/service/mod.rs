@@ -20,6 +20,7 @@ mod inbound;
 mod materialization;
 mod memory;
 mod producer;
+mod reliable_transport;
 // `registry` is `pub(crate)` (rather than private) solely so RFD-2's
 // deployment-compiler tests can reach `registry::validate_view_for_test`
 // (see registry.rs) to prove compiler output satisfies the BE install
@@ -65,7 +66,6 @@ use crate::runtime_filter::port::subscription::{
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
-use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
 pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
@@ -81,6 +81,7 @@ use self::materialization::{
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
+use self::reliable_transport::ReliableEnvelopeTransport;
 
 struct EventQueueState {
     draining: bool,
@@ -1119,6 +1120,10 @@ pub(crate) struct RuntimeFilterService {
     // dedupe. It is currently unbounded per query (reclaimed at query teardown); M3 will
     // subsume it into the per-channel, MemTracker-accounted, bounded dedupe set.
     delivered_versions: Mutex<BTreeSet<(RouteEdgeId, LogicalVersion)>>,
+    // Sender-side reliable transport for the outbound remote leg: buffers each
+    // wire-encoded remote frame for ack-release and bounded retry, failing open on
+    // deadline. Query-scoped so its in-flight buffer persists across delivery calls.
+    reliable_transport: ReliableEnvelopeTransport,
 }
 
 pub(super) struct OpenedProducer {
@@ -1160,12 +1165,14 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_owner_finish: Mutex::new(None),
         });
+        let reliable_transport = ReliableEnvelopeTransport::for_query(clock.clone());
         Self {
             _query_id: query_id,
             _clock: clock,
             memory_account,
             registry,
             dispatcher,
+            reliable_transport,
             producer_handles: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             producer_test_handles: Mutex::new(BTreeMap::new()),
@@ -1378,9 +1385,11 @@ impl RuntimeFilterService {
     /// Router (`route_delivery`) is the sole fanout authority: it validates each
     /// edge against the installed routing shard and splits the scope into loopback
     /// edges (delivered in-process to the local subscriptions via the existing
-    /// `LoopbackRouter`) and remote edges (wire-encoded and handed to `remote_sink`).
-    /// The fanout is read entirely from the resulting decision — this method never
-    /// widens by source role and never inspects the subscription map.
+    /// `LoopbackRouter`) and remote edges. Each remote edge is wire-encoded and
+    /// handed to the service's sender-side [`ReliableEnvelopeTransport`], which owns
+    /// ack-release, bounded retry, and deadline fail-open. The fanout is read
+    /// entirely from the resulting decision — this method never widens by source role
+    /// and never inspects the subscription map.
     ///
     /// `profile` is the consumer's install-owned artifact profile; it is the wire
     /// codec's contract authority for the remote leg. It is required even for a
@@ -1393,7 +1402,6 @@ impl RuntimeFilterService {
         profile: &ConsumerArtifactProfile,
         route_edge_ids: Vec<RouteEdgeId>,
         outcome: ArtifactDeliveryOutcome,
-        remote_sink: &dyn ArtifactRemoteSink,
     ) -> Result<RuntimeFilterRouteDecision, ArtifactDeliveryError> {
         // Snapshot the installation under the operation lock, then release it: the
         // loopback leg delivers into subscriptions and must not run while holding a
@@ -1429,9 +1437,11 @@ impl RuntimeFilterService {
             .router()
             .route(decision.loopback_route_edge_ids(), &outcome);
 
-        // Remote leg: wire-encode once per remote edge against the consumer profile
-        // and hand the frame to the injected sink. The bundle budget is the channel's
-        // installed `max_artifact_bytes` promoted to its wire ceiling.
+        // Remote leg: wire-encode once against the consumer profile and share the
+        // frame across every remote route (broadcast fans out one serialized frame),
+        // handing each to the reliable transport for ack-release and bounded retry.
+        // The bundle budget is the channel's installed `max_artifact_bytes` promoted
+        // to its wire ceiling.
         if !decision.remote_routes().is_empty() {
             let max_encoded = max_encoded_len_for_artifact_budget(
                 installed
@@ -1440,20 +1450,19 @@ impl RuntimeFilterService {
                     .max_artifact_bytes(),
             )?;
             let expectation = ArtifactDecodeExpectation::new(profile);
+            let frame = Arc::new(match &outcome {
+                ArtifactDeliveryOutcome::Published(bundle) => {
+                    encode_artifact_bundle(bundle, expectation, max_encoded)?
+                }
+                ArtifactDeliveryOutcome::Unavailable(reason) => {
+                    encode_unavailable(*reason, expectation, max_encoded)?
+                }
+                ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
+                    unreachable!("envelope kind rejected non-deliverable outcomes above")
+                }
+            });
             for route in decision.remote_routes() {
-                let frame = match &outcome {
-                    ArtifactDeliveryOutcome::Published(bundle) => {
-                        encode_artifact_bundle(bundle, expectation, max_encoded)?
-                    }
-                    ArtifactDeliveryOutcome::Unavailable(reason) => {
-                        encode_unavailable(*reason, expectation, max_encoded)?
-                    }
-                    ArtifactDeliveryOutcome::Unsupported(_)
-                    | ArtifactDeliveryOutcome::Cancelled => {
-                        unreachable!("envelope kind rejected non-deliverable outcomes above")
-                    }
-                };
-                remote_sink.deliver_remote(route, frame);
+                self.reliable_transport.send(route, Arc::clone(&frame));
             }
         }
 
@@ -1505,6 +1514,18 @@ impl RuntimeFilterService {
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
+    }
+
+    /// Point the outbound remote leg at a fake transport sink. Mirrors the other
+    /// `#[cfg(test)]` seams: the service is built with the inert production sink, and
+    /// delivery tests override it here rather than threading a sink through every
+    /// `new_with_dependencies` call site.
+    #[cfg(test)]
+    fn set_remote_sink_for_test(
+        &self,
+        sink: Arc<dyn crate::runtime_filter::router::remote::ArtifactRemoteSink>,
+    ) {
+        self.reliable_transport.set_sink_for_test(sink);
     }
 
     #[cfg(test)]
@@ -6777,11 +6798,11 @@ mod tests {
     }
 
     impl ArtifactRemoteSink for RecordingRemoteSink {
-        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: EncodedArtifactFrame) {
+        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame) {
             self.frames
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((route.route_edge_id(), frame));
+                .push((route.route_edge_id(), frame.clone()));
         }
     }
 
@@ -6986,7 +7007,8 @@ mod tests {
         let routes = install_outbound_delivery_aggregator(&fixture.service, &[(20, 20, 200)], &[]);
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -6995,7 +7017,6 @@ mod tests {
                 &routes.profile,
                 routes.loopback_edges.clone(),
                 ArtifactDeliveryOutcome::Published(bundle.clone()),
-                &sink,
             )
             .unwrap();
 
@@ -7031,7 +7052,8 @@ mod tests {
         );
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -7040,7 +7062,6 @@ mod tests {
                 &routes.profile,
                 routes.remote_edges.clone(),
                 ArtifactDeliveryOutcome::Published(bundle.clone()),
-                &sink,
             )
             .unwrap();
 
@@ -7096,7 +7117,8 @@ mod tests {
             );
             let bundle =
                 service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-            let sink = RecordingRemoteSink::default();
+            let sink = Arc::new(RecordingRemoteSink::default());
+            fixture.service.set_remote_sink_for_test(sink.clone());
             let decision = fixture
                 .service
                 .deliver_artifact(
@@ -7104,7 +7126,6 @@ mod tests {
                     &routes.profile,
                     routes.all_edges(),
                     ArtifactDeliveryOutcome::Published(bundle),
-                    &sink,
                 )
                 .unwrap();
             (
@@ -7141,7 +7162,8 @@ mod tests {
             &[(20, 20, 200)],
             &[(30, 30, 7, "10.0.0.7")],
         );
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -7150,7 +7172,6 @@ mod tests {
                 &routes.profile,
                 routes.all_edges(),
                 ArtifactDeliveryOutcome::Unavailable(UnavailableReason::IncompleteCoverage),
-                &sink,
             )
             .unwrap();
 
@@ -7175,7 +7196,8 @@ mod tests {
         let routes = install_outbound_delivery_aggregator(&fixture.service, &[(20, 20, 200)], &[]);
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         // An edge that is not in the installed routing shard must fail fast through
         // the Router rather than deliver on a best-effort basis.
@@ -7186,7 +7208,6 @@ mod tests {
                 &routes.profile,
                 vec![RouteEdgeId::new(999)],
                 ArtifactDeliveryOutcome::Published(bundle),
-                &sink,
             )
             .unwrap_err();
         assert!(matches!(error, ArtifactDeliveryError::Route(_)));
