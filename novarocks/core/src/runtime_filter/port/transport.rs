@@ -31,12 +31,21 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Artifact,
     ProducerClosed,
     Unavailable,
+    /// Acknowledges either a `Contribution`-kind or `Delivery`-kind route identity.
+    /// The acked route identity is the envelope's own top-level `route_identity`
+    /// (see `RuntimeFilterEnvelope::route_identity`); an `Ack` envelope does not
+    /// carry a second, separate identity for what it is acknowledging. The accept
+    /// status of that acknowledgement is carried by `RuntimeFilterEnvelope::accept_status`.
     Ack,
 }
 
 impl RuntimeFilterEnvelopeKind {
     const fn requires_producer_open(self) -> bool {
         matches!(self, Self::Contribution | Self::ProducerClosed)
+    }
+
+    const fn requires_accept_status(self) -> bool {
+        matches!(self, Self::Ack)
     }
 }
 
@@ -55,6 +64,8 @@ enum RuntimeFilterTransportErrorKind {
     ZeroLocalPartitionCount,
     ProducerOpenRequired(RuntimeFilterEnvelopeKind),
     ProducerOpenForbidden(RuntimeFilterEnvelopeKind),
+    AcceptStatusRequired(RuntimeFilterEnvelopeKind),
+    AcceptStatusForbidden(RuntimeFilterEnvelopeKind),
     EmptyRejectionReason,
 }
 
@@ -107,6 +118,18 @@ impl RuntimeFilterTransportError {
         }
     }
 
+    fn accept_status_required(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::AcceptStatusRequired(kind),
+        }
+    }
+
+    fn accept_status_forbidden(kind: RuntimeFilterEnvelopeKind) -> Self {
+        Self {
+            kind: RuntimeFilterTransportErrorKind::AcceptStatusForbidden(kind),
+        }
+    }
+
     fn empty_rejection_reason() -> Self {
         Self {
             kind: RuntimeFilterTransportErrorKind::EmptyRejectionReason,
@@ -146,6 +169,14 @@ impl fmt::Display for RuntimeFilterTransportError {
             RuntimeFilterTransportErrorKind::ProducerOpenForbidden(kind) => write!(
                 formatter,
                 "runtime filter envelope kind {kind:?} forbids producer-open metadata"
+            ),
+            RuntimeFilterTransportErrorKind::AcceptStatusRequired(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} requires an accept status"
+            ),
+            RuntimeFilterTransportErrorKind::AcceptStatusForbidden(kind) => write!(
+                formatter,
+                "runtime filter envelope kind {kind:?} forbids an accept status"
             ),
             RuntimeFilterTransportErrorKind::EmptyRejectionReason => {
                 formatter.write_str("runtime filter rejection reason must not be empty")
@@ -319,6 +350,19 @@ fn validate_producer_open_presence(
     Ok(())
 }
 
+fn validate_accept_status_presence(
+    kind: RuntimeFilterEnvelopeKind,
+    is_present: bool,
+) -> Result<(), RuntimeFilterTransportError> {
+    if kind.requires_accept_status() && !is_present {
+        return Err(RuntimeFilterTransportError::accept_status_required(kind));
+    }
+    if !kind.requires_accept_status() && is_present {
+        return Err(RuntimeFilterTransportError::accept_status_forbidden(kind));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterEnvelope {
     kind: RuntimeFilterEnvelopeKind,
@@ -327,6 +371,9 @@ pub(crate) struct RuntimeFilterEnvelope {
     deployment_epoch: DeploymentEpoch,
     route_identity: RuntimeFilterRouteIdentity,
     producer_open: Option<ProducerOpenMetadata>,
+    /// Present only for `Ack` envelopes: the accept status of the route
+    /// acknowledged by this envelope's top-level `route_identity`.
+    accept_status: Option<RuntimeFilterAcceptStatus>,
     schema_digest: [u8; 32],
     payload: Vec<u8>,
 }
@@ -339,6 +386,7 @@ impl RuntimeFilterEnvelope {
         deployment_epoch: DeploymentEpoch,
         route_identity: RuntimeFilterRouteIdentity,
         producer_open: Option<ProducerOpenMetadata>,
+        accept_status: Option<RuntimeFilterAcceptStatus>,
         schema_digest: &[u8],
         payload: Vec<u8>,
     ) -> Result<Self, RuntimeFilterTransportError> {
@@ -359,6 +407,7 @@ impl RuntimeFilterEnvelope {
             ));
         }
         validate_producer_open_presence(kind, producer_open.is_some())?;
+        validate_accept_status_presence(kind, accept_status.is_some())?;
         let identity_matches = match kind {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 route_identity.as_contribution().is_some()
@@ -393,6 +442,7 @@ impl RuntimeFilterEnvelope {
             deployment_epoch,
             route_identity,
             producer_open,
+            accept_status,
             schema_digest: fixed_schema_digest,
             payload,
         })
@@ -420,6 +470,13 @@ impl RuntimeFilterEnvelope {
 
     pub(crate) const fn producer_open(&self) -> Option<ProducerOpenMetadata> {
         self.producer_open
+    }
+
+    /// The accept status acknowledged by an `Ack` envelope. `None` for every
+    /// other kind. The identity being acknowledged is `route_identity`, not a
+    /// separate field.
+    pub(crate) const fn accept_status(&self) -> Option<RuntimeFilterAcceptStatus> {
+        self.accept_status
     }
 
     pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
@@ -523,6 +580,8 @@ mod tests {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
         )
         .then(|| ProducerOpenMetadata::try_new(24).unwrap());
+        let accept_status = matches!(kind, RuntimeFilterEnvelopeKind::Ack)
+            .then_some(RuntimeFilterAcceptStatus::Accepted);
         RuntimeFilterEnvelope::try_new(
             kind,
             UniqueId { hi: 1, lo: 2 },
@@ -530,6 +589,7 @@ mod tests {
             DeploymentEpoch::new(4),
             route_identity,
             producer_open,
+            accept_status,
             &[11; 32],
             payload.to_vec(),
         )
@@ -603,6 +663,7 @@ mod tests {
                 DeploymentEpoch::new(4),
                 contribution_route(),
                 Some(ProducerOpenMetadata::try_new(24).unwrap()),
+                None,
                 &[11; 32],
                 b"payload".to_vec(),
             )
@@ -691,6 +752,7 @@ mod tests {
                 deployment_epoch,
                 contribution_route(),
                 Some(ProducerOpenMetadata::try_new(24).unwrap()),
+                None,
                 schema_digest,
                 b"payload".to_vec(),
             )
@@ -779,6 +841,7 @@ mod tests {
                     DeploymentEpoch::new(4),
                     route_identity,
                     producer_open,
+                    None,
                     &[11; 32],
                     payload.to_vec(),
                 )
@@ -794,6 +857,7 @@ mod tests {
                 DeploymentEpoch::new(4),
                 delivery_route(),
                 None,
+                Some(RuntimeFilterAcceptStatus::Accepted),
                 &[11; 32],
                 Vec::new(),
             )
@@ -835,6 +899,11 @@ mod tests {
                 &b"payload"[..],
             ),
         ] {
+            // Ack additionally needs a valid accept status here so the assertion below
+            // exercises only the payload-presence axis under test, not the separate
+            // accept-status presence requirement.
+            let accept_status = matches!(kind, RuntimeFilterEnvelopeKind::Ack)
+                .then_some(RuntimeFilterAcceptStatus::Accepted);
             assert!(
                 RuntimeFilterEnvelope::try_new(
                     kind,
@@ -843,6 +912,7 @@ mod tests {
                     DeploymentEpoch::new(4),
                     route_identity,
                     producer_open,
+                    accept_status,
                     &[11; 32],
                     payload.to_vec(),
                 )
@@ -877,6 +947,7 @@ mod tests {
                     DeploymentEpoch::new(4),
                     contribution_route(),
                     producer_open,
+                    None,
                     &[11; 32],
                     payload.clone(),
                 )
@@ -908,6 +979,10 @@ mod tests {
                 Vec::new(),
             ),
         ] {
+            // Ack additionally needs a valid accept status here so the assertion below
+            // exercises only the producer-open axis under test.
+            let accept_status = matches!(kind, RuntimeFilterEnvelopeKind::Ack)
+                .then_some(RuntimeFilterAcceptStatus::Accepted);
             assert!(
                 RuntimeFilterEnvelope::try_new(
                     kind,
@@ -916,6 +991,7 @@ mod tests {
                     DeploymentEpoch::new(4),
                     route_identity,
                     Some(producer_open),
+                    accept_status,
                     &[11; 32],
                     payload,
                 )
@@ -936,6 +1012,7 @@ mod tests {
                 DeploymentEpoch::new(4),
                 contribution_route(),
                 Some(producer_open),
+                None,
                 &[11; 32],
                 payload,
             )
@@ -945,6 +1022,102 @@ mod tests {
         assert_eq!(envelope.producer_open(), Some(producer_open));
         assert!(envelope.payload().is_empty());
         assert!(build(b"unexpected".to_vec()).is_err());
+    }
+
+    #[test]
+    fn ack_payload_round_trips_each_accept_status_with_acked_route_identity() {
+        for accept_status in [
+            RuntimeFilterAcceptStatus::Accepted,
+            RuntimeFilterAcceptStatus::Duplicate,
+            RuntimeFilterAcceptStatus::Rejected,
+        ] {
+            for route_identity in [contribution_route(), delivery_route()] {
+                let ack = RuntimeFilterEnvelope::try_new(
+                    RuntimeFilterEnvelopeKind::Ack,
+                    UniqueId { hi: 1, lo: 2 },
+                    ChannelId::new(3),
+                    DeploymentEpoch::new(4),
+                    route_identity.clone(),
+                    None,
+                    Some(accept_status),
+                    &[11; 32],
+                    Vec::new(),
+                )
+                .expect("ack envelope with a present accept status is valid");
+
+                assert_eq!(ack.accept_status(), Some(accept_status));
+                assert_eq!(ack.route_identity(), &route_identity);
+            }
+        }
+    }
+
+    #[test]
+    fn ack_payload_is_required_for_ack_kind() {
+        for route_identity in [contribution_route(), delivery_route()] {
+            let error = RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Ack,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                route_identity,
+                None,
+                None,
+                &[11; 32],
+                Vec::new(),
+            )
+            .expect_err("ack envelope without an accept status must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "runtime filter envelope kind Ack requires an accept status"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_payload_is_forbidden_for_non_ack_kinds() {
+        for (kind, route_identity, producer_open, payload) in [
+            (
+                RuntimeFilterEnvelopeKind::Contribution,
+                contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
+                b"payload".to_vec(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                None,
+                b"artifact".to_vec(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                contribution_route(),
+                Some(ProducerOpenMetadata::try_new(24).unwrap()),
+                Vec::new(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                None,
+                b"reason".to_vec(),
+            ),
+        ] {
+            let error = RuntimeFilterEnvelope::try_new(
+                kind,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                route_identity,
+                producer_open,
+                Some(RuntimeFilterAcceptStatus::Accepted),
+                &[11; 32],
+                payload,
+            )
+            .expect_err("non-ack envelope carrying an accept status must be rejected");
+            assert_eq!(
+                error.to_string(),
+                format!("runtime filter envelope kind {kind:?} forbids an accept status")
+            );
+        }
     }
 
     #[test]

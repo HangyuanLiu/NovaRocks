@@ -436,6 +436,7 @@ mod tests {
             producer_open.map(|count| {
                 ProducerOpenMetadata::try_new(count).expect("nonzero partition count")
             }),
+            None,
             &schema_digest,
             payload,
         )
@@ -602,6 +603,7 @@ mod tests {
                 )
                 .expect("valid delivery route identity"),
             ),
+            None,
             None,
             &digest,
             payload,
@@ -922,6 +924,7 @@ mod tests {
                 .unwrap(),
             ),
             None,
+            Some(RuntimeFilterAcceptStatus::Accepted),
             &[0; 32],
             Vec::new(),
         )

@@ -188,6 +188,10 @@ pub(crate) fn handle_runtime_filter_envelope(
         producer_open.map(|metadata| metadata.local_partition_count),
     )
     .map_err(transport_error)?;
+    // `proto::filter::RuntimeFilterEnvelope` has no wire field for an Ack accept
+    // status yet (RFD-4/M3 introduces the domain-level requirement; wiring a wire
+    // representation for it is a later task), so this generic decode path can never
+    // supply one. That is a no-op for every other kind, which forbids the field.
     let envelope = RuntimeFilterEnvelope::try_new(
         kind,
         query_id,
@@ -195,6 +199,7 @@ pub(crate) fn handle_runtime_filter_envelope(
         DeploymentEpoch::new(deployment_epoch),
         domain_route_identity,
         producer_open,
+        None,
         &schema_digest,
         payload,
     )
@@ -539,11 +544,11 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 b"unavailable".as_slice(),
             ),
-            (
-                proto::filter::RuntimeFilterEnvelopeKind::Ack,
-                RuntimeFilterEnvelopeKind::Ack,
-                b"".as_slice(),
-            ),
+            // Ack is intentionally excluded: RFD-4/M3 requires an Ack envelope to
+            // carry an accept status (`RuntimeFilterEnvelope::accept_status`), and
+            // this wire message has no field to source one from, so it can no
+            // longer reach ingress as "valid" through this generic decode path.
+            // See `ack_kind_is_rejected_for_missing_wire_accept_status` below.
         ];
 
         for (wire_kind, domain_kind, expected_payload) in cases {
@@ -584,6 +589,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ack_kind_is_rejected_for_missing_wire_accept_status() {
+        // `valid_wire_envelope` builds an otherwise well-formed Ack wire envelope, but
+        // this wire message has no field to carry the accept status that RFD-4/M3
+        // requires domain-side (`RuntimeFilterEnvelope::accept_status`). The adapter
+        // always decodes a bare Ack with no accept status, so it is now unconditionally
+        // rejected before it ever reaches ingress.
+        let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+        let error = handle_runtime_filter_envelope(
+            ingress.clone(),
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Ack),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "runtime filter envelope kind Ack requires an accept status"
+        );
+        assert!(ingress.is_empty());
     }
 
     #[test]
@@ -947,9 +973,12 @@ mod tests {
         let ingress = Arc::new(RecordingIngress::new(
             RuntimeFilterIngressResult::rejected("semantic rejection").unwrap(),
         ));
+        // Any kind that reaches ingress exercises this mapping; Contribution is used
+        // here (rather than Ack) because it does not require a wire-sourced accept
+        // status to be well-formed.
         let response = handle_runtime_filter_envelope(
             ingress,
-            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Ack),
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution),
         )
         .expect("domain rejection must produce a response");
 

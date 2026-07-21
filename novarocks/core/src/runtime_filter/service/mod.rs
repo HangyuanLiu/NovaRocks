@@ -16,10 +16,12 @@
 // under the License.
 
 mod consumer_ingress;
+mod dedupe;
 mod inbound;
 mod materialization;
 mod memory;
 mod producer;
+mod reliable_transport;
 // `registry` is `pub(crate)` (rather than private) solely so RFD-2's
 // deployment-compiler tests can reach `registry::validate_view_for_test`
 // (see registry.rs) to prove compiler output satisfies the BE install
@@ -35,7 +37,7 @@ mod m4_conformance_tests;
 pub(crate) mod registry;
 mod subscription;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -48,8 +50,11 @@ use crate::runtime_filter::codec::artifact::{
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
-use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
-use crate::runtime_filter::port::identity::{LogicalVersion, RouteEdgeId};
+use crate::runtime_filter::port::events::{
+    RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink, TransportEventKind,
+    TransportFailOpenReason, TransportRouteEventIdentity,
+};
+use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
@@ -65,11 +70,11 @@ use crate::runtime_filter::port::subscription::{
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
-use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
 pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
 };
+use self::dedupe::IngressDedupe;
 pub(crate) use self::inbound::{
     InboundProducerDispatchError, InboundProducerDispatchErrorKind, InboundProducerDispatchOutcome,
 };
@@ -81,6 +86,9 @@ use self::materialization::{
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
+use self::reliable_transport::{
+    ReliableEnvelopeTransport, ReliableSendOutcome, TransportResourceLimit,
+};
 
 struct EventQueueState {
     draining: bool,
@@ -1112,13 +1120,17 @@ pub(crate) struct RuntimeFilterService {
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
-    // Consumer-ingress delivery idempotency ledger: the stable `(route_edge, version)`
-    // identities already delivered into local subscriptions. An exact replay of an
-    // already-delivered identity is answered `Duplicate` and is never re-delivered.
-    // This is the logical delivery identity (M2C spec §7.7), distinct from M3's transport
-    // dedupe. It is currently unbounded per query (reclaimed at query teardown); M3 will
-    // subsume it into the per-channel, MemTracker-accounted, bounded dedupe set.
-    delivered_versions: Mutex<BTreeSet<(RouteEdgeId, LogicalVersion)>>,
+    // Unified, per-channel ingress dedupe + `(query, epoch)` tombstone (M3 Task 3).
+    // Both ingress directions consult it; teardown (`cancel`) retires this query/epoch
+    // into its tombstone. It subsumes the former `delivered_versions` ledger (the
+    // consumer logical `(route_edge, version)` idempotency, M2C spec §7.7) and adds the
+    // transport-identity dedupe keyed on the wire route identity incl. transport
+    // sequence. See `dedupe.rs`.
+    dedupe: IngressDedupe,
+    // Sender-side reliable transport for the outbound remote leg: buffers each
+    // wire-encoded remote frame for ack-release and bounded retry, failing open on
+    // deadline. Query-scoped so its in-flight buffer persists across delivery calls.
+    reliable_transport: ReliableEnvelopeTransport,
 }
 
 pub(super) struct OpenedProducer {
@@ -1160,12 +1172,18 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_owner_finish: Mutex::new(None),
         });
+        // The reliable transport emits its structured `TransportEnvelope` events through
+        // the SAME `EventEmitter` the registry and dispatcher already use — one query-
+        // scoped lifecycle sink, never a second registry.
+        let reliable_transport =
+            ReliableEnvelopeTransport::for_query(clock.clone(), events.clone());
         Self {
             _query_id: query_id,
             _clock: clock,
             memory_account,
             registry,
             dispatcher,
+            reliable_transport,
             producer_handles: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             producer_test_handles: Mutex::new(BTreeMap::new()),
@@ -1176,7 +1194,7 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
             operation: Mutex::new(()),
-            delivered_versions: Mutex::new(BTreeSet::new()),
+            dedupe: IngressDedupe::new(query_id),
         }
     }
 
@@ -1378,9 +1396,11 @@ impl RuntimeFilterService {
     /// Router (`route_delivery`) is the sole fanout authority: it validates each
     /// edge against the installed routing shard and splits the scope into loopback
     /// edges (delivered in-process to the local subscriptions via the existing
-    /// `LoopbackRouter`) and remote edges (wire-encoded and handed to `remote_sink`).
-    /// The fanout is read entirely from the resulting decision — this method never
-    /// widens by source role and never inspects the subscription map.
+    /// `LoopbackRouter`) and remote edges. Each remote edge is wire-encoded and
+    /// handed to the service's sender-side [`ReliableEnvelopeTransport`], which owns
+    /// ack-release, bounded retry, and deadline fail-open. The fanout is read
+    /// entirely from the resulting decision — this method never widens by source role
+    /// and never inspects the subscription map.
     ///
     /// `profile` is the consumer's install-owned artifact profile; it is the wire
     /// codec's contract authority for the remote leg. It is required even for a
@@ -1393,7 +1413,6 @@ impl RuntimeFilterService {
         profile: &ConsumerArtifactProfile,
         route_edge_ids: Vec<RouteEdgeId>,
         outcome: ArtifactDeliveryOutcome,
-        remote_sink: &dyn ArtifactRemoteSink,
     ) -> Result<RuntimeFilterRouteDecision, ArtifactDeliveryError> {
         // Snapshot the installation under the operation lock, then release it: the
         // loopback leg delivers into subscriptions and must not run while holding a
@@ -1429,9 +1448,11 @@ impl RuntimeFilterService {
             .router()
             .route(decision.loopback_route_edge_ids(), &outcome);
 
-        // Remote leg: wire-encode once per remote edge against the consumer profile
-        // and hand the frame to the injected sink. The bundle budget is the channel's
-        // installed `max_artifact_bytes` promoted to its wire ceiling.
+        // Remote leg: wire-encode once against the consumer profile and share the
+        // frame across every remote route (broadcast fans out one serialized frame),
+        // handing each to the reliable transport for ack-release and bounded retry.
+        // The bundle budget is the channel's installed `max_artifact_bytes` promoted
+        // to its wire ceiling.
         if !decision.remote_routes().is_empty() {
             let max_encoded = max_encoded_len_for_artifact_budget(
                 installed
@@ -1440,24 +1461,76 @@ impl RuntimeFilterService {
                     .max_artifact_bytes(),
             )?;
             let expectation = ArtifactDecodeExpectation::new(profile);
+            let frame = Arc::new(match &outcome {
+                ArtifactDeliveryOutcome::Published(bundle) => {
+                    encode_artifact_bundle(bundle, expectation, max_encoded)?
+                }
+                ArtifactDeliveryOutcome::Unavailable(reason) => {
+                    encode_unavailable(*reason, expectation, max_encoded)?
+                }
+                ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
+                    unreachable!("envelope kind rejected non-deliverable outcomes above")
+                }
+            });
+            // The route-level event coordinates are shared across the fan-out: the same
+            // query / local participant / channel / epoch, differing only by route edge.
+            let common = RuntimeFilterEventIdentity::new(
+                self._query_id,
+                installed.participant_id(),
+                channel_id,
+                installed.epoch(),
+            );
             for route in decision.remote_routes() {
-                let frame = match &outcome {
-                    ArtifactDeliveryOutcome::Published(bundle) => {
-                        encode_artifact_bundle(bundle, expectation, max_encoded)?
+                let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
+                match self
+                    .reliable_transport
+                    .send(route, Arc::clone(&frame), identity)
+                {
+                    ReliableSendOutcome::Buffered(_identity) => {}
+                    ReliableSendOutcome::ResourceLimit(limit) => {
+                        // A self-owned transport ceiling tripped: the frame was neither
+                        // buffered nor put on the wire. Degrade this route as an explicit
+                        // resource-limit rejection (a first-class outcome, not a silent
+                        // drop) and keep going. Runtime filters are fail-open at the query
+                        // level, so the query neither errors nor panics.
+                        self.record_transport_resource_limit(
+                            identity,
+                            limit,
+                            frame.payload().len(),
+                        );
                     }
-                    ArtifactDeliveryOutcome::Unavailable(reason) => {
-                        encode_unavailable(*reason, expectation, max_encoded)?
-                    }
-                    ArtifactDeliveryOutcome::Unsupported(_)
-                    | ArtifactDeliveryOutcome::Cancelled => {
-                        unreachable!("envelope kind rejected non-deliverable outcomes above")
-                    }
-                };
-                remote_sink.deliver_remote(route, frame);
+                }
             }
         }
 
         Ok(decision)
+    }
+
+    /// Seam for a remote delivery route degraded because the sender-side reliable
+    /// transport hit a self-owned buffer ceiling (M3 Task 4). This is an EXPLICIT
+    /// resource rejection, distinct from the deadline fail-open: the artifact exists
+    /// but could not be buffered or transmitted under the transport's own limits.
+    ///
+    /// It deliberately does NOT deliver an `Unavailable(ResourceLimit)` sentinel to
+    /// the consumer — that reason means "no artifact was produced", which is not the
+    /// case here — and it deliberately does NOT touch the global MemTracker. Instead it
+    /// emits a structured `TransportEnvelope` fail-open event through the SAME lifecycle
+    /// sink the buffered transport steps use, so the resource-limit degradation is
+    /// observable. `_limit` names which ceiling tripped for the call site; the event
+    /// coarsens it to `ResourceLimit` (distinct from the deadline fail-open).
+    fn record_transport_resource_limit(
+        &self,
+        identity: TransportRouteEventIdentity,
+        _limit: TransportResourceLimit,
+        bytes: usize,
+    ) {
+        self.dispatcher
+            .events
+            .record(RuntimeFilterEvent::TransportEnvelope {
+                identity,
+                kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                bytes,
+            });
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
@@ -1487,6 +1560,12 @@ impl RuntimeFilterService {
             self.registry.cancel()
         };
         if let Some(cancelled) = installed {
+            // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
+            // teardown is rejected without rebuilding context (M2B3 lookup-only). Both
+            // terminal paths reach this line through `cancel()`: an explicit cancel
+            // calls it directly, and normal completion reaches it via `shutdown()`,
+            // which delegates to `cancel()`.
+            self.dedupe.retire_epoch(cancelled.installed().epoch());
             #[cfg(test)]
             self.fire_after_registry_cancel_before_channel_cancel();
             for (channel_id, channel) in cancelled.installed().channels() {
@@ -1505,6 +1584,25 @@ impl RuntimeFilterService {
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
+    }
+
+    /// Point the outbound remote leg at a fake transport sink. Mirrors the other
+    /// `#[cfg(test)]` seams: the service is built with the inert production sink, and
+    /// delivery tests override it here rather than threading a sink through every
+    /// `new_with_dependencies` call site.
+    #[cfg(test)]
+    fn set_remote_sink_for_test(
+        &self,
+        sink: Arc<dyn crate::runtime_filter::router::remote::ArtifactRemoteSink>,
+    ) {
+        self.reliable_transport.set_sink_for_test(sink);
+    }
+
+    /// Borrow the sender-side reliable transport so a fixture can synthesize acks and
+    /// drive retry / deadline ticks directly against the production-wired instance.
+    #[cfg(test)]
+    fn reliable_transport(&self) -> &ReliableEnvelopeTransport {
+        &self.reliable_transport
     }
 
     #[cfg(test)]
@@ -1921,7 +2019,8 @@ mod tests {
     };
     use crate::runtime_filter::port::events::{
         ConsumerEventIdentity, RuntimeFilterEvent, RuntimeFilterEventIdentity,
-        RuntimeFilterEventSink,
+        RuntimeFilterEventSink, TransportEventKind, TransportFailOpenReason,
+        TransportRouteEventIdentity,
     };
     use crate::runtime_filter::port::final_domain::FinalDomainTestIssuerTransition;
     use crate::runtime_filter::port::identity::*;
@@ -1958,6 +2057,7 @@ mod tests {
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
+    use super::reliable_transport::{EnvelopeAckOutcome, TransportResourceLimit};
     use super::subscription::SubscriptionGroup;
     use super::{
         ActionDispatcher, ArtifactDeliveryError, ChannelAction, EventBatchCompletion, EventEmitter,
@@ -6777,11 +6877,11 @@ mod tests {
     }
 
     impl ArtifactRemoteSink for RecordingRemoteSink {
-        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: EncodedArtifactFrame) {
+        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame) {
             self.frames
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((route.route_edge_id(), frame));
+                .push((route.route_edge_id(), frame.clone()));
         }
     }
 
@@ -6986,7 +7086,8 @@ mod tests {
         let routes = install_outbound_delivery_aggregator(&fixture.service, &[(20, 20, 200)], &[]);
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -6995,7 +7096,6 @@ mod tests {
                 &routes.profile,
                 routes.loopback_edges.clone(),
                 ArtifactDeliveryOutcome::Published(bundle.clone()),
-                &sink,
             )
             .unwrap();
 
@@ -7031,7 +7131,8 @@ mod tests {
         );
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -7040,7 +7141,6 @@ mod tests {
                 &routes.profile,
                 routes.remote_edges.clone(),
                 ArtifactDeliveryOutcome::Published(bundle.clone()),
-                &sink,
             )
             .unwrap();
 
@@ -7096,7 +7196,8 @@ mod tests {
             );
             let bundle =
                 service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-            let sink = RecordingRemoteSink::default();
+            let sink = Arc::new(RecordingRemoteSink::default());
+            fixture.service.set_remote_sink_for_test(sink.clone());
             let decision = fixture
                 .service
                 .deliver_artifact(
@@ -7104,7 +7205,6 @@ mod tests {
                     &routes.profile,
                     routes.all_edges(),
                     ArtifactDeliveryOutcome::Published(bundle),
-                    &sink,
                 )
                 .unwrap();
             (
@@ -7141,7 +7241,8 @@ mod tests {
             &[(20, 20, 200)],
             &[(30, 30, 7, "10.0.0.7")],
         );
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         let decision = fixture
             .service
@@ -7150,7 +7251,6 @@ mod tests {
                 &routes.profile,
                 routes.all_edges(),
                 ArtifactDeliveryOutcome::Unavailable(UnavailableReason::IncompleteCoverage),
-                &sink,
             )
             .unwrap();
 
@@ -7175,7 +7275,8 @@ mod tests {
         let routes = install_outbound_delivery_aggregator(&fixture.service, &[(20, 20, 200)], &[]);
         let bundle =
             service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
-        let sink = RecordingRemoteSink::default();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
 
         // An edge that is not in the installed routing shard must fail fast through
         // the Router rather than deliver on a best-effort basis.
@@ -7186,7 +7287,6 @@ mod tests {
                 &routes.profile,
                 vec![RouteEdgeId::new(999)],
                 ArtifactDeliveryOutcome::Published(bundle),
-                &sink,
             )
             .unwrap_err();
         assert!(matches!(error, ArtifactDeliveryError::Route(_)));
@@ -7380,6 +7480,7 @@ mod tests {
                 .unwrap(),
             ),
             None,
+            None,
             &digest,
             payload,
         )
@@ -7408,6 +7509,427 @@ mod tests {
             delivered,
             Some(bundle.canonical_digest()),
             "the compiler-authorized delivery must land the logically-equal artifact"
+        );
+    }
+
+    // ---- RFD-4/M3 Task 5: bounded at-least-once transport, fake-network fixture -----
+
+    /// Project the structured transport events out of a recording lifecycle sink.
+    fn transport_events_of(
+        events: &Events,
+    ) -> Vec<(TransportRouteEventIdentity, TransportEventKind, usize)> {
+        events
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeFilterEvent::TransportEnvelope {
+                    identity,
+                    kind,
+                    bytes,
+                } => Some((*identity, *kind, *bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A service built on the PRODUCTION compiler's 1FE+3BE `AllOf` topology, with a
+    /// recording lifecycle sink and an injected fake remote transport sink. The compiler
+    /// (`compiled_three_backend_all_of_plan`) projects the aggregator's genuine remote
+    /// consumer-delivery edge; the fixture never hand-builds a routing shard.
+    struct ReliableTransportFixture {
+        service: Arc<RuntimeFilterService>,
+        events: Arc<Events>,
+        remote_sink: Arc<RecordingRemoteSink>,
+        profile: ConsumerArtifactProfile,
+        channel_id: ChannelId,
+        remote_delivery_edge: RouteEdgeId,
+        started: Instant,
+    }
+
+    fn reliable_transport_fixture() -> ReliableTransportFixture {
+        let base = compiler_consumer_delivery_fixture();
+        // The genuine cross-backend delivery route the production compiler projected for
+        // the aggregator: an aggregator -> consumer edge whose peer is Remote.
+        let remote_delivery_edge = base
+            .install
+            .routing_shard()
+            .channel(base.channel_id)
+            .expect("compiler routing channel")
+            .outbound_edges()
+            .iter()
+            .find(|edge| {
+                edge.source().role() == RuntimeFilterRouteRole::Aggregator
+                    && matches!(edge.target().role(), RuntimeFilterRouteRole::Consumer(_))
+                    && matches!(edge.peer(), RuntimeFilterRoutePeer::Remote { .. })
+            })
+            .expect("the AllOf plan projects a remote aggregator -> consumer delivery edge")
+            .route_edge_id();
+
+        let events = Arc::new(Events::default());
+        let started = Instant::now();
+        let tracker = MemTrackerMemoryAccount::new_root_for_test("reliable-transport-fixture");
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events.clone(),
+            tracker,
+        ));
+        assert_eq!(
+            service.install(base.install).unwrap(),
+            InstallOutcome::Installed
+        );
+        let remote_sink = Arc::new(RecordingRemoteSink::default());
+        service.set_remote_sink_for_test(remote_sink.clone());
+        ReliableTransportFixture {
+            service,
+            events,
+            remote_sink,
+            profile: base.profile,
+            channel_id: base.channel_id,
+            remote_delivery_edge,
+            started,
+        }
+    }
+
+    #[test]
+    fn reliable_transport_fixture_send_then_ack_releases_and_records_the_lifecycle() {
+        use crate::runtime_filter::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity,
+        };
+
+        let fx = reliable_transport_fixture();
+        let bundle = service_outbound_delivery_membership_bundle(&fx.profile, fx.channel_id);
+
+        // Deliver through the production bridge to the compiler-authorized remote edge.
+        let decision = fx
+            .service
+            .deliver_artifact(
+                fx.channel_id,
+                &fx.profile,
+                vec![fx.remote_delivery_edge],
+                ArtifactDeliveryOutcome::Published(bundle),
+            )
+            .unwrap();
+
+        // Exactly one remote route, one wire frame, one buffered in-flight entry.
+        assert!(decision.loopback_route_edge_ids().is_empty());
+        assert_eq!(decision.remote_routes().len(), 1);
+        let frames = fx.remote_sink.frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, fx.remote_delivery_edge);
+        let wire_bytes = frames[0].1.payload().len();
+        assert_eq!(fx.service.reliable_transport().pending_len(), 1);
+
+        // A "sent" event flowed through the SAME lifecycle sink, keyed by the route and
+        // carrying the serialized byte size.
+        let sent = transport_events_of(&fx.events);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, TransportEventKind::Sent);
+        assert_eq!(sent[0].2, wire_bytes);
+        assert_eq!(sent[0].0.route_edge_id(), fx.remote_delivery_edge);
+        assert_eq!(sent[0].0.common().query_id(), uid(0));
+        assert_eq!(sent[0].0.common().channel_id(), fx.channel_id);
+
+        // The transport stamps sequences from 1 on a fresh query, so the first (only)
+        // remote send owns delivery sequence 1. Synthesize its Accepted ack.
+        let identity = RuntimeFilterRouteIdentity::delivery(
+            DeliveryRouteIdentity::try_new(fx.remote_delivery_edge, ProducerSequence::new(1))
+                .unwrap(),
+        );
+        assert_eq!(
+            fx.service
+                .reliable_transport()
+                .on_ack(&identity, RuntimeFilterAcceptStatus::Accepted),
+            EnvelopeAckOutcome::Released,
+        );
+        assert_eq!(fx.service.reliable_transport().pending_len(), 0);
+
+        // An "acked" event carrying the Accepted status was recorded.
+        let acked: Vec<_> = transport_events_of(&fx.events)
+            .into_iter()
+            .filter(|(_, kind, _)| matches!(kind, TransportEventKind::Acked(_)))
+            .collect();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(
+            acked[0].1,
+            TransportEventKind::Acked(RuntimeFilterAcceptStatus::Accepted),
+        );
+
+        // No hang: a bounded tick far in the future neither retries nor fails open.
+        assert!(
+            fx.service
+                .reliable_transport()
+                .drive_retries(fx.started + Duration::from_secs(60))
+                .is_quiescent()
+        );
+    }
+
+    #[test]
+    fn reliable_transport_fixture_missing_ack_retries_then_deadline_fails_open() {
+        let fx = reliable_transport_fixture();
+        let bundle = service_outbound_delivery_membership_bundle(&fx.profile, fx.channel_id);
+        fx.service
+            .deliver_artifact(
+                fx.channel_id,
+                &fx.profile,
+                vec![fx.remote_delivery_edge],
+                ArtifactDeliveryOutcome::Published(bundle),
+            )
+            .unwrap();
+        assert_eq!(fx.remote_sink.frames().len(), 1);
+        assert_eq!(fx.service.reliable_transport().pending_len(), 1);
+
+        // Never ack. Drive explicit retry ticks on the manual clock (no real waiting, no
+        // hang). The default policy bounds the attempt count, so retries are capped.
+        let mut retried = 0;
+        for step in 1..=6u32 {
+            let now = fx.started + Duration::from_millis(200 * u64::from(step));
+            retried += fx.service.reliable_transport().drive_retries(now).retried();
+        }
+        // Bounded at-least-once: the initial send plus the capped retries, no storm.
+        let total_sends = fx.remote_sink.frames().len();
+        assert_eq!(retried, 4, "retries are bounded by the attempt count");
+        assert_eq!(total_sends, 5, "initial send + 4 bounded retries");
+        let retried_events = transport_events_of(&fx.events)
+            .into_iter()
+            .filter(|(_, kind, _)| matches!(kind, TransportEventKind::Retried))
+            .count();
+        assert_eq!(retried_events, 4);
+        // Still buffered before the deadline; the query has NOT errored.
+        assert_eq!(fx.service.reliable_transport().pending_len(), 1);
+
+        // Cross the deadline: the frame is released and the route fails open — no panic,
+        // no error surfaced to the query.
+        let tick = fx
+            .service
+            .reliable_transport()
+            .drive_retries(fx.started + Duration::from_secs(31));
+        assert_eq!(tick.failed_open().len(), 1);
+        assert_eq!(fx.service.reliable_transport().pending_len(), 0);
+        let failed = transport_events_of(&fx.events)
+            .into_iter()
+            .filter(|(_, kind, _)| {
+                matches!(
+                    kind,
+                    TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline)
+                )
+            })
+            .count();
+        assert_eq!(failed, 1);
+
+        // No hang: further ticks are quiescent and nothing is re-sent past the deadline.
+        assert!(
+            fx.service
+                .reliable_transport()
+                .drive_retries(fx.started + Duration::from_secs(120))
+                .is_quiescent()
+        );
+        assert_eq!(fx.remote_sink.frames().len(), 5);
+    }
+
+    #[test]
+    fn reliable_transport_fixture_duplicate_wire_identity_answers_duplicate() {
+        use crate::runtime::query_context::{QueryContextManager, QueryId};
+        use crate::runtime_filter::codec::artifact::{
+            encode_artifact_bundle, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+        };
+        use crate::runtime_filter::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+            RuntimeFilterRouteIdentity,
+        };
+        use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
+
+        let fixture = compiler_consumer_delivery_fixture();
+        const QUERY: QueryId = QueryId { hi: 81, lo: 82 };
+        let query_uid = UniqueId { hi: 81, lo: 82 };
+        let epoch = fixture.install.epoch();
+
+        let manager = QueryContextManager::new_for_test();
+        manager
+            .get_or_register_native(
+                QUERY,
+                false,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .expect("register native query context");
+        let service = manager
+            .runtime_filter_service_for_ingress(QUERY)
+            .expect("registered query exposes a runtime filter service");
+        assert_eq!(
+            service.install(fixture.install).unwrap(),
+            InstallOutcome::Installed
+        );
+
+        let bundle =
+            service_outbound_delivery_membership_bundle(&fixture.profile, fixture.channel_id);
+        let ceiling =
+            max_encoded_len_for_artifact_budget(semantic_artifact_bytes(&bundle).unwrap()).unwrap();
+        let (digest, payload) = encode_artifact_bundle(
+            &bundle,
+            ArtifactDecodeExpectation::new(&fixture.profile),
+            ceiling,
+        )
+        .unwrap()
+        .into_parts();
+
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
+        // Same wire route identity (edge + transport sequence) each time.
+        let envelope = || {
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Artifact,
+                query_uid,
+                fixture.channel_id,
+                epoch,
+                RuntimeFilterRouteIdentity::delivery(
+                    DeliveryRouteIdentity::try_new(
+                        fixture.delivery_route_edge,
+                        ProducerSequence::new(1),
+                    )
+                    .unwrap(),
+                ),
+                None,
+                None,
+                &digest,
+                payload.clone(),
+            )
+            .unwrap()
+        };
+
+        // The first arrival is accepted; an exact at-least-once wire retry (identical
+        // route edge + transport sequence) is absorbed as Duplicate, never re-applied.
+        assert_eq!(
+            ingress.accept(envelope()).accept_status(),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        assert_eq!(
+            ingress.accept(envelope()).accept_status(),
+            RuntimeFilterAcceptStatus::Duplicate,
+        );
+    }
+
+    #[test]
+    fn reliable_transport_fixture_out_of_order_arrival_absorbed_by_logical_identity() {
+        use crate::runtime::query_context::{QueryContextManager, QueryId};
+        use crate::runtime_filter::codec::artifact::{
+            encode_artifact_bundle, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+        };
+        use crate::runtime_filter::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+            RuntimeFilterRouteIdentity,
+        };
+        use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
+
+        let fixture = compiler_consumer_delivery_fixture();
+        const QUERY: QueryId = QueryId { hi: 91, lo: 92 };
+        let query_uid = UniqueId { hi: 91, lo: 92 };
+        let epoch = fixture.install.epoch();
+
+        let manager = QueryContextManager::new_for_test();
+        manager
+            .get_or_register_native(
+                QUERY,
+                false,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .expect("register native query context");
+        let service = manager
+            .runtime_filter_service_for_ingress(QUERY)
+            .expect("registered query exposes a runtime filter service");
+        assert_eq!(
+            service.install(fixture.install).unwrap(),
+            InstallOutcome::Installed
+        );
+
+        let bundle =
+            service_outbound_delivery_membership_bundle(&fixture.profile, fixture.channel_id);
+        let ceiling =
+            max_encoded_len_for_artifact_budget(semantic_artifact_bytes(&bundle).unwrap()).unwrap();
+        let (digest, payload) = encode_artifact_bundle(
+            &bundle,
+            ArtifactDecodeExpectation::new(&fixture.profile),
+            ceiling,
+        )
+        .unwrap()
+        .into_parts();
+
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
+        // Same logical artifact (same `(route_edge, version)`) arriving under two DIFFERENT
+        // transport sequences, out of order (the later sequence first).
+        let arrival = |sequence: u64| {
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Artifact,
+                query_uid,
+                fixture.channel_id,
+                epoch,
+                RuntimeFilterRouteIdentity::delivery(
+                    DeliveryRouteIdentity::try_new(
+                        fixture.delivery_route_edge,
+                        ProducerSequence::new(sequence),
+                    )
+                    .unwrap(),
+                ),
+                None,
+                None,
+                &digest,
+                payload.clone(),
+            )
+            .unwrap()
+        };
+
+        // Transport sequence 2 arrives first and is accepted.
+        assert_eq!(
+            ingress.accept(arrival(2)).accept_status(),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        // Transport sequence 1 arrives afterward (out of order): the transport-identity gate
+        // admits the fresh sequence, but the stable logical `(route_edge, version)` identity
+        // absorbs it as Duplicate — never delivered or applied twice.
+        assert_eq!(
+            ingress.accept(arrival(1)).accept_status(),
+            RuntimeFilterAcceptStatus::Duplicate,
+        );
+    }
+
+    #[test]
+    fn transport_events_resource_limit_seam_emits_failed_open_through_the_lifecycle_sink() {
+        // The Task-4 resource-limit seam now emits a structured FailedOpen(ResourceLimit)
+        // event through the SAME lifecycle sink the buffered transport steps use — closing
+        // Task 4's flagged no-op seam. The event coarsens the specific ceiling into
+        // ResourceLimit (distinct from the deadline fail-open) and carries the frame bytes.
+        let events = Arc::new(Events::default());
+        let service = RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("transport-resource-limit-seam"),
+        );
+        let identity = TransportRouteEventIdentity::new(
+            RuntimeFilterEventIdentity::new(
+                uid(0),
+                RuntimeFilterParticipantId::new(2),
+                ChannelId::new(5),
+                DeploymentEpoch::new(9),
+            ),
+            RouteEdgeId::new(4),
+        );
+
+        service.record_transport_resource_limit(
+            identity,
+            TransportResourceLimit::PendingEntries,
+            128,
+        );
+
+        assert_eq!(
+            transport_events_of(&events),
+            vec![(
+                identity,
+                TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                128,
+            )],
         );
     }
 }

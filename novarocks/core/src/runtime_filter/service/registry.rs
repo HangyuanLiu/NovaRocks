@@ -38,7 +38,9 @@ use crate::runtime_filter::port::events::{
 use crate::runtime_filter::port::final_domain::{
     CompletionFenceAuthority, RuntimeCompletionFenceContract,
 };
-use crate::runtime_filter::port::identity::{DeploymentEpoch, RouteEdgeId};
+use crate::runtime_filter::port::identity::{
+    DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+};
 use crate::runtime_filter::port::install::{
     RuntimeFilterChannelDeployment, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
 };
@@ -361,6 +363,12 @@ impl InstalledDeployment {
 
     pub(super) fn epoch(&self) -> DeploymentEpoch {
         self.install.epoch()
+    }
+
+    /// The local (this-node) participant this deployment installed as. It is the
+    /// emitting participant for sender-side transport lifecycle events.
+    pub(super) fn participant_id(&self) -> RuntimeFilterParticipantId {
+        self.install.core_view().local_participant_id()
     }
 
     pub(super) fn router(&self) -> &LoopbackRouter {

@@ -21,8 +21,19 @@
 //! (delivered in-process by [`super::loopback::LoopbackRouter`]) and remote edges.
 //! For each remote edge the Service wire-encodes the materialized artifact (or an
 //! `Unavailable` sentinel) into an [`EncodedArtifactFrame`] and hands the frame to
-//! an `ArtifactRemoteSink`. The sink owns transport: M2C injects a recording fake,
-//! while M3 wires the live network sender behind the same seam.
+//! an `ArtifactRemoteSink`. The sink owns transmission only.
+//!
+//! Since M3 the remote leg no longer talks to the sink directly: it flows through
+//! the sender-side `ReliableEnvelopeTransport`
+//! ([`crate::runtime_filter::service::reliable_transport`]), which buffers each
+//! frame for ack-release and bounded retry and hands it to this sink as its
+//! underlying transmit primitive. The sink stays a pure transport seam: M2C/M3
+//! tests inject a recording (or drivable) fake, while RFD-6 wires the live network
+//! sender behind the same trait.
+//!
+//! The frame is borrowed rather than owned because the reliable transport may
+//! re-hand the same buffered frame across retries and broadcast fanout without
+//! re-serializing it.
 //!
 //! The sink never re-authorizes fanout — the [`RuntimeFilterRemoteRoute`] it
 //! receives was already vetted by the Router's `route_delivery`, so the sink only
@@ -38,5 +49,5 @@ use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
 /// frame is fully framed and self-describing (it carries the consumer profile
 /// digest and the bundle logical version), so the sink is a pure transport.
 pub(crate) trait ArtifactRemoteSink: Send + Sync {
-    fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: EncodedArtifactFrame);
+    fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame);
 }

@@ -18,6 +18,8 @@
 use std::error::Error;
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+
 use crate::runtime_filter::codec::contribution::{
     ContributionCodecExpectation, RuntimeFilterContribution, decode_contribution,
     semantic_contribution_bytes,
@@ -29,6 +31,7 @@ use crate::runtime_filter::port::producer::{
 use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
 use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
 
+use super::dedupe::{ContributionAdmission, TombstoneVerdict};
 use super::registry::{DispatchAdmission, InboundProducerContract};
 use super::{OpenedProducer, RuntimeFilterService};
 
@@ -46,6 +49,7 @@ pub(crate) enum InboundProducerDispatchErrorKind {
     CodecContract,
     ProducerContract,
     ServiceUnavailable,
+    ResourceLimit,
 }
 
 impl InboundProducerDispatchErrorKind {
@@ -57,6 +61,7 @@ impl InboundProducerDispatchErrorKind {
             Self::CodecContract => "[codec-contract]",
             Self::ProducerContract => "[producer-contract]",
             Self::ServiceUnavailable => "[service-unavailable]",
+            Self::ResourceLimit => "[resource-limit]",
         }
     }
 }
@@ -106,6 +111,27 @@ impl RuntimeFilterService {
                 "producer envelope requires contribution identity",
             )
         })?;
+
+        // (query, epoch) tombstone: a late contribution for a retired/stale epoch is
+        // rejected without rebuilding context (M2B3 lookup-only). Consulted before
+        // admission so a stale epoch after cancel is reported as StaleEpoch, not masked as
+        // a bare service-unavailable.
+        match self.dedupe.tombstone_verdict(envelope.deployment_epoch()) {
+            TombstoneVerdict::Live => {}
+            TombstoneVerdict::Retired => {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::ServiceUnavailable,
+                    "runtime filter query/epoch is retired",
+                ));
+            }
+            TombstoneVerdict::StaleEpoch => {
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::StaleEpoch,
+                    "runtime filter envelope epoch is older than a retired epoch",
+                ));
+            }
+        }
+
         let operation = self
             .operation
             .lock()
@@ -219,6 +245,36 @@ impl RuntimeFilterService {
                 route.partition_id(),
             )
             .map_err(map_producer_error)?;
+
+        // Transport-identity dedupe: a byte-identical at-least-once retry of this
+        // contribution identity is absorbed as `Duplicate` before any Core mutation. A
+        // same-identity arrival carrying different content is NOT a valid retry -- it
+        // flows to the Core, whose content-aware sequence dedupe rejects it as a
+        // conflicting replay. The content witness is the encoded contribution payload;
+        // for a `ProducerClosed` (empty payload) it collapses to the empty-payload digest,
+        // so its retries are absorbed too.
+        let content_digest: [u8; 32] = Sha256::digest(envelope.payload()).into();
+        match self
+            .dedupe
+            .admit_contribution(envelope.channel_id(), route, content_digest)
+        {
+            ContributionAdmission::Fresh | ContributionAdmission::Conflict => {}
+            ContributionAdmission::DuplicateRetry => {
+                drop(operation);
+                return Ok(InboundProducerDispatchOutcome::Duplicate);
+            }
+            ContributionAdmission::ResourceLimit => {
+                // A genuinely-new contribution identity beyond this channel's self-owned
+                // dedupe ceiling: an explicit first-class resource rejection, not a
+                // silent drop. Reject before any Core mutation.
+                drop(operation);
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::ResourceLimit,
+                    "runtime filter producer dedupe set is at its per-channel resource ceiling",
+                ));
+            }
+        }
+
         let OpenedProducer { handle, outcome } = self
             .open_producer_locked(
                 &installed,
@@ -355,6 +411,7 @@ const fn dispatch_outcome(outcome: SubmitOutcome) -> InboundProducerDispatchOutc
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
 
@@ -845,6 +902,7 @@ mod tests {
             DeploymentEpoch::new(epoch),
             RuntimeFilterRouteIdentity::contribution(route),
             producer_open.map(|count| ProducerOpenMetadata::try_new(count).unwrap()),
+            None,
             &digest,
             payload,
         )
@@ -1966,6 +2024,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             RuntimeFilterRouteIdentity::contribution(route),
             None,
+            Some(RuntimeFilterAcceptStatus::Accepted),
             &digest,
             Vec::new(),
         )
@@ -2028,6 +2087,7 @@ mod tests {
             DeploymentEpoch::new(EPOCH),
             RuntimeFilterRouteIdentity::contribution(route),
             Some(ProducerOpenMetadata::try_new(1).unwrap()),
+            None,
             &[0; 32],
             vec![1],
         )
@@ -2200,6 +2260,7 @@ mod tests {
                 self.deployment_epoch,
                 RuntimeFilterRouteIdentity::contribution(route),
                 Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                None,
                 &self.schema_digest,
                 payload,
             )
@@ -2764,6 +2825,195 @@ mod tests {
             b_partition_count(),
             None,
             "a late ProducerClosed must not open producer B"
+        );
+    }
+
+    // ==========================================================================================
+    // RFD-4/M3 Task 3: unified ingress dedupe + (query, epoch) tombstone (producer side).
+    // ==========================================================================================
+
+    // A byte-identical at-least-once retry of a contribution identity is absorbed as
+    // `Duplicate` BEFORE the producer is opened. The `after_inbound_open_admission` seam
+    // is re-armed after the first open, so it fires again only if the retry reaches the
+    // Core open path; the transport-identity gate short-circuits it, so the seam stays
+    // silent and the reducer domain is never mutated twice.
+    #[test]
+    fn ingress_dedupe_producer_transport_retry_short_circuits_before_core() {
+        let (service, _events) = install(membership_deployment(4096));
+        let (digest, payload) = encode(
+            &membership_contribution(7),
+            ContributionCodecExpectation::Membership(&membership_schema()),
+        );
+        let env = || {
+            contribution_env(
+                PRODUCER_BINDING,
+                PRODUCER_FINST,
+                0,
+                0,
+                1,
+                digest,
+                payload.clone(),
+            )
+        };
+
+        // The open-admission seam is one-shot, so re-arm the same counting closure before
+        // each dispatch: it fires once per reached open. A retry that short-circuits at the
+        // transport gate never reaches the open, so the count stays at one.
+        let opens = Arc::new(AtomicUsize::new(0));
+        let arm = || {
+            let opens = Arc::clone(&opens);
+            service.set_after_inbound_open_admission_hook(Arc::new(move || {
+                opens.fetch_add(1, Ordering::SeqCst);
+            }));
+        };
+
+        arm();
+        assert_eq!(
+            service.dispatch_inbound_producer(env()).unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        let seeded = channel_of(&service, PRODUCER_BINDING)
+            .producer_ingress_core_snapshot(BindingId::new(PRODUCER_BINDING), PRODUCER_FINST)
+            .membership_values;
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        // The byte-identical retry is absorbed at the transport-identity gate: Duplicate,
+        // no second open (the re-armed seam stays silent), no second Core mutation.
+        arm();
+        assert_eq!(
+            service.dispatch_inbound_producer(env()).unwrap(),
+            InboundProducerDispatchOutcome::Duplicate,
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "a transport retry must short-circuit before opening the producer"
+        );
+        let replayed = channel_of(&service, PRODUCER_BINDING)
+            .producer_ingress_core_snapshot(BindingId::new(PRODUCER_BINDING), PRODUCER_FINST)
+            .membership_values;
+        assert_eq!(
+            seeded, replayed,
+            "a transport retry must not mutate the reducer domain twice"
+        );
+    }
+
+    // The transport-identity gate must NOT mask the Core's conflicting-replay detection.
+    // A same-identity arrival carrying different content is not a valid at-least-once
+    // retry, so it flows past the content-guarded gate into the Core, which rejects it as
+    // a producer contract violation (never silently absorbed as a duplicate).
+    #[test]
+    fn ingress_dedupe_producer_same_identity_different_content_is_conflict_not_duplicate() {
+        let (service, events) = install(membership_deployment(4096));
+        let schema = membership_schema();
+        let (digest, payload7) = encode(
+            &membership_contribution(7),
+            ContributionCodecExpectation::Membership(&schema),
+        );
+        let (digest8, payload8) = encode(
+            &membership_contribution(8),
+            ContributionCodecExpectation::Membership(&schema),
+        );
+        assert_eq!(digest, digest8);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_producer(contribution_env(
+                    PRODUCER_BINDING,
+                    PRODUCER_FINST,
+                    0,
+                    0,
+                    1,
+                    digest,
+                    payload7,
+                ))
+                .unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+        assert_eq!(
+            service
+                .dispatch_inbound_producer(closed_env(
+                    PRODUCER_BINDING,
+                    PRODUCER_FINST,
+                    0,
+                    1,
+                    1,
+                    digest
+                ))
+                .unwrap(),
+            InboundProducerDispatchOutcome::Accepted,
+        );
+
+        // Same (binding, finst, partition, sequence) as the first contribution but a
+        // different membership payload: the content guard refuses to short-circuit, and
+        // the Core rejects the conflicting replay.
+        let before = capture(&service, PRODUCER_BINDING, PRODUCER_FINST, &events);
+        let error = err(service.dispatch_inbound_producer(contribution_env(
+            PRODUCER_BINDING,
+            PRODUCER_FINST,
+            0,
+            0,
+            1,
+            digest,
+            payload8,
+        )));
+        assert_prefix(&error, ProducerContract);
+        assert_eq!(
+            before,
+            capture(&service, PRODUCER_BINDING, PRODUCER_FINST, &events),
+            "a conflicting replay masked as a duplicate would have mutated the Core"
+        );
+    }
+
+    // (query, epoch) tombstone: after cancel/completion, a late envelope for an epoch
+    // OLDER than the retired epoch is reported as a stale epoch (not masked as a bare
+    // service-unavailable), and the cancelled registry is never revived (M2B3
+    // lookup-only).
+    #[test]
+    fn ingress_dedupe_producer_tombstone_stale_epoch_after_cancel_is_rejected() {
+        let (service, _events) = install(membership_deployment(4096));
+        let digest = installed_digest(&service, PRODUCER_BINDING);
+        service.cancel();
+
+        let error = err(service.dispatch_inbound_producer(envelope_full(
+            RuntimeFilterEnvelopeKind::ProducerClosed,
+            CHANNEL,
+            EPOCH - 1,
+            PRODUCER_BINDING,
+            PRODUCER_FINST,
+            0,
+            0,
+            Some(1),
+            digest,
+            Vec::new(),
+        )));
+        assert_prefix(&error, StaleEpoch);
+        assert!(
+            service.registry.active_installation().is_none(),
+            "the tombstone must not revive the cancelled registry"
+        );
+    }
+
+    // A late envelope for the retired epoch itself is rejected as service-unavailable
+    // without reviving the cancelled registry.
+    #[test]
+    fn ingress_dedupe_producer_tombstone_retired_epoch_after_cancel_does_not_revive() {
+        let (service, _events) = install(membership_deployment(4096));
+        let digest = installed_digest(&service, PRODUCER_BINDING);
+        service.cancel();
+
+        let error = err(service.dispatch_inbound_producer(closed_env(
+            PRODUCER_BINDING,
+            PRODUCER_FINST,
+            0,
+            0,
+            1,
+            digest,
+        )));
+        assert_prefix(&error, ServiceUnavailable);
+        assert!(
+            service.registry.active_installation().is_none(),
+            "the tombstone must not revive the cancelled registry"
         );
     }
 }

@@ -24,6 +24,7 @@ use super::identity::{
 };
 use super::producer::{ProducerFailureReason, RuntimeContractViolationKind};
 use super::subscription::{ArtifactUnsupportedReason, LiveTerminal, UnavailableReason};
+use super::transport::RuntimeFilterAcceptStatus;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct RuntimeFilterEventIdentity {
@@ -193,6 +194,68 @@ pub(crate) enum FinalDomainRejectionKind {
     ResourceLimit,
 }
 
+/// Sender-side transport delivery-route identity: the query/participant/channel/epoch
+/// coordinates plus the delivery route edge. This is the smallest identity that
+/// unambiguously names a remote delivery route on the SENDER side.
+///
+/// It is deliberately NOT a [`RouteEventIdentity`]: the sender does not know the remote
+/// consumer's fragment instance (the peer's ingress fans one delivery out to its local
+/// subscriptions), so a consumer-instance anchor cannot be formed here without inventing
+/// data. `participant_id` in the common coordinates is the LOCAL (emitting) participant,
+/// consistent with every other lifecycle event.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TransportRouteEventIdentity {
+    common: RuntimeFilterEventIdentity,
+    route_edge_id: RouteEdgeId,
+}
+
+impl TransportRouteEventIdentity {
+    pub(crate) const fn new(
+        common: RuntimeFilterEventIdentity,
+        route_edge_id: RouteEdgeId,
+    ) -> Self {
+        Self {
+            common,
+            route_edge_id,
+        }
+    }
+
+    pub(crate) const fn common(self) -> RuntimeFilterEventIdentity {
+        self.common
+    }
+
+    pub(crate) const fn route_edge_id(self) -> RouteEdgeId {
+        self.route_edge_id
+    }
+}
+
+/// Why a sender-side reliable-transport delivery route failed open — degraded without
+/// erroring the query (runtime filters are an optimization, never a correctness
+/// dependency).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportFailOpenReason {
+    /// The buffered frame outlived its retry/ack deadline and was released.
+    Deadline,
+    /// A self-owned sender-buffer ceiling refused the frame before it was buffered or
+    /// put on the wire (M3 Task 4 `ResourceLimit`).
+    ResourceLimit,
+}
+
+/// One step in a remote delivery frame's sender-side reliable-transport lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportEventKind {
+    /// The frame was buffered for ack-release + bounded retry and handed to the sink once.
+    Sent,
+    /// A buffered, still-unacked frame was re-handed to the sink on a retry tick.
+    Retried,
+    /// An acknowledgement arrived and released the buffered frame; carries the peer's
+    /// accept status (`Accepted` / `Duplicate` / `Rejected`).
+    Acked(RuntimeFilterAcceptStatus),
+    /// The route degraded without erroring the query: a deadline drop or a resource-limit
+    /// refusal.
+    FailedOpen(TransportFailOpenReason),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterEvent {
     DeploymentInstalled {
@@ -320,6 +383,15 @@ pub(crate) enum RuntimeFilterEvent {
     LoopbackDelivered {
         identity: RouteEventIdentity,
         version: LogicalVersion,
+    },
+    /// A sender-side reliable-transport lifecycle step for one remote delivery route:
+    /// the frame was sent / retried / acked / failed open. `bytes` is the serialized
+    /// frame payload length the event concerns (a broadcast frame shared across routes
+    /// carries its own length on each route's event).
+    TransportEnvelope {
+        identity: TransportRouteEventIdentity,
+        kind: TransportEventKind,
+        bytes: usize,
     },
     SubscriptionAcquired {
         identity: ConsumerEventIdentity,
