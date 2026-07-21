@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query-scoped production ingress for inbound runtime-filter producer envelopes.
+//! Query-scoped production ingress for inbound runtime-filter envelopes.
 //!
 //! This is the thin seam between the gRPC `RuntimeFilterEnvelope` wire adapter
 //! and a live query's `RuntimeFilterService`. It does exactly three things and
@@ -23,22 +23,30 @@
 //!
 //! 1. look up the query's already-installed service (lookup-only: it never
 //!    creates, revives, or renews a query),
-//! 2. dispatch the decoded producer envelope into that service, and
+//! 2. dispatch the decoded envelope into that service by its `kind()` —
+//!    producer-direction envelopes (`Contribution` / `ProducerClosed`) go to
+//!    `dispatch_inbound_producer`, consumer-direction envelopes (`Artifact` /
+//!    `Unavailable`) go to `dispatch_inbound_consumer`, and `Ack` (an M3 concern)
+//!    is rejected here, and
 //! 3. map the typed dispatch result back onto the transport-level
 //!    `RuntimeFilterIngressResult`.
 //!
 //! On a lookup miss it answers with a stable adapter-owned `[query-unavailable]`
 //! rejection whose shape matches the typed Core dispatch-error taxonomy, so
-//! producers observe one uniform rejection surface.
+//! callers observe one uniform rejection surface. The adapter imports only the
+//! two dispatch entrypoints and the result mapping — never the registry, Channel,
+//! codec, or subscription internals.
 
 use std::sync::Arc;
 
 use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
 use crate::runtime_filter::port::transport::{
-    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
+    RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
+    RuntimeFilterIngressResult,
 };
 use crate::runtime_filter::service::{
-    InboundProducerDispatchError, InboundProducerDispatchOutcome,
+    InboundConsumerDispatchError, InboundConsumerDispatchOutcome, InboundProducerDispatchError,
+    InboundProducerDispatchOutcome,
 };
 
 // Adapter-owned rejection for a query that is neither active nor within delivery
@@ -47,6 +55,13 @@ use crate::runtime_filter::service::{
 // and the six typed Core dispatch errors surface under one rejection taxonomy.
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: \
      runtime filter query is not active or in delivery grace";
+
+// Adapter-owned rejection for an `Ack` envelope: acknowledgement ingress is an M3
+// concern, so the kind reaches neither the producer nor the consumer dispatch path.
+// It mirrors the dispatch-error Display shape so `Ack` surfaces under the same
+// `runtime filter ingress rejected [<prefix>]` rejection taxonomy.
+const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: \
+     runtime filter ack ingress is not supported";
 
 /// Production ingress bound to the process-global query context manager.
 pub(crate) fn query_scoped_runtime_filter_envelope_ingress() -> Arc<dyn RuntimeFilterEnvelopeIngress>
@@ -79,15 +94,27 @@ impl RuntimeFilterEnvelopeIngress for QueryScopedRuntimeFilterEnvelopeIngress {
             return RuntimeFilterIngressResult::rejected(QUERY_UNAVAILABLE_REJECTION)
                 .expect("query-unavailable reason is non-empty");
         };
-        ingress_result_for_dispatch(service.dispatch_inbound_producer(envelope))
+        // Dispatch by direction: producer-contribution kinds to the producer path,
+        // artifact-delivery kinds to the consumer path, `Ack` (M3) rejected here.
+        match envelope.kind() {
+            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
+                ingress_result_for_producer_dispatch(service.dispatch_inbound_producer(envelope))
+            }
+            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+                ingress_result_for_consumer_dispatch(service.dispatch_inbound_consumer(envelope))
+            }
+            RuntimeFilterEnvelopeKind::Ack => {
+                RuntimeFilterIngressResult::rejected(ACK_UNSUPPORTED_REJECTION)
+                    .expect("ack-unsupported reason is non-empty")
+            }
+        }
     }
 }
 
 /// Maps a typed inbound producer dispatch result onto the transport ingress
-/// result. This is the single mapping the adapter performs after a live service
-/// is found; the six stable dispatch-error prefixes flow through unchanged via
+/// result. The stable producer dispatch-error prefixes flow through unchanged via
 /// the error's `Display`.
-fn ingress_result_for_dispatch(
+fn ingress_result_for_producer_dispatch(
     dispatched: Result<InboundProducerDispatchOutcome, InboundProducerDispatchError>,
 ) -> RuntimeFilterIngressResult {
     match dispatched {
@@ -95,6 +122,20 @@ fn ingress_result_for_dispatch(
         Ok(InboundProducerDispatchOutcome::Duplicate) => RuntimeFilterIngressResult::duplicate(),
         Err(error) => RuntimeFilterIngressResult::rejected(error.to_string())
             .expect("typed inbound dispatch error has a non-empty reason"),
+    }
+}
+
+/// Maps a typed inbound consumer-delivery dispatch result onto the transport
+/// ingress result. Mirrors the producer mapping; the stable consumer
+/// dispatch-error prefixes flow through unchanged via the error's `Display`.
+fn ingress_result_for_consumer_dispatch(
+    dispatched: Result<InboundConsumerDispatchOutcome, InboundConsumerDispatchError>,
+) -> RuntimeFilterIngressResult {
+    match dispatched {
+        Ok(InboundConsumerDispatchOutcome::Accepted) => RuntimeFilterIngressResult::accepted(),
+        Ok(InboundConsumerDispatchOutcome::Duplicate) => RuntimeFilterIngressResult::duplicate(),
+        Err(error) => RuntimeFilterIngressResult::rejected(error.to_string())
+            .expect("typed inbound consumer dispatch error has a non-empty reason"),
     }
 }
 
@@ -107,21 +148,29 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        ingress_result_for_dispatch, query_scoped_runtime_filter_envelope_ingress_with_manager,
+        ingress_result_for_consumer_dispatch, ingress_result_for_producer_dispatch,
+        query_scoped_runtime_filter_envelope_ingress_with_manager,
     };
     use crate::common::types::UniqueId;
     use crate::proto;
     use crate::runtime::query_context::{QueryContextManager, QueryId};
+    use crate::runtime_filter::codec::artifact::{
+        ArtifactDecodeExpectation, encode_artifact_bundle, encode_unavailable,
+        max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+    };
     use crate::runtime_filter::codec::contribution::{
         ContributionCodecExpectation, RuntimeFilterContribution, encode_contribution,
     };
+    use crate::runtime_filter::materializer::{MaterializationOutcome, Materializer};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, NullSemantics, ReductionRequirement,
         RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
     };
     use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+    use crate::runtime_filter::port::artifact::{
+        ArtifactBundle, ArtifactMembershipSchema, ConsumerArtifactProfile,
+    };
     use crate::runtime_filter::port::identity::{
         DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
     };
@@ -135,13 +184,23 @@ mod tests {
         RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
         RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
-    use crate::runtime_filter::port::transport::{
-        ContributionRouteIdentity, ProducerOpenMetadata, RuntimeFilterAcceptStatus,
-        RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind, RuntimeFilterIngressResult,
-        RuntimeFilterRouteIdentity,
+    use crate::runtime_filter::port::subscription::{
+        ArtifactAcquireOutcome, SubscriptionKind, UnavailableReason,
     };
-    use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
+    use crate::runtime_filter::port::support::{
+        ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
+        RetainedMemoryReservation, RuntimeFilterMemoryAccount,
+    };
+    use crate::runtime_filter::port::transport::{
+        ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+        RuntimeFilterIngressResult, RuntimeFilterRouteIdentity,
+    };
+    use crate::runtime_filter::port::value_domain::{
+        LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
+    };
     use crate::runtime_filter::service::{
+        InboundConsumerDispatchError, InboundConsumerDispatchErrorKind,
         InboundProducerDispatchError, InboundProducerDispatchErrorKind,
     };
     use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
@@ -156,6 +215,9 @@ mod tests {
     const CHANNEL: u32 = 1;
     const PRODUCER_BINDING: u32 = 1;
     const CONSUMER_BINDING: u32 = 2;
+    // The consumer's loopback delivery route edge; consumer-direction envelopes
+    // (`Artifact` / `Unavailable`) address this edge.
+    const CONSUMER_ROUTE: u32 = 40;
     const WITNESS: u32 = 11;
     const PRODUCER_FINST: UniqueId = UniqueId { hi: 1, lo: 2 };
     const CONSUMER_FINST: UniqueId = UniqueId { hi: 1, lo: 3 };
@@ -196,7 +258,7 @@ mod tests {
         ConsumerDeployment::new(
             ConsumerActivation::BlockingSnapshot,
             BTreeSet::from([ArtifactCapability::Membership]),
-            RouteEdgeId::new(40),
+            RouteEdgeId::new(CONSUMER_ROUTE),
             BTreeSet::from([CONSUMER_FINST]),
         )
     }
@@ -273,13 +335,34 @@ mod tests {
             inbound_edges.push(edge.clone());
             outbound_edges.push(edge);
         }
-        local_roles.extend(
-            channel
-                .consumers()
-                .keys()
-                .copied()
-                .map(RuntimeFilterRouteRole::Consumer),
-        );
+        // Each consumer gets a loopback aggregator -> consumer delivery edge keyed by
+        // its own `loopback_route_edge_id`, admitting the delivery kinds. This is what
+        // lets `dispatch_inbound_consumer` authorize an `Artifact` / `Unavailable`
+        // envelope and reach the target subscription (mirrors the M2C consumer-ingress
+        // install fixture).
+        for (binding_id, consumer) in channel.consumers() {
+            local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
+            let edge = RuntimeFilterRoutingEdgeView::new(
+                channel_id,
+                consumer.loopback_route_edge_id(),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Aggregator,
+                ),
+                RuntimeFilterRouteEndpointView::new(
+                    participant,
+                    RuntimeFilterRouteRole::Consumer(*binding_id),
+                ),
+                RuntimeFilterRoutePeer::Loopback,
+                BTreeSet::from([
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    RuntimeFilterEnvelopeKind::Unavailable,
+                ]),
+            )
+            .unwrap();
+            inbound_edges.push(edge.clone());
+            outbound_edges.push(edge);
+        }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
             channel_id,
             local_roles,
@@ -419,6 +502,127 @@ mod tests {
         );
     }
 
+    // The consumer dispatch error `Display` carries a distinct `consumer ingress`
+    // shape, so a consumer rejection surfacing through the adapter must start with
+    // that exact prefix (not the producer `runtime filter ingress rejected ` shape).
+    fn assert_rejected_consumer_prefix(result: &RuntimeFilterIngressResult, prefix: &str) {
+        assert_eq!(
+            result.accept_status(),
+            RuntimeFilterAcceptStatus::Rejected,
+            "expected a consumer rejection carrying {prefix}"
+        );
+        let reason = result
+            .rejection_reason()
+            .expect("a rejected ingress result carries a reason");
+        assert!(
+            reason.starts_with("runtime filter consumer ingress rejected "),
+            "reason {reason:?} must carry the consumer ingress rejection shape"
+        );
+        assert!(
+            reason.contains(prefix),
+            "reason {reason:?} must carry the {prefix} prefix"
+        );
+    }
+
+    // --- consumer delivery fixtures -----------------------------------------------------------
+
+    // Test-only memory account for the local bundle materialization; the live
+    // dispatch uses the service's own account supplied by the query context.
+    struct Memory;
+    impl RuntimeFilterMemoryAccount for Memory {
+        fn try_consume(&self, _: usize) -> Result<(), MemoryAccountError> {
+            Ok(())
+        }
+        fn release(&self, _: usize) {}
+    }
+
+    // The consumer artifact profile the installed membership consumer owns. It is
+    // exactly the `[ValueSet, EmptyDomain]` profile `ConsumerDeployment::new` freezes,
+    // so an envelope encoded against it matches the installed profile digest.
+    fn consumer_profile() -> ConsumerArtifactProfile {
+        ConsumerArtifactProfile::m1_test_default()
+    }
+
+    fn membership_bundle(profile: &ConsumerArtifactProfile) -> Arc<ArtifactBundle> {
+        let values = MembershipValues::int64([1, 2, 3]);
+        let schema =
+            ArtifactMembershipSchema::new(&values.data_type(), NullSemantics::NeverMatches)
+                .unwrap();
+        let snapshot = LogicalSnapshot::first(
+            ChannelId::new(CHANNEL),
+            ReducedMembershipDomain::new(values, false),
+            RetainedMemoryReservation::empty(),
+        );
+        let plan = Materializer::plan(
+            Arc::new(snapshot),
+            &schema,
+            profile,
+            MaterializationPolicy::for_test(),
+            4096,
+        )
+        .unwrap();
+        match Materializer::materialize(
+            plan,
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            Arc::new(ArtifactScratchBudget::new(1 << 16, 1 << 16).unwrap()),
+            Arc::new(Memory),
+        ) {
+            MaterializationOutcome::Published(bundle) => bundle,
+            other => panic!("membership fixture must publish a bundle, got {other:?}"),
+        }
+    }
+
+    fn encode_bundle(
+        bundle: &ArtifactBundle,
+        profile: &ConsumerArtifactProfile,
+    ) -> ([u8; 32], Vec<u8>) {
+        let ceiling =
+            max_encoded_len_for_artifact_budget(semantic_artifact_bytes(bundle).unwrap()).unwrap();
+        encode_artifact_bundle(bundle, ArtifactDecodeExpectation::new(profile), ceiling)
+            .unwrap()
+            .into_parts()
+    }
+
+    fn delivery_envelope(
+        kind: RuntimeFilterEnvelopeKind,
+        route_edge: u32,
+        sequence: u64,
+        digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> RuntimeFilterEnvelope {
+        RuntimeFilterEnvelope::try_new(
+            kind,
+            QUERY_UID,
+            ChannelId::new(CHANNEL),
+            DeploymentEpoch::new(EPOCH),
+            RuntimeFilterRouteIdentity::delivery(
+                DeliveryRouteIdentity::try_new(
+                    RouteEdgeId::new(route_edge),
+                    ProducerSequence::new(sequence),
+                )
+                .expect("valid delivery route identity"),
+            ),
+            None,
+            &digest,
+            payload,
+        )
+        .expect("valid delivery envelope")
+    }
+
+    fn artifact_envelope(
+        sequence: u64,
+        digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> RuntimeFilterEnvelope {
+        delivery_envelope(
+            RuntimeFilterEnvelopeKind::Artifact,
+            CONSUMER_ROUTE,
+            sequence,
+            digest,
+            payload,
+        )
+    }
+
     // --- tests --------------------------------------------------------------------------------
 
     #[test]
@@ -542,12 +746,25 @@ mod tests {
         // ServiceUnavailable is unreachable through the live producer-submit path
         // (dispatch holds an active installation), so exercise the same mapping the
         // adapter performs on any typed dispatch error.
-        let result = ingress_result_for_dispatch(Err(InboundProducerDispatchError::new(
+        let result = ingress_result_for_producer_dispatch(Err(InboundProducerDispatchError::new(
             InboundProducerDispatchErrorKind::ServiceUnavailable,
             "runtime filter service is uninstalled or cancelled",
         )));
 
         assert_rejected_prefix(&result, "[service-unavailable]");
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_consumer_service_unavailable_prefix() {
+        // Mirror of the producer mapping check on the consumer path: any typed consumer
+        // dispatch error surfaces through the adapter with its stable consumer-ingress
+        // prefix unchanged.
+        let result = ingress_result_for_consumer_dispatch(Err(InboundConsumerDispatchError::new(
+            InboundConsumerDispatchErrorKind::ServiceUnavailable,
+            "runtime filter service is cancelled or shut down",
+        )));
+
+        assert_rejected_consumer_prefix(&result, "[service-unavailable]");
     }
 
     #[test]
@@ -567,5 +784,158 @@ mod tests {
         .expect_err("malformed wire envelope must be an InvalidArgument gRPC error");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_installed_query_accepts_artifact_delivery() {
+        let manager = installed_manager();
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
+        let profile = consumer_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        let result = ingress.accept(artifact_envelope(1, digest, payload));
+
+        assert_eq!(result.accept_status(), RuntimeFilterAcceptStatus::Accepted);
+        assert_eq!(result.rejection_reason(), None);
+
+        // The artifact must have reached the real consumer subscription through
+        // `dispatch_inbound_consumer`, not the producer path.
+        let snapshot = manager
+            .runtime_filter_service_for_ingress(QUERY)
+            .expect("installed query exposes a runtime filter service")
+            .subscribe(
+                BindingId::new(CONSUMER_BINDING),
+                CONSUMER_FINST,
+                SubscriptionKind::BlockingSnapshot,
+            )
+            .expect("membership consumer is subscribable")
+            .into_blocking()
+            .expect("consumer activation is blocking-snapshot")
+            .snapshot()
+            .map(|delivered| delivered.canonical_digest());
+        assert_eq!(
+            snapshot,
+            Some(bundle.canonical_digest()),
+            "the target subscription must receive the logically-equal artifact"
+        );
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_installed_query_accepts_unavailable_delivery() {
+        let manager = installed_manager();
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager.clone());
+        let profile = consumer_profile();
+        let (digest, payload) = encode_unavailable(
+            UnavailableReason::IncompleteCoverage,
+            ArtifactDecodeExpectation::new(&profile),
+            1 << 20,
+        )
+        .unwrap()
+        .into_parts();
+
+        let result = ingress.accept(delivery_envelope(
+            RuntimeFilterEnvelopeKind::Unavailable,
+            CONSUMER_ROUTE,
+            1,
+            digest,
+            payload,
+        ));
+
+        assert_eq!(result.accept_status(), RuntimeFilterAcceptStatus::Accepted);
+
+        let acquired = manager
+            .runtime_filter_service_for_ingress(QUERY)
+            .expect("installed query exposes a runtime filter service")
+            .subscribe(
+                BindingId::new(CONSUMER_BINDING),
+                CONSUMER_FINST,
+                SubscriptionKind::BlockingSnapshot,
+            )
+            .expect("membership consumer is subscribable")
+            .into_blocking()
+            .expect("consumer activation is blocking-snapshot")
+            .acquire(Duration::ZERO);
+        assert!(
+            matches!(
+                acquired,
+                ArtifactAcquireOutcome::Unavailable(UnavailableReason::IncompleteCoverage)
+            ),
+            "the consumer subscription must observe the Unavailable reason, got {acquired:?}"
+        );
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_consumer_exact_replay_is_duplicate() {
+        let manager = installed_manager();
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager);
+        let profile = consumer_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            ingress
+                .accept(artifact_envelope(1, digest, payload.clone()))
+                .accept_status(),
+            RuntimeFilterAcceptStatus::Accepted,
+        );
+        assert_eq!(
+            ingress
+                .accept(artifact_envelope(1, digest, payload))
+                .accept_status(),
+            RuntimeFilterAcceptStatus::Duplicate,
+        );
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_consumer_codec_contract_prefix() {
+        let manager = installed_manager();
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager);
+        // A correctly-routed artifact whose profile digest does not match the installed
+        // consumer profile: consumer dispatch clears routing and rejects at the digest
+        // gate, carrying the consumer-ingress `[codec-contract]` prefix.
+        let correct = consumer_profile().id().bytes();
+        let wrong = [0x5A_u8; 32];
+        assert_ne!(wrong, correct);
+
+        let result = ingress.accept(artifact_envelope(1, wrong, vec![1]));
+
+        assert_rejected_consumer_prefix(&result, "[codec-contract]");
+    }
+
+    #[test]
+    fn query_scoped_runtime_filter_envelope_ingress_ack_is_rejected() {
+        // `Ack` belongs to M3: the adapter dispatches neither to the producer nor the
+        // consumer path and answers a stable adapter-owned rejection.
+        let manager = installed_manager();
+        let ingress = query_scoped_runtime_filter_envelope_ingress_with_manager(manager);
+        let ack = RuntimeFilterEnvelope::try_new(
+            RuntimeFilterEnvelopeKind::Ack,
+            QUERY_UID,
+            ChannelId::new(CHANNEL),
+            DeploymentEpoch::new(EPOCH),
+            RuntimeFilterRouteIdentity::delivery(
+                DeliveryRouteIdentity::try_new(
+                    RouteEdgeId::new(CONSUMER_ROUTE),
+                    ProducerSequence::new(1),
+                )
+                .unwrap(),
+            ),
+            None,
+            &[0; 32],
+            Vec::new(),
+        )
+        .expect("valid ack envelope");
+
+        let result = ingress.accept(ack);
+
+        assert_eq!(result.accept_status(), RuntimeFilterAcceptStatus::Rejected);
+        let reason = result
+            .rejection_reason()
+            .expect("ack rejection carries a reason");
+        assert!(
+            reason.contains("[ack-unsupported]"),
+            "ack rejection {reason:?} must carry the [ack-unsupported] prefix"
+        );
     }
 }
