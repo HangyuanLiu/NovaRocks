@@ -57,6 +57,7 @@ pub(crate) enum InboundConsumerDispatchErrorKind {
     RouteContract,
     CodecContract,
     ServiceUnavailable,
+    ResourceLimit,
 }
 
 impl InboundConsumerDispatchErrorKind {
@@ -67,6 +68,7 @@ impl InboundConsumerDispatchErrorKind {
             Self::RouteContract => "[route-contract]",
             Self::CodecContract => "[codec-contract]",
             Self::ServiceUnavailable => "[service-unavailable]",
+            Self::ResourceLimit => "[resource-limit]",
         }
     }
 }
@@ -143,10 +145,7 @@ impl RuntimeFilterService {
         // without rebuilding context (M2B3 lookup-only). Consulted before admission so a
         // stale epoch after cancel is reported as StaleEpoch, not masked as a bare
         // service-unavailable.
-        match self
-            .dedupe
-            .tombstone_verdict(envelope.query_id(), envelope.deployment_epoch())
-        {
+        match self.dedupe.tombstone_verdict(envelope.deployment_epoch()) {
             TombstoneVerdict::Live => {}
             TombstoneVerdict::Retired => {
                 return Err(ingress_error(
@@ -281,22 +280,39 @@ impl RuntimeFilterService {
         //       logical version is never delivered twice, even via a distinct transport
         //       sequence.
         let route_edge_id = route.route_edge_id();
-        if matches!(
-            self.dedupe.admit_delivery(envelope.channel_id(), route),
-            DeliveryAdmission::Duplicate
-        ) {
-            return Ok(InboundConsumerDispatchOutcome::Duplicate);
+        match self.dedupe.admit_delivery(envelope.channel_id(), route) {
+            DeliveryAdmission::Fresh => {}
+            DeliveryAdmission::Duplicate => {
+                return Ok(InboundConsumerDispatchOutcome::Duplicate);
+            }
+            DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
         }
-        if matches!(
-            self.dedupe
-                .admit_delivered_version(envelope.channel_id(), route_edge_id, version),
-            DeliveryAdmission::Duplicate
-        ) {
-            return Ok(InboundConsumerDispatchOutcome::Duplicate);
+        match self
+            .dedupe
+            .admit_delivered_version(envelope.channel_id(), route_edge_id, version)
+        {
+            DeliveryAdmission::Fresh => {}
+            DeliveryAdmission::Duplicate => {
+                return Ok(InboundConsumerDispatchOutcome::Duplicate);
+            }
+            DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
         }
         installed.router().route(&[route_edge_id], &outcome);
         Ok(InboundConsumerDispatchOutcome::Accepted)
     }
+}
+
+// A genuinely-new delivery identity beyond this channel's self-owned dedupe ceiling:
+// an explicit first-class resource rejection, not a silent drop. The transport gate
+// is checked first, so with a shared ceiling the logical gate is only reached once
+// the transport gate has admitted (it never grows faster), and the two gates never
+// leave inconsistent state at the cap. Rejected before the delivery is fanned into
+// the subscription, so no partial delivery ever occurs.
+fn resource_limit_error() -> InboundConsumerDispatchError {
+    ingress_error(
+        InboundConsumerDispatchErrorKind::ResourceLimit,
+        "runtime filter consumer dedupe set is at its per-channel resource ceiling",
+    )
 }
 
 fn ingress_error(
@@ -390,7 +406,8 @@ mod tests {
     use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
     use super::InboundConsumerDispatchErrorKind::{
-        CodecContract, DeploymentUnavailable, RouteContract, ServiceUnavailable, StaleEpoch,
+        CodecContract, DeploymentUnavailable, ResourceLimit, RouteContract, ServiceUnavailable,
+        StaleEpoch,
     };
     use super::{
         InboundConsumerDispatchError, InboundConsumerDispatchErrorKind,
@@ -1358,6 +1375,7 @@ mod tests {
             (RouteContract, "[route-contract]"),
             (CodecContract, "[codec-contract]"),
             (ServiceUnavailable, "[service-unavailable]"),
+            (ResourceLimit, "[resource-limit]"),
         ] {
             assert_eq!(kind.prefix(), prefix);
         }

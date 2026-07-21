@@ -49,6 +49,7 @@ pub(crate) enum InboundProducerDispatchErrorKind {
     CodecContract,
     ProducerContract,
     ServiceUnavailable,
+    ResourceLimit,
 }
 
 impl InboundProducerDispatchErrorKind {
@@ -60,6 +61,7 @@ impl InboundProducerDispatchErrorKind {
             Self::CodecContract => "[codec-contract]",
             Self::ProducerContract => "[producer-contract]",
             Self::ServiceUnavailable => "[service-unavailable]",
+            Self::ResourceLimit => "[resource-limit]",
         }
     }
 }
@@ -114,10 +116,7 @@ impl RuntimeFilterService {
         // rejected without rebuilding context (M2B3 lookup-only). Consulted before
         // admission so a stale epoch after cancel is reported as StaleEpoch, not masked as
         // a bare service-unavailable.
-        match self
-            .dedupe
-            .tombstone_verdict(envelope.query_id(), envelope.deployment_epoch())
-        {
+        match self.dedupe.tombstone_verdict(envelope.deployment_epoch()) {
             TombstoneVerdict::Live => {}
             TombstoneVerdict::Retired => {
                 return Err(ingress_error(
@@ -263,6 +262,16 @@ impl RuntimeFilterService {
             ContributionAdmission::DuplicateRetry => {
                 drop(operation);
                 return Ok(InboundProducerDispatchOutcome::Duplicate);
+            }
+            ContributionAdmission::ResourceLimit => {
+                // A genuinely-new contribution identity beyond this channel's self-owned
+                // dedupe ceiling: an explicit first-class resource rejection, not a
+                // silent drop. Reject before any Core mutation.
+                drop(operation);
+                return Err(ingress_error(
+                    InboundProducerDispatchErrorKind::ResourceLimit,
+                    "runtime filter producer dedupe set is at its per-channel resource ceiling",
+                ));
             }
         }
 

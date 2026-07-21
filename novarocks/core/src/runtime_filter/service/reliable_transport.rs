@@ -58,7 +58,7 @@ use crate::runtime_filter::port::transport::{
 };
 use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 
-/// Bounded retry / deadline policy for the reliable transport.
+/// Bounded retry / deadline / buffer policy for the reliable transport.
 ///
 /// `max_attempts` caps the total number of times a frame is handed to the sink
 /// (the initial send plus retries), bounding network chatter. `deadline` caps how
@@ -66,23 +66,44 @@ use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 /// bounding buffer lifetime. The two limits are independent: exhausting the attempt
 /// count stops re-transmission but keeps the frame buffered until the deadline, so
 /// an ack that finally arrives before the deadline still releases cleanly.
+///
+/// `max_pending_entries` and `max_pending_bytes` are the M3 Task 4 self-owned buffer
+/// ceilings. They bound the sender-side buffer purely through the transport's OWN
+/// counters — RF buffer memory is deliberately NOT wired into the global MemTracker
+/// this milestone. Offering a frame that would exceed either returns
+/// [`ReliableSendOutcome::ResourceLimit`] instead of buffering: an explicit resource
+/// rejection, distinct from the deadline fail-open degradation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReliableTransportPolicy {
     retry_interval: Duration,
     max_attempts: u32,
     deadline: Duration,
+    max_pending_entries: usize,
+    max_pending_bytes: usize,
 }
 
 impl ReliableTransportPolicy {
-    pub(crate) fn new(retry_interval: Duration, max_attempts: u32, deadline: Duration) -> Self {
+    pub(crate) fn new(
+        retry_interval: Duration,
+        max_attempts: u32,
+        deadline: Duration,
+        max_pending_entries: usize,
+        max_pending_bytes: usize,
+    ) -> Self {
         assert!(
             max_attempts >= 1,
             "reliable transport must allow at least the initial send"
+        );
+        assert!(
+            max_pending_entries >= 1,
+            "reliable transport must be able to buffer at least one frame"
         );
         Self {
             retry_interval,
             max_attempts,
             deadline,
+            max_pending_entries,
+            max_pending_bytes,
         }
     }
 }
@@ -94,12 +115,33 @@ const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 
+// Self-owned buffer ceilings (M3 Task 4). These are query-scoped SOFTWARE SAFETY
+// caps, not cluster-topology quantities: they must NOT be sized to the live BE count
+// (no single-BE assumption), so they are generous fixed constants that a healthy
+// broadcast fan-out and its unacked backlog stay far below. They exist only to stop
+// pathological unbounded growth (a retry storm, a peer that never acks). Bounding is
+// self-owned via the transport's own counters; RF buffer memory stays out of the
+// global MemTracker this milestone.
+//
+// `DEFAULT_MAX_PENDING_ENTRIES`: an in-flight backlog this deep (65536 unacked remote
+// deliveries for one query, across all its channels) is already pathological; real
+// ack cadence keeps the live buffer far smaller even when broadcasting to a large
+// cluster.
+const DEFAULT_MAX_PENDING_ENTRIES: usize = 1 << 16;
+// `DEFAULT_MAX_PENDING_BYTES`: 256 MiB of DISTINCT buffered serialized frames per
+// query. Each frame is itself bounded by its channel's `max_artifact_bytes` wire
+// ceiling, and a broadcast frame shared across routes is metered once (see
+// `PendingBuffer`), so a handful of in-flight artifact versions stay well under this.
+const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+
 impl Default for ReliableTransportPolicy {
     fn default() -> Self {
         Self::new(
             DEFAULT_RETRY_INTERVAL,
             DEFAULT_MAX_ATTEMPTS,
             DEFAULT_DEADLINE,
+            DEFAULT_MAX_PENDING_ENTRIES,
+            DEFAULT_MAX_PENDING_BYTES,
         )
     }
 }
@@ -137,6 +179,116 @@ struct PendingEntry {
     attempts: u32,
     first_sent_at: Instant,
     last_sent_at: Instant,
+}
+
+/// Which self-owned transport ceiling a `send` would exceed. Kept distinct so a
+/// later task's structured degradation event can name the limit that tripped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportResourceLimit {
+    /// Buffering another frame would exceed the pending-entry count ceiling.
+    PendingEntries,
+    /// Buffering another distinct frame would exceed the buffered serialized-byte
+    /// ceiling.
+    SerializedBytes,
+}
+
+/// Outcome of offering a frame to the reliable transport ([`ReliableEnvelopeTransport::send`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReliableSendOutcome {
+    /// Buffered for ack-release + bounded retry and handed to the sink once; carries
+    /// the delivery route identity the transport stamped so a later ack can address
+    /// exactly this in-flight frame.
+    Buffered(RuntimeFilterRouteIdentity),
+    /// Refused: a self-owned ceiling (pending-entry count or buffered serialized
+    /// bytes) would be exceeded. The frame was NOT buffered and NOT put on the wire.
+    /// This is an EXPLICIT resource rejection — a first-class outcome, not a silent
+    /// drop and not the deadline fail-open degradation. The caller degrades the route.
+    ResourceLimit(TransportResourceLimit),
+}
+
+#[cfg(test)]
+impl ReliableSendOutcome {
+    /// The stamped delivery identity of a buffered send, or a panic if the send was
+    /// refused. Test convenience for the common "expected to buffer" call site.
+    fn expect_buffered(self) -> RuntimeFilterRouteIdentity {
+        match self {
+            ReliableSendOutcome::Buffered(identity) => identity,
+            ReliableSendOutcome::ResourceLimit(limit) => {
+                panic!("expected a buffered send, got ResourceLimit({limit:?})")
+            }
+        }
+    }
+}
+
+/// The query-scoped in-flight buffer plus its self-owned counters.
+///
+/// Byte metering is per unique frame ALLOCATION, not per entry: a broadcast frame
+/// that fans out to several routes is one [`Arc`] allocation shared across entries,
+/// so its serialized bytes are counted once. Counting per entry would count a shared
+/// frame N times, misrepresenting real memory and rejecting legitimate wide fan-out.
+/// `frame_refs` keys on the frame allocation address (`Arc::as_ptr` as `usize`); while
+/// a frame has at least one buffered entry we hold an `Arc` to it, so its address is
+/// stable and unique, and `bytes` is adjusted only on the 0<->1 reference transition.
+#[derive(Default)]
+struct PendingBuffer {
+    entries: HashMap<PendingKey, PendingEntry>,
+    bytes: usize,
+    frame_refs: HashMap<usize, usize>,
+}
+
+impl PendingBuffer {
+    /// Admit a new entry under the ceilings. On success the entry is inserted and its
+    /// frame's bytes are metered (once per unique allocation); on a ceiling breach
+    /// nothing is inserted and the tripped limit is returned. Every `send` stamps a
+    /// fresh monotonic sequence, so `key` is always genuinely new — this never
+    /// overwrites, so idempotency is not a concern on the sender buffer.
+    fn admit(
+        &mut self,
+        key: PendingKey,
+        entry: PendingEntry,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<(), TransportResourceLimit> {
+        if self.entries.len() >= max_entries {
+            return Err(TransportResourceLimit::PendingEntries);
+        }
+        let allocation = Arc::as_ptr(&entry.frame) as usize;
+        let is_new_allocation = !self.frame_refs.contains_key(&allocation);
+        // Only a genuinely-new allocation adds bytes; a broadcast frame already
+        // buffered for another route adds none, so wide fan-out of one frame is never
+        // byte-rejected once the first route fits.
+        let added = if is_new_allocation {
+            entry.frame.payload().len()
+        } else {
+            0
+        };
+        if self.bytes.saturating_add(added) > max_bytes {
+            return Err(TransportResourceLimit::SerializedBytes);
+        }
+        *self.frame_refs.entry(allocation).or_insert(0) += 1;
+        self.bytes += added;
+        // Underscore-bound so the assertion's variable is not flagged unused in release
+        // builds, where `debug_assert!` compiles out.
+        let _previous = self.entries.insert(key, entry);
+        debug_assert!(
+            _previous.is_none(),
+            "reliable transport stamps a fresh sequence per send, so keys are unique"
+        );
+        Ok(())
+    }
+
+    /// Release the accounting for an entry's frame: drop one reference, and when the
+    /// last reference to an allocation goes away, reclaim its bytes.
+    fn release(&mut self, frame: &Arc<EncodedArtifactFrame>) {
+        let allocation = Arc::as_ptr(frame) as usize;
+        if let Some(refs) = self.frame_refs.get_mut(&allocation) {
+            *refs -= 1;
+            if *refs == 0 {
+                self.frame_refs.remove(&allocation);
+                self.bytes = self.bytes.saturating_sub(frame.payload().len());
+            }
+        }
+    }
 }
 
 /// The result of applying an ack to the buffer.
@@ -202,7 +354,7 @@ pub(crate) struct ReliableEnvelopeTransport {
     sink_override: Mutex<Option<Arc<dyn ArtifactRemoteSink>>>,
     clock: Arc<dyn RuntimeFilterClock>,
     policy: ReliableTransportPolicy,
-    pending: Mutex<HashMap<PendingKey, PendingEntry>>,
+    pending: Mutex<PendingBuffer>,
     next_sequence: AtomicU64,
 }
 
@@ -218,7 +370,7 @@ impl ReliableEnvelopeTransport {
             sink_override: Mutex::new(None),
             clock,
             policy,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingBuffer::default()),
             next_sequence: AtomicU64::new(1),
         }
     }
@@ -233,14 +385,21 @@ impl ReliableEnvelopeTransport {
         )
     }
 
-    /// Buffer `frame` for reliable delivery to `route` and hand it to the underlying
-    /// sink once. Returns the delivery route identity the transport stamped, so an
-    /// ack can later address exactly this in-flight frame.
+    /// Offer `frame` for reliable delivery to `route`: buffer it for ack-release and
+    /// bounded retry and hand it to the underlying sink once, UNLESS a self-owned
+    /// buffer ceiling would be exceeded.
+    ///
+    /// On success returns [`ReliableSendOutcome::Buffered`] with the delivery route
+    /// identity the transport stamped, so an ack can later address exactly this
+    /// in-flight frame. When the pending-entry count or the buffered serialized-byte
+    /// ceiling would be exceeded the frame is NOT buffered and NOT transmitted, and
+    /// [`ReliableSendOutcome::ResourceLimit`] is returned — an explicit resource
+    /// rejection the caller degrades the route on, distinct from the deadline fail-open.
     pub(crate) fn send(
         &self,
         route: &RuntimeFilterRemoteRoute,
         frame: Arc<EncodedArtifactFrame>,
-    ) -> RuntimeFilterRouteIdentity {
+    ) -> ReliableSendOutcome {
         let sequence = ProducerSequence::new(self.next_sequence.fetch_add(1, Ordering::Relaxed));
         let key = PendingKey {
             route_edge_id: route.route_edge_id(),
@@ -252,7 +411,7 @@ impl ReliableEnvelopeTransport {
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            pending.insert(
+            if let Err(limit) = pending.admit(
                 key,
                 PendingEntry {
                     frame: Arc::clone(&frame),
@@ -261,12 +420,18 @@ impl ReliableEnvelopeTransport {
                     first_sent_at: now,
                     last_sent_at: now,
                 },
-            );
+                self.policy.max_pending_entries,
+                self.policy.max_pending_bytes,
+            ) {
+                // Over a self-owned ceiling: the frame is neither buffered nor put on
+                // the wire. Surface the explicit rejection; the caller degrades the route.
+                return ReliableSendOutcome::ResourceLimit(limit);
+            }
         }
         // Transmit outside the buffer lock: a re-entrant or blocking sink must not be
         // able to stall a concurrent ack or retry tick that needs the buffer.
         self.resolve_sink().deliver_remote(route, &frame);
-        key.into_route_identity()
+        ReliableSendOutcome::Buffered(key.into_route_identity())
     }
 
     /// Apply an ack for `identity` with `status`, releasing the matching buffered
@@ -286,15 +451,18 @@ impl ReliableEnvelopeTransport {
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match pending.remove(&key) {
+        match pending.entries.remove(&key) {
             // Already released, or a duplicate / out-of-order ack for an identity that
             // is no longer in flight. A no-op — never a re-delivery.
             None => EnvelopeAckOutcome::Unknown,
-            Some(_entry) => match status {
-                RuntimeFilterAcceptStatus::Accepted => EnvelopeAckOutcome::Released,
-                RuntimeFilterAcceptStatus::Duplicate => EnvelopeAckOutcome::ReleasedOnDuplicate,
-                RuntimeFilterAcceptStatus::Rejected => EnvelopeAckOutcome::Rejected,
-            },
+            Some(entry) => {
+                pending.release(&entry.frame);
+                match status {
+                    RuntimeFilterAcceptStatus::Accepted => EnvelopeAckOutcome::Released,
+                    RuntimeFilterAcceptStatus::Duplicate => EnvelopeAckOutcome::ReleasedOnDuplicate,
+                    RuntimeFilterAcceptStatus::Rejected => EnvelopeAckOutcome::Rejected,
+                }
+            }
         }
     }
 
@@ -309,12 +477,13 @@ impl ReliableEnvelopeTransport {
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            pending.retain(|key, entry| {
+            let mut expired: Vec<PendingKey> = Vec::new();
+            for (key, entry) in pending.entries.iter_mut() {
                 // Deadline wins over retry: past the deadline the frame is dropped and
                 // the route fails open. No panic, no error surfaced to the query.
                 if now.saturating_duration_since(entry.first_sent_at) >= self.policy.deadline {
-                    failed_open.push(*key);
-                    return false;
+                    expired.push(*key);
+                    continue;
                 }
                 // Under the attempt bound and past the retry interval: re-hand it. Once
                 // the count is exhausted the frame stays buffered until its deadline, so
@@ -327,8 +496,14 @@ impl ReliableEnvelopeTransport {
                     entry.last_sent_at = now;
                     to_send.push((entry.route.clone(), Arc::clone(&entry.frame)));
                 }
-                true
-            });
+            }
+            // Remove the deadline-expired frames, reclaiming their byte accounting.
+            for key in expired {
+                if let Some(entry) = pending.entries.remove(&key) {
+                    pending.release(&entry.frame);
+                    failed_open.push(key);
+                }
+            }
         }
         // Re-hand retries outside the buffer lock (see `send`). The re-hand order
         // within a tick is unspecified (it follows HashMap iteration), so no caller
@@ -369,7 +544,19 @@ impl ReliableEnvelopeTransport {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .entries
             .len()
+    }
+
+    /// The distinct serialized-frame bytes currently buffered (per-unique-allocation;
+    /// a broadcast frame counts once). Test seam for the self-owned byte ceiling and
+    /// the release-to-zero teardown assertion.
+    #[cfg(test)]
+    fn pending_bytes(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bytes
     }
 
     /// Point the transport at a fake sink. Test-only seam used by service-level
@@ -388,7 +575,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::{EnvelopeAckOutcome, ReliableEnvelopeTransport, ReliableTransportPolicy};
+    use super::{
+        EnvelopeAckOutcome, ReliableEnvelopeTransport, ReliableSendOutcome,
+        ReliableTransportPolicy, TransportResourceLimit,
+    };
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
     use crate::runtime_filter::model::contract::BindingId;
@@ -465,12 +655,44 @@ mod tests {
         }
     }
 
+    // Roomy buffer ceilings so the pre-existing retry/ack/deadline tests never trip a
+    // resource limit; the `transport_bounded_*` tests set tight ceilings explicitly.
+    const ROOMY_MAX_ENTRIES: usize = 1024;
+    const ROOMY_MAX_BYTES: usize = 1 << 30;
+
     fn policy(retry_ms: u64, max_attempts: u32, deadline_ms: u64) -> ReliableTransportPolicy {
+        policy_bounded(
+            retry_ms,
+            max_attempts,
+            deadline_ms,
+            ROOMY_MAX_ENTRIES,
+            ROOMY_MAX_BYTES,
+        )
+    }
+
+    fn policy_bounded(
+        retry_ms: u64,
+        max_attempts: u32,
+        deadline_ms: u64,
+        max_pending_entries: usize,
+        max_pending_bytes: usize,
+    ) -> ReliableTransportPolicy {
         ReliableTransportPolicy::new(
             Duration::from_millis(retry_ms),
             max_attempts,
             Duration::from_millis(deadline_ms),
+            max_pending_entries,
+            max_pending_bytes,
         )
+    }
+
+    // A frame whose serialized payload is exactly `bytes` long, tagged by `tag` so
+    // distinct sends can be told apart. Byte-ceiling tests size payloads against a cap.
+    fn frame_sized(tag: u8, bytes: usize) -> Arc<EncodedArtifactFrame> {
+        Arc::new(EncodedArtifactFrame::from_parts_for_test(
+            [tag; 32],
+            vec![tag; bytes],
+        ))
     }
 
     fn route(edge: u32) -> RuntimeFilterRemoteRoute {
@@ -499,7 +721,9 @@ mod tests {
         } = harness(policy(100, 3, 10_000));
         let payload = frame(1);
 
-        let identity = transport.send(&route(30), Arc::clone(&payload));
+        let identity = transport
+            .send(&route(30), Arc::clone(&payload))
+            .expect_buffered();
 
         // Buffered exactly once.
         assert_eq!(transport.pending_len(), 1);
@@ -523,7 +747,7 @@ mod tests {
             clock,
         } = harness(policy(100, 3, 10_000));
 
-        let identity = transport.send(&route(30), frame(1));
+        let identity = transport.send(&route(30), frame(1)).expect_buffered();
         assert_eq!(transport.pending_len(), 1);
 
         assert_eq!(
@@ -552,7 +776,7 @@ mod tests {
             clock,
         } = harness(policy(100, 3, 10_000));
 
-        let identity = transport.send(&route(30), frame(1));
+        let identity = transport.send(&route(30), frame(1)).expect_buffered();
         assert_eq!(
             transport.on_ack(&identity, RuntimeFilterAcceptStatus::Duplicate),
             EnvelopeAckOutcome::ReleasedOnDuplicate
@@ -610,7 +834,7 @@ mod tests {
             clock,
         } = harness(policy(100, 2, 100_000));
 
-        let identity = transport.send(&route(30), frame(1));
+        let identity = transport.send(&route(30), frame(1)).expect_buffered();
         assert_eq!(sink.count(), 1);
 
         // One interval → the single allowed retry, reaching the bound of 2 sends.
@@ -651,8 +875,8 @@ mod tests {
         } = harness(policy(100, 3, 10_000));
 
         // Two envelopes to the SAME route get distinct sequences.
-        let first = transport.send(&route(30), frame(1));
-        let second = transport.send(&route(30), frame(2));
+        let first = transport.send(&route(30), frame(1)).expect_buffered();
+        let second = transport.send(&route(30), frame(2)).expect_buffered();
         assert_eq!(transport.pending_len(), 2);
         assert_ne!(
             first.as_delivery().unwrap().sequence(),
@@ -689,7 +913,7 @@ mod tests {
             clock,
         } = harness(policy(100, 10, 250));
 
-        let identity = transport.send(&route(30), frame(1));
+        let identity = transport.send(&route(30), frame(1)).expect_buffered();
 
         // A retry fires before the deadline.
         clock.advance(Duration::from_millis(100));
@@ -719,7 +943,7 @@ mod tests {
             clock,
         } = harness(policy(100, 5, 10_000));
 
-        let identity = transport.send(&route(30), frame(1));
+        let identity = transport.send(&route(30), frame(1)).expect_buffered();
         assert_eq!(
             transport.on_ack(&identity, RuntimeFilterAcceptStatus::Rejected),
             EnvelopeAckOutcome::Rejected
@@ -744,8 +968,12 @@ mod tests {
         assert_eq!(Arc::strong_count(&payload), 1);
 
         // One serialized frame fans out to two routes.
-        let route_a = transport.send(&route(30), Arc::clone(&payload));
-        let route_b = transport.send(&route(31), Arc::clone(&payload));
+        let route_a = transport
+            .send(&route(30), Arc::clone(&payload))
+            .expect_buffered();
+        let route_b = transport
+            .send(&route(31), Arc::clone(&payload))
+            .expect_buffered();
 
         // The single frame is shared (not re-serialized): caller + 2 buffered clones.
         assert_eq!(Arc::strong_count(&payload), 3);
@@ -773,5 +1001,180 @@ mod tests {
         );
         assert_eq!(transport.pending_len(), 0);
         assert_eq!(Arc::strong_count(&payload), 1);
+    }
+
+    // ==============================================================================
+    // M3 Task 4: self-owned buffer ceilings -> explicit ResourceLimit rejection.
+    // ==============================================================================
+
+    #[test]
+    fn transport_bounded_retry_queue_rejects_new_frame_at_entry_ceiling() {
+        // Entry-count ceiling of 2: the buffer admits two in-flight frames, then a
+        // third genuinely-new frame is refused with an explicit ResourceLimit — never
+        // silently dropped, never buffered beyond the cap.
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
+
+        let first = transport.send(&route(30), frame(1)).expect_buffered();
+        let _second = transport.send(&route(31), frame(2)).expect_buffered();
+        assert_eq!(transport.pending_len(), 2);
+        assert_eq!(sink.count(), 2);
+
+        // The third send is refused: not buffered, not put on the wire.
+        assert_eq!(
+            transport.send(&route(32), frame(3)),
+            ReliableSendOutcome::ResourceLimit(TransportResourceLimit::PendingEntries),
+        );
+        assert_eq!(
+            transport.pending_len(),
+            2,
+            "a refused frame is not buffered"
+        );
+        assert_eq!(sink.count(), 2, "a refused frame is not transmitted");
+
+        // Releasing an in-flight frame frees a slot; the next send is admitted again.
+        assert_eq!(
+            transport.on_ack(&first, RuntimeFilterAcceptStatus::Accepted),
+            EnvelopeAckOutcome::Released,
+        );
+        assert_eq!(transport.pending_len(), 1);
+        let _third = transport.send(&route(32), frame(3)).expect_buffered();
+        assert_eq!(transport.pending_len(), 2);
+        assert_eq!(sink.count(), 3);
+    }
+
+    #[test]
+    fn transport_bounded_serialized_buffer_rejects_new_frame_at_byte_ceiling() {
+        // Byte ceiling of 10: distinct frames are admitted until their serialized
+        // bytes would exceed the cap, then a new frame is refused with an explicit
+        // ResourceLimit. The cap rejects only strictly-greater, so the exact-fit send
+        // is still admitted.
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, ROOMY_MAX_ENTRIES, 10));
+
+        let _a = transport
+            .send(&route(30), frame_sized(1, 6))
+            .expect_buffered();
+        assert_eq!(transport.pending_bytes(), 6);
+
+        // 6 + 6 = 12 > 10: refused on the byte ceiling.
+        assert_eq!(
+            transport.send(&route(31), frame_sized(2, 6)),
+            ReliableSendOutcome::ResourceLimit(TransportResourceLimit::SerializedBytes),
+        );
+        assert_eq!(
+            transport.pending_len(),
+            1,
+            "a byte-refused frame is not buffered"
+        );
+        assert_eq!(transport.pending_bytes(), 6);
+
+        // 6 + 4 = 10 == cap: admitted.
+        let _b = transport
+            .send(&route(32), frame_sized(3, 4))
+            .expect_buffered();
+        assert_eq!(transport.pending_bytes(), 10);
+        assert_eq!(sink.count(), 2);
+
+        // Any further distinct byte is refused.
+        assert_eq!(
+            transport.send(&route(33), frame_sized(4, 1)),
+            ReliableSendOutcome::ResourceLimit(TransportResourceLimit::SerializedBytes),
+        );
+    }
+
+    #[test]
+    fn transport_bounded_broadcast_frame_meters_shared_bytes_once() {
+        // A broadcast frame fans out to several routes as one shared allocation, so
+        // its serialized bytes are metered once. Under a per-entry meter both routes
+        // would exceed a 10-byte cap (2 x 6 = 12); metering per allocation keeps it at
+        // 6 and admits the whole fan-out.
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, ROOMY_MAX_ENTRIES, 10));
+        let payload = frame_sized(9, 6);
+
+        let route_a = transport
+            .send(&route(30), Arc::clone(&payload))
+            .expect_buffered();
+        let route_b = transport
+            .send(&route(31), Arc::clone(&payload))
+            .expect_buffered();
+        assert_eq!(transport.pending_len(), 2);
+        assert_eq!(
+            transport.pending_bytes(),
+            6,
+            "a shared frame is metered once, not per route"
+        );
+        assert_eq!(sink.count(), 2);
+
+        // The shared allocation (and its bytes) survive until the last reference drops.
+        assert_eq!(
+            transport.on_ack(&route_a, RuntimeFilterAcceptStatus::Accepted),
+            EnvelopeAckOutcome::Released,
+        );
+        assert_eq!(transport.pending_bytes(), 6);
+        assert_eq!(
+            transport.on_ack(&route_b, RuntimeFilterAcceptStatus::Accepted),
+            EnvelopeAckOutcome::Released,
+        );
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn transport_bounded_release_returns_counts_to_zero() {
+        // The self-owned counters live inside the query-scoped transport, so releasing
+        // every in-flight frame (as query teardown does when the service is destroyed)
+        // returns both the entry count and the buffered bytes to zero — the buffer
+        // never grows without bound and never leaks.
+        let Harness {
+            transport,
+            sink: _sink,
+            clock,
+        } = harness(policy_bounded(
+            100,
+            10,
+            250,
+            ROOMY_MAX_ENTRIES,
+            ROOMY_MAX_BYTES,
+        ));
+
+        let a = transport
+            .send(&route(30), frame_sized(1, 5))
+            .expect_buffered();
+        let b = transport
+            .send(&route(31), frame_sized(2, 7))
+            .expect_buffered();
+        assert_eq!(transport.pending_len(), 2);
+        assert_eq!(transport.pending_bytes(), 12);
+
+        // Ack-release frees both entries and reclaims their bytes.
+        transport.on_ack(&a, RuntimeFilterAcceptStatus::Accepted);
+        transport.on_ack(&b, RuntimeFilterAcceptStatus::Duplicate);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+
+        // The deadline fail-open path also reclaims bytes, not just entries.
+        let _c = transport
+            .send(&route(32), frame_sized(3, 9))
+            .expect_buffered();
+        assert_eq!(transport.pending_bytes(), 9);
+        clock.advance(Duration::from_millis(300));
+        let tick = transport.drive_retries(clock.now());
+        assert_eq!(tick.failed_open().len(), 1);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(
+            transport.pending_bytes(),
+            0,
+            "deadline fail-open reclaims buffered bytes"
+        );
     }
 }

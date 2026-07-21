@@ -23,8 +23,8 @@
 //! for that state; the two ingress paths (`inbound.rs`, `consumer_ingress.rs`)
 //! consult it, and the service teardown (`mod.rs`) populates the tombstone.
 //!
-//! It holds three logically-distinct structures, all keyed per channel so a later
-//! milestone (Task 4) can bound each set naturally:
+//! It holds three logically-distinct structures, all keyed per channel so each set
+//! is bounded naturally by a self-owned per-channel identity ceiling (M3 Task 4):
 //!
 //! 1. **Transport-identity dedupe** — one index per direction, keyed on the wire
 //!    route identity *including the transport sequence*. It absorbs a re-arrival of
@@ -48,8 +48,15 @@
 //!    for a retired epoch is rejected without rebuilding context (M2B3 lookup-only);
 //!    an envelope older than a retired epoch is rejected as stale.
 //!
-//! Task 4 adds the actual per-channel count ceilings and the resource-limit
-//! rejection; this component deliberately stops at the structure and semantics.
+//! Each per-channel identity set (contributions, deliveries, delivered_versions) is
+//! self-bounded by a count ceiling: a genuinely-new identity beyond the ceiling is
+//! refused with a `ResourceLimit` admission (the ingress path surfaces it as a
+//! first-class rejection), while an already-recorded identity at the ceiling still
+//! answers its normal Duplicate/DuplicateRetry/Conflict verdict so idempotency
+//! survives at the cap. The bounding is purely these self-owned counters — the dedupe
+//! sets are deliberately NOT wired into the global MemTracker this milestone. The
+//! `(query, epoch)` tombstone is not ceilinged: it is keyed to this one query and
+//! grows only with the query's own deployment epochs (realistically one).
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,6 +88,10 @@ pub(super) enum ContributionAdmission {
     /// The identity was seen before but with different content: this is not a valid
     /// retry. Proceed to the Core, which rejects it as a `ConflictingReplay`.
     Conflict,
+    /// A genuinely-new identity that would push this channel's contribution set past
+    /// its self-owned ceiling: refuse it as an explicit resource rejection instead of
+    /// growing without bound. An already-recorded identity is never `ResourceLimit`.
+    ResourceLimit,
 }
 
 /// Result of admitting a consumer delivery transport / logical identity.
@@ -90,6 +101,25 @@ pub(super) enum DeliveryAdmission {
     Fresh,
     /// Already recorded: answer `Duplicate` and do not re-deliver.
     Duplicate,
+    /// A genuinely-new identity that would push this channel's delivery set past its
+    /// self-owned ceiling: refuse it as an explicit resource rejection instead of
+    /// growing without bound. An already-recorded identity is never `ResourceLimit`.
+    ResourceLimit,
+}
+
+/// Admit `key` into a per-channel delivery-identity set under its self-owned ceiling.
+/// An already-present key is a `Duplicate` (idempotency survives at the ceiling); a
+/// genuinely-new key at or above the ceiling is refused as `ResourceLimit`; otherwise
+/// it is inserted and answered `Fresh`.
+fn admit_into_set<K: Ord>(set: &mut BTreeSet<K>, key: K, ceiling: usize) -> DeliveryAdmission {
+    if set.contains(&key) {
+        DeliveryAdmission::Duplicate
+    } else if set.len() >= ceiling {
+        DeliveryAdmission::ResourceLimit
+    } else {
+        set.insert(key);
+        DeliveryAdmission::Fresh
+    }
 }
 
 /// Verdict from consulting the `(query, epoch)` tombstone for an inbound envelope.
@@ -106,11 +136,24 @@ pub(super) enum TombstoneVerdict {
     StaleEpoch,
 }
 
+// Generous per-channel identity ceiling (M3 Task 4). This is a query-scoped SOFTWARE
+// SAFETY cap, NOT a cluster-topology quantity: it must NOT be sized to the live BE
+// count (no single-BE assumption). A channel's real producer fan-in
+// (instances x partitions x sequences) or consumer fan-out (route edges x versions)
+// stays far below a million distinct identities even in a large 1FE+NBE cluster, so
+// this only stops pathological unbounded growth from a retry storm. It is applied
+// independently to each per-channel set. Bounding is self-owned; the dedupe sets are
+// never wired into the global MemTracker this milestone.
+const DEFAULT_MAX_IDENTITIES_PER_CHANNEL: usize = 1 << 20;
+
 pub(super) struct IngressDedupe {
     /// The query this dedupe is scoped to; the tombstone is keyed
     /// `(query_id, deployment_epoch)`, so it is recorded and consulted against this
     /// identity.
     query_id: UniqueId,
+    /// Self-owned ceiling on the size of each per-channel identity set. Exceeding it
+    /// with a genuinely-new identity yields a `ResourceLimit` admission.
+    max_identities_per_channel: usize,
     state: Mutex<DedupeState>,
 }
 
@@ -129,8 +172,20 @@ struct DedupeState {
 
 impl IngressDedupe {
     pub(super) fn new(query_id: UniqueId) -> Self {
+        Self::with_max_identities_per_channel(query_id, DEFAULT_MAX_IDENTITIES_PER_CHANNEL)
+    }
+
+    pub(super) fn with_max_identities_per_channel(
+        query_id: UniqueId,
+        max_identities_per_channel: usize,
+    ) -> Self {
+        assert!(
+            max_identities_per_channel >= 1,
+            "each per-channel dedupe set must admit at least one identity"
+        );
         Self {
             query_id,
+            max_identities_per_channel,
             state: Mutex::new(DedupeState::default()),
         }
     }
@@ -155,22 +210,28 @@ impl IngressDedupe {
             route.partition_id(),
             route.sequence(),
         );
+        let ceiling = self.max_identities_per_channel;
         let mut state = self.lock();
-        match state
-            .contributions
-            .entry(channel_id)
-            .or_default()
-            .entry(key)
-        {
-            Entry::Vacant(slot) => {
-                slot.insert(content_digest);
-                ContributionAdmission::Fresh
-            }
+        let channel = state.contributions.entry(channel_id).or_default();
+        // Snapshot the size before taking the entry (which borrows the map): a Vacant
+        // slot at the ceiling is a genuinely-new identity beyond the cap.
+        let occupancy = channel.len();
+        match channel.entry(key) {
+            // An already-recorded identity keeps answering its normal retry/conflict
+            // verdict, at the ceiling or not, so idempotency survives at the cap.
             Entry::Occupied(slot) => {
                 if *slot.get() == content_digest {
                     ContributionAdmission::DuplicateRetry
                 } else {
                     ContributionAdmission::Conflict
+                }
+            }
+            Entry::Vacant(slot) => {
+                if occupancy >= ceiling {
+                    ContributionAdmission::ResourceLimit
+                } else {
+                    slot.insert(content_digest);
+                    ContributionAdmission::Fresh
                 }
             }
         }
@@ -184,12 +245,10 @@ impl IngressDedupe {
         route: &DeliveryRouteIdentity,
     ) -> DeliveryAdmission {
         let key = (route.route_edge_id(), route.sequence());
+        let ceiling = self.max_identities_per_channel;
         let mut state = self.lock();
-        if state.deliveries.entry(channel_id).or_default().insert(key) {
-            DeliveryAdmission::Fresh
-        } else {
-            DeliveryAdmission::Duplicate
-        }
+        let set = state.deliveries.entry(channel_id).or_default();
+        admit_into_set(set, key, ceiling)
     }
 
     /// Consumer logical idempotency (absorbed from `delivered_versions`): the stable
@@ -202,17 +261,10 @@ impl IngressDedupe {
         route_edge_id: RouteEdgeId,
         version: LogicalVersion,
     ) -> DeliveryAdmission {
+        let ceiling = self.max_identities_per_channel;
         let mut state = self.lock();
-        if state
-            .delivered_versions
-            .entry(channel_id)
-            .or_default()
-            .insert((route_edge_id, version))
-        {
-            DeliveryAdmission::Fresh
-        } else {
-            DeliveryAdmission::Duplicate
-        }
+        let set = state.delivered_versions.entry(channel_id).or_default();
+        admit_into_set(set, (route_edge_id, version), ceiling)
     }
 
     /// Tombstone this service's `(query, epoch)` at cancel/completion so a late or
@@ -224,11 +276,13 @@ impl IngressDedupe {
 
     /// Consult the tombstone for an inbound envelope. Never rebuilds or revives any
     /// query state — a retired or stale envelope is rejected outright.
-    pub(super) fn tombstone_verdict(
-        &self,
-        query_id: UniqueId,
-        epoch: DeploymentEpoch,
-    ) -> TombstoneVerdict {
+    ///
+    /// The lookup is keyed by this component's own `query_id`: the service is looked
+    /// up by the envelope's query id before dispatch, so an envelope reaching here
+    /// always speaks this same query. The redundant caller-supplied query id has been
+    /// dropped in favour of `self.query_id`.
+    pub(super) fn tombstone_verdict(&self, epoch: DeploymentEpoch) -> TombstoneVerdict {
+        let query_id = self.query_id;
         let state = self.lock();
         if state.retired.contains(&(query_id, epoch)) {
             return TombstoneVerdict::Retired;
@@ -248,6 +302,34 @@ impl IngressDedupe {
             }
         }
         TombstoneVerdict::Live
+    }
+
+    /// Size of a channel's producer contribution identity set. Test seam for the
+    /// self-owned ceiling and teardown assertions.
+    #[cfg(test)]
+    fn contribution_len(&self, channel_id: ChannelId) -> usize {
+        self.lock()
+            .contributions
+            .get(&channel_id)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// Size of a channel's consumer delivery transport-identity set.
+    #[cfg(test)]
+    fn delivery_len(&self, channel_id: ChannelId) -> usize {
+        self.lock()
+            .deliveries
+            .get(&channel_id)
+            .map_or(0, BTreeSet::len)
+    }
+
+    /// Size of a channel's consumer logical `(route_edge, version)` set.
+    #[cfg(test)]
+    fn delivered_version_len(&self, channel_id: ChannelId) -> usize {
+        self.lock()
+            .delivered_versions
+            .get(&channel_id)
+            .map_or(0, BTreeSet::len)
     }
 }
 
@@ -357,38 +439,190 @@ mod tests {
     fn ingress_dedupe_component_tombstone_retired_and_stale() {
         let dedupe = dedupe();
         assert_eq!(
-            dedupe.tombstone_verdict(QID, DeploymentEpoch::new(9)),
+            dedupe.tombstone_verdict(DeploymentEpoch::new(9)),
             TombstoneVerdict::Live,
         );
         dedupe.retire_epoch(DeploymentEpoch::new(9));
         assert_eq!(
-            dedupe.tombstone_verdict(QID, DeploymentEpoch::new(9)),
+            dedupe.tombstone_verdict(DeploymentEpoch::new(9)),
             TombstoneVerdict::Retired,
         );
         assert_eq!(
-            dedupe.tombstone_verdict(QID, DeploymentEpoch::new(8)),
+            dedupe.tombstone_verdict(DeploymentEpoch::new(8)),
             TombstoneVerdict::StaleEpoch,
         );
         // A newer epoch is neither retired nor stale (a still-live generation).
         assert_eq!(
-            dedupe.tombstone_verdict(QID, DeploymentEpoch::new(10)),
+            dedupe.tombstone_verdict(DeploymentEpoch::new(10)),
             TombstoneVerdict::Live,
         );
     }
 
     #[test]
     fn ingress_dedupe_component_tombstone_is_query_scoped() {
+        // The tombstone is keyed to the dedupe's own query (the lookup no longer takes
+        // a query id — the component is query-scoped by construction), so a distinct
+        // query's dedupe has an entirely independent tombstone.
         let dedupe = dedupe();
         dedupe.retire_epoch(DeploymentEpoch::new(9));
-        // A different query's epoch is never tombstoned here.
-        let other = UniqueId { hi: 7, lo: 8 };
         assert_eq!(
-            dedupe.tombstone_verdict(other, DeploymentEpoch::new(9)),
+            dedupe.tombstone_verdict(DeploymentEpoch::new(9)),
+            TombstoneVerdict::Retired,
+        );
+
+        let other = IngressDedupe::new(UniqueId { hi: 7, lo: 8 });
+        // The other query's dedupe never saw the retire; its epochs stay Live.
+        assert_eq!(
+            other.tombstone_verdict(DeploymentEpoch::new(9)),
             TombstoneVerdict::Live,
         );
         assert_eq!(
-            dedupe.tombstone_verdict(other, DeploymentEpoch::new(1)),
+            other.tombstone_verdict(DeploymentEpoch::new(1)),
             TombstoneVerdict::Live,
         );
+    }
+
+    // ==============================================================================
+    // M3 Task 4: self-owned per-channel ceilings -> explicit ResourceLimit admission.
+    // ==============================================================================
+
+    // A dedupe whose per-channel identity ceiling is a tiny `max`, so the tests can
+    // fill a set to the cap without materializing a million identities.
+    fn bounded_dedupe(max: usize) -> IngressDedupe {
+        IngressDedupe::with_max_identities_per_channel(QID, max)
+    }
+
+    #[test]
+    fn transport_bounded_contribution_dedupe_rejects_new_identity_at_ceiling() {
+        // Ceiling of 2 distinct contribution identities per channel.
+        let dedupe = bounded_dedupe(2);
+        let channel = ChannelId::new(1);
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(1), [1; 32]),
+            ContributionAdmission::Fresh,
+        );
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(2), [2; 32]),
+            ContributionAdmission::Fresh,
+        );
+        assert_eq!(dedupe.contribution_len(channel), 2);
+
+        // A genuinely-new identity beyond the ceiling is refused, not admitted.
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(3), [3; 32]),
+            ContributionAdmission::ResourceLimit,
+        );
+        assert_eq!(
+            dedupe.contribution_len(channel),
+            2,
+            "a rejected identity is not recorded"
+        );
+    }
+
+    #[test]
+    fn transport_bounded_contribution_idempotency_survives_at_ceiling() {
+        // At the ceiling, an already-recorded identity keeps answering its normal
+        // retry / conflict verdict — only genuinely-new identities are rejected.
+        let dedupe = bounded_dedupe(1);
+        let channel = ChannelId::new(1);
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(1), [1; 32]),
+            ContributionAdmission::Fresh,
+        );
+        // Same identity + same digest at the cap: still a genuine retry.
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(1), [1; 32]),
+            ContributionAdmission::DuplicateRetry,
+        );
+        // Same identity + different digest at the cap: still a conflict for the Core.
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(1), [9; 32]),
+            ContributionAdmission::Conflict,
+        );
+        // Only a genuinely-new identity is refused.
+        assert_eq!(
+            dedupe.admit_contribution(channel, &contribution(2), [2; 32]),
+            ContributionAdmission::ResourceLimit,
+        );
+    }
+
+    #[test]
+    fn transport_bounded_delivery_dedupe_rejects_new_identity_at_ceiling() {
+        // Ceiling of 2 distinct delivery transport identities per channel.
+        let dedupe = bounded_dedupe(2);
+        let channel = ChannelId::new(1);
+        assert_eq!(
+            dedupe.admit_delivery(channel, &delivery(1)),
+            DeliveryAdmission::Fresh,
+        );
+        assert_eq!(
+            dedupe.admit_delivery(channel, &delivery(2)),
+            DeliveryAdmission::Fresh,
+        );
+        // A genuinely-new transport identity beyond the ceiling is refused ...
+        assert_eq!(
+            dedupe.admit_delivery(channel, &delivery(3)),
+            DeliveryAdmission::ResourceLimit,
+        );
+        // ... but an already-recorded identity at the ceiling is still a Duplicate.
+        assert_eq!(
+            dedupe.admit_delivery(channel, &delivery(1)),
+            DeliveryAdmission::Duplicate,
+        );
+        assert_eq!(dedupe.delivery_len(channel), 2);
+    }
+
+    #[test]
+    fn transport_bounded_delivered_version_dedupe_rejects_new_identity_at_ceiling() {
+        // The logical `(route_edge, version)` set is bounded independently.
+        let dedupe = bounded_dedupe(1);
+        let channel = ChannelId::new(1);
+        let edge = RouteEdgeId::new(40);
+        assert_eq!(
+            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(5)),
+            DeliveryAdmission::Fresh,
+        );
+        // A genuinely-new version beyond the ceiling is refused ...
+        assert_eq!(
+            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(6)),
+            DeliveryAdmission::ResourceLimit,
+        );
+        // ... but the recorded version at the ceiling is still a Duplicate.
+        assert_eq!(
+            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(5)),
+            DeliveryAdmission::Duplicate,
+        );
+        assert_eq!(dedupe.delivered_version_len(channel), 1);
+    }
+
+    #[test]
+    fn transport_bounded_ceiling_is_per_channel_and_released_on_teardown() {
+        // The ceiling applies to each channel independently, and every count lives
+        // inside this query-scoped component, so dropping it (as query cancel destroys
+        // the service) frees everything — a freshly-built dedupe observes zero counts.
+        let dedupe = bounded_dedupe(1);
+        let channel_a = ChannelId::new(1);
+        let channel_b = ChannelId::new(2);
+        assert_eq!(
+            dedupe.admit_delivery(channel_a, &delivery(1)),
+            DeliveryAdmission::Fresh,
+        );
+        // Channel A is at its cap; channel B has its own independent budget.
+        assert_eq!(
+            dedupe.admit_delivery(channel_a, &delivery(2)),
+            DeliveryAdmission::ResourceLimit,
+        );
+        assert_eq!(
+            dedupe.admit_delivery(channel_b, &delivery(2)),
+            DeliveryAdmission::Fresh,
+        );
+        assert_eq!(dedupe.delivery_len(channel_a), 1);
+        assert_eq!(dedupe.delivery_len(channel_b), 1);
+
+        drop(dedupe);
+        // Teardown frees the self-owned counters: a new query's dedupe starts at zero.
+        let fresh = bounded_dedupe(1);
+        assert_eq!(fresh.delivery_len(channel_a), 0);
+        assert_eq!(fresh.delivery_len(channel_b), 0);
     }
 }

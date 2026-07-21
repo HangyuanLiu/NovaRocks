@@ -83,7 +83,9 @@ use self::materialization::{
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
-use self::reliable_transport::ReliableEnvelopeTransport;
+use self::reliable_transport::{
+    ReliableEnvelopeTransport, ReliableSendOutcome, TransportResourceLimit,
+};
 
 struct EventQueueState {
     draining: bool,
@@ -1464,11 +1466,38 @@ impl RuntimeFilterService {
                 }
             });
             for route in decision.remote_routes() {
-                self.reliable_transport.send(route, Arc::clone(&frame));
+                match self.reliable_transport.send(route, Arc::clone(&frame)) {
+                    ReliableSendOutcome::Buffered(_identity) => {}
+                    ReliableSendOutcome::ResourceLimit(limit) => {
+                        // A self-owned transport ceiling tripped: the frame was neither
+                        // buffered nor put on the wire. Degrade this route as an explicit
+                        // resource-limit rejection (a first-class outcome, not a silent
+                        // drop) and keep going. Runtime filters are fail-open at the query
+                        // level, so the query neither errors nor panics.
+                        self.record_transport_resource_limit(route.route_edge_id(), limit);
+                    }
+                }
             }
         }
 
         Ok(decision)
+    }
+
+    /// Seam for a remote delivery route degraded because the sender-side reliable
+    /// transport hit a self-owned buffer ceiling (M3 Task 4). This is an EXPLICIT
+    /// resource rejection, distinct from the deadline fail-open: the artifact exists
+    /// but could not be buffered or transmitted under the transport's own limits.
+    ///
+    /// It deliberately does NOT deliver an `Unavailable(ResourceLimit)` sentinel to
+    /// the consumer — that reason means "no artifact was produced", which is not the
+    /// case here — and it deliberately does NOT touch the global MemTracker. Task 5
+    /// turns this into a structured degradation event carrying the route and the
+    /// tripped limit; today it is the recording seam.
+    fn record_transport_resource_limit(
+        &self,
+        _route_edge_id: RouteEdgeId,
+        _limit: TransportResourceLimit,
+    ) {
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
@@ -1500,7 +1529,9 @@ impl RuntimeFilterService {
         if let Some(cancelled) = installed {
             // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
             // teardown is rejected without rebuilding context (M2B3 lookup-only). Both
-            // cancel and normal completion funnel through here (`shutdown` -> `cancel`).
+            // terminal paths reach this line through `cancel()`: an explicit cancel
+            // calls it directly, and normal completion reaches it via `shutdown()`,
+            // which delegates to `cancel()`.
             self.dedupe.retire_epoch(cancelled.installed().epoch());
             #[cfg(test)]
             self.fire_after_registry_cancel_before_channel_cancel();
