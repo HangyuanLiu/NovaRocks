@@ -228,6 +228,17 @@ impl EventScheduler {
             }
             BlockedReason::OutputFull => {
                 let Some(observable) = task.sink_observable() else {
+                    // The sink may finish after the driver reports OutputFull but before
+                    // the scheduler captures its observable. Re-run the task instead of
+                    // rejecting this stale blocked state.
+                    if task.sink_ready() && self.shared.get().is_some() {
+                        let mut task = task;
+                        task.set_ready();
+                        task.set_in_blocked(false);
+                        task.set_need_check_reschedule(false);
+                        self.enqueue_ready(task);
+                        return Ok(());
+                    }
                     if should_sample_log(&EVENT_SCHEDULER_MISSING_OBS_LOG_COUNT) {
                         debug!(
                             "EventScheduler add_blocked: OutputFull missing sink observable; finst={:?} driver_id={} source_ready={} sink_ready={}",
@@ -409,4 +420,135 @@ impl EventScheduler {
 enum ObserverKind {
     Source,
     Sink,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::exec::chunk::Chunk;
+    use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+    use crate::exec::pipeline::fragment_context::FragmentContext;
+    use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+    use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::runtime::runtime_state::RuntimeState;
+
+    struct FinishTransitionSink {
+        finished: Arc<AtomicBool>,
+    }
+
+    impl Operator for FinishTransitionSink {
+        fn name(&self) -> &str {
+            "FINISH_TRANSITION_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished.load(Ordering::Acquire)
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for FinishTransitionSink {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            true
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            (!self.is_finished()).then(|| Arc::new(Observable::new()))
+        }
+    }
+
+    #[test]
+    fn output_full_task_that_finishes_before_parking_is_rechecked() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let runtime_state = Arc::new(RuntimeState::default());
+        let mut driver = PipelineDriver::new(
+            3,
+            vec![Box::new(FinishTransitionSink {
+                finished: Arc::clone(&finished),
+            })],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((67_100, 65_538)),
+        );
+
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::OutputFull)
+        ));
+        finished.store(true, Ordering::Release);
+
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            runtime_state,
+            Some((67_100, 65_538)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1, fragment_ctx);
+        let task = DriverTask::new(driver, completion, Duration::from_millis(10));
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+
+        assert!(
+            scheduler
+                .add_blocked(task, BlockedReason::OutputFull)
+                .is_ok(),
+            "a sink that became ready must be rechecked instead of rejected"
+        );
+
+        assert!(
+            scheduler
+                .blocked
+                .lock()
+                .expect("event scheduler blocked lock")
+                .is_empty()
+        );
+        assert!(
+            scheduler
+                .reschedule_queue
+                .lock()
+                .expect("event scheduler queue lock")
+                .is_empty()
+        );
+        assert_eq!(
+            executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .len(),
+            1
+        );
+    }
 }
