@@ -20,7 +20,7 @@ use std::sync::Arc;
 use novarocks::meta::repository::iceberg_operation::{
     IcebergOperationFactUpdate, IcebergOperationRepository,
 };
-use novarocks::meta::{MetaStoreProvider, MetaWriteTxn};
+use novarocks::meta::MetaStoreProvider;
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{CreatePreparingRequest, OperationFact, OperationState, StoredOperation};
@@ -120,9 +120,6 @@ impl OperationJournal for MetaStoreOperationJournal {
     }
 }
 
-// `MetaWriteTxn` is used via `txn.commit()` / `txn.as_mut()` method resolution;
-// `MetaStoreProvider` via `begin_write`/`begin_read`. Both imports are load-bearing.
-
 #[cfg(test)]
 pub(crate) mod testing {
     use std::collections::BTreeMap;
@@ -134,7 +131,9 @@ pub(crate) mod testing {
 
     /// In-memory `OperationJournal` for runner unit tests. Uses the real
     /// `validate_operation_transition` so it rejects illegal transitions the
-    /// same way the persistent repository does.
+    /// same way the persistent repository does. It does NOT model core's
+    /// same-state fact refinement / conflicting-replay rejection; a test that
+    /// needs that behavior should drive the real `MetaStoreOperationJournal`.
     #[derive(Default)]
     pub(crate) struct InMemoryOperationJournal {
         inner: Mutex<Inner>,
