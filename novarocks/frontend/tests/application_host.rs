@@ -20,6 +20,7 @@ use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreLimitOverrides, StateStoreProviderConfig,
 };
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn sqlite_config(temp: &TempDir) -> StateStoreAppConfig {
     StateStoreAppConfig {
@@ -69,7 +70,7 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_provider_fails_before_store_open() {
-    let config = StateStoreAppConfig {
+    let mysql_config = StateStoreAppConfig {
         store: StateStoreConfig {
             cluster_id: "frontend-cluster".to_owned(),
             limits: StateStoreLimitOverrides::default(),
@@ -79,25 +80,41 @@ async fn unsupported_provider_fails_before_store_open() {
         },
         mysql_client: None,
     };
-
-    let error = match FrontendApplicationHost::open(Some(config)).await {
-        Ok(_) => panic!("deferred provider must be rejected before runtime or store I/O"),
-        Err(error) => error,
+    let foundationdb_config = StateStoreAppConfig {
+        store: StateStoreConfig {
+            cluster_id: "frontend-cluster".to_owned(),
+            limits: StateStoreLimitOverrides::default(),
+            provider: StateStoreProviderConfig::Foundationdb {
+                cluster_file: "/definitely/not/an/fdb/cluster-file".into(),
+                keyspace_id: Uuid::nil(),
+            },
+        },
+        mysql_client: None,
     };
 
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::DeploymentSource);
-    assert!(error.to_string().contains("UnsupportedProvider"));
+    for config in [mysql_config, foundationdb_config] {
+        let error = match FrontendApplicationHost::open(Some(config)).await {
+            Ok(_) => panic!("deferred provider must be rejected before runtime or store I/O"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), FrontendApplicationErrorKind::DeploymentSource);
+        assert!(error.to_string().contains("UnsupportedProvider"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_open_releases_partial_resources() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
+    let non_directory_parent = temp.path().join("not-a-directory");
+    std::fs::write(&non_directory_parent, b"not a directory")
+        .expect("create regular file for SQLite parent failure");
     let config = StateStoreAppConfig {
         store: StateStoreConfig {
             cluster_id: "frontend-cluster".to_owned(),
             limits: StateStoreLimitOverrides::default(),
             provider: StateStoreProviderConfig::Sqlite {
-                path: ":memory:".into(),
+                path: non_directory_parent.join("state-store.sqlite"),
                 deployment_owner: "frontend-fe".to_owned(),
             },
         },
