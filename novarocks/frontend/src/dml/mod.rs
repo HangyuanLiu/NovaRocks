@@ -41,9 +41,9 @@ pub use model::{
     OperationFact, OperationKind, OperationState, OperationTarget, RecoveryEvidence,
     StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
 };
-// pub use runner::{
-//     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
-// };
+pub use runner::{
+    AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
+};
 // pub use service::DmlService;
 
 /// Current wall-clock time in Unix milliseconds, used for operation timestamps.
