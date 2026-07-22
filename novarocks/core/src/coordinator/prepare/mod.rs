@@ -242,6 +242,7 @@ pub(crate) fn prepare_fragments(
         topological_fragment_order,
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
+        plan.runtime_filter_graph().clone(),
     ))
 }
 
@@ -292,6 +293,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         plan.topology().topological_fragment_order().to_vec(),
         plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),
+        plan.runtime_filter_graph().clone(),
     ))
 }
 
@@ -365,9 +367,12 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use arrow::datatypes::DataType;
 
     use super::*;
+    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -375,6 +380,101 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+
+    fn sealed_runtime_filter_graph() -> crate::runtime_filter::model::graph::RuntimeFilterGraph {
+        use crate::runtime_filter::model::contract::{
+            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        };
+        use crate::runtime_filter::model::coverage::Coverage;
+        use crate::runtime_filter::model::graph::{
+            ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
+            ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+            RuntimeFilterChannelSpec, RuntimeFilterGraph,
+        };
+        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+
+        let channel_id = ChannelId::new(1);
+        let witness_id = CoverageWitnessId::new(1);
+        let location = PlanLocation {
+            fragment_id: PlanFragmentId::new(7),
+            node_id: PlanNodeId::new(70),
+        };
+        let expression = || TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut graph = RuntimeFilterGraph::default();
+        graph
+            .insert_channel(RuntimeFilterChannelSpec {
+                channel_id,
+                logical_domain: RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: Coverage::Leaf(witness_id),
+                terminal_coverage: Coverage::Leaf(witness_id),
+                reduction_requirement: ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                required_consumer_capabilities: BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ]),
+                policy: RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 1024,
+                    max_artifact_bytes: 4096,
+                    deadline_ms: 30_000,
+                    max_retries: 3,
+                },
+            })
+            .expect("unique channel");
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(1),
+                channel_id,
+                coverage_witness_id: Some(witness_id),
+                location,
+                expression: expression(),
+                apply_point: ApplyPoint::NodeOutput,
+                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                    contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    completion_requirement: CompletionRequirement::ProducerClosed,
+                    join_key_ordinal: 0,
+                }),
+            })
+            .expect("unique producer binding");
+        graph
+            .insert_binding(RuntimeFilterBindingSpec {
+                binding_id: BindingId::new(2),
+                channel_id,
+                coverage_witness_id: None,
+                location,
+                expression: expression(),
+                apply_point: ApplyPoint::NodeInput,
+                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                    capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    },
+                    target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
+                }),
+            })
+            .expect("unique consumer binding");
+        graph
+    }
 
     fn write_plan() -> crate::sql::planner::distributed::DistributedPlan {
         let columns = vec![OutputColumn {
@@ -468,6 +568,34 @@ mod tests {
         assert_eq!(
             error,
             "prepared sealed output mismatch fragment_id=7: non-write fragment is missing FragmentEdgeOutputCatalog output"
+        );
+    }
+
+    #[test]
+    fn prepared_fragment_set_retains_sealed_runtime_filter_graph() {
+        let plan = crate::sql::planner::distributed::test_support::rebuild_test_plan(
+            test_support::result_plan(),
+            |builder| {
+                builder.fragments_mut()[0].root.runtime_filter_binding_ids =
+                    vec![BindingId::new(1), BindingId::new(2)];
+                *builder.runtime_filter_graph_mut() = sealed_runtime_filter_graph();
+            },
+        );
+        let prepared = prepare_fragments(&plan, &crate::connector::ConnectorRegistry::new(), None)
+            .expect("prepare sealed graph");
+
+        assert_eq!(prepared.runtime_filter_graph().channel_count(), 1);
+        assert_eq!(prepared.runtime_filter_graph().binding_count(), 2);
+        assert_eq!(
+            prepared
+                .runtime_filter_graph()
+                .channel(ChannelId::new(1))
+                .unwrap()
+                .policy,
+            plan.runtime_filter_graph()
+                .channel(ChannelId::new(1))
+                .unwrap()
+                .policy
         );
     }
 }

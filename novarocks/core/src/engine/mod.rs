@@ -3614,10 +3614,15 @@ fn coordinated_execution_services() -> Result<
     let role = crate::novarocks_config::config()
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
-    let (dispatcher, scheduler) = match role {
+    let (dispatcher, scheduler, runtime_filter_deployment_control) = match role {
         ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             let snapshot = crate::coordinator::cluster::LiveBackendSnapshot::new(entries);
+            let runtime_filter_deployment_control = Arc::new(
+                crate::service::grpc_fragment_dispatcher::GrpcRuntimeFilterDeploymentControl::new(
+                    snapshot.entries(),
+                )?,
+            );
             let (dispatcher, scheduler) =
                 dispatch_and_scheduler_from_live_backend_snapshot(snapshot)?;
             let dispatcher = Arc::new(dispatcher);
@@ -3625,6 +3630,8 @@ fn coordinated_execution_services() -> Result<
             (
                 dispatcher as Arc<dyn crate::coordinator::dispatch::FragmentDispatcher>,
                 scheduler,
+                runtime_filter_deployment_control
+                    as Arc<dyn crate::coordinator::ports::RuntimeFilterDeploymentControlPort>,
             )
         }
         ClusterRole::Be => {
@@ -3638,6 +3645,7 @@ fn coordinated_execution_services() -> Result<
         dispatcher,
         report_endpoint,
         observer,
+        runtime_filter_deployment_control,
     );
     Ok((execution_ports, scheduler))
 }

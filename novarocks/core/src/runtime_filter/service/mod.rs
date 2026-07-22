@@ -18,14 +18,8 @@
 mod consumer_ingress;
 mod dedupe;
 mod inbound;
-mod materialization;
-mod memory;
-mod producer;
-mod reliable_transport;
-// `registry` is `pub(crate)` (rather than private) solely so RFD-2's
-// deployment-compiler tests can reach `registry::validate_view_for_test`
-// (see registry.rs) to prove compiler output satisfies the BE install
-// contract. Item-level privacy inside `registry.rs` is unaffected.
+#[cfg(test)]
+mod live_deployment_conformance_tests;
 #[cfg(test)]
 mod m3a_tests;
 #[cfg(test)]
@@ -34,18 +28,22 @@ mod m3b_tests;
 mod m3c_tests;
 #[cfg(test)]
 mod m4_conformance_tests;
-pub(crate) mod registry;
+mod materialization;
+mod memory;
+mod producer;
+mod registry;
+mod reliable_transport;
 mod subscription;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::codec::artifact::{
-    ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle, encode_unavailable,
-    max_encoded_len_for_artifact_budget,
+    ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle,
+    encode_completed_without_artifact, encode_unavailable, max_encoded_len_for_artifact_budget,
 };
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
@@ -57,9 +55,9 @@ use crate::runtime_filter::port::events::{
 use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
-    FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
-    ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
-    RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    FinalDomainProducerAdapter, InstallContractError, InstallContractErrorKind, InstallOutcome,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerHandleWeak,
+    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::routing::{
@@ -86,6 +84,7 @@ use self::materialization::{
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
+pub(crate) use self::reliable_transport::ReliableTransportPolicy;
 use self::reliable_transport::{
     ReliableEnvelopeTransport, ReliableSendOutcome, TransportResourceLimit,
 };
@@ -375,9 +374,11 @@ impl RuntimeFilterEventSink for EventEmitter {
 }
 
 struct ActionDispatcher {
+    query_id: UniqueId,
     registry: Arc<DeploymentRegistry>,
     events: Arc<EventEmitter>,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    reliable_transport: Arc<ReliableEnvelopeTransport>,
     channels: Mutex<BTreeMap<ChannelId, Arc<ChannelDispatchFlight>>>,
     #[cfg(test)]
     after_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -829,6 +830,8 @@ impl ActionDispatcher {
         };
         let mut events = Vec::new();
         let mut deliveries = Vec::new();
+        let mut remote_deliveries = Vec::new();
+        let mut remote_terminals = Vec::new();
         let mut error = None;
         match action {
             ChannelAction::None | ChannelAction::Progress { .. } => {}
@@ -840,6 +843,11 @@ impl ActionDispatcher {
                             None,
                             Some(LiveTerminal::CompletedWithoutArtifact),
                         ));
+                        remote_terminals.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            LiveTerminal::CompletedWithoutArtifact,
+                        ));
                     }
                 }
             }
@@ -850,6 +858,11 @@ impl ActionDispatcher {
                             group.route_edges().to_vec(),
                             None,
                             Some(LiveTerminal::DegradedLogical(*reason)),
+                        ));
+                        remote_terminals.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            LiveTerminal::DegradedLogical(*reason),
                         ));
                     }
                 }
@@ -973,7 +986,7 @@ impl ActionDispatcher {
                                     digest: bundle.canonical_digest(),
                                 });
                             }
-                            Some(outcome)
+                            Some(outcome.clone())
                         }
                         PublishCommitOutcome::Stale => {
                             events
@@ -1000,6 +1013,40 @@ impl ActionDispatcher {
                             }
                         }
                     }
+                    let remote_outcome = if terminal == Some(LiveTerminal::Completed)
+                        && matches!(outcome, ArtifactDeliveryOutcome::Published(_))
+                    {
+                        // A completion must always cross the wire as one atomic final
+                        // artifact, including when the same version was published by an
+                        // earlier VisibleSnapshot and this materialization is idempotent.
+                        Some(&outcome)
+                    } else {
+                        delivery_outcome.as_ref()
+                    };
+                    if let Some(outcome) = remote_outcome {
+                        let envelope_kind = match outcome {
+                            ArtifactDeliveryOutcome::Published(_) => {
+                                Some(if terminal == Some(LiveTerminal::Completed) {
+                                    RuntimeFilterEnvelopeKind::FinalArtifact
+                                } else {
+                                    RuntimeFilterEnvelopeKind::Artifact
+                                })
+                            }
+                            ArtifactDeliveryOutcome::Unavailable(_) => {
+                                Some(RuntimeFilterEnvelopeKind::Unavailable)
+                            }
+                            ArtifactDeliveryOutcome::Unsupported(_)
+                            | ArtifactDeliveryOutcome::Cancelled => None,
+                        };
+                        if let Some(envelope_kind) = envelope_kind {
+                            remote_deliveries.push((
+                                work.group.profile().clone(),
+                                work.group.route_edges().to_vec(),
+                                outcome.clone(),
+                                envelope_kind,
+                            ));
+                        }
+                    }
                     if !delivered_before_notify {
                         deliveries.push((
                             work.group.route_edges().to_vec(),
@@ -1012,10 +1059,17 @@ impl ActionDispatcher {
             ChannelAction::Unavailable { reason, .. } => {
                 if let Some(plan) = installed.artifact_plan(channel_id) {
                     for group in plan.groups() {
+                        let outcome = ArtifactDeliveryOutcome::Unavailable(*reason);
                         deliveries.push((
                             group.route_edges().to_vec(),
-                            Some(ArtifactDeliveryOutcome::Unavailable(*reason)),
+                            Some(outcome.clone()),
                             Some(LiveTerminal::Unavailable(*reason)),
+                        ));
+                        remote_deliveries.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            outcome,
+                            RuntimeFilterEnvelopeKind::Unavailable,
                         ));
                     }
                 }
@@ -1030,7 +1084,185 @@ impl ActionDispatcher {
                 .router()
                 .route_live(&route_edges, outcome.as_ref(), terminal);
         }
+        for (profile, route_edges, outcome, envelope_kind) in remote_deliveries {
+            if let Err(delivery_error) = self.deliver_remote_artifact(
+                &installed,
+                channel_id,
+                &profile,
+                route_edges,
+                &outcome,
+                envelope_kind,
+            ) {
+                error.get_or_insert_with(|| {
+                    violation(
+                        RuntimeContractViolationKind::ServiceUnavailable,
+                        delivery_error.to_string(),
+                    )
+                });
+            }
+        }
+        for (profile, route_edges, terminal) in remote_terminals {
+            if let Err(delivery_error) = self.deliver_remote_terminal(
+                &installed,
+                channel_id,
+                &profile,
+                route_edges,
+                terminal,
+            ) {
+                error.get_or_insert_with(|| {
+                    violation(
+                        RuntimeContractViolationKind::ServiceUnavailable,
+                        delivery_error.to_string(),
+                    )
+                });
+            }
+        }
         (batch, error)
+    }
+
+    fn deliver_remote_terminal(
+        &self,
+        installed: &InstalledDeployment,
+        channel_id: ChannelId,
+        profile: &ConsumerArtifactProfile,
+        route_edge_ids: Vec<RouteEdgeId>,
+        terminal: LiveTerminal,
+    ) -> Result<(), ArtifactDeliveryError> {
+        let envelope_kind = match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+            }
+            LiveTerminal::DegradedLogical(_) => RuntimeFilterEnvelopeKind::DegradedLogical,
+            LiveTerminal::Completed | LiveTerminal::Unavailable(_) | LiveTerminal::Cancelled => {
+                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+            }
+            LiveTerminal::DegradedArtifact(_) | LiveTerminal::DegradedDelivery(_) => {
+                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+            }
+        };
+        let intent = RuntimeFilterDeliveryRouteIntent::new(
+            installed.epoch(),
+            channel_id,
+            route_edge_ids,
+            envelope_kind,
+        )?;
+        let decision = installed.role_router().route_delivery(intent)?;
+        if decision.remote_routes().is_empty() {
+            return Ok(());
+        }
+        let expectation = ArtifactDecodeExpectation::new(profile);
+        let frame = Arc::new(match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                encode_completed_without_artifact(expectation)
+            }
+            LiveTerminal::DegradedLogical(reason) => {
+                let max_encoded = max_encoded_len_for_artifact_budget(
+                    installed
+                        .artifact_plan(channel_id)
+                        .ok_or(ArtifactDeliveryError::NotInstalled)?
+                        .max_artifact_bytes(),
+                )?;
+                encode_unavailable(reason, expectation, max_encoded)?
+            }
+            LiveTerminal::Completed | LiveTerminal::Unavailable(_) | LiveTerminal::Cancelled => {
+                unreachable!("non-deliverable terminals are rejected above")
+            }
+            LiveTerminal::DegradedArtifact(_) | LiveTerminal::DegradedDelivery(_) => {
+                unreachable!("non-deliverable terminals are rejected above")
+            }
+        });
+        let common = RuntimeFilterEventIdentity::new(
+            self.query_id,
+            installed.participant_id(),
+            channel_id,
+            installed.epoch(),
+        );
+        for route in decision.remote_routes() {
+            let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
+            if let ReliableSendOutcome::ResourceLimit(_limit) = self.reliable_transport.send_kind(
+                route,
+                Arc::clone(&frame),
+                identity,
+                envelope_kind,
+            ) {
+                self.events.record(RuntimeFilterEvent::TransportEnvelope {
+                    identity,
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    bytes: frame.payload().len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver_remote_artifact(
+        &self,
+        installed: &InstalledDeployment,
+        channel_id: ChannelId,
+        profile: &ConsumerArtifactProfile,
+        route_edge_ids: Vec<RouteEdgeId>,
+        outcome: &ArtifactDeliveryOutcome,
+        envelope_kind: RuntimeFilterEnvelopeKind,
+    ) -> Result<(), ArtifactDeliveryError> {
+        match (outcome, envelope_kind) {
+            (
+                ArtifactDeliveryOutcome::Published(_),
+                RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::FinalArtifact,
+            )
+            | (ArtifactDeliveryOutcome::Unavailable(_), RuntimeFilterEnvelopeKind::Unavailable) => {
+            }
+            _ => return Err(ArtifactDeliveryError::UndeliverableOutcome),
+        }
+        let intent = RuntimeFilterDeliveryRouteIntent::new(
+            installed.epoch(),
+            channel_id,
+            route_edge_ids,
+            envelope_kind,
+        )?;
+        let decision = installed.role_router().route_delivery(intent)?;
+        if decision.remote_routes().is_empty() {
+            return Ok(());
+        }
+        let max_encoded = max_encoded_len_for_artifact_budget(
+            installed
+                .artifact_plan(channel_id)
+                .ok_or(ArtifactDeliveryError::NotInstalled)?
+                .max_artifact_bytes(),
+        )?;
+        let expectation = ArtifactDecodeExpectation::new(profile);
+        let frame = Arc::new(match outcome {
+            ArtifactDeliveryOutcome::Published(bundle) => {
+                encode_artifact_bundle(bundle, expectation, max_encoded)?
+            }
+            ArtifactDeliveryOutcome::Unavailable(reason) => {
+                encode_unavailable(*reason, expectation, max_encoded)?
+            }
+            ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
+                unreachable!("non-deliverable outcomes are rejected above")
+            }
+        });
+        let common = RuntimeFilterEventIdentity::new(
+            self.query_id,
+            installed.participant_id(),
+            channel_id,
+            installed.epoch(),
+        );
+        for route in decision.remote_routes() {
+            let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
+            if let ReliableSendOutcome::ResourceLimit(_limit) = self.reliable_transport.send_kind(
+                route,
+                Arc::clone(&frame),
+                identity,
+                envelope_kind,
+            ) {
+                self.events.record(RuntimeFilterEvent::TransportEnvelope {
+                    identity,
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    bytes: frame.payload().len(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1097,6 +1329,210 @@ impl From<ArtifactWireCodecError> for ArtifactDeliveryError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LifecyclePhase {
+    Running,
+    Closing,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CloseRole {
+    Leader,
+    Follower,
+    Deferred,
+    Closed,
+}
+
+struct LifecycleState {
+    phase: LifecyclePhase,
+    in_flight: usize,
+    owners: HashMap<ThreadId, usize>,
+    finalizer: Option<ThreadId>,
+}
+
+/// Reentrant-safe lifecycle barrier shared by Service and its reliable transport.
+///
+/// A permit covers one externally observable operation. Closing rejects new permits
+/// and a non-reentrant closer waits on the condition variable until every admitted
+/// operation has left. A closer invoked synchronously from its own callback is marked
+/// deferred; the outer operation's guard claims finalization after releasing its last
+/// permit, avoiding self-wait deadlocks without weakening the external close barrier.
+pub(super) struct LifecycleBarrier {
+    state: Mutex<LifecycleState>,
+    changed: Condvar,
+}
+
+impl LifecycleBarrier {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(LifecycleState {
+                phase: LifecyclePhase::Running,
+                in_flight: 0,
+                owners: HashMap::new(),
+                finalizer: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(super) fn try_admit(&self) -> Option<LifecyclePermit<'_>> {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.phase != LifecyclePhase::Running {
+            return None;
+        }
+        state.in_flight += 1;
+        *state.owners.entry(current).or_insert(0) += 1;
+        Some(LifecyclePermit { barrier: self })
+    }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == LifecyclePhase::Running
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .phase
+            == LifecyclePhase::Closing
+    }
+
+    pub(super) fn request_close(&self) -> CloseRole {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.phase == LifecyclePhase::Closed {
+            return CloseRole::Closed;
+        }
+        state.phase = LifecyclePhase::Closing;
+        if state.owners.get(&current).copied().unwrap_or(0) != 0
+            || state.finalizer.as_ref() == Some(&current)
+        {
+            return CloseRole::Deferred;
+        }
+        if state.finalizer.is_none() {
+            state.finalizer = Some(current);
+            CloseRole::Leader
+        } else {
+            CloseRole::Follower
+        }
+    }
+
+    pub(super) fn wait_for_quiescence(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.in_flight != 0 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(super) fn wait_until_closed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.phase != LifecyclePhase::Closed {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(super) fn mark_closed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.phase = LifecyclePhase::Closed;
+        state.finalizer = None;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn release(&self) {
+        let current = std::thread::current().id();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let remove_owner = {
+            let count = state
+                .owners
+                .get_mut(&current)
+                .expect("lifecycle permit owner is registered");
+            *count -= 1;
+            *count == 0
+        };
+        if remove_owner {
+            state.owners.remove(&current);
+        }
+        state.in_flight -= 1;
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+pub(super) struct LifecyclePermit<'a> {
+    barrier: &'a LifecycleBarrier,
+}
+
+/// Guarantees that a lifecycle leader publishes `Closed` even when teardown code
+/// panics. External callbacks are still allowed to propagate their first panic, but
+/// duplicate closers must never remain parked behind a permanently `Closing` owner.
+pub(super) struct FinalizerCompletion<'a> {
+    barrier: &'a LifecycleBarrier,
+}
+
+impl<'a> FinalizerCompletion<'a> {
+    pub(super) fn new(barrier: &'a LifecycleBarrier) -> Self {
+        Self { barrier }
+    }
+}
+
+impl Drop for FinalizerCompletion<'_> {
+    fn drop(&mut self) {
+        self.barrier.mark_closed();
+    }
+}
+
+pub(super) type FinalizerPanic = Box<dyn std::any::Any + Send + 'static>;
+
+/// Keep cleanup progressing after the first teardown panic. Discarding a later
+/// payload normally would run its arbitrary `Drop` implementation inside finalizer
+/// code, so leak it deliberately on this already-failing path instead.
+pub(super) fn retain_first_finalizer_panic(
+    first: &mut Option<FinalizerPanic>,
+    payload: FinalizerPanic,
+) {
+    if first.is_none() {
+        *first = Some(payload);
+    } else {
+        std::mem::forget(payload);
+    }
+}
+
+/// Resume a teardown panic only when this finalizer did not start inside another
+/// unwind. A deferred close commonly finalizes from a call guard's `Drop`; resuming a
+/// secondary teardown panic there would abort the process and erase the outer panic.
+pub(super) fn finish_finalizer_panic(first: Option<FinalizerPanic>, entered_while_panicking: bool) {
+    let Some(payload) = first else {
+        return;
+    };
+    if entered_while_panicking {
+        // Panic payloads are arbitrary user values and their destructor may panic.
+        // Leaking one payload while the thread is already unwinding is preferable to
+        // a double-panic process abort.
+        std::mem::forget(payload);
+    } else {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+impl Drop for LifecyclePermit<'_> {
+    fn drop(&mut self) {
+        self.barrier.release();
+    }
+}
+
 pub(crate) struct RuntimeFilterService {
     _query_id: UniqueId,
     _clock: Arc<dyn RuntimeFilterClock>,
@@ -1119,7 +1555,14 @@ pub(crate) struct RuntimeFilterService {
     before_inbound_typed_dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_deadline_dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_close_request_before_quiescence: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_resource_limit_event_admission: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
+    lifecycle: LifecycleBarrier,
     // Unified, per-channel ingress dedupe + `(query, epoch)` tombstone (M3 Task 3).
     // Both ingress directions consult it; teardown (`cancel`) retires this query/epoch
     // into its tombstone. It subsumes the former `delivered_versions` ledger (the
@@ -1130,12 +1573,33 @@ pub(crate) struct RuntimeFilterService {
     // Sender-side reliable transport for the outbound remote leg: buffers each
     // wire-encoded remote frame for ack-release and bounded retry, failing open on
     // deadline. Query-scoped so its in-flight buffer persists across delivery calls.
-    reliable_transport: ReliableEnvelopeTransport,
+    reliable_transport: Arc<ReliableEnvelopeTransport>,
 }
 
 pub(super) struct OpenedProducer {
     pub(super) handle: ProducerHandle,
     pub(super) outcome: SubmitOutcome,
+}
+
+struct ServiceCall<'a> {
+    service: &'a RuntimeFilterService,
+    permit: Option<LifecyclePermit<'a>>,
+}
+
+impl<'a> ServiceCall<'a> {
+    fn admit(service: &'a RuntimeFilterService) -> Option<Self> {
+        Some(Self {
+            service,
+            permit: Some(service.lifecycle.try_admit()?),
+        })
+    }
+}
+
+impl Drop for ServiceCall<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.service.finish_close_if_requested();
+    }
 }
 
 impl RuntimeFilterService {
@@ -1152,10 +1616,19 @@ impl RuntimeFilterService {
             memory_account.clone(),
             events.clone(),
         ));
+        // The reliable transport emits its structured `TransportEnvelope` events through
+        // the SAME `EventEmitter` the registry and dispatcher already use — one query-
+        // scoped lifecycle sink, never a second registry.
+        let reliable_transport = Arc::new(ReliableEnvelopeTransport::for_query(
+            clock.clone(),
+            events.clone(),
+        ));
         let dispatcher = Arc::new(ActionDispatcher {
+            query_id,
             registry: registry.clone(),
             events: events.clone(),
             memory_account: memory_account.clone(),
+            reliable_transport: reliable_transport.clone(),
             channels: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             after_claim: Mutex::new(None),
@@ -1172,11 +1645,6 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_owner_finish: Mutex::new(None),
         });
-        // The reliable transport emits its structured `TransportEnvelope` events through
-        // the SAME `EventEmitter` the registry and dispatcher already use — one query-
-        // scoped lifecycle sink, never a second registry.
-        let reliable_transport =
-            ReliableEnvelopeTransport::for_query(clock.clone(), events.clone());
         Self {
             _query_id: query_id,
             _clock: clock,
@@ -1193,18 +1661,60 @@ impl RuntimeFilterService {
             before_inbound_typed_dispatch: Mutex::new(None),
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
+            #[cfg(test)]
+            before_deadline_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            after_close_request_before_quiescence: Mutex::new(None),
+            #[cfg(test)]
+            before_resource_limit_event_admission: Mutex::new(None),
             operation: Mutex::new(()),
+            lifecycle: LifecycleBarrier::new(),
             dedupe: IngressDedupe::new(query_id),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_lifecycle_test(
+        query_id: UniqueId,
+        clock: Arc<dyn RuntimeFilterClock>,
+        event_sink: Arc<dyn RuntimeFilterEventSink>,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Self {
+        Self::new_with_dependencies(query_id, clock, event_sink, memory_account)
     }
 
     pub(crate) fn install(
         &self,
         install: RuntimeFilterParticipantInstall,
     ) -> Result<InstallOutcome, InstallContractError> {
+        if !self.lifecycle.is_running() {
+            return Err(InstallContractError::new(
+                InstallContractErrorKind::ServiceClosed,
+                "runtime filter service is terminal",
+            ));
+        }
         let result = self.registry.install(install)?;
         let outcome = result.outcome();
         Ok(outcome)
+    }
+
+    pub(crate) fn configure_transport(
+        &self,
+        policy: ReliableTransportPolicy,
+    ) -> Result<(), String> {
+        let Some(_call) = ServiceCall::admit(self) else {
+            return Err("runtime filter service is terminal".to_string());
+        };
+        self.reliable_transport.configure_policy(policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_participant_install_for_test(
+        &self,
+    ) -> Option<RuntimeFilterParticipantInstall> {
+        self.registry
+            .active_installation()
+            .map(|installed| installed.participant_install_for_test())
     }
 
     pub(crate) fn open_producer(
@@ -1414,6 +1924,9 @@ impl RuntimeFilterService {
         route_edge_ids: Vec<RouteEdgeId>,
         outcome: ArtifactDeliveryOutcome,
     ) -> Result<RuntimeFilterRouteDecision, ArtifactDeliveryError> {
+        let Some(call) = ServiceCall::admit(self) else {
+            return Err(ArtifactDeliveryError::NotInstalled);
+        };
         // Snapshot the installation under the operation lock, then release it: the
         // loopback leg delivers into subscriptions and must not run while holding a
         // lock a concurrent cancel/install could contend.
@@ -1453,6 +1966,7 @@ impl RuntimeFilterService {
         // handing each to the reliable transport for ack-release and bounded retry.
         // The bundle budget is the channel's installed `max_artifact_bytes` promoted
         // to its wire ceiling.
+        let mut resource_limits = Vec::new();
         if !decision.remote_routes().is_empty() {
             let max_encoded = max_encoded_len_for_artifact_budget(
                 installed
@@ -1482,10 +1996,12 @@ impl RuntimeFilterService {
             );
             for route in decision.remote_routes() {
                 let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
-                match self
-                    .reliable_transport
-                    .send(route, Arc::clone(&frame), identity)
-                {
+                match self.reliable_transport.send_kind(
+                    route,
+                    Arc::clone(&frame),
+                    identity,
+                    envelope_kind,
+                ) {
                     ReliableSendOutcome::Buffered(_identity) => {}
                     ReliableSendOutcome::ResourceLimit(limit) => {
                         // A self-owned transport ceiling tripped: the frame was neither
@@ -1493,14 +2009,23 @@ impl RuntimeFilterService {
                         // resource-limit rejection (a first-class outcome, not a silent
                         // drop) and keep going. Runtime filters are fail-open at the query
                         // level, so the query neither errors nor panics.
-                        self.record_transport_resource_limit(
-                            identity,
-                            limit,
-                            frame.payload().len(),
-                        );
+                        resource_limits.push((identity, limit, frame.payload().len()));
+                    }
+                    ReliableSendOutcome::Shutdown => {
+                        // Query teardown is terminal. A racing delivery is rejected
+                        // without reviving transport state or failing the query.
                     }
                 }
             }
+        }
+
+        // Resource-limit events use a fresh admission after the outbound operation.
+        // This preserves parent-before-child ordering while giving a racing shutdown a
+        // real linearization point at the event boundary: if close wins this gap, no
+        // callback is emitted after terminal state.
+        drop(call);
+        for (identity, limit, bytes) in resource_limits {
+            self.record_transport_resource_limit(identity, limit, bytes);
         }
 
         Ok(decision)
@@ -1524,6 +2049,19 @@ impl RuntimeFilterService {
         _limit: TransportResourceLimit,
         bytes: usize,
     ) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_resource_limit_event_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            hook();
+        }
+        let Some(_call) = ServiceCall::admit(self) else {
+            return;
+        };
         self.dispatcher
             .events
             .record(RuntimeFilterEvent::TransportEnvelope {
@@ -1542,6 +2080,19 @@ impl RuntimeFilterService {
             self.registry.active_installation()
         };
         if let Some(installed) = installed {
+            #[cfg(test)]
+            if let Some(hook) = self
+                .before_deadline_dispatch
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .cloned()
+            {
+                hook();
+            }
+            let Some(_call) = ServiceCall::admit(self) else {
+                return;
+            };
             for (channel_id, channel) in installed.channels() {
                 let action = channel.expire_deadline(now);
                 if !matches!(action, ChannelAction::None) {
@@ -1551,49 +2102,129 @@ impl RuntimeFilterService {
         }
     }
 
+    /// Advance every time-owned Service subsystem from one manager-provided instant.
+    /// Channel deadlines and reliable transport completions/retries share this sole
+    /// production driver so their lifecycle cannot drift into separate timer owners.
+    pub(crate) fn tick(&self, now: Instant) {
+        let Some(_call) = ServiceCall::admit(self) else {
+            return;
+        };
+        self.expire_deadlines(now);
+        if !self.lifecycle.is_running() {
+            return;
+        }
+        let _ = self.reliable_transport.drain_completions_and_drive(now);
+    }
+
     pub(crate) fn cancel(&self) {
-        let installed = {
+        self.close_from_request();
+    }
+
+    fn finish_close_if_requested(&self) {
+        if self.lifecycle.is_closing() {
+            self.close_from_request();
+        }
+    }
+
+    fn close_from_request(&self) {
+        match self.lifecycle.request_close() {
+            CloseRole::Closed | CloseRole::Deferred => return,
+            CloseRole::Follower => {
+                self.lifecycle.wait_until_closed();
+                return;
+            }
+            CloseRole::Leader => {}
+        }
+        let entered_while_panicking = std::thread::panicking();
+        let completion = FinalizerCompletion::new(&self.lifecycle);
+        let mut first_panic = None;
+        #[cfg(test)]
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.fire_after_close_request_before_quiescence();
+        })) {
+            retain_first_finalizer_panic(&mut first_panic, payload);
+        }
+        self.lifecycle.wait_for_quiescence();
+        let installed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _operation = self
                 .operation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             self.registry.cancel()
+        })) {
+            Ok(installed) => installed,
+            Err(payload) => {
+                retain_first_finalizer_panic(&mut first_panic, payload);
+                None
+            }
         };
+        // Terminalize outbound authority before any channel-cancellation callback can
+        // reenter delivery. The transport waits for an already-admitted nonblocking
+        // submission to finish, then closes its sink and releases every pending frame.
+        // Repeated callers also pass through this idempotent barrier, so none can
+        // return while another caller is still closing an admitted submission.
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.reliable_transport.shutdown();
+        })) {
+            retain_first_finalizer_panic(&mut first_panic, payload);
+        }
         if let Some(cancelled) = installed {
             // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
             // teardown is rejected without rebuilding context (M2B3 lookup-only). Both
             // terminal paths reach this line through `cancel()`: an explicit cancel
             // calls it directly, and normal completion reaches it via `shutdown()`,
             // which delegates to `cancel()`.
-            self.dedupe.retire_epoch(cancelled.installed().epoch());
-            #[cfg(test)]
-            self.fire_after_registry_cancel_before_channel_cancel();
-            for (channel_id, channel) in cancelled.installed().channels() {
-                let action = channel.cancel();
-                let action = if matches!(action, ChannelAction::None) {
-                    channel.terminal_action()
-                } else {
-                    action
-                };
-                let barrier = self.dispatcher.dispatch_nonblocking(channel_id, action);
-                cancelled.arm_artifact_cancellation(channel_id, barrier);
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.dedupe.retire_epoch(cancelled.installed().epoch());
+            })) {
+                retain_first_finalizer_panic(&mut first_panic, payload);
             }
-            cancelled.deliver_artifact_cancellation();
+            #[cfg(test)]
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.fire_after_registry_cancel_before_channel_cancel();
+            })) {
+                retain_first_finalizer_panic(&mut first_panic, payload);
+            }
+            for (channel_id, channel) in cancelled.installed().channels() {
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let action = channel.cancel();
+                    let action = if matches!(action, ChannelAction::None) {
+                        channel.terminal_action()
+                    } else {
+                        action
+                    };
+                    let barrier = self.dispatcher.dispatch_nonblocking(channel_id, action);
+                    cancelled.arm_artifact_cancellation(channel_id, barrier);
+                })) {
+                    retain_first_finalizer_panic(&mut first_panic, payload);
+                }
+            }
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cancelled.deliver_artifact_cancellation();
+            })) {
+                retain_first_finalizer_panic(&mut first_panic, payload);
+            }
         }
+        drop(completion);
+        finish_finalizer_panic(first_panic, entered_while_panicking);
     }
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
     }
 
+    pub(crate) fn shutdown_transport(&self) {
+        self.shutdown();
+    }
+
     /// Point the outbound remote leg at a fake transport sink. Mirrors the other
-    /// `#[cfg(test)]` seams: the service is built with the inert production sink, and
+    /// `#[cfg(test)]` seams: the service is built with the live production sink, and
     /// delivery tests override it here rather than threading a sink through every
     /// `new_with_dependencies` call site.
     #[cfg(test)]
-    fn set_remote_sink_for_test(
+    pub(crate) fn set_remote_sink_for_test(
         &self,
-        sink: Arc<dyn crate::runtime_filter::router::remote::ArtifactRemoteSink>,
+        sink: Arc<dyn crate::runtime_filter::router::remote::RuntimeFilterEnvelopeSink>,
     ) {
         self.reliable_transport.set_sink_for_test(sink);
     }
@@ -1603,6 +2234,24 @@ impl RuntimeFilterService {
     #[cfg(test)]
     fn reliable_transport(&self) -> &ReliableEnvelopeTransport {
         &self.reliable_transport
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_remote_transport_for_test(
+        &self,
+        route: &crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
+        frame: Arc<crate::runtime_filter::codec::artifact::EncodedArtifactFrame>,
+        identity: TransportRouteEventIdentity,
+    ) {
+        assert!(matches!(
+            self.reliable_transport.send(route, frame, identity),
+            ReliableSendOutcome::Buffered(_)
+        ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_pending_len_for_test(&self) -> usize {
+        self.reliable_transport.pending_len()
     }
 
     #[cfg(test)]
@@ -1750,6 +2399,30 @@ impl RuntimeFilterService {
     }
 
     #[cfg(test)]
+    fn set_before_deadline_dispatch_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_deadline_dispatch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_after_close_request_before_quiescence_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .after_close_request_before_quiescence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_resource_limit_event_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .before_resource_limit_event_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
     fn fire_after_inbound_open_admission(&self) {
         let hook = self
             .after_inbound_open_admission
@@ -1777,6 +2450,18 @@ impl RuntimeFilterService {
     fn fire_after_registry_cancel_before_channel_cancel(&self) {
         let hook = self
             .after_registry_cancel_before_channel_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn fire_after_close_request_before_quiescence(&self) {
+        let hook = self
+            .after_close_request_before_quiescence
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
@@ -1999,7 +2684,7 @@ mod tests {
     use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle,
+        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle, decode_unavailable,
     };
     use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
     use crate::runtime_filter::deployment::compiler::compile;
@@ -2040,7 +2725,8 @@ mod tests {
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
-        BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
+        BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, SubscriptionHandle,
+        SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
@@ -2052,7 +2738,9 @@ mod tests {
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
-    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+    };
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     use super::materialization::MaterializationWorkClaim;
@@ -2070,6 +2758,77 @@ mod tests {
     impl RuntimeFilterEventSink for Events {
         fn record(&self, event: RuntimeFilterEvent) {
             self.0.lock().unwrap().push(event);
+        }
+    }
+
+    struct BlockingResourceLimitEvents {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+        recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
+    impl RuntimeFilterEventSink for BlockingResourceLimitEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if matches!(
+                event,
+                RuntimeFilterEvent::TransportEnvelope {
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    ..
+                }
+            ) {
+                self.entered
+                    .send(())
+                    .expect("resource-limit callback entered");
+                if let Some(release) = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    release.recv().expect("release resource-limit callback");
+                }
+            }
+            self.recorded
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event);
+        }
+    }
+
+    struct ReentrantResourceLimitEvents {
+        service: Mutex<Weak<RuntimeFilterService>>,
+        observed_closed: AtomicBool,
+        fired: AtomicBool,
+    }
+
+    impl RuntimeFilterEventSink for ReentrantResourceLimitEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if matches!(
+                event,
+                RuntimeFilterEvent::TransportEnvelope {
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    ..
+                }
+            ) && !self.fired.swap(true, Ordering::AcqRel)
+            {
+                let service = self
+                    .service
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .upgrade()
+                    .expect("service alive during event callback");
+                service.shutdown();
+                self.observed_closed.store(
+                    service
+                        .lifecycle
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .phase
+                        == super::LifecyclePhase::Closed,
+                    Ordering::Release,
+                );
+            }
         }
     }
 
@@ -2330,6 +3089,37 @@ mod tests {
         recorded: Mutex<Vec<RuntimeFilterEvent>>,
     }
 
+    struct BlockingChannelDeadlineEvents {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
+    impl RuntimeFilterEventSink for BlockingChannelDeadlineEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            if matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }) {
+                self.entered.send(()).expect("channel callback entered");
+                self.release
+                    .lock()
+                    .expect("channel callback release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("channel callback released");
+            }
+            self.recorded.lock().expect("recorded events").push(event);
+        }
+    }
+
+    impl BlockingChannelDeadlineEvents {
+        fn unavailable_count(&self) -> usize {
+            self.recorded
+                .lock()
+                .expect("recorded events")
+                .iter()
+                .filter(|event| matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }))
+                .count()
+        }
+    }
+
     impl RuntimeFilterEventSink for BlockingLastInstallEvent {
         fn record(&self, event: RuntimeFilterEvent) {
             if matches!(event, RuntimeFilterEvent::ChannelPlanned { .. }) {
@@ -2430,7 +3220,7 @@ mod tests {
                 ConsumerDeployment::new(
                     ConsumerActivation::BlockingSnapshot,
                     BTreeSet::from([ArtifactCapability::Membership]),
-                    RouteEdgeId::new(route_edge),
+                    BTreeSet::from([RouteEdgeId::new(route_edge)]),
                     consumer_instances.into_iter().map(uid).collect(),
                 ),
             )]),
@@ -2482,7 +3272,7 @@ mod tests {
                         None,
                     )
                     .unwrap(),
-                    RouteEdgeId::new(40),
+                    BTreeSet::from([RouteEdgeId::new(40)]),
                     BTreeSet::from([uid(30)]),
                 ),
             )]),
@@ -2591,7 +3381,7 @@ mod tests {
             DeploymentEpoch::new(9),
         )
         .unwrap();
-        let participant = RuntimeFilterParticipantId::new(0);
+        let participant = RuntimeFilterParticipantId::new(1);
         let core_view = plan
             .install_views
             .remove(&participant)
@@ -2608,6 +3398,11 @@ mod tests {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
         let remote_producer = UniqueId { hi: 1, lo: 4 };
+        // The shared fixture places this producer on backend index 7. Participant
+        // identities are deliberately nonzero, so the compiler projects backend N
+        // as participant N + 1 rather than preserving the backend index verbatim.
+        let remote_participant =
+            crate::runtime_filter::deployment::participant_id_for_backend(7).unwrap();
         let mut plan = super::test_support::compiled_three_backend_all_of_plan();
         let aggregator = plan
             .routing_shards
@@ -2628,9 +3423,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             routing_channel.producer_participant(producer_binding, remote_producer),
-            Some(RuntimeFilterParticipantId::new(7))
+            Some(remote_participant)
         );
-        assert_ne!(aggregator, RuntimeFilterParticipantId::new(7));
+        assert_ne!(aggregator, remote_participant);
         let core_view = plan.install_views.remove(&aggregator).unwrap();
         let routing_shard = plan.routing_shards.remove(&aggregator).unwrap();
         (
@@ -2643,6 +3438,35 @@ mod tests {
     pub(super) fn inbound_loopback_install_for_test(
         channel: RuntimeFilterChannelDeployment,
     ) -> RuntimeFilterParticipantInstall {
+        let mut grouped = BTreeMap::<
+            crate::runtime_filter::port::artifact::ConsumerProfileId,
+            (
+                crate::runtime_filter::port::artifact::ConsumerArtifactProfile,
+                BTreeSet<RouteEdgeId>,
+            ),
+        >::new();
+        for consumer in channel.consumers().values() {
+            grouped
+                .entry(consumer.artifact_profile().id())
+                .or_insert_with(|| (consumer.artifact_profile().clone(), BTreeSet::new()))
+                .1
+                .extend(consumer.route_edge_ids().iter().copied());
+        }
+        let channel = channel.with_outbound_materialization_groups(
+            grouped
+                .into_iter()
+                .map(|(profile_id, (profile, routes))| {
+                    (
+                        profile_id,
+                        OutboundMaterializationGroup::new(
+                            OutboundMaterializationOwner::Aggregator,
+                            profile,
+                            routes,
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let epoch = DeploymentEpoch::new(9);
         let participant = RuntimeFilterParticipantId::new(3);
         let channel_id = channel.channel_id();
@@ -2670,19 +3494,41 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
+                    RuntimeFilterEnvelopeKind::Unavailable,
                 ]),
             )
             .unwrap();
             inbound_edges.push(edge.clone());
             outbound_edges.push(edge);
         }
-        local_roles.extend(
-            channel
-                .consumers()
-                .keys()
-                .copied()
-                .map(RuntimeFilterRouteRole::Consumer),
-        );
+        for (binding_id, consumer) in channel.consumers() {
+            local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
+            for route_edge_id in consumer.route_edge_ids() {
+                let edge = RuntimeFilterRoutingEdgeView::new(
+                    channel_id,
+                    *route_edge_id,
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Aggregator,
+                    ),
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Consumer(*binding_id),
+                    ),
+                    RuntimeFilterRoutePeer::Loopback,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
+                    ]),
+                )
+                .unwrap();
+                inbound_edges.push(edge.clone());
+                outbound_edges.push(edge);
+            }
+        }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
             channel_id,
             local_roles,
@@ -2734,20 +3580,35 @@ mod tests {
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
         max_concurrent_jobs: usize,
     ) -> RuntimeFilterChannelDeployment {
-        let base = deployment(1, 10, 30, 40, [10], [30], 100);
+        deployment_with_profiles_concurrency_and_activation(
+            consumers,
+            max_concurrent_jobs,
+            ConsumerActivation::BlockingSnapshot,
+        )
+    }
+
+    fn deployment_with_profiles_concurrency_and_activation(
+        consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
+        max_concurrent_jobs: usize,
+        activation: ConsumerActivation,
+    ) -> RuntimeFilterChannelDeployment {
+        let base = match activation {
+            ConsumerActivation::BlockingSnapshot => deployment(1, 10, 30, 40, [10], [30], 100),
+            ConsumerActivation::NonBlockingLive { .. } => fenced_final_deployment(),
+        };
         let consumers = consumers
             .into_iter()
             .map(|(binding, route, instance, profile)| {
                 (
                     BindingId::new(binding),
                     ConsumerDeployment::with_profile(
-                        ConsumerActivation::BlockingSnapshot,
+                        activation,
                         BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
                         ]),
                         profile,
-                        RouteEdgeId::new(route),
+                        BTreeSet::from([RouteEdgeId::new(route)]),
                         BTreeSet::from([uid(instance)]),
                     ),
                 )
@@ -2924,7 +3785,7 @@ mod tests {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
                 deadline_ms: 100,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(4096),
             MaterializationPolicy::for_test(),
@@ -2940,7 +3801,7 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
-                    RouteEdgeId::new(1),
+                    BTreeSet::from([RouteEdgeId::new(1)]),
                     BTreeSet::from([uid(2)]),
                 ),
             )]),
@@ -2988,7 +3849,7 @@ mod tests {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
                 deadline_ms: 100,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(4096),
             MaterializationPolicy::for_test(),
@@ -3010,7 +3871,7 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
-                    RouteEdgeId::new(1),
+                    BTreeSet::from([RouteEdgeId::new(1)]),
                     BTreeSet::from([uid(2)]),
                 ),
             )]),
@@ -4150,6 +5011,108 @@ mod tests {
         }
     }
 
+    fn install_with_extra_route_kind(
+        install: RuntimeFilterParticipantInstall,
+        route_edge_id: RouteEdgeId,
+        extra: RuntimeFilterEnvelopeKind,
+    ) -> RuntimeFilterParticipantInstall {
+        let (core, shard) = install.into_parts();
+        let channels = shard
+            .channels()
+            .iter()
+            .map(|(channel_id, channel)| {
+                let mutate = |edge: &RuntimeFilterRoutingEdgeView| {
+                    let mut allowed = edge.allowed_kinds().clone();
+                    if edge.route_edge_id() == route_edge_id {
+                        allowed.insert(extra);
+                    }
+                    RuntimeFilterRoutingEdgeView::new(
+                        *channel_id,
+                        edge.route_edge_id(),
+                        edge.source().clone(),
+                        edge.target().clone(),
+                        edge.peer().clone(),
+                        allowed,
+                    )
+                    .unwrap()
+                };
+                (
+                    *channel_id,
+                    RuntimeFilterChannelRoutingView::new(
+                        *channel_id,
+                        channel.local_roles().clone(),
+                        channel.producer_instances().clone(),
+                        channel.inbound_edges().iter().map(&mutate).collect(),
+                        channel.outbound_edges().iter().map(&mutate).collect(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        RuntimeFilterParticipantInstall::new(
+            core,
+            RuntimeFilterRoutingShard::new(
+                shard.deployment_epoch(),
+                shard.local_participant_id(),
+                channels,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn shared_install_validator_rejects_cross_family_extra_allowed_kinds() {
+        let direct = view([deployment(1, 10, 30, 40, [10], [30], 100)]);
+        let direct_route = direct.routing_shard().channels()[&ChannelId::new(1)].outbound_edges()
+            [0]
+        .route_edge_id();
+        let direct = install_with_extra_route_kind(
+            direct,
+            direct_route,
+            RuntimeFilterEnvelopeKind::Contribution,
+        );
+        crate::runtime_filter::deployment::install_validation::validate_participant_install(
+            &direct,
+        )
+        .expect_err("direct delivery rejects contribution-family authority");
+
+        let plan = super::test_support::compiled_three_backend_all_of_plan();
+        for (_, install) in RuntimeFilterDeploymentExtension::new()
+            .participant_installs(&plan)
+            .expect("compiler projections pair")
+        {
+            let edges = install
+                .routing_shard()
+                .channels()
+                .values()
+                .flat_map(|channel| {
+                    channel
+                        .inbound_edges()
+                        .iter()
+                        .chain(channel.outbound_edges())
+                })
+                .map(|edge| {
+                    let extra = if edge
+                        .allowed_kinds()
+                        .contains(&RuntimeFilterEnvelopeKind::Artifact)
+                    {
+                        RuntimeFilterEnvelopeKind::Contribution
+                    } else {
+                        RuntimeFilterEnvelopeKind::Artifact
+                    };
+                    (edge.route_edge_id(), extra)
+                })
+                .collect::<BTreeSet<_>>();
+            for (route_edge_id, extra) in edges {
+                let mutated = install_with_extra_route_kind(install.clone(), route_edge_id, extra);
+                crate::runtime_filter::deployment::install_validation::validate_participant_install(
+                    &mutated,
+                )
+                .expect_err("To/FromAggregator edges reject cross-family authority");
+            }
+        }
+    }
+
     #[test]
     fn deadline_is_anchored_after_delayed_build_and_idempotent_install_does_not_reset_it() {
         let events = Arc::new(Events::default());
@@ -4349,7 +5312,7 @@ mod tests {
             common,
             BindingId::new(50),
             ConsumerActivation::BlockingSnapshot,
-            RouteEdgeId::new(70),
+            [RouteEdgeId::new(70)],
             [uid(50)],
             direct_events,
         ));
@@ -4372,7 +5335,7 @@ mod tests {
             common,
             BindingId::new(51),
             ConsumerActivation::BlockingSnapshot,
-            RouteEdgeId::new(71),
+            [RouteEdgeId::new(71)],
             [uid(51)],
             codec_events,
         ));
@@ -5548,6 +6511,264 @@ mod tests {
             incomplete_subscription.acquire(Duration::ZERO),
             ArtifactAcquireOutcome::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn shutdown_linearizes_before_a_channel_deadline_callback_can_return_late() {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let events = Arc::new(BlockingChannelDeadlineEvents {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            recorded: Mutex::new(Vec::new()),
+        });
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("channel-deadline-lifecycle"),
+        ));
+        service
+            .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
+            .expect("install deadline channel");
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_service = service.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_service.expire_deadlines(started + Duration::from_millis(100));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("channel deadline callback entered");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = service.clone();
+        let shutdown_events = events.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx
+                .send(shutdown_events.unavailable_count())
+                .expect("shutdown complete");
+        });
+        let early_count = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+
+        release_tx.send(()).expect("release channel callback");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        let count_at_shutdown = early_count.unwrap_or_else(|| {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time")
+        });
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            early_count.is_none(),
+            "shutdown returned while an admitted channel callback was still running"
+        );
+        assert_eq!(events.unavailable_count(), count_at_shutdown);
+    }
+
+    #[test]
+    fn shutdown_hook_panic_closes_service_and_wakes_duplicate_shutdown() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let subscription = fixture
+            .service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .expect("subscribe before shutdown");
+        fixture
+            .service
+            .set_after_registry_cancel_before_channel_cancel_hook(Arc::new(|| {
+                panic!("intentional service finalizer hook panic");
+            }));
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.service.shutdown();
+        }));
+        assert!(first.is_err(), "the finalizer must resume the hook panic");
+
+        let (duplicate_done_tx, duplicate_done_rx) = mpsc::sync_channel(1);
+        let duplicate_service = fixture.service.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_service.shutdown();
+            duplicate_done_tx
+                .send(())
+                .expect("duplicate shutdown completion");
+        });
+        duplicate_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate shutdown must wake after a panicking finalizer");
+        duplicate.join().expect("duplicate shutdown thread");
+
+        assert_eq!(
+            fixture
+                .service
+                .lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase,
+            super::LifecyclePhase::Closed,
+        );
+        assert!(matches!(
+            subscription.acquire(Duration::ZERO),
+            ArtifactAcquireOutcome::Unavailable(_) | ArtifactAcquireOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn nested_service_unwind_preserves_outer_panic_in_subprocess() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current lib-test executable"),
+        )
+        .arg("nested_service_unwind_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .output()
+        .expect("run isolated nested-unwind service regression");
+        assert!(
+            output.status.success(),
+            "nested service unwind aborted the child process:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated by nested_service_unwind_preserves_outer_panic_in_subprocess"]
+    fn nested_service_unwind_child() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let subscription = fixture
+            .service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .expect("subscribe before nested shutdown");
+        fixture
+            .service
+            .set_after_registry_cancel_before_channel_cancel_hook(Arc::new(|| {
+                panic!("secondary service teardown panic");
+            }));
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call =
+                super::ServiceCall::admit(&fixture.service).expect("admit fake service callback");
+            fixture.service.shutdown();
+            panic!("outer service callback panic");
+        }));
+        let payload = match outer {
+            Ok(_) => panic!("outer service callback must panic"),
+            Err(payload) => payload,
+        };
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer service callback panic"),
+            "the original callback panic must survive nested finalization"
+        );
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let duplicate_service = fixture.service.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_service.shutdown();
+            done_tx.send(()).expect("duplicate shutdown complete");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate shutdown must observe Closed");
+        duplicate.join().expect("duplicate shutdown thread");
+        assert_eq!(
+            fixture
+                .service
+                .lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase,
+            super::LifecyclePhase::Closed,
+        );
+        assert!(matches!(
+            subscription.acquire(Duration::ZERO),
+            ArtifactAcquireOutcome::Unavailable(_) | ArtifactAcquireOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn deadline_snapshot_before_shutdown_does_not_dispatch_after_terminal() {
+        let events = Arc::new(Events::default());
+        let started = Instant::now();
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(started)),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("deadline-snapshot-lifecycle"),
+        ));
+        service
+            .install(view([deployment(1, 10, 30, 40, [10], [30], 100)]))
+            .expect("install deadline channel");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let armed = Arc::new(AtomicBool::new(true));
+        service.set_before_deadline_dispatch_hook(Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).expect("deadline snapshot reached");
+                release_rx
+                    .lock()
+                    .expect("deadline snapshot release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("deadline snapshot released");
+            }
+        }));
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_service = service.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_service.expire_deadlines(started + Duration::from_millis(100));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline snapshotted installation");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = service.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        let shutdown_completed_before_release = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_tx.send(()).expect("release deadline snapshot");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        if !shutdown_completed_before_release {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time");
+        }
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            shutdown_completed_before_release,
+            "shutdown must close while an unadmitted channel dispatch is paused"
+        );
+        assert!(
+            events
+                .0
+                .lock()
+                .expect("recorded events")
+                .iter()
+                .all(|event| !matches!(event, RuntimeFilterEvent::ChannelUnavailable { .. }))
+        );
     }
 
     #[test]
@@ -6873,24 +8094,120 @@ mod tests {
     /// M3 replaces this with the live network sender behind the same seam.
     #[derive(Default)]
     struct RecordingRemoteSink {
-        frames: Mutex<Vec<(RouteEdgeId, EncodedArtifactFrame)>>,
+        envelopes: Mutex<
+            Vec<(
+                RouteEdgeId,
+                crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+            )>,
+        >,
     }
 
-    impl ArtifactRemoteSink for RecordingRemoteSink {
-        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame) {
-            self.frames
+    impl RuntimeFilterEnvelopeSink for RecordingRemoteSink {
+        fn try_send(
+            &self,
+            route: RuntimeFilterRemoteRoute,
+            envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            let envelope = envelope.envelope().clone();
+            self.envelopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((route.route_edge_id(), frame.clone()));
+                .push((route.route_edge_id(), envelope));
+            SinkSubmitOutcome::Submitted
         }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     impl RecordingRemoteSink {
         fn frames(&self) -> Vec<(RouteEdgeId, EncodedArtifactFrame)> {
-            self.frames
+            self.envelopes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .map(|(edge, envelope)| {
+                    (
+                        *edge,
+                        EncodedArtifactFrame::from_parts_for_test(
+                            *envelope.schema_digest(),
+                            envelope.payload().to_vec(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+
+        fn envelopes(
+            &self,
+        ) -> Vec<(
+            RouteEdgeId,
+            crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+        )> {
+            self.envelopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
+        }
+    }
+
+    struct ReentrantServiceShutdownSink {
+        service: Mutex<Weak<RuntimeFilterService>>,
+        send_entered: mpsc::SyncSender<()>,
+        reentry_release: Mutex<Option<mpsc::Receiver<()>>>,
+        reentry_returned: mpsc::SyncSender<()>,
+        shutdown_entered: Option<mpsc::SyncSender<()>>,
+        shutdown_release: Mutex<Option<mpsc::Receiver<()>>>,
+        shutdown: AtomicBool,
+    }
+
+    impl RuntimeFilterEnvelopeSink for ReentrantServiceShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            self.send_entered.send(()).expect("transport call entered");
+            if let Some(release) = self
+                .reentry_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                release.recv().expect("release service shutdown reentry");
+            }
+            self.service
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .upgrade()
+                .expect("service remains alive during callback")
+                .shutdown();
+            self.reentry_returned
+                .send(())
+                .expect("service shutdown reentry returned");
+            SinkSubmitOutcome::Submitted
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {
+            if let Some(entered) = &self.shutdown_entered {
+                entered.send(()).expect("sink shutdown entered");
+            }
+            if let Some(release) = self
+                .shutdown_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                release.recv().expect("release sink shutdown");
+            }
+            self.shutdown.store(true, Ordering::Release);
         }
     }
 
@@ -6963,16 +8280,55 @@ mod tests {
         local_consumers: &[(u32, u32, i64)],
         remote_consumers: &[(u32, u32, u32, &str)],
     ) -> OutboundDeliveryRoutes {
+        install_outbound_delivery_aggregator_with_activation(
+            service,
+            local_consumers,
+            remote_consumers,
+            ConsumerActivation::BlockingSnapshot,
+        )
+    }
+
+    fn install_outbound_delivery_aggregator_with_activation(
+        service: &RuntimeFilterService,
+        local_consumers: &[(u32, u32, i64)],
+        remote_consumers: &[(u32, u32, u32, &str)],
+        activation: ConsumerActivation,
+    ) -> OutboundDeliveryRoutes {
         let epoch = DeploymentEpoch::new(9);
         let aggregator = RuntimeFilterParticipantId::new(3);
         let channel_id = ChannelId::new(1);
         let profile = service_outbound_delivery_profile();
 
-        let channel = deployment_with_profiles(
-            local_consumers
-                .iter()
-                .map(|(binding, route, instance)| (*binding, *route, *instance, profile.clone())),
-        );
+        let local_profiles = local_consumers
+            .iter()
+            .map(|(binding, route, instance)| (*binding, *route, *instance, profile.clone()))
+            .collect::<Vec<_>>();
+        let max_concurrent_jobs = local_profiles
+            .iter()
+            .map(|(_, _, _, profile)| profile.id())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let channel = deployment_with_profiles_concurrency_and_activation(
+            local_profiles,
+            max_concurrent_jobs,
+            activation,
+        )
+        .with_outbound_materialization_groups(BTreeMap::from([(
+            profile.id(),
+            OutboundMaterializationGroup::new(
+                OutboundMaterializationOwner::Aggregator,
+                profile.clone(),
+                local_consumers
+                    .iter()
+                    .map(|(_, route, _)| RouteEdgeId::new(*route))
+                    .chain(
+                        remote_consumers
+                            .iter()
+                            .map(|(_, route, _, _)| RouteEdgeId::new(*route)),
+                    )
+                    .collect(),
+            ),
+        )]));
         let core_view = RuntimeFilterInstallView::new(
             epoch,
             aggregator,
@@ -6993,6 +8349,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
             ]),
         )
         .unwrap();
@@ -7020,6 +8377,9 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Artifact,
                     RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                    RuntimeFilterEnvelopeKind::DegradedLogical,
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
                 ]),
             )
             .unwrap();
@@ -7045,6 +8405,9 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Artifact,
                     RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                    RuntimeFilterEnvelopeKind::DegradedLogical,
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
                 ]),
             )
             .unwrap();
@@ -7181,6 +8544,371 @@ mod tests {
             decoded.artifacts()[0].1.canonical_bytes(),
             bundle.artifacts()[0].1.canonical_bytes()
         );
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_completed_without_artifact_to_remote_groups() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::CompletedWithoutArtifact {
+                    order: 0,
+                    outcome: SubmitOutcome::CompletedWithoutArtifact,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(
+            envelope.kind(),
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+        );
+        assert_eq!(envelope.schema_digest(), &routes.profile.id().bytes());
+        assert!(envelope.payload().is_empty());
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_degraded_logical_to_remote_groups() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::DegradedLogical {
+                    order: 0,
+                    outcome: SubmitOutcome::TerminalNoop,
+                    reason: UnavailableReason::ProducerFailed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(envelope.kind(), RuntimeFilterEnvelopeKind::DegradedLogical);
+        assert_eq!(envelope.schema_digest(), &routes.profile.id().bytes());
+        assert_eq!(
+            decode_unavailable(
+                envelope.payload(),
+                envelope.schema_digest(),
+                ArtifactDecodeExpectation::new(&routes.profile),
+                1 << 20,
+            )
+            .unwrap(),
+            UnavailableReason::ProducerFailed
+        );
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_final_artifact_atomically_with_loopback_parity() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator_with_activation(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::Completed {
+                    order: 0,
+                    outcome: SubmitOutcome::Completed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let SubscriptionHandle::Live(loopback_subscription) = fixture
+            .service
+            .subscribe(
+                BindingId::new(20),
+                uid(200),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+        else {
+            panic!("completed loopback route must install a live subscription")
+        };
+        let LivePollOutcome::Updated {
+            bundle: loopback,
+            terminal: Some(LiveTerminal::Completed),
+        } = loopback_subscription.poll_after(None)
+        else {
+            panic!("completed loopback route must atomically publish and complete")
+        };
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1, "completion is one atomic wire message");
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(envelope.kind(), RuntimeFilterEnvelopeKind::FinalArtifact);
+        let remote = decode_artifact_bundle(
+            envelope.payload(),
+            envelope.schema_digest(),
+            ArtifactDecodeExpectation::new(&routes.profile),
+            1 << 20,
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            MemTrackerMemoryAccount::new_root_for_test("final-artifact-parity"),
+        )
+        .unwrap();
+        assert_eq!(remote.canonical_digest(), loopback.canonical_digest());
+    }
+
+    #[test]
+    fn visible_then_completed_sends_artifact_then_atomic_final_artifact() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::VisibleSnapshot {
+                    order: 0,
+                    outcome: SubmitOutcome::Published,
+                    version: snapshot.version(),
+                    snapshot: snapshot.clone(),
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::Completed {
+                    order: 1,
+                    outcome: SubmitOutcome::Completed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(
+            envelopes
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+            ],
+        );
+        assert_eq!(envelopes[0].1.payload(), envelopes[1].1.payload());
+        assert_eq!(
+            envelopes[0].1.schema_digest(),
+            envelopes[1].1.schema_digest()
+        );
+    }
+
+    #[test]
+    fn reentrant_service_shutdown_waits_for_child_transport_teardown() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let bundle =
+            service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
+        let (send_entered_tx, send_entered_rx) = mpsc::sync_channel(1);
+        let (reentry_returned_tx, reentry_returned_rx) = mpsc::sync_channel(1);
+        let (sink_shutdown_entered_tx, sink_shutdown_entered_rx) = mpsc::sync_channel(1);
+        let (sink_shutdown_release_tx, sink_shutdown_release_rx) = mpsc::sync_channel(1);
+        let sink = Arc::new(ReentrantServiceShutdownSink {
+            service: Mutex::new(Arc::downgrade(&fixture.service)),
+            send_entered: send_entered_tx,
+            reentry_release: Mutex::new(None),
+            reentry_returned: reentry_returned_tx,
+            shutdown_entered: Some(sink_shutdown_entered_tx),
+            shutdown_release: Mutex::new(Some(sink_shutdown_release_rx)),
+            shutdown: AtomicBool::new(false),
+        });
+        fixture.service.set_remote_sink_for_test(sink.clone());
+
+        let delivery_service = fixture.service.clone();
+        let delivery_profile = routes.profile.clone();
+        let delivery_edges = routes.remote_edges.clone();
+        let delivery = std::thread::spawn(move || {
+            delivery_service.deliver_artifact(
+                routes.channel_id,
+                &delivery_profile,
+                delivery_edges,
+                ArtifactDeliveryOutcome::Published(bundle),
+            )
+        });
+        send_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote submission entered");
+        reentry_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reentrant service shutdown returned");
+        sink_shutdown_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child transport teardown entered");
+
+        let (duplicate_done_tx, duplicate_done_rx) = mpsc::sync_channel(1);
+        let duplicate_service = fixture.service.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_service.shutdown();
+            duplicate_done_tx
+                .send(())
+                .expect("duplicate service shutdown completion");
+        });
+        let duplicate_returned_before_child = duplicate_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        sink_shutdown_release_tx
+            .send(())
+            .expect("release child transport teardown");
+        if !duplicate_returned_before_child {
+            duplicate_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("duplicate shutdown joined after child teardown");
+        }
+        delivery.join().expect("delivery thread").expect("delivery");
+        duplicate.join().expect("duplicate shutdown thread");
+
+        assert!(
+            !duplicate_returned_before_child,
+            "service shutdown returned before child transport teardown"
+        );
+        assert!(sink.shutdown.load(Ordering::Acquire));
+        assert_eq!(fixture.service.reliable_transport().pending_len(), 0);
+    }
+
+    #[test]
+    fn parent_before_child_permit_order_breaks_cross_thread_shutdown_cycle() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let bundle =
+            service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
+        let (send_entered_tx, send_entered_rx) = mpsc::sync_channel(1);
+        let (reentry_release_tx, reentry_release_rx) = mpsc::sync_channel(1);
+        let (reentry_returned_tx, reentry_returned_rx) = mpsc::sync_channel(1);
+        let sink = Arc::new(ReentrantServiceShutdownSink {
+            service: Mutex::new(Arc::downgrade(&fixture.service)),
+            send_entered: send_entered_tx,
+            reentry_release: Mutex::new(Some(reentry_release_rx)),
+            reentry_returned: reentry_returned_tx,
+            shutdown_entered: None,
+            shutdown_release: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        });
+        fixture.service.set_remote_sink_for_test(sink.clone());
+
+        let delivery_service = fixture.service.clone();
+        let delivery_profile = routes.profile.clone();
+        let delivery_edges = routes.remote_edges.clone();
+        let delivery = std::thread::spawn(move || {
+            delivery_service.deliver_artifact(
+                routes.channel_id,
+                &delivery_profile,
+                delivery_edges,
+                ArtifactDeliveryOutcome::Published(bundle),
+            )
+        });
+        send_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread B holds the child transport permit");
+
+        let (parent_close_requested_tx, parent_close_requested_rx) = mpsc::sync_channel(1);
+        fixture
+            .service
+            .set_after_close_request_before_quiescence_hook(Arc::new(move || {
+                parent_close_requested_tx
+                    .send(())
+                    .expect("parent close request observed");
+            }));
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = fixture.service.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx
+                .send(())
+                .expect("thread A shutdown complete");
+        });
+        parent_close_requested_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread A requested parent close");
+
+        reentry_release_tx
+            .send(())
+            .expect("release thread B into parent shutdown reentry");
+        reentry_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread B must defer parent shutdown instead of following thread A");
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("thread A completes after thread B releases parent and child permits");
+        delivery.join().expect("delivery thread").expect("delivery");
+        shutdown.join().expect("shutdown thread");
+
+        assert!(sink.shutdown.load(Ordering::Acquire));
+        assert_eq!(fixture.service.reliable_transport().pending_len(), 0);
     }
 
     #[test]
@@ -7375,7 +9103,7 @@ mod tests {
                     ArtifactCapability::EmptyDomain,
                 ]),
                 profile.clone(),
-                delivery_route_edge,
+                BTreeSet::from([delivery_route_edge]),
                 BTreeSet::from([consumer_finst]),
             ),
         );
@@ -7393,7 +9121,8 @@ mod tests {
             template.materialization_policy(),
             template.producers().clone(),
             consumers,
-        );
+        )
+        .with_outbound_materialization_groups(template.outbound_materialization_groups().clone());
         let mut channels = core_view.channels().clone();
         channels.insert(channel_id, consumer_channel);
         let augmented_core =
@@ -7930,6 +9659,194 @@ mod tests {
                 TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
                 128,
             )],
+        );
+    }
+
+    #[test]
+    fn resource_limit_event_gap_suppresses_callback_after_shutdown_wins() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure_transport(super::ReliableTransportPolicy::new(
+                Duration::from_millis(10),
+                2,
+                Duration::from_secs(1),
+                1,
+                1 << 20,
+            ))
+            .expect("one-entry transport policy");
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7"), (40, 31, 8, "10.0.0.8")],
+        );
+        fixture
+            .service
+            .set_remote_sink_for_test(Arc::new(RecordingRemoteSink::default()));
+        let bundle =
+            service_outbound_delivery_membership_bundle(&routes.profile, routes.channel_id);
+        let (gap_entered_tx, gap_entered_rx) = mpsc::sync_channel(1);
+        let (gap_release_tx, gap_release_rx) = mpsc::sync_channel(1);
+        let gap_release_rx = Mutex::new(gap_release_rx);
+        fixture
+            .service
+            .set_before_resource_limit_event_admission_hook(Arc::new(move || {
+                gap_entered_tx.send(()).expect("resource event gap entered");
+                gap_release_rx
+                    .lock()
+                    .expect("resource event gap")
+                    .recv()
+                    .expect("release resource event gap");
+            }));
+
+        let delivery_service = fixture.service.clone();
+        let delivery_profile = routes.profile.clone();
+        let delivery = std::thread::spawn(move || {
+            delivery_service.deliver_artifact(
+                routes.channel_id,
+                &delivery_profile,
+                routes.remote_edges,
+                ArtifactDeliveryOutcome::Published(bundle),
+            )
+        });
+        gap_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resource-limit event reached pre-admission gap");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = fixture.service.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown wins before second event admission");
+        gap_release_tx.send(()).expect("release event gap");
+        delivery.join().expect("delivery thread").expect("delivery");
+        shutdown.join().expect("shutdown thread");
+
+        assert!(
+            transport_events_of(&fixture.events)
+                .iter()
+                .all(|(_, kind, _)| {
+                    !matches!(
+                        kind,
+                        TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit)
+                    )
+                }),
+            "shutdown must suppress the not-yet-admitted resource-limit callback"
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_for_admitted_resource_limit_event_callback() {
+        let (callback_entered_tx, callback_entered_rx) = mpsc::sync_channel(1);
+        let (callback_release_tx, callback_release_rx) = mpsc::sync_channel(1);
+        let events = Arc::new(BlockingResourceLimitEvents {
+            entered: callback_entered_tx,
+            release: Mutex::new(Some(callback_release_rx)),
+            recorded: Mutex::new(Vec::new()),
+        });
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events,
+            MemTrackerMemoryAccount::new_root_for_test("resource-limit-admission"),
+        ));
+        let identity = TransportRouteEventIdentity::new(
+            RuntimeFilterEventIdentity::new(
+                uid(0),
+                RuntimeFilterParticipantId::new(3),
+                ChannelId::new(1),
+                DeploymentEpoch::new(9),
+            ),
+            RouteEdgeId::new(30),
+        );
+
+        let delivery_service = service.clone();
+        let delivery = std::thread::spawn(move || {
+            delivery_service.record_transport_resource_limit(
+                identity,
+                TransportResourceLimit::PendingEntries,
+                128,
+            );
+        });
+        callback_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resource-limit callback entered");
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_service = service.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_service.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        let shutdown_returned_early = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        callback_release_tx
+            .send(())
+            .expect("release resource-limit callback");
+        if !shutdown_returned_early {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joins after callback");
+        }
+        delivery.join().expect("delivery thread");
+        shutdown.join().expect("shutdown thread");
+        assert!(
+            !shutdown_returned_early,
+            "shutdown returned while an admitted resource-limit callback was active"
+        );
+    }
+
+    #[test]
+    fn resource_limit_event_reentrant_shutdown_is_deferred_by_service_permit() {
+        let events = Arc::new(ReentrantResourceLimitEvents {
+            service: Mutex::new(Weak::new()),
+            observed_closed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+            uid(0),
+            Arc::new(Clock(Instant::now())),
+            events.clone(),
+            MemTrackerMemoryAccount::new_root_for_test("resource-limit-reentry"),
+        ));
+        *events
+            .service
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&service);
+        let identity = TransportRouteEventIdentity::new(
+            RuntimeFilterEventIdentity::new(
+                uid(0),
+                RuntimeFilterParticipantId::new(3),
+                ChannelId::new(1),
+                DeploymentEpoch::new(9),
+            ),
+            RouteEdgeId::new(30),
+        );
+
+        service.record_transport_resource_limit(
+            identity,
+            TransportResourceLimit::PendingEntries,
+            128,
+        );
+
+        assert!(events.fired.load(Ordering::Acquire));
+        assert!(
+            !events.observed_closed.load(Ordering::Acquire),
+            "reentrant shutdown must defer while the resource event owns a ServiceCall"
+        );
+        assert_eq!(
+            service
+                .lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase,
+            super::LifecyclePhase::Closed,
         );
     }
 }

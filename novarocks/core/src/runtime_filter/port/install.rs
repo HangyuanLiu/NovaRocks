@@ -25,11 +25,16 @@ use crate::runtime_filter::model::contract::{
 };
 use crate::runtime_filter::model::coverage::Coverage;
 
-use super::artifact::ConsumerArtifactProfile;
+use super::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
 use super::identity::{DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId};
 use super::routing::RuntimeFilterRoutingShard;
 #[cfg(test)]
-use super::routing::{RuntimeFilterChannelRoutingView, RuntimeFilterRouteRole};
+use super::routing::{
+    RuntimeFilterChannelRoutingView, RuntimeFilterRouteEndpointView, RuntimeFilterRoutePeer,
+    RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView,
+};
+#[cfg(test)]
+use super::transport::RuntimeFilterEnvelopeKind;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterCoreBudget {
@@ -180,8 +185,47 @@ pub(crate) struct ConsumerDeployment {
     activation: ConsumerActivation,
     capabilities: BTreeSet<ArtifactCapability>,
     artifact_profile: ConsumerArtifactProfile,
-    loopback_route_edge_id: RouteEdgeId,
+    route_edge_ids: BTreeSet<RouteEdgeId>,
     expected_fragment_instances: BTreeSet<UniqueId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutboundMaterializationOwner {
+    DirectSource,
+    Aggregator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutboundMaterializationGroup {
+    owner: OutboundMaterializationOwner,
+    profile: ConsumerArtifactProfile,
+    route_edge_ids: BTreeSet<RouteEdgeId>,
+}
+
+impl OutboundMaterializationGroup {
+    pub(crate) fn new(
+        owner: OutboundMaterializationOwner,
+        profile: ConsumerArtifactProfile,
+        route_edge_ids: BTreeSet<RouteEdgeId>,
+    ) -> Self {
+        Self {
+            owner,
+            profile,
+            route_edge_ids,
+        }
+    }
+
+    pub(crate) const fn owner(&self) -> OutboundMaterializationOwner {
+        self.owner
+    }
+
+    pub(crate) const fn profile(&self) -> &ConsumerArtifactProfile {
+        &self.profile
+    }
+
+    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
+        &self.route_edge_ids
+    }
 }
 
 impl ConsumerDeployment {
@@ -189,7 +233,7 @@ impl ConsumerDeployment {
     pub(crate) fn new(
         activation: ConsumerActivation,
         mut capabilities: BTreeSet<ArtifactCapability>,
-        loopback_route_edge_id: RouteEdgeId,
+        route_edge_ids: BTreeSet<RouteEdgeId>,
         expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> Self {
         if capabilities.contains(&ArtifactCapability::Membership) {
@@ -199,7 +243,7 @@ impl ConsumerDeployment {
             activation,
             capabilities,
             ConsumerArtifactProfile::m1_test_default(),
-            loopback_route_edge_id,
+            route_edge_ids,
             expected_fragment_instances,
         )
     }
@@ -208,14 +252,14 @@ impl ConsumerDeployment {
         activation: ConsumerActivation,
         capabilities: BTreeSet<ArtifactCapability>,
         artifact_profile: ConsumerArtifactProfile,
-        loopback_route_edge_id: RouteEdgeId,
+        route_edge_ids: BTreeSet<RouteEdgeId>,
         expected_fragment_instances: BTreeSet<UniqueId>,
     ) -> Self {
         Self {
             activation,
             capabilities,
             artifact_profile,
-            loopback_route_edge_id,
+            route_edge_ids,
             expected_fragment_instances,
         }
     }
@@ -232,8 +276,8 @@ impl ConsumerDeployment {
         &self.artifact_profile
     }
 
-    pub(crate) const fn loopback_route_edge_id(&self) -> RouteEdgeId {
-        self.loopback_route_edge_id
+    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<RouteEdgeId> {
+        &self.route_edge_ids
     }
 
     pub(crate) const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
@@ -256,6 +300,7 @@ pub(crate) struct RuntimeFilterChannelDeployment {
     materialization_policy: MaterializationPolicy,
     producers: BTreeMap<BindingId, ProducerDeployment>,
     consumers: BTreeMap<BindingId, ConsumerDeployment>,
+    outbound_materialization_groups: BTreeMap<ConsumerProfileId, OutboundMaterializationGroup>,
 }
 
 impl RuntimeFilterChannelDeployment {
@@ -289,7 +334,16 @@ impl RuntimeFilterChannelDeployment {
             materialization_policy,
             producers,
             consumers,
+            outbound_materialization_groups: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn with_outbound_materialization_groups(
+        mut self,
+        groups: BTreeMap<ConsumerProfileId, OutboundMaterializationGroup>,
+    ) -> Self {
+        self.outbound_materialization_groups = groups;
+        self
     }
 
     pub(crate) const fn channel_id(&self) -> ChannelId {
@@ -330,6 +384,11 @@ impl RuntimeFilterChannelDeployment {
     }
     pub(crate) const fn consumers(&self) -> &BTreeMap<BindingId, ConsumerDeployment> {
         &self.consumers
+    }
+    pub(crate) const fn outbound_materialization_groups(
+        &self,
+    ) -> &BTreeMap<ConsumerProfileId, OutboundMaterializationGroup> {
+        &self.outbound_materialization_groups
     }
 }
 
@@ -439,19 +498,90 @@ pub(crate) fn local_participant_install_for_test(
                 )
             })
             .collect();
+        let mut inbound_edges = Vec::new();
+        let mut outbound_edges = Vec::new();
+        if let Some(producer_binding_id) = deployment.producers().keys().next().copied() {
+            for (consumer_binding_id, consumer) in deployment.consumers() {
+                for route_edge_id in consumer.route_edge_ids() {
+                    let edge = RuntimeFilterRoutingEdgeView::new(
+                        *channel_id,
+                        *route_edge_id,
+                        RuntimeFilterRouteEndpointView::new(
+                            participant,
+                            RuntimeFilterRouteRole::Producer(producer_binding_id),
+                        ),
+                        RuntimeFilterRouteEndpointView::new(
+                            participant,
+                            RuntimeFilterRouteRole::Consumer(*consumer_binding_id),
+                        ),
+                        RuntimeFilterRoutePeer::Loopback,
+                        BTreeSet::from([
+                            RuntimeFilterEnvelopeKind::Artifact,
+                            RuntimeFilterEnvelopeKind::Unavailable,
+                            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                            RuntimeFilterEnvelopeKind::DegradedLogical,
+                            RuntimeFilterEnvelopeKind::FinalArtifact,
+                        ]),
+                    )
+                    .expect("test install view produces a valid consumer route");
+                    inbound_edges.push(edge.clone());
+                    outbound_edges.push(edge);
+                }
+            }
+        }
         let channel = RuntimeFilterChannelRoutingView::new(
             *channel_id,
             local_roles,
             producer_instances,
-            Vec::new(),
-            Vec::new(),
+            inbound_edges,
+            outbound_edges,
         )
         .expect("test install view produces a valid routing channel");
         channels.insert(*channel_id, channel);
     }
     let routing_shard = RuntimeFilterRoutingShard::new(core_view.epoch(), participant, channels)
         .expect("test install view produces a valid routing shard");
-    RuntimeFilterParticipantInstall::new(core_view, routing_shard)
+    let projected_channels = core_view
+        .channels()
+        .iter()
+        .map(|(channel_id, deployment)| {
+            let mut grouped = BTreeMap::<
+                ConsumerProfileId,
+                (ConsumerArtifactProfile, BTreeSet<RouteEdgeId>),
+            >::new();
+            if !deployment.producers().is_empty() {
+                for consumer in deployment.consumers().values() {
+                    let entry = grouped
+                        .entry(consumer.artifact_profile().id())
+                        .or_insert_with(|| (consumer.artifact_profile().clone(), BTreeSet::new()));
+                    entry.1.extend(consumer.route_edge_ids().iter().copied());
+                }
+            }
+            let groups = grouped
+                .into_iter()
+                .map(|(profile_id, (profile, routes))| {
+                    (
+                        profile_id,
+                        OutboundMaterializationGroup::new(
+                            OutboundMaterializationOwner::DirectSource,
+                            profile,
+                            routes,
+                        ),
+                    )
+                })
+                .collect();
+            (
+                *channel_id,
+                deployment
+                    .clone()
+                    .with_outbound_materialization_groups(groups),
+            )
+        })
+        .collect();
+    RuntimeFilterParticipantInstall::new(
+        RuntimeFilterInstallView::new(core_view.epoch(), participant, projected_channels),
+        routing_shard,
+    )
 }
 
 #[cfg(test)]
@@ -528,7 +658,7 @@ mod tests {
                 ConsumerDeployment::new(
                     ConsumerActivation::BlockingSnapshot,
                     BTreeSet::from([ArtifactCapability::Membership]),
-                    RouteEdgeId::new(5),
+                    BTreeSet::from([RouteEdgeId::new(5)]),
                     consumer_instances.clone(),
                 ),
             )]),

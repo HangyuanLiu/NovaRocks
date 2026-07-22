@@ -46,6 +46,12 @@ service NovaRocksGrpc {
       returns (novarocks.filter.TransmitRuntimeFilterResponse);
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
+  rpc InstallRuntimeFilterDeployment(
+      novarocks.filter.InstallRuntimeFilterDeploymentRequest)
+      returns (novarocks.filter.InstallRuntimeFilterDeploymentResponse);
+  rpc AbortRuntimeFilterDeployment(
+      novarocks.filter.AbortRuntimeFilterDeploymentRequest)
+      returns (novarocks.filter.AbortRuntimeFilterDeploymentResponse);
   // Point lookup (fetch-by-key).
   rpc Lookup(novarocks.filter.LookupRequest)
       returns (novarocks.filter.LookupResponse);

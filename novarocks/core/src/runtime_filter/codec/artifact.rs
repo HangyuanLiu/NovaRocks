@@ -154,6 +154,15 @@ impl EncodedArtifactFrame {
     }
 }
 
+pub(crate) fn encode_completed_without_artifact(
+    expectation: ArtifactDecodeExpectation<'_>,
+) -> EncodedArtifactFrame {
+    EncodedArtifactFrame {
+        profile_digest: expectation.profile().id().bytes(),
+        payload: Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactWireCodecError {
     Malformed,

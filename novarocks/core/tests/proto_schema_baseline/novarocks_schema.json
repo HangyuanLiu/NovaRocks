@@ -1284,6 +1284,46 @@
     "idl/novarocks/filter.proto": {
       "package": "novarocks.filter",
       "messages": {
+        "AbortRuntimeFilterDeploymentRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "query_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "deployment_epoch",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "AbortRuntimeFilterDeploymentResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "status",
+              "type_name": "RuntimeFilterDeploymentResponseStatus",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "rejection",
+              "type_name": "RuntimeFilterDeploymentRejection",
+              "label": "optional",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "Column": {
           "fields": {
             "1": {
@@ -1305,6 +1345,67 @@
               "name": "data",
               "type_name": "bytes",
               "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "InstallRuntimeFilterDeploymentRequest": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "query_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "deployment_epoch",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "participant_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "lifecycle",
+              "type_name": "RuntimeFilterQueryLifecycleOptions",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "install",
+              "type_name": "RuntimeFilterParticipantInstall",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "InstallRuntimeFilterDeploymentResponse": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "status",
+              "type_name": "RuntimeFilterDeploymentResponseStatus",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "rejection",
+              "type_name": "RuntimeFilterDeploymentRejection",
+              "label": "optional",
               "oneof": null
             }
           },
@@ -1365,6 +1466,233 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterChannelDeployment": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "channel_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "logical_domain",
+              "type_name": "RuntimeFilterLogicalDomain",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "lifecycle",
+              "type_name": "RuntimeFilterLifecycle",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "availability_coverage",
+              "type_name": "RuntimeFilterCoverage",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "terminal_coverage",
+              "type_name": "RuntimeFilterCoverage",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "reduction",
+              "type_name": "novarocks.plan.RuntimeFilterReductionContract",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "allowed_contribution_kinds",
+              "type_name": "novarocks.plan.RuntimeFilterContributionKind",
+              "label": "repeated",
+              "oneof": null
+            },
+            "8": {
+              "number": 8,
+              "name": "completion_requirement",
+              "type_name": "novarocks.plan.RuntimeFilterCompletionRequirement",
+              "label": "singular",
+              "oneof": null
+            },
+            "9": {
+              "number": 9,
+              "name": "policy",
+              "type_name": "RuntimeFilterPolicyRequirement",
+              "label": "singular",
+              "oneof": null
+            },
+            "10": {
+              "number": 10,
+              "name": "core_budget",
+              "type_name": "RuntimeFilterCoreBudget",
+              "label": "singular",
+              "oneof": null
+            },
+            "11": {
+              "number": 11,
+              "name": "materialization_policy",
+              "type_name": "RuntimeFilterMaterializationPolicy",
+              "label": "singular",
+              "oneof": null
+            },
+            "12": {
+              "number": 12,
+              "name": "producers",
+              "type_name": "RuntimeFilterProducerDeployment",
+              "label": "repeated",
+              "oneof": null
+            },
+            "13": {
+              "number": 13,
+              "name": "consumers",
+              "type_name": "RuntimeFilterConsumerDeployment",
+              "label": "repeated",
+              "oneof": null
+            },
+            "14": {
+              "number": 14,
+              "name": "outbound_materialization_groups",
+              "type_name": "RuntimeFilterOutboundMaterializationGroup",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterChannelRoutingView": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "channel_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "local_roles",
+              "type_name": "RuntimeFilterRouteRole",
+              "label": "repeated",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "producer_instances",
+              "type_name": "RuntimeFilterProducerInstanceRoute",
+              "label": "repeated",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "inbound_edges",
+              "type_name": "RuntimeFilterRoutingEdgeView",
+              "label": "repeated",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "outbound_edges",
+              "type_name": "RuntimeFilterRoutingEdgeView",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterConsumerArtifactProfile": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "accepted_kinds",
+              "type_name": "RuntimeFilterArtifactKind",
+              "label": "repeated",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "bloom_hash_contract",
+              "type_name": "bytes",
+              "label": "optional",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "order_contract_digest",
+              "type_name": "bytes",
+              "label": "optional",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "profile_id",
+              "type_name": "bytes",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterConsumerDeployment": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "activation",
+              "type_name": "novarocks.plan.RuntimeFilterConsumerActivation",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "capabilities",
+              "type_name": "novarocks.plan.RuntimeFilterArtifactCapability",
+              "label": "repeated",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "artifact_profile",
+              "type_name": "RuntimeFilterConsumerArtifactProfile",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "route_edge_ids",
+              "type_name": "uint32",
+              "label": "repeated",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "expected_fragment_instances",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterContributionRouteIdentity": {
           "fields": {
             "1": {
@@ -1399,6 +1727,72 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterCoreBudget": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "max_reducer_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterCoverage": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "leaf_witness_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "2": {
+              "number": 2,
+              "name": "all_of",
+              "type_name": "RuntimeFilterCoverageAllOf",
+              "label": "singular",
+              "oneof": "kind"
+            },
+            "3": {
+              "number": 3,
+              "name": "any_of",
+              "type_name": "RuntimeFilterCoverageAnyOf",
+              "label": "singular",
+              "oneof": "kind"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterCoverageAllOf": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "children",
+              "type_name": "RuntimeFilterCoverage",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterCoverageAnyOf": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "children",
+              "type_name": "RuntimeFilterCoverage",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterDeliveryRouteIdentity": {
           "fields": {
             "1": {
@@ -1412,6 +1806,26 @@
               "number": 2,
               "name": "sequence",
               "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterDeploymentRejection": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "code",
+              "type_name": "RuntimeFilterDeploymentRejectionCode",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "reason",
+              "type_name": "string",
               "label": "singular",
               "oneof": null
             }
@@ -1508,12 +1922,317 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterLogicalDomain": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "value_type",
+              "type_name": "novarocks.common.TypeDesc",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "contract",
+              "type_name": "novarocks.plan.RuntimeFilterContract",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterMaterializationPolicy": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "bloom_bits_per_key",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "bloom_hash_count",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "bloom_seed",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "bloom_algorithm_version",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "max_total_retained_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "max_scratch_bytes_per_job",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "max_concurrent_jobs",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOutboundMaterializationGroup": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "owner",
+              "type_name": "RuntimeFilterOutboundMaterializationOwner",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "artifact_profile",
+              "type_name": "RuntimeFilterConsumerArtifactProfile",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "route_edge_ids",
+              "type_name": "uint32",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterParticipantInstall": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "core_channels",
+              "type_name": "RuntimeFilterChannelDeployment",
+              "label": "repeated",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "routing_channels",
+              "type_name": "RuntimeFilterChannelRoutingView",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterPolicyRequirement": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "max_contribution_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "max_artifact_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "deadline_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "max_retries",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterProducerDeployment": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "coverage_witness_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "expected_fragment_instances",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "repeated",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterProducerInstanceRoute": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "fragment_instance_id",
+              "type_name": "novarocks.common.UniqueId",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "participant_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterProducerOpenMetadata": {
           "fields": {
             "1": {
               "number": 1,
               "name": "local_partition_count",
               "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterQueryLifecycleOptions": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "delivery_expire_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "query_expire_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "transport_retry_interval_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "transport_max_attempts",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "transport_deadline_ms",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "6": {
+              "number": 6,
+              "name": "transport_max_pending_entries",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            },
+            "7": {
+              "number": 7,
+              "name": "transport_max_pending_bytes",
+              "type_name": "uint64",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRemotePeer": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "participant_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "endpoint",
+              "type_name": "string",
+              "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRouteEndpointView": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "participant_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "role",
+              "type_name": "RuntimeFilterRouteRole",
               "label": "singular",
               "oneof": null
             }
@@ -1536,6 +2255,101 @@
               "type_name": "RuntimeFilterDeliveryRouteIdentity",
               "label": "singular",
               "oneof": "value"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRoutePeer": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "loopback",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "peer"
+            },
+            "2": {
+              "number": 2,
+              "name": "remote",
+              "type_name": "RuntimeFilterRemotePeer",
+              "label": "singular",
+              "oneof": "peer"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRouteRole": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "producer_binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": "role"
+            },
+            "2": {
+              "number": 2,
+              "name": "aggregator",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "role"
+            },
+            "3": {
+              "number": 3,
+              "name": "relay",
+              "type_name": "bool",
+              "label": "singular",
+              "oneof": "role"
+            },
+            "4": {
+              "number": 4,
+              "name": "consumer_binding_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": "role"
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterRoutingEdgeView": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "route_edge_id",
+              "type_name": "uint32",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "source",
+              "type_name": "RuntimeFilterRouteEndpointView",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "target",
+              "type_name": "RuntimeFilterRouteEndpointView",
+              "label": "singular",
+              "oneof": null
+            },
+            "4": {
+              "number": 4,
+              "name": "peer",
+              "type_name": "RuntimeFilterRoutePeer",
+              "label": "singular",
+              "oneof": null
+            },
+            "5": {
+              "number": 5,
+              "name": "allowed_kinds",
+              "type_name": "RuntimeFilterEnvelopeKind",
+              "label": "repeated",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -1633,6 +2447,92 @@
           "reserved_numbers": [],
           "reserved_names": []
         },
+        "RuntimeFilterArtifactKind": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_VALUE_SET"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_BLOOM"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_BITSET"
+            },
+            {
+              "number": 4,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_RANGE"
+            },
+            {
+              "number": 5,
+              "name": "RUNTIME_FILTER_ARTIFACT_KIND_EMPTY_DOMAIN"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterDeploymentRejectionCode": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INVALID_REQUEST"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_STALE_EPOCH"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_CONFLICTING_DEPLOYMENT"
+            },
+            {
+              "number": 4,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_QUERY_ABORTED"
+            },
+            {
+              "number": 5,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_ACTIVE_FRAGMENTS"
+            },
+            {
+              "number": 6,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INTERNAL"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterDeploymentResponseStatus": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_APPLIED"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_IDEMPOTENT"
+            },
+            {
+              "number": 3,
+              "name": "RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_REJECTED"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
         "RuntimeFilterEnvelopeKind": {
           "values": [
             {
@@ -1658,6 +2558,54 @@
             {
               "number": 5,
               "name": "RUNTIME_FILTER_ENVELOPE_KIND_ACK"
+            },
+            {
+              "number": 6,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_COMPLETED_WITHOUT_ARTIFACT"
+            },
+            {
+              "number": 7,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_DEGRADED_LOGICAL"
+            },
+            {
+              "number": 8,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_FINAL_ARTIFACT"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterLifecycle": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_LIFECYCLE_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_LIFECYCLE_COMPLETE_ONCE"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_LIFECYCLE_MONOTONIC_UPDATES"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOutboundMaterializationOwner": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_DIRECT_SOURCE"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_AGGREGATOR"
             }
           ],
           "reserved_numbers": [],
@@ -8577,6 +9525,12 @@
       "services": {
         "NovaRocksGrpc": {
           "rpcs": {
+            "AbortRuntimeFilterDeployment": {
+              "request": "novarocks.filter.AbortRuntimeFilterDeploymentRequest",
+              "response": "novarocks.filter.AbortRuntimeFilterDeploymentResponse",
+              "client_streaming": false,
+              "server_streaming": false
+            },
             "BatchReportExecStatus": {
               "request": "BatchReportExecStatusRequest",
               "response": "BatchReportExecStatusResponse",
@@ -8610,6 +9564,12 @@
             "Heartbeat": {
               "request": "HeartbeatRequest",
               "response": "HeartbeatResponse",
+              "client_streaming": false,
+              "server_streaming": false
+            },
+            "InstallRuntimeFilterDeployment": {
+              "request": "novarocks.filter.InstallRuntimeFilterDeploymentRequest",
+              "response": "novarocks.filter.InstallRuntimeFilterDeploymentResponse",
               "client_streaming": false,
               "server_streaming": false
             },

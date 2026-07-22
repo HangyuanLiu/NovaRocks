@@ -107,6 +107,15 @@ pub(super) enum DeliveryAdmission {
     ResourceLimit,
 }
 
+/// Logical delivery state retained for one stable `(route_edge, version)` key.
+/// A final artifact is a strict upgrade over an earlier non-final delivery: it
+/// carries the same artifact plus the `Completed` terminal atomically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeliveredVersionKind {
+    NonFinal,
+    FinalArtifact,
+}
+
 /// Admit `key` into a per-channel delivery-identity set under its self-owned ceiling.
 /// An already-present key is a `Duplicate` (idempotency survives at the ceiling); a
 /// genuinely-new key at or above the ceiling is refused as `ResourceLimit`; otherwise
@@ -165,7 +174,8 @@ struct DedupeState {
     /// (1) consumer transport-identity index, per channel.
     deliveries: BTreeMap<ChannelId, BTreeSet<DeliveryKey>>,
     /// (2) absorbed logical delivery idempotency, per channel.
-    delivered_versions: BTreeMap<ChannelId, BTreeSet<(RouteEdgeId, LogicalVersion)>>,
+    delivered_versions:
+        BTreeMap<ChannelId, BTreeMap<(RouteEdgeId, LogicalVersion), DeliveredVersionKind>>,
     /// (3) `(query, epoch)` tombstone set.
     retired: BTreeSet<(UniqueId, DeploymentEpoch)>,
 }
@@ -260,11 +270,33 @@ impl IngressDedupe {
         channel_id: ChannelId,
         route_edge_id: RouteEdgeId,
         version: LogicalVersion,
+        kind: DeliveredVersionKind,
     ) -> DeliveryAdmission {
         let ceiling = self.max_identities_per_channel;
         let mut state = self.lock();
-        let set = state.delivered_versions.entry(channel_id).or_default();
-        admit_into_set(set, (route_edge_id, version), ceiling)
+        let delivered = state.delivered_versions.entry(channel_id).or_default();
+        let occupancy = delivered.len();
+        match delivered.entry((route_edge_id, version)) {
+            Entry::Occupied(mut slot)
+                if *slot.get() == DeliveredVersionKind::NonFinal
+                    && kind == DeliveredVersionKind::FinalArtifact =>
+            {
+                // This is the one permitted same-version transition. It consumes no
+                // additional identity capacity and must proceed to delivery so ingress
+                // can merge `Completed` with the already-visible artifact.
+                slot.insert(DeliveredVersionKind::FinalArtifact);
+                DeliveryAdmission::Fresh
+            }
+            Entry::Occupied(_) => DeliveryAdmission::Duplicate,
+            Entry::Vacant(slot) => {
+                if occupancy >= ceiling {
+                    DeliveryAdmission::ResourceLimit
+                } else {
+                    slot.insert(kind);
+                    DeliveryAdmission::Fresh
+                }
+            }
+        }
     }
 
     /// Tombstone this service's `(query, epoch)` at cancel/completion so a late or
@@ -329,13 +361,16 @@ impl IngressDedupe {
         self.lock()
             .delivered_versions
             .get(&channel_id)
-            .map_or(0, BTreeSet::len)
+            .map_or(0, BTreeMap::len)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ContributionAdmission, DeliveryAdmission, IngressDedupe, TombstoneVerdict};
+    use super::{
+        ContributionAdmission, DeliveredVersionKind, DeliveryAdmission, IngressDedupe,
+        TombstoneVerdict,
+    };
     use crate::common::types::UniqueId;
     use crate::runtime_filter::model::contract::{BindingId, ChannelId};
     use crate::runtime_filter::port::identity::{
@@ -414,7 +449,7 @@ mod tests {
             DeliveryAdmission::Fresh,
         );
         assert_eq!(
-            dedupe.admit_delivered_version(channel, edge, version),
+            dedupe.admit_delivered_version(channel, edge, version, DeliveredVersionKind::NonFinal,),
             DeliveryAdmission::Fresh,
         );
 
@@ -425,12 +460,49 @@ mod tests {
         );
         // ... but the same logical version is a duplicate at the logical gate.
         assert_eq!(
-            dedupe.admit_delivered_version(channel, edge, version),
+            dedupe.admit_delivered_version(channel, edge, version, DeliveredVersionKind::NonFinal,),
             DeliveryAdmission::Duplicate,
         );
         // An exact transport retry is a duplicate at the transport gate.
         assert_eq!(
             dedupe.admit_delivery(channel, &delivery(1)),
+            DeliveryAdmission::Duplicate,
+        );
+    }
+
+    #[test]
+    fn logical_artifact_can_upgrade_to_final_without_new_identity() {
+        let dedupe = bounded_dedupe(1);
+        let channel = ChannelId::new(1);
+        let edge = RouteEdgeId::new(40);
+        let version = LogicalVersion::new(5);
+
+        assert_eq!(
+            dedupe.admit_delivered_version(channel, edge, version, DeliveredVersionKind::NonFinal,),
+            DeliveryAdmission::Fresh,
+        );
+        assert_eq!(
+            dedupe.admit_delivered_version(
+                channel,
+                edge,
+                version,
+                DeliveredVersionKind::FinalArtifact,
+            ),
+            DeliveryAdmission::Fresh,
+            "final delivery upgrades the existing key even at the ceiling",
+        );
+        assert_eq!(dedupe.delivered_version_len(channel), 1);
+        assert_eq!(
+            dedupe.admit_delivered_version(
+                channel,
+                edge,
+                version,
+                DeliveredVersionKind::FinalArtifact,
+            ),
+            DeliveryAdmission::Duplicate,
+        );
+        assert_eq!(
+            dedupe.admit_delivered_version(channel, edge, version, DeliveredVersionKind::NonFinal,),
             DeliveryAdmission::Duplicate,
         );
     }
@@ -579,17 +651,32 @@ mod tests {
         let channel = ChannelId::new(1);
         let edge = RouteEdgeId::new(40);
         assert_eq!(
-            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(5)),
+            dedupe.admit_delivered_version(
+                channel,
+                edge,
+                LogicalVersion::new(5),
+                DeliveredVersionKind::NonFinal,
+            ),
             DeliveryAdmission::Fresh,
         );
         // A genuinely-new version beyond the ceiling is refused ...
         assert_eq!(
-            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(6)),
+            dedupe.admit_delivered_version(
+                channel,
+                edge,
+                LogicalVersion::new(6),
+                DeliveredVersionKind::NonFinal,
+            ),
             DeliveryAdmission::ResourceLimit,
         );
         // ... but the recorded version at the ceiling is still a Duplicate.
         assert_eq!(
-            dedupe.admit_delivered_version(channel, edge, LogicalVersion::new(5)),
+            dedupe.admit_delivered_version(
+                channel,
+                edge,
+                LogicalVersion::new(5),
+                DeliveredVersionKind::NonFinal,
+            ),
             DeliveryAdmission::Duplicate,
         );
         assert_eq!(dedupe.delivered_version_len(channel), 1);

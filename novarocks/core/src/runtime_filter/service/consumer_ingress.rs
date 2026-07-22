@@ -18,10 +18,11 @@
 //! Inbound consumer-delivery ingress: the mirror dual of `inbound.rs`'s
 //! `dispatch_inbound_producer`.
 //!
-//! A remote `Artifact` / `Unavailable` envelope arriving at a consumer/relay
-//! participant is looked up to its live query, authorized and decoded against the
-//! consumer's install-owned `ConsumerArtifactProfile`, and delivered into the
-//! target subscription. The pipeline follows a fixed validation-before-delivery
+//! A remote artifact, final-artifact, unavailable, or typed terminal envelope arriving
+//! at a consumer/relay participant is looked up to its live query, authorized and
+//! decoded against the consumer's install-owned `ConsumerArtifactProfile`, and
+//! delivered into the target subscription. The pipeline follows a fixed
+//! validation-before-delivery
 //! order (route identity -> admission -> route authorization -> profile digest ->
 //! strict decode -> release lock -> deliver) so no partial state is ever exposed:
 //! any earlier failure rejects before the delivery and leaves the subscription
@@ -37,11 +38,11 @@ use crate::runtime_filter::codec::artifact::{
 };
 use crate::runtime_filter::port::identity::LogicalVersion;
 use crate::runtime_filter::port::routing::RuntimeFilterRouteContractError;
-use crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome;
+use crate::runtime_filter::port::subscription::{ArtifactDeliveryOutcome, LiveTerminal};
 use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
 
 use super::RuntimeFilterService;
-use super::dedupe::{DeliveryAdmission, TombstoneVerdict};
+use super::dedupe::{DeliveredVersionKind, DeliveryAdmission, TombstoneVerdict};
 use super::registry::DispatchAdmission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,7 +228,7 @@ impl RuntimeFilterService {
         let max_encoded = max_encoded_len_for_artifact_budget(plan.max_artifact_bytes())
             .map_err(map_codec_error)?;
         let expectation = ArtifactDecodeExpectation::new(profile);
-        let (outcome, version) = match envelope.kind() {
+        let (outcome, terminal, version) = match envelope.kind() {
             RuntimeFilterEnvelopeKind::Artifact => {
                 let bundle = decode_artifact_bundle(
                     envelope.payload(),
@@ -239,7 +240,28 @@ impl RuntimeFilterService {
                 )
                 .map_err(map_codec_error)?;
                 let version = bundle.version();
-                (ArtifactDeliveryOutcome::Published(bundle), version)
+                (
+                    Some(ArtifactDeliveryOutcome::Published(bundle)),
+                    None,
+                    Some((version, DeliveredVersionKind::NonFinal)),
+                )
+            }
+            RuntimeFilterEnvelopeKind::FinalArtifact => {
+                let bundle = decode_artifact_bundle(
+                    envelope.payload(),
+                    envelope.schema_digest(),
+                    expectation,
+                    max_encoded,
+                    plan.retained_budget(),
+                    self.memory_account.clone(),
+                )
+                .map_err(map_codec_error)?;
+                let version = bundle.version();
+                (
+                    Some(ArtifactDeliveryOutcome::Published(bundle)),
+                    Some(LiveTerminal::Completed),
+                    Some((version, DeliveredVersionKind::FinalArtifact)),
+                )
             }
             RuntimeFilterEnvelopeKind::Unavailable => {
                 let reason = decode_unavailable(
@@ -253,9 +275,23 @@ impl RuntimeFilterService {
                 // reserved zero logical version (never a real bundle version >= FIRST) for
                 // delivery-identity idempotency.
                 (
-                    ArtifactDeliveryOutcome::Unavailable(reason),
-                    LogicalVersion::new(0),
+                    Some(ArtifactDeliveryOutcome::Unavailable(reason)),
+                    None,
+                    Some((LogicalVersion::new(0), DeliveredVersionKind::NonFinal)),
                 )
+            }
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+                (None, Some(LiveTerminal::CompletedWithoutArtifact), None)
+            }
+            RuntimeFilterEnvelopeKind::DegradedLogical => {
+                let reason = decode_unavailable(
+                    envelope.payload(),
+                    envelope.schema_digest(),
+                    expectation,
+                    max_encoded,
+                )
+                .map_err(map_codec_error)?;
+                (None, Some(LiveTerminal::DegradedLogical(reason)), None)
             }
             _ => {
                 // Unreachable: `authorize_delivery` already rejected every non-delivery
@@ -287,17 +323,23 @@ impl RuntimeFilterService {
             }
             DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
         }
-        match self
-            .dedupe
-            .admit_delivered_version(envelope.channel_id(), route_edge_id, version)
-        {
-            DeliveryAdmission::Fresh => {}
-            DeliveryAdmission::Duplicate => {
-                return Ok(InboundConsumerDispatchOutcome::Duplicate);
+        if let Some((version, kind)) = version {
+            match self.dedupe.admit_delivered_version(
+                envelope.channel_id(),
+                route_edge_id,
+                version,
+                kind,
+            ) {
+                DeliveryAdmission::Fresh => {}
+                DeliveryAdmission::Duplicate => {
+                    return Ok(InboundConsumerDispatchOutcome::Duplicate);
+                }
+                DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
             }
-            DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
         }
-        installed.router().route(&[route_edge_id], &outcome);
+        installed
+            .router()
+            .route_live(&[route_edge_id], outcome.as_ref(), terminal);
         Ok(InboundConsumerDispatchOutcome::Accepted)
     }
 }
@@ -348,8 +390,8 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, EncodedArtifactFrame, encode_artifact_bundle,
-        encode_unavailable, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+        ArtifactDecodeExpectation, encode_artifact_bundle, encode_unavailable,
+        max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
     };
     use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::materializer::bloom::BloomHashContract;
@@ -373,9 +415,9 @@ mod tests {
         RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::install::{
-        ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
-        RuntimeFilterParticipantInstall,
+        ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+        OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
     };
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
@@ -388,7 +430,8 @@ mod tests {
         RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
     use crate::runtime_filter::port::subscription::{
-        ArtifactAcquireOutcome, ArtifactDeliveryOutcome, SubscriptionKind, UnavailableReason,
+        ArtifactAcquireOutcome, ArtifactDeliveryOutcome, LivePollOutcome, LiveTerminal,
+        SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
@@ -403,7 +446,9 @@ mod tests {
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };
 
-    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+    };
 
     use super::InboundConsumerDispatchErrorKind::{
         CodecContract, DeploymentUnavailable, ResourceLimit, RouteContract, ServiceUnavailable,
@@ -513,10 +558,10 @@ mod tests {
             ]),
             CompletionRequirement::ProducerClosed,
             RuntimeFilterPolicyRequirement {
-                max_contribution_bytes: 4096,
+                max_contribution_bytes: max_artifact_bytes,
                 max_artifact_bytes,
                 deadline_ms: 1000,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(1 << 20),
             MaterializationPolicy::for_test(),
@@ -533,7 +578,7 @@ mod tests {
                         ArtifactCapability::EmptyDomain,
                     ]),
                     profile,
-                    RouteEdgeId::new(CONSUMER_ROUTE),
+                    BTreeSet::from([RouteEdgeId::new(CONSUMER_ROUTE)]),
                     BTreeSet::from([consumer_finst()]),
                 ),
             )]),
@@ -580,7 +625,7 @@ mod tests {
                 max_contribution_bytes: 4096,
                 max_artifact_bytes: 4096,
                 deadline_ms: 1000,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(1 << 20),
             MaterializationPolicy::for_test(),
@@ -596,22 +641,156 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     range_profile(),
-                    RouteEdgeId::new(RANGE_ROUTE),
+                    BTreeSet::from([RouteEdgeId::new(RANGE_ROUTE)]),
                     BTreeSet::from([range_consumer_finst()]),
                 ),
             )]),
         )
     }
 
-    // Install participant 3 as a colocated aggregator + producer + consumer. Each
-    // producer contributes a loopback ToAggregator edge; each consumer a loopback
-    // FromAggregator delivery edge whose route edge id is the consumer's own
-    // `loopback_route_edge_id`. The consumer-ingress dispatch is topology-agnostic:
-    // it authorizes the inbound delivery edge and delivers into the subscription
-    // registered under that same route edge id. (Task 5 proves the production
-    // cross-participant compiler topology; this hand-built fixture is the M2B3
-    // `inbound_loopback_install_for_test` shape extended with delivery edges.)
+    fn without_local_producers(
+        channel: RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            BTreeMap::new(),
+            channel.consumers().clone(),
+        )
+    }
+
+    fn install_consumer_only(
+        service: &RuntimeFilterService,
+        channel: RuntimeFilterChannelDeployment,
+    ) {
+        let epoch = DeploymentEpoch::new(EPOCH);
+        let participant = RuntimeFilterParticipantId::new(3);
+        let remote_aggregator = RuntimeFilterParticipantId::new(4);
+        let channel_id = channel.channel_id();
+        let mut local_roles = BTreeSet::new();
+        let mut inbound_edges = Vec::new();
+        for (binding_id, consumer) in channel.consumers() {
+            local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
+            for route_edge_id in consumer.route_edge_ids() {
+                inbound_edges.push(
+                    RuntimeFilterRoutingEdgeView::new(
+                        channel_id,
+                        *route_edge_id,
+                        RuntimeFilterRouteEndpointView::new(
+                            remote_aggregator,
+                            RuntimeFilterRouteRole::Aggregator,
+                        ),
+                        RuntimeFilterRouteEndpointView::new(
+                            participant,
+                            RuntimeFilterRouteRole::Consumer(*binding_id),
+                        ),
+                        RuntimeFilterRoutePeer::Remote {
+                            participant_id: remote_aggregator,
+                            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(
+                                "remote-aggregator",
+                                9060,
+                            )
+                            .unwrap(),
+                        },
+                        BTreeSet::from([
+                            RuntimeFilterEnvelopeKind::Artifact,
+                            RuntimeFilterEnvelopeKind::Unavailable,
+                            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                            RuntimeFilterEnvelopeKind::DegradedLogical,
+                            RuntimeFilterEnvelopeKind::FinalArtifact,
+                        ]),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let routing_channel = RuntimeFilterChannelRoutingView::new(
+            channel_id,
+            local_roles,
+            BTreeMap::new(),
+            inbound_edges,
+            Vec::new(),
+        )
+        .unwrap();
+        let install = RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(
+                epoch,
+                participant,
+                BTreeMap::from([(channel_id, channel)]),
+            ),
+            RuntimeFilterRoutingShard::new(
+                epoch,
+                participant,
+                BTreeMap::from([(channel_id, routing_channel)]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(service.install(install).unwrap(), InstallOutcome::Installed);
+    }
+
+    // Install participant 3 as a producer/aggregator plus a consumer receiving from
+    // a remote aggregator. Consumer ingress owns only inbound delivery-profile
+    // authority; it does not imply local outbound materialization authority.
     fn install(service: &RuntimeFilterService, channel: RuntimeFilterChannelDeployment) {
+        let consumer_route_kinds = channel
+            .consumers()
+            .values()
+            .flat_map(|consumer| consumer.route_edge_ids().iter().copied())
+            .map(|route_edge_id| {
+                (
+                    route_edge_id,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
+                    ]),
+                )
+            })
+            .collect();
+        install_with_consumer_route_kinds(service, channel, consumer_route_kinds, false);
+    }
+
+    fn install_with_loopback_delivery(
+        service: &RuntimeFilterService,
+        channel: RuntimeFilterChannelDeployment,
+    ) {
+        let consumer_route_kinds = channel
+            .consumers()
+            .values()
+            .flat_map(|consumer| consumer.route_edge_ids().iter().copied())
+            .map(|route_edge_id| {
+                (
+                    route_edge_id,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
+                    ]),
+                )
+            })
+            .collect();
+        install_with_consumer_route_kinds(service, channel, consumer_route_kinds, true);
+    }
+
+    fn install_with_consumer_route_kinds(
+        service: &RuntimeFilterService,
+        channel: RuntimeFilterChannelDeployment,
+        consumer_route_kinds: BTreeMap<RouteEdgeId, BTreeSet<RuntimeFilterEnvelopeKind>>,
+        loopback_delivery: bool,
+    ) {
         let epoch = DeploymentEpoch::new(EPOCH);
         let participant = RuntimeFilterParticipantId::new(3);
         let channel_id = channel.channel_id();
@@ -639,6 +818,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
+                    RuntimeFilterEnvelopeKind::Unavailable,
                 ]),
             )
             .unwrap();
@@ -647,26 +827,43 @@ mod tests {
         }
         for (binding_id, consumer) in channel.consumers() {
             local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
-            let edge = RuntimeFilterRoutingEdgeView::new(
-                channel_id,
-                consumer.loopback_route_edge_id(),
-                RuntimeFilterRouteEndpointView::new(
-                    participant,
-                    RuntimeFilterRouteRole::Aggregator,
-                ),
-                RuntimeFilterRouteEndpointView::new(
-                    participant,
-                    RuntimeFilterRouteRole::Consumer(*binding_id),
-                ),
-                RuntimeFilterRoutePeer::Loopback,
-                BTreeSet::from([
-                    RuntimeFilterEnvelopeKind::Artifact,
-                    RuntimeFilterEnvelopeKind::Unavailable,
-                ]),
-            )
-            .unwrap();
-            inbound_edges.push(edge.clone());
-            outbound_edges.push(edge);
+            for route_edge_id in consumer.route_edge_ids() {
+                let source_participant = if loopback_delivery {
+                    participant
+                } else {
+                    RuntimeFilterParticipantId::new(4)
+                };
+                let edge = RuntimeFilterRoutingEdgeView::new(
+                    channel_id,
+                    *route_edge_id,
+                    RuntimeFilterRouteEndpointView::new(
+                        source_participant,
+                        RuntimeFilterRouteRole::Aggregator,
+                    ),
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Consumer(*binding_id),
+                    ),
+                    if loopback_delivery {
+                        RuntimeFilterRoutePeer::Loopback
+                    } else {
+                        RuntimeFilterRoutePeer::Remote {
+                            participant_id: source_participant,
+                            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(
+                                "remote-aggregator",
+                                9060,
+                            )
+                            .unwrap(),
+                        }
+                    },
+                    consumer_route_kinds.get(route_edge_id).cloned().unwrap(),
+                )
+                .unwrap();
+                inbound_edges.push(edge.clone());
+                if loopback_delivery {
+                    outbound_edges.push(edge);
+                }
+            }
         }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
             channel_id,
@@ -682,6 +879,38 @@ mod tests {
             BTreeMap::from([(channel_id, routing_channel)]),
         )
         .unwrap();
+        let channel = if loopback_delivery {
+            let grouped =
+                channel
+                    .consumers()
+                    .values()
+                    .fold(BTreeMap::new(), |mut groups, consumer| {
+                        groups
+                            .entry(consumer.artifact_profile().id())
+                            .or_insert_with(|| {
+                                (consumer.artifact_profile().clone(), BTreeSet::new())
+                            })
+                            .1
+                            .extend(consumer.route_edge_ids().iter().copied());
+                        groups
+                    });
+            let groups = grouped
+                .into_iter()
+                .map(|(profile_id, (profile, routes))| {
+                    (
+                        profile_id,
+                        OutboundMaterializationGroup::new(
+                            OutboundMaterializationOwner::Aggregator,
+                            profile,
+                            routes,
+                        ),
+                    )
+                })
+                .collect();
+            channel.with_outbound_materialization_groups(groups)
+        } else {
+            channel
+        };
         let core_view = RuntimeFilterInstallView::new(
             epoch,
             participant,
@@ -982,6 +1211,400 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_consumer_only_completed_without_artifact_is_typed_and_idempotent() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        assert!(
+            service
+                .open_producer(
+                    BindingId::new(PRODUCER_BINDING),
+                    producer_finst(),
+                    1,
+                    crate::runtime_filter::port::producer::ProducerPortKind::OrderedBound,
+                )
+                .is_err(),
+            "consumer-only installation must not rely on a local producer"
+        );
+        let profile = range_profile();
+        let envelope = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                1,
+                profile.id().bytes(),
+                Vec::new(),
+            )
+        };
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::CompletedWithoutArtifact),
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_consumer_only_degraded_logical_retains_prior_artifact() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (artifact_digest, artifact_payload) = encode_bundle(&bundle, &profile);
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    CHANNEL,
+                    EPOCH,
+                    RANGE_ROUTE,
+                    1,
+                    artifact_digest,
+                    artifact_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        let (terminal_digest, terminal_payload) = encode_unavailable(
+            UnavailableReason::ProducerFailed,
+            ArtifactDecodeExpectation::new(&profile),
+            ROOMY,
+        )
+        .unwrap()
+        .into_parts();
+        let terminal = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                2,
+                terminal_digest,
+                terminal_payload.clone(),
+            )
+        };
+        assert_eq!(
+            service.dispatch_inbound_consumer(terminal()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(terminal()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(
+            live.snapshot().unwrap().canonical_digest(),
+            bundle.canonical_digest(),
+            "logical degradation must retain the last published artifact"
+        );
+        assert!(matches!(
+            live.poll_after(Some(bundle.version())),
+            LivePollOutcome::Idle {
+                latest_version: Some(version),
+                terminal: Some(LiveTerminal::DegradedLogical(
+                    UnavailableReason::ProducerFailed
+                )),
+            } if version == bundle.version()
+        ));
+    }
+
+    #[test]
+    fn remote_consumer_only_final_artifact_sets_latest_and_completed_atomically() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+        let envelope = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                1,
+                digest,
+                payload.clone(),
+            )
+        };
+
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Updated {
+                bundle: delivered,
+                terminal: Some(LiveTerminal::Completed),
+            } if delivered.canonical_digest() == bundle.canonical_digest()
+        ));
+    }
+
+    #[test]
+    fn same_version_artifact_then_final_artifact_upgrades_completed_once() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    CHANNEL,
+                    EPOCH,
+                    RANGE_ROUTE,
+                    1,
+                    digest,
+                    payload.clone(),
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        let final_artifact = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                2,
+                digest,
+                payload.clone(),
+            )
+        };
+        assert_eq!(
+            service.dispatch_inbound_consumer(final_artifact()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+            "the final envelope must merge completion into an existing version"
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(final_artifact()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert!(matches!(
+            live.poll_after(Some(bundle.version())),
+            LivePollOutcome::Idle {
+                latest_version: Some(version),
+                terminal: Some(LiveTerminal::Completed),
+            } if version == bundle.version()
+        ));
+    }
+
+    #[test]
+    fn final_artifact_rejects_profile_payload_and_route_contract_drift() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                1,
+                [0x5a; 32],
+                payload.clone(),
+            ))),
+            CodecContract,
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                2,
+                digest,
+                b"not-an-artifact-frame".to_vec(),
+            ))),
+            CodecContract,
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                999,
+                3,
+                digest,
+                payload,
+            ))),
+            RouteContract,
+        );
+    }
+
+    #[test]
+    fn remote_final_artifact_keeps_blocking_snapshot_semantics() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(membership_channel(4096)));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
+                    CHANNEL,
+                    EPOCH,
+                    CONSUMER_ROUTE,
+                    1,
+                    digest,
+                    payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        let ArtifactAcquireOutcome::Published(delivered) = service
+            .subscribe_blocking(BindingId::new(CONSUMER_BINDING), consumer_finst())
+            .unwrap()
+            .acquire(Duration::ZERO)
+        else {
+            panic!("final artifact must publish the blocking snapshot")
+        };
+        assert_eq!(delivered.canonical_digest(), bundle.canonical_digest());
+    }
+
+    #[test]
+    fn remote_terminal_rejects_wrong_profile_and_malformed_reason() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let wrong_profile = delivery_env(
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            CHANNEL,
+            EPOCH,
+            RANGE_ROUTE,
+            1,
+            [0x5a; 32],
+            Vec::new(),
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(wrong_profile)),
+            CodecContract,
+        );
+        let malformed = delivery_env(
+            RuntimeFilterEnvelopeKind::DegradedLogical,
+            CHANNEL,
+            EPOCH,
+            RANGE_ROUTE,
+            2,
+            range_profile().id().bytes(),
+            b"not-a-canonical-reason-frame".to_vec(),
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(malformed)),
+            CodecContract,
+        );
+
+        let profile = range_profile();
+        let (digest, mut unknown_reason_payload) = encode_unavailable(
+            UnavailableReason::ProducerFailed,
+            ArtifactDecodeExpectation::new(&profile),
+            ROOMY,
+        )
+        .unwrap()
+        .into_parts();
+        *unknown_reason_payload
+            .last_mut()
+            .expect("unavailable reason frame has a body") = u8::MAX;
+        let unknown_reason = delivery_env(
+            RuntimeFilterEnvelopeKind::DegradedLogical,
+            CHANNEL,
+            EPOCH,
+            RANGE_ROUTE,
+            3,
+            digest,
+            unknown_reason_payload,
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(unknown_reason)),
+            CodecContract,
+        );
+    }
+
+    #[test]
+    fn remote_live_terminal_does_not_complete_blocking_snapshot() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(membership_channel(4096)));
+        let profile = membership_profile();
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                    CHANNEL,
+                    EPOCH,
+                    CONSUMER_ROUTE,
+                    1,
+                    profile.id().bytes(),
+                    Vec::new(),
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        assert!(matches!(
+            service
+                .subscribe_blocking(BindingId::new(CONSUMER_BINDING), consumer_finst())
+                .unwrap()
+                .acquire(Duration::ZERO),
+            ArtifactAcquireOutcome::TimedOut
+        ));
+    }
+
     // ==========================================================================================
     // Unavailable delivery: Accepted, observed as Unavailable(reason), never revokes an artifact.
     // ==========================================================================================
@@ -1025,6 +1648,110 @@ mod tests {
             ),
             "the subscription must observe the Unavailable reason, got {acquired:?}"
         );
+    }
+
+    #[test]
+    fn multiple_canonical_consumer_routes_dispatch_through_same_subscription() {
+        let service = service();
+        let channel = membership_channel(4096);
+        let consumer = channel
+            .consumers()
+            .get(&BindingId::new(CONSUMER_BINDING))
+            .unwrap();
+        let mut consumers = channel.consumers().clone();
+        consumers.insert(
+            BindingId::new(CONSUMER_BINDING),
+            ConsumerDeployment::with_profile(
+                consumer.activation(),
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+                BTreeSet::from([RouteEdgeId::new(CONSUMER_ROUTE), RouteEdgeId::new(41)]),
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        let channel = RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        );
+        install_with_consumer_route_kinds(
+            &service,
+            channel,
+            BTreeMap::from([
+                (
+                    RouteEdgeId::new(CONSUMER_ROUTE),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
+                    ]),
+                ),
+                (
+                    RouteEdgeId::new(41),
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
+                    ]),
+                ),
+            ]),
+            false,
+        );
+
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (artifact_digest, artifact_payload) = encode_bundle(&bundle, &profile);
+        let (unavailable_digest, unavailable_payload) = encode_unavailable(
+            UnavailableReason::ProducerFailed,
+            ArtifactDecodeExpectation::new(&profile),
+            ROOMY,
+        )
+        .unwrap()
+        .into_parts();
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(artifact_env(
+                    CONSUMER_ROUTE,
+                    1,
+                    artifact_digest,
+                    artifact_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Unavailable,
+                    CHANNEL,
+                    EPOCH,
+                    41,
+                    2,
+                    unavailable_digest,
+                    unavailable_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+
+        let observation = observe(&service);
+        assert_eq!(observation.snapshot_digest, Some(bundle.canonical_digest()));
+        assert_eq!(observation.delivery_calls, 2);
     }
 
     #[test]
@@ -1403,10 +2130,20 @@ mod tests {
     // A loopback-only delivery scope must never reach the remote sink; if the Router ever
     // classified a loopback edge as remote this panics rather than silently wire-encoding.
     struct NoopRemoteSink;
-    impl ArtifactRemoteSink for NoopRemoteSink {
-        fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: &EncodedArtifactFrame) {
+    impl RuntimeFilterEnvelopeSink for NoopRemoteSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
             panic!("a loopback-only delivery scope must not reach the remote sink");
         }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     fn bitset_profile() -> ConsumerArtifactProfile {
@@ -1509,7 +2246,7 @@ mod tests {
         // (a) loopback: the outbound bridge routes the in-memory bundle straight into the
         //     local subscription with no wire encode.
         let loopback_service = service();
-        install(&loopback_service, channel());
+        install_with_loopback_delivery(&loopback_service, channel());
         // The panicking sink asserts the loopback-only scope never reaches the remote
         // transport, even though nothing is expected to be transmitted.
         loopback_service.set_remote_sink_for_test(Arc::new(NoopRemoteSink));

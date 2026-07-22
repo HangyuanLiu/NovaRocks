@@ -17,6 +17,7 @@
 
 pub(crate) mod compiler;
 pub(crate) mod extension;
+pub(crate) mod install_validation;
 pub(crate) mod role_graph;
 pub(crate) mod routing_shard;
 pub(crate) mod shard;
@@ -24,6 +25,7 @@ pub(crate) mod wait_for;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::role_graph::RoleGraph;
@@ -50,6 +52,27 @@ pub(crate) struct RuntimeFilterDeploymentPolicy {
     /// stamped into every channel deployment. A resource-policy input supplied by
     /// the caller (RFD-6 / query options), never a magic default.
     pub materialization: MaterializationPolicy,
+}
+
+/// Query-scoped transport limits derived from the same sealed graph as the
+/// compiler policy. The live sender consumes this explicit contract instead of
+/// falling back to service-internal defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterQueryTransportPolicy {
+    pub(crate) retry_interval: Duration,
+    pub(crate) max_attempts: u32,
+    pub(crate) deadline: Duration,
+    pub(crate) max_pending_entries: usize,
+    pub(crate) max_pending_bytes: usize,
+}
+
+/// Complete query-level deployment policy assembled by the coordinator before
+/// compilation. Install and transport use one graph-derived deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterQueryDeploymentPolicy {
+    pub(crate) compiler: RuntimeFilterDeploymentPolicy,
+    pub(crate) transport: RuntimeFilterQueryTransportPolicy,
+    pub(crate) install_rpc_deadline: Duration,
 }
 
 pub(crate) type BindingInstanceIndex =
@@ -181,8 +204,10 @@ impl std::error::Error for DeploymentError {}
 pub(crate) fn participant_id_for_backend(
     backend_idx: usize,
 ) -> Result<RuntimeFilterParticipantId, DeploymentError> {
-    let participant = u32::try_from(backend_idx)
-        .map_err(|_| DeploymentError::BackendIdOutOfRange { backend_idx })?;
+    let participant = backend_idx
+        .checked_add(1)
+        .and_then(|participant| u32::try_from(participant).ok())
+        .ok_or(DeploymentError::BackendIdOutOfRange { backend_idx })?;
     Ok(RuntimeFilterParticipantId::new(participant))
 }
 
@@ -222,5 +247,18 @@ mod tests {
         assert!(rendered.contains("blocking"));
         assert!(rendered.contains("binding 2"));
         assert!(rendered.contains("channel 1"));
+    }
+
+    #[test]
+    fn backend_participant_identity_is_nonzero_and_overflow_checked() {
+        assert_eq!(
+            participant_id_for_backend(0).unwrap(),
+            RuntimeFilterParticipantId::new(1)
+        );
+        assert_eq!(
+            participant_id_for_backend(8).unwrap(),
+            RuntimeFilterParticipantId::new(9)
+        );
+        assert!(participant_id_for_backend(u32::MAX as usize).is_err());
     }
 }

@@ -200,7 +200,11 @@ impl RoleRouter {
         }
         if !matches!(
             kind,
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable
+            RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         ) || !edge.allowed_kinds().contains(&kind)
         {
             return Err(RuntimeFilterRouteContractError::ForbiddenInboundKind {
@@ -294,9 +298,9 @@ mod tests {
 
     fn backends() -> LiveBackendSnapshot {
         LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
+            (6, "10.0.0.7:9060".parse().unwrap()),
+            (10, "10.0.0.11:9060".parse().unwrap()),
         ])
     }
 

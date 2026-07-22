@@ -19,12 +19,16 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::mpsc::SyncSender;
+
 use tonic::Request;
 use tonic::transport::Channel;
 
 use crate::common::network::format_host_for_url;
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_transmission;
@@ -48,8 +52,16 @@ impl NovaRocksGrpcRemoteClient {
     /// The underlying HTTP/2 channel is established lazily via the shared
     /// channel cache, so construction itself is cheap.
     pub fn new(addr: SocketAddr) -> Result<Self, String> {
-        let host = addr.ip().to_string();
-        let port = addr.port();
+        Self::new_host_port(addr.ip().to_string(), addr.port())
+    }
+
+    pub(crate) fn new_runtime_endpoint(endpoint: &RuntimeEndpoint) -> Result<Self, String> {
+        let port = u16::try_from(endpoint.port())
+            .map_err(|_| format!("invalid runtime filter endpoint port {}", endpoint.port()))?;
+        Self::new_host_port(endpoint.host().to_string(), port)
+    }
+
+    fn new_host_port(host: String, port: u16) -> Result<Self, String> {
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
         channel_endpoint(&host, port)
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
@@ -80,6 +92,27 @@ impl NovaRocksGrpcRemoteClient {
     {
         let ch = get_or_create_channel(&self.host, self.port).await?;
         Ok(Self::client_from_channel(ch))
+    }
+
+    async fn make_runtime_filter_async_client(
+        &self,
+        operation: &str,
+        deadline_at: tokio::time::Instant,
+    ) -> Result<proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<Channel>, String>
+    {
+        let acquire = async {
+            #[cfg(test)]
+            await_runtime_filter_channel_acquisition_test_hook(&self.host, self.port).await;
+            self.make_async_client().await
+        };
+        tokio::time::timeout_at(deadline_at, acquire)
+            .await
+            .map_err(|_| {
+                format!("runtime filter {operation} deadline exceeded during channel acquisition")
+            })?
+            .map_err(|error| {
+                format!("runtime filter {operation} channel acquisition failed: {error}")
+            })
     }
 
     fn client_from_channel(
@@ -181,6 +214,84 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(|e| format!("heartbeat rpc failed: {e}"))
     }
 
+    pub(crate) async fn install_runtime_filter_deployment_async(
+        &self,
+        request: proto::filter::InstallRuntimeFilterDeploymentRequest,
+        deadline: Duration,
+    ) -> Result<proto::filter::InstallRuntimeFilterDeploymentResponse, String> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        let mut client = self
+            .make_runtime_filter_async_client("install", deadline_at)
+            .await?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "runtime filter install deadline exceeded before unary RPC submission".to_string(),
+            );
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(
+            deadline_at,
+            client.install_runtime_filter_deployment(request),
+        )
+        .await
+        .map_err(|_| "runtime filter install deadline exceeded during unary RPC".to_string())?
+        .map(|response| response.into_inner())
+        .map_err(|error| format!("install_runtime_filter_deployment rpc failed: {error}"))
+    }
+
+    pub(crate) async fn abort_runtime_filter_deployment_async(
+        &self,
+        request: proto::filter::AbortRuntimeFilterDeploymentRequest,
+        deadline: Duration,
+    ) -> Result<proto::filter::AbortRuntimeFilterDeploymentResponse, String> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        let mut client = self
+            .make_runtime_filter_async_client("abort", deadline_at)
+            .await?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "runtime filter abort deadline exceeded before unary RPC submission".to_string(),
+            );
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.abort_runtime_filter_deployment(request))
+            .await
+            .map_err(|_| "runtime filter abort deadline exceeded during unary RPC".to_string())?
+            .map(|response| response.into_inner())
+            .map_err(|error| format!("abort_runtime_filter_deployment rpc failed: {error}"))
+    }
+
+    pub(crate) async fn transmit_runtime_filter_envelope_async(
+        &self,
+        request: proto::filter::RuntimeFilterEnvelope,
+        deadline: Duration,
+    ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, String> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        let mut client = self
+            .make_runtime_filter_async_client("envelope", deadline_at)
+            .await?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "runtime filter envelope deadline exceeded before unary RPC submission".to_string(),
+            );
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(
+            deadline_at,
+            client.transmit_runtime_filter_envelope(request),
+        )
+        .await
+        .map_err(|_| "runtime filter envelope deadline exceeded during unary RPC".to_string())?
+        .map(|response| response.into_inner())
+        .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
+    }
+
     pub fn blocking_heartbeat(
         &self,
         req: proto::novarocks::HeartbeatRequest,
@@ -206,6 +317,61 @@ struct ChannelCache {
 }
 
 static CHANNELS: OnceLock<ChannelCache> = OnceLock::new();
+
+#[cfg(test)]
+struct RuntimeFilterChannelAcquisitionTestHook {
+    endpoint: String,
+    started: SyncSender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn runtime_filter_channel_acquisition_test_hook()
+-> &'static Mutex<Option<RuntimeFilterChannelAcquisitionTestHook>> {
+    static HOOK: OnceLock<Mutex<Option<RuntimeFilterChannelAcquisitionTestHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_runtime_filter_channel_acquisition_test_hook(
+    endpoint: String,
+    started: SyncSender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut hook = runtime_filter_channel_acquisition_test_hook()
+        .lock()
+        .expect("runtime filter channel acquisition test hook lock");
+    assert!(
+        hook.is_none(),
+        "runtime filter channel acquisition test hook already set"
+    );
+    *hook = Some(RuntimeFilterChannelAcquisitionTestHook {
+        endpoint,
+        started,
+        release,
+    });
+}
+
+#[cfg(test)]
+async fn await_runtime_filter_channel_acquisition_test_hook(host: &str, port: u16) {
+    let endpoint = format!("{}:{port}", format_host_for_url(host));
+    let hook = {
+        let mut hook = runtime_filter_channel_acquisition_test_hook()
+            .lock()
+            .expect("runtime filter channel acquisition test hook lock");
+        if hook.as_ref().is_some_and(|hook| hook.endpoint == endpoint) {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.started
+            .send(())
+            .expect("channel acquisition test observer");
+        let _ = hook.release.await;
+    }
+}
 
 fn channels() -> &'static ChannelCache {
     CHANNELS.get_or_init(|| ChannelCache {
@@ -261,6 +427,9 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
 mod pr3_tests {
     use super::*;
 
+    use std::sync::mpsc::sync_channel;
+    use std::time::Instant;
+
     #[test]
     fn remote_client_connect_accepts_socket_addr() {
         let addr: SocketAddr = "127.0.0.1:19030".parse().expect("valid addr");
@@ -286,6 +455,68 @@ mod pr3_tests {
             .expect("connect wrapper should accept IPv6 SocketAddr");
         assert_eq!(client.host, "::1");
         assert_eq!(client.port, 19030);
+    }
+
+    #[test]
+    fn runtime_filter_install_deadline_bounds_channel_acquisition_and_rpc() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve endpoint");
+        let addr = listener.local_addr().expect("reserved endpoint address");
+        drop(listener);
+        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("test client");
+        let deadline = Duration::from_millis(30);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        set_runtime_filter_channel_acquisition_test_hook(
+            format!("{}:{}", addr.ip(), addr.port()),
+            started_tx,
+            release_rx,
+        );
+        let (result_tx, result_rx) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let started_at = Instant::now();
+            let result = data_block_on(async move {
+                client
+                    .install_runtime_filter_deployment_async(
+                        proto::filter::InstallRuntimeFilterDeploymentRequest::default(),
+                        deadline,
+                    )
+                    .await
+            })
+            .and_then(|result| result);
+            result_tx.send((result, started_at.elapsed())).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fake channel acquisition starts");
+        let outcome = match result_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = release_tx.send(());
+                let (_, elapsed) = result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("released legacy acquisition completes");
+                worker.join().expect("deadline worker");
+                panic!(
+                    "runtime filter deadline did not bound channel acquisition: {error}; elapsed={elapsed:?}"
+                );
+            }
+        };
+        drop(release_tx);
+        worker.join().expect("deadline worker");
+
+        let error = outcome
+            .0
+            .expect_err("fake acquisition must exceed the deadline");
+        assert!(
+            error.contains("runtime filter install deadline exceeded during channel acquisition"),
+            "{error}"
+        );
+        assert!(
+            outcome.1 < Duration::from_millis(200),
+            "elapsed={:?}",
+            outcome.1
+        );
     }
 }
 

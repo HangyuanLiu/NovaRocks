@@ -198,7 +198,7 @@ fn deployment_for(
             max_contribution_bytes: 4096,
             max_artifact_bytes: 4096,
             deadline_ms: 100,
-            max_retries: 0,
+            max_retries: 1,
         },
         RuntimeFilterCoreBudget::new(16 * 1024),
         MaterializationPolicy::for_test(),
@@ -223,7 +223,7 @@ fn deployment_for(
                     None,
                 )
                 .unwrap(),
-                RouteEdgeId::new(40),
+                BTreeSet::from([RouteEdgeId::new(40)]),
                 BTreeSet::from([uid(30)]),
             ),
         )]),

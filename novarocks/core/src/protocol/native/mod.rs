@@ -17,4 +17,14 @@
 
 pub(crate) mod decode;
 pub(crate) mod encode;
+mod runtime_filter_install;
 pub(crate) mod type_mapping;
+
+// Narrow Task 4/5 surface: handlers and client adapters need only these DTOs
+// and boundary entry points, not the codec implementation module.
+#[allow(unused_imports)]
+pub(crate) use runtime_filter_install::{
+    DecodedRuntimeFilterParticipantInstall, RuntimeFilterDeploymentAbort,
+    RuntimeFilterQueryLifecycleOptions, decode_abort_runtime_filter_deployment,
+    decode_participant_install, encode_abort_runtime_filter_deployment, encode_participant_install,
+};

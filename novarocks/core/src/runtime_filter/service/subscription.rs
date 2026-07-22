@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -357,7 +357,7 @@ impl NonBlockingLiveSubscription for LiveSubscriptionSlot {
 }
 
 pub(super) struct SubscriptionGroup {
-    route_edge_id: RouteEdgeId,
+    route_edge_ids: BTreeSet<RouteEdgeId>,
     activation: crate::runtime_filter::model::contract::ConsumerActivation,
     slots: BTreeMap<UniqueId, InstalledSubscriptionSlot>,
     #[cfg(test)]
@@ -376,7 +376,7 @@ impl SubscriptionGroup {
         common: RuntimeFilterEventIdentity,
         binding_id: crate::runtime_filter::model::contract::BindingId,
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
-        route_edge_id: RouteEdgeId,
+        route_edge_ids: impl IntoIterator<Item = RouteEdgeId>,
         instances: impl IntoIterator<Item = UniqueId>,
         events: Arc<dyn RuntimeFilterEventSink>,
     ) -> Self {
@@ -403,7 +403,7 @@ impl SubscriptionGroup {
             })
             .collect();
         Self {
-            route_edge_id,
+            route_edge_ids: route_edge_ids.into_iter().collect(),
             activation,
             slots,
             #[cfg(test)]
@@ -441,12 +441,12 @@ impl SubscriptionGroup {
         }
     }
 
-    pub(super) fn live_route_edge_id(&self) -> Option<RouteEdgeId> {
+    pub(super) fn live_route_edge_ids(&self) -> Option<&BTreeSet<RouteEdgeId>> {
         matches!(
             self.activation,
             crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. }
         )
-        .then_some(self.route_edge_id)
+        .then_some(&self.route_edge_ids)
     }
 
     pub(super) fn arm_cancellation_event(
@@ -454,7 +454,7 @@ impl SubscriptionGroup {
         route_edge_id: RouteEdgeId,
         barrier: Arc<EventBatchCompletion>,
     ) {
-        if route_edge_id != self.route_edge_id {
+        if !self.route_edge_ids.contains(&route_edge_id) {
             return;
         }
         for slot in self.slots.values() {
@@ -491,7 +491,7 @@ impl ArtifactDelivery for SubscriptionGroup {
         outcome: Option<ArtifactDeliveryOutcome>,
         terminal: Option<LiveTerminal>,
     ) {
-        if route_edge_id != self.route_edge_id {
+        if !self.route_edge_ids.contains(&route_edge_id) {
             return;
         }
         #[cfg(test)]

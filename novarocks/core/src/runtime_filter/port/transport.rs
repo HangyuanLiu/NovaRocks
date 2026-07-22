@@ -18,6 +18,7 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
@@ -31,6 +32,9 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Artifact,
     ProducerClosed,
     Unavailable,
+    CompletedWithoutArtifact,
+    DegradedLogical,
+    FinalArtifact,
     /// Acknowledges either a `Contribution`-kind or `Delivery`-kind route identity.
     /// The acked route identity is the envelope's own top-level `route_identity`
     /// (see `RuntimeFilterEnvelope::route_identity`); an `Ack` envelope does not
@@ -412,9 +416,11 @@ impl RuntimeFilterEnvelope {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 route_identity.as_contribution().is_some()
             }
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
-                route_identity.as_delivery().is_some()
-            }
+            RuntimeFilterEnvelopeKind::Artifact
+            | RuntimeFilterEnvelopeKind::FinalArtifact
+            | RuntimeFilterEnvelopeKind::Unavailable
+            | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+            | RuntimeFilterEnvelopeKind::DegradedLogical => route_identity.as_delivery().is_some(),
             RuntimeFilterEnvelopeKind::Ack => true,
         };
         if !identity_matches {
@@ -424,7 +430,9 @@ impl RuntimeFilterEnvelope {
             kind,
             RuntimeFilterEnvelopeKind::Contribution
                 | RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
                 | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         );
         if payload_required && payload.is_empty() {
             return Err(RuntimeFilterTransportError::payload_required(kind));
@@ -485,6 +493,37 @@ impl RuntimeFilterEnvelope {
 
     pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
+    }
+}
+
+/// A complete domain envelope plus the unary deadline installed for this query.
+///
+/// The reliable transport owns the envelope identity and retry lifetime. The sink
+/// receives this immutable value and is responsible only for wire transmission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterTransportEnvelope {
+    envelope: RuntimeFilterEnvelope,
+    rpc_deadline: Duration,
+}
+
+impl RuntimeFilterTransportEnvelope {
+    pub(crate) fn new(envelope: RuntimeFilterEnvelope, rpc_deadline: Duration) -> Self {
+        assert!(
+            !rpc_deadline.is_zero(),
+            "runtime filter envelope RPC deadline must be nonzero"
+        );
+        Self {
+            envelope,
+            rpc_deadline,
+        }
+    }
+
+    pub(crate) const fn envelope(&self) -> &RuntimeFilterEnvelope {
+        &self.envelope
+    }
+
+    pub(crate) fn into_parts(self) -> (RuntimeFilterEnvelope, Duration) {
+        (self.envelope, self.rpc_deadline)
     }
 }
 
@@ -608,6 +647,11 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Artifact,
                 delivery_route(),
                 &b"artifact"[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                &b"final-artifact"[..],
             ),
             (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
@@ -821,6 +865,12 @@ mod tests {
                 &b"payload"[..],
             ),
             (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                contribution_route(),
+                None,
+                &b"payload"[..],
+            ),
+            (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 delivery_route(),
                 Some(ProducerOpenMetadata::try_new(24).unwrap()),
@@ -876,6 +926,12 @@ mod tests {
             ),
             (
                 RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                None,
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
                 delivery_route(),
                 None,
                 &b""[..],
@@ -969,6 +1025,11 @@ mod tests {
                 b"artifact".to_vec(),
             ),
             (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                b"final-artifact".to_vec(),
+            ),
+            (
                 RuntimeFilterEnvelopeKind::Unavailable,
                 delivery_route(),
                 b"reason".to_vec(),
@@ -1022,6 +1083,66 @@ mod tests {
         assert_eq!(envelope.producer_open(), Some(producer_open));
         assert!(envelope.payload().is_empty());
         assert!(build(b"unexpected".to_vec()).is_err());
+    }
+
+    #[test]
+    fn delivery_terminal_kinds_enforce_identity_and_payload_contracts() {
+        let completed = RuntimeFilterEnvelope::try_new(
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            UniqueId { hi: 1, lo: 2 },
+            ChannelId::new(3),
+            DeploymentEpoch::new(4),
+            delivery_route(),
+            None,
+            None,
+            &[11; 32],
+            Vec::new(),
+        )
+        .expect("completed-without-artifact terminal");
+        assert!(completed.payload().is_empty());
+
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                None,
+                None,
+                &[11; 32],
+                b"unexpected".to_vec(),
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                None,
+                None,
+                &[11; 32],
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                contribution_route(),
+                None,
+                None,
+                &[11; 32],
+                b"reason".to_vec(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1158,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn trait_object_dispatch_preserves_all_five_real_envelopes_in_order() {
+    fn trait_object_dispatch_preserves_all_envelope_kinds_in_order() {
         let recording = Arc::new(RecordingIngress::default());
         let ingress: Arc<dyn RuntimeFilterEnvelopeIngress> = recording.clone();
         for envelope in [
@@ -1173,12 +1294,27 @@ mod tests {
                 b"artifact",
             ),
             envelope(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                b"final-artifact",
+            ),
+            envelope(
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 contribution_route(),
                 b"",
             ),
             envelope(
                 RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                b"reason",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                delivery_route(),
+                b"",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
                 delivery_route(),
                 b"reason",
             ),
@@ -1195,8 +1331,11 @@ mod tests {
             [
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
                 RuntimeFilterEnvelopeKind::Ack,
             ]
         );

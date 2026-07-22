@@ -261,11 +261,11 @@ mod tests {
             availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
             producers: vec![ProducerPlacement {
                 binding: BindingId::new(10),
-                participants: BTreeSet::from([pid(0)]),
+                participants: BTreeSet::from([pid(3)]),
             }],
             consumers: vec![ConsumerPlacement {
                 binding: BindingId::new(11),
-                participants: BTreeSet::from([pid(0)]),
+                participants: BTreeSet::from([pid(3)]),
             }],
         };
         let mut alloc = RouteEdgeAllocator::new();
@@ -286,7 +286,7 @@ mod tests {
             producers: vec![
                 ProducerPlacement {
                     binding: BindingId::new(10),
-                    participants: BTreeSet::from([pid(0)]),
+                    participants: BTreeSet::from([pid(3)]),
                 },
                 ProducerPlacement {
                     binding: BindingId::new(10),
@@ -315,7 +315,7 @@ mod tests {
             producers: vec![
                 ProducerPlacement {
                     binding: BindingId::new(10),
-                    participants: BTreeSet::from([pid(0)]),
+                    participants: BTreeSet::from([pid(3)]),
                 },
                 ProducerPlacement {
                     binding: BindingId::new(10),
@@ -345,16 +345,16 @@ mod tests {
             availability_coverage: Coverage::Leaf(CoverageWitnessId::new(1)),
             producers: vec![ProducerPlacement {
                 binding: BindingId::new(10),
-                participants: BTreeSet::from([pid(0)]),
+                participants: BTreeSet::from([pid(3)]),
             }],
             consumers: vec![
                 ConsumerPlacement {
                     binding: BindingId::new(11),
-                    participants: BTreeSet::from([pid(0)]),
+                    participants: BTreeSet::from([pid(3)]),
                 },
                 ConsumerPlacement {
                     binding: BindingId::new(12),
-                    participants: BTreeSet::from([pid(0)]),
+                    participants: BTreeSet::from([pid(3)]),
                 },
             ],
         };

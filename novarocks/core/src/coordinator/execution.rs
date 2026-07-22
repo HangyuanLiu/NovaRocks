@@ -57,6 +57,7 @@ use crate::coordinator::profile::{
     StandaloneQueryProfileGuard, standalone_query_profile_count, take_standalone_query_profiles,
 };
 use crate::coordinator::report::{StandaloneQueryFailureGuard, take_standalone_query_failure};
+use crate::coordinator::runtime_filter_deployment::InstalledRuntimeFilterDeployment;
 use crate::coordinator::scheduler::SchedulingPlan;
 use crate::coordinator::scheduler::{FragmentInstancePlacement, FragmentScheduler};
 use crate::coordinator::write::report::{WriteAbortInput, WriteCommitInput, WriterKey};
@@ -362,6 +363,21 @@ pub(crate) struct ExecutionCoordinator {
     query_options: CoordinatorQueryOptions,
     #[cfg(test)]
     scheduled_plan_test_drift: Option<ScheduledPlanTestDrift>,
+    #[cfg(test)]
+    post_install_assembly_test_drift: Option<PostInstallAssemblyTestDrift>,
+}
+
+struct PreparedNativeSubmission<'a> {
+    tracker: InFlightTracker,
+    submissions: Vec<(usize, NativeFragmentEnvelope)>,
+    execution_root_fragment_id: FragmentId,
+    root_backend_idx: usize,
+    root_finst_id: UniqueId,
+    timeout_ms: i64,
+    root_schedule: &'a PreparedFragment,
+    root_uses_result_buffer: bool,
+    expected_root_chunk_schema: Option<ChunkSchemaRef>,
+    write_registration: Option<RegisteredWriteCoordinator>,
 }
 
 /// Query options sealed for the native coordinator boundary.
@@ -395,6 +411,12 @@ enum ScheduledPlanTestDrift {
     Unknown,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PostInstallAssemblyTestDrift {
+    MissingRootPlacement,
+}
+
 impl ExecutionCoordinator {
     pub(crate) fn new(
         prepared: PreparedFragmentSet,
@@ -411,6 +433,8 @@ impl ExecutionCoordinator {
             query_options: CoordinatorQueryOptions::from_upstream(query_options),
             #[cfg(test)]
             scheduled_plan_test_drift: None,
+            #[cfg(test)]
+            post_install_assembly_test_drift: None,
         }
     }
 
@@ -436,10 +460,15 @@ impl ExecutionCoordinator {
         let query_options = self.query_options;
         #[cfg(test)]
         let scheduled_plan_test_drift = self.scheduled_plan_test_drift;
+        #[cfg(test)]
+        let post_install_assembly_test_drift = self.post_install_assembly_test_drift;
         let CoordinatorExecutionPorts {
             dispatcher,
             report_endpoint,
             observer,
+            runtime_filter_policy_provider,
+            deployment_epoch_allocator,
+            runtime_filter_deployment_control,
         } = self.execution_ports;
         let scheduler = self.scheduler;
         // ---------------------------------------------------------------
@@ -480,294 +509,377 @@ impl ExecutionCoordinator {
         let plan = apply_scheduled_plan_test_drift(plan, scheduled_plan_test_drift);
         validate_artifact_fragment_sets(&prepared, &native_bundle, &plan)?;
         validate_scheduling_placements(&plan)?;
-        let execution_root_fragment_id = plan.root_fragment_id;
-        let mut native_fragments_by_id = native_bundle.into_fragments().collect::<BTreeMap<_, _>>();
 
-        // ---------------------------------------------------------------
-        // 2. Build per-edge / CTE consumer indices used for sink wiring.
-        // ---------------------------------------------------------------
-        // Stream producer fragment id -> its single outgoing plain stream edge.
-        // Both edge indices are infallible map-builders: the planner seal
-        // (`validate_source_edge_shape`) already owns plain-stream fan-out,
-        // plain/router mix, and per-(source, group) router branch/kind/target
-        // uniqueness, and guarantees at most one router group per source fragment.
-        // Grouping the router edges by source therefore never collides here.
-        let stream_edge_by_source = build_stream_edge_by_source(&edges);
-        let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<&FragmentEdge>)> =
-            group_router_edges_by_source(&edges)
-                .into_iter()
-                .map(|((source_fragment_id, router_group_id), branch_edges)| {
-                    (source_fragment_id, (router_group_id, branch_edges))
-                })
-                .collect();
-        // CTE id -> native consumer sidecars: (consumer_fragment_id, exchange_node_id,
-        // native partition, output_slot_ids, logical producer column ids).
-        let mut cte_consumers: BTreeMap<
-            CteId,
-            Vec<(
-                FragmentId,
-                i32,
-                crate::proto::plan::DataPartition,
-                Vec<i32>,
-                Vec<ColumnId>,
-            )>,
-        > = BTreeMap::new();
-        for e in &edges {
-            match &e.edge_kind {
-                FragmentEdgeKind::Stream => {}
-                FragmentEdgeKind::CteMulticast {
-                    cte_id,
-                    receive_producer_column_ids,
-                } => {
-                    let native_partition = crate::protocol::native::encode::encode_data_partition(
-                        &e.output_partition,
-                    )?;
-                    cte_consumers.entry(*cte_id).or_default().push((
-                        e.target_fragment_id,
-                        e.target_exchange_node_id,
-                        native_partition,
-                        e.output_slot_ids.clone(),
-                        receive_producer_column_ids.clone(),
-                    ));
-                }
-                FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
-            }
-        }
-        // CTE consumers may also be expressed via `cte_exchange_nodes` on the
-        // consumer fragment when no explicit edge carries them.
-        for schedule in prepared.scheduling_view().fragments() {
-            for (cte_id, exchange_node_id, receive_producer_column_ids) in
-                schedule.boundary_projection().cte_exchange_nodes()
-            {
-                let consumers = cte_consumers.entry(*cte_id).or_default();
-                if !consumers.iter().any(|(fid, nid, _, _, _)| {
-                    *fid == schedule.fragment_id() && *nid == *exchange_node_id
-                }) {
-                    consumers.push((
-                        schedule.fragment_id(),
-                        *exchange_node_id,
-                        crate::proto::plan::DataPartition {
-                            kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
-                            exprs: Vec::new(),
-                        },
-                        Vec::new(),
-                        receive_producer_column_ids.clone(),
-                    ));
-                }
-            }
-        }
+        let installed_runtime_filter_deployment = if let Some(deployment) =
+            crate::coordinator::runtime_filter_deployment::prepare_runtime_filter_deployment(
+                prepared.runtime_filter_graph(),
+                scheduler.live_backend_snapshot(),
+                runtime_filter_policy_provider.as_ref(),
+                &deployment_epoch_allocator,
+            )? {
+            let compiled = crate::runtime_filter::deployment::compiler::compile(
+                prepared.runtime_filter_graph(),
+                &plan,
+                &edges,
+                scheduler.live_backend_snapshot(),
+                &deployment.policy.compiler,
+                deployment.epoch,
+            )
+            .map_err(|error| format!("runtime filter deployment compile failed: {error}"))?;
+            let installs =
+                crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension::new(
+                )
+                .participant_installs(&compiled)
+                .map_err(|error| {
+                    format!("runtime filter participant install projection failed: {error}")
+                })?;
+            let (delivery_expire, query_expire) =
+                crate::runtime::query_options::query_expire_durations(Some(
+                    query_options.as_runtime_options(),
+                ));
+            let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+                delivery_expire,
+                query_expire,
+                transport_retry_interval: deployment.policy.transport.retry_interval,
+                transport_max_attempts: deployment.policy.transport.max_attempts,
+                transport_deadline: deployment.policy.transport.deadline,
+                transport_max_pending_entries: deployment.policy.transport.max_pending_entries,
+                transport_max_pending_bytes: deployment.policy.transport.max_pending_bytes,
+            };
+            Some(
+                crate::coordinator::runtime_filter_deployment::RuntimeFilterInstallBarrier::new(
+                    runtime_filter_deployment_control,
+                )
+                .install_all_or_rollback(
+                    query_id,
+                    deployment.epoch,
+                    lifecycle,
+                    deployment.policy.install_rpc_deadline,
+                    installs,
+                )?,
+            )
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let plan = apply_post_install_assembly_test_drift(plan, post_install_assembly_test_drift);
+        let pre_submission_result = (|| -> Result<PreparedNativeSubmission<'_>, String> {
+            let execution_root_fragment_id = plan.root_fragment_id;
+            let mut native_fragments_by_id =
+                native_bundle.into_fragments().collect::<BTreeMap<_, _>>();
 
-        // ---------------------------------------------------------------
-        // 3. Translate every placement into a native fragment submission.
-        // ---------------------------------------------------------------
-        let needs_fragment_status_report =
-            dispatcher.needs_fragment_status_report() || collect_profiles;
-
-        // Snapshot the per-consumer-fragment instance destinations for CTE
-        // multicast sub-sinks (each consumer fans out to all of its instances).
-        let consumer_dests: BTreeMap<
-            FragmentId,
-            Vec<crate::runtime::endpoint::FragmentDestination>,
-        > = plan
-            .by_fragment
-            .iter()
-            .map(|(fid, insts)| {
-                let dests = insts
-                    .iter()
-                    .map(|inst| {
-                        crate::runtime::endpoint::FragmentDestination::new(
-                            inst.finst_id,
-                            inst.endpoint.clone(),
-                        )
+            // ---------------------------------------------------------------
+            // 2. Build per-edge / CTE consumer indices used for sink wiring.
+            // ---------------------------------------------------------------
+            // Stream producer fragment id -> its single outgoing plain stream edge.
+            // Both edge indices are infallible map-builders: the planner seal
+            // (`validate_source_edge_shape`) already owns plain-stream fan-out,
+            // plain/router mix, and per-(source, group) router branch/kind/target
+            // uniqueness, and guarantees at most one router group per source fragment.
+            // Grouping the router edges by source therefore never collides here.
+            let stream_edge_by_source = build_stream_edge_by_source(&edges);
+            let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<&FragmentEdge>)> =
+                group_router_edges_by_source(&edges)
+                    .into_iter()
+                    .map(|((source_fragment_id, router_group_id), branch_edges)| {
+                        (source_fragment_id, (router_group_id, branch_edges))
                     })
                     .collect();
-                (*fid, dests)
-            })
-            .collect();
-
-        let mut tracker = InFlightTracker::default();
-        // Collect submissions by fragment, then submit consumers before
-        // producers. This ensures downstream exchange receivers/result buffers
-        // are registered before an upstream producer can fail or send data.
-        let mut submissions_by_fragment: BTreeMap<
-            FragmentId,
-            Vec<(usize, NativeFragmentEnvelope)>,
-        > = BTreeMap::new();
-        let mut expected_writers = Vec::new();
-
-        for (&fragment_id, placements) in &plan.by_fragment {
-            let schedule = prepared
-                .fragment(fragment_id)
-                .ok_or_else(|| format!("fragment {fragment_id} missing from prepared set"))?;
-            let native_template = native_fragments_by_id
-                .remove(&fragment_id)
-                .ok_or_else(|| format!("native fragment bundle missing fragment {fragment_id}"))?;
-            let is_root = fragment_id == execution_root_fragment_id;
-            let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
-            let router_edges = router_edges_by_source.get(&fragment_id);
-            let is_terminal_write = stream_edge.is_none()
-                && router_edges.is_none()
-                && schedule.boundary_projection().cte_id().is_none()
-                && schedule.execution_role().is_terminal_write();
-            let is_producer = stream_edge.is_some()
-                || router_edges.is_some()
-                || schedule.boundary_projection().cte_id().is_some();
-            validate_fragment_output_kind(
-                fragment_id,
-                is_root,
-                is_terminal_write,
-                is_producer,
-                schedule.execution_role(),
-            )?;
-
-            // Classify the fragment once.
-            if !is_root
-                && !is_terminal_write
-                && schedule.boundary_projection().cte_id().is_none()
-                && stream_edge.is_none()
-                && router_edges.is_none()
-            {
-                return Err(format!(
-                    "fragment {fragment_id} is neither root, CTE producer, stream producer, nor \
-                     Iceberg change-stream router producer or terminal write fragment; \
-                     stream fan-out is not supported in standalone coordinator"
-                ));
-            }
-            ensure_native_fragment_sink_supported(
-                fragment_id,
-                is_root,
-                is_terminal_write,
-                stream_edge.is_some(),
-                router_edges.is_some(),
-                schedule.boundary_projection().cte_id().is_some(),
-            )?;
-
-            for placement in placements {
-                let fragment_has_write_sink = is_terminal_write;
-                let fragment_report_endpoint =
-                    if fragment_has_write_sink || needs_fragment_status_report {
-                        Some(report_endpoint.clone())
-                    } else {
-                        None
-                    };
-
-                if fragment_has_write_sink {
-                    expected_writers.push(WriterKey {
-                        query_id,
-                        fragment_instance_id: placement.finst_id,
-                        backend_num: placement.instance_index as i32,
-                    });
+            // CTE id -> native consumer sidecars: (consumer_fragment_id, exchange_node_id,
+            // native partition, output_slot_ids, logical producer column ids).
+            let mut cte_consumers: BTreeMap<
+                CteId,
+                Vec<(
+                    FragmentId,
+                    i32,
+                    crate::proto::plan::DataPartition,
+                    Vec<i32>,
+                    Vec<ColumnId>,
+                )>,
+            > = BTreeMap::new();
+            for e in &edges {
+                match &e.edge_kind {
+                    FragmentEdgeKind::Stream => {}
+                    FragmentEdgeKind::CteMulticast {
+                        cte_id,
+                        receive_producer_column_ids,
+                    } => {
+                        let native_partition =
+                            crate::protocol::native::encode::encode_data_partition(
+                                &e.output_partition,
+                            )?;
+                        cte_consumers.entry(*cte_id).or_default().push((
+                            e.target_fragment_id,
+                            e.target_exchange_node_id,
+                            native_partition,
+                            e.output_slot_ids.clone(),
+                            receive_producer_column_ids.clone(),
+                        ));
+                    }
+                    FragmentEdgeKind::IcebergChangeStreamRouter { .. } => {}
                 }
-
-                let mut native_fragment = native_template.clone();
-                if !is_root && !is_terminal_write && stream_edge.is_none() {
-                    if let Some((router_group_id, branch_edges)) = router_edges {
-                        patch_native_iceberg_change_stream_router_sink(
-                            &mut native_fragment,
-                            fragment_id,
-                            *router_group_id,
-                            branch_edges,
-                            &plan.by_fragment,
-                        )?;
-                    } else if let Some(cte_id) = schedule.boundary_projection().cte_id() {
-                        let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-                        patch_native_cte_multicast_sink(
-                            &mut native_fragment,
-                            fragment_id,
-                            cte_id,
-                            &consumers,
-                            &consumer_dests,
-                        )?;
+            }
+            // CTE consumers may also be expressed via `cte_exchange_nodes` on the
+            // consumer fragment when no explicit edge carries them.
+            for schedule in prepared.scheduling_view().fragments() {
+                for (cte_id, exchange_node_id, receive_producer_column_ids) in
+                    schedule.boundary_projection().cte_exchange_nodes()
+                {
+                    let consumers = cte_consumers.entry(*cte_id).or_default();
+                    if !consumers.iter().any(|(fid, nid, _, _, _)| {
+                        *fid == schedule.fragment_id() && *nid == *exchange_node_id
+                    }) {
+                        consumers.push((
+                            schedule.fragment_id(),
+                            *exchange_node_id,
+                            crate::proto::plan::DataPartition {
+                                kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            },
+                            Vec::new(),
+                            receive_producer_column_ids.clone(),
+                        ));
                     }
                 }
-                let typed_result_sink = is_root && needs_fragment_status_report;
-                let native_instance_params =
-                    crate::protocol::native::encode::encode_instance_params(
-                        &query_id,
-                        placement,
-                        query_options.as_runtime_options(),
-                        placement.instance_index as i32,
-                        fragment_report_endpoint.as_ref(),
-                        typed_result_sink,
-                    )?;
-                let submission =
-                    NativeFragmentEnvelope::new(native_fragment, native_instance_params);
-
-                submissions_by_fragment
-                    .entry(fragment_id)
-                    .or_default()
-                    .push((placement.backend_idx, submission));
             }
-        }
 
-        if !native_fragments_by_id.is_empty() {
-            return Err(format!(
-                "native fragments remained after submission assembly: {:?}",
-                native_fragments_by_id.keys().collect::<Vec<_>>()
-            ));
-        }
+            // ---------------------------------------------------------------
+            // 3. Translate every placement into a native fragment submission.
+            // ---------------------------------------------------------------
+            let needs_fragment_status_report =
+                dispatcher.needs_fragment_status_report() || collect_profiles;
 
-        if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
-            return Err("root fragment produced no placement".to_string());
-        }
-        // Submit consumers before producers: iterate the sealed leaves-first
-        // topological order in reverse (root first) so downstream exchange
-        // receivers / result buffers register before any upstream producer can
-        // send. The order is the planner-sealed projection, not recomputed here.
-        let mut submissions: Vec<(usize, NativeFragmentEnvelope)> = Vec::new();
-        for &fragment_id in prepared.scheduling_view().topological_order().iter().rev() {
-            if let Some(mut fragment_submissions) = submissions_by_fragment.remove(&fragment_id) {
-                submissions.append(&mut fragment_submissions);
+            // Snapshot the per-consumer-fragment instance destinations for CTE
+            // multicast sub-sinks (each consumer fans out to all of its instances).
+            let consumer_dests: BTreeMap<
+                FragmentId,
+                Vec<crate::runtime::endpoint::FragmentDestination>,
+            > = plan
+                .by_fragment
+                .iter()
+                .map(|(fid, insts)| {
+                    let dests = insts
+                        .iter()
+                        .map(|inst| {
+                            crate::runtime::endpoint::FragmentDestination::new(
+                                inst.finst_id,
+                                inst.endpoint.clone(),
+                            )
+                        })
+                        .collect();
+                    (*fid, dests)
+                })
+                .collect();
+
+            let tracker = InFlightTracker::default();
+            // Collect submissions by fragment, then submit consumers before
+            // producers. This ensures downstream exchange receivers/result buffers
+            // are registered before an upstream producer can fail or send data.
+            let mut submissions_by_fragment: BTreeMap<
+                FragmentId,
+                Vec<(usize, NativeFragmentEnvelope)>,
+            > = BTreeMap::new();
+            let mut expected_writers = Vec::new();
+
+            for (&fragment_id, placements) in &plan.by_fragment {
+                let schedule = prepared
+                    .fragment(fragment_id)
+                    .ok_or_else(|| format!("fragment {fragment_id} missing from prepared set"))?;
+                let native_template =
+                    native_fragments_by_id.remove(&fragment_id).ok_or_else(|| {
+                        format!("native fragment bundle missing fragment {fragment_id}")
+                    })?;
+                let is_root = fragment_id == execution_root_fragment_id;
+                let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
+                let router_edges = router_edges_by_source.get(&fragment_id);
+                let is_terminal_write = stream_edge.is_none()
+                    && router_edges.is_none()
+                    && schedule.boundary_projection().cte_id().is_none()
+                    && schedule.execution_role().is_terminal_write();
+                let is_producer = stream_edge.is_some()
+                    || router_edges.is_some()
+                    || schedule.boundary_projection().cte_id().is_some();
+                validate_fragment_output_kind(
+                    fragment_id,
+                    is_root,
+                    is_terminal_write,
+                    is_producer,
+                    schedule.execution_role(),
+                )?;
+
+                // Classify the fragment once.
+                if !is_root
+                    && !is_terminal_write
+                    && schedule.boundary_projection().cte_id().is_none()
+                    && stream_edge.is_none()
+                    && router_edges.is_none()
+                {
+                    return Err(format!(
+                        "fragment {fragment_id} is neither root, CTE producer, stream producer, nor \
+                     Iceberg change-stream router producer or terminal write fragment; \
+                     stream fan-out is not supported in standalone coordinator"
+                    ));
+                }
+                ensure_native_fragment_sink_supported(
+                    fragment_id,
+                    is_root,
+                    is_terminal_write,
+                    stream_edge.is_some(),
+                    router_edges.is_some(),
+                    schedule.boundary_projection().cte_id().is_some(),
+                )?;
+
+                for placement in placements {
+                    let fragment_has_write_sink = is_terminal_write;
+                    let fragment_report_endpoint =
+                        if fragment_has_write_sink || needs_fragment_status_report {
+                            Some(report_endpoint.clone())
+                        } else {
+                            None
+                        };
+
+                    if fragment_has_write_sink {
+                        expected_writers.push(WriterKey {
+                            query_id,
+                            fragment_instance_id: placement.finst_id,
+                            backend_num: placement.instance_index as i32,
+                        });
+                    }
+
+                    let mut native_fragment = native_template.clone();
+                    if !is_root && !is_terminal_write && stream_edge.is_none() {
+                        if let Some((router_group_id, branch_edges)) = router_edges {
+                            patch_native_iceberg_change_stream_router_sink(
+                                &mut native_fragment,
+                                fragment_id,
+                                *router_group_id,
+                                branch_edges,
+                                &plan.by_fragment,
+                            )?;
+                        } else if let Some(cte_id) = schedule.boundary_projection().cte_id() {
+                            let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                            patch_native_cte_multicast_sink(
+                                &mut native_fragment,
+                                fragment_id,
+                                cte_id,
+                                &consumers,
+                                &consumer_dests,
+                            )?;
+                        }
+                    }
+                    let typed_result_sink = is_root && needs_fragment_status_report;
+                    let native_instance_params =
+                        crate::protocol::native::encode::encode_instance_params(
+                            &query_id,
+                            placement,
+                            query_options.as_runtime_options(),
+                            placement.instance_index as i32,
+                            fragment_report_endpoint.as_ref(),
+                            typed_result_sink,
+                        )?;
+                    let submission =
+                        NativeFragmentEnvelope::new(native_fragment, native_instance_params);
+
+                    submissions_by_fragment
+                        .entry(fragment_id)
+                        .or_default()
+                        .push((placement.backend_idx, submission));
+                }
             }
-        }
-        if !submissions_by_fragment.is_empty() {
-            return Err(format!(
-                "submissions remained for unknown fragments: {:?}",
-                submissions_by_fragment.keys().collect::<Vec<_>>()
-            ));
-        }
 
-        let write_registration = if expected_writers.is_empty() {
-            None
-        } else {
-            Some(RegisteredWriteCoordinator::register(
-                query_id,
-                expected_writers,
-            )?)
+            if !native_fragments_by_id.is_empty() {
+                return Err(format!(
+                    "native fragments remained after submission assembly: {:?}",
+                    native_fragments_by_id.keys().collect::<Vec<_>>()
+                ));
+            }
+
+            if !submissions_by_fragment.contains_key(&execution_root_fragment_id) {
+                return Err("root fragment produced no placement".to_string());
+            }
+            // Submit consumers before producers: iterate the sealed leaves-first
+            // topological order in reverse (root first) so downstream exchange
+            // receivers / result buffers register before any upstream producer can
+            // send. The order is the planner-sealed projection, not recomputed here.
+            let mut submissions: Vec<(usize, NativeFragmentEnvelope)> = Vec::new();
+            for &fragment_id in prepared.scheduling_view().topological_order().iter().rev() {
+                if let Some(mut fragment_submissions) = submissions_by_fragment.remove(&fragment_id)
+                {
+                    submissions.append(&mut fragment_submissions);
+                }
+            }
+            if !submissions_by_fragment.is_empty() {
+                return Err(format!(
+                    "submissions remained for unknown fragments: {:?}",
+                    submissions_by_fragment.keys().collect::<Vec<_>>()
+                ));
+            }
+
+            let write_registration = if expected_writers.is_empty() {
+                None
+            } else {
+                Some(RegisteredWriteCoordinator::register(
+                    query_id,
+                    expected_writers,
+                )?)
+            };
+            let timeout_ms = query_options
+                .as_runtime_options()
+                .query_timeout
+                .map(|t| t as i64 * 1000)
+                .unwrap_or(300_000); // 5 minute default
+            let root_schedule = prepared
+                .fragment(execution_root_fragment_id)
+                .ok_or_else(|| "root fragment not found in prepared set".to_string())?;
+            let root_uses_result_buffer = !root_schedule.execution_role().is_terminal_write();
+            let expected_root_chunk_schema = if root_uses_result_buffer {
+                Some(build_root_expected_chunk_schema(root_schedule)?)
+            } else {
+                None
+            };
+
+            Ok(PreparedNativeSubmission {
+                tracker,
+                submissions,
+                execution_root_fragment_id,
+                root_backend_idx: plan.root_backend_idx,
+                root_finst_id: plan.root_finst_id.clone(),
+                timeout_ms,
+                root_schedule,
+                root_uses_result_buffer,
+                expected_root_chunk_schema,
+                write_registration,
+            })
+        })();
+        let mut pre_submission = match pre_submission_result {
+            Ok(pre_submission) => pre_submission,
+            Err(primary_error) => {
+                return Err(match installed_runtime_filter_deployment {
+                    Some(deployment) => deployment.abort_preserving(primary_error),
+                    None => primary_error,
+                });
+            }
         };
-        let write_coordinator = write_registration
+        let write_coordinator = pre_submission
+            .write_registration
             .as_ref()
             .map(RegisteredWriteCoordinator::coordinator);
 
-        let timeout_ms = query_options
-            .as_runtime_options()
-            .query_timeout
-            .map(|t| t as i64 * 1000)
-            .unwrap_or(300_000); // 5 minute default
-        let root_schedule = prepared
-            .fragment(execution_root_fragment_id)
-            .ok_or_else(|| "root fragment not found in prepared set".to_string())?;
-        let root_uses_result_buffer = !root_schedule.execution_role().is_terminal_write();
-        let expected_root_chunk_schema = if root_uses_result_buffer {
-            Some(build_root_expected_chunk_schema(root_schedule)?)
-        } else {
-            None
-        };
-
-        let fetch_result = submit_and_fetch_loop(
+        let fetch_result = submit_and_fetch_loop_with_deployment_lease(
             &dispatcher,
-            &mut tracker,
-            submissions,
-            execution_root_fragment_id,
-            plan.root_backend_idx,
-            plan.root_finst_id.clone(),
+            &mut pre_submission.tracker,
+            pre_submission.submissions,
+            pre_submission.execution_root_fragment_id,
+            pre_submission.root_backend_idx,
+            pre_submission.root_finst_id,
             &query_id,
-            root_uses_result_buffer,
-            timeout_ms,
-            expected_root_chunk_schema.as_ref(),
+            pre_submission.root_uses_result_buffer,
+            pre_submission.timeout_ms,
+            pre_submission.expected_root_chunk_schema.as_ref(),
             write_coordinator,
             collect_profiles,
             observer.as_ref(),
+            installed_runtime_filter_deployment,
         )?;
         let runtime_filter_dormancy_proof = if collect_profiles {
             let topology = runtime_filter_dormancy_topology.as_ref().ok_or_else(|| {
@@ -793,6 +905,7 @@ impl ExecutionCoordinator {
             );
         }
 
+        let root_schedule = pre_submission.root_schedule;
         let chunks = align_fetch_chunks_to_output_columns(
             fetch_result.chunks,
             root_schedule.boundary_projection().output_columns(),
@@ -1563,15 +1676,15 @@ fn native_cte_multicast_contract_slot_map(
 // In-flight instance tracking (per-backend cancellation)
 // ---------------------------------------------------------------------------
 
-/// Tracks submitted fragment instances grouped by backend so that, on any
-/// failure, cancellation can fan out to every backend that accepted work.
+/// Tracks attempted fragment instances grouped by backend so that, on any
+/// failure, cancellation can cover work whose submit outcome is unknown.
 #[derive(Default)]
 pub(crate) struct InFlightTracker {
     pub(crate) by_backend: BTreeMap<usize, Vec<UniqueId>>,
 }
 
 impl InFlightTracker {
-    /// Record that `finst_id` was submitted to `backend_idx`.
+    /// Record that submission of `finst_id` is in flight on `backend_idx`.
     pub(crate) fn record_submitted(&mut self, backend_idx: usize, finst_id: UniqueId) {
         self.by_backend
             .entry(backend_idx)
@@ -1705,8 +1818,9 @@ fn prevalidate_fragment_submissions(
 /// Submit each `(backend_idx, params)` through the dispatcher in order, tracking
 /// accepted instances per backend, then poll the root fragment until EOF.
 ///
-/// On any submit failure or fetch error, all already-submitted instances are
-/// cancelled (fanned out per backend) before the error is returned.
+/// On any submit failure or fetch error, all attempted instances are cancelled
+/// (fanned out per backend) before the error is returned.
+#[cfg(test)]
 pub(crate) fn submit_and_fetch_loop(
     dispatcher: &Arc<dyn FragmentDispatcher>,
     tracker: &mut InFlightTracker,
@@ -1722,6 +1836,41 @@ pub(crate) fn submit_and_fetch_loop(
     collect_profiles: bool,
     observer: &dyn CoordinatorObserver,
 ) -> Result<SubmitAndFetchResult, String> {
+    submit_and_fetch_loop_with_deployment_lease(
+        dispatcher,
+        tracker,
+        submissions,
+        execution_root_fragment_id,
+        root_backend_idx,
+        root_finst_id,
+        query_id,
+        root_uses_result_buffer,
+        timeout_ms,
+        expected_root_chunk_schema,
+        write_coordinator,
+        collect_profiles,
+        observer,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_and_fetch_loop_with_deployment_lease(
+    dispatcher: &Arc<dyn FragmentDispatcher>,
+    tracker: &mut InFlightTracker,
+    submissions: Vec<(usize, NativeFragmentEnvelope)>,
+    execution_root_fragment_id: FragmentId,
+    root_backend_idx: usize,
+    root_finst_id: UniqueId,
+    query_id: &UniqueId,
+    root_uses_result_buffer: bool,
+    timeout_ms: i64,
+    expected_root_chunk_schema: Option<&ChunkSchemaRef>,
+    write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
+    collect_profiles: bool,
+    observer: &dyn CoordinatorObserver,
+    mut installed_runtime_filter_deployment: Option<InstalledRuntimeFilterDeployment>,
+) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
     let runtime_query_id = crate::runtime::query_context::QueryId {
         hi: query_id.hi,
@@ -1732,14 +1881,21 @@ pub(crate) fn submit_and_fetch_loop(
     };
     let _failure_guard = StandaloneQueryFailureGuard::register(query_id);
     let _profile_guard = collect_profiles.then(|| StandaloneQueryProfileGuard::register(query_id));
-    let validated_finst_ids = prevalidate_fragment_submissions(
+    let validated_finst_ids = match prevalidate_fragment_submissions(
         &submissions,
         *query_id,
         execution_root_fragment_id,
         root_backend_idx,
         root_finst_id,
-    )?;
-
+    ) {
+        Ok(validated_finst_ids) => validated_finst_ids,
+        Err(primary_error) => {
+            return Err(match installed_runtime_filter_deployment.take() {
+                Some(deployment) => deployment.abort_preserving(primary_error),
+                None => primary_error,
+            });
+        }
+    };
     // Register every validated placement before the first remote submission.
     // Otherwise a backend-loss event between submit success and registration
     // can miss the query permanently because the registry emits only the state
@@ -1754,15 +1910,21 @@ pub(crate) fn submit_and_fetch_loop(
     }
 
     for ((backend_idx, submission), finst_id) in submissions.into_iter().zip(validated_finst_ids) {
+        // A unary submit may return an error after the remote participant has
+        // accepted the fragment. Arm cancellation before dispatch so the
+        // unknown-outcome attempt is covered together with prior accepts.
+        tracker.record_submitted(backend_idx, finst_id.clone());
         if let Err(e) = dispatcher.submit_fragment(backend_idx, submission) {
             tracker.cancel_all(dispatcher.as_ref());
-            return Err(e);
+            return Err(match installed_runtime_filter_deployment.take() {
+                Some(deployment) => deployment.abort_preserving(e),
+                None => e,
+            });
         }
         observer.fragment_scheduled();
         if let Some(registry) = crate::coordinator::cluster::backend_registry() {
             registry.record_scheduled_fragment(backend_idx as crate::coordinator::cluster::BeId);
         }
-        tracker.record_submitted(backend_idx, finst_id.clone());
         if crate::runtime::query_state::in_flight_table().state(runtime_query_id)
             == Some(QueryState::Failed)
         {
@@ -1770,8 +1932,15 @@ pub(crate) fn submit_and_fetch_loop(
                 .failure_reason(runtime_query_id)
                 .unwrap_or_else(|| format!("query {} failed", runtime_query_id));
             tracker.cancel_all(dispatcher.as_ref());
-            return Err(reason);
+            return Err(match installed_runtime_filter_deployment.take() {
+                Some(deployment) => deployment.abort_preserving(reason),
+                None => reason,
+            });
         }
+    }
+
+    if let Some(deployment) = installed_runtime_filter_deployment.take() {
+        deployment.release();
     }
 
     let mut chunks = Vec::new();
@@ -2074,6 +2243,20 @@ fn apply_scheduled_plan_test_drift(
     plan
 }
 
+#[cfg(test)]
+fn apply_post_install_assembly_test_drift(
+    mut plan: SchedulingPlan,
+    drift: Option<PostInstallAssemblyTestDrift>,
+) -> SchedulingPlan {
+    if matches!(
+        drift,
+        Some(PostInstallAssemblyTestDrift::MissingRootPlacement)
+    ) {
+        plan.by_fragment.remove(&plan.root_fragment_id);
+    }
+    plan
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2194,6 +2377,7 @@ mod native_contract_tests {
                 crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
                     .expect("report endpoint"),
                 Arc::new(CountingCoordinatorObserver::default()),
+                Arc::new(crate::coordinator::ports::RejectingTestRuntimeFilterDeploymentControl),
             ),
             scheduler,
             query_options,
@@ -2922,7 +3106,7 @@ mod native_contract_tests {
     }
 
     #[test]
-    fn submit_failure_cancels_only_native_instances_already_accepted() {
+    fn submit_failure_cancels_accepted_and_unknown_outcome_native_instances() {
         let inner = CapturingDispatcher::new(Some(2));
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
         let observer = CountingCoordinatorObserver::default();
@@ -2955,7 +3139,10 @@ mod native_contract_tests {
         assert!(err.contains("native submit failed on call 2"), "{err}");
         assert_eq!(
             *inner.cancellations.lock().unwrap(),
-            vec![(1, vec![UniqueId { hi: 92_000, lo: 1 }])]
+            vec![
+                (0, vec![UniqueId { hi: 92_000, lo: 2 }]),
+                (1, vec![UniqueId { hi: 92_000, lo: 1 }]),
+            ]
         );
         assert_eq!(observer.0.load(Ordering::SeqCst), 1);
     }
@@ -3971,5 +4158,855 @@ mod native_contract_tests {
             ],
             "target fragment 4 has no placements",
         );
+    }
+
+    mod runtime_filter_deployment {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::mpsc::{SyncSender, sync_channel};
+        use std::time::Duration;
+
+        use arrow::datatypes::DataType;
+
+        use super::*;
+        use crate::coordinator::ports::{
+            RuntimeFilterDeploymentControlPort, RuntimeFilterDeploymentPolicyProvider,
+        };
+        use crate::coordinator::runtime_filter_deployment::RuntimeFilterInstallBarrier;
+        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+        use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
+        use crate::runtime_filter::model::contract::{
+            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        };
+        use crate::runtime_filter::model::coverage::Coverage;
+        use crate::runtime_filter::model::graph::{
+            ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
+            ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+            RuntimeFilterChannelSpec, RuntimeFilterGraph,
+        };
+        use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+        use crate::runtime_filter::port::install::{
+            RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+        };
+        use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+
+        type InstallGate = tokio::sync::oneshot::Receiver<Result<(), String>>;
+        type AbortGate = tokio::sync::oneshot::Receiver<()>;
+
+        #[derive(Default)]
+        struct RecordingDeploymentControl {
+            install_results: Mutex<BTreeMap<u32, Result<(), String>>>,
+            abort_results: Mutex<BTreeMap<u32, Result<(), String>>>,
+            install_gates: Mutex<BTreeMap<u32, InstallGate>>,
+            abort_gates: Mutex<BTreeMap<u32, AbortGate>>,
+            install_calls: Mutex<Vec<u32>>,
+            abort_calls: Mutex<Vec<u32>>,
+            live_installations: Mutex<BTreeSet<u32>>,
+            tombstones: Mutex<BTreeSet<u32>>,
+            install_side_effect_on_error: Mutex<BTreeSet<u32>>,
+            events: Arc<Mutex<Vec<String>>>,
+            install_started: Mutex<Option<SyncSender<u32>>>,
+            abort_started: Mutex<Option<SyncSender<u32>>>,
+        }
+
+        impl RecordingDeploymentControl {
+            fn with_install_result(
+                self: Arc<Self>,
+                participant: u32,
+                result: Result<(), String>,
+            ) -> Arc<Self> {
+                self.install_results
+                    .lock()
+                    .unwrap()
+                    .insert(participant, result);
+                self
+            }
+
+            fn with_abort_result(
+                self: Arc<Self>,
+                participant: u32,
+                result: Result<(), String>,
+            ) -> Arc<Self> {
+                self.abort_results
+                    .lock()
+                    .unwrap()
+                    .insert(participant, result);
+                self
+            }
+
+            fn with_install_side_effect_on_error(self: Arc<Self>, participant: u32) -> Arc<Self> {
+                self.install_side_effect_on_error
+                    .lock()
+                    .unwrap()
+                    .insert(participant);
+                self
+            }
+
+            fn gate_install(
+                &self,
+                participant: u32,
+            ) -> tokio::sync::oneshot::Sender<Result<(), String>> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.install_gates.lock().unwrap().insert(participant, rx);
+                tx
+            }
+
+            fn gate_abort(&self, participant: u32) -> tokio::sync::oneshot::Sender<()> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.abort_gates.lock().unwrap().insert(participant, rx);
+                tx
+            }
+
+            fn install_calls(&self) -> Vec<u32> {
+                self.install_calls.lock().unwrap().clone()
+            }
+
+            fn abort_calls(&self) -> Vec<u32> {
+                self.abort_calls.lock().unwrap().clone()
+            }
+
+            fn live_installations(&self) -> BTreeSet<u32> {
+                self.live_installations.lock().unwrap().clone()
+            }
+
+            fn tombstones(&self) -> BTreeSet<u32> {
+                self.tombstones.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeFilterDeploymentControlPort for RecordingDeploymentControl {
+            async fn install(
+                &self,
+                _query_id: UniqueId,
+                _lifecycle: RuntimeFilterQueryLifecycleOptions,
+                _deadline: Duration,
+                participant: RuntimeFilterParticipantId,
+                _install: RuntimeFilterParticipantInstall,
+            ) -> Result<(), String> {
+                let participant = participant.get();
+                self.events
+                    .as_ref()
+                    .lock()
+                    .unwrap()
+                    .push(format!("install:{participant}"));
+                self.install_calls.lock().unwrap().push(participant);
+                if let Some(started) = self.install_started.lock().unwrap().as_ref() {
+                    started.send(participant).expect("bounded start receiver");
+                }
+                if self.tombstones.lock().unwrap().contains(&participant) {
+                    return Err(format!(
+                        "runtime filter deployment participant {participant} is tombstoned"
+                    ));
+                }
+                let gate = self.install_gates.lock().unwrap().remove(&participant);
+                let result = if let Some(gate) = gate {
+                    gate.await.expect("install gate sender")
+                } else {
+                    self.install_results
+                        .lock()
+                        .unwrap()
+                        .remove(&participant)
+                        .unwrap_or(Ok(()))
+                };
+                if result.is_ok()
+                    || self
+                        .install_side_effect_on_error
+                        .lock()
+                        .unwrap()
+                        .remove(&participant)
+                {
+                    self.live_installations.lock().unwrap().insert(participant);
+                }
+                result
+            }
+
+            async fn abort(
+                &self,
+                _query_id: UniqueId,
+                _epoch: DeploymentEpoch,
+                _deadline: Duration,
+                participant: RuntimeFilterParticipantId,
+            ) -> Result<(), String> {
+                let participant = participant.get();
+                self.events
+                    .as_ref()
+                    .lock()
+                    .unwrap()
+                    .push(format!("abort:{participant}"));
+                self.abort_calls.lock().unwrap().push(participant);
+                if let Some(started) = self.abort_started.lock().unwrap().as_ref() {
+                    started.send(participant).expect("bounded start receiver");
+                }
+                let gate = self.abort_gates.lock().unwrap().remove(&participant);
+                if let Some(gate) = gate {
+                    gate.await.expect("abort gate sender");
+                }
+                self.tombstones.lock().unwrap().insert(participant);
+                self.live_installations.lock().unwrap().remove(&participant);
+                self.abort_results
+                    .lock()
+                    .unwrap()
+                    .remove(&participant)
+                    .unwrap_or(Ok(()))
+            }
+        }
+
+        struct RecordingPolicyProvider {
+            inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider,
+            calls: AtomicUsize,
+            failure: Option<String>,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl RuntimeFilterDeploymentPolicyProvider for RecordingPolicyProvider {
+            fn policy_for(
+                &self,
+                graph: &RuntimeFilterGraph,
+                backends: &crate::coordinator::cluster::LiveBackendSnapshot,
+            ) -> Result<RuntimeFilterQueryDeploymentPolicy, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.events.lock().unwrap().push("compile".to_string());
+                if let Some(failure) = &self.failure {
+                    return Err(failure.clone());
+                }
+                self.inner.policy_for(graph, backends)
+            }
+        }
+
+        fn lifecycle() -> RuntimeFilterQueryLifecycleOptions {
+            RuntimeFilterQueryLifecycleOptions {
+                delivery_expire: Duration::from_secs(5),
+                query_expire: Duration::from_secs(30),
+                transport_retry_interval: Duration::from_millis(200),
+                transport_max_attempts: 3,
+                transport_deadline: Duration::from_secs(2),
+                transport_max_pending_entries: 1024,
+                transport_max_pending_bytes: 1 << 20,
+            }
+        }
+
+        fn participant_install(participant: u32) -> RuntimeFilterParticipantInstall {
+            let epoch = DeploymentEpoch::new(17);
+            let participant = RuntimeFilterParticipantId::new(participant);
+            RuntimeFilterParticipantInstall::new(
+                RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
+                RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                    .expect("empty test routing shard"),
+            )
+        }
+
+        fn installed_deployment(
+            control: Arc<RecordingDeploymentControl>,
+            query_id: UniqueId,
+            participants: &[u32],
+        ) -> InstalledRuntimeFilterDeployment {
+            RuntimeFilterInstallBarrier::new(control)
+                .install_all_or_rollback(
+                    query_id,
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    participants
+                        .iter()
+                        .map(|participant| {
+                            (
+                                RuntimeFilterParticipantId::new(*participant),
+                                participant_install(*participant),
+                            )
+                        })
+                        .collect(),
+                )
+                .expect("test deployment installs")
+        }
+
+        fn membership_graph() -> RuntimeFilterGraph {
+            let channel_id = ChannelId::new(1);
+            let witness = CoverageWitnessId::new(1);
+            let location = PlanLocation {
+                fragment_id: PlanFragmentId::new(7),
+                node_id: PlanNodeId::new(70),
+            };
+            let expression = || TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(1)),
+                data_type: DataType::Int64,
+                nullable: false,
+            };
+            let mut graph = RuntimeFilterGraph::default();
+            graph
+                .insert_channel(RuntimeFilterChannelSpec {
+                    channel_id,
+                    logical_domain: RuntimeFilterLogicalDomain::Membership {
+                        value_type: DataType::Int64,
+                        null_semantics: NullSemantics::NeverMatches,
+                    },
+                    lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                    availability_coverage: Coverage::Leaf(witness),
+                    terminal_coverage: Coverage::Leaf(witness),
+                    reduction_requirement: ReductionRequirement::SetUnion,
+                    allowed_contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    required_consumer_capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    policy: RuntimeFilterPolicyRequirement {
+                        max_contribution_bytes: 1024,
+                        max_artifact_bytes: 4096,
+                        deadline_ms: 2_000,
+                        max_retries: 2,
+                    },
+                })
+                .unwrap();
+            graph
+                .insert_binding(RuntimeFilterBindingSpec {
+                    binding_id: BindingId::new(1),
+                    channel_id,
+                    coverage_witness_id: Some(witness),
+                    location,
+                    expression: expression(),
+                    apply_point: ApplyPoint::NodeOutput,
+                    role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                        contribution_kinds: BTreeSet::from([
+                            ContributionKind::ValueDomainDelta,
+                            ContributionKind::ProducerClosed,
+                        ]),
+                        completion_requirement: CompletionRequirement::ProducerClosed,
+                        join_key_ordinal: 0,
+                    }),
+                })
+                .unwrap();
+            graph
+                .insert_binding(RuntimeFilterBindingSpec {
+                    binding_id: BindingId::new(2),
+                    channel_id,
+                    coverage_witness_id: None,
+                    location,
+                    expression: expression(),
+                    apply_point: ApplyPoint::NodeInput,
+                    role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                        capabilities: BTreeSet::from([
+                            ArtifactCapability::Membership,
+                            ArtifactCapability::EmptyDomain,
+                        ]),
+                        activation: ConsumerActivation::NonBlockingLive {
+                            late_apply: LateApplyGranularity::Batch,
+                        },
+                        target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
+                    }),
+                })
+                .unwrap();
+            graph
+        }
+
+        fn execution_artifacts(
+            graph: RuntimeFilterGraph,
+        ) -> (PreparedFragmentSet, NativeFragmentBundle) {
+            let fragment = PlanFragment {
+                fragment_id: 7,
+                root: DistributedNode {
+                    node_id: 70,
+                    fragment_id: 7,
+                    tuple_ids: vec![70],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    runtime_filter_binding_ids: if graph.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![BindingId::new(1), BindingId::new(2)]
+                    },
+                    children: Vec::new(),
+                    stats: PhysicalPlanStats {
+                        output_row_count: 0.0,
+                        row_count_confidence: PlannerConfidence::Fallback,
+                        column_statistics: Default::default(),
+                        cost_estimate: None,
+                        broadcast_decision: None,
+                    },
+                    payload: DistributedNodeKind::Values(PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    }),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            };
+            let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+                fragments: vec![fragment],
+                root_fragment_id: 7,
+                edges: Vec::new(),
+                runtime_filter_graph: graph,
+            };
+            let prepared = crate::coordinator::prepare::prepare_fragments(
+                &plan,
+                &crate::connector::ConnectorRegistry::new(),
+                None,
+            )
+            .expect("prepare runtime-filter execution artifact");
+            let native_bundle =
+                crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
+                    .expect("encode runtime-filter execution artifact");
+            (prepared, native_bundle)
+        }
+
+        fn scheduler() -> Arc<FragmentScheduler> {
+            Arc::new(FragmentScheduler::new_with_backend_ids(vec![(
+                0,
+                "127.0.0.1:19031".parse().unwrap(),
+            )]))
+        }
+
+        fn coordinator(
+            graph: RuntimeFilterGraph,
+            dispatcher: Arc<CapturingDispatcher>,
+            control: Arc<dyn RuntimeFilterDeploymentControlPort>,
+            policy_provider: Arc<dyn RuntimeFilterDeploymentPolicyProvider>,
+        ) -> ExecutionCoordinator {
+            let (prepared, native_bundle) = execution_artifacts(graph);
+            let mut ports = CoordinatorExecutionPorts::new(
+                dispatcher,
+                crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
+                Arc::new(CountingCoordinatorObserver::default()),
+                control,
+            );
+            ports.runtime_filter_policy_provider = policy_provider;
+            ExecutionCoordinator::new(prepared, native_bundle, ports, scheduler(), None)
+        }
+
+        fn native_policy(events: Arc<Mutex<Vec<String>>>) -> Arc<RecordingPolicyProvider> {
+            Arc::new(RecordingPolicyProvider {
+                inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider::new(2),
+                calls: AtomicUsize::new(0),
+                failure: None,
+                events,
+            })
+        }
+
+        #[test]
+        fn nonempty_graph_compiles_after_schedule_before_install() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let control = Arc::new(RecordingDeploymentControl {
+                events: events.clone(),
+                ..Default::default()
+            });
+            let dispatcher = CapturingDispatcher::new(None);
+            coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                control.clone(),
+                native_policy(events.clone()),
+            )
+            .execute_with_write_outcome()
+            .expect("compiled deployment installs before fragment submission");
+
+            assert_eq!(events.lock().unwrap().as_slice(), ["compile", "install:1"]);
+            assert_eq!(control.install_calls(), vec![1]);
+            assert!(control.abort_calls().is_empty());
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn post_install_assembly_failure_aborts_every_acknowledged_participant() {
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_abort_result(1, Err("rollback failed at backend-zero".to_string()));
+            let dispatcher = CapturingDispatcher::new(None);
+            let mut coordinator = coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                control.clone(),
+                native_policy(Arc::new(Mutex::new(Vec::new()))),
+            );
+            coordinator.post_install_assembly_test_drift =
+                Some(PostInstallAssemblyTestDrift::MissingRootPlacement);
+
+            let error = coordinator
+                .execute_with_write_outcome()
+                .expect_err("post-install assembly failure must roll back the ACKed deployment");
+
+            assert!(
+                error.starts_with("native fragments remained after submission assembly"),
+                "{error}"
+            );
+            assert!(error.contains("rollback failures"), "{error}");
+            assert!(error.contains("participant 1"), "{error}");
+            assert!(error.contains("rollback failed at backend-zero"), "{error}");
+            assert_eq!(control.install_calls(), vec![1]);
+            assert_eq!(control.abort_calls(), vec![1]);
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn fragment_submit_waits_for_every_install_ack() {
+            let (started_tx, started_rx) = sync_channel(2);
+            let control = Arc::new(RecordingDeploymentControl {
+                install_started: Mutex::new(Some(started_tx)),
+                ..Default::default()
+            });
+            let first = control.gate_install(1);
+            let second = control.gate_install(2);
+            let (submitted_tx, submitted_rx) = sync_channel(1);
+            let barrier_control = control.clone();
+            std::thread::spawn(move || {
+                let result = RuntimeFilterInstallBarrier::new(barrier_control)
+                    .install_all_or_rollback(
+                        UniqueId { hi: 1, lo: 2 },
+                        DeploymentEpoch::new(17),
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        vec![
+                            (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                            (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                        ],
+                    )
+                    .map(InstalledRuntimeFilterDeployment::release);
+                submitted_tx.send(result).unwrap();
+            });
+
+            let mut started = BTreeSet::new();
+            started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            assert_eq!(started, BTreeSet::from([1, 2]));
+            first.send(Ok(())).unwrap();
+            assert!(submitted_rx.try_recv().is_err());
+            second.send(Ok(())).unwrap();
+            assert!(
+                submitted_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn unreleased_deployment_drop_aborts_every_participant() {
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let deployment = installed_deployment(
+                control.clone(),
+                UniqueId {
+                    hi: 95_000,
+                    lo: 95_001,
+                },
+                &[1, 2],
+            );
+
+            drop(deployment);
+
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+        }
+
+        #[test]
+        fn install_unknown_outcome_submits_zero_fragments_and_aborts_every_attempted_participant() {
+            let integrated_control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(1, Err("coordinator install refused".to_string()));
+            let dispatcher = CapturingDispatcher::new(None);
+            let integrated_error = coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                integrated_control,
+                native_policy(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .execute_with_write_outcome()
+            .expect_err("install failure must stop the real coordinator before submission");
+            assert!(
+                integrated_error.contains("coordinator install refused"),
+                "{integrated_error}"
+            );
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
+
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(2, Err("install ACK was lost".to_string()))
+                .with_install_side_effect_on_error(2);
+            let submitted = AtomicUsize::new(0);
+            let error = RuntimeFilterInstallBarrier::new(control.clone())
+                .install_all_or_rollback(
+                    UniqueId { hi: 3, lo: 4 },
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    vec![
+                        (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                        (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                    ],
+                )
+                .map(|deployment| {
+                    deployment.release();
+                    submitted.fetch_add(1, Ordering::SeqCst)
+                })
+                .err()
+                .expect("install failure must trigger rollback");
+
+            assert!(error.contains("participant 2"), "{error}");
+            assert!(error.contains("install ACK was lost"), "{error}");
+            assert_eq!(submitted.load(Ordering::SeqCst), 0);
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+
+            let late_install = crate::runtime::global_async_runtime::data_block_on(async {
+                control
+                    .install(
+                        UniqueId { hi: 3, lo: 4 },
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        RuntimeFilterParticipantId::new(2),
+                        participant_install(2),
+                    )
+                    .await
+            })
+            .expect("data runtime remains available")
+            .expect_err("rollback tombstone must reject a late install");
+            assert!(late_install.contains("tombstoned"), "{late_install}");
+            assert!(control.live_installations().is_empty());
+        }
+
+        #[test]
+        fn rollback_fans_out_to_every_attempted_participant_in_parallel() {
+            let (started_tx, started_rx) = sync_channel(2);
+            let control = Arc::new(RecordingDeploymentControl {
+                abort_started: Mutex::new(Some(started_tx)),
+                ..Default::default()
+            })
+            .with_install_result(2, Err("install outcome unknown".to_string()));
+            let first_abort = control.gate_abort(1);
+            let second_abort = control.gate_abort(2);
+            let (result_tx, result_rx) = sync_channel(1);
+            let barrier_control = control.clone();
+            std::thread::spawn(move || {
+                let result = RuntimeFilterInstallBarrier::new(barrier_control)
+                    .install_all_or_rollback(
+                        UniqueId { hi: 8, lo: 9 },
+                        DeploymentEpoch::new(17),
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        vec![
+                            (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                            (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                        ],
+                    );
+                result_tx.send(result).expect("bounded result receiver");
+            });
+
+            let mut started = BTreeSet::new();
+            started.insert(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("first rollback starts"),
+            );
+            started.insert(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("second rollback starts"),
+            );
+            assert_eq!(started, BTreeSet::from([1, 2]));
+            assert!(
+                result_rx.try_recv().is_err(),
+                "rollback must wait for every participant"
+            );
+            first_abort.send(()).expect("release first rollback");
+            second_abort.send(()).expect("release second rollback");
+
+            let error = result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("barrier returns after rollback fanout")
+                .err()
+                .expect("unknown install outcome remains the primary error");
+            assert!(error.contains("install outcome unknown"), "{error}");
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+        }
+
+        #[test]
+        fn first_submit_failure_cancels_in_flight_fragment_and_aborts_entire_deployment() {
+            let query_id = UniqueId {
+                hi: 96_000,
+                lo: 96_001,
+            };
+            let first_finst_id = UniqueId { hi: 96_000, lo: 1 };
+            let root_finst_id = UniqueId { hi: 96_000, lo: 2 };
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let deployment = installed_deployment(control.clone(), query_id, &[1, 2]);
+            let dispatcher = CapturingDispatcher::new(Some(1));
+            let dispatcher_port: Arc<dyn FragmentDispatcher> = dispatcher.clone();
+            let mut tracker = InFlightTracker::default();
+
+            let error = submit_and_fetch_loop_with_deployment_lease(
+                &dispatcher_port,
+                &mut tracker,
+                vec![
+                    (1, submission(3, query_id, first_finst_id)),
+                    (0, submission(7, query_id, root_finst_id)),
+                ],
+                7,
+                0,
+                root_finst_id,
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+                &CountingCoordinatorObserver::default(),
+                Some(deployment),
+            )
+            .expect_err("first submit failure must abort the installed deployment");
+
+            assert!(
+                error.starts_with("native submit failed on call 1"),
+                "{error}"
+            );
+            assert_eq!(
+                *dispatcher.cancellations.lock().unwrap(),
+                vec![(1, vec![first_finst_id])]
+            );
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+            assert_eq!(
+                crate::runtime::query_state::in_flight_table().state(
+                    crate::runtime::query_context::QueryId {
+                        hi: query_id.hi,
+                        lo: query_id.lo,
+                    }
+                ),
+                None,
+                "failed submission must not leak a query-state registration"
+            );
+        }
+
+        #[test]
+        fn middle_submit_failure_cancels_every_attempt_and_preserves_abort_context() {
+            let query_id = UniqueId {
+                hi: 97_000,
+                lo: 97_001,
+            };
+            let first_finst_id = UniqueId { hi: 97_000, lo: 1 };
+            let root_finst_id = UniqueId { hi: 97_000, lo: 2 };
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_abort_result(2, Err("participant-two abort failed".to_string()));
+            let deployment = installed_deployment(control.clone(), query_id, &[1, 2]);
+            let dispatcher = CapturingDispatcher::new(Some(2));
+            let dispatcher_port: Arc<dyn FragmentDispatcher> = dispatcher.clone();
+            let mut tracker = InFlightTracker::default();
+
+            let error = submit_and_fetch_loop_with_deployment_lease(
+                &dispatcher_port,
+                &mut tracker,
+                vec![
+                    (1, submission(3, query_id, first_finst_id)),
+                    (0, submission(7, query_id, root_finst_id)),
+                ],
+                7,
+                0,
+                root_finst_id,
+                &query_id,
+                true,
+                1_000,
+                None,
+                None,
+                false,
+                &CountingCoordinatorObserver::default(),
+                Some(deployment),
+            )
+            .expect_err("middle submit failure must abort the installed deployment");
+
+            assert!(
+                error.starts_with("native submit failed on call 2"),
+                "{error}"
+            );
+            assert!(error.contains("rollback failures"), "{error}");
+            assert!(error.contains("participant-two abort failed"), "{error}");
+            assert_eq!(
+                *dispatcher.cancellations.lock().unwrap(),
+                vec![(0, vec![root_finst_id]), (1, vec![first_finst_id]),]
+            );
+            assert_eq!(control.abort_calls(), vec![1, 2]);
+            assert!(control.live_installations().is_empty());
+            assert_eq!(control.tombstones(), BTreeSet::from([1, 2]));
+        }
+
+        #[test]
+        fn rollback_failure_preserves_primary_install_error_with_context() {
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(2, Err("primary install failure at endpoint-b".to_string()))
+                .with_abort_result(1, Err("rollback failure at endpoint-a".to_string()));
+            let error = RuntimeFilterInstallBarrier::new(control)
+                .install_all_or_rollback(
+                    UniqueId { hi: 5, lo: 6 },
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    vec![
+                        (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                        (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                    ],
+                )
+                .err()
+                .expect("install failure must preserve rollback context");
+
+            assert!(error.contains("participant 2"), "{error}");
+            assert!(
+                error.contains("primary install failure at endpoint-b"),
+                "{error}"
+            );
+            assert!(error.contains("rollback failures"), "{error}");
+            assert!(error.contains("participant 1"), "{error}");
+            assert!(error.contains("rollback failure at endpoint-a"), "{error}");
+        }
+
+        #[test]
+        fn empty_graph_sends_zero_install_rpc() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let policy = native_policy(events);
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let dispatcher = CapturingDispatcher::new(None);
+            coordinator(
+                RuntimeFilterGraph::default(),
+                dispatcher.clone(),
+                control.clone(),
+                policy.clone(),
+            )
+            .execute_with_write_outcome()
+            .expect("empty graph bypasses deployment");
+
+            assert_eq!(policy.calls.load(Ordering::SeqCst), 0);
+            assert!(control.install_calls().is_empty());
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn compile_failure_sends_zero_install_and_zero_submit() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let policy = Arc::new(RecordingPolicyProvider {
+                inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider::new(2),
+                calls: AtomicUsize::new(0),
+                failure: Some("compile phase rejected policy".to_string()),
+                events,
+            });
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let dispatcher = CapturingDispatcher::new(None);
+            let error = coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                control.clone(),
+                policy,
+            )
+            .execute_with_write_outcome()
+            .expect_err("compile phase failure must stop deployment");
+
+            assert!(error.contains("compile phase rejected policy"), "{error}");
+            assert!(control.install_calls().is_empty());
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
+        }
     }
 }

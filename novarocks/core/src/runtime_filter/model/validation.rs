@@ -29,10 +29,7 @@ use super::graph::{
     ApplyPoint, ConsumerRequirement, ProducerRequirement, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
 };
-
-pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1 << 30;
-pub(crate) const MAX_DEADLINE_MS: u64 = 86_400_000;
-pub(crate) const MAX_RETRIES: u32 = 100;
+use super::policy::{RuntimeFilterPolicyValidationError, validate_runtime_filter_policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PolicyField {
@@ -276,48 +273,35 @@ fn validate_policy(
     channel_id: ChannelId,
     policy: RuntimeFilterPolicyRequirement,
 ) -> Result<(), GraphValidationError> {
-    let zero_field = if policy.max_contribution_bytes == 0 {
-        Some(PolicyField::MaxContributionBytes)
-    } else if policy.max_artifact_bytes == 0 {
-        Some(PolicyField::MaxArtifactBytes)
-    } else if policy.deadline_ms == 0 {
-        Some(PolicyField::DeadlineMs)
-    } else if policy.max_retries == 0 {
-        Some(PolicyField::MaxRetries)
-    } else {
-        None
-    };
-    if let Some(field) = zero_field {
-        return Err(channel_error(
-            channel_id,
-            GraphValidationErrorKind::ZeroPolicyValue(field),
-        ));
-    }
-    if policy.max_contribution_bytes > policy.max_artifact_bytes {
-        return Err(channel_error(
-            channel_id,
-            GraphValidationErrorKind::ContributionBytesExceedArtifactBytes,
-        ));
-    }
-    if policy.max_artifact_bytes > MAX_ARTIFACT_BYTES {
-        return Err(channel_error(
-            channel_id,
-            GraphValidationErrorKind::ArtifactBytesExceedLimit,
-        ));
-    }
-    if policy.deadline_ms > MAX_DEADLINE_MS {
-        return Err(channel_error(
-            channel_id,
-            GraphValidationErrorKind::DeadlineExceedsLimit,
-        ));
-    }
-    if policy.max_retries > MAX_RETRIES {
-        return Err(channel_error(
-            channel_id,
-            GraphValidationErrorKind::RetriesExceedLimit,
-        ));
-    }
-    Ok(())
+    validate_runtime_filter_policy(policy).map_err(|error| {
+        let kind = match error {
+            RuntimeFilterPolicyValidationError::ZeroMaxContributionBytes => {
+                GraphValidationErrorKind::ZeroPolicyValue(PolicyField::MaxContributionBytes)
+            }
+            RuntimeFilterPolicyValidationError::ZeroMaxArtifactBytes => {
+                GraphValidationErrorKind::ZeroPolicyValue(PolicyField::MaxArtifactBytes)
+            }
+            RuntimeFilterPolicyValidationError::ZeroDeadlineMs => {
+                GraphValidationErrorKind::ZeroPolicyValue(PolicyField::DeadlineMs)
+            }
+            RuntimeFilterPolicyValidationError::ZeroMaxRetries => {
+                GraphValidationErrorKind::ZeroPolicyValue(PolicyField::MaxRetries)
+            }
+            RuntimeFilterPolicyValidationError::ContributionBytesExceedArtifactBytes => {
+                GraphValidationErrorKind::ContributionBytesExceedArtifactBytes
+            }
+            RuntimeFilterPolicyValidationError::ArtifactBytesExceedLimit => {
+                GraphValidationErrorKind::ArtifactBytesExceedLimit
+            }
+            RuntimeFilterPolicyValidationError::DeadlineExceedsLimit => {
+                GraphValidationErrorKind::DeadlineExceedsLimit
+            }
+            RuntimeFilterPolicyValidationError::RetriesExceedLimit => {
+                GraphValidationErrorKind::RetriesExceedLimit
+            }
+        };
+        channel_error(channel_id, kind)
+    })
 }
 
 fn validate_channel_matrix(channel: &RuntimeFilterChannelSpec) -> Result<(), GraphValidationError> {
@@ -671,6 +655,7 @@ mod tests {
     use super::super::coverage::{Coverage, CoverageShapeError};
     use super::super::graph::tests::*;
     use super::super::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+    use super::super::policy::{MAX_ARTIFACT_BYTES, MAX_DEADLINE_MS, MAX_RETRIES};
     use super::*;
 
     fn join_graph() -> RuntimeFilterGraph {

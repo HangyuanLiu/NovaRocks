@@ -19,6 +19,7 @@ syntax = "proto3";
 package novarocks.filter;
 
 import "common.proto";  // novarocks.common.{Status, UniqueId, TypeDesc}
+import "plan.proto";
 
 // Runtime-filter transmission. Producer: src/exec/operators/hashjoin/
 // hash_join_build_sink.rs + src/runtime/runtime_filter_worker.rs. Consumer:
@@ -72,6 +73,9 @@ enum RuntimeFilterEnvelopeKind {
   RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_CLOSED = 3;
   RUNTIME_FILTER_ENVELOPE_KIND_UNAVAILABLE = 4;
   RUNTIME_FILTER_ENVELOPE_KIND_ACK = 5;
+  RUNTIME_FILTER_ENVELOPE_KIND_COMPLETED_WITHOUT_ARTIFACT = 6;
+  RUNTIME_FILTER_ENVELOPE_KIND_DEGRADED_LOGICAL = 7;
+  RUNTIME_FILTER_ENVELOPE_KIND_FINAL_ARTIFACT = 8;
 }
 
 message RuntimeFilterContributionRouteIdentity {
@@ -119,4 +123,227 @@ message RuntimeFilterEnvelopeResponse {
   RuntimeFilterRouteIdentity acked_route_identity = 1;
   RuntimeFilterAcceptStatus accept_status = 2;
   string rejection_reason = 3;
+}
+
+// Query-scoped lifetimes and reliable-transport limits installed before any
+// fragment is submitted. Every duration and limit is required to be nonzero.
+message RuntimeFilterQueryLifecycleOptions {
+  uint64 delivery_expire_ms = 1;
+  uint64 query_expire_ms = 2;
+  uint64 transport_retry_interval_ms = 3;
+  uint64 transport_max_attempts = 4;
+  uint64 transport_deadline_ms = 5;
+  uint64 transport_max_pending_entries = 6;
+  uint64 transport_max_pending_bytes = 7;
+}
+
+enum RuntimeFilterLifecycle {
+  RUNTIME_FILTER_LIFECYCLE_UNSPECIFIED = 0;
+  RUNTIME_FILTER_LIFECYCLE_COMPLETE_ONCE = 1;
+  RUNTIME_FILTER_LIFECYCLE_MONOTONIC_UPDATES = 2;
+}
+
+message RuntimeFilterCoverage {
+  oneof kind {
+    uint32 leaf_witness_id = 1;
+    RuntimeFilterCoverageAllOf all_of = 2;
+    RuntimeFilterCoverageAnyOf any_of = 3;
+  }
+}
+
+message RuntimeFilterCoverageAllOf {
+  repeated RuntimeFilterCoverage children = 1;
+}
+
+message RuntimeFilterCoverageAnyOf {
+  repeated RuntimeFilterCoverage children = 1;
+}
+
+message RuntimeFilterPolicyRequirement {
+  uint64 max_contribution_bytes = 1;
+  uint64 max_artifact_bytes = 2;
+  uint64 deadline_ms = 3;
+  uint32 max_retries = 4;
+}
+
+message RuntimeFilterCoreBudget {
+  uint64 max_reducer_bytes = 1;
+}
+
+message RuntimeFilterMaterializationPolicy {
+  uint64 bloom_bits_per_key = 1;
+  uint32 bloom_hash_count = 2;
+  uint64 bloom_seed = 3;
+  uint32 bloom_algorithm_version = 4;
+  uint64 max_total_retained_bytes = 5;
+  uint64 max_scratch_bytes_per_job = 6;
+  uint64 max_concurrent_jobs = 7;
+}
+
+enum RuntimeFilterArtifactKind {
+  RUNTIME_FILTER_ARTIFACT_KIND_UNSPECIFIED = 0;
+  RUNTIME_FILTER_ARTIFACT_KIND_VALUE_SET = 1;
+  RUNTIME_FILTER_ARTIFACT_KIND_BLOOM = 2;
+  RUNTIME_FILTER_ARTIFACT_KIND_BITSET = 3;
+  RUNTIME_FILTER_ARTIFACT_KIND_RANGE = 4;
+  RUNTIME_FILTER_ARTIFACT_KIND_EMPTY_DOMAIN = 5;
+}
+
+message RuntimeFilterConsumerArtifactProfile {
+  repeated RuntimeFilterArtifactKind accepted_kinds = 1;
+  optional bytes bloom_hash_contract = 2;
+  optional bytes order_contract_digest = 3;
+  bytes profile_id = 4;
+}
+
+message RuntimeFilterProducerDeployment {
+  uint32 binding_id = 1;
+  uint32 coverage_witness_id = 2;
+  repeated novarocks.common.UniqueId expected_fragment_instances = 3;
+}
+
+message RuntimeFilterConsumerDeployment {
+  uint32 binding_id = 1;
+  novarocks.plan.RuntimeFilterConsumerActivation activation = 2;
+  repeated novarocks.plan.RuntimeFilterArtifactCapability capabilities = 3;
+  RuntimeFilterConsumerArtifactProfile artifact_profile = 4;
+  repeated uint32 route_edge_ids = 5;
+  repeated novarocks.common.UniqueId expected_fragment_instances = 6;
+}
+
+enum RuntimeFilterOutboundMaterializationOwner {
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_UNSPECIFIED = 0;
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_DIRECT_SOURCE = 1;
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_AGGREGATOR = 2;
+}
+
+message RuntimeFilterOutboundMaterializationGroup {
+  RuntimeFilterOutboundMaterializationOwner owner = 1;
+  RuntimeFilterConsumerArtifactProfile artifact_profile = 2;
+  repeated uint32 route_edge_ids = 3;
+}
+
+// The TypeDesc supplies the expression/value type required by the shared plan
+// contract decoder; the contract remains the canonical typed logical-domain
+// authority and cross-checks this type.
+message RuntimeFilterLogicalDomain {
+  novarocks.common.TypeDesc value_type = 1;
+  novarocks.plan.RuntimeFilterContract contract = 2;
+}
+
+message RuntimeFilterChannelDeployment {
+  uint32 channel_id = 1;
+  RuntimeFilterLogicalDomain logical_domain = 2;
+  RuntimeFilterLifecycle lifecycle = 3;
+  RuntimeFilterCoverage availability_coverage = 4;
+  RuntimeFilterCoverage terminal_coverage = 5;
+  novarocks.plan.RuntimeFilterReductionContract reduction = 6;
+  repeated novarocks.plan.RuntimeFilterContributionKind allowed_contribution_kinds = 7;
+  novarocks.plan.RuntimeFilterCompletionRequirement completion_requirement = 8;
+  RuntimeFilterPolicyRequirement policy = 9;
+  RuntimeFilterCoreBudget core_budget = 10;
+  RuntimeFilterMaterializationPolicy materialization_policy = 11;
+  repeated RuntimeFilterProducerDeployment producers = 12;
+  repeated RuntimeFilterConsumerDeployment consumers = 13;
+  repeated RuntimeFilterOutboundMaterializationGroup outbound_materialization_groups = 14;
+}
+
+message RuntimeFilterRouteRole {
+  oneof role {
+    uint32 producer_binding_id = 1;
+    bool aggregator = 2;
+    bool relay = 3;
+    uint32 consumer_binding_id = 4;
+  }
+}
+
+message RuntimeFilterRouteEndpointView {
+  uint32 participant_id = 1;
+  RuntimeFilterRouteRole role = 2;
+}
+
+message RuntimeFilterRemotePeer {
+  uint32 participant_id = 1;
+  string endpoint = 2;
+}
+
+message RuntimeFilterRoutePeer {
+  oneof peer {
+    bool loopback = 1;
+    RuntimeFilterRemotePeer remote = 2;
+  }
+}
+
+message RuntimeFilterRoutingEdgeView {
+  uint32 route_edge_id = 1;
+  RuntimeFilterRouteEndpointView source = 2;
+  RuntimeFilterRouteEndpointView target = 3;
+  RuntimeFilterRoutePeer peer = 4;
+  repeated RuntimeFilterEnvelopeKind allowed_kinds = 5;
+}
+
+message RuntimeFilterProducerInstanceRoute {
+  uint32 binding_id = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  uint32 participant_id = 3;
+}
+
+message RuntimeFilterChannelRoutingView {
+  uint32 channel_id = 1;
+  repeated RuntimeFilterRouteRole local_roles = 2;
+  repeated RuntimeFilterProducerInstanceRoute producer_instances = 3;
+  repeated RuntimeFilterRoutingEdgeView inbound_edges = 4;
+  repeated RuntimeFilterRoutingEdgeView outbound_edges = 5;
+}
+
+// Query/epoch/participant are intentionally owned by the enclosing request.
+// Repeated entry messages preserve duplicate logical keys for strict decoding.
+message RuntimeFilterParticipantInstall {
+  repeated RuntimeFilterChannelDeployment core_channels = 1;
+  repeated RuntimeFilterChannelRoutingView routing_channels = 2;
+}
+
+message InstallRuntimeFilterDeploymentRequest {
+  novarocks.common.UniqueId query_id = 1;
+  uint64 deployment_epoch = 2;
+  uint32 participant_id = 3;
+  RuntimeFilterQueryLifecycleOptions lifecycle = 4;
+  RuntimeFilterParticipantInstall install = 5;
+}
+
+enum RuntimeFilterDeploymentResponseStatus {
+  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_UNSPECIFIED = 0;
+  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_APPLIED = 1;
+  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_IDEMPOTENT = 2;
+  RUNTIME_FILTER_DEPLOYMENT_RESPONSE_STATUS_REJECTED = 3;
+}
+
+enum RuntimeFilterDeploymentRejectionCode {
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_UNSPECIFIED = 0;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INVALID_REQUEST = 1;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_STALE_EPOCH = 2;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_CONFLICTING_DEPLOYMENT = 3;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_QUERY_ABORTED = 4;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_ACTIVE_FRAGMENTS = 5;
+  RUNTIME_FILTER_DEPLOYMENT_REJECTION_CODE_INTERNAL = 6;
+}
+
+message RuntimeFilterDeploymentRejection {
+  RuntimeFilterDeploymentRejectionCode code = 1;
+  string reason = 2;
+}
+
+message InstallRuntimeFilterDeploymentResponse {
+  RuntimeFilterDeploymentResponseStatus status = 1;
+  optional RuntimeFilterDeploymentRejection rejection = 2;
+}
+
+message AbortRuntimeFilterDeploymentRequest {
+  novarocks.common.UniqueId query_id = 1;
+  uint64 deployment_epoch = 2;
+}
+
+message AbortRuntimeFilterDeploymentResponse {
+  RuntimeFilterDeploymentResponseStatus status = 1;
+  optional RuntimeFilterDeploymentRejection rejection = 2;
 }

@@ -35,6 +35,32 @@ pub(crate) enum RuntimeFilterRouteRole {
     Consumer(BindingId),
 }
 
+pub(crate) fn canonical_route_allowed_kinds(
+    source: RuntimeFilterRouteRole,
+    target: RuntimeFilterRouteRole,
+) -> Option<BTreeSet<RuntimeFilterEnvelopeKind>> {
+    match (source, target) {
+        (RuntimeFilterRouteRole::Producer(_), RuntimeFilterRouteRole::Consumer(_))
+        | (RuntimeFilterRouteRole::Aggregator, RuntimeFilterRouteRole::Consumer(_)) => {
+            Some(BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+            ]))
+        }
+        (RuntimeFilterRouteRole::Producer(_), RuntimeFilterRouteRole::Aggregator) => {
+            Some(BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterRouteEndpointView {
     participant_id: RuntimeFilterParticipantId,
@@ -342,7 +368,11 @@ impl RuntimeFilterDeliveryRouteIntent {
         reject_zero(channel_id.get(), "channel id")?;
         if !matches!(
             envelope_kind,
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable
+            RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         ) {
             return Err(RuntimeFilterRouteContractError::ForbiddenDeliveryKind {
                 channel: channel_id,
@@ -845,6 +875,31 @@ mod tests {
             Some(RuntimeFilterParticipantId::new(2))
         );
         assert_eq!(channel.outbound_edges(), &[edge]);
+    }
+
+    #[test]
+    fn canonical_delivery_family_includes_exact_terminal_kinds() {
+        let expected = BTreeSet::from([
+            RuntimeFilterEnvelopeKind::Artifact,
+            RuntimeFilterEnvelopeKind::Unavailable,
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            RuntimeFilterEnvelopeKind::DegradedLogical,
+            RuntimeFilterEnvelopeKind::FinalArtifact,
+        ]);
+        assert_eq!(
+            canonical_route_allowed_kinds(
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            canonical_route_allowed_kinds(
+                RuntimeFilterRouteRole::Aggregator,
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            ),
+            Some(expected)
+        );
     }
 
     #[test]

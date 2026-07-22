@@ -44,9 +44,8 @@
 //! buffer, so this module only emits for frames it actually holds.
 //!
 //! Retry and deadline timing are driven by the injected [`RuntimeFilterClock`] and
-//! an explicit `drive_retries(now)` call: there is no background thread and no live
-//! timer here. The live network sender and the production tick loop are RFD-6; this
-//! task builds only the substrate and exercises it through an injectable fake sink.
+//! the query manager's bounded production tick. There is no per-query background
+//! thread or timer here.
 //!
 //! The transport is kind-agnostic: it keys, waits, and releases purely by delivery
 //! route identity. It never inspects the producer's semantic kind (Join / TopN /
@@ -66,9 +65,18 @@ use crate::runtime_filter::port::identity::{ProducerSequence, RouteEdgeId};
 use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
 use crate::runtime_filter::port::support::RuntimeFilterClock;
 use crate::runtime_filter::port::transport::{
-    DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity,
+    DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+    RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
 };
-use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+use crate::runtime_filter::router::remote::{
+    RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+};
+use crate::service::grpc_runtime_filter_sender::GrpcRuntimeFilterEnvelopeSink;
+
+use super::{
+    CloseRole, FinalizerCompletion, LifecycleBarrier, LifecyclePermit, finish_finalizer_panic,
+    retain_first_finalizer_panic,
+};
 
 /// Bounded retry / deadline / buffer policy for the reliable transport.
 ///
@@ -85,7 +93,7 @@ use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 /// this milestone. Offering a frame that would exceed either returns
 /// [`ReliableSendOutcome::ResourceLimit`] instead of buffering: an explicit resource
 /// rejection, distinct from the deadline fail-open degradation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReliableTransportPolicy {
     retry_interval: Duration,
     max_attempts: u32,
@@ -188,6 +196,7 @@ impl PendingKey {
 struct PendingEntry {
     frame: Arc<EncodedArtifactFrame>,
     route: RuntimeFilterRemoteRoute,
+    kind: RuntimeFilterEnvelopeKind,
     attempts: u32,
     first_sent_at: Instant,
     last_sent_at: Instant,
@@ -219,6 +228,8 @@ pub(crate) enum ReliableSendOutcome {
     /// This is an EXPLICIT resource rejection — a first-class outcome, not a silent
     /// drop and not the deadline fail-open degradation. The caller degrades the route.
     ResourceLimit(TransportResourceLimit),
+    /// The query transport is terminal. The frame was neither buffered nor sent.
+    Shutdown,
 }
 
 #[cfg(test)]
@@ -231,6 +242,7 @@ impl ReliableSendOutcome {
             ReliableSendOutcome::ResourceLimit(limit) => {
                 panic!("expected a buffered send, got ResourceLimit({limit:?})")
             }
+            ReliableSendOutcome::Shutdown => panic!("expected a buffered send after shutdown"),
         }
     }
 }
@@ -349,37 +361,52 @@ impl ReliableTransportTick {
     }
 }
 
-/// Production placeholder sink. The live network sender lands in RFD-6; until then
-/// the remote leg still buffers for ack-release and retry but transmits into a
-/// no-op, so nothing is actually put on the wire yet.
-struct InertArtifactRemoteSink;
-
-impl ArtifactRemoteSink for InertArtifactRemoteSink {
-    fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: &EncodedArtifactFrame) {}
-}
-
 /// Query-scoped sender-side reliable transport. See the module docs for the model.
 pub(crate) struct ReliableEnvelopeTransport {
-    sink: Arc<dyn ArtifactRemoteSink>,
-    // Test-only override so a service assembled with the inert production sink can be
+    sink: Arc<dyn RuntimeFilterEnvelopeSink>,
+    // Test-only override so a service assembled with the live production sink can be
     // pointed at a recording / drivable fake without threading the sink through the
     // ~30 `new_with_dependencies` call sites. Mirrors the service's other
     // `Mutex<Option<..>>` test seams.
     #[cfg(test)]
-    sink_override: Mutex<Option<Arc<dyn ArtifactRemoteSink>>>,
+    sink_override: Mutex<Option<Arc<dyn RuntimeFilterEnvelopeSink>>>,
+    #[cfg(test)]
+    before_event_emit: Mutex<Option<Arc<dyn Fn(TransportEventKind) + Send + Sync>>>,
     clock: Arc<dyn RuntimeFilterClock>,
-    policy: ReliableTransportPolicy,
+    policy: Mutex<ReliableTransportPolicy>,
     pending: Mutex<PendingBuffer>,
     next_sequence: AtomicU64,
+    lifecycle: LifecycleBarrier,
     // The RFD-3 lifecycle event sink the Service assembles from its own `EventEmitter`.
     // Structured `TransportEnvelope` events flow through this SAME sink — never a second
     // registry — so the sender-side transport lifecycle is observable end to end.
     event_sink: Arc<dyn RuntimeFilterEventSink>,
 }
 
+struct TransportCall<'a> {
+    transport: &'a ReliableEnvelopeTransport,
+    permit: Option<LifecyclePermit<'a>>,
+}
+
+impl<'a> TransportCall<'a> {
+    fn admit(transport: &'a ReliableEnvelopeTransport) -> Option<Self> {
+        Some(Self {
+            transport,
+            permit: Some(transport.lifecycle.try_admit()?),
+        })
+    }
+}
+
+impl Drop for TransportCall<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.transport.finish_close_if_requested();
+    }
+}
+
 impl ReliableEnvelopeTransport {
     pub(crate) fn new(
-        sink: Arc<dyn ArtifactRemoteSink>,
+        sink: Arc<dyn RuntimeFilterEnvelopeSink>,
         clock: Arc<dyn RuntimeFilterClock>,
         policy: ReliableTransportPolicy,
         event_sink: Arc<dyn RuntimeFilterEventSink>,
@@ -388,37 +415,136 @@ impl ReliableEnvelopeTransport {
             sink,
             #[cfg(test)]
             sink_override: Mutex::new(None),
+            #[cfg(test)]
+            before_event_emit: Mutex::new(None),
             clock,
-            policy,
+            policy: Mutex::new(policy),
             pending: Mutex::new(PendingBuffer::default()),
             next_sequence: AtomicU64::new(1),
+            lifecycle: LifecycleBarrier::new(),
             event_sink,
         }
     }
 
-    /// Assemble the production transport for a query: the inert sink (no live sender
-    /// until RFD-6), the default bounded-retry policy, and the query's lifecycle event
-    /// sink so every buffered transport step is observable.
+    /// Assemble the production transport with one query-scoped bounded live gRPC sink.
     pub(crate) fn for_query(
         clock: Arc<dyn RuntimeFilterClock>,
         event_sink: Arc<dyn RuntimeFilterEventSink>,
     ) -> Self {
         Self::new(
-            Arc::new(InertArtifactRemoteSink),
+            GrpcRuntimeFilterEnvelopeSink::new(),
             clock,
             ReliableTransportPolicy::default(),
             event_sink,
         )
     }
 
+    pub(crate) fn configure_policy(&self, policy: ReliableTransportPolicy) -> Result<(), String> {
+        let mut current = self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *current == policy {
+            return Ok(());
+        }
+        if !self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .is_empty()
+        {
+            return Err(
+                "runtime filter transport policy cannot change after delivery starts".into(),
+            );
+        }
+        *current = policy;
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.close_from_request();
+    }
+
+    fn finish_close_if_requested(&self) {
+        if self.lifecycle.is_closing() {
+            self.close_from_request();
+        }
+    }
+
+    fn close_from_request(&self) {
+        match self.lifecycle.request_close() {
+            CloseRole::Closed | CloseRole::Deferred => return,
+            CloseRole::Follower => {
+                self.lifecycle.wait_until_closed();
+                return;
+            }
+            CloseRole::Leader => self.lifecycle.wait_for_quiescence(),
+        }
+        let entered_while_panicking = std::thread::panicking();
+        let completion = FinalizerCompletion::new(&self.lifecycle);
+        let mut first_panic = None;
+        // The lifecycle mutex is not held across trait calls. A synchronous shutdown
+        // reentry observes this thread as the finalizer and returns deferred; this
+        // finalizer then completes the close and wakes every duplicate caller.
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.sink.shutdown()))
+        {
+            retain_first_finalizer_panic(&mut first_panic, payload);
+        }
+        #[cfg(test)]
+        if let Some(sink) = self
+            .sink_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.shutdown()))
+            {
+                retain_first_finalizer_panic(&mut first_panic, payload);
+            }
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending.entries.clear();
+        pending.frame_refs.clear();
+        pending.bytes = 0;
+        drop(pending);
+        drop(completion);
+        finish_finalizer_panic(first_panic, entered_while_panicking);
+    }
+
     /// Emit a structured transport lifecycle event through the query's RFD-3 sink.
-    fn emit(&self, identity: TransportRouteEventIdentity, kind: TransportEventKind, bytes: usize) {
+    fn emit(
+        &self,
+        identity: TransportRouteEventIdentity,
+        kind: TransportEventKind,
+        bytes: usize,
+    ) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_event_emit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            hook(kind);
+        }
+        let Some(_call) = TransportCall::admit(self) else {
+            return false;
+        };
         self.event_sink
             .record(RuntimeFilterEvent::TransportEnvelope {
                 identity,
                 kind,
                 bytes,
             });
+        true
     }
 
     /// Offer `frame` for reliable delivery to `route`: buffer it for ack-release and
@@ -437,6 +563,19 @@ impl ReliableEnvelopeTransport {
         frame: Arc<EncodedArtifactFrame>,
         identity: TransportRouteEventIdentity,
     ) -> ReliableSendOutcome {
+        self.send_kind(route, frame, identity, RuntimeFilterEnvelopeKind::Artifact)
+    }
+
+    pub(crate) fn send_kind(
+        &self,
+        route: &RuntimeFilterRemoteRoute,
+        frame: Arc<EncodedArtifactFrame>,
+        identity: TransportRouteEventIdentity,
+        kind: RuntimeFilterEnvelopeKind,
+    ) -> ReliableSendOutcome {
+        let Some(call) = TransportCall::admit(self) else {
+            return ReliableSendOutcome::Shutdown;
+        };
         let sequence = ProducerSequence::new(self.next_sequence.fetch_add(1, Ordering::Relaxed));
         let key = PendingKey {
             route_edge_id: route.route_edge_id(),
@@ -444,6 +583,10 @@ impl ReliableEnvelopeTransport {
         };
         let now = self.clock.now();
         let bytes = frame.payload().len();
+        let policy = *self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         {
             let mut pending = self
                 .pending
@@ -454,13 +597,14 @@ impl ReliableEnvelopeTransport {
                 PendingEntry {
                     frame: Arc::clone(&frame),
                     route: route.clone(),
+                    kind,
                     attempts: 1,
                     first_sent_at: now,
                     last_sent_at: now,
                     event_identity: identity,
                 },
-                self.policy.max_pending_entries,
-                self.policy.max_pending_bytes,
+                policy.max_pending_entries,
+                policy.max_pending_bytes,
             ) {
                 // Over a self-owned ceiling: the frame is neither buffered nor put on
                 // the wire, and NO transport event is emitted here — the frame never
@@ -469,13 +613,64 @@ impl ReliableEnvelopeTransport {
                 return ReliableSendOutcome::ResourceLimit(limit);
             }
         }
-        // Transmit outside the buffer lock: a re-entrant or blocking sink must not be
-        // able to stall a concurrent ack or retry tick that needs the buffer.
-        self.resolve_sink().deliver_remote(route, &frame);
-        // Emit once the frame is on the wire and the buffer lock is released — the event
-        // sink is re-entrant and must never stall a concurrent ack or retry tick.
-        self.emit(identity, TransportEventKind::Sent, bytes);
-        ReliableSendOutcome::Buffered(key.into_route_identity())
+        let route_identity = key.into_route_identity();
+        let envelope =
+            Self::transport_envelope(key, kind, identity, frame.as_ref(), policy.deadline);
+        let submit = self.resolve_sink().try_send(route.clone(), envelope);
+        if !self.lifecycle.is_running() {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(entry) = pending.entries.remove(&key) {
+                pending.release(&entry.frame);
+            }
+            return ReliableSendOutcome::Shutdown;
+        }
+        drop(call);
+        match submit {
+            SinkSubmitOutcome::Submitted => {
+                if self.emit(identity, TransportEventKind::Sent, bytes) {
+                    ReliableSendOutcome::Buffered(route_identity)
+                } else {
+                    ReliableSendOutcome::Shutdown
+                }
+            }
+            SinkSubmitOutcome::QueueFull => ReliableSendOutcome::Buffered(route_identity),
+            SinkSubmitOutcome::Shutdown => {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(entry) = pending.entries.remove(&key) {
+                    pending.release(&entry.frame);
+                }
+                ReliableSendOutcome::Shutdown
+            }
+        }
+    }
+
+    fn transport_envelope(
+        key: PendingKey,
+        kind: RuntimeFilterEnvelopeKind,
+        event_identity: TransportRouteEventIdentity,
+        frame: &EncodedArtifactFrame,
+        rpc_deadline: Duration,
+    ) -> RuntimeFilterTransportEnvelope {
+        let common = event_identity.common();
+        let envelope = RuntimeFilterEnvelope::try_new(
+            kind,
+            common.query_id(),
+            common.channel_id(),
+            common.epoch(),
+            key.into_route_identity(),
+            None,
+            None,
+            frame.profile_digest(),
+            frame.payload().to_vec(),
+        )
+        .expect("installed route and encoded frame form a valid domain envelope");
+        RuntimeFilterTransportEnvelope::new(envelope, rpc_deadline)
     }
 
     /// Apply an ack for `identity` with `status`, releasing the matching buffered
@@ -485,10 +680,29 @@ impl ReliableEnvelopeTransport {
         identity: &RuntimeFilterRouteIdentity,
         status: RuntimeFilterAcceptStatus,
     ) -> EnvelopeAckOutcome {
+        let Some(call) = TransportCall::admit(self) else {
+            return EnvelopeAckOutcome::Unknown;
+        };
+        let (outcome, event) = self.on_ack_admitted(identity, status);
+        drop(call);
+        if let Some((event_identity, bytes)) = event {
+            let _ = self.emit(event_identity, TransportEventKind::Acked(status), bytes);
+        }
+        outcome
+    }
+
+    fn on_ack_admitted(
+        &self,
+        identity: &RuntimeFilterRouteIdentity,
+        status: RuntimeFilterAcceptStatus,
+    ) -> (
+        EnvelopeAckOutcome,
+        Option<(TransportRouteEventIdentity, usize)>,
+    ) {
         let Some(delivery) = identity.as_delivery() else {
             // Only delivery frames are buffered today; `Contribution` acks converge
             // here in RFD-6. A non-delivery identity therefore matches nothing.
-            return EnvelopeAckOutcome::Unknown;
+            return (EnvelopeAckOutcome::Unknown, None);
         };
         let key = PendingKey::from_delivery(delivery);
         let released = {
@@ -504,15 +718,14 @@ impl ReliableEnvelopeTransport {
         match released {
             // Already released, or a duplicate / out-of-order ack for an identity that
             // is no longer in flight. A no-op — never a re-delivery, and no event.
-            None => EnvelopeAckOutcome::Unknown,
+            None => (EnvelopeAckOutcome::Unknown, None),
             Some((event_identity, bytes)) => {
-                // Emit the ack (carrying the peer's accept status) outside the buffer lock.
-                self.emit(event_identity, TransportEventKind::Acked(status), bytes);
-                match status {
+                let outcome = match status {
                     RuntimeFilterAcceptStatus::Accepted => EnvelopeAckOutcome::Released,
                     RuntimeFilterAcceptStatus::Duplicate => EnvelopeAckOutcome::ReleasedOnDuplicate,
                     RuntimeFilterAcceptStatus::Rejected => EnvelopeAckOutcome::Rejected,
-                }
+                };
+                (outcome, Some((event_identity, bytes)))
             }
         }
     }
@@ -521,9 +734,33 @@ impl ReliableEnvelopeTransport {
     /// the bounded attempt count, and release + fail open any frame past its
     /// deadline. Explicit and side-effect-scoped — no background thread.
     pub(crate) fn drive_retries(&self, now: Instant) -> ReliableTransportTick {
+        let Some(call) = TransportCall::admit(self) else {
+            return ReliableTransportTick::default();
+        };
+        let (tick, events) = self.drive_retries_admitted(now);
+        drop(call);
+        for (identity, kind, bytes) in events {
+            let _ = self.emit(identity, kind, bytes);
+        }
+        tick
+    }
+
+    fn drive_retries_admitted(
+        &self,
+        now: Instant,
+    ) -> (
+        ReliableTransportTick,
+        Vec<(TransportRouteEventIdentity, TransportEventKind, usize)>,
+    ) {
+        let policy = *self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut to_send: Vec<(
+            PendingKey,
             RuntimeFilterRemoteRoute,
             Arc<EncodedArtifactFrame>,
+            RuntimeFilterEnvelopeKind,
             TransportRouteEventIdentity,
             usize,
         )> = Vec::new();
@@ -537,22 +774,23 @@ impl ReliableEnvelopeTransport {
             for (key, entry) in pending.entries.iter_mut() {
                 // Deadline wins over retry: past the deadline the frame is dropped and
                 // the route fails open. No panic, no error surfaced to the query.
-                if now.saturating_duration_since(entry.first_sent_at) >= self.policy.deadline {
+                if now.saturating_duration_since(entry.first_sent_at) >= policy.deadline {
                     expired.push(*key);
                     continue;
                 }
                 // Under the attempt bound and past the retry interval: re-hand it. Once
                 // the count is exhausted the frame stays buffered until its deadline, so
                 // a late ack can still release it cleanly.
-                if entry.attempts < self.policy.max_attempts
-                    && now.saturating_duration_since(entry.last_sent_at)
-                        >= self.policy.retry_interval
+                if entry.attempts < policy.max_attempts
+                    && now.saturating_duration_since(entry.last_sent_at) >= policy.retry_interval
                 {
                     entry.attempts += 1;
                     entry.last_sent_at = now;
                     to_send.push((
+                        *key,
                         entry.route.clone(),
                         Arc::clone(&entry.frame),
+                        entry.kind,
                         entry.event_identity,
                         entry.frame.payload().len(),
                     ));
@@ -569,32 +807,109 @@ impl ReliableEnvelopeTransport {
         // Re-hand retries outside the buffer lock (see `send`). The re-hand order
         // within a tick is unspecified (it follows HashMap iteration), so no caller
         // may depend on it; only `failed_open` is sorted below for determinism.
-        let sink = self.resolve_sink();
-        for (route, frame, identity, bytes) in &to_send {
-            sink.deliver_remote(route, frame);
-            self.emit(*identity, TransportEventKind::Retried, *bytes);
+        let mut events = Vec::new();
+        for (key, route, frame, kind, identity, bytes) in &to_send {
+            if !self.lifecycle.is_running() {
+                break;
+            }
+            let envelope =
+                Self::transport_envelope(*key, *kind, *identity, frame.as_ref(), policy.deadline);
+            if matches!(
+                self.resolve_sink().try_send(route.clone(), envelope),
+                SinkSubmitOutcome::Submitted
+            ) && self.lifecycle.is_running()
+            {
+                events.push((*identity, TransportEventKind::Retried, *bytes));
+            }
         }
         // Sort by delivery key so the tick's `failed_open` order and the deadline events
         // are deterministic regardless of HashMap iteration order.
         failed_open.sort_unstable_by_key(|(key, _, _)| *key);
         let mut failed_identities = Vec::with_capacity(failed_open.len());
         for (key, identity, bytes) in failed_open {
-            self.emit(
-                identity,
-                TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
-                bytes,
-            );
+            if self.lifecycle.is_running() {
+                events.push((
+                    identity,
+                    TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
+                    bytes,
+                ));
+            }
             failed_identities.push(key.into_route_identity());
         }
-        ReliableTransportTick {
-            retried: to_send.len(),
-            failed_open: failed_identities,
+        (
+            ReliableTransportTick {
+                retried: to_send.len(),
+                failed_open: failed_identities,
+            },
+            events,
+        )
+    }
+
+    /// Drain every currently available unary completion before advancing retry and
+    /// deadline state. Network failures leave entries pending; ACK rejection and
+    /// strict response-contract failures release and fail the route open.
+    pub(crate) fn drain_completions_and_drive(&self, now: Instant) -> ReliableTransportTick {
+        let Some(call) = TransportCall::admit(self) else {
+            return ReliableTransportTick::default();
+        };
+        let mut contract_failed = Vec::new();
+        let mut events = Vec::new();
+        while let Some(completion) = self.resolve_sink().try_recv_completion() {
+            if !self.lifecycle.is_running() {
+                return ReliableTransportTick::default();
+            }
+            match completion {
+                SinkCompletion::Ack(identity, status) => {
+                    let (outcome, event) = self.on_ack_admitted(&identity, status);
+                    if matches!(outcome, EnvelopeAckOutcome::Rejected) {
+                        contract_failed.push(identity);
+                    }
+                    if let Some((event_identity, bytes)) = event {
+                        events.push((event_identity, TransportEventKind::Acked(status), bytes));
+                    }
+                }
+                SinkCompletion::TransportFailure(identity, error) if error.is_contract() => {
+                    let (outcome, event) =
+                        self.on_ack_admitted(&identity, RuntimeFilterAcceptStatus::Rejected);
+                    if matches!(outcome, EnvelopeAckOutcome::Rejected) {
+                        contract_failed.push(identity);
+                    }
+                    if let Some((event_identity, bytes)) = event {
+                        events.push((
+                            event_identity,
+                            TransportEventKind::Acked(RuntimeFilterAcceptStatus::Rejected),
+                            bytes,
+                        ));
+                    }
+                }
+                SinkCompletion::TransportFailure(_identity, _error) => {
+                    // A network failure is retryable. The pending entry stays owned by
+                    // this transport until a later ACK, retry deadline, or shutdown.
+                }
+            }
         }
+        if !self.lifecycle.is_running() {
+            return ReliableTransportTick::default();
+        }
+        let (mut tick, mut drive_events) = self.drive_retries_admitted(now);
+        events.append(&mut drive_events);
+        contract_failed.append(&mut tick.failed_open);
+        contract_failed.sort_by_key(|identity| {
+            identity
+                .as_delivery()
+                .map(|delivery| (delivery.route_edge_id(), delivery.sequence()))
+        });
+        tick.failed_open = contract_failed;
+        drop(call);
+        for (identity, kind, bytes) in events {
+            let _ = self.emit(identity, kind, bytes);
+        }
+        tick
     }
 
     /// Resolve the sink to transmit through: the test override when installed,
     /// otherwise the sink the transport was constructed with.
-    fn resolve_sink(&self) -> Arc<dyn ArtifactRemoteSink> {
+    fn resolve_sink(&self) -> Arc<dyn RuntimeFilterEnvelopeSink> {
         #[cfg(test)]
         {
             if let Some(sink) = self
@@ -629,20 +944,30 @@ impl ReliableEnvelopeTransport {
             .bytes
     }
 
-    /// Point the transport at a fake sink. Test-only seam used by service-level
-    /// delivery tests that build the service with the inert production sink.
+    /// Override the live production sink with a fake. This test-only seam lets
+    /// service-level delivery tests observe and drive outbound transport deterministically.
     #[cfg(test)]
-    pub(crate) fn set_sink_for_test(&self, sink: Arc<dyn ArtifactRemoteSink>) {
+    pub(crate) fn set_sink_for_test(&self, sink: Arc<dyn RuntimeFilterEnvelopeSink>) {
         *self
             .sink_override
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sink);
     }
+
+    #[cfg(test)]
+    fn set_before_event_emit_for_test(&self, hook: Arc<dyn Fn(TransportEventKind) + Send + Sync>) {
+        *self
+            .before_event_emit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
 
     use super::{
@@ -662,8 +987,12 @@ mod tests {
     };
     use crate::runtime_filter::port::routing::{RuntimeFilterRemoteRoute, RuntimeFilterRouteRole};
     use crate::runtime_filter::port::support::RuntimeFilterClock;
-    use crate::runtime_filter::port::transport::RuntimeFilterAcceptStatus;
-    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+    use crate::runtime_filter::port::transport::{
+        RuntimeFilterAcceptStatus, RuntimeFilterTransportEnvelope,
+    };
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
+    };
 
     /// A no-op lifecycle sink for the Task-2/Task-4 mechanics tests, which assert buffer /
     /// retry / ack / deadline behavior and do not observe events.
@@ -708,6 +1037,77 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum BlockedTransportEvent {
+        Acked,
+        FailedOpen,
+    }
+
+    struct BlockingTransportEvents {
+        blocked: BlockedTransportEvent,
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        recorded: Mutex<Vec<RuntimeFilterEvent>>,
+    }
+
+    impl RuntimeFilterEventSink for BlockingTransportEvents {
+        fn record(&self, event: RuntimeFilterEvent) {
+            let targeted = matches!(
+                (&self.blocked, &event),
+                (
+                    BlockedTransportEvent::Acked,
+                    RuntimeFilterEvent::TransportEnvelope {
+                        kind: TransportEventKind::Acked(_),
+                        ..
+                    }
+                ) | (
+                    BlockedTransportEvent::FailedOpen,
+                    RuntimeFilterEvent::TransportEnvelope {
+                        kind: TransportEventKind::FailedOpen(_),
+                        ..
+                    }
+                )
+            );
+            if targeted {
+                self.entered.send(()).expect("event callback entered");
+                self.release
+                    .lock()
+                    .expect("event release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("event callback released");
+            }
+            self.recorded.lock().expect("recorded events").push(event);
+        }
+    }
+
+    impl BlockingTransportEvents {
+        fn target_count(&self) -> usize {
+            self.recorded
+                .lock()
+                .expect("recorded events")
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        (&self.blocked, event),
+                        (
+                            BlockedTransportEvent::Acked,
+                            RuntimeFilterEvent::TransportEnvelope {
+                                kind: TransportEventKind::Acked(_),
+                                ..
+                            }
+                        ) | (
+                            BlockedTransportEvent::FailedOpen,
+                            RuntimeFilterEvent::TransportEnvelope {
+                                kind: TransportEventKind::FailedOpen(_),
+                                ..
+                            }
+                        )
+                    )
+                })
+                .count()
+        }
+    }
+
     /// A stable transport route identity for a given delivery edge. The query /
     /// participant / channel / epoch coordinates are fixed test constants; only the route
     /// edge varies, which is what `send`/`on_ack`/`drive_retries` key their events on.
@@ -734,6 +1134,15 @@ mod tests {
         ) -> ReliableSendOutcome {
             self.send(route, frame, event_identity(route.route_edge_id()))
         }
+
+        fn lifecycle_closed_for_test(&self) -> bool {
+            self.lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase
+                == super::super::LifecyclePhase::Closed
+        }
     }
 
     /// Drivable fake sink: records every (route edge, frame) it is handed so a test
@@ -741,14 +1150,36 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         sends: Mutex<Vec<(RouteEdgeId, EncodedArtifactFrame)>>,
+        completions: Mutex<VecDeque<SinkCompletion>>,
+        shutdown: AtomicBool,
     }
 
-    impl ArtifactRemoteSink for RecordingSink {
-        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame) {
-            self.sends
-                .lock()
-                .unwrap()
-                .push((route.route_edge_id(), frame.clone()));
+    impl RuntimeFilterEnvelopeSink for RecordingSink {
+        fn try_send(
+            &self,
+            route: RuntimeFilterRemoteRoute,
+            envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            if self.shutdown.load(Ordering::Acquire) {
+                return SinkSubmitOutcome::Shutdown;
+            }
+            let envelope = envelope.envelope();
+            self.sends.lock().unwrap().push((
+                route.route_edge_id(),
+                EncodedArtifactFrame::from_parts_for_test(
+                    *envelope.schema_digest(),
+                    envelope.payload().to_vec(),
+                ),
+            ));
+            SinkSubmitOutcome::Submitted
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            self.completions.lock().unwrap().pop_front()
+        }
+
+        fn shutdown(&self) {
+            self.shutdown.store(true, Ordering::Release);
         }
     }
 
@@ -763,6 +1194,10 @@ mod tests {
 
         fn frames(&self) -> Vec<(RouteEdgeId, EncodedArtifactFrame)> {
             self.sends.lock().unwrap().clone()
+        }
+
+        fn complete(&self, completion: SinkCompletion) {
+            self.completions.lock().unwrap().push_back(completion);
         }
     }
 
@@ -784,6 +1219,84 @@ mod tests {
             let mut guard = self.0.lock().unwrap();
             *guard += by;
         }
+    }
+
+    struct ReentrantShutdownSink {
+        transport: Mutex<Weak<ReliableEnvelopeTransport>>,
+    }
+
+    struct PanicOnceShutdownSink {
+        panic_once: AtomicBool,
+    }
+
+    struct NestedUnwindShutdownSink {
+        transport: Mutex<Weak<ReliableEnvelopeTransport>>,
+    }
+
+    impl RuntimeFilterEnvelopeSink for NestedUnwindShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            self.transport
+                .lock()
+                .expect("nested-unwind transport")
+                .upgrade()
+                .expect("transport installed")
+                .shutdown();
+            panic!("outer transport callback panic");
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {
+            panic!("secondary transport teardown panic");
+        }
+    }
+
+    impl RuntimeFilterEnvelopeSink for PanicOnceShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            SinkSubmitOutcome::Submitted
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {
+            if self.panic_once.swap(false, Ordering::AcqRel) {
+                panic!("intentional sink shutdown panic");
+            }
+        }
+    }
+
+    impl RuntimeFilterEnvelopeSink for ReentrantShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            self.transport
+                .lock()
+                .expect("reentrant transport")
+                .upgrade()
+                .expect("transport installed")
+                .shutdown();
+            SinkSubmitOutcome::Submitted
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     struct Harness {
@@ -890,6 +1403,130 @@ mod tests {
             identity.as_delivery().unwrap().route_edge_id(),
             RouteEdgeId::new(30)
         );
+    }
+
+    #[test]
+    fn sink_try_send_can_reenter_shutdown_without_deadlock() {
+        let sink = Arc::new(ReentrantShutdownSink {
+            transport: Mutex::new(Weak::new()),
+        });
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            sink.clone(),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            Arc::new(NoopEvents),
+        ));
+        *sink.transport.lock().expect("reentrant transport") = Arc::downgrade(&transport);
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            let outcome = transport.send_test(&route(130), frame(1));
+            done_tx.send(outcome).expect("reentrant send complete");
+        });
+        let outcome = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sink shutdown reentry deadlocked");
+        sender.join().expect("reentrant sender thread");
+        assert!(matches!(outcome, ReliableSendOutcome::Shutdown));
+    }
+
+    #[test]
+    fn sink_shutdown_panic_closes_transport_and_wakes_duplicate_shutdown() {
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            Arc::new(PanicOnceShutdownSink {
+                panic_once: AtomicBool::new(true),
+            }),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            Arc::new(NoopEvents),
+        ));
+        transport.send_test(&route(144), frame(5)).expect_buffered();
+        assert_eq!(transport.pending_len(), 1);
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let transport = transport.clone();
+            move || transport.shutdown()
+        }));
+        assert!(first.is_err(), "the original sink panic must be resumed");
+
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let second_transport = transport.clone();
+        let second = std::thread::spawn(move || {
+            second_transport.shutdown();
+            second_done_tx.send(()).expect("second shutdown complete");
+        });
+        let second_completed = second_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if second_completed {
+            second.join().expect("second shutdown thread");
+        }
+
+        assert!(
+            second_completed,
+            "duplicate shutdown remained blocked after sink panic"
+        );
+        assert!(transport.lifecycle_closed_for_test());
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn nested_transport_unwind_preserves_outer_panic_in_subprocess() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current lib-test executable"),
+        )
+        .arg("nested_transport_unwind_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .output()
+        .expect("run isolated nested-unwind transport regression");
+        assert!(
+            output.status.success(),
+            "nested transport unwind aborted the child process:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated by nested_transport_unwind_preserves_outer_panic_in_subprocess"]
+    fn nested_transport_unwind_child() {
+        let sink = Arc::new(NestedUnwindShutdownSink {
+            transport: Mutex::new(Weak::new()),
+        });
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            sink.clone(),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            Arc::new(NoopEvents),
+        ));
+        *sink.transport.lock().expect("nested-unwind transport") = Arc::downgrade(&transport);
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let transport = transport.clone();
+            move || transport.send_test(&route(145), frame(6))
+        }));
+        let payload = match outer {
+            Ok(_) => panic!("outer transport callback must panic"),
+            Err(payload) => payload,
+        };
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer transport callback panic"),
+            "the original callback panic must survive nested finalization"
+        );
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let duplicate_transport = transport.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_transport.shutdown();
+            done_tx.send(()).expect("duplicate shutdown complete");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate shutdown must observe Closed");
+        duplicate.join().expect("duplicate shutdown thread");
+        assert!(transport.lifecycle_closed_for_test());
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
     }
 
     #[test]
@@ -1356,6 +1993,56 @@ mod tests {
         }
     }
 
+    fn blocking_events(
+        blocked: BlockedTransportEvent,
+    ) -> (
+        Arc<BlockingTransportEvents>,
+        mpsc::Receiver<()>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        (
+            Arc::new(BlockingTransportEvents {
+                blocked,
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                recorded: Mutex::new(Vec::new()),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn install_before_emit_barrier(
+        transport: &ReliableEnvelopeTransport,
+        blocked: BlockedTransportEvent,
+    ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let armed = AtomicBool::new(true);
+        let release_rx = Mutex::new(release_rx);
+        transport.set_before_event_emit_for_test(Arc::new(move |kind| {
+            let targeted = matches!(
+                (blocked, kind),
+                (BlockedTransportEvent::Acked, TransportEventKind::Acked(_))
+                    | (
+                        BlockedTransportEvent::FailedOpen,
+                        TransportEventKind::FailedOpen(_)
+                    )
+            );
+            if targeted && armed.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).expect("before-emit barrier entered");
+                release_rx
+                    .lock()
+                    .expect("before-emit release")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("before-emit barrier released");
+            }
+        }));
+        (entered_rx, release_tx)
+    }
+
     #[test]
     fn transport_events_send_records_sent_through_the_lifecycle_sink_with_byte_size() {
         let EventsHarness {
@@ -1440,6 +2127,238 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_linearizes_before_an_ack_callback_can_return_late() {
+        let sink = Arc::new(RecordingSink::default());
+        let (events, entered_rx, release_tx) = blocking_events(BlockedTransportEvent::Acked);
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            sink,
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            events.clone(),
+        ));
+        let ack = transport
+            .send(&route(140), frame(1), event_identity(RouteEdgeId::new(140)))
+            .expect_buffered();
+
+        let (ack_done_tx, ack_done_rx) = mpsc::sync_channel(1);
+        let ack_transport = transport.clone();
+        let ack_thread = std::thread::spawn(move || {
+            let outcome = ack_transport.on_ack(&ack, RuntimeFilterAcceptStatus::Accepted);
+            ack_done_tx.send(outcome).expect("ack complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ack callback entered");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_transport = transport.clone();
+        let shutdown_events = events.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_transport.shutdown();
+            shutdown_done_tx
+                .send(shutdown_events.target_count())
+                .expect("shutdown complete");
+        });
+        let early_count = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+
+        release_tx.send(()).expect("release ack callback");
+        ack_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ack joined in time");
+        let count_at_shutdown = early_count.unwrap_or_else(|| {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time")
+        });
+        ack_thread.join().expect("ack thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            early_count.is_none(),
+            "shutdown returned while an admitted ACK callback was still running"
+        );
+        assert_eq!(events.target_count(), count_at_shutdown);
+    }
+
+    #[test]
+    fn shutdown_linearizes_before_a_deadline_callback_can_return_late() {
+        let sink = Arc::new(RecordingSink::default());
+        let started = Instant::now();
+        let (events, entered_rx, release_tx) = blocking_events(BlockedTransportEvent::FailedOpen);
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            sink,
+            Arc::new(ManualClock::new(started)),
+            policy(100, 3, 200),
+            events.clone(),
+        ));
+        transport
+            .send(&route(141), frame(2), event_identity(RouteEdgeId::new(141)))
+            .expect_buffered();
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_transport = transport.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_transport.drive_retries(started + Duration::from_millis(200));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline callback entered");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_transport = transport.clone();
+        let shutdown_events = events.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_transport.shutdown();
+            shutdown_done_tx
+                .send(shutdown_events.target_count())
+                .expect("shutdown complete");
+        });
+        let early_count = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .ok();
+
+        release_tx.send(()).expect("release deadline callback");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        let count_at_shutdown = early_count.unwrap_or_else(|| {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time")
+        });
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            early_count.is_none(),
+            "shutdown returned while an admitted deadline callback was still running"
+        );
+        assert_eq!(events.target_count(), count_at_shutdown);
+    }
+
+    #[test]
+    fn ack_removed_before_shutdown_does_not_emit_after_terminal() {
+        let events = Arc::new(RecordingEvents::default());
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            Arc::new(RecordingSink::default()),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            events.clone(),
+        ));
+        let ack = transport
+            .send(&route(142), frame(3), event_identity(RouteEdgeId::new(142)))
+            .expect_buffered();
+        let (entered_rx, release_tx) =
+            install_before_emit_barrier(&transport, BlockedTransportEvent::Acked);
+
+        let (ack_done_tx, ack_done_rx) = mpsc::sync_channel(1);
+        let ack_transport = transport.clone();
+        let ack_thread = std::thread::spawn(move || {
+            ack_transport.on_ack(&ack, RuntimeFilterAcceptStatus::Accepted);
+            ack_done_tx.send(()).expect("ack complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ACK removed before emit");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_transport = transport.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_transport.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        let shutdown_completed_before_release = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_tx.send(()).expect("release ACK emit gap");
+        ack_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ack joined in time");
+        if !shutdown_completed_before_release {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time");
+        }
+        ack_thread.join().expect("ack thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            shutdown_completed_before_release,
+            "shutdown must close while an unadmitted ACK callback is paused"
+        );
+        assert!(
+            events
+                .transport_events()
+                .iter()
+                .all(|(_, kind, _)| !matches!(kind, TransportEventKind::Acked(_)))
+        );
+    }
+
+    #[test]
+    fn deadline_removed_before_shutdown_does_not_emit_after_terminal() {
+        let events = Arc::new(RecordingEvents::default());
+        let started = Instant::now();
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            Arc::new(RecordingSink::default()),
+            Arc::new(ManualClock::new(started)),
+            policy(100, 3, 200),
+            events.clone(),
+        ));
+        transport
+            .send(&route(143), frame(4), event_identity(RouteEdgeId::new(143)))
+            .expect_buffered();
+        let (entered_rx, release_tx) =
+            install_before_emit_barrier(&transport, BlockedTransportEvent::FailedOpen);
+
+        let (tick_done_tx, tick_done_rx) = mpsc::sync_channel(1);
+        let tick_transport = transport.clone();
+        let tick_thread = std::thread::spawn(move || {
+            tick_transport.drive_retries(started + Duration::from_millis(200));
+            tick_done_tx.send(()).expect("deadline tick complete");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline removed before emit");
+
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::sync_channel(1);
+        let shutdown_transport = transport.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutdown_transport.shutdown();
+            shutdown_done_tx.send(()).expect("shutdown complete");
+        });
+        let shutdown_completed_before_release = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+
+        release_tx.send(()).expect("release deadline emit gap");
+        tick_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline tick joined in time");
+        if !shutdown_completed_before_release {
+            shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown joined in time");
+        }
+        tick_thread.join().expect("deadline tick thread");
+        shutdown_thread.join().expect("shutdown thread");
+
+        assert!(
+            shutdown_completed_before_release,
+            "shutdown must close while an unadmitted deadline callback is paused"
+        );
+        assert!(
+            events
+                .transport_events()
+                .iter()
+                .all(|(_, kind, _)| !matches!(kind, TransportEventKind::FailedOpen(_)))
+        );
+    }
+
+    #[test]
     fn transport_events_retry_and_deadline_record_retried_then_failed_open() {
         // retry 100ms, attempt bound 3, deadline 250ms.
         let EventsHarness {
@@ -1519,6 +2438,159 @@ mod tests {
                 TransportEventKind::Sent,
                 4,
             )],
+        );
+    }
+
+    #[test]
+    fn accepted_and_duplicate_ack_release_pending() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let accepted = transport
+            .send_test(&route(71), frame_sized(1, 5))
+            .expect_buffered();
+        let duplicate = transport
+            .send_test(&route(72), frame_sized(2, 7))
+            .expect_buffered();
+
+        sink.complete(SinkCompletion::Ack(
+            accepted,
+            RuntimeFilterAcceptStatus::Accepted,
+        ));
+        sink.complete(SinkCompletion::Ack(
+            duplicate,
+            RuntimeFilterAcceptStatus::Duplicate,
+        ));
+        let tick = transport.drain_completions_and_drive(clock.now());
+
+        assert!(tick.failed_open().is_empty());
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn ack_identity_mismatch_is_contract_rejection() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let requested = transport
+            .send_test(&route(73), frame_sized(3, 9))
+            .expect_buffered();
+
+        sink.complete(SinkCompletion::TransportFailure(
+            requested.clone(),
+            SinkTransportError::contract("runtime filter ACK identity mismatch"),
+        ));
+        let tick = transport.drain_completions_and_drive(clock.now());
+
+        assert_eq!(tick.failed_open(), &[requested]);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn malformed_ack_contract_failure_releases_without_retry() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let requested = transport
+            .send_test(&route(78), frame_sized(8, 23))
+            .expect_buffered();
+
+        sink.complete(SinkCompletion::TransportFailure(
+            requested.clone(),
+            SinkTransportError::contract("runtime filter ACK accept status must be specified"),
+        ));
+        let tick = transport.drain_completions_and_drive(clock.now());
+
+        assert_eq!(tick.failed_open(), &[requested]);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+        clock.advance(Duration::from_millis(100));
+        assert!(
+            transport
+                .drain_completions_and_drive(clock.now())
+                .is_quiescent()
+        );
+        assert_eq!(sink.count(), 1);
+    }
+
+    #[test]
+    fn network_failure_remains_pending_until_retry() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let requested = transport
+            .send_test(&route(74), frame_sized(4, 11))
+            .expect_buffered();
+        sink.complete(SinkCompletion::TransportFailure(
+            requested,
+            SinkTransportError::network("temporary peer outage"),
+        ));
+
+        assert!(
+            transport
+                .drain_completions_and_drive(clock.now())
+                .is_quiescent()
+        );
+        assert_eq!(transport.pending_len(), 1);
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(
+            transport.drain_completions_and_drive(clock.now()).retried(),
+            1
+        );
+        assert_eq!(sink.count(), 2);
+        assert_eq!(transport.pending_len(), 1);
+    }
+
+    #[test]
+    fn deadline_failure_opens_route_without_failing_query() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(50, 2, 150));
+        let requested = transport
+            .send_test(&route(75), frame_sized(5, 13))
+            .expect_buffered();
+        sink.complete(SinkCompletion::TransportFailure(
+            requested.clone(),
+            SinkTransportError::network("peer unavailable"),
+        ));
+        clock.advance(Duration::from_millis(200));
+
+        let tick = transport.drain_completions_and_drive(clock.now());
+        assert_eq!(tick.failed_open(), &[requested]);
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn shutdown_releases_pending_and_rejects_new_send() {
+        let Harness {
+            transport,
+            sink: _,
+            clock: _,
+        } = harness(policy(100, 3, 10_000));
+        transport
+            .send_test(&route(76), frame_sized(6, 17))
+            .expect_buffered();
+        assert_eq!(transport.pending_len(), 1);
+
+        transport.shutdown();
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+        assert_eq!(
+            transport.send_test(&route(77), frame_sized(7, 19)),
+            ReliableSendOutcome::Shutdown
         );
     }
 }

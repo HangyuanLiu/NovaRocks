@@ -36,6 +36,65 @@ use crate::runtime_filter::port::transport::{
 pub(crate) type NativeRuntimeFilterRequest = proto::filter::TransmitRuntimeFilterRequest;
 pub(crate) type NativeRuntimeFilterResponse = proto::filter::TransmitRuntimeFilterResponse;
 
+pub(crate) fn encode_runtime_filter_envelope(
+    envelope: &RuntimeFilterEnvelope,
+) -> proto::filter::RuntimeFilterEnvelope {
+    proto::filter::RuntimeFilterEnvelope {
+        kind: encode_kind(envelope.kind()) as i32,
+        query_id: Some(proto::common::UniqueId {
+            hi: envelope.query_id().hi,
+            lo: envelope.query_id().lo,
+        }),
+        channel_id: envelope.channel_id().get(),
+        deployment_epoch: envelope.deployment_epoch().get(),
+        route_identity: Some(encode_route_identity(envelope.route_identity())),
+        schema_digest: envelope.schema_digest().to_vec(),
+        payload: envelope.payload().to_vec(),
+        producer_open: envelope.producer_open().map(|metadata| {
+            proto::filter::RuntimeFilterProducerOpenMetadata {
+                local_partition_count: metadata.local_partition_count().get(),
+            }
+        }),
+    }
+}
+
+pub(crate) fn decode_runtime_filter_envelope_response(
+    response: proto::filter::RuntimeFilterEnvelopeResponse,
+) -> Result<(RuntimeFilterRouteIdentity, RuntimeFilterAcceptStatus), String> {
+    let identity = response
+        .acked_route_identity
+        .as_ref()
+        .ok_or_else(|| "runtime filter ACK route identity is missing".to_string())
+        .and_then(|identity| decode_route_identity(identity).map_err(|error| error.to_string()))?;
+    let status = match proto::filter::RuntimeFilterAcceptStatus::try_from(response.accept_status) {
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Accepted) => {
+            RuntimeFilterAcceptStatus::Accepted
+        }
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Duplicate) => {
+            RuntimeFilterAcceptStatus::Duplicate
+        }
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Rejected) => {
+            RuntimeFilterAcceptStatus::Rejected
+        }
+        Ok(proto::filter::RuntimeFilterAcceptStatus::Unspecified) => {
+            return Err("runtime filter ACK accept status must be specified".to_string());
+        }
+        Err(_) => return Err("runtime filter ACK accept status is unknown".to_string()),
+    };
+    match status {
+        RuntimeFilterAcceptStatus::Accepted | RuntimeFilterAcceptStatus::Duplicate
+            if !response.rejection_reason.is_empty() =>
+        {
+            return Err("runtime filter successful ACK carried a rejection reason".to_string());
+        }
+        RuntimeFilterAcceptStatus::Rejected if response.rejection_reason.trim().is_empty() => {
+            return Err("runtime filter rejected ACK omitted its rejection reason".to_string());
+        }
+        _ => {}
+    }
+    Ok((identity, status))
+}
+
 pub(crate) fn decode_runtime_filter_transmission(
     request: proto::filter::TransmitRuntimeFilterRequest,
 ) -> Result<RuntimeFilterTransmission, String> {
@@ -252,7 +311,68 @@ fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
             Ok(RuntimeFilterEnvelopeKind::Unavailable)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Ack => Ok(RuntimeFilterEnvelopeKind::Ack),
+        proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+            Ok(RuntimeFilterEnvelopeKind::CompletedWithoutArtifact)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
+            Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
+            Ok(RuntimeFilterEnvelopeKind::FinalArtifact)
+        }
     }
+}
+
+fn encode_kind(kind: RuntimeFilterEnvelopeKind) -> proto::filter::RuntimeFilterEnvelopeKind {
+    match kind {
+        RuntimeFilterEnvelopeKind::Contribution => {
+            proto::filter::RuntimeFilterEnvelopeKind::Contribution
+        }
+        RuntimeFilterEnvelopeKind::Artifact => proto::filter::RuntimeFilterEnvelopeKind::Artifact,
+        RuntimeFilterEnvelopeKind::ProducerClosed => {
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed
+        }
+        RuntimeFilterEnvelopeKind::Unavailable => {
+            proto::filter::RuntimeFilterEnvelopeKind::Unavailable
+        }
+        RuntimeFilterEnvelopeKind::Ack => proto::filter::RuntimeFilterEnvelopeKind::Ack,
+        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+            proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+        }
+        RuntimeFilterEnvelopeKind::DegradedLogical => {
+            proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical
+        }
+        RuntimeFilterEnvelopeKind::FinalArtifact => {
+            proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact
+        }
+    }
+}
+
+fn encode_route_identity(
+    identity: &RuntimeFilterRouteIdentity,
+) -> proto::filter::RuntimeFilterRouteIdentity {
+    use proto::filter::runtime_filter_route_identity::Value;
+
+    let value = if let Some(identity) = identity.as_contribution() {
+        Value::Contribution(proto::filter::RuntimeFilterContributionRouteIdentity {
+            producer_binding_id: identity.producer_binding_id().get(),
+            fragment_instance_id: Some(proto::common::UniqueId {
+                hi: identity.fragment_instance_id().hi,
+                lo: identity.fragment_instance_id().lo,
+            }),
+            partition_id: identity.partition_id().get(),
+            sequence: identity.sequence().get(),
+        })
+    } else {
+        let identity = identity
+            .as_delivery()
+            .expect("runtime filter route identity is contribution or delivery");
+        Value::Delivery(proto::filter::RuntimeFilterDeliveryRouteIdentity {
+            route_edge_id: identity.route_edge_id().get(),
+            sequence: identity.sequence().get(),
+        })
+    };
+    proto::filter::RuntimeFilterRouteIdentity { value: Some(value) }
 }
 
 fn decode_route_identity(
@@ -492,6 +612,9 @@ mod tests {
             proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
                 (delivery_route(), b"artifact".to_vec(), None)
             }
+            proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
+                (delivery_route(), b"final-artifact".to_vec(), None)
+            }
             proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => (
                 contribution_route(),
                 Vec::new(),
@@ -504,6 +627,12 @@ mod tests {
             }
             proto::filter::RuntimeFilterEnvelopeKind::Ack => {
                 (contribution_route(), Vec::new(), None)
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+                (delivery_route(), Vec::new(), None)
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
+                (delivery_route(), b"degraded-logical".to_vec(), None)
             }
             proto::filter::RuntimeFilterEnvelopeKind::Unspecified => {
                 panic!("unspecified kind is not a valid fixture")
@@ -535,6 +664,11 @@ mod tests {
                 b"artifact".as_slice(),
             ),
             (
+                proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                b"final-artifact".as_slice(),
+            ),
+            (
                 proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 b"".as_slice(),
@@ -543,6 +677,16 @@ mod tests {
                 proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::Unavailable,
                 b"unavailable".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                b"".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                b"degraded-logical".as_slice(),
             ),
             // Ack is intentionally excluded: RFD-4/M3 requires an Ack envelope to
             // carry an accept status (`RuntimeFilterEnvelope::accept_status`), and
@@ -579,7 +723,11 @@ mod tests {
                     assert_eq!(identity.partition_id(), PartitionId::new(20));
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
                 }
-                RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+                RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical => {
                     let identity = envelope
                         .route_identity()
                         .as_delivery()
@@ -609,6 +757,19 @@ mod tests {
             error.message(),
             "runtime filter envelope kind Ack requires an accept status"
         );
+        assert!(ingress.is_empty());
+    }
+
+    #[test]
+    fn unknown_proto_envelope_kind_is_rejected_before_ingress() {
+        let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.kind = i32::MAX;
+
+        let error = handle_runtime_filter_envelope(ingress.clone(), request).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.message(), "runtime filter envelope kind is unknown");
         assert!(ingress.is_empty());
     }
 
