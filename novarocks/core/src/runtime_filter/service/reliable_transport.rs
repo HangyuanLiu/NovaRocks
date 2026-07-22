@@ -776,8 +776,8 @@ impl ReliableEnvelopeTransport {
             .bytes
     }
 
-    /// Point the transport at a fake sink. Test-only seam used by service-level
-    /// delivery tests that build the service with the inert production sink.
+    /// Override the live production sink with a fake. This test-only seam lets
+    /// service-level delivery tests observe and drive outbound transport deterministically.
     #[cfg(test)]
     pub(crate) fn set_sink_for_test(&self, sink: Arc<dyn RuntimeFilterEnvelopeSink>) {
         *self
