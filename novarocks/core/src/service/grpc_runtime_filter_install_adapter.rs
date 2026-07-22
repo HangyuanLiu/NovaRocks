@@ -184,6 +184,7 @@ fn abort_rejected(
 mod tests {
     use crate::common::types::UniqueId;
     use crate::proto;
+    use crate::protocol::native::{RuntimeFilterQueryLifecycleOptions, encode_participant_install};
     use crate::runtime::query_context::{QueryContextManager, QueryId};
     use crate::runtime_filter::port::identity::{DeploymentEpoch, ProducerSequence};
     use crate::runtime_filter::port::transport::{
@@ -191,10 +192,31 @@ mod tests {
         RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     };
     use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager;
+    use std::time::Duration;
 
     use super::query_scoped_runtime_filter_deployment_ingress_with_manager;
+    use crate::runtime::query_context::runtime_filter_service_lifecycle_tests::participant_install;
 
     const QUERY: QueryId = QueryId { hi: 931, lo: 932 };
+
+    fn with_epoch(
+        install: crate::runtime_filter::port::install::RuntimeFilterParticipantInstall,
+        epoch: u64,
+    ) -> crate::runtime_filter::port::install::RuntimeFilterParticipantInstall {
+        let (core, routing) = install.into_parts();
+        let core = crate::runtime_filter::port::install::RuntimeFilterInstallView::new(
+            DeploymentEpoch::new(epoch),
+            core.local_participant_id(),
+            core.channels().clone(),
+        );
+        let routing = crate::runtime_filter::port::routing::RuntimeFilterRoutingShard::new(
+            DeploymentEpoch::new(epoch),
+            routing.local_participant_id(),
+            routing.channels().clone(),
+        )
+        .expect("valid routing shard with replacement epoch");
+        crate::runtime_filter::port::install::RuntimeFilterParticipantInstall::new(core, routing)
+    }
 
     #[test]
     fn invalid_install_is_rejected_before_context_creation() {
@@ -254,5 +276,59 @@ mod tests {
         assert_eq!(result.accept_status(), RuntimeFilterAcceptStatus::Rejected);
         assert_eq!(manager.fragment_counts_for_test(QUERY), None);
         assert!(manager.runtime_filter_service_for_ingress(QUERY).is_none());
+    }
+
+    #[test]
+    fn terminal_epoch_rejections_remain_typed_at_adapter_boundary() {
+        let manager = QueryContextManager::new_for_test();
+        let ingress = query_scoped_runtime_filter_deployment_ingress_with_manager(manager.clone());
+        let terminal_epoch = DeploymentEpoch::new(10);
+        manager
+            .abort_runtime_filter_deployment(QUERY, terminal_epoch)
+            .expect("create terminal");
+        let lifecycle = RuntimeFilterQueryLifecycleOptions {
+            delivery_expire: Duration::from_secs(11),
+            query_expire: Duration::from_secs(29),
+            transport_retry_interval: Duration::from_millis(200),
+            transport_max_attempts: 3,
+            transport_deadline: Duration::from_secs(5),
+            transport_max_pending_entries: 128,
+            transport_max_pending_bytes: 1024 * 1024,
+        };
+
+        for (epoch, expected) in [
+            (
+                10,
+                proto::filter::RuntimeFilterDeploymentRejectionCode::QueryAborted,
+            ),
+            (
+                5,
+                proto::filter::RuntimeFilterDeploymentRejectionCode::StaleEpoch,
+            ),
+            (
+                20,
+                proto::filter::RuntimeFilterDeploymentRejectionCode::ConflictingDeployment,
+            ),
+        ] {
+            let install = with_epoch(participant_install(), epoch);
+            let request = encode_participant_install(
+                UniqueId {
+                    hi: QUERY.hi,
+                    lo: QUERY.lo,
+                },
+                lifecycle,
+                &install,
+            )
+            .expect("encode install");
+            let response = ingress.install(request);
+            assert_eq!(
+                response.status,
+                proto::filter::RuntimeFilterDeploymentResponseStatus::Rejected as i32
+            );
+            assert_eq!(
+                response.rejection.expect("typed rejection").code,
+                expected as i32
+            );
+        }
     }
 }
