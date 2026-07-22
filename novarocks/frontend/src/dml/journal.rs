@@ -274,3 +274,61 @@ pub(crate) mod testing {
         }
     }
 }
+
+#[cfg(test)]
+mod meta_store_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use novarocks::meta::SqliteMetaStoreProvider;
+
+    use super::*;
+    use crate::dml::model::{OperationKind, OperationTarget};
+
+    fn request() -> CreatePreparingRequest {
+        CreatePreparingRequest {
+            operation_kind: OperationKind::InsertAppend,
+            operation_subkind: None,
+            target: OperationTarget {
+                catalog: "cat".to_string(),
+                namespace: "ns".to_string(),
+                table: "tbl".to_string(),
+                ref_name: None,
+            },
+            attempt_id: "attempt-1".to_string(),
+            base_snapshot_id: None,
+            base_snapshot_map: BTreeMap::new(),
+            staged_artifacts: Vec::new(),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn round_trip_over_real_sqlite_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider: Arc<dyn MetaStoreProvider> = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite")).expect("provider"),
+        );
+        let journal = MetaStoreOperationJournal::new(provider);
+
+        let id = journal.create_preparing(request()).unwrap();
+        assert_eq!(
+            journal.load(id).unwrap().unwrap().state,
+            OperationState::Preparing
+        );
+
+        journal.transition(id, OperationState::Committing).unwrap();
+        assert_eq!(journal.list_unfinished().unwrap().len(), 1);
+
+        let fact = crate::dml::reconcile::operation_fact_from_commit_result(Ok(
+            &crate::dml::model::CommitOutcome {
+                new_snapshot_id: 100,
+                written_manifest_paths: vec![],
+            },
+        ));
+        journal.record_fact(id, fact).unwrap();
+        let stored = journal.load(id).unwrap().unwrap();
+        assert_eq!(stored.state, OperationState::Committed);
+        assert_eq!(stored.commit_outcome.unwrap().snapshot_id, 100);
+    }
+}
