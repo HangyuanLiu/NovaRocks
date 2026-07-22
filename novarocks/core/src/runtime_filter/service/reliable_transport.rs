@@ -85,7 +85,7 @@ use crate::runtime_filter::router::remote::ArtifactRemoteSink;
 /// this milestone. Offering a frame that would exceed either returns
 /// [`ReliableSendOutcome::ResourceLimit`] instead of buffering: an explicit resource
 /// rejection, distinct from the deadline fail-open degradation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReliableTransportPolicy {
     retry_interval: Duration,
     max_attempts: u32,
@@ -368,7 +368,7 @@ pub(crate) struct ReliableEnvelopeTransport {
     #[cfg(test)]
     sink_override: Mutex<Option<Arc<dyn ArtifactRemoteSink>>>,
     clock: Arc<dyn RuntimeFilterClock>,
-    policy: ReliableTransportPolicy,
+    policy: Mutex<ReliableTransportPolicy>,
     pending: Mutex<PendingBuffer>,
     next_sequence: AtomicU64,
     // The RFD-3 lifecycle event sink the Service assembles from its own `EventEmitter`.
@@ -389,7 +389,7 @@ impl ReliableEnvelopeTransport {
             #[cfg(test)]
             sink_override: Mutex::new(None),
             clock,
-            policy,
+            policy: Mutex::new(policy),
             pending: Mutex::new(PendingBuffer::default()),
             next_sequence: AtomicU64::new(1),
             event_sink,
@@ -409,6 +409,39 @@ impl ReliableEnvelopeTransport {
             ReliableTransportPolicy::default(),
             event_sink,
         )
+    }
+
+    pub(crate) fn configure_policy(&self, policy: ReliableTransportPolicy) -> Result<(), String> {
+        let mut current = self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *current == policy {
+            return Ok(());
+        }
+        if !self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .is_empty()
+        {
+            return Err(
+                "runtime filter transport policy cannot change after delivery starts".into(),
+            );
+        }
+        *current = policy;
+        Ok(())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending.entries.clear();
+        pending.frame_refs.clear();
+        pending.bytes = 0;
     }
 
     /// Emit a structured transport lifecycle event through the query's RFD-3 sink.
@@ -444,6 +477,10 @@ impl ReliableEnvelopeTransport {
         };
         let now = self.clock.now();
         let bytes = frame.payload().len();
+        let policy = *self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         {
             let mut pending = self
                 .pending
@@ -459,8 +496,8 @@ impl ReliableEnvelopeTransport {
                     last_sent_at: now,
                     event_identity: identity,
                 },
-                self.policy.max_pending_entries,
-                self.policy.max_pending_bytes,
+                policy.max_pending_entries,
+                policy.max_pending_bytes,
             ) {
                 // Over a self-owned ceiling: the frame is neither buffered nor put on
                 // the wire, and NO transport event is emitted here — the frame never
@@ -521,6 +558,10 @@ impl ReliableEnvelopeTransport {
     /// the bounded attempt count, and release + fail open any frame past its
     /// deadline. Explicit and side-effect-scoped — no background thread.
     pub(crate) fn drive_retries(&self, now: Instant) -> ReliableTransportTick {
+        let policy = *self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut to_send: Vec<(
             RuntimeFilterRemoteRoute,
             Arc<EncodedArtifactFrame>,
@@ -537,16 +578,15 @@ impl ReliableEnvelopeTransport {
             for (key, entry) in pending.entries.iter_mut() {
                 // Deadline wins over retry: past the deadline the frame is dropped and
                 // the route fails open. No panic, no error surfaced to the query.
-                if now.saturating_duration_since(entry.first_sent_at) >= self.policy.deadline {
+                if now.saturating_duration_since(entry.first_sent_at) >= policy.deadline {
                     expired.push(*key);
                     continue;
                 }
                 // Under the attempt bound and past the retry interval: re-hand it. Once
                 // the count is exhausted the frame stays buffered until its deadline, so
                 // a late ack can still release it cleanly.
-                if entry.attempts < self.policy.max_attempts
-                    && now.saturating_duration_since(entry.last_sent_at)
-                        >= self.policy.retry_interval
+                if entry.attempts < policy.max_attempts
+                    && now.saturating_duration_since(entry.last_sent_at) >= policy.retry_interval
                 {
                     entry.attempts += 1;
                     entry.last_sent_at = now;

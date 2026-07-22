@@ -55,6 +55,9 @@ use crate::novarocks_logging::{error, info};
 use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
+use crate::service::grpc_runtime_filter_install_adapter::{
+    RuntimeFilterDeploymentIngress, query_scoped_runtime_filter_deployment_ingress,
+};
 use crate::service::internal_rpc;
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
 #[cfg(feature = "compat")]
@@ -93,6 +96,7 @@ pub struct GrpcService {
     allow_local_execution: bool,
     report_handler: Arc<dyn CoordinatorReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+    runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
 }
 
 impl std::fmt::Debug for GrpcService {
@@ -121,6 +125,7 @@ impl GrpcService {
             true,
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -135,6 +140,7 @@ impl GrpcService {
             false,
             report_handler,
             query_scoped_runtime_filter_envelope_ingress(),
+            query_scoped_runtime_filter_deployment_ingress(),
         )
     }
 
@@ -142,11 +148,13 @@ impl GrpcService {
         allow_local_execution: bool,
         report_handler: Arc<dyn CoordinatorReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+        runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
     ) -> Self {
         Self {
             allow_local_execution,
             report_handler,
             runtime_filter_envelope_ingress,
+            runtime_filter_deployment_ingress,
         }
     }
 
@@ -155,7 +163,12 @@ impl GrpcService {
         report_handler: Arc<dyn CoordinatorReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
-        Self::with_handlers(true, report_handler, runtime_filter_envelope_ingress)
+        Self::with_handlers(
+            true,
+            report_handler,
+            runtime_filter_envelope_ingress,
+            query_scoped_runtime_filter_deployment_ingress(),
+        )
     }
 
     #[cfg(test)]
@@ -163,7 +176,43 @@ impl GrpcService {
         report_handler: Arc<dyn CoordinatorReportHandler>,
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
-        Self::with_handlers(false, report_handler, runtime_filter_envelope_ingress)
+        Self::with_handlers(
+            false,
+            report_handler,
+            runtime_filter_envelope_ingress,
+            query_scoped_runtime_filter_deployment_ingress(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_execution_with_runtime_filter_manager(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+        manager: Arc<crate::runtime::query_context::QueryContextManager>,
+    ) -> Self {
+        Self::with_handlers(
+            true,
+            report_handler,
+            crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress_with_manager(
+                manager.clone(),
+            ),
+            crate::service::grpc_runtime_filter_install_adapter::query_scoped_runtime_filter_deployment_ingress_with_manager(
+                manager,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_execution_with_runtime_filter_handlers(
+        report_handler: Arc<dyn CoordinatorReportHandler>,
+        runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
+        runtime_filter_deployment_ingress: Arc<dyn RuntimeFilterDeploymentIngress>,
+    ) -> Self {
+        Self::with_handlers(
+            true,
+            report_handler,
+            runtime_filter_envelope_ingress,
+            runtime_filter_deployment_ingress,
+        )
     }
 
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
@@ -316,22 +365,38 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
     async fn install_runtime_filter_deployment(
         &self,
-        _request: tonic::Request<proto::filter::InstallRuntimeFilterDeploymentRequest>,
+        request: tonic::Request<proto::filter::InstallRuntimeFilterDeploymentRequest>,
     ) -> Result<tonic::Response<proto::filter::InstallRuntimeFilterDeploymentResponse>, tonic::Status>
     {
-        Err(tonic::Status::unimplemented(
-            "runtime filter deployment handler lands in RFD-6A Task 4",
-        ))
+        self.require_local_execution("InstallRuntimeFilterDeployment")?;
+        let ingress = self.runtime_filter_deployment_ingress.clone();
+        let request = request.into_inner();
+        let response = tokio::task::spawn_blocking(move || ingress.install(request))
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "install_runtime_filter_deployment handler panicked: {error}"
+                ))
+            })?;
+        Ok(tonic::Response::new(response))
     }
 
     async fn abort_runtime_filter_deployment(
         &self,
-        _request: tonic::Request<proto::filter::AbortRuntimeFilterDeploymentRequest>,
+        request: tonic::Request<proto::filter::AbortRuntimeFilterDeploymentRequest>,
     ) -> Result<tonic::Response<proto::filter::AbortRuntimeFilterDeploymentResponse>, tonic::Status>
     {
-        Err(tonic::Status::unimplemented(
-            "runtime filter deployment handler lands in RFD-6A Task 4",
-        ))
+        self.require_local_execution("AbortRuntimeFilterDeployment")?;
+        let ingress = self.runtime_filter_deployment_ingress.clone();
+        let request = request.into_inner();
+        let response = tokio::task::spawn_blocking(move || ingress.abort(request))
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "abort_runtime_filter_deployment handler panicked: {error}"
+                ))
+            })?;
+        Ok(tonic::Response::new(response))
     }
 
     async fn lookup(

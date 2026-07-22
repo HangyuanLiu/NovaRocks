@@ -37,6 +37,7 @@ use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
+use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::lookup::GlobalLateMaterializationContext;
 use crate::runtime::mem_tracker::{self, MemTracker};
@@ -47,7 +48,10 @@ use crate::runtime::runtime_filter_observability::{
 };
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
 use crate::runtime::runtime_filter_worker::{RuntimeFilterWorker, RuntimeFilterWorkerParams};
-use crate::runtime_filter::service::RuntimeFilterService;
+use crate::runtime_filter::port::identity::DeploymentEpoch;
+use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
+use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
+use crate::runtime_filter::service::{ReliableTransportPolicy, RuntimeFilterService};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryId {
@@ -173,6 +177,7 @@ pub(crate) struct QueryContext {
     runtime_filter_worker: Option<Arc<RuntimeFilterWorker>>,
     pending_runtime_filters: Vec<PendingRuntimeFilter>,
     runtime_filter_service: Arc<RuntimeFilterService>,
+    runtime_filter_deployment: Option<RuntimeFilterDeploymentClaim>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
@@ -182,6 +187,68 @@ pub(crate) struct QueryContext {
     pub(crate) mem_tracker: Arc<MemTracker>,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeFilterDeploymentClaim {
+    lifecycle: RuntimeFilterQueryLifecycleOptions,
+    install: RuntimeFilterParticipantInstall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterDeploymentInstallOutcome {
+    Applied,
+    Idempotent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterDeploymentAbortOutcome {
+    Applied,
+    Idempotent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterDeploymentInstallErrorKind {
+    StaleEpoch,
+    ConflictingDeployment,
+    QueryAborted,
+    ActiveFragments,
+    Internal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterDeploymentInstallError {
+    kind: RuntimeFilterDeploymentInstallErrorKind,
+    detail: String,
+}
+
+impl RuntimeFilterDeploymentInstallError {
+    fn new(kind: RuntimeFilterDeploymentInstallErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> RuntimeFilterDeploymentInstallErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for RuntimeFilterDeploymentInstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "runtime filter deployment {:?}: {}",
+            self.kind, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeFilterDeploymentInstallError {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum LegacyRuntimeFilterExecutionClaim {
@@ -264,6 +331,7 @@ impl QueryContext {
             runtime_filter_worker: None,
             pending_runtime_filters: Vec::new(),
             runtime_filter_service,
+            runtime_filter_deployment: None,
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
             glm_contexts: HashMap::new(),
@@ -746,6 +814,7 @@ struct QueryContextManagerInner {
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
     fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
+    runtime_filter_deployment_tombstones: HashMap<QueryId, DeploymentEpoch>,
     #[cfg(feature = "compat")]
     incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
     #[cfg(feature = "compat")]
@@ -944,6 +1013,275 @@ impl QueryContextManager {
         )
     }
 
+    pub(crate) fn install_runtime_filter_deployment(
+        &self,
+        query_id: QueryId,
+        lifecycle: RuntimeFilterQueryLifecycleOptions,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<RuntimeFilterDeploymentInstallOutcome, RuntimeFilterDeploymentInstallError> {
+        let epoch = install.epoch();
+        let (service, just_created) = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if guard
+                .runtime_filter_deployment_tombstones
+                .contains_key(&query_id)
+            {
+                return Err(RuntimeFilterDeploymentInstallError::new(
+                    RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
+                    "runtime filter deployment query was already aborted",
+                ));
+            }
+
+            let just_created = if guard.active.contains_key(&query_id) {
+                false
+            } else if let Some(context) = guard.second_chance.remove(&query_id) {
+                guard.active.insert(query_id, context);
+                false
+            } else {
+                let mut context =
+                    QueryContext::new(query_id, lifecycle.delivery_expire, lifecycle.query_expire);
+                context
+                    .claim_legacy_runtime_filter_execution(
+                        LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                    )
+                    .map_err(|error| {
+                        RuntimeFilterDeploymentInstallError::new(
+                            RuntimeFilterDeploymentInstallErrorKind::Internal,
+                            error,
+                        )
+                    })?;
+                guard.active.insert(query_id, context);
+                true
+            };
+
+            let context = guard
+                .active
+                .get_mut(&query_id)
+                .expect("runtime filter install context is active");
+            context
+                .claim_legacy_runtime_filter_execution(
+                    LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                )
+                .map_err(|error| {
+                    RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::Internal,
+                        error,
+                    )
+                })?;
+            if let Some(claim) = &context.runtime_filter_deployment {
+                if epoch.get() < claim.install.epoch().get() {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::StaleEpoch,
+                        "runtime filter deployment epoch is older than the installed epoch",
+                    ));
+                }
+                if epoch != claim.install.epoch()
+                    || lifecycle != claim.lifecycle
+                    || install != claim.install
+                {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::ConflictingDeployment,
+                        "runtime filter deployment conflicts with the query installation",
+                    ));
+                }
+            } else {
+                if context.num_fragments != 0 || context.num_active_fragments != 0 {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::ActiveFragments,
+                        "runtime filter deployment must be installed before fragment registration",
+                    ));
+                }
+                context.runtime_filter_deployment = Some(RuntimeFilterDeploymentClaim {
+                    lifecycle,
+                    install: install.clone(),
+                });
+            }
+            (context.runtime_filter_service(), just_created)
+        };
+
+        if let Err(error) = service.configure_transport(ReliableTransportPolicy::new(
+            lifecycle.transport_retry_interval,
+            lifecycle.transport_max_attempts,
+            lifecycle.transport_deadline,
+            lifecycle.transport_max_pending_entries,
+            lifecycle.transport_max_pending_bytes,
+        )) {
+            self.retire_failed_runtime_filter_deployment_install(
+                query_id,
+                epoch,
+                just_created,
+                &service,
+            );
+            return Err(RuntimeFilterDeploymentInstallError::new(
+                RuntimeFilterDeploymentInstallErrorKind::Internal,
+                error,
+            ));
+        }
+
+        let outcome = match service.install(install) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.retire_failed_runtime_filter_deployment_install(
+                    query_id,
+                    epoch,
+                    just_created,
+                    &service,
+                );
+                return Err(map_runtime_filter_install_error(
+                    error.kind(),
+                    error.to_string(),
+                ));
+            }
+        };
+
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .runtime_filter_deployment_tombstones
+            .contains_key(&query_id)
+            || !guard.active.get(&query_id).is_some_and(|context| {
+                Arc::ptr_eq(&context.runtime_filter_service, &service)
+                    && context
+                        .runtime_filter_deployment
+                        .as_ref()
+                        .is_some_and(|claim| claim.install.epoch() == epoch)
+            })
+        {
+            return Err(RuntimeFilterDeploymentInstallError::new(
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
+                "runtime filter deployment was aborted before install acknowledgement",
+            ));
+        }
+        Ok(match outcome {
+            InstallOutcome::AlreadyInstalled => RuntimeFilterDeploymentInstallOutcome::Idempotent,
+            InstallOutcome::Installed | InstallOutcome::IgnoredEmpty => {
+                RuntimeFilterDeploymentInstallOutcome::Applied
+            }
+        })
+    }
+
+    fn retire_failed_runtime_filter_deployment_install(
+        &self,
+        query_id: QueryId,
+        epoch: DeploymentEpoch,
+        just_created: bool,
+        service: &Arc<RuntimeFilterService>,
+    ) {
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            guard
+                .runtime_filter_deployment_tombstones
+                .insert(query_id, epoch);
+            if just_created
+                && guard.active.get(&query_id).is_some_and(|context| {
+                    context.num_fragments == 0
+                        && context.num_active_fragments == 0
+                        && Arc::ptr_eq(&context.runtime_filter_service, service)
+                })
+            {
+                guard.active.remove(&query_id)
+            } else {
+                None
+            }
+        };
+        service.shutdown_transport();
+        drop(removed);
+    }
+
+    pub(crate) fn abort_runtime_filter_deployment(
+        &self,
+        query_id: QueryId,
+        epoch: DeploymentEpoch,
+    ) -> Result<RuntimeFilterDeploymentAbortOutcome, RuntimeFilterDeploymentInstallError> {
+        let (service, removed) = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if let Some(tombstone) = guard
+                .runtime_filter_deployment_tombstones
+                .get(&query_id)
+                .copied()
+            {
+                if tombstone == epoch {
+                    return Ok(RuntimeFilterDeploymentAbortOutcome::Idempotent);
+                }
+                let kind = if epoch.get() < tombstone.get() {
+                    RuntimeFilterDeploymentInstallErrorKind::StaleEpoch
+                } else {
+                    RuntimeFilterDeploymentInstallErrorKind::ConflictingDeployment
+                };
+                return Err(RuntimeFilterDeploymentInstallError::new(
+                    kind,
+                    "runtime filter abort epoch differs from the query tombstone",
+                ));
+            }
+
+            let location = if guard.active.contains_key(&query_id) {
+                Some(true)
+            } else if guard.second_chance.contains_key(&query_id) {
+                Some(false)
+            } else {
+                None
+            };
+            let service = if let Some(active) = location {
+                let context = if active {
+                    guard.active.get(&query_id).expect("checked active")
+                } else {
+                    guard
+                        .second_chance
+                        .get(&query_id)
+                        .expect("checked second chance")
+                };
+                if let Some(claim) = &context.runtime_filter_deployment {
+                    if epoch.get() < claim.install.epoch().get() {
+                        return Err(RuntimeFilterDeploymentInstallError::new(
+                            RuntimeFilterDeploymentInstallErrorKind::StaleEpoch,
+                            "runtime filter abort epoch is older than the installed epoch",
+                        ));
+                    }
+                    if epoch != claim.install.epoch() {
+                        return Err(RuntimeFilterDeploymentInstallError::new(
+                            RuntimeFilterDeploymentInstallErrorKind::ConflictingDeployment,
+                            "runtime filter abort epoch differs from the installed epoch",
+                        ));
+                    }
+                } else if context.num_fragments != 0 || context.num_active_fragments != 0 {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::ActiveFragments,
+                        "runtime filter abort cannot target a query with active fragments and no matching deployment",
+                    ));
+                }
+                Some(context.runtime_filter_service())
+            } else {
+                None
+            };
+
+            guard
+                .runtime_filter_deployment_tombstones
+                .insert(query_id, epoch);
+            let removed = match location {
+                Some(true)
+                    if guard.active.get(&query_id).is_some_and(|context| {
+                        context.num_fragments == 0 && context.num_active_fragments == 0
+                    }) =>
+                {
+                    guard.active.remove(&query_id)
+                }
+                Some(false)
+                    if guard.second_chance.get(&query_id).is_some_and(|context| {
+                        context.num_fragments == 0 && context.num_active_fragments == 0
+                    }) =>
+                {
+                    guard.second_chance.remove(&query_id)
+                }
+                _ => None,
+            };
+            (service, removed)
+        };
+        if let Some(service) = service {
+            service.shutdown_transport();
+        }
+        drop(removed);
+        Ok(RuntimeFilterDeploymentAbortOutcome::Applied)
+    }
+
     #[cfg(feature = "compat")]
     pub(crate) fn get_or_register_compat(
         &self,
@@ -1024,6 +1362,13 @@ impl QueryContextManager {
         claim: LegacyRuntimeFilterExecutionClaim,
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
+            && guard
+                .runtime_filter_deployment_tombstones
+                .contains_key(&query_id)
+        {
+            return Err("runtime filter deployment query was already aborted".to_string());
+        }
         if let Some(ctx) = guard.active.get_mut(&query_id) {
             if claim != LegacyRuntimeFilterExecutionClaim::Unclaimed {
                 ctx.claim_legacy_runtime_filter_execution(claim)?;
@@ -1319,6 +1664,12 @@ impl QueryContextManager {
         query_id: QueryId,
     ) -> Option<Arc<RuntimeFilterService>> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .runtime_filter_deployment_tombstones
+            .contains_key(&query_id)
+        {
+            return None;
+        }
         if let Some(context) = guard.active.get(&query_id) {
             if !context.has_no_active_instances() || !context.is_query_expired() {
                 return Some(context.runtime_filter_service());
@@ -2263,6 +2614,25 @@ fn remove_runtime_filter_lifecycle(query_id: QueryId) {
         .remove_query(QueryKey::from_hi_lo(query_id.hi, query_id.lo));
 }
 
+fn map_runtime_filter_install_error(
+    kind: InstallContractErrorKind,
+    detail: String,
+) -> RuntimeFilterDeploymentInstallError {
+    let kind = match kind {
+        InstallContractErrorKind::EpochMismatch => {
+            RuntimeFilterDeploymentInstallErrorKind::StaleEpoch
+        }
+        InstallContractErrorKind::ConflictingDeployment => {
+            RuntimeFilterDeploymentInstallErrorKind::ConflictingDeployment
+        }
+        InstallContractErrorKind::ServiceClosed => {
+            RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+        }
+        _ => RuntimeFilterDeploymentInstallErrorKind::Internal,
+    };
+    RuntimeFilterDeploymentInstallError::new(kind, detail)
+}
+
 #[cfg(all(test, feature = "compat"))]
 mod generation_race_tests {
     use std::sync::atomic::AtomicBool;
@@ -3002,7 +3372,7 @@ mod runtime_filter_service_lifecycle_tests {
         })
     }
 
-    fn query_id(lo: i64) -> QueryId {
+    pub(super) fn query_id(lo: i64) -> QueryId {
         QueryId { hi: 70, lo }
     }
 
@@ -3010,7 +3380,7 @@ mod runtime_filter_service_lifecycle_tests {
         UniqueId { hi: 70, lo }
     }
 
-    fn participant_install() -> RuntimeFilterParticipantInstall {
+    pub(super) fn participant_install() -> RuntimeFilterParticipantInstall {
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(2);
         let deployment = RuntimeFilterChannelDeployment::new(
@@ -3032,7 +3402,7 @@ mod runtime_filter_service_lifecycle_tests {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
                 deadline_ms: 100,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(8192),
             crate::runtime_filter::port::install::MaterializationPolicy::for_test(),
@@ -3921,5 +4291,215 @@ mod runtime_filter_service_lifecycle_tests {
             .install(participant_install())
             .expect_err("context drop must close retained service");
         assert_eq!(error.kind(), InstallContractErrorKind::ServiceClosed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    pub(super) mod runtime_filter_deployment {
+        use std::time::Duration;
+
+        use super::super::{
+            QueryContextManager, RuntimeFilterDeploymentAbortOutcome,
+            RuntimeFilterDeploymentInstallErrorKind, RuntimeFilterDeploymentInstallOutcome,
+        };
+        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+        use crate::runtime_filter::port::identity::DeploymentEpoch;
+        use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
+
+        use super::super::runtime_filter_service_lifecycle_tests::{participant_install, query_id};
+
+        fn lifecycle() -> RuntimeFilterQueryLifecycleOptions {
+            RuntimeFilterQueryLifecycleOptions {
+                delivery_expire: Duration::from_secs(11),
+                query_expire: Duration::from_secs(29),
+                transport_retry_interval: Duration::from_millis(200),
+                transport_max_attempts: 3,
+                transport_deadline: Duration::from_secs(5),
+                transport_max_pending_entries: 128,
+                transport_max_pending_bytes: 1024 * 1024,
+            }
+        }
+
+        fn with_epoch(
+            install: RuntimeFilterParticipantInstall,
+            epoch: u64,
+        ) -> RuntimeFilterParticipantInstall {
+            let (core, routing) = install.into_parts();
+            let core = crate::runtime_filter::port::install::RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(epoch),
+                core.local_participant_id(),
+                core.channels().clone(),
+            );
+            let routing = crate::runtime_filter::port::routing::RuntimeFilterRoutingShard::new(
+                DeploymentEpoch::new(epoch),
+                routing.local_participant_id(),
+                routing.channels().clone(),
+            )
+            .expect("valid routing shard with replacement epoch");
+            RuntimeFilterParticipantInstall::new(core, routing)
+        }
+
+        fn snapshot(
+            manager: &QueryContextManager,
+            query_id: super::super::QueryId,
+        ) -> Option<(usize, usize, Duration, Duration)> {
+            let guard = manager.inner.lock().expect("query manager");
+            guard
+                .active
+                .get(&query_id)
+                .or_else(|| guard.second_chance.get(&query_id))
+                .map(|context| {
+                    (
+                        context.num_fragments,
+                        context.num_active_fragments,
+                        context.delivery_expire,
+                        context.query_expire,
+                    )
+                })
+        }
+
+        #[test]
+        fn install_precreates_context_without_fragment_count() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9201);
+            assert_eq!(snapshot(&manager, query), None);
+
+            let outcome = manager
+                .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                .expect("first install");
+
+            assert_eq!(outcome, RuntimeFilterDeploymentInstallOutcome::Applied);
+            assert_eq!(
+                snapshot(&manager, query),
+                Some((0, 0, lifecycle().delivery_expire, lifecycle().query_expire))
+            );
+        }
+
+        #[test]
+        fn identical_install_retry_is_idempotent() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9202);
+            let install = participant_install();
+            assert_eq!(snapshot(&manager, query), None);
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), install.clone())
+                    .expect("first install"),
+                RuntimeFilterDeploymentInstallOutcome::Applied
+            );
+            let before = snapshot(&manager, query);
+            assert_eq!(
+                before,
+                Some((0, 0, lifecycle().delivery_expire, lifecycle().query_expire))
+            );
+
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), install)
+                    .expect("identical retry"),
+                RuntimeFilterDeploymentInstallOutcome::Idempotent
+            );
+            assert_eq!(snapshot(&manager, query), before);
+        }
+
+        #[test]
+        fn conflicting_or_stale_install_is_rejected() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9203);
+            let install = participant_install();
+            assert_eq!(snapshot(&manager, query), None);
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), install.clone())
+                .expect("first install");
+            let before = snapshot(&manager, query);
+            assert_eq!(
+                before,
+                Some((0, 0, lifecycle().delivery_expire, lifecycle().query_expire))
+            );
+
+            let stale = manager
+                .install_runtime_filter_deployment(
+                    query,
+                    lifecycle(),
+                    with_epoch(install.clone(), 5),
+                )
+                .expect_err("older epoch");
+            assert_eq!(
+                stale.kind(),
+                RuntimeFilterDeploymentInstallErrorKind::StaleEpoch
+            );
+            assert_eq!(snapshot(&manager, query), before);
+
+            let mut changed_lifecycle = lifecycle();
+            changed_lifecycle.query_expire += Duration::from_secs(1);
+            let conflict = manager
+                .install_runtime_filter_deployment(query, changed_lifecycle, install)
+                .expect_err("same epoch lifecycle conflict");
+            assert_eq!(
+                conflict.kind(),
+                RuntimeFilterDeploymentInstallErrorKind::ConflictingDeployment
+            );
+            assert_eq!(snapshot(&manager, query), before);
+        }
+
+        #[test]
+        fn abort_is_idempotent_and_leaves_tombstone() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9204);
+            let install = participant_install();
+            assert_eq!(snapshot(&manager, query), None);
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), install.clone())
+                .expect("first install");
+            assert_eq!(
+                snapshot(&manager, query),
+                Some((0, 0, lifecycle().delivery_expire, lifecycle().query_expire))
+            );
+
+            assert_eq!(
+                manager
+                    .abort_runtime_filter_deployment(query, install.epoch())
+                    .expect("first abort"),
+                RuntimeFilterDeploymentAbortOutcome::Applied
+            );
+            assert_eq!(snapshot(&manager, query), None);
+            assert_eq!(
+                manager
+                    .abort_runtime_filter_deployment(query, install.epoch())
+                    .expect("duplicate abort"),
+                RuntimeFilterDeploymentAbortOutcome::Idempotent
+            );
+            assert_eq!(snapshot(&manager, query), None);
+        }
+
+        #[test]
+        fn aborted_query_cannot_be_reinstalled_or_revived_by_envelope() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9205);
+            let install = participant_install();
+            assert_eq!(snapshot(&manager, query), None);
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), install.clone())
+                .expect("first install");
+            assert_eq!(
+                snapshot(&manager, query),
+                Some((0, 0, lifecycle().delivery_expire, lifecycle().query_expire))
+            );
+            manager
+                .abort_runtime_filter_deployment(query, install.epoch())
+                .expect("abort");
+            assert_eq!(snapshot(&manager, query), None);
+
+            let error = manager
+                .install_runtime_filter_deployment(query, lifecycle(), install)
+                .expect_err("aborted query cannot be reinstalled");
+            assert_eq!(
+                error.kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert!(manager.runtime_filter_service_for_ingress(query).is_none());
+            assert_eq!(snapshot(&manager, query), None);
+        }
     }
 }

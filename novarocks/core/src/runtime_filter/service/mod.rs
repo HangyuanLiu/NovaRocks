@@ -82,6 +82,7 @@ use self::materialization::{
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
+pub(crate) use self::reliable_transport::ReliableTransportPolicy;
 use self::reliable_transport::{
     ReliableEnvelopeTransport, ReliableSendOutcome, TransportResourceLimit,
 };
@@ -1203,6 +1204,13 @@ impl RuntimeFilterService {
         Ok(outcome)
     }
 
+    pub(crate) fn configure_transport(
+        &self,
+        policy: ReliableTransportPolicy,
+    ) -> Result<(), String> {
+        self.reliable_transport.configure_policy(policy)
+    }
+
     pub(crate) fn open_producer(
         &self,
         binding_id: BindingId,
@@ -1580,6 +1588,11 @@ impl RuntimeFilterService {
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
+        self.reliable_transport.shutdown();
+    }
+
+    pub(crate) fn shutdown_transport(&self) {
+        self.shutdown();
     }
 
     /// Point the outbound remote leg at a fake transport sink. Mirrors the other
