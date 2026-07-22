@@ -22,5 +22,9 @@ pub(crate) mod ports;
 pub(crate) mod prepare;
 pub(crate) mod profile;
 pub(crate) mod report;
+// Task 4 wires this Task 1 foundation into the pre-submit compiler/barrier path.
+// Until then the focused tests are its only caller; keep the staged seam warning-free.
+#[allow(dead_code)]
+pub(crate) mod runtime_filter_deployment;
 pub(crate) mod scheduler;
 pub(crate) mod write;

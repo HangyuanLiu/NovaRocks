@@ -24,6 +24,7 @@ pub(crate) mod wait_for;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::role_graph::RoleGraph;
@@ -50,6 +51,27 @@ pub(crate) struct RuntimeFilterDeploymentPolicy {
     /// stamped into every channel deployment. A resource-policy input supplied by
     /// the caller (RFD-6 / query options), never a magic default.
     pub materialization: MaterializationPolicy,
+}
+
+/// Query-scoped transport limits derived from the same sealed graph as the
+/// compiler policy. The live sender consumes this explicit contract instead of
+/// falling back to service-internal defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterQueryTransportPolicy {
+    pub(crate) retry_interval: Duration,
+    pub(crate) max_attempts: u32,
+    pub(crate) deadline: Duration,
+    pub(crate) max_pending_entries: usize,
+    pub(crate) max_pending_bytes: usize,
+}
+
+/// Complete query-level deployment policy assembled by the coordinator before
+/// compilation. Install and transport use one graph-derived deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterQueryDeploymentPolicy {
+    pub(crate) compiler: RuntimeFilterDeploymentPolicy,
+    pub(crate) transport: RuntimeFilterQueryTransportPolicy,
+    pub(crate) install_rpc_deadline: Duration,
 }
 
 pub(crate) type BindingInstanceIndex =

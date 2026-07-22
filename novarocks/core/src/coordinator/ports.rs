@@ -17,8 +17,22 @@
 
 use std::sync::Arc;
 
+use crate::coordinator::cluster::LiveBackendSnapshot;
 use crate::coordinator::dispatch::FragmentDispatcher;
+use crate::coordinator::runtime_filter_deployment::{
+    DeploymentEpochAllocator, NativeRuntimeFilterDeploymentPolicyProvider,
+};
 use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+
+pub(crate) trait RuntimeFilterDeploymentPolicyProvider: Send + Sync + 'static {
+    fn policy_for(
+        &self,
+        graph: &RuntimeFilterGraph,
+        backends: &LiveBackendSnapshot,
+    ) -> Result<RuntimeFilterQueryDeploymentPolicy, String>;
+}
 
 pub(crate) trait CoordinatorObserver: Send + Sync + 'static {
     fn fragment_scheduled(&self);
@@ -35,6 +49,8 @@ pub(crate) struct CoordinatorExecutionPorts {
     pub(crate) dispatcher: Arc<dyn FragmentDispatcher>,
     pub(crate) report_endpoint: RuntimeEndpoint,
     pub(crate) observer: Arc<dyn CoordinatorObserver>,
+    pub(crate) runtime_filter_policy_provider: Arc<dyn RuntimeFilterDeploymentPolicyProvider>,
+    pub(crate) deployment_epoch_allocator: DeploymentEpochAllocator,
 }
 
 impl CoordinatorExecutionPorts {
@@ -47,6 +63,12 @@ impl CoordinatorExecutionPorts {
             dispatcher,
             report_endpoint,
             observer,
+            runtime_filter_policy_provider: Arc::new(
+                NativeRuntimeFilterDeploymentPolicyProvider::new(
+                    crate::common::config::data_runtime_worker_threads(),
+                ),
+            ),
+            deployment_epoch_allocator: DeploymentEpochAllocator,
         }
     }
 }

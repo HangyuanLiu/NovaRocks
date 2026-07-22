@@ -440,6 +440,8 @@ impl ExecutionCoordinator {
             dispatcher,
             report_endpoint,
             observer,
+            runtime_filter_policy_provider: _runtime_filter_policy_provider,
+            deployment_epoch_allocator: _deployment_epoch_allocator,
         } = self.execution_ports;
         let scheduler = self.scheduler;
         // ---------------------------------------------------------------

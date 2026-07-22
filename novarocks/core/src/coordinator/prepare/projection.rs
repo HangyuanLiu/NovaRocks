@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use super::runtime_filter_binding::RuntimeFilterBindingTable;
 use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
+use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
@@ -118,6 +119,9 @@ pub(crate) struct PreparedFragmentSet {
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
     scan_bindings: ScanExecutionBindings,
     projection: PreparedPlanProjection,
+    // Task 4 consumes the sealed graph at the pre-submit compiler boundary.
+    #[allow(dead_code)]
+    runtime_filter_graph: RuntimeFilterGraph,
 }
 
 impl PreparedFragmentSet {
@@ -127,6 +131,7 @@ impl PreparedFragmentSet {
         topological_fragment_order: Vec<FragmentId>,
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
+        runtime_filter_graph: RuntimeFilterGraph,
     ) -> Self {
         Self {
             by_fragment,
@@ -136,6 +141,7 @@ impl PreparedFragmentSet {
                 execution_anchor_fragment_id,
                 edges,
             },
+            runtime_filter_graph,
         }
     }
 
@@ -157,6 +163,12 @@ impl PreparedFragmentSet {
 
     pub(crate) fn fragment(&self, fragment_id: FragmentId) -> Option<&PreparedFragment> {
         self.by_fragment.get(&fragment_id)
+    }
+
+    // Task 4 consumes this accessor when it wires compiler/barrier installation.
+    #[allow(dead_code)]
+    pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
+        &self.runtime_filter_graph
     }
 }
 
@@ -275,5 +287,6 @@ pub(crate) fn prepared_fragment_set_for_test(
         topological_fragment_order,
         execution_anchor_fragment_id,
         edges,
+        RuntimeFilterGraph::default(),
     )
 }
