@@ -46,7 +46,7 @@ pub(crate) use instance::{
     LakeMetaScanRangeFact, LakeScanProgramFacts, StarRocksDecodeFacts, StarRocksJdbcFacts,
     StarRocksObjectStoreDefaults, StarRocksPathRewriteFacts, decode_incremental_scan_ranges,
     decode_lake_meta_scan_range_facts, decode_lake_scan_program_facts,
-    decode_scan_contracts_and_assignments,
+    decode_scan_contracts_and_raw_ranges,
 };
 pub(crate) use options::decode_query_options;
 pub(crate) use runtime_filter::decode_runtime_filter_params;

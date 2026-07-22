@@ -818,10 +818,11 @@ fn lower_file_scan_node_inner(
     };
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
 
-    // Split the decoded config into a static source plus its file ranges, then
-    // eagerly `bind` (mirrors the HDFS/JDBC funnel). FILE_SCAN is constructed
-    // inline here rather than through `create_scan_node`, so the split happens
-    // at this decode site instead of in the connector registry.
+    // Split the decoded config into a static source (stored on the ScanNode)
+    // plus its file ranges (captured for the instance below). FILE_SCAN is
+    // constructed inline here rather than through `create_scan_node`, so the
+    // split happens at this decode site instead of in the connector registry.
+    // Binding is deferred to materialize time; nothing is bound here.
     let source = FileLoadScanSource {
         format_type,
         source_chunk_schema,

@@ -203,9 +203,7 @@ mod tests {
         }
 
         fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            let morsels = (0..self.morsels)
-                .map(|index| test_file_morsel(index))
-                .collect();
+            let morsels = (0..self.morsels).map(test_file_morsel).collect();
             Ok(ScanMorsels::new(morsels, false))
         }
     }

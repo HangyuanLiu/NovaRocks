@@ -430,7 +430,12 @@ pub(crate) fn decode_instance_parts(
     })
 }
 
-pub(crate) fn decode_scan_contracts_and_assignments(
+/// Decode the static scan contracts and the transient per-node enrichment
+/// carrier. This does NOT build the instance's `ScanAssignments`: it returns the
+/// raw `(ScanAssignmentKind, Vec<ScanRangeParams>)` per node that the scan
+/// decoders read (kind guard + range enrichment); the instance assignments are
+/// assembled afterwards from the enriched `BoundScanRanges` the decoders capture.
+pub(crate) fn decode_scan_contracts_and_raw_ranges(
     nodes: &[plan_nodes::TPlanNode],
     raw_ranges: &BTreeMap<i32, Vec<internal_service::TScanRangeParams>>,
     descriptors: Option<&descriptors::TDescriptorTable>,

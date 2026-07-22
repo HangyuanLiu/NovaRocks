@@ -51,7 +51,7 @@ use super::error::{
 };
 use super::instance::{
     DecodedStarRocksInstanceParts, StarRocksDecodeFacts, decode_instance_parts,
-    decode_scan_contracts_and_assignments,
+    decode_scan_contracts_and_raw_ranges,
 };
 use super::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
 use super::node::{
@@ -488,7 +488,7 @@ fn decode_draft_parts(
             .query_globals
             .and_then(|globals| globals.time_zone.clone()),
     );
-    let (scan_contracts, raw_scan_ranges) = decode_scan_contracts_and_assignments(
+    let (scan_contracts, raw_scan_ranges) = decode_scan_contracts_and_raw_ranges(
         &plan.nodes,
         &instance.scan_ranges,
         input.descriptors,
@@ -1794,7 +1794,7 @@ mod tests {
         )]);
         let facts = super::super::instance::StarRocksDecodeFacts::default();
         let (contracts, assignments) =
-            super::super::instance::decode_scan_contracts_and_assignments(
+            super::super::instance::decode_scan_contracts_and_raw_ranges(
                 &[scan_node],
                 &raw_ranges,
                 None,
@@ -1812,7 +1812,7 @@ mod tests {
                 .assignment_kind(),
             crate::exec::fragment::program::ScanAssignmentKind::BrokerFile
         );
-        // `decode_scan_contracts_and_assignments` now returns the transient
+        // `decode_scan_contracts_and_raw_ranges` now returns the transient
         // enrichment carrier (kind, raw ScanRangeParams) per node.
         let (_, assignment_ranges) = assignments.get(&node_id).expect("scan assignment");
         assert_eq!(assignment_ranges.len(), 1);
@@ -1952,7 +1952,7 @@ mod tests {
         ]);
         let facts = super::super::instance::StarRocksDecodeFacts::default();
         let (contracts, assignments) =
-            super::super::instance::decode_scan_contracts_and_assignments(
+            super::super::instance::decode_scan_contracts_and_raw_ranges(
                 &[hdfs_node, lake_node, schema_node],
                 &raw_ranges,
                 None,
@@ -2110,7 +2110,7 @@ mod tests {
                 ),
             ],
         )]);
-        let error = super::super::instance::decode_scan_contracts_and_assignments(
+        let error = super::super::instance::decode_scan_contracts_and_raw_ranges(
             &[hdfs_node],
             &raw_ranges,
             None,
@@ -2163,7 +2163,7 @@ mod tests {
         ));
         let facts = super::super::instance::StarRocksDecodeFacts::default();
         let (contracts, assignments) =
-            super::super::instance::decode_scan_contracts_and_assignments(
+            super::super::instance::decode_scan_contracts_and_raw_ranges(
                 &[node],
                 &BTreeMap::new(),
                 None,

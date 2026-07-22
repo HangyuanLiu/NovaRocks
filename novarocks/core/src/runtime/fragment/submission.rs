@@ -898,8 +898,8 @@ mod tests {
         // submission validates. The `BoundScanRanges` variant is irrelevant here.
         let scans = ScanAssignments::try_new(
             scans
-                .into_iter()
-                .map(|(id, _kind)| (id, BoundScanRanges::None))
+                .into_keys()
+                .map(|id| (id, BoundScanRanges::None))
                 .collect(),
         )
         .expect("scan assignments");
