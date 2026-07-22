@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use crate::common::app_config;
 use crate::exec::node::ExecPlan;
+use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
@@ -54,6 +55,7 @@ pub(crate) fn execute_native_plan_with_pipeline(
     debug: bool,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -67,6 +69,7 @@ pub(crate) fn execute_native_plan_with_pipeline(
         debug,
         time_slice,
         sink,
+        exchange_bindings,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -83,6 +86,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     debug: bool,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -97,6 +101,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
         debug,
         time_slice,
         sink,
+        exchange_bindings,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -115,6 +120,7 @@ pub(crate) fn execute_compat_plan_with_pipeline(
     debug: bool,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -128,6 +134,7 @@ pub(crate) fn execute_compat_plan_with_pipeline(
         debug,
         time_slice,
         sink,
+        exchange_bindings,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -145,6 +152,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
     debug: bool,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -159,6 +167,7 @@ pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
         debug,
         time_slice,
         sink,
+        exchange_bindings,
         exchange_finst_id,
         profiler,
         pipeline_dop,
@@ -183,6 +192,7 @@ fn execute_plan_with_pipeline_in_mode(
     debug: bool,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
@@ -239,6 +249,7 @@ fn execute_plan_with_pipeline_in_mode(
                 debug,
                 dep_manager.clone(),
                 exchange_finst_id,
+                exchange_bindings,
                 pipeline_dop,
                 root_sink_dop,
                 runtime_state.native_runtime_filter_context().cloned(),
@@ -251,6 +262,7 @@ fn execute_plan_with_pipeline_in_mode(
                 debug,
                 dep_manager.clone(),
                 exchange_finst_id,
+                exchange_bindings,
                 pipeline_dop,
                 root_sink_dop,
                 runtime_filter_hub.expect("compat runtime-filter hub"),
@@ -396,6 +408,7 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
     use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+    use crate::exec::pipeline::binding::ExchangeBindings;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime::runtime_state::RuntimeState;
@@ -582,6 +595,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(producer_handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -666,6 +680,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(consumer_handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -795,6 +810,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -915,6 +931,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1031,6 +1048,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1153,6 +1171,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1305,6 +1324,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1481,6 +1501,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1641,6 +1662,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1791,6 +1813,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             1,
@@ -1917,6 +1940,7 @@ mod tests {
             false,
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(handle.clone())),
+            ExchangeBindings::default(),
             None,
             None,
             2,

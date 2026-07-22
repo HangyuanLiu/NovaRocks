@@ -259,6 +259,8 @@ pub(crate) fn execute_native_submission(
     // PBF-2 launches each validated submission once. PBF-4 will materialize
     // instance-owned scan and exchange state instead of cloning bound nodes.
     let exec_plan = program.plan().clone();
+    let exchange_bindings =
+        crate::runtime::fragment::exchange::materialize_exchange_bindings(program, instance);
     let _exec_timer = context
         .profiler
         .as_ref()
@@ -268,6 +270,7 @@ pub(crate) fn execute_native_submission(
         debug_exec_node_output(),
         Duration::from_millis(50),
         sink,
+        exchange_bindings,
         Some((fragment_instance_id.hi, fragment_instance_id.lo)),
         context.profiler,
         pipeline_dop,

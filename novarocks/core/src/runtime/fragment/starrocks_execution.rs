@@ -98,6 +98,8 @@ pub(crate) fn execute_starrocks_submission(
     }
     let _group_execution_scan_dop = metadata.group_execution_scan_dop;
     let exec_plan = program.plan().clone();
+    let exchange_bindings =
+        crate::runtime::fragment::exchange::materialize_exchange_bindings(program, instance);
     let _timer = context
         .profiler
         .as_ref()
@@ -107,6 +109,7 @@ pub(crate) fn execute_starrocks_submission(
         debug_exec_node_output(),
         Duration::from_millis(50),
         sink,
+        exchange_bindings,
         Some((fragment_instance_id.hi, fragment_instance_id.lo)),
         context.profiler,
         pipeline_dop,

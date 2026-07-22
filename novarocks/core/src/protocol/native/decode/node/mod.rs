@@ -2573,12 +2573,7 @@ mod tests {
             node: ExecNode {
                 kind: ExecNodeKind::ExchangeSource(
                     crate::exec::node::exchange_source::ExchangeSourceNode::new(
-                        crate::runtime::exchange::ExchangeKey {
-                            finst_id_hi: 1,
-                            finst_id_lo: 2,
-                            node_id: 3,
-                        },
-                        1,
+                        3,
                         std::time::Duration::from_secs(1),
                         Arc::clone(&baseline.output_schema),
                     ),

@@ -29,7 +29,6 @@ use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
-use crate::runtime::exchange;
 use crate::thrift::{descriptors, plan_nodes};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
@@ -50,7 +49,10 @@ pub(crate) fn lower_exchange_node(
 ) -> Result<Lowered, StarRocksFragmentDecodeError> {
     let payload_path = node_path.clone().field("exchange_node");
     if children.is_empty() {
-        let fragment_instance_id = fragment_instance_id.ok_or_else(|| {
+        // Validate the exchange receiver carries a fragment instance id. The
+        // instance-scoped ExchangeKey and sender count are materialized into the
+        // per-node ExchangeBinding at execution time, not baked into the node.
+        let _fragment_instance_id = fragment_instance_id.ok_or_else(|| {
             StarRocksFragmentDecodeError::missing(
                 node_path.clone(),
                 "EXCHANGE_NODE missing fragment instance id for exchange receiver",
@@ -71,11 +73,6 @@ pub(crate) fn lower_exchange_node(
             );
         }
 
-        let key = exchange::ExchangeKey {
-            finst_id_hi: fragment_instance_id.hi,
-            finst_id_lo: fragment_instance_id.lo,
-            node_id: node.node_id,
-        };
         let exchange_timeout_ms = exchange_wait_ms();
 
         let expected_chunk_schema =
@@ -85,8 +82,7 @@ pub(crate) fn lower_exchange_node(
         let mut out = ExecNode {
             kind: ExecNodeKind::ExchangeSource(
                 ExchangeSourceNode::new(
-                    key,
-                    expected,
+                    node.node_id,
                     Duration::from_millis(exchange_timeout_ms),
                     expected_chunk_schema,
                 )

@@ -165,7 +165,7 @@ impl ProgramInventory {
             ExecNodeKind::UnionAll(node) => self.visit_inputs(&node.inputs),
             ExecNodeKind::Limit(node) => self.visit(&node.input),
             ExecNodeKind::ExchangeSource(node) => {
-                let id = FragmentNodeId::new(node.key.node_id);
+                let id = FragmentNodeId::new(node.node_id);
                 if self
                     .exchange_nodes
                     .insert(id, Arc::clone(&node.expected_chunk_schema))
@@ -715,15 +715,10 @@ mod tests {
         )
     }
 
-    fn exchange_node(node_id: i32, expected_schema: ChunkSchemaRef, finst: UniqueId) -> ExecNode {
+    fn exchange_node(node_id: i32, expected_schema: ChunkSchemaRef, _finst: UniqueId) -> ExecNode {
         ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
-                ExchangeKey {
-                    finst_id_hi: finst.hi,
-                    finst_id_lo: finst.lo,
-                    node_id,
-                },
-                1,
+                node_id,
                 Duration::from_secs(1),
                 expected_schema,
             )),

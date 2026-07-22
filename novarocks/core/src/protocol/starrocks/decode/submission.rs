@@ -802,7 +802,7 @@ fn collect_exchange_contracts(
     ) -> Result<(), StarRocksFragmentDecodeError> {
         match &node.kind {
             ExecNodeKind::ExchangeSource(exchange) => {
-                let id = FragmentNodeId::new(exchange.key.node_id);
+                let id = FragmentNodeId::new(exchange.node_id);
                 if contracts
                     .insert(
                         id,

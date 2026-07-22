@@ -36,6 +36,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
+use crate::exec::pipeline::binding::ExchangeBinding;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -77,6 +78,7 @@ const RUNTIME_FILTER_UNAVAILABLE: &str = "RuntimeFilterUnavailable";
 pub struct ExchangeSourceFactory {
     name: String,
     node: ExchangeSourceNode,
+    binding: ExchangeBinding,
     runtime_filter_execution: ExchangeSourceRuntimeFilterExecution,
     arena: Arc<ExprArena>,
 }
@@ -98,12 +100,13 @@ enum ExchangeSourceRuntimeFilterExecution {
 impl ExchangeSourceFactory {
     pub(crate) fn new_native(
         node: ExchangeSourceNode,
+        binding: ExchangeBinding,
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
         let name = node.profile_name();
         exchange::register_expected_chunk_schema(
-            node.key,
-            node.expected_senders,
+            binding.key,
+            binding.expected_senders,
             node.expected_chunk_schema(),
         )?;
         let consumers = NativeRuntimeFilterConsumerSet::from_plan(
@@ -113,6 +116,7 @@ impl ExchangeSourceFactory {
         Ok(Self {
             name,
             node,
+            binding,
             runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native { consumers },
             arena,
         })
@@ -121,18 +125,20 @@ impl ExchangeSourceFactory {
     #[cfg(test)]
     fn new_native_with_consumers_for_test(
         node: ExchangeSourceNode,
+        binding: ExchangeBinding,
         arena: Arc<ExprArena>,
         consumers: NativeRuntimeFilterConsumerSet,
     ) -> Result<Self, String> {
         let name = node.profile_name();
         exchange::register_expected_chunk_schema(
-            node.key,
-            node.expected_senders,
+            binding.key,
+            binding.expected_senders,
             node.expected_chunk_schema(),
         )?;
         Ok(Self {
             name,
             node,
+            binding,
             runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Native { consumers },
             arena,
         })
@@ -141,13 +147,14 @@ impl ExchangeSourceFactory {
     #[cfg(feature = "compat")]
     pub(crate) fn new_compat(
         node: ExchangeSourceNode,
+        binding: ExchangeBinding,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
         let name = node.profile_name();
         exchange::register_expected_chunk_schema(
-            node.key,
-            node.expected_senders,
+            binding.key,
+            binding.expected_senders,
             node.expected_chunk_schema(),
         )?;
         let runtime_filter_specs = node.runtime_filter_specs().to_vec();
@@ -157,12 +164,13 @@ impl ExchangeSourceFactory {
             .collect();
         let runtime_filters_expected = runtime_filter_specs.len();
         if runtime_filters_expected > 0 {
-            runtime_filter_hub.register_probe_specs(node.key.node_id, &runtime_filter_specs);
+            runtime_filter_hub.register_probe_specs(node.node_id, &runtime_filter_specs);
         }
         let local_rf_waiting_set = node.local_rf_waiting_set().to_vec();
         Ok(Self {
             name,
             node,
+            binding,
             runtime_filter_execution: ExchangeSourceRuntimeFilterExecution::Compat {
                 runtime_filter_specs,
                 runtime_filter_exprs,
@@ -196,7 +204,7 @@ impl ExchangeSourceFactory {
                 } else {
                     debug!(
                         "exchange skip unknown local RF dependency: node_id={} waiting_build_node_id={}",
-                        self.node.key.node_id, node_id
+                        self.node.node_id, node_id
                     );
                 }
             }
@@ -227,15 +235,15 @@ impl OperatorFactory for ExchangeSourceFactory {
                     if !local_rf_waiting_set.is_empty() {
                         debug!(
                             "ExchangeSource local RF wait: finst={} node_id={} driver_id={} waiting_set={:?}",
-                            self.node.key.finst_uuid(),
-                            self.node.key.node_id,
+                            self.binding.key.finst_uuid(),
+                            self.node.node_id,
                             driver_id,
                             local_rf_waiting_set
                         );
                     }
                     let probe =
                         (*runtime_filters_expected > 0).then(|| ExchangeRuntimeFilterProbe {
-                            probe: runtime_filter_hub.register_probe(self.node.key.node_id),
+                            probe: runtime_filter_hub.register_probe(self.node.node_id),
                         });
                     (
                         probe,
@@ -248,6 +256,7 @@ impl OperatorFactory for ExchangeSourceFactory {
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
+            binding: self.binding,
             driver_id,
             receiver: None,
             start: None,
@@ -282,6 +291,7 @@ impl OperatorFactory for ExchangeSourceFactory {
 struct ExchangeSourceOperator {
     name: String,
     node: ExchangeSourceNode,
+    binding: ExchangeBinding,
     driver_id: i32,
     receiver: Option<exchange::ExchangeReceiverHandle>,
     start: Option<Instant>,
@@ -411,13 +421,14 @@ impl Operator for ExchangeSourceOperator {
         if self.receiver.is_some() {
             return Ok(());
         }
-        let receiver = exchange::get_receiver_handle(self.node.key, self.node.expected_senders)?;
+        let receiver =
+            exchange::get_receiver_handle(self.binding.key, self.binding.expected_senders)?;
         self.receiver = Some(receiver);
         debug!(
             "ExchangeSource prepared: finst={} node_id={} expected_senders={} timeout={:?}",
-            self.node.key.finst_uuid(),
-            self.node.key.node_id,
-            self.node.expected_senders,
+            self.binding.key.finst_uuid(),
+            self.node.node_id,
+            self.binding.expected_senders,
             self.node.timeout
         );
         Ok(())
@@ -459,8 +470,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
             if should_log_exchange_source_ready() {
                 debug!(
                     "ExchangeSource has_output due to timeout: finst={} node_id={} elapsed={:?} timeout={:?}",
-                    self.node.key.finst_uuid(),
-                    self.node.key.node_id,
+                    self.binding.key.finst_uuid(),
+                    self.node.node_id,
                     start.elapsed(),
                     self.node.timeout
                 );
@@ -470,13 +481,13 @@ impl ProcessorOperator for ExchangeSourceOperator {
         let Some(receiver) = self.receiver.as_ref() else {
             return false;
         };
-        let ready = receiver.has_output_or_finished(self.node.expected_senders);
+        let ready = receiver.has_output_or_finished(self.binding.expected_senders);
         if ready && should_log_exchange_source_ready() {
             debug!(
                 "ExchangeSource has_output due to receiver: finst={} node_id={} expected_senders={}",
-                self.node.key.finst_uuid(),
-                self.node.key.node_id,
-                self.node.expected_senders
+                self.binding.key.finst_uuid(),
+                self.node.node_id,
+                self.binding.expected_senders
             );
         }
         ready
@@ -498,7 +509,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if !self.receiver_mem_tracker_ready {
             self.receiver_mem_tracker_ready = true;
             if let Some(root) = state.mem_tracker() {
-                let _ = exchange::ensure_receiver_mem_tracker(self.node.key, &root)?;
+                let _ = exchange::ensure_receiver_mem_tracker(self.binding.key, &root)?;
             }
         }
 
@@ -506,7 +517,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
             self.logged_first_pull = true;
             debug!(
                 "ExchangeSource first pull: node_id={} driver_id={}",
-                self.node.key.node_id, self.driver_id
+                self.node.node_id, self.driver_id
             );
         }
 
@@ -516,15 +527,15 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if start.elapsed() >= self.node.timeout {
             debug!(
                 "ExchangeSource timeout waiting for senders: finst_id={} node_id={} elapsed={:?} timeout={:?}",
-                self.node.key.finst_uuid(),
-                self.node.key.node_id,
+                self.binding.key.finst_uuid(),
+                self.node.node_id,
                 start.elapsed(),
                 self.node.timeout
             );
             return Err(format!(
                 "exchange timeout waiting for senders: finst_id={} node_id={}",
-                self.node.key.finst_uuid(),
-                self.node.key.node_id
+                self.binding.key.finst_uuid(),
+                self.node.node_id
             ));
         }
 
@@ -532,7 +543,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
             let out = {
                 let receiver = self.receiver.as_ref().expect("receiver");
                 receiver
-                    .try_pop_next_with_stats(self.node.expected_senders)
+                    .try_pop_next_with_stats(self.binding.expected_senders)
                     .map_err(|e| e.to_string())?
             };
 
@@ -555,13 +566,13 @@ impl ProcessorOperator for ExchangeSourceOperator {
                         if filtered.is_empty() {
                             debug!(
                                 "ExchangeSource filtered empty chunk: node_id={} driver_id={} input_rows={}",
-                                self.node.key.node_id, self.driver_id, input_rows
+                                self.node.node_id, self.driver_id, input_rows
                             );
                             continue;
                         }
                         debug!(
                             "ExchangeSource output chunk: node_id={} driver_id={} input_rows={} output_rows={}",
-                            self.node.key.node_id,
+                            self.node.node_id,
                             self.driver_id,
                             input_rows,
                             filtered.len()
@@ -570,7 +581,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     } else {
                         debug!(
                             "ExchangeSource filtered to None: node_id={} driver_id={} input_rows={}",
-                            self.node.key.node_id, self.driver_id, input_rows
+                            self.node.node_id, self.driver_id, input_rows
                         );
                     }
                     continue;
@@ -578,8 +589,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
                     debug!(
                         "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
-                        self.node.key.finst_uuid(),
-                        self.node.key.node_id,
+                        self.binding.key.finst_uuid(),
+                        self.node.node_id,
                         self.driver_id,
                         stats.request_received,
                         stats.bytes_received,
@@ -595,7 +606,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                         self.logged_first_none = true;
                         debug!(
                             "ExchangeSource no output yet: node_id={} driver_id={}",
-                            self.node.key.node_id, self.driver_id
+                            self.node.node_id, self.driver_id
                         );
                     }
                     return Ok(None);
@@ -624,7 +635,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
             if let Some(receiver) = self.receiver.as_ref() {
                 // If data is already available, let the driver consume it instead of
                 // waiting on runtime filters.
-                if receiver.has_output_or_finished(self.node.expected_senders) {
+                if receiver.has_output_or_finished(self.binding.expected_senders) {
                     return None;
                 }
             }
@@ -712,7 +723,7 @@ impl ExchangeSourceOperator {
                 self.record_runtime_filter_acquired(&outcome, 0);
                 debug!(
                     "exchange runtime filters unavailable: node_id={} expected={} reason={:?}",
-                    self.node.key.node_id, self.runtime_filters_expected, reason
+                    self.node.node_id, self.runtime_filters_expected, reason
                 );
                 (0, 0)
             }
@@ -760,7 +771,7 @@ impl ExchangeSourceOperator {
     ) {
         debug!(
             "exchange runtime filters loaded: node_id={} expected={} in_filters={} membership_filters={}",
-            self.node.key.node_id,
+            self.node.node_id,
             self.runtime_filters_expected,
             in_filters.len(),
             membership_filters.len()
@@ -769,7 +780,7 @@ impl ExchangeSourceOperator {
             let filter = filter.as_ref();
             debug!(
                 "exchange runtime in filter: node_id={} filter_id={} slot_id={:?} empty={}",
-                self.node.key.node_id,
+                self.node.node_id,
                 filter.filter_id(),
                 filter.slot_id(),
                 filter.is_empty()
@@ -784,7 +795,7 @@ impl ExchangeSourceOperator {
             };
             debug!(
                 "exchange runtime membership filter: node_id={} filter_id={} kind={} slot_id={:?} ltype={:?} size={} has_null={} join_mode={} empty={}",
-                self.node.key.node_id,
+                self.node.node_id,
                 filter.filter_id(),
                 kind,
                 filter.slot_id(),
@@ -880,6 +891,7 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::join::CompatJoinRuntimeFilterSpec;
+    use crate::exec::pipeline::binding::ExchangeBinding;
     use crate::exec::runtime_filter::{
         LocalRuntimeInFilterSet, RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter,
         RuntimeEmptyFilter, RuntimeFilterType, RuntimeMembershipFilter, RuntimeMinMaxFilter,
@@ -971,15 +983,19 @@ mod tests {
         };
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let node = ExchangeSourceNode::new(
-            key,
-            1,
+            key.node_id,
             Duration::from_secs(2),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .unwrap(),
         );
-        let factory =
-            ExchangeSourceFactory::new_native_with_consumers_for_test(node, arena, consumers)
-                .unwrap();
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 1,
+        };
+        let factory = ExchangeSourceFactory::new_native_with_consumers_for_test(
+            node, binding, arena, consumers,
+        )
+        .unwrap();
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1009,15 +1025,19 @@ mod tests {
         };
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let node = ExchangeSourceNode::new(
-            key,
-            1,
+            key.node_id,
             Duration::from_secs(2),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .unwrap(),
         );
-        let factory =
-            ExchangeSourceFactory::new_native_with_consumers_for_test(node, arena, consumers)
-                .unwrap();
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 1,
+        };
+        let factory = ExchangeSourceFactory::new_native_with_consumers_for_test(
+            node, binding, arena, consumers,
+        )
+        .unwrap();
         let state = RuntimeState::default();
         let mut source = factory.create(1, 0);
         source.prepare().unwrap();
@@ -1038,6 +1058,34 @@ mod tests {
             .unwrap();
         assert_eq!(int32_values(&output), vec![2, 4]);
         exchange::remove_fragment(key.finst_id_hi, key.finst_id_lo);
+    }
+
+    #[test]
+    fn native_factory_registers_receiver_from_binding_not_node() {
+        // node_id (5) deliberately differs from the binding's expected_senders (4):
+        // a factory that read the sender count from the static node instead of the
+        // instance binding would register the wrong receiver state (or use the wrong
+        // ExchangeKey), so this pins the cutover contract.
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 77_001,
+            finst_id_lo: 88_002,
+            node_id: 5,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        let node = ExchangeSourceNode::new(5, Duration::from_secs(60), chunk_schema);
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 4,
+        };
+        ExchangeSourceFactory::new_native(node, binding, Arc::new(ExprArena::default()))
+            .expect("native exchange factory");
+        let snapshot =
+            exchange::snapshot_receiver_state(key).expect("factory registered the receiver state");
+        assert_eq!(snapshot.expected_senders, 4);
+        exchange::cancel_exchange_key(key);
     }
 
     #[test]
@@ -1067,13 +1115,13 @@ mod tests {
         hub.publish_filters(&[], &[pruning_membership_filter(7, vec![1, 2, 3])]);
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 0,
+            finst_id_lo: 0,
+            node_id: 42,
+        };
         let node = ExchangeSourceNode::new(
-            exchange::ExchangeKey {
-                finst_id_hi: 0,
-                finst_id_lo: 0,
-                node_id: 42,
-            },
-            1,
+            42,
             Duration::from_secs(60),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .expect("chunk schema"),
@@ -1081,6 +1129,10 @@ mod tests {
         let mut operator = ExchangeSourceOperator {
             name: "exchange".to_string(),
             node,
+            binding: ExchangeBinding {
+                key,
+                expected_senders: 1,
+            },
             driver_id: 0,
             receiver: None,
             start: None,
@@ -1179,13 +1231,13 @@ mod tests {
         hub.publish_filters(&in_filters, &[passthrough_membership_filter(8)]);
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 0,
+            finst_id_lo: 0,
+            node_id: 42,
+        };
         let node = ExchangeSourceNode::new(
-            exchange::ExchangeKey {
-                finst_id_hi: 0,
-                finst_id_lo: 0,
-                node_id: 42,
-            },
-            1,
+            42,
             Duration::from_secs(60),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .expect("chunk schema"),
@@ -1193,6 +1245,10 @@ mod tests {
         let mut operator = ExchangeSourceOperator {
             name: "exchange".to_string(),
             node,
+            binding: ExchangeBinding {
+                key,
+                expected_senders: 1,
+            },
             driver_id: 0,
             receiver: None,
             start: None,
@@ -1266,13 +1322,13 @@ mod tests {
         );
         let probe = hub.register_probe(42);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 0,
+            finst_id_lo: 0,
+            node_id: 42,
+        };
         let node = ExchangeSourceNode::new(
-            exchange::ExchangeKey {
-                finst_id_hi: 0,
-                finst_id_lo: 0,
-                node_id: 42,
-            },
-            1,
+            42,
             Duration::from_secs(60),
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .expect("chunk schema"),
@@ -1280,6 +1336,10 @@ mod tests {
         let mut operator = ExchangeSourceOperator {
             name: "exchange".to_string(),
             node,
+            binding: ExchangeBinding {
+                key,
+                expected_senders: 1,
+            },
             driver_id: 0,
             receiver: None,
             start: None,
