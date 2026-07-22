@@ -14,17 +14,3 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-pub mod application;
-pub mod deployment;
-pub mod dml;
-mod server;
-pub mod system_catalog;
-pub mod view;
-
-pub use application::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-};
-pub use server::{FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown};
-pub use system_catalog::SystemCatalogService;
-pub use view::FrontendViewService;
