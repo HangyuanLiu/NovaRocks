@@ -73,7 +73,10 @@ use crate::runtime_filter::router::remote::{
 };
 use crate::service::grpc_runtime_filter_sender::GrpcRuntimeFilterEnvelopeSink;
 
-use super::{CloseRole, FinalizerCompletion, LifecycleBarrier, LifecyclePermit};
+use super::{
+    CloseRole, FinalizerCompletion, LifecycleBarrier, LifecyclePermit, finish_finalizer_panic,
+    retain_first_finalizer_panic,
+};
 
 /// Bounded retry / deadline / buffer policy for the reliable transport.
 ///
@@ -478,6 +481,7 @@ impl ReliableEnvelopeTransport {
             }
             CloseRole::Leader => self.lifecycle.wait_for_quiescence(),
         }
+        let entered_while_panicking = std::thread::panicking();
         let completion = FinalizerCompletion::new(&self.lifecycle);
         let mut first_panic = None;
         // The lifecycle mutex is not held across trait calls. A synchronous shutdown
@@ -486,7 +490,7 @@ impl ReliableEnvelopeTransport {
         if let Err(payload) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.sink.shutdown()))
         {
-            first_panic = Some(payload);
+            retain_first_finalizer_panic(&mut first_panic, payload);
         }
         #[cfg(test)]
         if let Some(sink) = self
@@ -499,7 +503,7 @@ impl ReliableEnvelopeTransport {
             if let Err(payload) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.shutdown()))
             {
-                first_panic.get_or_insert(payload);
+                retain_first_finalizer_panic(&mut first_panic, payload);
             }
         }
         let mut pending = self
@@ -511,9 +515,7 @@ impl ReliableEnvelopeTransport {
         pending.bytes = 0;
         drop(pending);
         drop(completion);
-        if let Some(payload) = first_panic {
-            std::panic::resume_unwind(payload);
-        }
+        finish_finalizer_panic(first_panic, entered_while_panicking);
     }
 
     /// Emit a structured transport lifecycle event through the query's RFD-3 sink.
@@ -1227,6 +1229,34 @@ mod tests {
         panic_once: AtomicBool,
     }
 
+    struct NestedUnwindShutdownSink {
+        transport: Mutex<Weak<ReliableEnvelopeTransport>>,
+    }
+
+    impl RuntimeFilterEnvelopeSink for NestedUnwindShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            self.transport
+                .lock()
+                .expect("nested-unwind transport")
+                .upgrade()
+                .expect("transport installed")
+                .shutdown();
+            panic!("outer transport callback panic");
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {
+            panic!("secondary transport teardown panic");
+        }
+    }
+
     impl RuntimeFilterEnvelopeSink for PanicOnceShutdownSink {
         fn try_send(
             &self,
@@ -1434,6 +1464,66 @@ mod tests {
             second_completed,
             "duplicate shutdown remained blocked after sink panic"
         );
+        assert!(transport.lifecycle_closed_for_test());
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn nested_transport_unwind_preserves_outer_panic_in_subprocess() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current lib-test executable"),
+        )
+        .arg("nested_transport_unwind_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .output()
+        .expect("run isolated nested-unwind transport regression");
+        assert!(
+            output.status.success(),
+            "nested transport unwind aborted the child process:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated by nested_transport_unwind_preserves_outer_panic_in_subprocess"]
+    fn nested_transport_unwind_child() {
+        let sink = Arc::new(NestedUnwindShutdownSink {
+            transport: Mutex::new(Weak::new()),
+        });
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            sink.clone(),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            Arc::new(NoopEvents),
+        ));
+        *sink.transport.lock().expect("nested-unwind transport") = Arc::downgrade(&transport);
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let transport = transport.clone();
+            move || transport.send_test(&route(145), frame(6))
+        }));
+        let payload = match outer {
+            Ok(_) => panic!("outer transport callback must panic"),
+            Err(payload) => payload,
+        };
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer transport callback panic"),
+            "the original callback panic must survive nested finalization"
+        );
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let duplicate_transport = transport.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_transport.shutdown();
+            done_tx.send(()).expect("duplicate shutdown complete");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate shutdown must observe Closed");
+        duplicate.join().expect("duplicate shutdown thread");
         assert!(transport.lifecycle_closed_for_test());
         assert_eq!(transport.pending_len(), 0);
         assert_eq!(transport.pending_bytes(), 0);

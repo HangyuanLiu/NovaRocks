@@ -1259,6 +1259,39 @@ impl Drop for FinalizerCompletion<'_> {
     }
 }
 
+pub(super) type FinalizerPanic = Box<dyn std::any::Any + Send + 'static>;
+
+/// Keep cleanup progressing after the first teardown panic. Discarding a later
+/// payload normally would run its arbitrary `Drop` implementation inside finalizer
+/// code, so leak it deliberately on this already-failing path instead.
+pub(super) fn retain_first_finalizer_panic(
+    first: &mut Option<FinalizerPanic>,
+    payload: FinalizerPanic,
+) {
+    if first.is_none() {
+        *first = Some(payload);
+    } else {
+        std::mem::forget(payload);
+    }
+}
+
+/// Resume a teardown panic only when this finalizer did not start inside another
+/// unwind. A deferred close commonly finalizes from a call guard's `Drop`; resuming a
+/// secondary teardown panic there would abort the process and erase the outer panic.
+pub(super) fn finish_finalizer_panic(first: Option<FinalizerPanic>, entered_while_panicking: bool) {
+    let Some(payload) = first else {
+        return;
+    };
+    if entered_while_panicking {
+        // Panic payloads are arbitrary user values and their destructor may panic.
+        // Leaking one payload while the thread is already unwinding is preferable to
+        // a double-panic process abort.
+        std::mem::forget(payload);
+    } else {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 impl Drop for LifecyclePermit<'_> {
     fn drop(&mut self) {
         self.barrier.release();
@@ -1854,13 +1887,14 @@ impl RuntimeFilterService {
             }
             CloseRole::Leader => {}
         }
+        let entered_while_panicking = std::thread::panicking();
         let completion = FinalizerCompletion::new(&self.lifecycle);
         let mut first_panic = None;
         #[cfg(test)]
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.fire_after_close_request_before_quiescence();
         })) {
-            first_panic = Some(payload);
+            retain_first_finalizer_panic(&mut first_panic, payload);
         }
         self.lifecycle.wait_for_quiescence();
         let installed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1872,7 +1906,7 @@ impl RuntimeFilterService {
         })) {
             Ok(installed) => installed,
             Err(payload) => {
-                first_panic = Some(payload);
+                retain_first_finalizer_panic(&mut first_panic, payload);
                 None
             }
         };
@@ -1884,7 +1918,7 @@ impl RuntimeFilterService {
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.reliable_transport.shutdown();
         })) {
-            first_panic.get_or_insert(payload);
+            retain_first_finalizer_panic(&mut first_panic, payload);
         }
         if let Some(cancelled) = installed {
             // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
@@ -1895,13 +1929,13 @@ impl RuntimeFilterService {
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.dedupe.retire_epoch(cancelled.installed().epoch());
             })) {
-                first_panic.get_or_insert(payload);
+                retain_first_finalizer_panic(&mut first_panic, payload);
             }
             #[cfg(test)]
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.fire_after_registry_cancel_before_channel_cancel();
             })) {
-                first_panic.get_or_insert(payload);
+                retain_first_finalizer_panic(&mut first_panic, payload);
             }
             for (channel_id, channel) in cancelled.installed().channels() {
                 if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1914,19 +1948,17 @@ impl RuntimeFilterService {
                     let barrier = self.dispatcher.dispatch_nonblocking(channel_id, action);
                     cancelled.arm_artifact_cancellation(channel_id, barrier);
                 })) {
-                    first_panic.get_or_insert(payload);
+                    retain_first_finalizer_panic(&mut first_panic, payload);
                 }
             }
             if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cancelled.deliver_artifact_cancellation();
             })) {
-                first_panic.get_or_insert(payload);
+                retain_first_finalizer_panic(&mut first_panic, payload);
             }
         }
         drop(completion);
-        if let Some(payload) = first_panic {
-            std::panic::resume_unwind(payload);
-        }
+        finish_finalizer_panic(first_panic, entered_while_panicking);
     }
 
     pub(crate) fn shutdown(&self) {
@@ -6176,6 +6208,80 @@ mod tests {
             .expect("duplicate shutdown must wake after a panicking finalizer");
         duplicate.join().expect("duplicate shutdown thread");
 
+        assert_eq!(
+            fixture
+                .service
+                .lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase,
+            super::LifecyclePhase::Closed,
+        );
+        assert!(matches!(
+            subscription.acquire(Duration::ZERO),
+            ArtifactAcquireOutcome::Unavailable(_) | ArtifactAcquireOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn nested_service_unwind_preserves_outer_panic_in_subprocess() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current lib-test executable"),
+        )
+        .arg("nested_service_unwind_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .output()
+        .expect("run isolated nested-unwind service regression");
+        assert!(
+            output.status.success(),
+            "nested service unwind aborted the child process:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated by nested_service_unwind_preserves_outer_panic_in_subprocess"]
+    fn nested_service_unwind_child() {
+        let fixture = fixture();
+        install_one(&fixture);
+        let subscription = fixture
+            .service
+            .subscribe_blocking(BindingId::new(30), uid(30))
+            .expect("subscribe before nested shutdown");
+        fixture
+            .service
+            .set_after_registry_cancel_before_channel_cancel_hook(Arc::new(|| {
+                panic!("secondary service teardown panic");
+            }));
+
+        let outer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call =
+                super::ServiceCall::admit(&fixture.service).expect("admit fake service callback");
+            fixture.service.shutdown();
+            panic!("outer service callback panic");
+        }));
+        let payload = match outer {
+            Ok(_) => panic!("outer service callback must panic"),
+            Err(payload) => payload,
+        };
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("outer service callback panic"),
+            "the original callback panic must survive nested finalization"
+        );
+
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let duplicate_service = fixture.service.clone();
+        let duplicate = std::thread::spawn(move || {
+            duplicate_service.shutdown();
+            done_tx.send(()).expect("duplicate shutdown complete");
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("duplicate shutdown must observe Closed");
+        duplicate.join().expect("duplicate shutdown thread");
         assert_eq!(
             fixture
                 .service
