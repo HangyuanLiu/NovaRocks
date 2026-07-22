@@ -36,11 +36,11 @@ pub mod service;
 // compiling after every task's commit.
 pub use error::{DmlError, DmlErrorKind};
 // pub use journal::{MetaStoreOperationJournal, OperationJournal};
-// pub use model::{
-//     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-//     OperationFact, OperationKind, OperationState, OperationTarget, RecoveryEvidence,
-//     StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
-// };
+pub use model::{
+    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
+    OperationFact, OperationKind, OperationState, OperationTarget, RecoveryEvidence,
+    StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+};
 // pub use runner::{
 //     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,
 // };
