@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -31,7 +32,7 @@ use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
+use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
@@ -195,6 +196,59 @@ pub struct StarRocksScanOp {
 impl StarRocksScanOp {
     pub fn new(cfg: StarRocksScanConfig) -> Self {
         Self { cfg }
+    }
+}
+
+/// Static [`ScanSource`] for StarRocks lake/tablet scans (compat only).
+///
+/// Holds everything the decoder built for a [`StarRocksScanConfig`] except the
+/// per-instance `ranges` / `has_more`, which arrive via
+/// [`BoundScanRanges::StarRocksTablet`] at bind time (mirrors the HDFS funnel).
+/// `deferred_lake_resolution` is carried as-is: the decoder fully builds it and
+/// `bind` never re-derives its tablets.
+pub(crate) struct StarRocksScanSource {
+    pub(crate) db_name: Option<String>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) required_chunk_schema: ChunkSchemaRef,
+    pub(crate) output_chunk_schema: ChunkSchemaRef,
+    pub(crate) query_global_dicts: QueryGlobalDictEncodeMap,
+    pub(crate) limit: Option<usize>,
+    pub(crate) batch_size: Option<i32>,
+    pub(crate) query_timeout: Option<i32>,
+    pub(crate) mem_limit: Option<i64>,
+    pub(crate) profile_label: Option<String>,
+    pub(crate) min_max_predicates: Vec<MinMaxPredicate>,
+    pub(crate) lake_schema_meta: Option<LakeScanSchemaMeta>,
+    pub(crate) deferred_lake_resolution: Option<DeferredLakeScanResolution>,
+    pub(crate) topn_filter_column_map: HashMap<i32, String>,
+}
+
+impl ScanSource for StarRocksScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        let BoundScanRanges::StarRocksTablet { ranges, has_more } = ranges else {
+            return Err("starrocks scan source requires StarRocksTablet scan ranges".to_string());
+        };
+        let cfg = StarRocksScanConfig {
+            db_name: self.db_name.clone(),
+            table_name: self.table_name.clone(),
+            properties: self.properties.clone(),
+            ranges,
+            has_more,
+            required_chunk_schema: self.required_chunk_schema.clone(),
+            output_chunk_schema: self.output_chunk_schema.clone(),
+            query_global_dicts: self.query_global_dicts.clone(),
+            limit: self.limit,
+            batch_size: self.batch_size,
+            query_timeout: self.query_timeout,
+            mem_limit: self.mem_limit,
+            profile_label: self.profile_label.clone(),
+            min_max_predicates: self.min_max_predicates.clone(),
+            lake_schema_meta: self.lake_schema_meta.clone(),
+            deferred_lake_resolution: self.deferred_lake_resolution.clone(),
+            topn_filter_column_map: self.topn_filter_column_map.clone(),
+        };
+        Ok(Arc::new(StarRocksScanOp::new(cfg)))
     }
 }
 
@@ -636,9 +690,77 @@ fn resolve_object_store_profile<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::DeferredLakeScanResolution;
+    use std::sync::Arc;
+
+    use super::{DeferredLakeScanResolution, StarRocksScanRange, StarRocksScanSource};
     use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
     use crate::runtime::query_context::QueryId;
+
+    fn source_for_test() -> StarRocksScanSource {
+        StarRocksScanSource {
+            db_name: None,
+            table_name: None,
+            properties: Default::default(),
+            required_chunk_schema: Arc::new(ChunkSchema::empty()),
+            output_chunk_schema: Arc::new(ChunkSchema::empty()),
+            query_global_dicts: Default::default(),
+            limit: None,
+            batch_size: None,
+            query_timeout: None,
+            mem_limit: None,
+            profile_label: None,
+            min_max_predicates: Vec::new(),
+            lake_schema_meta: None,
+            deferred_lake_resolution: None,
+            topn_filter_column_map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn starrocks_scan_source_bind_tablet_ranges_yields_range_morsels() {
+        let source = source_for_test();
+        let op = source
+            .bind(BoundScanRanges::StarRocksTablet {
+                ranges: vec![
+                    StarRocksScanRange::new(300, 100, 7),
+                    StarRocksScanRange::new(301, 100, 7),
+                ],
+                has_more: false,
+            })
+            .expect("starrocks scan source bind should succeed");
+
+        let morsels = op.build_morsels().expect("build morsels");
+        assert!(!morsels.has_more);
+        assert_eq!(morsels.morsels.len(), 2);
+        match &morsels.morsels[0] {
+            ScanMorsel::StarRocksRange { index, tablet_id } => {
+                assert_eq!(*index, 0);
+                assert_eq!(*tablet_id, 300);
+            }
+            other => panic!("expected StarRocksRange morsel, got {other:?}"),
+        }
+        match &morsels.morsels[1] {
+            ScanMorsel::StarRocksRange { index, tablet_id } => {
+                assert_eq!(*index, 1);
+                assert_eq!(*tablet_id, 301);
+            }
+            other => panic!("expected StarRocksRange morsel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starrocks_scan_source_bind_rejects_wrong_variant() {
+        let source = source_for_test();
+        let Err(err) = source.bind(BoundScanRanges::None) else {
+            panic!("non-StarRocksTablet scan ranges must be rejected");
+        };
+        assert!(
+            err.contains("starrocks scan source requires StarRocksTablet scan ranges"),
+            "err={err}"
+        );
+    }
 
     #[test]
     fn deferred_lake_scan_resolution_keeps_protocol_neutral_identity_and_tablets() {

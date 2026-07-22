@@ -658,9 +658,50 @@ impl ScanConnector for StarRocksConnector {
 
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
-            ScanConfig::StarRocks(cfg) => Ok(ScanNode::new(Arc::new(
-                starrocks::StarRocksScanOp::new(*cfg),
-            ))),
+            ScanConfig::StarRocks(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // tablet ranges, then eagerly `bind` (mirrors the JDBC/HDFS
+                // funnel). `deferred_lake_resolution` is carried through as-is;
+                // `bind` never re-derives its tablets.
+                let StarRocksScanConfig {
+                    db_name,
+                    table_name,
+                    properties,
+                    ranges,
+                    has_more,
+                    required_chunk_schema,
+                    output_chunk_schema,
+                    query_global_dicts,
+                    limit,
+                    batch_size,
+                    query_timeout,
+                    mem_limit,
+                    profile_label,
+                    min_max_predicates,
+                    lake_schema_meta,
+                    deferred_lake_resolution,
+                    topn_filter_column_map,
+                } = *cfg;
+                let source = starrocks::StarRocksScanSource {
+                    db_name,
+                    table_name,
+                    properties,
+                    required_chunk_schema,
+                    output_chunk_schema,
+                    query_global_dicts,
+                    limit,
+                    batch_size,
+                    query_timeout,
+                    mem_limit,
+                    profile_label,
+                    min_max_predicates,
+                    lake_schema_meta,
+                    deferred_lake_resolution,
+                    topn_filter_column_map,
+                };
+                let op = source.bind(BoundScanRanges::StarRocksTablet { ranges, has_more })?;
+                Ok(ScanNode::new(op))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
