@@ -51,6 +51,11 @@ pub trait WriteExecutor {
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String>;
 
     /// Commit the collected writer output via the typed commit service.
+    // The Err type is core's genuine `CommitServiceError` contract (also consumed
+    // by-reference by the reconcile classifier); boxing it would diverge from core
+    // and burden DML-2's real executor, and this is a cold I/O path — so allow the
+    // large-err lint here. Placed on the trait method; impls do not need their own.
+    #[allow(clippy::result_large_err)]
     fn commit(
         &self,
         spec: &WriteTransactionSpec,
@@ -298,6 +303,10 @@ mod tests {
             journal.load(1).unwrap().unwrap().state,
             OperationState::Finalized
         );
+        assert_eq!(
+            journal.load(1).unwrap().unwrap().commit_outcome.unwrap().snapshot_id,
+            42
+        );
     }
 
     #[test]
@@ -331,7 +340,8 @@ mod tests {
         let admit = AlwaysAdmit;
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
-        assert!(runner.run(spec()).is_err());
+        let err = runner.run(spec()).unwrap_err();
+        assert_eq!(err.kind(), DmlErrorKind::Executor);
         let stored = journal.load(1).unwrap().unwrap();
         assert_eq!(stored.state, OperationState::FailedKnownUncommitted);
         assert_eq!(
@@ -350,7 +360,8 @@ mod tests {
         let admit = AlwaysAdmit;
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
-        assert!(runner.run(spec()).is_err());
+        let err = runner.run(spec()).unwrap_err();
+        assert_eq!(err.kind(), DmlErrorKind::Executor);
         assert_eq!(
             journal.load(1).unwrap().unwrap().state,
             OperationState::FailedKnownUncommitted
@@ -370,7 +381,8 @@ mod tests {
         let admit = AlwaysAdmit;
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
-        assert!(runner.run(spec()).is_err());
+        let err = runner.run(spec()).unwrap_err();
+        assert_eq!(err.kind(), DmlErrorKind::Commit);
         let stored = journal.load(1).unwrap().unwrap();
         assert_eq!(stored.state, OperationState::CommitUnknown);
         assert_eq!(
@@ -392,7 +404,8 @@ mod tests {
         let admit = AlwaysAdmit;
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
-        assert!(runner.run(spec()).is_err());
+        let err = runner.run(spec()).unwrap_err();
+        assert_eq!(err.kind(), DmlErrorKind::Commit);
         assert_eq!(
             journal.load(1).unwrap().unwrap().state,
             OperationState::FailedKnownUncommitted
@@ -409,7 +422,8 @@ mod tests {
         let admit = AlwaysAdmit;
         let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
 
-        assert!(runner.run(spec()).is_err());
+        let err = runner.run(spec()).unwrap_err();
+        assert_eq!(err.kind(), DmlErrorKind::Finalize);
         let stored = journal.load(1).unwrap().unwrap();
         assert_eq!(stored.state, OperationState::FinalizeFailedKnownCommitted);
         assert_eq!(

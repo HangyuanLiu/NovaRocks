@@ -65,6 +65,12 @@ impl DmlError {
         Self::new(DmlErrorKind::Finalize, error)
     }
 
+    // Constructed by `WriteAdmission` implementations that deny a write (CP-3
+    // fencing). DML-1 ships only `AlwaysAdmit`, which never denies, so the only
+    // non-test caller arrives later; keep it to complete the error API surface.
+    // (`#[allow]`, not `#[expect]`: under `--all-targets` the cfg(test) build uses
+    // it via the test `DenyAdmission`, so `#[expect]` would be unfulfilled there.)
+    #[allow(dead_code)]
     pub(crate) fn admission(error: impl fmt::Display) -> Self {
         Self::new(DmlErrorKind::Admission, error)
     }
