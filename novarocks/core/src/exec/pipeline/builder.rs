@@ -54,6 +54,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
 use crate::exec::operators::hashjoin::build_state::JoinBuildSinkState;
+use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
 use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
@@ -747,6 +748,30 @@ fn validate_native_producer_specs(
         }
     }
     Ok(())
+}
+
+fn native_join_producer_factory(
+    specs: &[crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec],
+    build_keys: &[crate::exec::expr::ExprId],
+    eq_null_safe: &[bool],
+    build_dop: i32,
+    ctx: &PipelineBuildContext,
+) -> Result<Option<Arc<NativeRuntimeFilterProducerFactory>>, String> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let context =
+        native_runtime_filter_context(&ctx.runtime_filter_execution, specs[0].binding_id)?;
+    Ok(Some(Arc::new(
+        NativeRuntimeFilterProducerFactory::from_plan(
+            specs,
+            build_keys,
+            eq_null_safe,
+            ctx.arena.as_ref(),
+            context.clone(),
+            build_dop,
+        )?,
+    )))
 }
 
 fn validate_native_consumer_specs(
@@ -1587,9 +1612,22 @@ fn build_pipeline_for_node(
                 probe_build.pipeline.factories.push(Box::new(probe_factory));
 
                 let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
+                let native_producers = match runtime_filter_execution {
+                    JoinRuntimeFilterExecution::Native { producers } => {
+                        native_join_producer_factory(
+                            producers,
+                            &build_keys,
+                            &eq_null_safe,
+                            build_build.pipeline.dop,
+                            ctx,
+                        )?
+                    }
+                    #[cfg(feature = "compat")]
+                    JoinRuntimeFilterExecution::Compat { .. } => None,
+                };
                 let build_factory = match runtime_filter_execution {
                     JoinRuntimeFilterExecution::Native { .. } => {
-                        HashJoinBuildSinkFactory::new_native(
+                        HashJoinBuildSinkFactory::new_native_with_runtime_filters(
                             Arc::clone(&ctx.arena),
                             *join_type,
                             residual_predicate.is_some(),
@@ -1599,6 +1637,7 @@ fn build_pipeline_for_node(
                             eq_null_safe.clone(),
                             *distribution_mode,
                             build_state,
+                            native_producers,
                         )
                     }
                     #[cfg(feature = "compat")]
@@ -1718,18 +1757,32 @@ fn build_pipeline_for_node(
             probe_build.pipeline.factories.push(Box::new(probe_factory));
 
             let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
+            let native_producers = match runtime_filter_execution {
+                JoinRuntimeFilterExecution::Native { producers } => native_join_producer_factory(
+                    producers,
+                    &build_keys,
+                    &eq_null_safe,
+                    build_build.pipeline.dop,
+                    ctx,
+                )?,
+                #[cfg(feature = "compat")]
+                JoinRuntimeFilterExecution::Compat { .. } => None,
+            };
             let build_factory = match runtime_filter_execution {
-                JoinRuntimeFilterExecution::Native { .. } => HashJoinBuildSinkFactory::new_native(
-                    Arc::clone(&ctx.arena),
-                    *join_type,
-                    residual_predicate.is_some(),
-                    probe_is_left,
-                    has_equi_keys,
-                    build_keys.clone(),
-                    eq_null_safe.clone(),
-                    *distribution_mode,
-                    build_state,
-                ),
+                JoinRuntimeFilterExecution::Native { .. } => {
+                    HashJoinBuildSinkFactory::new_native_with_runtime_filters(
+                        Arc::clone(&ctx.arena),
+                        *join_type,
+                        residual_predicate.is_some(),
+                        probe_is_left,
+                        has_equi_keys,
+                        build_keys.clone(),
+                        eq_null_safe.clone(),
+                        *distribution_mode,
+                        build_state,
+                        native_producers,
+                    )
+                }
                 #[cfg(feature = "compat")]
                 JoinRuntimeFilterExecution::Compat { .. } => HashJoinBuildSinkFactory::new_compat(
                     Arc::clone(&ctx.arena),
@@ -2244,6 +2297,182 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn installed_native_producer_context() -> (
+        Arc<crate::runtime::query_context::QueryContextManager>,
+        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+    ) {
+        let (manager, _) = installed_native_consumer_context();
+        let context = manager
+            .runtime_filter_context_for_native_execution(
+                crate::runtime::query_context::QueryId { hi: 70, lo: 9_201 },
+                crate::common::types::UniqueId { hi: 70, lo: 30 },
+            )
+            .expect("producer runtime-filter context");
+        (manager, context)
+    }
+
+    fn native_join_producer_plan(distribution_mode: JoinDistributionMode) -> ExecPlan {
+        use crate::exec::node::join::NativeJoinRuntimeFilterProducerSpec;
+        use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
+        use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+
+        let left_schema = Arc::new(Schema::new(vec![Field::new(
+            "probe",
+            DataType::Int64,
+            false,
+        )]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new(
+            "build",
+            DataType::Int64,
+            false,
+        )]));
+        let join_schema = Arc::new(Schema::new(vec![
+            Field::new("probe", DataType::Int64, false),
+            Field::new("build", DataType::Int64, false),
+        ]));
+        let left_chunk_schema = chunk_schema_of(&left_schema, &[SlotId::new(1)]);
+        let right_chunk_schema = chunk_schema_of(&right_schema, &[SlotId::new(2)]);
+        let join_chunk_schema = chunk_schema_of(&join_schema, &[SlotId::new(1), SlotId::new(2)]);
+        let mut arena = ExprArena::default();
+        let probe_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let build_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let membership_schema = ArtifactMembershipSchema::new(
+            &DataType::Int64,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        let contract = NativeRuntimeFilterContract::Membership {
+            canonical_schema: Arc::from(membership_schema.canonical_bytes()),
+            schema_digest: membership_schema.digest().bytes(),
+        };
+
+        ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::Join(JoinNode {
+                    left: Box::new(lookup_node(1, Arc::clone(&left_chunk_schema))),
+                    right: Box::new(lookup_node(2, Arc::clone(&right_chunk_schema))),
+                    node_id: 3,
+                    join_type: JoinType::Inner,
+                    distribution_mode,
+                    left_chunk_schema,
+                    right_chunk_schema,
+                    join_scope_chunk_schema: join_chunk_schema,
+                    probe_keys: vec![probe_expr],
+                    build_keys: vec![build_expr],
+                    eq_null_safe: vec![false],
+                    residual_predicate: None,
+                    runtime_filter_execution: JoinRuntimeFilterExecution::Native {
+                        producers: vec![NativeJoinRuntimeFilterProducerSpec {
+                            binding_id: 3,
+                            channel_id: 1,
+                            build_expr_id: build_expr,
+                            build_key_index: 0,
+                            contribution_kinds: BTreeSet::from([
+                                ContributionKind::ValueDomainDelta,
+                                ContributionKind::ProducerClosed,
+                            ]),
+                            completion_requirement: CompletionRequirement::ProducerClosed,
+                            contract,
+                            reduction: NativeRuntimeFilterReduction::SetUnion,
+                        }],
+                    },
+                }),
+            },
+        }
+    }
+
+    fn assert_native_join_build_sinks_bind_exact_producer(
+        distribution_mode: JoinDistributionMode,
+        expected_build_dop: i32,
+    ) {
+        use std::time::Duration;
+
+        use crate::runtime_filter::model::contract::BindingId;
+        use crate::runtime_filter::port::subscription::{ArtifactAcquireOutcome, SubscriptionKind};
+
+        let (_manager, context) = installed_native_producer_context();
+        let service = Arc::clone(context.service());
+        let graph = build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+            &native_join_producer_plan(distribution_mode),
+            false,
+            DependencyManager::new(),
+            None,
+            3,
+            Some(context),
+        )
+        .expect("native join pipeline");
+        let build_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline.factories.last().is_some_and(|factory| {
+                    factory.is_sink() && factory.name().starts_with("HASH_JOIN")
+                })
+            })
+            .expect("real hash-join build pipeline");
+        assert_eq!(build_pipeline.dop, expected_build_dop);
+        let factory = build_pipeline.factories.last().expect("build sink factory");
+        let state = crate::runtime::runtime_state::RuntimeState::default();
+        let subscription = service
+            .subscribe(
+                BindingId::new(4),
+                crate::common::types::UniqueId { hi: 70, lo: 40 },
+                SubscriptionKind::BlockingSnapshot,
+            )
+            .expect("installed local consumer subscription")
+            .into_blocking()
+            .expect("blocking subscription");
+        let mut operators = Vec::new();
+        for local_index in 0..build_pipeline.dop {
+            let mut operator = factory.create(build_pipeline.dop, local_index);
+            operator
+                .bind_runtime_state(&state)
+                .expect("bind exact native producer");
+            operators.push(operator);
+        }
+        assert!(
+            service.core_producer_handle_exists_for_test(
+                BindingId::new(3),
+                crate::common::types::UniqueId { hi: 70, lo: 30 },
+            ),
+            "every real native build sink must bind the installed producer"
+        );
+        let operator_count = operators.len();
+        for (index, operator) in operators.iter_mut().enumerate() {
+            operator
+                .as_processor_mut()
+                .expect("hash-join build processor")
+                .set_finishing(&state)
+                .expect("finish real native build sink");
+            if index + 1 < operator_count {
+                assert!(
+                    subscription.snapshot().is_none(),
+                    "native RF must not publish before every real build sink closes"
+                );
+            }
+        }
+        assert!(
+            matches!(
+                subscription.acquire(Duration::from_secs(1)),
+                ArtifactAcquireOutcome::Published(_)
+            ),
+            "every real build sink must close its RF partition and publish the local artifact"
+        );
+        assert!(service.admitted_transport_envelopes_for_test().is_empty());
+        drop(operators);
+    }
+
+    #[test]
+    fn native_broadcast_pipeline_supplies_producer_specs_to_every_real_build_sink() {
+        assert_native_join_build_sinks_bind_exact_producer(JoinDistributionMode::Broadcast, 1);
+    }
+
+    #[test]
+    fn native_partitioned_pipeline_supplies_producer_specs_to_every_real_build_sink() {
+        assert_native_join_build_sinks_bind_exact_producer(JoinDistributionMode::Partitioned, 3);
     }
 
     #[test]

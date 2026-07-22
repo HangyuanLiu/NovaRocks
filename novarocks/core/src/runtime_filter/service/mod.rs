@@ -90,6 +90,7 @@ use self::materialization::{
 };
 pub(crate) use self::native_execution::{
     InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
+    ResolvedNativeProducer,
 };
 use self::producer::{RemoteProducerAdapter, RemoteProducerState, ServiceProducerAdapter};
 use self::registry::{DeploymentRegistry, InstalledDeployment};
