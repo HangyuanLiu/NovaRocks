@@ -164,6 +164,7 @@ pub(crate) struct QueryContext {
     pub(crate) num_active_fragments: usize,
     pub(crate) total_fragments: Option<usize>,
     pub(crate) cancelled_by_fe: bool,
+    runtime_filter_cancel_retain_until: Option<Instant>,
     pub(crate) delivery_expire: Duration,
     pub(crate) delivery_deadline: Instant,
     #[allow(dead_code)]
@@ -247,6 +248,23 @@ struct RuntimeFilterDeploymentTerminalRecord {
     epoch: DeploymentEpoch,
     state: RuntimeFilterDeploymentTerminalState,
     expires_at: Instant,
+}
+
+struct RuntimeFilterQueryCancellationRecord {
+    expires_at: Instant,
+}
+
+struct RuntimeFilterQueryCancellationTerminalization {
+    epoch: DeploymentEpoch,
+    completion: Arc<RuntimeFilterDeploymentCompletion>,
+    install_completion: Arc<RuntimeFilterDeploymentCompletion>,
+    after_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct RuntimeFilterQueryCancellationAction {
+    service: Option<Arc<RuntimeFilterService>>,
+    terminalization: Option<RuntimeFilterQueryCancellationTerminalization>,
 }
 
 // The control plane has no separate retry-horizon knob before Task 5. Retain an
@@ -370,6 +388,7 @@ impl QueryContext {
             num_active_fragments: 0,
             total_fragments: None,
             cancelled_by_fe: false,
+            runtime_filter_cancel_retain_until: None,
             delivery_expire,
             delivery_deadline: now + delivery_expire,
             query_expire,
@@ -471,6 +490,16 @@ impl QueryContext {
         self.runtime_filter_deployment
             .as_ref()
             .is_some_and(|claim| claim.state == RuntimeFilterDeploymentClaimState::Installing)
+    }
+
+    fn runtime_filter_cancel_is_retained(&self, now: Instant) -> bool {
+        self.runtime_filter_cancel_retain_until
+            .is_some_and(|retain_until| retain_until > now)
+    }
+
+    fn runtime_filter_cancel_retention_expired(&self, now: Instant) -> bool {
+        self.runtime_filter_cancel_retain_until
+            .is_some_and(|retain_until| retain_until <= now)
     }
 
     pub(crate) fn is_dead(&self) -> bool {
@@ -891,6 +920,7 @@ struct QueryContextManagerInner {
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
     fragment_completions: HashMap<UniqueId, FragmentCompletionEntry>,
     runtime_filter_deployment_terminals: HashMap<QueryId, RuntimeFilterDeploymentTerminalRecord>,
+    runtime_filter_query_cancellations: HashMap<QueryId, RuntimeFilterQueryCancellationRecord>,
     #[cfg(test)]
     runtime_filter_terminal_now: Option<Instant>,
     #[cfg(test)]
@@ -941,6 +971,7 @@ fn runtime_filter_terminal_capacity(_inner: &QueryContextManagerInner) -> usize 
 
 fn runtime_filter_deployment_record_count(inner: &QueryContextManagerInner) -> usize {
     inner.runtime_filter_deployment_terminals.len()
+        + inner.runtime_filter_query_cancellations.len()
         + inner
             .active
             .iter()
@@ -970,6 +1001,9 @@ fn runtime_filter_deployment_has_reserved_record(
     inner
         .runtime_filter_deployment_terminals
         .contains_key(&query_id)
+        || inner
+            .runtime_filter_query_cancellations
+            .contains_key(&query_id)
         || inner
             .active
             .get(&query_id)
@@ -1002,6 +1036,9 @@ fn clean_expired_runtime_filter_terminals(inner: &mut QueryContextManagerInner) 
                 RuntimeFilterDeploymentTerminalState::Aborting(_)
             ) || record.expires_at > now
         });
+    inner
+        .runtime_filter_query_cancellations
+        .retain(|_, record| record.expires_at > now);
 }
 
 fn runtime_filter_terminal_expiry(inner: &QueryContextManagerInner) -> Instant {
@@ -1066,6 +1103,7 @@ impl QueryContextManager {
     fn clean_expired(&self) {
         let expired = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let runtime_filter_now = runtime_filter_terminal_now(&guard);
             clean_expired_runtime_filter_terminals(&mut guard);
             let expired_second_chance = guard
                 .second_chance
@@ -1073,7 +1111,9 @@ impl QueryContextManager {
                 .filter_map(|(qid, ctx)| {
                     (ctx.has_no_active_instances()
                         && !ctx.runtime_filter_deployment_is_installing()
-                        && ctx.is_delivery_expired())
+                        && (ctx.runtime_filter_cancel_retention_expired(runtime_filter_now)
+                            || (!ctx.runtime_filter_cancel_is_retained(runtime_filter_now)
+                                && ctx.is_delivery_expired())))
                     .then_some(*qid)
                 })
                 .collect::<Vec<_>>();
@@ -1083,7 +1123,9 @@ impl QueryContextManager {
                 .filter_map(|(qid, ctx)| {
                     (ctx.has_no_active_instances()
                         && !ctx.runtime_filter_deployment_is_installing()
-                        && ctx.is_query_expired())
+                        && (ctx.runtime_filter_cancel_retention_expired(runtime_filter_now)
+                            || (!ctx.runtime_filter_cancel_is_retained(runtime_filter_now)
+                                && ctx.is_query_expired())))
                     .then_some(*qid)
                 })
                 .collect::<Vec<_>>();
@@ -1343,6 +1385,15 @@ impl QueryContextManager {
             let step = {
                 let mut guard = self.inner.lock().expect("query_ctx_manager lock");
                 clean_expired_runtime_filter_terminals(&mut guard);
+                if guard
+                    .runtime_filter_query_cancellations
+                    .contains_key(&query_id)
+                {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
+                        "runtime filter deployment query was already cancelled",
+                    ));
+                }
                 if let Some(record) = guard.runtime_filter_deployment_terminals.get(&query_id) {
                     let kind = if epoch.get() < record.epoch.get() {
                         RuntimeFilterDeploymentInstallErrorKind::StaleEpoch
@@ -1364,6 +1415,22 @@ impl QueryContextManager {
                 } else {
                     None
                 };
+                if location.is_some_and(|active| {
+                    let context = if active {
+                        guard.active.get(&query_id).expect("checked active")
+                    } else {
+                        guard
+                            .second_chance
+                            .get(&query_id)
+                            .expect("checked second chance")
+                    };
+                    context.cancelled_by_fe
+                }) {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
+                        "runtime filter deployment query was already cancelled",
+                    ));
+                }
                 let existing_claim = location.and_then(|active| {
                     let context = if active {
                         guard.active.get(&query_id).expect("checked active")
@@ -1602,6 +1669,12 @@ impl QueryContextManager {
                         "runtime filter deployment context changed before acknowledgement",
                     ));
                 }
+                if context.cancelled_by_fe {
+                    return Err(RuntimeFilterDeploymentInstallError::new(
+                        RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
+                        "runtime filter deployment query was cancelled before acknowledgement",
+                    ));
+                }
                 let claim = context.runtime_filter_deployment.as_mut().ok_or_else(|| {
                     RuntimeFilterDeploymentInstallError::new(
                         RuntimeFilterDeploymentInstallErrorKind::QueryAborted,
@@ -1667,6 +1740,7 @@ impl QueryContextManager {
             }
             let completion = Arc::new(RuntimeFilterDeploymentCompletion::new());
             let expires_at = runtime_filter_terminal_expiry(&guard);
+            guard.runtime_filter_query_cancellations.remove(&query_id);
             guard.runtime_filter_deployment_terminals.insert(
                 query_id,
                 RuntimeFilterDeploymentTerminalRecord {
@@ -1879,6 +1953,7 @@ impl QueryContextManager {
 
                     let completion = Arc::new(RuntimeFilterDeploymentCompletion::new());
                     let expires_at = runtime_filter_terminal_expiry(&guard);
+                    guard.runtime_filter_query_cancellations.remove(&query_id);
                     guard.runtime_filter_deployment_terminals.insert(
                         query_id,
                         RuntimeFilterDeploymentTerminalRecord {
@@ -2032,12 +2107,25 @@ impl QueryContextManager {
         claim: LegacyRuntimeFilterExecutionClaim,
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        clean_expired_runtime_filter_terminals(&mut guard);
         if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
-            && guard
+            && (guard
                 .runtime_filter_deployment_terminals
                 .contains_key(&query_id)
+                || guard
+                    .runtime_filter_query_cancellations
+                    .contains_key(&query_id))
         {
-            return Err("runtime filter deployment query was already aborted".to_string());
+            return Err("runtime filter deployment query was already cancelled".to_string());
+        }
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
+            && guard
+                .active
+                .get(&query_id)
+                .or_else(|| guard.second_chance.get(&query_id))
+                .is_some_and(|context| context.cancelled_by_fe)
+        {
+            return Err("runtime filter deployment query was already cancelled".to_string());
         }
         if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
             && guard
@@ -2979,31 +3067,163 @@ impl QueryContextManager {
     pub(crate) fn is_query_canceled(&self, query_id: QueryId) -> bool {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
-            .active
-            .get(&query_id)
-            .map(|ctx| ctx.cancelled_by_fe)
-            .or_else(|| {
-                guard
+            .runtime_filter_query_cancellations
+            .contains_key(&query_id)
+            || guard
+                .active
+                .get(&query_id)
+                .map(|ctx| ctx.cancelled_by_fe)
+                .or_else(|| {
+                    guard
+                        .second_chance
+                        .get(&query_id)
+                        .map(|ctx| ctx.cancelled_by_fe)
+                })
+                .unwrap_or(false)
+    }
+
+    fn prepare_runtime_filter_query_cancellation(
+        inner: &mut QueryContextManagerInner,
+        query_id: QueryId,
+        expected_execution: Option<QueryExecutionKey>,
+    ) -> RuntimeFilterQueryCancellationAction {
+        clean_expired_runtime_filter_terminals(inner);
+        let location = if inner.active.contains_key(&query_id) {
+            Some(true)
+        } else if inner.second_chance.contains_key(&query_id) {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(active) = location else {
+            return RuntimeFilterQueryCancellationAction::default();
+        };
+        let matches = {
+            let context = if active {
+                inner.active.get(&query_id).expect("checked active")
+            } else {
+                inner
                     .second_chance
                     .get(&query_id)
-                    .map(|ctx| ctx.cancelled_by_fe)
-            })
-            .unwrap_or(false)
+                    .expect("checked second chance")
+            };
+            expected_execution.is_none_or(|execution| context.matches_execution(execution))
+        };
+        if !matches {
+            return RuntimeFilterQueryCancellationAction::default();
+        }
+
+        let expires_at = runtime_filter_terminal_expiry(inner);
+        let (service, claim, retain_epochless_cancellation) = {
+            let context = if active {
+                inner.active.get_mut(&query_id).expect("checked active")
+            } else {
+                inner
+                    .second_chance
+                    .get_mut(&query_id)
+                    .expect("checked second chance")
+            };
+            context.cancelled_by_fe = true;
+            let claim = context
+                .runtime_filter_deployment
+                .as_ref()
+                .map(|claim| (claim.install.epoch(), claim.completion.clone()));
+            let retain_epochless_cancellation = claim.is_none()
+                && matches!(context.execution_generation, QueryContextGeneration::Native);
+            if retain_epochless_cancellation {
+                context.runtime_filter_cancel_retain_until = Some(expires_at);
+            }
+            (
+                context.runtime_filter_service(),
+                claim,
+                retain_epochless_cancellation,
+            )
+        };
+
+        if inner
+            .runtime_filter_deployment_terminals
+            .contains_key(&query_id)
+        {
+            return RuntimeFilterQueryCancellationAction {
+                service: Some(service),
+                terminalization: None,
+            };
+        }
+
+        let Some((epoch, install_completion)) = claim else {
+            if retain_epochless_cancellation {
+                if let Some(record) = inner.runtime_filter_query_cancellations.get_mut(&query_id) {
+                    record.expires_at = expires_at;
+                } else if runtime_filter_deployment_record_count(inner)
+                    < runtime_filter_terminal_capacity(inner)
+                {
+                    inner.runtime_filter_query_cancellations.insert(
+                        query_id,
+                        RuntimeFilterQueryCancellationRecord { expires_at },
+                    );
+                }
+                // Capacity exhaustion cannot be returned through ordinary cancellation.
+                // The target context remains retained and cancelled instead; never evict a
+                // live control record or block unrelated query ids.
+            }
+            return RuntimeFilterQueryCancellationAction {
+                service: Some(service),
+                terminalization: None,
+            };
+        };
+
+        let completion = Arc::new(RuntimeFilterDeploymentCompletion::new());
+        inner.runtime_filter_query_cancellations.remove(&query_id);
+        inner.runtime_filter_deployment_terminals.insert(
+            query_id,
+            RuntimeFilterDeploymentTerminalRecord {
+                epoch,
+                state: RuntimeFilterDeploymentTerminalState::Aborting(completion.clone()),
+                expires_at,
+            },
+        );
+        #[cfg(test)]
+        let after_shutdown = inner.after_runtime_filter_service_shutdown.take();
+        #[cfg(not(test))]
+        let after_shutdown: Option<Arc<dyn Fn() + Send + Sync>> = None;
+        RuntimeFilterQueryCancellationAction {
+            service: Some(service),
+            terminalization: Some(RuntimeFilterQueryCancellationTerminalization {
+                epoch,
+                completion,
+                install_completion,
+                after_shutdown,
+            }),
+        }
+    }
+
+    fn execute_runtime_filter_query_cancellation(
+        &self,
+        query_id: QueryId,
+        action: RuntimeFilterQueryCancellationAction,
+    ) -> std::thread::Result<()> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(terminalization) = action.terminalization {
+                self.shutdown_and_publish_runtime_filter_deployment_aborted(
+                    query_id,
+                    terminalization.epoch,
+                    action.service,
+                    terminalization.completion,
+                    terminalization.after_shutdown,
+                    Some(terminalization.install_completion),
+                );
+            } else if let Some(service) = action.service {
+                service.cancel();
+            }
+        }))
     }
 
     #[allow(dead_code)]
     pub(crate) fn abort_query(&self, query_id: QueryId) -> Vec<UniqueId> {
-        let (service, finsts) = {
+        let (cancellation, finsts) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let service = if let Some(ctx) = guard.active.get_mut(&query_id) {
-                ctx.cancelled_by_fe = true;
-                Some(ctx.runtime_filter_service())
-            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-                ctx.cancelled_by_fe = true;
-                Some(ctx.runtime_filter_service())
-            } else {
-                None
-            };
+            let cancellation =
+                Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None);
             let finsts = guard
                 .finst_to_query
                 .iter()
@@ -3011,26 +3231,20 @@ impl QueryContextManager {
                     (execution.query_id() == query_id).then_some(*finst_id)
                 })
                 .collect();
-            (service, finsts)
+            (cancellation, finsts)
         };
-        if let Some(service) = service {
-            service.cancel();
+        if let Err(payload) = self.execute_runtime_filter_query_cancellation(query_id, cancellation)
+        {
+            std::panic::resume_unwind(payload);
         }
         finsts
     }
 
     pub(crate) fn cancel_query(&self, query_id: QueryId, err: String) -> Vec<UniqueId> {
-        let (service, finsts, completions) = {
+        let (cancellation, finsts, completions) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let service = if let Some(ctx) = guard.active.get_mut(&query_id) {
-                ctx.cancelled_by_fe = true;
-                Some(ctx.runtime_filter_service())
-            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-                ctx.cancelled_by_fe = true;
-                Some(ctx.runtime_filter_service())
-            } else {
-                None
-            };
+            let cancellation =
+                Self::prepare_runtime_filter_query_cancellation(&mut guard, query_id, None);
 
             let mut finsts = Vec::new();
             let mut completions = Vec::new();
@@ -3051,14 +3265,16 @@ impl QueryContextManager {
             for finst_id in stale {
                 guard.fragment_completions.remove(&finst_id);
             }
-            (service, finsts, completions)
+            (cancellation, finsts, completions)
         };
 
-        if let Some(service) = service {
-            service.cancel();
-        }
+        let cancellation_unwind =
+            self.execute_runtime_filter_query_cancellation(query_id, cancellation);
         for completion in completions {
             completion.abort_from_query(err.clone());
+        }
+        if let Err(payload) = cancellation_unwind {
+            std::panic::resume_unwind(payload);
         }
         finsts
     }
@@ -3068,20 +3284,14 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         err: String,
     ) -> Vec<UniqueId> {
-        let (service, finsts, completions) = {
+        let (cancellation, finsts, completions) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let query_id = execution.query_id();
-            let context = if guard.active.contains_key(&query_id) {
-                guard.active.get_mut(&query_id)
-            } else {
-                guard.second_chance.get_mut(&query_id)
-            };
-            let service = context
-                .filter(|ctx| ctx.matches_execution(execution))
-                .map(|ctx| {
-                    ctx.cancelled_by_fe = true;
-                    ctx.runtime_filter_service()
-                });
+            let cancellation = Self::prepare_runtime_filter_query_cancellation(
+                &mut guard,
+                query_id,
+                Some(execution),
+            );
             let finsts = guard
                 .finst_to_query
                 .iter()
@@ -3093,13 +3303,15 @@ impl QueryContextManager {
                 .filter(|entry| entry.execution == execution)
                 .filter_map(|entry| entry.completion.upgrade())
                 .collect::<Vec<_>>();
-            (service, finsts, completions)
+            (cancellation, finsts, completions)
         };
-        if let Some(service) = service {
-            service.cancel();
-        }
+        let cancellation_unwind =
+            self.execute_runtime_filter_query_cancellation(execution.query_id(), cancellation);
         for completion in completions {
             completion.abort_from_query(err.clone());
+        }
+        if let Err(payload) = cancellation_unwind {
+            std::panic::resume_unwind(payload);
         }
         finsts
     }
@@ -3127,17 +3339,11 @@ impl QueryContextManager {
             };
             binding_observer();
             let query_id = execution.query_id();
-            let context = if guard.active.contains_key(&query_id) {
-                guard.active.get_mut(&query_id)
-            } else {
-                guard.second_chance.get_mut(&query_id)
-            };
-            let service = context
-                .filter(|ctx| ctx.matches_execution(execution))
-                .map(|ctx| {
-                    ctx.cancelled_by_fe = true;
-                    ctx.runtime_filter_service()
-                });
+            let cancellation = Self::prepare_runtime_filter_query_cancellation(
+                &mut guard,
+                query_id,
+                Some(execution),
+            );
             let finsts = guard
                 .finst_to_query
                 .iter()
@@ -3149,14 +3355,16 @@ impl QueryContextManager {
                 .filter(|entry| entry.execution == execution)
                 .filter_map(|entry| entry.completion.upgrade())
                 .collect::<Vec<_>>();
-            (query_id, service, finsts, completions)
+            (query_id, cancellation, finsts, completions)
         };
-        let (query_id, service, finsts, completions) = collected;
-        if let Some(service) = service {
-            service.cancel();
-        }
+        let (query_id, cancellation, finsts, completions) = collected;
+        let cancellation_unwind =
+            self.execute_runtime_filter_query_cancellation(query_id, cancellation);
         for completion in completions {
             completion.abort_from_query(err.clone());
+        }
+        if let Err(payload) = cancellation_unwind {
+            std::panic::resume_unwind(payload);
         }
         if finsts.is_empty() {
             return FinstCancelResult {
@@ -3279,6 +3487,14 @@ impl QueryContextManager {
         if !no_active_fragments {
             guard.active.insert(query_id, ctx);
             return FragmentFinishReportDecision::default();
+        }
+        if ctx.runtime_filter_cancel_is_retained(runtime_filter_terminal_now(&guard)) {
+            ctx.extend_delivery_lifetime();
+            guard.second_chance.insert(query_id, ctx);
+            return FragmentFinishReportDecision {
+                include_runtime_filter_profile: true,
+                remove_runtime_filter_lifecycle_after_report: false,
+            };
         }
         if ctx.is_dead() {
             let decision = FragmentFinishReportDecision {
@@ -4988,13 +5204,14 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
 mod tests {
     pub(super) mod runtime_filter_deployment {
         use std::sync::{Arc, Mutex, mpsc};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         use super::super::{
-            LookupFetcherLifecycle, QueryContextManager, RuntimeFilterDeploymentAbortOutcome,
-            RuntimeFilterDeploymentClaimState, RuntimeFilterDeploymentInstallErrorKind,
-            RuntimeFilterDeploymentInstallOutcome,
+            LookupFetcherLifecycle, QueryContextManager, QueryExecutionKey,
+            RuntimeFilterDeploymentAbortOutcome, RuntimeFilterDeploymentClaimState,
+            RuntimeFilterDeploymentInstallErrorKind, RuntimeFilterDeploymentInstallOutcome,
         };
+        use crate::common::types::UniqueId;
         use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
         use crate::runtime_filter::port::identity::DeploymentEpoch;
         use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
@@ -5822,10 +6039,14 @@ mod tests {
 
             publish_release_tx.send(()).expect("publish Installed");
             assert_eq!(
-                install.join().expect("install thread").expect("install"),
-                RuntimeFilterDeploymentInstallOutcome::Applied
+                install
+                    .join()
+                    .expect("install thread")
+                    .expect_err("cancelled context cannot publish Installed")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
             );
-            assert!(manager.runtime_filter_deployment_is_installed_for_test(query));
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
         }
 
         #[test]
@@ -5987,6 +6208,428 @@ mod tests {
                     expected
                 );
             }
+        }
+
+        #[test]
+        fn cancel_query_during_installed_publish_rejects_ack_and_revival() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_230);
+            let install = participant_install();
+            let (service_installed_tx, service_installed_rx) = mpsc::sync_channel(0);
+            let (publish_release_tx, publish_release_rx) = mpsc::sync_channel(0);
+            let publish_release_rx = Mutex::new(publish_release_rx);
+            manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .before_runtime_filter_installed_publish = Some(Arc::new(move || {
+                service_installed_tx
+                    .send(())
+                    .expect("signal Service install complete");
+                publish_release_rx
+                    .lock()
+                    .expect("publish release lock")
+                    .recv()
+                    .expect("release Installed publish");
+            }));
+
+            let install_manager = manager.clone();
+            let first_install = install.clone();
+            let installer = std::thread::spawn(move || {
+                install_manager.install_runtime_filter_deployment(query, lifecycle(), first_install)
+            });
+            service_installed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("Service installed before final publish");
+            assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
+
+            assert!(
+                manager
+                    .cancel_query(query, "query cancelled".to_string())
+                    .is_empty()
+            );
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+            assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
+
+            publish_release_tx
+                .send(())
+                .expect("release Installed publish");
+            assert_eq!(
+                installer
+                    .join()
+                    .expect("installer thread")
+                    .expect_err("cancelled install cannot ACK")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), install)
+                    .expect_err("cancelled query cannot be reinstalled")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert!(
+                manager
+                    .get_or_register_native(
+                        query,
+                        false,
+                        lifecycle().delivery_expire,
+                        lifecycle().query_expire,
+                    )
+                    .is_err()
+            );
+            assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
+        }
+
+        #[test]
+        fn cancel_after_installed_rejects_duplicate_install_and_fragment_registration() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_231);
+            let install = participant_install();
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), install.clone())
+                .expect("install");
+            assert!(manager.runtime_filter_deployment_is_installed_for_test(query));
+
+            manager.cancel_query(query, "query cancelled".to_string());
+
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), install)
+                    .expect_err("cancelled Installed deployment is not idempotent success")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert!(
+                manager
+                    .get_or_register_native(
+                        query,
+                        false,
+                        lifecycle().delivery_expire,
+                        lifecycle().query_expire,
+                    )
+                    .is_err()
+            );
+            assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
+        }
+
+        #[test]
+        fn abort_query_terminalizes_deployment_and_preserves_finst_result() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_232);
+            let finst_a = UniqueId { hi: 9_233, lo: 1 };
+            let finst_b = UniqueId { hi: 9_233, lo: 2 };
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                .expect("install");
+            manager.register_finsts([finst_a, finst_b], query);
+
+            let finsts = manager.abort_query(query);
+
+            assert_eq!(finsts.len(), 2);
+            assert!(finsts.contains(&finst_a));
+            assert!(finsts.contains(&finst_b));
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+        }
+
+        #[test]
+        fn cancel_query_execution_terminalizes_matching_deployment_and_preserves_finst_result() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_234);
+            let finst = UniqueId { hi: 9_235, lo: 1 };
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                .expect("install");
+            manager.register_finst(finst, query);
+
+            assert_eq!(
+                manager.cancel_query_execution(
+                    QueryExecutionKey::native(query),
+                    "execution cancelled".to_string(),
+                ),
+                vec![finst]
+            );
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+        }
+
+        #[test]
+        fn cancel_finst_observer_terminalizes_deployment_and_preserves_query_result() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_236);
+            let finst_a = UniqueId { hi: 9_237, lo: 1 };
+            let finst_b = UniqueId { hi: 9_237, lo: 2 };
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                .expect("install");
+            manager.register_finsts([finst_a, finst_b], query);
+            let (observer_tx, observer_rx) = mpsc::sync_channel(1);
+
+            let result =
+                manager.cancel_finst_internal(finst_a, "finst cancelled".to_string(), || {
+                    observer_tx.send(()).expect("binding observer")
+                });
+
+            observer_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("observer ran while binding was resolved");
+            assert_eq!(result.query_id, Some(query));
+            assert_eq!(result.finsts.len(), 2);
+            assert!(result.finsts.contains(&finst_a));
+            assert!(result.finsts.contains(&finst_b));
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+        }
+
+        #[test]
+        fn cancelled_empty_native_context_blocks_revival_until_retry_horizon() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_238);
+            manager
+                .ensure_native_context(
+                    query,
+                    false,
+                    lifecycle().delivery_expire,
+                    lifecycle().query_expire,
+                )
+                .expect("create empty native context");
+            assert!(
+                manager
+                    .cancel_query(query, "cancel empty context".to_string())
+                    .is_empty()
+            );
+
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                    .expect_err("query cancel tombstone blocks late install")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert!(
+                manager
+                    .get_or_register_native(
+                        query,
+                        false,
+                        lifecycle().delivery_expire,
+                        lifecycle().query_expire,
+                    )
+                    .is_err()
+            );
+
+            {
+                let mut guard = manager.inner.lock().expect("query manager");
+                guard
+                    .active
+                    .get_mut(&query)
+                    .expect("cancelled context remains active")
+                    .query_deadline = Instant::now() - Duration::from_millis(1);
+            }
+            manager.clean_expired_for_test();
+            assert_eq!(manager.fragment_counts_for_test(query), Some((0, 0)));
+
+            let horizon = manager.runtime_filter_control_retry_horizon_for_test();
+            manager
+                .advance_runtime_filter_terminal_clock_for_test(horizon + Duration::from_millis(1));
+            manager.clean_expired_for_test();
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                    .expect("query id may be reused after cancellation retry horizon"),
+                RuntimeFilterDeploymentInstallOutcome::Applied
+            );
+        }
+
+        #[test]
+        fn truly_contextless_cancel_preserves_baseline_noop_semantics() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_240);
+
+            assert!(
+                manager
+                    .cancel_query(query, "unknown query".to_string())
+                    .is_empty()
+            );
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(query, lifecycle(), participant_install(),)
+                    .expect("unknown-query cancellation does not reserve an epochless record"),
+                RuntimeFilterDeploymentInstallOutcome::Applied
+            );
+        }
+
+        #[test]
+        fn cancelled_empty_context_fails_closed_when_terminal_capacity_is_full() {
+            let manager = QueryContextManager::new_for_test();
+            manager.set_runtime_filter_terminal_capacity_for_test(1);
+            let occupied = query_id(9_241);
+            let cancelled = query_id(9_242);
+            let unrelated = query_id(9_243);
+            manager
+                .ensure_native_context(
+                    cancelled,
+                    false,
+                    lifecycle().delivery_expire,
+                    lifecycle().query_expire,
+                )
+                .expect("create target empty context");
+            manager
+                .ensure_native_context(
+                    unrelated,
+                    false,
+                    lifecycle().delivery_expire,
+                    lifecycle().query_expire,
+                )
+                .expect("create unrelated empty context");
+            manager
+                .abort_runtime_filter_deployment(occupied, DeploymentEpoch::new(1))
+                .expect("reserve the only terminal record");
+
+            manager.cancel_query(cancelled, "cancel empty context".to_string());
+
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(
+                        cancelled,
+                        lifecycle(),
+                        participant_install(),
+                    )
+                    .expect_err("cancelled context itself must fail closed at capacity")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            manager
+                .get_or_register_native(
+                    unrelated,
+                    false,
+                    lifecycle().delivery_expire,
+                    lifecycle().query_expire,
+                )
+                .expect("unrelated existing native path is not globally blocked");
+            let fresh = query_id(9_244);
+            manager
+                .get_or_register_native(
+                    fresh,
+                    false,
+                    lifecycle().delivery_expire,
+                    lifecycle().query_expire,
+                )
+                .expect("unrelated new native path is not globally blocked");
+
+            {
+                let mut guard = manager.inner.lock().expect("query manager");
+                guard
+                    .active
+                    .get_mut(&cancelled)
+                    .expect("cancelled context retained")
+                    .query_deadline = Instant::now() - Duration::from_millis(1);
+            }
+            manager.clean_expired_for_test();
+            assert_eq!(manager.fragment_counts_for_test(cancelled), Some((0, 0)));
+
+            let horizon = manager.runtime_filter_control_retry_horizon_for_test();
+            manager
+                .advance_runtime_filter_terminal_clock_for_test(horizon + Duration::from_millis(1));
+            manager.clean_expired_for_test();
+            assert_eq!(
+                manager
+                    .install_runtime_filter_deployment(
+                        cancelled,
+                        lifecycle(),
+                        participant_install(),
+                    )
+                    .expect("capacity and saturation are reclaimed together"),
+                RuntimeFilterDeploymentInstallOutcome::Applied
+            );
+        }
+
+        #[test]
+        fn cancellation_races_explicit_abort_and_installer_without_double_terminalization() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_239);
+            let install = participant_install();
+            let epoch = install.epoch();
+            let (service_installed_tx, service_installed_rx) = mpsc::sync_channel(0);
+            let (install_release_tx, install_release_rx) = mpsc::sync_channel(0);
+            let install_release_rx = Mutex::new(install_release_rx);
+            manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .before_runtime_filter_installed_publish = Some(Arc::new(move || {
+                service_installed_tx.send(()).expect("Service installed");
+                install_release_rx
+                    .lock()
+                    .expect("install release lock")
+                    .recv()
+                    .expect("release installer");
+            }));
+            let install_manager = manager.clone();
+            let installer = std::thread::spawn(move || {
+                install_manager.install_runtime_filter_deployment(query, lifecycle(), install)
+            });
+            service_installed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("installer reached publish barrier");
+
+            let (shutdown_reached_tx, shutdown_reached_rx) = mpsc::sync_channel(0);
+            let (abort_publish_tx, abort_publish_rx) = mpsc::sync_channel(0);
+            let abort_publish_rx = Mutex::new(abort_publish_rx);
+            manager.set_after_runtime_filter_service_shutdown_hook_for_test(Arc::new(move || {
+                shutdown_reached_tx.send(()).expect("shutdown reached");
+                abort_publish_rx
+                    .lock()
+                    .expect("abort publish lock")
+                    .recv()
+                    .expect("publish Aborted");
+            }));
+            let cancel_manager = manager.clone();
+            let cancel = std::thread::spawn(move || {
+                cancel_manager.cancel_query(query, "query cancelled".to_string())
+            });
+            shutdown_reached_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("cancellation reached shutdown hook");
+            assert!(manager.runtime_filter_deployment_is_aborting_for_test(query));
+
+            let (abort_waiting_tx, abort_waiting_rx) = mpsc::sync_channel(0);
+            manager.set_abort_wait_observer_for_test(Arc::new(move || {
+                abort_waiting_tx.send(()).expect("abort waits");
+            }));
+            let abort_manager = manager.clone();
+            let (abort_result_tx, abort_result_rx) = mpsc::sync_channel(1);
+            let abort = std::thread::spawn(move || {
+                abort_result_tx
+                    .send(abort_manager.abort_runtime_filter_deployment(query, epoch))
+                    .expect("send abort result");
+            });
+            abort_waiting_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("explicit abort observed cancellation Aborting");
+
+            abort_publish_tx
+                .send(())
+                .expect("publish cancellation Aborted");
+            assert!(cancel.join().expect("cancel thread").is_empty());
+            assert_eq!(
+                abort_result_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("abort result")
+                    .expect("abort success"),
+                RuntimeFilterDeploymentAbortOutcome::Idempotent
+            );
+            abort.join().expect("abort thread");
+            install_release_tx.send(()).expect("release installer");
+            assert_eq!(
+                installer
+                    .join()
+                    .expect("installer thread")
+                    .expect_err("cancelled install cannot ACK")
+                    .kind(),
+                RuntimeFilterDeploymentInstallErrorKind::QueryAborted
+            );
+            assert!(manager.runtime_filter_deployment_is_aborted_for_test(query));
+            assert_eq!(manager.runtime_filter_terminal_count_for_test(), 1);
         }
     }
 }
