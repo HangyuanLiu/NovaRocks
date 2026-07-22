@@ -18,6 +18,7 @@
 mod encoding;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(unix)]
@@ -25,6 +26,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mysql_common::scramble::scramble_native;
@@ -33,8 +35,8 @@ use opensrv_mysql::{
     QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
-use tokio::net::TcpListener;
-use tokio::task;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{self, JoinSet};
 use tracing::{info, warn};
 
 use crate::common::engine_error::{EngineError, EngineErrorCode};
@@ -61,6 +63,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
+const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
 struct ClientDisconnectWatcher {
@@ -165,6 +168,33 @@ pub fn run_standalone_server_with_config(
     run_with_resolved_options(resolved)
 }
 
+/// Run the standalone server until the supplied shutdown future resolves.
+///
+/// Unlike the synchronous compatibility wrappers, this function does not
+/// create a Tokio runtime. The caller owns the runtime that drives server and
+/// application shutdown. `local_exchange` selects all-in-one execution when
+/// true and FE coordinator-only execution when false.
+pub async fn run_standalone_server_with_config_until_shutdown<F>(
+    cfg: NovaRocksConfig,
+    config_path: Option<PathBuf>,
+    port_override: Option<u16>,
+    local_exchange: bool,
+    shutdown: F,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+{
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path,
+        preloaded_config: Some(cfg),
+        start_local_exchange_execution: local_exchange,
+        start_coordinator_report_grpc: true,
+        ..resolved
+    };
+    run_with_resolved_options_until_shutdown(resolved, shutdown).await
+}
+
 /// Run the standalone server for `role=fe`.
 ///
 /// Identical to [`run_standalone_server_with_config`] except local fragment
@@ -193,6 +223,25 @@ pub fn configure_standalone_internal_rpc_transport() {
 }
 
 fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+        .build()
+        .map_err(|e| format!("build tokio runtime failed: {e}"))?;
+
+    runtime.block_on(run_with_resolved_options_until_shutdown(
+        resolved,
+        std::future::pending(),
+    ))
+}
+
+async fn run_with_resolved_options_until_shutdown<F>(
+    resolved: ResolvedStandaloneServerOptions,
+    shutdown: F,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+{
     configure_standalone_internal_rpc_transport();
 
     let opts = StandaloneOptions {
@@ -202,30 +251,45 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         Some(cfg) => StandaloneNovaRocks::open_with_config(opts, cfg)?,
         None => StandaloneNovaRocks::open(opts)?,
     };
-    let _refresh_coordinator = crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
-        &engine,
-        resolved.refresh_coordinator.clone(),
-    );
-    let _maintenance_coordinator =
+    let coordinator_handles = (
+        crate::engine::mv_scheduler::start_refresh_coordinator_for_server(
+            &engine,
+            resolved.refresh_coordinator,
+        ),
         crate::engine::mv_maintenance::start_maintenance_coordinator_for_server(
             &engine,
-            resolved.maintenance.clone(),
-        );
+            resolved.maintenance,
+        ),
+    );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|e| format!("build tokio runtime failed: {e}"))?;
+    let server = async move {
+        start_standalone_grpc_endpoint(
+            &resolved.grpc_bind_host,
+            resolved.start_local_exchange_execution,
+            resolved.start_coordinator_report_grpc,
+        )?;
 
-    runtime.block_on(serve_forever(
-        engine,
-        resolved.mysql_port,
-        resolved.user.clone(),
-        resolved.grpc_bind_host.clone(),
-        resolved.start_local_exchange_execution,
-        resolved.start_coordinator_report_grpc,
-    ))
+        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, resolved.mysql_port));
+        let ready_user = resolved.user.clone();
+        let session_engine = engine;
+        let session_user = resolved.user;
+        serve_until_shutdown(
+            bind_addr,
+            shutdown,
+            move |stream, peer_addr| {
+                serve_mysql_connection(
+                    session_engine.clone(),
+                    session_user.clone(),
+                    stream,
+                    peer_addr,
+                )
+            },
+            move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
+        )
+        .await
+    };
+
+    await_server_with_coordinator_handles(coordinator_handles, server).await
 }
 
 fn resolve_server_options(
@@ -332,11 +396,8 @@ fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, St
     }
 }
 
-async fn serve_forever(
-    engine: StandaloneNovaRocks,
-    mysql_port: u16,
-    user: String,
-    grpc_bind_host: String,
+fn start_standalone_grpc_endpoint(
+    grpc_bind_host: &str,
     start_local_exchange_execution: bool,
     start_coordinator_report_grpc: bool,
 ) -> Result<(), String> {
@@ -372,10 +433,10 @@ async fn serve_forever(
         }
     }
 
-    let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port));
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|e| format!("bind standalone mysql server on {bind_addr} failed: {e}"))?;
+    Ok(())
+}
+
+fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
     info!(
         "standalone mysql server listening on {} (user={}, db={})",
         bind_addr, user, DEFAULT_DATABASE
@@ -387,38 +448,145 @@ async fn serve_forever(
     // `NOVAROCKS_READY` is the wait-for-ready contract — do not change it
     // without updating callers (CLAUDE.md, sql-tests harness, etc.).
     println!(
-        "NOVAROCKS_READY mysql_port={mysql_port} pid={}",
+        "NOVAROCKS_READY mysql_port={} pid={}",
+        bind_addr.port(),
         std::process::id()
     );
-    loop {
-        let (stream, peer_addr) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("accept standalone mysql connection failed: {e}"))?;
-        let engine = engine.clone();
-        let user = user.clone();
-        tokio::spawn(async move {
-            let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            let (client_disconnect_signal, disconnect_watcher) =
-                spawn_client_disconnect_watcher(&stream);
-            let connection_disconnect_signal = Arc::clone(&client_disconnect_signal);
-            let shim = NovaRocksMysqlShim::new(
-                engine,
-                user,
-                connection_id,
-                client_disconnect_signal,
-                disconnect_watcher,
-            );
-            let (reader, writer) = stream.into_split();
-            let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
-            connection_disconnect_signal.store(true, Ordering::SeqCst);
-            if let Err(err) = result {
-                warn!(
-                    "standalone mysql connection failed: peer={}, connection_id={}, err={}",
-                    peer_addr, connection_id, err
-                );
+}
+
+async fn await_server_with_coordinator_handles<C, F>(
+    coordinator_handles: C,
+    server: F,
+) -> Result<(), String>
+where
+    F: Future<Output = Result<(), String>>,
+{
+    let _coordinator_handles = coordinator_handles;
+    server.await
+}
+
+async fn serve_until_shutdown<F, H, HFut, R>(
+    bind_addr: SocketAddr,
+    shutdown: F,
+    session_handler: H,
+    on_ready: R,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    H: FnMut(TcpStream, SocketAddr) -> HFut,
+    HFut: Future<Output = ()> + Send + 'static,
+    R: FnOnce(SocketAddr),
+{
+    serve_until_shutdown_with_drain_timeout(
+        bind_addr,
+        shutdown,
+        session_handler,
+        on_ready,
+        SESSION_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_until_shutdown_with_drain_timeout<F, H, HFut, R>(
+    bind_addr: SocketAddr,
+    shutdown: F,
+    mut session_handler: H,
+    on_ready: R,
+    drain_timeout: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    H: FnMut(TcpStream, SocketAddr) -> HFut,
+    HFut: Future<Output = ()> + Send + 'static,
+    R: FnOnce(SocketAddr),
+{
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| format!("bind standalone mysql server on {bind_addr} failed: {e}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|e| format!("read standalone mysql server address failed: {e}"))?;
+    on_ready(bound_addr);
+
+    let mut sessions = JoinSet::new();
+    tokio::pin!(shutdown);
+    let serve_result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break Ok(()),
+            completed = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(result) = completed {
+                    log_session_join_error(result);
+                }
             }
-        });
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer_addr)) => {
+                        sessions.spawn(session_handler(stream, peer_addr));
+                    }
+                    Err(err) => {
+                        break Err(format!(
+                            "accept standalone mysql connection failed: {err}"
+                        ));
+                    }
+                }
+            }
+        }
+    };
+
+    drop(listener);
+    drain_session_tasks(&mut sessions, drain_timeout).await;
+    serve_result
+}
+
+fn log_session_join_error(result: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = result
+        && !err.is_cancelled()
+    {
+        warn!("standalone mysql connection task failed: {err}");
+    }
+}
+
+async fn drain_session_tasks(sessions: &mut JoinSet<()>, drain_timeout: Duration) {
+    let drain = async {
+        while let Some(result) = sessions.join_next().await {
+            log_session_join_error(result);
+        }
+    };
+    if tokio::time::timeout(drain_timeout, drain).await.is_ok() {
+        return;
+    }
+
+    sessions.abort_all();
+    while let Some(result) = sessions.join_next().await {
+        log_session_join_error(result);
+    }
+}
+
+async fn serve_mysql_connection(
+    engine: StandaloneNovaRocks,
+    user: String,
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+) {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let (client_disconnect_signal, disconnect_watcher) = spawn_client_disconnect_watcher(&stream);
+    let connection_disconnect_signal = Arc::clone(&client_disconnect_signal);
+    let shim = NovaRocksMysqlShim::new(
+        engine,
+        user,
+        connection_id,
+        client_disconnect_signal,
+        disconnect_watcher,
+    );
+    let (reader, writer) = stream.into_split();
+    let result = AsyncMysqlIntermediary::run_on(shim, reader, writer).await;
+    connection_disconnect_signal.store(true, Ordering::SeqCst);
+    if let Err(err) = result {
+        warn!(
+            "standalone mysql connection failed: peer={}, connection_id={}, err={}",
+            peer_addr, connection_id, err
+        );
     }
 }
 
@@ -1809,6 +1977,235 @@ fn strip_string_quotes(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod shutdown_lifecycle {
+        use std::future::pending;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use tokio::net::TcpStream;
+        use tokio::sync::oneshot;
+
+        use super::*;
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+        #[derive(Clone)]
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        async fn wait_until_connect_refused(addr: SocketAddr) {
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                loop {
+                    match TcpStream::connect(addr).await {
+                        Ok(stream) => drop(stream),
+                        Err(_) => break,
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener should stop accepting within the test timeout");
+        }
+
+        #[tokio::test]
+        async fn shutdown_before_first_connection_stops_accepting() {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let server = tokio::spawn(serve_until_shutdown(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+                |_stream, _peer_addr| async move {
+                    panic!("no connection should be accepted before shutdown")
+                },
+                move |addr| {
+                    let _ = ready_tx.send(addr);
+                },
+            ));
+            let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
+                .await
+                .expect("server should bind within the test timeout")
+                .expect("ready sender should stay alive");
+
+            shutdown_tx.send(()).expect("send shutdown");
+            tokio::time::timeout(TEST_TIMEOUT, server)
+                .await
+                .expect("server should stop within the test timeout")
+                .expect("server task should not panic")
+                .expect("server shutdown should succeed");
+
+            assert!(TcpStream::connect(addr).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn shutdown_stops_new_accepts_and_waits_for_active_session() {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (started_tx, started_rx) = oneshot::channel();
+            let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+            let (release_tx, release_rx) = oneshot::channel();
+            let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            let server = tokio::spawn(serve_until_shutdown(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+                move |_stream, _peer_addr| {
+                    let started_tx = Arc::clone(&started_tx);
+                    let release_rx = Arc::clone(&release_rx);
+                    async move {
+                        if let Some(started_tx) = started_tx.lock().expect("started lock").take() {
+                            let _ = started_tx.send(());
+                        }
+                        let release_rx = release_rx.lock().expect("release lock").take();
+                        if let Some(release_rx) = release_rx {
+                            let _ = release_rx.await;
+                        }
+                    }
+                },
+                move |addr| {
+                    let _ = ready_tx.send(addr);
+                },
+            ));
+            let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
+                .await
+                .expect("server should bind within the test timeout")
+                .expect("ready sender should stay alive");
+            let _client = TcpStream::connect(addr)
+                .await
+                .expect("connect active session");
+            tokio::time::timeout(TEST_TIMEOUT, started_rx)
+                .await
+                .expect("session should start within the test timeout")
+                .expect("session start sender should stay alive");
+
+            shutdown_tx.send(()).expect("send shutdown");
+            wait_until_connect_refused(addr).await;
+            assert!(
+                !server.is_finished(),
+                "server must wait for the accepted session to finish"
+            );
+
+            release_tx.send(()).expect("release active session");
+            tokio::time::timeout(TEST_TIMEOUT, server)
+                .await
+                .expect("server should stop after session release")
+                .expect("server task should not panic")
+                .expect("server shutdown should succeed");
+        }
+
+        #[tokio::test]
+        async fn drain_timeout_aborts_stuck_session() {
+            assert_eq!(SESSION_DRAIN_TIMEOUT, Duration::from_secs(5));
+
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (started_tx, started_rx) = oneshot::channel();
+            let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+            let session_dropped = Arc::new(AtomicBool::new(false));
+            let session_dropped_in_task = Arc::clone(&session_dropped);
+            let server = tokio::spawn(serve_until_shutdown_with_drain_timeout(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+                move |_stream, _peer_addr| {
+                    let started_tx = Arc::clone(&started_tx);
+                    let session_dropped = Arc::clone(&session_dropped_in_task);
+                    async move {
+                        let _probe = DropProbe(session_dropped);
+                        if let Some(started_tx) = started_tx.lock().expect("started lock").take() {
+                            let _ = started_tx.send(());
+                        }
+                        pending::<()>().await;
+                    }
+                },
+                move |addr| {
+                    let _ = ready_tx.send(addr);
+                },
+                Duration::from_millis(20),
+            ));
+            let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
+                .await
+                .expect("server should bind within the test timeout")
+                .expect("ready sender should stay alive");
+            let _client = TcpStream::connect(addr)
+                .await
+                .expect("connect stuck session");
+            tokio::time::timeout(TEST_TIMEOUT, started_rx)
+                .await
+                .expect("session should start within the test timeout")
+                .expect("session start sender should stay alive");
+
+            shutdown_tx.send(()).expect("send shutdown");
+            tokio::time::timeout(TEST_TIMEOUT, server)
+                .await
+                .expect("server should abort the stuck session")
+                .expect("server task should not panic")
+                .expect("server shutdown should succeed");
+
+            assert!(session_dropped.load(Ordering::SeqCst));
+            assert!(TcpStream::connect(addr).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn bind_failure_returns_without_ready_marker() {
+            let occupied = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("reserve test address");
+            let addr = occupied.local_addr().expect("reserved address");
+            let ready_emitted = Arc::new(AtomicBool::new(false));
+            let ready_emitted_in_callback = Arc::clone(&ready_emitted);
+
+            let err = serve_until_shutdown(
+                addr,
+                pending::<()>(),
+                |_stream, _peer_addr| async move {},
+                move |_addr| ready_emitted_in_callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect_err("occupied address should fail to bind");
+
+            assert!(err.contains("bind standalone mysql server"), "{err}");
+            assert!(!ready_emitted.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn serve_error_still_drops_coordinator_handles() {
+            let occupied = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("reserve test address");
+            let addr = occupied.local_addr().expect("reserved address");
+            let refresh_dropped = Arc::new(AtomicBool::new(false));
+            let maintenance_dropped = Arc::new(AtomicBool::new(false));
+
+            let err = await_server_with_coordinator_handles(
+                (
+                    DropProbe(Arc::clone(&refresh_dropped)),
+                    DropProbe(Arc::clone(&maintenance_dropped)),
+                ),
+                serve_until_shutdown(
+                    addr,
+                    pending::<()>(),
+                    |_stream, _peer_addr| async move {},
+                    |_addr| {},
+                ),
+            )
+            .await
+            .expect_err("occupied address should fail to bind");
+
+            assert!(err.contains("bind standalone mysql server"), "{err}");
+            assert!(refresh_dropped.load(Ordering::SeqCst));
+            assert!(maintenance_dropped.load(Ordering::SeqCst));
+        }
+    }
 
     #[test]
     fn request_query_options_projection_preserves_session_fields_and_runtime_defaults() {
