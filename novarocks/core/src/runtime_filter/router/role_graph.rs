@@ -200,7 +200,10 @@ impl RoleRouter {
         }
         if !matches!(
             kind,
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable
+            RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         ) || !edge.allowed_kinds().contains(&kind)
         {
             return Err(RuntimeFilterRouteContractError::ForbiddenInboundKind {

@@ -45,6 +45,8 @@ pub(crate) fn canonical_route_allowed_kinds(
             Some(BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
             ]))
         }
         (RuntimeFilterRouteRole::Producer(_), RuntimeFilterRouteRole::Aggregator) => {
@@ -365,7 +367,10 @@ impl RuntimeFilterDeliveryRouteIntent {
         reject_zero(channel_id.get(), "channel id")?;
         if !matches!(
             envelope_kind,
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable
+            RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         ) {
             return Err(RuntimeFilterRouteContractError::ForbiddenDeliveryKind {
                 channel: channel_id,
@@ -868,6 +873,30 @@ mod tests {
             Some(RuntimeFilterParticipantId::new(2))
         );
         assert_eq!(channel.outbound_edges(), &[edge]);
+    }
+
+    #[test]
+    fn canonical_delivery_family_includes_exact_terminal_kinds() {
+        let expected = BTreeSet::from([
+            RuntimeFilterEnvelopeKind::Artifact,
+            RuntimeFilterEnvelopeKind::Unavailable,
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            RuntimeFilterEnvelopeKind::DegradedLogical,
+        ]);
+        assert_eq!(
+            canonical_route_allowed_kinds(
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            canonical_route_allowed_kinds(
+                RuntimeFilterRouteRole::Aggregator,
+                RuntimeFilterRouteRole::Consumer(BindingId::new(20)),
+            ),
+            Some(expected)
+        );
     }
 
     #[test]

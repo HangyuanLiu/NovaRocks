@@ -811,6 +811,8 @@ mod tests {
             &BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
             ])
         );
         assert!(

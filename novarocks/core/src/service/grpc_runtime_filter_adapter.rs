@@ -311,6 +311,12 @@ fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
             Ok(RuntimeFilterEnvelopeKind::Unavailable)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Ack => Ok(RuntimeFilterEnvelopeKind::Ack),
+        proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+            Ok(RuntimeFilterEnvelopeKind::CompletedWithoutArtifact)
+        }
+        proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
+            Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
+        }
     }
 }
 
@@ -327,6 +333,12 @@ fn encode_kind(kind: RuntimeFilterEnvelopeKind) -> proto::filter::RuntimeFilterE
             proto::filter::RuntimeFilterEnvelopeKind::Unavailable
         }
         RuntimeFilterEnvelopeKind::Ack => proto::filter::RuntimeFilterEnvelopeKind::Ack,
+        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+            proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+        }
+        RuntimeFilterEnvelopeKind::DegradedLogical => {
+            proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical
+        }
     }
 }
 
@@ -607,6 +619,12 @@ mod tests {
             proto::filter::RuntimeFilterEnvelopeKind::Ack => {
                 (contribution_route(), Vec::new(), None)
             }
+            proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+                (delivery_route(), Vec::new(), None)
+            }
+            proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
+                (delivery_route(), b"degraded-logical".to_vec(), None)
+            }
             proto::filter::RuntimeFilterEnvelopeKind::Unspecified => {
                 panic!("unspecified kind is not a valid fixture")
             }
@@ -646,6 +664,16 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 b"unavailable".as_slice(),
             ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                b"".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                b"degraded-logical".as_slice(),
+            ),
             // Ack is intentionally excluded: RFD-4/M3 requires an Ack envelope to
             // carry an accept status (`RuntimeFilterEnvelope::accept_status`), and
             // this wire message has no field to source one from, so it can no
@@ -681,7 +709,10 @@ mod tests {
                     assert_eq!(identity.partition_id(), PartitionId::new(20));
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
                 }
-                RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+                RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+                | RuntimeFilterEnvelopeKind::DegradedLogical => {
                     let identity = envelope
                         .route_identity()
                         .as_delivery()
@@ -711,6 +742,19 @@ mod tests {
             error.message(),
             "runtime filter envelope kind Ack requires an accept status"
         );
+        assert!(ingress.is_empty());
+    }
+
+    #[test]
+    fn unknown_proto_envelope_kind_is_rejected_before_ingress() {
+        let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
+        let mut request =
+            valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
+        request.kind = i32::MAX;
+
+        let error = handle_runtime_filter_envelope(ingress.clone(), request).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.message(), "runtime filter envelope kind is unknown");
         assert!(ingress.is_empty());
     }
 

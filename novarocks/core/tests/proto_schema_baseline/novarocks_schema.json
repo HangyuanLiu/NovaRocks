@@ -1558,6 +1558,13 @@
               "type_name": "RuntimeFilterConsumerDeployment",
               "label": "repeated",
               "oneof": null
+            },
+            "14": {
+              "number": 14,
+              "name": "outbound_materialization_groups",
+              "type_name": "RuntimeFilterOutboundMaterializationGroup",
+              "label": "repeated",
+              "oneof": null
             }
           },
           "reserved_numbers": [],
@@ -1984,6 +1991,33 @@
               "name": "max_concurrent_jobs",
               "type_name": "uint64",
               "label": "singular",
+              "oneof": null
+            }
+          },
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOutboundMaterializationGroup": {
+          "fields": {
+            "1": {
+              "number": 1,
+              "name": "owner",
+              "type_name": "RuntimeFilterOutboundMaterializationOwner",
+              "label": "singular",
+              "oneof": null
+            },
+            "2": {
+              "number": 2,
+              "name": "artifact_profile",
+              "type_name": "RuntimeFilterConsumerArtifactProfile",
+              "label": "singular",
+              "oneof": null
+            },
+            "3": {
+              "number": 3,
+              "name": "route_edge_ids",
+              "type_name": "uint32",
+              "label": "repeated",
               "oneof": null
             }
           },
@@ -2524,6 +2558,14 @@
             {
               "number": 5,
               "name": "RUNTIME_FILTER_ENVELOPE_KIND_ACK"
+            },
+            {
+              "number": 6,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_COMPLETED_WITHOUT_ARTIFACT"
+            },
+            {
+              "number": 7,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_DEGRADED_LOGICAL"
             }
           ],
           "reserved_numbers": [],
@@ -2542,6 +2584,24 @@
             {
               "number": 2,
               "name": "RUNTIME_FILTER_LIFECYCLE_MONOTONIC_UPDATES"
+            }
+          ],
+          "reserved_numbers": [],
+          "reserved_names": []
+        },
+        "RuntimeFilterOutboundMaterializationOwner": {
+          "values": [
+            {
+              "number": 0,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_UNSPECIFIED"
+            },
+            {
+              "number": 1,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_DIRECT_SOURCE"
+            },
+            {
+              "number": 2,
+              "name": "RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_AGGREGATOR"
             }
           ],
           "reserved_numbers": [],

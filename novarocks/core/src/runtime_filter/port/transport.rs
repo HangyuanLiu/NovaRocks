@@ -32,6 +32,8 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Artifact,
     ProducerClosed,
     Unavailable,
+    CompletedWithoutArtifact,
+    DegradedLogical,
     /// Acknowledges either a `Contribution`-kind or `Delivery`-kind route identity.
     /// The acked route identity is the envelope's own top-level `route_identity`
     /// (see `RuntimeFilterEnvelope::route_identity`); an `Ack` envelope does not
@@ -413,9 +415,10 @@ impl RuntimeFilterEnvelope {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 route_identity.as_contribution().is_some()
             }
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
-                route_identity.as_delivery().is_some()
-            }
+            RuntimeFilterEnvelopeKind::Artifact
+            | RuntimeFilterEnvelopeKind::Unavailable
+            | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+            | RuntimeFilterEnvelopeKind::DegradedLogical => route_identity.as_delivery().is_some(),
             RuntimeFilterEnvelopeKind::Ack => true,
         };
         if !identity_matches {
@@ -426,6 +429,7 @@ impl RuntimeFilterEnvelope {
             RuntimeFilterEnvelopeKind::Contribution
                 | RuntimeFilterEnvelopeKind::Artifact
                 | RuntimeFilterEnvelopeKind::Unavailable
+                | RuntimeFilterEnvelopeKind::DegradedLogical
         );
         if payload_required && payload.is_empty() {
             return Err(RuntimeFilterTransportError::payload_required(kind));
@@ -1054,6 +1058,66 @@ mod tests {
         assert_eq!(envelope.producer_open(), Some(producer_open));
         assert!(envelope.payload().is_empty());
         assert!(build(b"unexpected".to_vec()).is_err());
+    }
+
+    #[test]
+    fn delivery_terminal_kinds_enforce_identity_and_payload_contracts() {
+        let completed = RuntimeFilterEnvelope::try_new(
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            UniqueId { hi: 1, lo: 2 },
+            ChannelId::new(3),
+            DeploymentEpoch::new(4),
+            delivery_route(),
+            None,
+            None,
+            &[11; 32],
+            Vec::new(),
+        )
+        .expect("completed-without-artifact terminal");
+        assert!(completed.payload().is_empty());
+
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                None,
+                None,
+                &[11; 32],
+                b"unexpected".to_vec(),
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                delivery_route(),
+                None,
+                None,
+                &[11; 32],
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
+                UniqueId { hi: 1, lo: 2 },
+                ChannelId::new(3),
+                DeploymentEpoch::new(4),
+                contribution_route(),
+                None,
+                None,
+                &[11; 32],
+                b"reason".to_vec(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

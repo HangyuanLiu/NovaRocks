@@ -2472,6 +2472,8 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
             ]),
         )
     }
@@ -2972,6 +2974,8 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Artifact,
                         RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
                     ]),
                 ),
                 inbound_to_consumer_with_kinds(
@@ -2983,6 +2987,8 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Artifact,
                         RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
                     ]),
                 ),
             ],

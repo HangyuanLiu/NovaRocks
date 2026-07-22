@@ -518,6 +518,8 @@ pub(crate) fn local_participant_install_for_test(
                         BTreeSet::from([
                             RuntimeFilterEnvelopeKind::Artifact,
                             RuntimeFilterEnvelopeKind::Unavailable,
+                            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                            RuntimeFilterEnvelopeKind::DegradedLogical,
                         ]),
                     )
                     .expect("test install view produces a valid consumer route");

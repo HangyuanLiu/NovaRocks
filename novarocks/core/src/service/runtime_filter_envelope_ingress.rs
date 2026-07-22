@@ -100,7 +100,10 @@ impl RuntimeFilterEnvelopeIngress for QueryScopedRuntimeFilterEnvelopeIngress {
             RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed => {
                 ingress_result_for_producer_dispatch(service.dispatch_inbound_producer(envelope))
             }
-            RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::Unavailable => {
+            RuntimeFilterEnvelopeKind::Artifact
+            | RuntimeFilterEnvelopeKind::Unavailable
+            | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+            | RuntimeFilterEnvelopeKind::DegradedLogical => {
                 ingress_result_for_consumer_dispatch(service.dispatch_inbound_consumer(envelope))
             }
             RuntimeFilterEnvelopeKind::Ack => {
@@ -175,9 +178,9 @@ mod tests {
         DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::install::{
-        ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
-        RuntimeFilterParticipantInstall,
+        ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+        OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
     };
     use crate::runtime_filter::port::producer::InstallOutcome;
     use crate::runtime_filter::port::routing::{
@@ -265,6 +268,8 @@ mod tests {
 
     fn membership_deployment(max_contribution_bytes: u64) -> RuntimeFilterChannelDeployment {
         let witness = CoverageWitnessId::new(WITNESS);
+        let consumer = membership_consumer();
+        let profile = consumer.artifact_profile().clone();
         RuntimeFilterChannelDeployment::new(
             ChannelId::new(CHANNEL),
             RuntimeFilterLogicalDomain::Membership {
@@ -292,8 +297,16 @@ mod tests {
                 BindingId::new(PRODUCER_BINDING),
                 ProducerDeployment::new(witness, BTreeSet::from([PRODUCER_FINST])),
             )]),
-            BTreeMap::from([(BindingId::new(CONSUMER_BINDING), membership_consumer())]),
+            BTreeMap::from([(BindingId::new(CONSUMER_BINDING), consumer)]),
         )
+        .with_outbound_materialization_groups(BTreeMap::from([(
+            profile.id(),
+            OutboundMaterializationGroup::new(
+                OutboundMaterializationOwner::Aggregator,
+                profile,
+                BTreeSet::from([RouteEdgeId::new(CONSUMER_ROUTE)]),
+            ),
+        )]))
     }
 
     // Production-shaped local loopback install: an explicit producer -> aggregator
@@ -329,6 +342,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
+                    RuntimeFilterEnvelopeKind::Unavailable,
                 ]),
             )
             .unwrap();
@@ -358,6 +372,8 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Artifact,
                         RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
                     ]),
                 )
                 .unwrap();

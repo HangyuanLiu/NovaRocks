@@ -42,8 +42,8 @@ use std::time::Instant;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::codec::artifact::{
-    ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle, encode_unavailable,
-    max_encoded_len_for_artifact_budget,
+    ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle,
+    encode_completed_without_artifact, encode_unavailable, max_encoded_len_for_artifact_budget,
 };
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
@@ -831,6 +831,7 @@ impl ActionDispatcher {
         let mut events = Vec::new();
         let mut deliveries = Vec::new();
         let mut remote_deliveries = Vec::new();
+        let mut remote_terminals = Vec::new();
         let mut error = None;
         match action {
             ChannelAction::None | ChannelAction::Progress { .. } => {}
@@ -842,6 +843,11 @@ impl ActionDispatcher {
                             None,
                             Some(LiveTerminal::CompletedWithoutArtifact),
                         ));
+                        remote_terminals.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            LiveTerminal::CompletedWithoutArtifact,
+                        ));
                     }
                 }
             }
@@ -852,6 +858,11 @@ impl ActionDispatcher {
                             group.route_edges().to_vec(),
                             None,
                             Some(LiveTerminal::DegradedLogical(*reason)),
+                        ));
+                        remote_terminals.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            LiveTerminal::DegradedLogical(*reason),
                         ));
                     }
                 }
@@ -1061,7 +1072,98 @@ impl ActionDispatcher {
                 });
             }
         }
+        for (profile, route_edges, terminal) in remote_terminals {
+            if let Err(delivery_error) = self.deliver_remote_terminal(
+                &installed,
+                channel_id,
+                &profile,
+                route_edges,
+                terminal,
+            ) {
+                error.get_or_insert_with(|| {
+                    violation(
+                        RuntimeContractViolationKind::ServiceUnavailable,
+                        delivery_error.to_string(),
+                    )
+                });
+            }
+        }
         (batch, error)
+    }
+
+    fn deliver_remote_terminal(
+        &self,
+        installed: &InstalledDeployment,
+        channel_id: ChannelId,
+        profile: &ConsumerArtifactProfile,
+        route_edge_ids: Vec<RouteEdgeId>,
+        terminal: LiveTerminal,
+    ) -> Result<(), ArtifactDeliveryError> {
+        let envelope_kind = match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+            }
+            LiveTerminal::DegradedLogical(_) => RuntimeFilterEnvelopeKind::DegradedLogical,
+            LiveTerminal::Completed | LiveTerminal::Unavailable(_) | LiveTerminal::Cancelled => {
+                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+            }
+            LiveTerminal::DegradedArtifact(_) | LiveTerminal::DegradedDelivery(_) => {
+                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+            }
+        };
+        let intent = RuntimeFilterDeliveryRouteIntent::new(
+            installed.epoch(),
+            channel_id,
+            route_edge_ids,
+            envelope_kind,
+        )?;
+        let decision = installed.role_router().route_delivery(intent)?;
+        if decision.remote_routes().is_empty() {
+            return Ok(());
+        }
+        let expectation = ArtifactDecodeExpectation::new(profile);
+        let frame = Arc::new(match terminal {
+            LiveTerminal::CompletedWithoutArtifact => {
+                encode_completed_without_artifact(expectation)
+            }
+            LiveTerminal::DegradedLogical(reason) => {
+                let max_encoded = max_encoded_len_for_artifact_budget(
+                    installed
+                        .artifact_plan(channel_id)
+                        .ok_or(ArtifactDeliveryError::NotInstalled)?
+                        .max_artifact_bytes(),
+                )?;
+                encode_unavailable(reason, expectation, max_encoded)?
+            }
+            LiveTerminal::Completed | LiveTerminal::Unavailable(_) | LiveTerminal::Cancelled => {
+                unreachable!("non-deliverable terminals are rejected above")
+            }
+            LiveTerminal::DegradedArtifact(_) | LiveTerminal::DegradedDelivery(_) => {
+                unreachable!("non-deliverable terminals are rejected above")
+            }
+        });
+        let common = RuntimeFilterEventIdentity::new(
+            self.query_id,
+            installed.participant_id(),
+            channel_id,
+            installed.epoch(),
+        );
+        for route in decision.remote_routes() {
+            let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
+            if let ReliableSendOutcome::ResourceLimit(_limit) = self.reliable_transport.send_kind(
+                route,
+                Arc::clone(&frame),
+                identity,
+                envelope_kind,
+            ) {
+                self.events.record(RuntimeFilterEvent::TransportEnvelope {
+                    identity,
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    bytes: frame.payload().len(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn deliver_remote_artifact(
@@ -2550,7 +2652,7 @@ mod tests {
     use crate::coordinator::scheduler::{FragmentInstancePlacement, SchedulingPlan};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle,
+        ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle, decode_unavailable,
     };
     use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
     use crate::runtime_filter::deployment::compiler::compile;
@@ -3384,6 +3486,8 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Artifact,
                         RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                        RuntimeFilterEnvelopeKind::DegradedLogical,
                     ]),
                 )
                 .unwrap();
@@ -7941,7 +8045,12 @@ mod tests {
     /// M3 replaces this with the live network sender behind the same seam.
     #[derive(Default)]
     struct RecordingRemoteSink {
-        frames: Mutex<Vec<(RouteEdgeId, EncodedArtifactFrame)>>,
+        envelopes: Mutex<
+            Vec<(
+                RouteEdgeId,
+                crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+            )>,
+        >,
     }
 
     impl RuntimeFilterEnvelopeSink for RecordingRemoteSink {
@@ -7950,17 +8059,11 @@ mod tests {
             route: RuntimeFilterRemoteRoute,
             envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
         ) -> SinkSubmitOutcome {
-            let envelope = envelope.envelope();
-            self.frames
+            let envelope = envelope.envelope().clone();
+            self.envelopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((
-                    route.route_edge_id(),
-                    EncodedArtifactFrame::from_parts_for_test(
-                        *envelope.schema_digest(),
-                        envelope.payload().to_vec(),
-                    ),
-                ));
+                .push((route.route_edge_id(), envelope));
             SinkSubmitOutcome::Submitted
         }
 
@@ -7973,7 +8076,29 @@ mod tests {
 
     impl RecordingRemoteSink {
         fn frames(&self) -> Vec<(RouteEdgeId, EncodedArtifactFrame)> {
-            self.frames
+            self.envelopes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .map(|(edge, envelope)| {
+                    (
+                        *edge,
+                        EncodedArtifactFrame::from_parts_for_test(
+                            *envelope.schema_digest(),
+                            envelope.payload().to_vec(),
+                        ),
+                    )
+                })
+                .collect()
+        }
+
+        fn envelopes(
+            &self,
+        ) -> Vec<(
+            RouteEdgeId,
+            crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
+        )> {
+            self.envelopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
@@ -8180,6 +8305,8 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Artifact,
                     RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                    RuntimeFilterEnvelopeKind::DegradedLogical,
                 ]),
             )
             .unwrap();
@@ -8205,6 +8332,8 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Artifact,
                     RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                    RuntimeFilterEnvelopeKind::DegradedLogical,
                 ]),
             )
             .unwrap();
@@ -8340,6 +8469,89 @@ mod tests {
         assert_eq!(
             decoded.artifacts()[0].1.canonical_bytes(),
             bundle.artifacts()[0].1.canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_completed_without_artifact_to_remote_groups() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::CompletedWithoutArtifact {
+                    order: 0,
+                    outcome: SubmitOutcome::CompletedWithoutArtifact,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(
+            envelope.kind(),
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
+        );
+        assert_eq!(envelope.schema_digest(), &routes.profile.id().bytes());
+        assert!(envelope.payload().is_empty());
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_degraded_logical_to_remote_groups() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::DegradedLogical {
+                    order: 0,
+                    outcome: SubmitOutcome::TerminalNoop,
+                    reason: UnavailableReason::ProducerFailed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(envelope.kind(), RuntimeFilterEnvelopeKind::DegradedLogical);
+        assert_eq!(envelope.schema_digest(), &routes.profile.id().bytes());
+        assert_eq!(
+            decode_unavailable(
+                envelope.payload(),
+                envelope.schema_digest(),
+                ArtifactDecodeExpectation::new(&routes.profile),
+                1 << 20,
+            )
+            .unwrap(),
+            UnavailableReason::ProducerFailed
         );
     }
 

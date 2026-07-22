@@ -1578,6 +1578,12 @@ fn encode_envelope_kind(kind: RuntimeFilterEnvelopeKind) -> i32 {
             filter::RuntimeFilterEnvelopeKind::Unavailable as i32
         }
         RuntimeFilterEnvelopeKind::Ack => filter::RuntimeFilterEnvelopeKind::Ack as i32,
+        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
+            filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact as i32
+        }
+        RuntimeFilterEnvelopeKind::DegradedLogical => {
+            filter::RuntimeFilterEnvelopeKind::DegradedLogical as i32
+        }
     }
 }
 
@@ -1594,6 +1600,12 @@ fn decode_envelope_kind(raw: i32, path: FieldPath) -> CodecResult<RuntimeFilterE
             Ok(RuntimeFilterEnvelopeKind::Unavailable)
         }
         Ok(filter::RuntimeFilterEnvelopeKind::Ack) => Ok(RuntimeFilterEnvelopeKind::Ack),
+        Ok(filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact) => {
+            Ok(RuntimeFilterEnvelopeKind::CompletedWithoutArtifact)
+        }
+        Ok(filter::RuntimeFilterEnvelopeKind::DegradedLogical) => {
+            Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
+        }
         Ok(filter::RuntimeFilterEnvelopeKind::Unspecified) | Err(_) => Err(codec_error(
             path,
             ProtocolErrorKind::InvalidEnum,
@@ -1782,6 +1794,8 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
             ]),
         );
         let core = membership_channel(
@@ -2183,6 +2197,8 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
             ]),
         );
         let core = ordered_topk_channel(channel_id.get(), producer.get());
@@ -2836,6 +2852,8 @@ mod tests {
             RuntimeFilterEnvelopeKind::ProducerClosed,
             RuntimeFilterEnvelopeKind::Unavailable,
             RuntimeFilterEnvelopeKind::Ack,
+            RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+            RuntimeFilterEnvelopeKind::DegradedLogical,
         ] {
             assert_eq!(
                 decode_envelope_kind(
