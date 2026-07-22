@@ -30,8 +30,8 @@ use crate::connector::iceberg::file_pruning::{
 use crate::connector::iceberg::position_delete::load_position_deletes;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{
-    HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels,
-    ScanOp, ScanRuntimeFilterDecision,
+    BoundScanRanges, HdfsScanFileFormat, IncrementalScanRange, RuntimeFilterContext, ScanMorsel,
+    ScanMorsels, ScanOp, ScanRuntimeFilterDecision, ScanSource,
 };
 use crate::formats::{FileFormatConfig, build_format_iter};
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
@@ -803,6 +803,68 @@ impl ScanOp for HdfsScanOp {
     }
 }
 
+/// Static [`ScanSource`] for HDFS / Iceberg-data file scans.
+///
+/// Everything except the file ranges is fixed at decode time and stored here.
+/// The per-instance `ranges` / `has_more` arrive via [`BoundScanRanges::File`]
+/// at bind time. `original_range_count` is not carried on the source: every
+/// decoder sets it to `ranges.len()` at construction (compat captures it before
+/// `apply_path_rewrite`, which rewrites paths in place without changing the
+/// count), so `bind` recomputes it from the bound ranges identically.
+pub(crate) struct HdfsScanSource {
+    limit: Option<usize>,
+    profile_label: Option<String>,
+    format: Option<FileFormatConfig>,
+    object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    iceberg_table_locations: HashMap<i64, String>,
+    query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
+    iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
+}
+
+impl HdfsScanSource {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        limit: Option<usize>,
+        profile_label: Option<String>,
+        format: Option<FileFormatConfig>,
+        object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+        iceberg_table_locations: HashMap<i64, String>,
+        query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
+        iceberg_runtime_pruning: Option<HdfsIcebergRuntimePruningConfig>,
+    ) -> Self {
+        Self {
+            limit,
+            profile_label,
+            format,
+            object_store_config,
+            iceberg_table_locations,
+            query_global_dicts,
+            iceberg_runtime_pruning,
+        }
+    }
+}
+
+impl ScanSource for HdfsScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        let BoundScanRanges::File { ranges, has_more } = ranges else {
+            return Err("hdfs scan source requires File scan ranges".to_string());
+        };
+        let cfg = HdfsScanConfig {
+            original_range_count: ranges.len(),
+            ranges,
+            has_more,
+            limit: self.limit,
+            profile_label: self.profile_label.clone(),
+            format: self.format.clone(),
+            object_store_config: self.object_store_config.clone(),
+            iceberg_table_locations: self.iceberg_table_locations.clone(),
+            query_global_dicts: self.query_global_dicts.clone(),
+            iceberg_runtime_pruning: self.iceberg_runtime_pruning.clone(),
+        };
+        Ok(Arc::new(HdfsScanOp::new(cfg)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -823,8 +885,8 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprId};
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::{
-        HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange, ScanMorsel, ScanNode,
-        ScanOp, ScanRuntimeFilterDecision,
+        BoundScanRanges, HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange,
+        ScanMorsel, ScanNode, ScanOp, ScanRuntimeFilterDecision, ScanSource,
     };
     use crate::exec::operators::scan::ScanSourceFactory;
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -844,9 +906,76 @@ mod tests {
     };
 
     use super::{
-        HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp,
+        HdfsIcebergRuntimePruningConfig, HdfsScanConfig, HdfsScanOp, HdfsScanSource,
         apply_parquet_pruning_gate_for_delete_files,
     };
+
+    fn plain_file_range(path: &str) -> FileScanRange {
+        FileScanRange {
+            path: path.to_string(),
+            file_len: 1024,
+            offset: 0,
+            length: 1024,
+            scan_range_id: -1,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+            iceberg_file_pruning: None,
+        }
+    }
+
+    fn hdfs_scan_source_for_test() -> HdfsScanSource {
+        HdfsScanSource::new(
+            None,
+            None,
+            None,
+            None,
+            HashMap::new(),
+            Default::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn hdfs_scan_source_bind_file_ranges_yields_file_morsels() {
+        let source = hdfs_scan_source_for_test();
+        let op = source
+            .bind(BoundScanRanges::File {
+                ranges: vec![
+                    plain_file_range("s3://bucket/path/a.parquet"),
+                    plain_file_range("s3://bucket/path/b.parquet"),
+                ],
+                has_more: false,
+            })
+            .expect("hdfs scan source bind should succeed");
+
+        let morsels = op.build_morsels().expect("build morsels");
+        assert!(!morsels.has_more);
+        assert_eq!(morsels.morsels.len(), 2);
+        assert!(
+            morsels
+                .morsels
+                .iter()
+                .all(|morsel| matches!(morsel, ScanMorsel::FileRange { .. })),
+            "expected all FileRange morsels, got {:?}",
+            morsels.morsels
+        );
+    }
+
+    #[test]
+    fn hdfs_scan_source_bind_rejects_wrong_variant() {
+        let source = hdfs_scan_source_for_test();
+        let Err(err) = source.bind(BoundScanRanges::None) else {
+            panic!("non-File scan ranges must be rejected");
+        };
+        assert!(
+            err.contains("hdfs scan source requires File scan ranges"),
+            "err={err}"
+        );
+    }
 
     fn make_hdfs_range(path: &str, first_row_id: Option<i64>) -> IncrementalScanRange {
         make_hdfs_range_with_change_op(path, first_row_id, None)

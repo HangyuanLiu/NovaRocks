@@ -562,7 +562,35 @@ impl ScanConnector for HdfsConnector {
 
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
-            ScanConfig::Hdfs(cfg) => Ok(ScanNode::new(Arc::new(hdfs::HdfsScanOp::new(*cfg)))),
+            ScanConfig::Hdfs(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // file ranges, then eagerly `bind` (mirrors the JDBC funnel).
+                let HdfsScanConfig {
+                    ranges,
+                    // `original_range_count` is recomputed from `ranges` in
+                    // `bind`; it equals `ranges.len()` at every decode site.
+                    original_range_count: _,
+                    has_more,
+                    limit,
+                    profile_label,
+                    format,
+                    object_store_config,
+                    iceberg_table_locations,
+                    query_global_dicts,
+                    iceberg_runtime_pruning,
+                } = *cfg;
+                let source = hdfs::HdfsScanSource::new(
+                    limit,
+                    profile_label,
+                    format,
+                    object_store_config,
+                    iceberg_table_locations,
+                    query_global_dicts,
+                    iceberg_runtime_pruning,
+                );
+                let op = source.bind(BoundScanRanges::File { ranges, has_more })?;
+                Ok(ScanNode::new(op))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name
@@ -583,9 +611,31 @@ impl ScanConnector for IcebergConnector {
 
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
-            ScanConfig::IcebergMetadata(cfg) => Ok(ScanNode::new(Arc::new(
-                iceberg::IcebergMetadataScanOp::new(cfg)?,
-            ))),
+            ScanConfig::IcebergMetadata(cfg) => {
+                // Split the decoder-built config into a static source plus its
+                // metadata split ranges, then eagerly `bind` (mirrors JDBC).
+                let IcebergMetadataScanConfig {
+                    metadata_table_type,
+                    serialized_table,
+                    serialized_predicate,
+                    load_column_stats,
+                    ranges,
+                    batch_size,
+                    output_columns,
+                    profile_label,
+                } = cfg;
+                let source = iceberg::metadata::IcebergMetadataScanSource::new(
+                    metadata_table_type,
+                    serialized_table,
+                    serialized_predicate,
+                    load_column_stats,
+                    batch_size,
+                    output_columns,
+                    profile_label,
+                );
+                let op = source.bind(BoundScanRanges::IcebergMetadata { ranges })?;
+                Ok(ScanNode::new(op))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name

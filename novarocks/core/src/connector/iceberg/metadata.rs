@@ -28,7 +28,9 @@ use iceberg::spec::{SnapshotRetention, TableMetadata};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
+use crate::exec::node::scan::{
+    BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp, ScanSource,
+};
 use crate::runtime::profile::RuntimeProfile;
 
 /// Decode the JSON payload that the planner stamps onto
@@ -325,6 +327,65 @@ impl ScanOp for IcebergMetadataScanOp {
             return Some(format!("{prefix} ({label})"));
         }
         Some(prefix.to_string())
+    }
+}
+
+/// Static [`ScanSource`] for Iceberg metadata-table scans.
+///
+/// All fields except the per-instance metadata split ranges are fixed at decode
+/// time and stored here. The `ranges` arrive via
+/// [`BoundScanRanges::IcebergMetadata`] at bind time.
+pub(crate) struct IcebergMetadataScanSource {
+    metadata_table_type: IcebergMetadataTableType,
+    serialized_table: String,
+    serialized_predicate: String,
+    load_column_stats: bool,
+    batch_size: usize,
+    output_columns: Vec<IcebergMetadataOutputColumn>,
+    profile_label: Option<String>,
+}
+
+impl IcebergMetadataScanSource {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        metadata_table_type: IcebergMetadataTableType,
+        serialized_table: String,
+        serialized_predicate: String,
+        load_column_stats: bool,
+        batch_size: usize,
+        output_columns: Vec<IcebergMetadataOutputColumn>,
+        profile_label: Option<String>,
+    ) -> Self {
+        Self {
+            metadata_table_type,
+            serialized_table,
+            serialized_predicate,
+            load_column_stats,
+            batch_size,
+            output_columns,
+            profile_label,
+        }
+    }
+}
+
+impl ScanSource for IcebergMetadataScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        let BoundScanRanges::IcebergMetadata { ranges } = ranges else {
+            return Err(
+                "iceberg metadata scan source requires IcebergMetadata scan ranges".to_string(),
+            );
+        };
+        let cfg = IcebergMetadataScanConfig {
+            metadata_table_type: self.metadata_table_type.clone(),
+            serialized_table: self.serialized_table.clone(),
+            serialized_predicate: self.serialized_predicate.clone(),
+            load_column_stats: self.load_column_stats,
+            ranges,
+            batch_size: self.batch_size,
+            output_columns: self.output_columns.clone(),
+            profile_label: self.profile_label.clone(),
+        };
+        Ok(Arc::new(IcebergMetadataScanOp::new(cfg)?))
     }
 }
 
@@ -1415,14 +1476,78 @@ fn build_entries_chunks(
 
 #[cfg(test)]
 mod tests {
+    // `IcebergMetadataOutputColumn` is imported by a later `use super::{...}` in
+    // this same test module, so it is intentionally not re-listed here.
     use super::{
-        IcebergMetadataScanConfig, IcebergMetadataScanOp, IcebergMetadataTableType,
-        normalize_metadata_output_type,
+        IcebergMetadataScanConfig, IcebergMetadataScanOp, IcebergMetadataScanRange,
+        IcebergMetadataScanSource, IcebergMetadataTableType, normalize_metadata_output_type,
     };
     use crate::common::ids::SlotId;
+    use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
     use arrow::array::{Array, MapArray};
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
+
+    fn iceberg_metadata_source_for_test() -> IcebergMetadataScanSource {
+        IcebergMetadataScanSource::new(
+            IcebergMetadataTableType::Snapshots,
+            String::new(),
+            String::new(),
+            false,
+            4096,
+            vec![IcebergMetadataOutputColumn {
+                name: "snapshot_id".to_string(),
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int64,
+                nullable: true,
+            }],
+            None,
+        )
+    }
+
+    fn metadata_range(path: &str) -> IcebergMetadataScanRange {
+        IcebergMetadataScanRange {
+            path: path.to_string(),
+            serialized_split: String::new(),
+        }
+    }
+
+    #[test]
+    fn iceberg_metadata_scan_source_bind_yields_one_morsel_per_range() {
+        let source = iceberg_metadata_source_for_test();
+        let op = source
+            .bind(BoundScanRanges::IcebergMetadata {
+                ranges: vec![
+                    metadata_range("meta-a"),
+                    metadata_range("meta-b"),
+                    metadata_range("meta-c"),
+                ],
+            })
+            .expect("iceberg metadata scan source bind should succeed");
+
+        let morsels = op.build_morsels().expect("build morsels");
+        assert!(!morsels.has_more);
+        assert_eq!(morsels.morsels.len(), 3);
+        assert!(
+            morsels.morsels.iter().enumerate().all(|(index, morsel)| {
+                matches!(morsel, ScanMorsel::IcebergMetadata { index: got } if *got == index)
+            }),
+            "expected contiguous IcebergMetadata morsels, got {:?}",
+            morsels.morsels
+        );
+    }
+
+    #[test]
+    fn iceberg_metadata_scan_source_bind_rejects_wrong_variant() {
+        let source = iceberg_metadata_source_for_test();
+        let Err(err) = source.bind(BoundScanRanges::None) else {
+            panic!("non-IcebergMetadata scan ranges must be rejected");
+        };
+        assert!(
+            err.contains("iceberg metadata scan source requires IcebergMetadata scan ranges"),
+            "err={err}"
+        );
+    }
 
     #[test]
     fn test_normalize_metadata_output_type_makes_map_keys_non_nullable() {
