@@ -35,7 +35,7 @@ pub mod service;
 // not-yet-implemented items stay commented out so the module tree keeps
 // compiling after every task's commit.
 pub use error::{DmlError, DmlErrorKind};
-// pub use journal::{MetaStoreOperationJournal, OperationJournal};
+pub use journal::{MetaStoreOperationJournal, OperationJournal};
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
     OperationFact, OperationKind, OperationState, OperationTarget, RecoveryEvidence,
