@@ -643,13 +643,6 @@ fn decode_core_channel(
         .policy
         .as_ref()
         .ok_or_else(|| missing(path.clone().field("policy"), "policy is required"))?;
-    for (raw, field) in [
-        (policy_wire.max_contribution_bytes, "max_contribution_bytes"),
-        (policy_wire.max_artifact_bytes, "max_artifact_bytes"),
-        (policy_wire.deadline_ms, "deadline_ms"),
-    ] {
-        reject_zero(raw, path.clone().field("policy").field(field), field)?;
-    }
     let policy = RuntimeFilterPolicyRequirement {
         max_contribution_bytes: policy_wire.max_contribution_bytes,
         max_artifact_bytes: policy_wire.max_artifact_bytes,
@@ -1537,6 +1530,7 @@ mod tests {
         SortDirection, TopKSummaryRequirement,
     };
     use crate::runtime_filter::model::coverage::Coverage;
+    use crate::runtime_filter::model::policy::{MAX_ARTIFACT_BYTES, MAX_DEADLINE_MS, MAX_RETRIES};
     use crate::runtime_filter::port::artifact::{
         ArtifactKind, ConsumerArtifactProfile, HashContractDigest,
     };
@@ -1767,6 +1761,27 @@ mod tests {
             channel.completion_requirement(),
             channel.policy(),
             budget,
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            channel.consumers().clone(),
+        )
+    }
+
+    fn with_policy(
+        channel: RuntimeFilterChannelDeployment,
+        policy: RuntimeFilterPolicyRequirement,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            policy,
+            channel.core_budget(),
             channel.materialization_policy(),
             channel.producers().clone(),
             channel.consumers().clone(),
@@ -2089,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_install_round_trips_all_legal_domain_and_routing_fixtures() {
+    fn runtime_filter_install_round_trips_direct_aggregate_and_relay() {
         let ordered = replace_only_core_channel(direct_install(), ordered_bound_channel);
         let final_domain = replace_only_core_channel(direct_install(), final_domain_channel);
         for install in [
@@ -2401,6 +2416,56 @@ mod tests {
                     )
                 }),
             ),
+            (
+                "zero max retries",
+                replace_only_core_channel(direct_install(), |channel| {
+                    let policy = RuntimeFilterPolicyRequirement {
+                        max_retries: 0,
+                        ..channel.policy()
+                    };
+                    with_policy(channel, policy)
+                }),
+            ),
+            (
+                "contribution bytes exceed artifact bytes",
+                replace_only_core_channel(direct_install(), |channel| {
+                    let policy = RuntimeFilterPolicyRequirement {
+                        max_contribution_bytes: channel.policy().max_artifact_bytes + 1,
+                        ..channel.policy()
+                    };
+                    with_policy(channel, policy)
+                }),
+            ),
+            (
+                "artifact bytes exceed canonical limit",
+                replace_only_core_channel(direct_install(), |channel| {
+                    let policy = RuntimeFilterPolicyRequirement {
+                        max_artifact_bytes: MAX_ARTIFACT_BYTES + 1,
+                        ..channel.policy()
+                    };
+                    with_policy(channel, policy)
+                }),
+            ),
+            (
+                "deadline exceeds canonical limit",
+                replace_only_core_channel(direct_install(), |channel| {
+                    let policy = RuntimeFilterPolicyRequirement {
+                        deadline_ms: MAX_DEADLINE_MS + 1,
+                        ..channel.policy()
+                    };
+                    with_policy(channel, policy)
+                }),
+            ),
+            (
+                "retries exceed canonical limit",
+                replace_only_core_channel(direct_install(), |channel| {
+                    let policy = RuntimeFilterPolicyRequirement {
+                        max_retries: MAX_RETRIES + 1,
+                        ..channel.policy()
+                    };
+                    with_policy(channel, policy)
+                }),
+            ),
         ];
         for (name, invalid) in domain_cases {
             assert!(
@@ -2410,7 +2475,7 @@ mod tests {
         }
 
         type Request = filter::InstallRuntimeFilterDeploymentRequest;
-        let mutations: [(&str, fn(&mut Request)); 5] = [
+        let mutations: [(&str, fn(&mut Request)); 10] = [
             ("empty contribution set", |request| {
                 request.install.as_mut().expect("install").core_channels[0]
                     .allowed_contribution_kinds
@@ -2439,6 +2504,41 @@ mod tests {
                     crate::proto::plan::RuntimeFilterContributionKind::FinalDomainShard as i32,
                     crate::proto::plan::RuntimeFilterContributionKind::ProducerClosed as i32,
                 ];
+            }),
+            ("zero max retries", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .policy
+                    .as_mut()
+                    .expect("policy")
+                    .max_retries = 0;
+            }),
+            ("contribution bytes exceed artifact bytes", |request| {
+                let policy = request.install.as_mut().expect("install").core_channels[0]
+                    .policy
+                    .as_mut()
+                    .expect("policy");
+                policy.max_contribution_bytes = policy.max_artifact_bytes + 1;
+            }),
+            ("artifact bytes exceed canonical limit", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .policy
+                    .as_mut()
+                    .expect("policy")
+                    .max_artifact_bytes = MAX_ARTIFACT_BYTES + 1;
+            }),
+            ("deadline exceeds canonical limit", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .policy
+                    .as_mut()
+                    .expect("policy")
+                    .deadline_ms = MAX_DEADLINE_MS + 1;
+            }),
+            ("retries exceed canonical limit", |request| {
+                request.install.as_mut().expect("install").core_channels[0]
+                    .policy
+                    .as_mut()
+                    .expect("policy")
+                    .max_retries = MAX_RETRIES + 1;
             }),
         ];
         let valid = encode_participant_install(QUERY, lifecycle_options(), &direct_install())

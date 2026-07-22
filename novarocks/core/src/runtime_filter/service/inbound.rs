@@ -597,7 +597,7 @@ mod tests {
             max_contribution_bytes,
             max_artifact_bytes: 4096,
             deadline_ms: 1000,
-            max_retries: 0,
+            max_retries: 1,
         }
     }
 

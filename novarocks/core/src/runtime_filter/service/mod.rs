@@ -2672,13 +2672,31 @@ mod tests {
             inbound_edges.push(edge.clone());
             outbound_edges.push(edge);
         }
-        local_roles.extend(
-            channel
-                .consumers()
-                .keys()
-                .copied()
-                .map(RuntimeFilterRouteRole::Consumer),
-        );
+        for (binding_id, consumer) in channel.consumers() {
+            local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
+            for route_edge_id in consumer.route_edge_ids() {
+                let edge = RuntimeFilterRoutingEdgeView::new(
+                    channel_id,
+                    *route_edge_id,
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Aggregator,
+                    ),
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Consumer(*binding_id),
+                    ),
+                    RuntimeFilterRoutePeer::Loopback,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
+                )
+                .unwrap();
+                inbound_edges.push(edge.clone());
+                outbound_edges.push(edge);
+            }
+        }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
             channel_id,
             local_roles,
@@ -2920,7 +2938,7 @@ mod tests {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
                 deadline_ms: 100,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(4096),
             MaterializationPolicy::for_test(),
@@ -2984,7 +3002,7 @@ mod tests {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
                 deadline_ms: 100,
-                max_retries: 0,
+                max_retries: 1,
             },
             RuntimeFilterCoreBudget::new(4096),
             MaterializationPolicy::for_test(),

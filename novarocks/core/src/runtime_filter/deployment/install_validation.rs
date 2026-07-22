@@ -33,6 +33,7 @@ use crate::runtime_filter::model::contract::{
     RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::model::coverage::Coverage;
+use crate::runtime_filter::model::policy::validate_runtime_filter_policy;
 use crate::runtime_filter::port::artifact::{
     ArtifactKind, ArtifactMembershipSchema, ConsumerProfileId,
 };
@@ -792,15 +793,12 @@ fn validate_common_channel(
             "Core roles do not match the routing requirements",
         ));
     }
-    if channel.policy().max_contribution_bytes == 0
-        || channel.policy().max_artifact_bytes == 0
-        || channel.policy().deadline_ms == 0
-    {
-        return Err(install_error(
+    validate_runtime_filter_policy(channel.policy()).map_err(|error| {
+        install_error(
             InstallContractErrorKind::InvalidPolicy,
-            "max contribution bytes, max artifact bytes, and completion deadline must be non-zero",
-        ));
-    }
+            format!("invalid runtime filter policy: {error:?}"),
+        )
+    })?;
     if channel.core_budget().max_reducer_bytes() == 0 {
         return Err(install_error(
             InstallContractErrorKind::InvalidBudget,

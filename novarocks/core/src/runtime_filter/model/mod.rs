@@ -18,4 +18,5 @@
 pub(crate) mod contract;
 pub(crate) mod coverage;
 pub(crate) mod graph;
+pub(crate) mod policy;
 pub(crate) mod validation;
