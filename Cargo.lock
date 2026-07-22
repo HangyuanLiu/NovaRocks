@@ -3267,6 +3267,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-frontend"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "novarocks-state-store",
+ "sha2",
+]
+
+[[package]]
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [

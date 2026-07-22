@@ -1,0 +1,13 @@
+[package]
+name = "novarocks-frontend"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+novarocks-state-store = { path = "../state-store" }
+sha2 = "0.10"
