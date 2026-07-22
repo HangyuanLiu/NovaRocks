@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
-use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+use crate::exec::fragment::program::ScanAssignmentKind;
 use crate::exec::node::scan::{
     BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp, ScanSource,
 };
@@ -39,9 +39,8 @@ use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids, slot_name_from_desc,
 };
-use crate::protocol::starrocks::decode::node::{Lowered, local_rf_waiting_set};
+use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier, local_rf_waiting_set};
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::scan_range::{BrokerFileFormat, ScanRange};
 use crate::thrift::{descriptors, plan_nodes, types};
 
@@ -495,7 +494,7 @@ pub(crate) fn lower_file_scan_node(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     program_facts: Option<&BrokerFileProgramFacts>,
     arena: &mut ExprArena,
     out_layout: Layout,
@@ -506,7 +505,7 @@ pub(crate) fn lower_file_scan_node(
         desc_tbl,
         _tuple_slots,
         layout_hints,
-        scan_assignments,
+        scan_ranges,
         program_facts,
         arena,
         out_layout,
@@ -520,7 +519,7 @@ fn lower_file_scan_node_inner(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
-    scan_assignments: Option<&ScanAssignments>,
+    scan_ranges: Option<ScanRangeCarrier>,
     program_facts: Option<&BrokerFileProgramFacts>,
     arena: &mut ExprArena,
     mut out_layout: Layout,
@@ -556,17 +555,16 @@ fn lower_file_scan_node_inner(
         ));
     }
 
-    let Some(scan_assignments) = scan_assignments else {
+    let Some(scan_ranges) = scan_ranges else {
         return Err("FILE_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
     };
-    let assignment = scan_assignments
-        .get(&FragmentNodeId::new(node.node_id))
+    let (assignment_kind, assignment_ranges) = scan_ranges
+        .get(node.node_id)
         .ok_or_else(|| format!("missing typed scan assignment for node_id={}", node.node_id))?;
-    if assignment.kind() != ScanAssignmentKind::BrokerFile {
+    if assignment_kind != ScanAssignmentKind::BrokerFile {
         return Err(format!(
-            "FILE_SCAN_NODE node_id={} expected BrokerFile assignment, got {:?}",
+            "FILE_SCAN_NODE node_id={} expected BrokerFile assignment, got {assignment_kind:?}",
             node.node_id,
-            assignment.kind()
         ));
     }
     let program_facts = program_facts.ok_or_else(|| {
@@ -582,7 +580,7 @@ fn lower_file_scan_node_inner(
     let mut format_type: Option<plan_nodes::TFileFormatType> = None;
     let mut json_range_options: Option<(bool, Option<String>)> = None;
 
-    for scan_range_param in assignment.ranges() {
+    for scan_range_param in assignment_ranges {
         if scan_range_param.empty.unwrap_or(false) {
             if scan_range_param.has_more.unwrap_or(false) {
                 has_more = true;
@@ -835,11 +833,12 @@ fn lower_file_scan_node_inner(
         json,
         arena: Arc::new(arena.clone()),
     };
-    let op = source.bind(BoundScanRanges::File { ranges, has_more })?;
+    // Route the enriched ranges to the instance; bind at materialize time.
+    scan_ranges.capture(node.node_id, BoundScanRanges::File { ranges, has_more });
 
     let limit = node.limit;
     let limit = (limit >= 0).then_some(limit as usize);
-    let scan = ScanNode::new(op)
+    let scan = ScanNode::new(Arc::new(source))
         .with_node_id(node.node_id)
         .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)

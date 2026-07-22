@@ -231,7 +231,7 @@ mod tests {
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::{ConnectorRegistry, HdfsScanConfig, ScanConfig, ScanConnector};
     #[cfg(feature = "compat")]
-    use crate::connector::{StarRocksScanConfig, StarRocksScanOp};
+    use crate::connector::StarRocksScanConfig;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::iceberg_delta_scan::DeltaSourceRole;
@@ -448,15 +448,45 @@ mod tests {
         fn create_scan_node(
             &self,
             cfg: ScanConfig,
-        ) -> Result<crate::exec::node::scan::ScanNode, String> {
+        ) -> Result<
+            (
+                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
+                crate::exec::node::scan::BoundScanRanges,
+            ),
+            String,
+        > {
             let ScanConfig::Hdfs(cfg) = cfg else {
                 return Err("capturing hdfs connector received non-HDFS config".to_string());
             };
             let cfg = *cfg;
             *self.captured.lock().expect("captured hdfs config lock") = Some(cfg.clone());
-            Ok(crate::exec::node::scan::ScanNode::new(Arc::new(
-                crate::connector::hdfs::HdfsScanOp::new(cfg),
-            )))
+            // Mirror the real HdfsConnector split: static source + file ranges.
+            let crate::connector::HdfsScanConfig {
+                ranges,
+                original_range_count: _,
+                has_more,
+                limit,
+                profile_label,
+                format,
+                object_store_config,
+                iceberg_table_locations,
+                query_global_dicts,
+                iceberg_runtime_pruning,
+            } = cfg;
+            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
+                std::sync::Arc::new(crate::connector::hdfs::HdfsScanSource::new(
+                    limit,
+                    profile_label,
+                    format,
+                    object_store_config,
+                    iceberg_table_locations,
+                    query_global_dicts,
+                    iceberg_runtime_pruning,
+                ));
+            Ok((
+                source,
+                crate::exec::node::scan::BoundScanRanges::File { ranges, has_more },
+            ))
         }
     }
 
@@ -678,7 +708,13 @@ mod tests {
         fn create_scan_node(
             &self,
             cfg: ScanConfig,
-        ) -> Result<crate::exec::node::scan::ScanNode, String> {
+        ) -> Result<
+            (
+                std::sync::Arc<dyn crate::exec::node::scan::ScanSource>,
+                crate::exec::node::scan::BoundScanRanges,
+            ),
+            String,
+        > {
             let ScanConfig::StarRocks(cfg) = cfg else {
                 return Err("capturing StarRocks connector received non-StarRocks config".into());
             };
@@ -687,9 +723,48 @@ mod tests {
                 .captured
                 .lock()
                 .expect("captured StarRocks config lock") = Some(cfg.clone());
-            Ok(crate::exec::node::scan::ScanNode::new(Arc::new(
-                StarRocksScanOp::new(cfg),
-            )))
+            // Mirror the real StarRocksConnector split: static source + tablets.
+            let StarRocksScanConfig {
+                db_name,
+                table_name,
+                properties,
+                ranges,
+                has_more,
+                required_chunk_schema,
+                output_chunk_schema,
+                query_global_dicts,
+                limit,
+                batch_size,
+                query_timeout,
+                mem_limit,
+                profile_label,
+                min_max_predicates,
+                lake_schema_meta,
+                deferred_lake_resolution,
+                topn_filter_column_map,
+            } = cfg;
+            let source: std::sync::Arc<dyn crate::exec::node::scan::ScanSource> =
+                std::sync::Arc::new(crate::connector::starrocks::StarRocksScanSource {
+                    db_name,
+                    table_name,
+                    properties,
+                    required_chunk_schema,
+                    output_chunk_schema,
+                    query_global_dicts,
+                    limit,
+                    batch_size,
+                    query_timeout,
+                    mem_limit,
+                    profile_label,
+                    min_max_predicates,
+                    lake_schema_meta,
+                    deferred_lake_resolution,
+                    topn_filter_column_map,
+                });
+            Ok((
+                source,
+                crate::exec::node::scan::BoundScanRanges::StarRocksTablet { ranges, has_more },
+            ))
         }
     }
 
@@ -1151,7 +1226,12 @@ mod tests {
         let ExecNodeKind::Scan(scan) = lowered.node.kind else {
             panic!("expected Scan");
         };
-        let morsels = scan.build_morsels().expect("build morsels");
+        let morsels = scan
+            .source()
+            .bind(ctx.captured_ranges_for_test(10))
+            .expect("bind scan source")
+            .build_morsels()
+            .expect("build morsels");
         let [ScanMorsel::FileRange { delete_files, .. }] = morsels.morsels.as_slice() else {
             panic!("expected one file morsel, got {:?}", morsels.morsels);
         };
@@ -1185,7 +1265,12 @@ mod tests {
         let ExecNodeKind::Scan(scan) = lowered.node.kind else {
             panic!("expected Scan");
         };
-        let morsels = scan.build_morsels().expect("build morsels");
+        let morsels = scan
+            .source()
+            .bind(ctx.captured_ranges_for_test(10))
+            .expect("bind scan source")
+            .build_morsels()
+            .expect("build morsels");
         let [
             ScanMorsel::FileRange {
                 ivm_change_op,

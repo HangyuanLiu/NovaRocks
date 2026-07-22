@@ -58,7 +58,7 @@ impl FragmentSubmission {
         let inventory = ProgramInventory::try_collect(program.plan())?;
         validate_scan_contracts(&program, &inventory)?;
         validate_exchange_contracts(&program, &inventory)?;
-        validate_scan_assignments(&program, &instance)?;
+        validate_scan_assignments(&inventory, &instance)?;
         validate_exchange_assignments(&program, &instance)?;
         validate_sink_assignment(&program, &instance)?;
         #[cfg(feature = "compat")]
@@ -140,7 +140,13 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
 }
 
 struct ProgramInventory {
+    /// All scan-shaped plan nodes (`ExecNodeKind::Scan` + `IcebergDeltaScan`).
+    /// Used to cross-check the static `scan_sources` contracts.
     scan_nodes: BTreeSet<FragmentNodeId>,
+    /// Only `ExecNodeKind::Scan` nodes — the ones `materialize_scan_bindings`
+    /// binds and that therefore require an instance `ScanAssignment`.
+    /// `IcebergDeltaScan` is intentionally excluded (it carries its own ranges).
+    materializable_scan_nodes: BTreeSet<FragmentNodeId>,
     exchange_nodes: BTreeMap<FragmentNodeId, ChunkSchemaRef>,
 }
 
@@ -148,6 +154,7 @@ impl ProgramInventory {
     fn try_collect(plan: &ExecPlan) -> Result<Self, FragmentBindingError> {
         let mut inventory = Self {
             scan_nodes: BTreeSet::new(),
+            materializable_scan_nodes: BTreeSet::new(),
             exchange_nodes: BTreeMap::new(),
         };
         inventory.visit(&plan.root)?;
@@ -181,11 +188,15 @@ impl ProgramInventory {
             }
             ExecNodeKind::Scan(node) => {
                 if let Some(raw_id) = node.node_id() {
-                    self.insert_scan(FragmentNodeId::new(raw_id))?;
+                    let id = FragmentNodeId::new(raw_id);
+                    self.insert_scan(id)?;
+                    // Only real ScanSource-backed scans are materialized/bound.
+                    self.materializable_scan_nodes.insert(id);
                 }
                 Ok(())
             }
             ExecNodeKind::IcebergDeltaScan(node) => {
+                // Counts as a scan contract, but is not materialized here.
                 self.insert_scan(FragmentNodeId::new(node.node_id))
             }
             #[cfg(feature = "compat")]
@@ -408,38 +419,39 @@ fn validate_exchange_contracts(
     Ok(())
 }
 
+/// Presence-only cross-check between the plan's materializable scan nodes
+/// (`ExecNodeKind::Scan`) and the instance's scan assignments (mirrors
+/// `validate_exchange_assignments`).
+///
+/// This is checked against the plan's `ExecNodeKind::Scan` set rather than the
+/// static `scan_sources` contract set, because the two legitimately differ:
+/// jdbc/mysql scans are materializable `Scan` nodes with no `ScanAssignmentKind`
+/// (hence not in `scan_sources`), and `IcebergDeltaScan` is a `scan_sources`
+/// contract that is not materialized here. Every materializable scan must have
+/// an instance assignment (so `materialize_scan_bindings` never misses), and no
+/// assignment may lack a materializable node. The old strict kind match is gone:
+/// variant-vs-source correctness is enforced at materialize time by
+/// `ScanSource::bind`.
 fn validate_scan_assignments(
-    program: &FragmentProgram,
+    inventory: &ProgramInventory,
     instance: &FragmentInstanceSpec,
 ) -> Result<(), FragmentBindingError> {
-    for (id, contract) in program.scan_sources() {
-        let Some(assignment) = instance.scan_assignments().get(id) else {
+    for id in &inventory.materializable_scan_nodes {
+        if instance.scan_assignments().get(id).is_none() {
             return Err(FragmentBindingError::new(
                 FragmentBindingTarget::ScanNode(id.get()),
                 FragmentBindingErrorKind::MissingAssignment,
                 format!("missing scan assignment for node {}", id.get()),
             ));
-        };
-        if assignment.kind() != contract.assignment_kind() {
-            return Err(FragmentBindingError::new(
-                FragmentBindingTarget::ScanNode(id.get()),
-                FragmentBindingErrorKind::WrongAssignmentKind,
-                format!(
-                    "scan node {} expected {:?}, got {:?}",
-                    id.get(),
-                    contract.assignment_kind(),
-                    assignment.kind()
-                ),
-            ));
         }
     }
     for (id, _) in instance.scan_assignments().iter() {
-        if !program.scan_sources().contains_key(id) {
+        if !inventory.materializable_scan_nodes.contains(id) {
             return Err(FragmentBindingError::new(
                 FragmentBindingTarget::ScanNode(id.get()),
                 FragmentBindingErrorKind::ExtraAssignment,
                 format!(
-                    "scan assignment for node {} has no static contract",
+                    "scan assignment for node {} has no materializable scan node",
                     id.get()
                 ),
             ));
@@ -617,7 +629,7 @@ mod tests {
     };
     use crate::exec::node::runtime_filter::NativeRuntimeFilterConsumerNode;
     use crate::exec::node::scan::{
-        RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
+        BoundScanRanges, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
     };
     use crate::exec::node::set_op::{SetOpKind, SetOpNode};
     use crate::exec::node::union_all::UnionAllNode;
@@ -679,7 +691,7 @@ mod tests {
     }
 
     fn scan_node(node_id: Option<i32>) -> ExecNode {
-        let mut scan = ScanNode::new(Arc::new(DummyScanOp));
+        let mut scan = ScanNode::new_for_test(Arc::new(DummyScanOp));
         if let Some(node_id) = node_id {
             scan = scan.with_node_id(node_id);
         }
@@ -882,10 +894,12 @@ mod tests {
         prober_params: BTreeMap<i32, Vec<RuntimeFilterProberDestination>>,
         builder_counts: BTreeMap<i32, i32>,
     ) -> FragmentInstanceSpec {
+        // Kind is no longer stored on the assignment; presence is what the
+        // submission validates. The `BoundScanRanges` variant is irrelevant here.
         let scans = ScanAssignments::try_new(
             scans
                 .into_iter()
-                .map(|(id, kind)| (id, (kind, Vec::new())))
+                .map(|(id, _kind)| (id, BoundScanRanges::None))
                 .collect(),
         )
         .expect("scan assignments");
@@ -1135,32 +1149,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_wrong_scan_assignment_kind() {
-        let id = FragmentNodeId::new(10);
-        let program = program_with(
-            scan_plan(Some(10)),
-            result_sink(),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 25),
-            BTreeMap::from([(id, ScanAssignmentKind::StarRocksTablet)]),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        assert_error(
-            FragmentSubmission::try_new(program, instance),
-            FragmentBindingTarget::ScanNode(10),
-            FragmentBindingErrorKind::WrongAssignmentKind,
-        );
-    }
+    // NOTE: the old `rejects_wrong_scan_assignment_kind` test was removed: the
+    // instance assignment no longer carries a `ScanAssignmentKind`, and
+    // variant-vs-source correctness is now enforced at materialize time by
+    // `ScanSource::bind` rather than by a submission-time kind cross-check.
 
     #[test]
     fn reports_smallest_scan_error_first() {
@@ -2269,11 +2261,16 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         );
+        // IcebergDelta is a scan *contract* (`scan_sources`) but is not a
+        // materializable `ExecNodeKind::Scan` node, so it must NOT carry an
+        // instance scan assignment (it keeps its own ranges). Submission still
+        // succeeds: the contract resolves to the delta plan node, and the empty
+        // materializable-scan set needs no assignment.
         let instance = instance_with(
             FragmentContractVersion::CURRENT,
             query_id(1, 2),
             uid(1, 66),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
+            BTreeMap::new(),
             BTreeMap::new(),
             FragmentSinkAssignment::None,
             BTreeMap::new(),

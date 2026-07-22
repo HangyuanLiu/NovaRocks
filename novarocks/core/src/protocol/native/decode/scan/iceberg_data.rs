@@ -99,12 +99,15 @@ pub(super) fn lower_iceberg_data_files_scan(
         iceberg_runtime_pruning,
     };
     let predicate = lower_scan_predicate(scan, arena, &read_plan.read_layout)?;
-    let scan_node = ctx
+    let (source, bound_ranges) = ctx
         .connectors()?
         .create_scan_node("hdfs", ScanConfig::Hdfs(Box::new(cfg)))
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "files", error)
-        })?
+        })?;
+    // Route the enriched ranges to the instance; bind happens at materialize.
+    ctx.capture_scan_ranges(node.node_id, bound_ranges);
+    let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(read_plan.read_schema.clone())
         .with_limit(parse_scan_limit(node.limit)?)

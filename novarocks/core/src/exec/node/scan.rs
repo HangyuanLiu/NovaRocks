@@ -362,9 +362,11 @@ pub trait ScanOp: Send + Sync {
 /// layer materialize a per-instance [`ScanOp`] from static config plus these
 /// ranges.
 ///
-/// The `File`, `StarRocksTablet`, and `IcebergMetadata` variants are populated
-/// by later KRN-1 connector tasks; only `None` (jdbc) and `SchemaSelection`
-/// (schema) are consumed today.
+/// Every variant is consumed at execution time: the decoders route the
+/// enriched ranges into the instance's `ScanAssignment`, and
+/// `materialize_scan_bindings` replays them through `ScanSource::bind` to
+/// produce the per-instance `ScanOp`.
+#[derive(Clone, Debug)]
 pub enum BoundScanRanges {
     /// No ranges; the op emits a single morsel (jdbc/mysql).
     None,
@@ -429,7 +431,7 @@ pub struct RowPositionScanConfig {
 
 #[derive(Clone)]
 pub struct ScanNode {
-    op: Arc<dyn ScanOp>,
+    source: Arc<dyn ScanSource>,
     node_id: Option<i32>,
     runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     native_runtime_filter_specs:
@@ -451,10 +453,23 @@ pub struct ScanNode {
     iceberg_virtual: Option<IcebergVirtualSpec>,
 }
 
+/// Test-only static source that binds to a fixed, pre-built op regardless of
+/// ranges. Lets operator/decoder tests keep hand-rolling a `ScanOp` and drop it
+/// onto a static `ScanNode` without a real connector source.
+#[cfg(test)]
+struct FixedOpScanSource(Arc<dyn ScanOp>);
+
+#[cfg(test)]
+impl ScanSource for FixedOpScanSource {
+    fn bind(&self, _ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
 impl ScanNode {
-    pub fn new(op: Arc<dyn ScanOp>) -> Self {
+    pub fn new(source: Arc<dyn ScanSource>) -> Self {
         Self {
-            op,
+            source,
             node_id: None,
             runtime_filter_specs: Vec::new(),
             native_runtime_filter_specs: Vec::new(),
@@ -472,6 +487,13 @@ impl ScanNode {
             lake_glm_info: None,
             iceberg_virtual: None,
         }
+    }
+
+    /// Test-only: build a static node whose source binds to `op` regardless of
+    /// ranges. Mirrors the pre-Phase-3 `ScanNode::new(op)` ergonomics for tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(op: Arc<dyn ScanOp>) -> Self {
+        Self::new(Arc::new(FixedOpScanSource(op)))
     }
 
     pub fn with_node_id(mut self, node_id: i32) -> Self {
@@ -557,6 +579,13 @@ impl ScanNode {
 
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
+    }
+
+    /// The static scan source. The per-instance `ScanOp` is materialized from
+    /// this plus the instance's `BoundScanRanges` at execution time
+    /// (`materialize_scan_bindings`), not stored on the node.
+    pub fn source(&self) -> Arc<dyn ScanSource> {
+        Arc::clone(&self.source)
     }
 
     pub fn runtime_filter_specs(&self) -> &[RuntimeFilterProbeSpec] {
@@ -648,71 +677,6 @@ impl ScanNode {
             self.runtime_filter_specs.push(spec.clone());
             seen.insert(spec.filter_id, spec.clone());
         }
-    }
-
-    pub fn profile_name(&self) -> Option<String> {
-        self.op.profile_name()
-    }
-
-    pub fn supports_incremental_scan_ranges(&self) -> bool {
-        self.op.supports_incremental_scan_ranges()
-    }
-
-    pub fn build_incremental_morsels(
-        &self,
-        scan_ranges: &[IncrementalScanRange],
-    ) -> Result<ScanMorsels, String> {
-        self.op.build_incremental_morsels(scan_ranges)
-    }
-
-    pub fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        if matches!(morsel, ScanMorsel::Empty) {
-            return Ok(Box::new(std::iter::empty()));
-        }
-        self.op.execute_iter(morsel, profile, runtime_filters)
-    }
-
-    pub fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        let mut morsels = self.op.build_morsels()?;
-        morsels.ensure_non_empty(self.accept_empty_scan_ranges);
-        Ok(morsels)
-    }
-
-    pub fn materialize_morsels_after_runtime_filters(&self) -> bool {
-        !self.runtime_filter_specs.is_empty() && self.op.materialize_morsels_after_runtime_filters()
-    }
-
-    pub(crate) fn build_morsels_with_runtime_filters(
-        &self,
-        acquired: Option<&AcquiredRuntimeFilters>,
-    ) -> Result<ScanMorsels, String> {
-        let decision = ScanRuntimeFilterDecision::from_acquired(acquired);
-        let mut morsels = self.op.build_morsels_with_runtime_filters(decision)?;
-        morsels.ensure_non_empty(self.accept_empty_scan_ranges);
-        Ok(morsels)
-    }
-
-    pub(crate) fn flush_morsel_materialization_profile(&self, profile: &RuntimeProfile) {
-        self.op.flush_morsel_materialization_profile(profile);
-    }
-
-    pub fn load_iceberg_position_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<roaring::RoaringTreemap>, String> {
-        self.op.load_iceberg_position_deletes(morsel)
-    }
-
-    pub fn load_iceberg_equality_deletes(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<Vec<EqualityDeleteSet>>, String> {
-        self.op.load_iceberg_equality_deletes(morsel)
     }
 }
 

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -24,13 +25,15 @@ use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
     FragmentProgramOptions, RuntimeFilterContract, RuntimeFilterId,
 };
+use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec, FragmentRuntimeOptions,
+    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
+    FragmentRuntimeOptions, ScanAssignments,
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::LookupFetcherLifecycle;
@@ -51,7 +54,9 @@ use super::instance::{
     decode_scan_contracts_and_assignments,
 };
 use super::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
-use super::node::{StarRocksPlanDecodeContext, decode_broker_file_program_facts, lower_plan};
+use super::node::{
+    ScanRangeCarrier, StarRocksPlanDecodeContext, decode_broker_file_program_facts, lower_plan,
+};
 use super::sink::fragment::{DecodedStarRocksFragmentSink, decode_fragment_sink};
 
 pub(crate) struct StarRocksDecodeInput<'a> {
@@ -483,7 +488,7 @@ fn decode_draft_parts(
             .query_globals
             .and_then(|globals| globals.time_zone.clone()),
     );
-    let (scan_contracts, scan_assignments) = decode_scan_contracts_and_assignments(
+    let (scan_contracts, raw_scan_ranges) = decode_scan_contracts_and_assignments(
         &plan.nodes,
         &instance.scan_ranges,
         input.descriptors,
@@ -492,6 +497,10 @@ fn decode_draft_parts(
             .field("params")
             .field("per_node_scan_ranges"),
     )?;
+    // Capture slot for the enriched `BoundScanRanges` the scan decoders produce;
+    // drained into the instance's scan assignments after `lower_plan`.
+    let captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>> =
+        RefCell::new(BTreeMap::new());
     let broker_file_program_facts = decode_broker_file_program_facts(
         &plan.nodes,
         &instance.scan_ranges,
@@ -518,7 +527,10 @@ fn decode_draft_parts(
     let plan_context = StarRocksPlanDecodeContext::new(
         Some(instance.query_id),
         Some(instance.fragment_instance_id.get()),
-        Some(&scan_assignments),
+        Some(ScanRangeCarrier::new(
+            &raw_scan_ranges,
+            &captured_scan_ranges,
+        )),
         Some(&broker_file_program_facts),
         Some(&lake_scan_program_facts),
         Some(&lake_meta_scan_range_facts),
@@ -624,6 +636,13 @@ fn decode_draft_parts(
                 .clone()
                 .map(StarRocksReportDestination::Coordinator)
         });
+    // Drain the enriched per-node `BoundScanRanges` captured during `lower_plan`
+    // into the instance's scan assignments (`materialize_scan_bindings` binds
+    // these). Uses `borrow_mut` (not `into_inner`) so `plan_context`'s borrow of
+    // `captured_scan_ranges` can coexist.
+    let scan_assignments =
+        ScanAssignments::try_new(std::mem::take(&mut captured_scan_ranges.borrow_mut()))
+            .map_err(StarRocksFragmentDecodeError::Binding)?;
     let instance_spec = FragmentInstanceSpec::new_compat(
         FragmentContractVersion::CURRENT,
         instance.query_id,
@@ -1793,10 +1812,12 @@ mod tests {
                 .assignment_kind(),
             crate::exec::fragment::program::ScanAssignmentKind::BrokerFile
         );
-        let assignment = assignments.get(&node_id).expect("scan assignment");
-        assert_eq!(assignment.ranges().len(), 1);
+        // `decode_scan_contracts_and_assignments` now returns the transient
+        // enrichment carrier (kind, raw ScanRangeParams) per node.
+        let (_, assignment_ranges) = assignments.get(&node_id).expect("scan assignment");
+        assert_eq!(assignment_ranges.len(), 1);
         assert!(matches!(
-            assignment.ranges()[0].range,
+            assignment_ranges[0].range,
             crate::runtime::scan_range::ScanRange::BrokerFile(_)
         ));
     }
@@ -1954,7 +1975,7 @@ mod tests {
         ] {
             let id = FragmentNodeId::new(node_id);
             assert_eq!(contracts[&id].assignment_kind(), kind);
-            assert_eq!(assignments.get(&id).expect("assignment").ranges().len(), 1);
+            assert_eq!(assignments.get(&id).expect("assignment").1.len(), 1);
         }
     }
 
@@ -2046,16 +2067,17 @@ mod tests {
             .scan_assignments()
             .get(&FragmentNodeId::new(18))
             .expect("typed HDFS assignment");
-        let crate::runtime::scan_range::ScanRange::File(typed_range) =
-            &assignment.ranges()[0].range
-        else {
-            panic!("expected typed HDFS file range");
-        };
-        assert_eq!(typed_range.candidate_node.as_deref(), Some("  backend-7  "));
         let ExecNodeKind::Scan(scan) = &submission.program().plan().root.kind else {
             panic!("expected HDFS scan root");
         };
-        let morsels = scan.build_morsels().expect("build HDFS scan morsels");
+        // The static node holds only the source; the enriched ranges live in
+        // the instance assignment. Materialize the per-instance op and confirm
+        // the candidate node is normalized (trimmed) through to the morsel.
+        let op = scan
+            .source()
+            .bind(assignment.ranges().clone())
+            .expect("bind HDFS scan source");
+        let morsels = op.build_morsels().expect("build HDFS scan morsels");
         let Some(ScanMorsel::FileRange {
             external_datacache: Some(options),
             ..

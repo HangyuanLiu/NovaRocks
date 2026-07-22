@@ -1215,7 +1215,7 @@ mod tests {
         op: Arc<HdfsScanOp>,
         runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     ) -> ScanNode {
-        ScanNode::new(op)
+        ScanNode::new_for_test(op)
             .with_node_id(77)
             .with_runtime_filter_specs(runtime_filter_specs)
             .with_connector_io_tasks_per_scan_operator(Some(1))
@@ -1225,12 +1225,17 @@ mod tests {
     #[cfg(feature = "compat")]
     fn hdfs_scan_source_for_runtime_pruning_test(
         scan: ScanNode,
+        op: Arc<dyn crate::exec::node::scan::ScanOp>,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         driver_id: i32,
         profile: RuntimeProfile,
     ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
-        let factory =
-            ScanSourceFactory::new_compat(scan, runtime_filter_hub, Arc::new(ExprArena::default()));
+        let factory = ScanSourceFactory::new_compat(
+            scan,
+            op,
+            runtime_filter_hub,
+            Arc::new(ExprArena::default()),
+        );
         let mut source = factory.create(1, driver_id);
         source.set_profiles(OperatorProfiles::new(profile));
         source.prepare().expect("prepare scan source");
@@ -1249,8 +1254,9 @@ mod tests {
         let op = Arc::new(HdfsScanOp::new(hdfs_cfg_with_two_iceberg_files_for_test()));
         let scan = hdfs_scan_node_for_runtime_pruning_test(Arc::clone(&op), Vec::new());
 
-        assert!(!scan.materialize_morsels_after_runtime_filters());
-        let morsels = scan.build_morsels().expect("build static morsels");
+        // No planned runtime-filter specs -> morsels are not deferred behind RF.
+        assert!(scan.runtime_filter_specs().is_empty());
+        let morsels = op.build_morsels().expect("build static morsels");
         assert_eq!(morsels.morsels.len(), 2);
 
         let counters = op.iceberg_runtime_pruning_counter_snapshot_for_test();

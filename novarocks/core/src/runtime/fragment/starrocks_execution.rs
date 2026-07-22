@@ -100,6 +100,12 @@ pub(crate) fn execute_starrocks_submission(
     let exec_plan = program.plan().clone();
     let exchange_bindings =
         crate::runtime::fragment::exchange::materialize_exchange_bindings(program, instance);
+    let scan_bindings = crate::runtime::fragment::scan::materialize_scan_bindings(
+        program, instance,
+    )
+    .map_err(|error| {
+        FragmentExecutionError::new(FragmentExecutionErrorKind::Pipeline, error.to_string())
+    })?;
     let _timer = context
         .profiler
         .as_ref()
@@ -110,6 +116,7 @@ pub(crate) fn execute_starrocks_submission(
         Duration::from_millis(50),
         sink,
         exchange_bindings,
+        scan_bindings,
         Some((fragment_instance_id.hi, fragment_instance_id.lo)),
         context.profiler,
         pipeline_dop,

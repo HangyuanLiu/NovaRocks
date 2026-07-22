@@ -55,6 +55,16 @@ impl ScanBindings {
     }
 }
 
+// `dyn ScanOp` is not `Debug`, so print only the bound node ids. Enough for
+// `Result::expect_err`-style diagnostics without touching the ops.
+impl std::fmt::Debug for ScanBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanBindings")
+            .field("node_ids", &self.0.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

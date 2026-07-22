@@ -37,7 +37,7 @@ use crate::connector::iceberg::equality_delete::{EqualityDeleteSet, equality_del
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, hydrate_dictionary_columns_except};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
+use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode, ScanOp};
 use crate::exec::operators::FilterEncodingPolicy;
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterConsumerSet;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -123,6 +123,9 @@ impl Drop for IoExecScope {
 pub(super) struct ScanAsyncRunner {
     name: String,
     scan: ScanNode,
+    /// Instance-materialized bound op. Morsel execution / iceberg-delete loads
+    /// go through this op; `scan` supplies only static node config.
+    op: Arc<dyn ScanOp>,
     dispatch: Arc<ScanDispatchState>,
     pub(super) morsel_iter: Option<BoxedExecIter>,
     pub(super) pending_chunk: Option<Chunk>,
@@ -303,9 +306,11 @@ fn find_field_by_id(schema: &arrow::datatypes::SchemaRef, target_id: i32) -> Opt
 }
 
 impl ScanAsyncRunner {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         name: String,
         scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         dispatch: Arc<ScanDispatchState>,
         shared_runtime_filter_decision: SharedRuntimeFilterDecision,
         runtime_filter_probe: Option<ScanRuntimeFilterProbe>,
@@ -324,6 +329,7 @@ impl ScanAsyncRunner {
             conjunct_encoding_policy,
             name,
             scan,
+            op,
             dispatch,
             morsel_iter: None,
             pending_chunk: None,
@@ -582,15 +588,20 @@ impl ScanAsyncRunner {
                 self.iceberg_include_position_filter_state =
                     self.build_iceberg_include_position_filter_state(&morsel);
                 let start = Instant::now();
-                self.morsel_iter = Some(
-                    self.scan
+                // Preserve the old `ScanNode::execute_iter` behavior: an `Empty`
+                // morsel yields an empty iterator without touching the op.
+                let iter = if matches!(morsel, ScanMorsel::Empty) {
+                    Box::new(std::iter::empty()) as crate::exec::node::BoxedExecIter
+                } else {
+                    self.op
                         .execute_iter(
                             morsel,
                             self.profiles.as_ref().map(|p| p.unique.clone()),
                             self.runtime_filter_ctx.as_deref(),
                         )
-                        .map_err(|e| e.to_string())?,
-                );
+                        .map_err(|e| e.to_string())?
+                };
+                self.morsel_iter = Some(iter);
                 self.maybe_log_slow_call("morsel", "execute_iter", start);
                 self.last_progress = Instant::now();
             }
@@ -799,11 +810,11 @@ impl ScanAsyncRunner {
             return Ok(None);
         }
         let deleted = self
-            .scan
+            .op
             .load_iceberg_position_deletes(morsel)?
             .unwrap_or_default();
         let equality_deletes = self
-            .scan
+            .op
             .load_iceberg_equality_deletes(morsel)?
             .unwrap_or_default();
         if deleted.is_empty() && equality_deletes.is_empty() {
@@ -2237,7 +2248,7 @@ mod tests {
             }],
         );
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
             .with_node_id(42)
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
@@ -2247,6 +2258,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            Arc::new(EmptyScanOp),
             dispatch,
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
@@ -2287,7 +2299,7 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
             .with_node_id(42)
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
@@ -2297,6 +2309,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            Arc::new(EmptyScanOp),
             dispatch,
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(hub.register_probe(42))),
@@ -2444,7 +2457,7 @@ mod tests {
         hub.publish_filters(&[], &[membership]);
 
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
             .with_node_id(42)
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
@@ -2459,6 +2472,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            Arc::new(EmptyScanOp),
             dispatch,
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
@@ -2732,12 +2746,13 @@ mod tests {
 
         let observed_min_max_counts = Arc::new(Mutex::new(Vec::new()));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new(Arc::new(RuntimeFilterRecordingScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(RuntimeFilterRecordingScanOp {
             observed_min_max_counts: Arc::clone(&observed_min_max_counts),
-        }))
-        .with_node_id(42)
-        .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let morsels = scan.build_morsels().expect("build morsels");
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(42)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = op.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             morsels.morsels,
             morsels.has_more,
@@ -2745,6 +2760,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            op,
             dispatch,
             SharedRuntimeFilterDecision::new(),
             Some(ScanRuntimeFilterProbe::new(probe)),
@@ -2811,12 +2827,13 @@ mod tests {
 
         let observed_min_max_counts = Arc::new(Mutex::new(Vec::new()));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new(Arc::new(RuntimeFilterRecordingScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(RuntimeFilterRecordingScanOp {
             observed_min_max_counts: Arc::clone(&observed_min_max_counts),
-        }))
-        .with_node_id(42)
-        .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
-        let morsels = scan.build_morsels().expect("build morsels");
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(42)
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
+        let morsels = op.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             morsels.morsels,
             morsels.has_more,
@@ -2824,6 +2841,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            op,
             dispatch,
             shared_decision,
             None,
@@ -2909,7 +2927,7 @@ mod tests {
             false,
         )));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let scan = ScanNode::new(Arc::new(EmptyScanOp))
+        let scan = ScanNode::new_for_test(Arc::new(EmptyScanOp))
             .with_node_id(1)
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let arena = Arc::new(ExprArena::default());
@@ -2917,6 +2935,7 @@ mod tests {
         let mut pending_runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan.clone(),
+            Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
             SharedRuntimeFilterDecision::new(),
             None,
@@ -2932,6 +2951,7 @@ mod tests {
         let empty_runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            Arc::new(EmptyScanOp),
             Arc::clone(&dispatch),
             SharedRuntimeFilterDecision::new(),
             None,
@@ -2976,17 +2996,18 @@ mod tests {
         let predicate = arena.push_typed(ExprNode::Lt(slot, literal), DataType::Boolean);
         let arena = Arc::new(arena);
 
-        let scan = ScanNode::new(Arc::new(ValuesScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(ValuesScanOp {
             values: vec![1, 3, 2, 4],
             ivm_change_op: None,
-        }))
-        .with_node_id(1)
-        .with_output_chunk_schema(chunk_schema_of(
-            &Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-            &[SlotId::new(1)],
-        ))
-        .with_conjunct_predicate(Some(predicate));
-        let morsels = scan.build_morsels().expect("build morsels");
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(1)
+            .with_output_chunk_schema(chunk_schema_of(
+                &Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                &[SlotId::new(1)],
+            ))
+            .with_conjunct_predicate(Some(predicate));
+        let morsels = op.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             morsels.morsels,
             morsels.has_more,
@@ -2995,6 +3016,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            op,
             dispatch,
             SharedRuntimeFilterDecision::new(),
             None,
@@ -3053,11 +3075,12 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let scan = ScanNode::new(Arc::new(SingleChunkScanOp { chunk }))
+        let op: Arc<dyn ScanOp> = Arc::new(SingleChunkScanOp { chunk });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
             .with_node_id(1)
             .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]))
             .with_conjunct_predicate(Some(predicate));
-        let morsels = scan.build_morsels().expect("build morsels");
+        let morsels = op.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             morsels.morsels,
             morsels.has_more,
@@ -3066,6 +3089,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            op,
             dispatch,
             SharedRuntimeFilterDecision::new(),
             None,
@@ -3099,14 +3123,15 @@ mod tests {
         let mut spec = IcebergVirtualSpec::default();
         spec.change_op_slot = Some(SlotId::new(2));
         spec.change_op_field = Some(Field::new("__change_op", DataType::Int8, false));
-        let scan = ScanNode::new(Arc::new(ValuesScanOp {
+        let op: Arc<dyn ScanOp> = Arc::new(ValuesScanOp {
             values: vec![1, 2, 3],
             ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_DELETE),
-        }))
-        .with_node_id(1)
-        .with_output_chunk_schema(chunk_schema_of(&schema, &[SlotId::new(1), SlotId::new(2)]))
-        .with_iceberg_virtual(Some(spec));
-        let morsels = scan.build_morsels().expect("build morsels");
+        });
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_node_id(1)
+            .with_output_chunk_schema(chunk_schema_of(&schema, &[SlotId::new(1), SlotId::new(2)]))
+            .with_iceberg_virtual(Some(spec));
+        let morsels = op.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
             morsels.morsels,
             morsels.has_more,
@@ -3115,6 +3140,7 @@ mod tests {
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
             scan,
+            op,
             dispatch,
             SharedRuntimeFilterDecision::new(),
             None,

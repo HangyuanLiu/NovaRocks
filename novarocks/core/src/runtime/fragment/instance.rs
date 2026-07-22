@@ -22,13 +22,13 @@ use crate::common::types::UniqueId;
 use crate::exec::fragment::error::{
     FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
 };
-use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, ScanAssignmentKind};
+use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
+use crate::exec::node::scan::BoundScanRanges;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 #[cfg(feature = "compat")]
 use crate::runtime::runtime_filter_params::RuntimeFilterParams;
-use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FragmentInstanceId(UniqueId);
@@ -63,22 +63,26 @@ impl BackendNum {
     }
 }
 
+/// A single scan node's instance-local enriched connector ranges.
+///
+/// There is no `kind` here on purpose: the connector type is already carried by
+/// the `BoundScanRanges` variant, and variant-vs-source correctness is enforced
+/// at materialize time by `ScanSource::bind`. (The decoders' pre-enrichment
+/// kind guards read the transient `(ScanAssignmentKind, Vec<ScanRangeParams>)`
+/// carrier instead.) jdbc/mysql scans legitimately have no `ScanAssignmentKind`.
 #[derive(Clone, Debug)]
 pub(crate) struct ScanAssignment {
-    kind: ScanAssignmentKind,
-    ranges: Vec<ScanRangeParams>,
+    ranges: BoundScanRanges,
 }
 
 impl ScanAssignment {
-    fn new(kind: ScanAssignmentKind, ranges: Vec<ScanRangeParams>) -> Self {
-        Self { kind, ranges }
+    fn new(ranges: BoundScanRanges) -> Self {
+        Self { ranges }
     }
 
-    pub(crate) const fn kind(&self) -> ScanAssignmentKind {
-        self.kind
-    }
-
-    pub(crate) fn ranges(&self) -> &[ScanRangeParams] {
+    /// The instance's enriched connector ranges. `materialize_scan_bindings`
+    /// clones these into `ScanSource::bind` to produce this instance's op.
+    pub(crate) fn ranges(&self) -> &BoundScanRanges {
         &self.ranges
     }
 }
@@ -87,31 +91,19 @@ impl ScanAssignment {
 pub(crate) struct ScanAssignments(BTreeMap<FragmentNodeId, ScanAssignment>);
 
 impl ScanAssignments {
+    /// Carry the already-enriched `BoundScanRanges` per plan scan node. No
+    /// validation happens here (kept `Result` for call-site symmetry): the
+    /// old per-range kind assertion is gone, presence is cross-checked in
+    /// `FragmentSubmission::try_new`, and variant-vs-source correctness is
+    /// enforced at materialize time by `ScanSource::bind`.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn try_new(
-        assignments: BTreeMap<FragmentNodeId, (ScanAssignmentKind, Vec<ScanRangeParams>)>,
+        assignments: BTreeMap<FragmentNodeId, BoundScanRanges>,
     ) -> Result<Self, FragmentBindingError> {
-        let mut bound_assignments = BTreeMap::new();
-        for (node_id, (kind, ranges)) in assignments {
-            for (index, range) in ranges.iter().enumerate() {
-                let matches_kind = match (kind, &range.range) {
-                    (ScanAssignmentKind::File, ScanRange::File(_)) => true,
-                    #[cfg(feature = "compat")]
-                    (ScanAssignmentKind::BrokerFile, ScanRange::BrokerFile(_)) => true,
-                    #[cfg(feature = "compat")]
-                    (ScanAssignmentKind::SchemaSelection, ScanRange::SchemaSelection(_)) => true,
-                    (ScanAssignmentKind::StarRocksTablet, ScanRange::StarRocksTablet(_)) => true,
-                    _ => false,
-                };
-                if !matches_kind {
-                    return Err(FragmentBindingError::new(
-                        FragmentBindingTarget::ScanNode(node_id.get()),
-                        FragmentBindingErrorKind::InvalidAssignment,
-                        format!("scan range {index} does not match assignment kind {kind:?}"),
-                    ));
-                }
-            }
-            bound_assignments.insert(node_id, ScanAssignment::new(kind, ranges));
-        }
+        let bound_assignments = assignments
+            .into_iter()
+            .map(|(node_id, ranges)| (node_id, ScanAssignment::new(ranges)))
+            .collect();
         Ok(Self(bound_assignments))
     }
 
@@ -374,38 +366,23 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::exec::fragment::error::{FragmentBindingErrorKind, FragmentBindingTarget};
-    use crate::exec::fragment::program::{
-        FragmentContractVersion, FragmentNodeId, ScanAssignmentKind,
-    };
+    use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
+    use crate::runtime::runtime_filter_params::RuntimeFilterParams;
     use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRange, ScanRangeParams};
 
     use super::*;
 
-    fn file_range() -> ScanRangeParams {
-        ScanRangeParams::file(FileScanRange {
-            file_format: FileFormat::Parquet,
-            full_path: Some("s3://bucket/data.parquet".to_string()),
-            relative_path: None,
-            table_id: None,
-            offset: 0,
-            length: 16,
-            file_length: 16,
-            delete_files: Vec::new(),
-            deletion_vector_descriptor: None,
-            first_row_id: None,
-            data_sequence_number: None,
-            modification_time: None,
-            datacache_options: None,
-            candidate_node: None,
-            included_positions: Vec::new(),
-            serialized_split: None,
-            use_iceberg_jni_metadata_reader: false,
-            ivm_change_op: None,
-            file_pruning_min_max_values: None,
-        })
+    /// A simple, connector-agnostic `BoundScanRanges` for exercising the
+    /// instance-assignment carrier (variant content is irrelevant here — the
+    /// carrier no longer validates it; `ScanSource::bind` does, at materialize).
+    fn bound_ranges() -> BoundScanRanges {
+        BoundScanRanges::File {
+            ranges: Vec::new(),
+            has_more: false,
+        }
     }
 
     #[test]
@@ -425,65 +402,35 @@ mod tests {
     }
 
     #[test]
-    fn scan_assignments_preserve_empty_kinds_and_reject_mixed_ranges_at_map_key() {
+    fn scan_assignments_carry_bound_ranges_per_node() {
+        // The instance carrier now holds the enriched `BoundScanRanges` per
+        // node with no kind and no per-range validation (that moved to
+        // `ScanSource::bind` at materialize time). Empty and non-empty carriers
+        // both round-trip through the map key.
         let node_id = FragmentNodeId::new(17);
-        for kind in [
-            ScanAssignmentKind::File,
-            ScanAssignmentKind::StarRocksTablet,
-        ] {
-            let assignments =
-                ScanAssignments::try_new(BTreeMap::from([(node_id, (kind, Vec::new()))]))
-                    .expect("empty assignment keeps its explicit kind");
-            let assignment = assignments.get(&node_id).expect("assignment at map key");
-            assert_eq!(assignment.kind(), kind);
-            assert!(assignment.ranges().is_empty());
-        }
-
-        let tablet_range =
-            ScanRangeParams::starrocks_tablet(300, 100, 7).expect("valid StarRocks tablet range");
-        for (kind, ranges) in [
-            (ScanAssignmentKind::File, vec![tablet_range]),
-            (ScanAssignmentKind::StarRocksTablet, vec![file_range()]),
-        ] {
-            let error = ScanAssignments::try_new(BTreeMap::from([(node_id, (kind, ranges))]))
-                .expect_err("mismatched scan range kind must fail");
-            assert_eq!(error.target(), FragmentBindingTarget::ScanNode(17));
-            assert_eq!(error.kind(), FragmentBindingErrorKind::InvalidAssignment);
-        }
-    }
-
-    #[test]
-    fn scan_assignments_preserve_nonempty_tablet_ranges() {
-        let node_id = FragmentNodeId::new(23);
-        let assignments = ScanAssignments::try_new(BTreeMap::from([(
-            node_id,
-            (
-                ScanAssignmentKind::StarRocksTablet,
-                vec![
-                    ScanRangeParams::starrocks_tablet(300, 100, 7)
-                        .expect("valid StarRocks tablet range"),
-                ],
-            ),
-        )]))
-        .expect("tablet assignment");
-
+        let assignments =
+            ScanAssignments::try_new(BTreeMap::from([(node_id, BoundScanRanges::None)]))
+                .expect("carrier");
         let assignment = assignments.get(&node_id).expect("assignment at map key");
-        assert_eq!(assignment.kind(), ScanAssignmentKind::StarRocksTablet);
+        assert!(matches!(assignment.ranges(), BoundScanRanges::None));
+
+        let file_node = FragmentNodeId::new(23);
+        let assignments = ScanAssignments::try_new(BTreeMap::from([(file_node, bound_ranges())]))
+            .expect("carrier");
         assert!(matches!(
-            &assignment.ranges()[0].range,
-            ScanRange::StarRocksTablet(tablet)
-                if tablet.tablet_id == 300 && tablet.partition_id == 100 && tablet.version == 7
+            assignments.get(&file_node).expect("assignment").ranges(),
+            BoundScanRanges::File {
+                has_more: false,
+                ..
+            }
         ));
     }
 
     #[test]
     fn assignment_collections_use_typed_ordered_node_ids_and_nonzero_senders() {
         let scan_node = FragmentNodeId::new(3);
-        let scans = ScanAssignments::try_new(BTreeMap::from([(
-            scan_node,
-            (ScanAssignmentKind::File, vec![file_range()]),
-        )]))
-        .expect("file assignment");
+        let scans = ScanAssignments::try_new(BTreeMap::from([(scan_node, bound_ranges())]))
+            .expect("file assignment");
         assert_eq!(scans.len(), 1);
         assert!(!scans.is_empty());
         assert!(scans.get(&scan_node).is_some());
@@ -561,11 +508,8 @@ mod tests {
     #[test]
     fn instance_spec_exposes_immutable_domain_parts() {
         let scan_node = FragmentNodeId::new(3);
-        let scans = ScanAssignments::try_new(BTreeMap::from([(
-            scan_node,
-            (ScanAssignmentKind::File, Vec::new()),
-        )]))
-        .expect("empty file assignment");
+        let scans = ScanAssignments::try_new(BTreeMap::from([(scan_node, bound_ranges())]))
+            .expect("empty file assignment");
         let exchange_node = FragmentNodeId::new(5);
         let exchanges = ExchangeInputAssignments::new(BTreeMap::from([(
             exchange_node,

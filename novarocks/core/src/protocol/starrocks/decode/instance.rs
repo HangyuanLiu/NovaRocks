@@ -25,7 +25,6 @@ use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind, ScanSou
 use crate::exec::node::scan::{HdfsScanFileFormat, IncrementalHdfsScanRange, IncrementalScanRange};
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::fragment::instance::ScanAssignments;
 use crate::runtime::fragment::instance::{BackendNum, FragmentInstanceId};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
@@ -440,7 +439,11 @@ pub(crate) fn decode_scan_contracts_and_assignments(
 ) -> Result<
     (
         BTreeMap<FragmentNodeId, ScanSourceContract>,
-        ScanAssignments,
+        // Transient enrichment INPUT per scan node: its assignment kind (for the
+        // decoders' kind guards) plus the decoded `ScanRangeParams`. The
+        // instance's `ScanAssignments` are assembled after node decode from the
+        // enriched `BoundScanRanges` captured by the decoders.
+        BTreeMap<FragmentNodeId, (ScanAssignmentKind, Vec<ScanRangeParams>)>,
     ),
     StarRocksFragmentDecodeError,
 > {
@@ -530,8 +533,6 @@ pub(crate) fn decode_scan_contracts_and_assignments(
         }
         assignments.insert(id, (kind, decoded));
     }
-    let assignments =
-        ScanAssignments::try_new(assignments).map_err(StarRocksFragmentDecodeError::Binding)?;
     Ok((contracts, assignments))
 }
 

@@ -31,7 +31,8 @@ use crate::exec::node::scan::IncrementalScanRange;
 #[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::RowPositionScanConfig;
-use crate::exec::node::scan::ScanNode;
+#[cfg(feature = "compat")]
+use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
@@ -878,16 +879,16 @@ impl Drop for QueryContext {
 
 #[cfg(feature = "compat")]
 struct IncrementalScanNodeHandle {
-    scan: ScanNode,
+    op: Arc<dyn ScanOp>,
     dispatch: Arc<ScanDispatchState>,
     update_mu: Mutex<()>,
 }
 
 #[cfg(feature = "compat")]
 impl IncrementalScanNodeHandle {
-    fn new(scan: ScanNode, dispatch: Arc<ScanDispatchState>) -> Self {
+    fn new(op: Arc<dyn ScanOp>, dispatch: Arc<ScanDispatchState>) -> Self {
         Self {
-            scan,
+            op,
             dispatch,
             update_mu: Mutex::new(()),
         }
@@ -895,7 +896,7 @@ impl IncrementalScanNodeHandle {
 
     fn append_scan_ranges(&self, scan_ranges: &[IncrementalScanRange]) -> Result<(), String> {
         let _guard = self.update_mu.lock().expect("incremental scan handle lock");
-        let morsels = self.scan.build_incremental_morsels(scan_ranges)?;
+        let morsels = self.op.build_incremental_morsels(scan_ranges)?;
         self.dispatch
             .append_morsels(morsels.morsels, morsels.has_more)
     }
@@ -2872,7 +2873,7 @@ impl QueryContextManager {
         &self,
         finst_id: UniqueId,
         node_id: i32,
-        scan: ScanNode,
+        op: Arc<dyn ScanOp>,
         dispatch: Arc<ScanDispatchState>,
     ) -> Result<(), String> {
         let handle = {
@@ -2884,7 +2885,7 @@ impl QueryContextManager {
             if let Some(existing) = node_map.get(&node_id) {
                 Arc::clone(existing)
             } else {
-                let handle = Arc::new(IncrementalScanNodeHandle::new(scan, dispatch));
+                let handle = Arc::new(IncrementalScanNodeHandle::new(op, dispatch));
                 node_map.insert(node_id, Arc::clone(&handle));
                 handle
             }
