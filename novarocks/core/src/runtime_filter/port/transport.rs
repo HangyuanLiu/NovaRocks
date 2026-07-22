@@ -18,6 +18,7 @@
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId};
@@ -485,6 +486,37 @@ impl RuntimeFilterEnvelope {
 
     pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
+    }
+}
+
+/// A complete domain envelope plus the unary deadline installed for this query.
+///
+/// The reliable transport owns the envelope identity and retry lifetime. The sink
+/// receives this immutable value and is responsible only for wire transmission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeFilterTransportEnvelope {
+    envelope: RuntimeFilterEnvelope,
+    rpc_deadline: Duration,
+}
+
+impl RuntimeFilterTransportEnvelope {
+    pub(crate) fn new(envelope: RuntimeFilterEnvelope, rpc_deadline: Duration) -> Self {
+        assert!(
+            !rpc_deadline.is_zero(),
+            "runtime filter envelope RPC deadline must be nonzero"
+        );
+        Self {
+            envelope,
+            rpc_deadline,
+        }
+    }
+
+    pub(crate) const fn envelope(&self) -> &RuntimeFilterEnvelope {
+        &self.envelope
+    }
+
+    pub(crate) fn into_parts(self) -> (RuntimeFilterEnvelope, Duration) {
+        (self.envelope, self.rpc_deadline)
     }
 }
 

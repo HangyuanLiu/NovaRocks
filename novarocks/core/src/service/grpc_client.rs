@@ -28,6 +28,7 @@ use tonic::transport::Channel;
 use crate::common::network::format_host_for_url;
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
+use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use crate::runtime::runtime_filter_transmission::RuntimeFilterTransmission;
 use crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_transmission;
@@ -51,8 +52,16 @@ impl NovaRocksGrpcRemoteClient {
     /// The underlying HTTP/2 channel is established lazily via the shared
     /// channel cache, so construction itself is cheap.
     pub fn new(addr: SocketAddr) -> Result<Self, String> {
-        let host = addr.ip().to_string();
-        let port = addr.port();
+        Self::new_host_port(addr.ip().to_string(), addr.port())
+    }
+
+    pub(crate) fn new_runtime_endpoint(endpoint: &RuntimeEndpoint) -> Result<Self, String> {
+        let port = u16::try_from(endpoint.port())
+            .map_err(|_| format!("invalid runtime filter endpoint port {}", endpoint.port()))?;
+        Self::new_host_port(endpoint.host().to_string(), port)
+    }
+
+    fn new_host_port(host: String, port: u16) -> Result<Self, String> {
         // Eagerly verify the endpoint can be parsed; actual TCP setup is lazy.
         channel_endpoint(&host, port)
             .map_err(|e| format!("invalid BE endpoint {host}:{port}: {e}"))?;
@@ -254,6 +263,33 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(|_| "runtime filter abort deadline exceeded during unary RPC".to_string())?
             .map(|response| response.into_inner())
             .map_err(|error| format!("abort_runtime_filter_deployment rpc failed: {error}"))
+    }
+
+    pub(crate) async fn transmit_runtime_filter_envelope_async(
+        &self,
+        request: proto::filter::RuntimeFilterEnvelope,
+        deadline: Duration,
+    ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, String> {
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        let mut client = self
+            .make_runtime_filter_async_client("envelope", deadline_at)
+            .await?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "runtime filter envelope deadline exceeded before unary RPC submission".to_string(),
+            );
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(
+            deadline_at,
+            client.transmit_runtime_filter_envelope(request),
+        )
+        .await
+        .map_err(|_| "runtime filter envelope deadline exceeded during unary RPC".to_string())?
+        .map(|response| response.into_inner())
+        .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
     }
 
     pub fn blocking_heartbeat(

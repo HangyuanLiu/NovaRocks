@@ -348,8 +348,8 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::runtime_filter::codec::artifact::{
-        ArtifactDecodeExpectation, EncodedArtifactFrame, encode_artifact_bundle,
-        encode_unavailable, max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
+        ArtifactDecodeExpectation, encode_artifact_bundle, encode_unavailable,
+        max_encoded_len_for_artifact_budget, semantic_artifact_bytes,
     };
     use crate::runtime_filter::core::ordered_reducer::OrderedBoundDomain;
     use crate::runtime_filter::materializer::bloom::BloomHashContract;
@@ -403,7 +403,9 @@ mod tests {
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain,
     };
 
-    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+    };
 
     use super::InboundConsumerDispatchErrorKind::{
         CodecContract, DeploymentUnavailable, ResourceLimit, RouteContract, ServiceUnavailable,
@@ -1515,10 +1517,20 @@ mod tests {
     // A loopback-only delivery scope must never reach the remote sink; if the Router ever
     // classified a loopback edge as remote this panics rather than silently wire-encoding.
     struct NoopRemoteSink;
-    impl ArtifactRemoteSink for NoopRemoteSink {
-        fn deliver_remote(&self, _route: &RuntimeFilterRemoteRoute, _frame: &EncodedArtifactFrame) {
+    impl RuntimeFilterEnvelopeSink for NoopRemoteSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
             panic!("a loopback-only delivery scope must not reach the remote sink");
         }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     fn bitset_profile() -> ConsumerArtifactProfile {

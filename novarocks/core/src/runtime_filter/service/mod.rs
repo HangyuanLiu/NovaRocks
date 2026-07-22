@@ -1486,10 +1486,12 @@ impl RuntimeFilterService {
             );
             for route in decision.remote_routes() {
                 let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
-                match self
-                    .reliable_transport
-                    .send(route, Arc::clone(&frame), identity)
-                {
+                match self.reliable_transport.send_kind(
+                    route,
+                    Arc::clone(&frame),
+                    identity,
+                    envelope_kind,
+                ) {
                     ReliableSendOutcome::Buffered(_identity) => {}
                     ReliableSendOutcome::ResourceLimit(limit) => {
                         // A self-owned transport ceiling tripped: the frame was neither
@@ -1502,6 +1504,10 @@ impl RuntimeFilterService {
                             limit,
                             frame.payload().len(),
                         );
+                    }
+                    ReliableSendOutcome::Shutdown => {
+                        // Query teardown is terminal. A racing delivery is rejected
+                        // without reviving transport state or failing the query.
                     }
                 }
             }
@@ -1602,7 +1608,7 @@ impl RuntimeFilterService {
     #[cfg(test)]
     fn set_remote_sink_for_test(
         &self,
-        sink: Arc<dyn crate::runtime_filter::router::remote::ArtifactRemoteSink>,
+        sink: Arc<dyn crate::runtime_filter::router::remote::RuntimeFilterEnvelopeSink>,
     ) {
         self.reliable_transport.set_sink_for_test(sink);
     }
@@ -2061,7 +2067,9 @@ mod tests {
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
-    use crate::runtime_filter::router::remote::ArtifactRemoteSink;
+    use crate::runtime_filter::router::remote::{
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+    };
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     use super::materialization::MaterializationWorkClaim;
@@ -6903,13 +6911,31 @@ mod tests {
         frames: Mutex<Vec<(RouteEdgeId, EncodedArtifactFrame)>>,
     }
 
-    impl ArtifactRemoteSink for RecordingRemoteSink {
-        fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame) {
+    impl RuntimeFilterEnvelopeSink for RecordingRemoteSink {
+        fn try_send(
+            &self,
+            route: RuntimeFilterRemoteRoute,
+            envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            let envelope = envelope.envelope();
             self.frames
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((route.route_edge_id(), frame.clone()));
+                .push((
+                    route.route_edge_id(),
+                    EncodedArtifactFrame::from_parts_for_test(
+                        *envelope.schema_digest(),
+                        envelope.payload().to_vec(),
+                    ),
+                ));
+            SinkSubmitOutcome::Submitted
         }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {}
     }
 
     impl RecordingRemoteSink {

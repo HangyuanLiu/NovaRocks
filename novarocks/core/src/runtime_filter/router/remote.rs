@@ -19,9 +19,8 @@
 //!
 //! The delivery Router splits an authorized delivery scope into loopback edges
 //! (delivered in-process by [`super::loopback::LoopbackRouter`]) and remote edges.
-//! For each remote edge the Service wire-encodes the materialized artifact (or an
-//! `Unavailable` sentinel) into an [`EncodedArtifactFrame`] and hands the frame to
-//! an `ArtifactRemoteSink`. The sink owns transmission only.
+//! For each remote edge the reliable transport stamps a complete domain envelope
+//! and hands it to a [`RuntimeFilterEnvelopeSink`]. The sink owns transmission only.
 //!
 //! Since M3 the remote leg no longer talks to the sink directly: it flows through
 //! the sender-side `ReliableEnvelopeTransport`
@@ -31,23 +30,72 @@
 //! tests inject a recording (or drivable) fake, while RFD-6 wires the live network
 //! sender behind the same trait.
 //!
-//! The frame is borrowed rather than owned because the reliable transport may
-//! re-hand the same buffered frame across retries and broadcast fanout without
-//! re-serializing it.
-//!
 //! The sink never re-authorizes fanout — the [`RuntimeFilterRemoteRoute`] it
 //! receives was already vetted by the Router's `route_delivery`, so the sink only
 //! transmits to the route's peer participant/endpoint.
 
-use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
 use crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute;
+use crate::runtime_filter::port::transport::{
+    RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SinkSubmitOutcome {
+    Submitted,
+    QueueFull,
+    Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SinkTransportError {
+    Network(String),
+    Contract(String),
+}
+
+impl SinkTransportError {
+    pub(crate) fn network(error: impl Into<String>) -> Self {
+        Self::Network(error.into())
+    }
+
+    pub(crate) fn contract(error: impl Into<String>) -> Self {
+        Self::Contract(error.into())
+    }
+
+    pub(crate) const fn is_contract(&self) -> bool {
+        matches!(self, Self::Contract(_))
+    }
+}
+
+impl std::fmt::Display for SinkTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(error) => write!(formatter, "runtime filter transport failure: {error}"),
+            Self::Contract(error) => {
+                write!(formatter, "runtime filter contract rejection: {error}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SinkCompletion {
+    Ack(RuntimeFilterRouteIdentity, RuntimeFilterAcceptStatus),
+    TransportFailure(RuntimeFilterRouteIdentity, SinkTransportError),
+}
 
 /// Transport seam for the delivery Router's remote leg.
 ///
-/// Implementations receive an already-authorized [`RuntimeFilterRemoteRoute`] and
-/// the canonical [`EncodedArtifactFrame`] to transmit to that route's peer. The
-/// frame is fully framed and self-describing (it carries the consumer profile
-/// digest and the bundle logical version), so the sink is a pure transport.
-pub(crate) trait ArtifactRemoteSink: Send + Sync {
-    fn deliver_remote(&self, route: &RuntimeFilterRemoteRoute, frame: &EncodedArtifactFrame);
+/// `try_send` must never perform network I/O or block. Implementations use bounded
+/// queues and publish each unary result through `try_recv_completion`; retry,
+/// buffering, deadline and sequence ownership remain above this seam.
+pub(crate) trait RuntimeFilterEnvelopeSink: Send + Sync {
+    fn try_send(
+        &self,
+        route: RuntimeFilterRemoteRoute,
+        envelope: RuntimeFilterTransportEnvelope,
+    ) -> SinkSubmitOutcome;
+
+    fn try_recv_completion(&self) -> Option<SinkCompletion>;
+
+    fn shutdown(&self);
 }
