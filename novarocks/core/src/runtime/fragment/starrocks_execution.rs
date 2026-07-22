@@ -74,6 +74,7 @@ pub(crate) fn execute_starrocks_submission(
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker,
+            native_runtime_filter_context: None,
         },
         context.profiler.as_ref(),
     )

@@ -19,7 +19,7 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterAvailability, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
 };
 use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use std::collections::BTreeSet;
@@ -71,7 +71,6 @@ pub(crate) struct NativeJoinRuntimeFilterProducerSpec {
     pub(crate) completion_requirement: CompletionRequirement,
     pub(crate) contract: NativeRuntimeFilterContract,
     pub(crate) reduction: NativeRuntimeFilterReduction,
-    pub(crate) availability: NativeRuntimeFilterAvailability,
 }
 
 #[derive(Clone, Debug)]

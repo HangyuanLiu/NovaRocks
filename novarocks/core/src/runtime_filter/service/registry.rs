@@ -308,6 +308,25 @@ impl InstalledDeployment {
         self.producers.get(&binding_id)
     }
 
+    pub(super) fn channel_deployment(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<&crate::runtime_filter::port::install::RuntimeFilterChannelDeployment> {
+        self.install.core_view().channels().get(&channel_id)
+    }
+
+    pub(super) fn producer_participant(
+        &self,
+        channel_id: ChannelId,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> Option<RuntimeFilterParticipantId> {
+        self.install
+            .routing_shard()
+            .channel(channel_id)
+            .and_then(|channel| channel.producer_participant(binding_id, fragment_instance_id))
+    }
+
     pub(super) fn subscription(
         &self,
         binding_id: BindingId,

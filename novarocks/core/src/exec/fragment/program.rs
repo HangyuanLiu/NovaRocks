@@ -178,6 +178,10 @@ impl RuntimeFilterContract {
         &self.probe_filters
     }
 
+    pub(crate) fn has_bindings(&self) -> bool {
+        !self.build_filters.is_empty() || !self.probe_filters.is_empty()
+    }
+
     pub(crate) fn dormancy_facts(&self) -> &[RuntimeFilterDormancyFact] {
         &self.dormancy_facts
     }
@@ -603,5 +607,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![31]
         );
+        assert!(program.runtime_filters().has_bindings());
     }
 }

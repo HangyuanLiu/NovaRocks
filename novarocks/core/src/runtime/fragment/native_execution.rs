@@ -39,6 +39,7 @@ use crate::runtime::profile::{
     NATIVE_RUNTIME_FILTER_ZERO_SIDE_EFFECT_COUNTERS, Profiler,
 };
 use crate::runtime::result_buffer;
+use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
@@ -161,6 +162,7 @@ pub(crate) struct NativeExecutionContext {
     pub(crate) profiler: Option<Profiler>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) readiness: NativeExecutionReadiness,
+    pub(crate) runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
 }
 
 #[derive(Debug)]
@@ -235,6 +237,7 @@ pub(crate) fn execute_native_submission(
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),
+            native_runtime_filter_context: context.runtime_filter.clone(),
         },
         context.profiler.as_ref(),
     )
@@ -414,6 +417,7 @@ mod tests {
                 profiler: Some(profiler.clone()),
                 mem_tracker: None,
                 readiness,
+                runtime_filter: None,
             },
         )
         .expect("noop submission executes");

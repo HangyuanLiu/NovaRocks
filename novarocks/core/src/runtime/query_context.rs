@@ -52,7 +52,9 @@ use crate::runtime_filter::model::policy::MAX_DEADLINE_MS;
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{InstallContractErrorKind, InstallOutcome};
-use crate::runtime_filter::service::{ReliableTransportPolicy, RuntimeFilterService};
+use crate::runtime_filter::service::{
+    NativeRuntimeFilterExecutionContext, ReliableTransportPolicy, RuntimeFilterService,
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct QueryId {
@@ -335,7 +337,7 @@ impl std::error::Error for RuntimeFilterDeploymentInstallError {}
 pub(crate) enum LegacyRuntimeFilterExecutionClaim {
     #[default]
     Unclaimed,
-    NativeDisabled,
+    NativeService,
     #[cfg(feature = "compat")]
     Compat,
 }
@@ -550,7 +552,7 @@ impl QueryContext {
             (current, requested) if current == requested => Ok(()),
             (
                 LegacyRuntimeFilterExecutionClaim::Unclaimed,
-                LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                LegacyRuntimeFilterExecutionClaim::NativeService,
             ) => {
                 if self.runtime_filter_params.is_some()
                     || self.runtime_filter_worker_params.is_some()
@@ -559,7 +561,7 @@ impl QueryContext {
                     || !self.pending_runtime_filters.is_empty()
                 {
                     return Err(
-                        "cannot claim NativeDisabled with unexpected legacy runtime-filter state"
+                        "cannot claim NativeService with unexpected legacy runtime-filter state"
                             .to_string(),
                     );
                 }
@@ -589,7 +591,7 @@ impl QueryContext {
             (current, requested) if current == requested => Ok(()),
             (
                 LegacyRuntimeFilterExecutionClaim::Unclaimed,
-                LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                LegacyRuntimeFilterExecutionClaim::NativeService,
             ) => {
                 if self.runtime_filter_params.is_some()
                     || self.runtime_filter_worker_params.is_some()
@@ -598,7 +600,7 @@ impl QueryContext {
                     || !self.pending_runtime_filters.is_empty()
                 {
                     return Err(
-                        "cannot claim NativeDisabled with unexpected legacy runtime-filter state"
+                        "cannot claim NativeService with unexpected legacy runtime-filter state"
                             .to_string(),
                     );
                 }
@@ -617,8 +619,9 @@ impl QueryContext {
 
     fn ensure_legacy_runtime_filter_enabled(&self) -> Result<(), String> {
         match self.legacy_runtime_filter_execution {
-            LegacyRuntimeFilterExecutionClaim::NativeDisabled => Err(
-                "legacy runtime-filter state is unavailable for NativeDisabled query".to_string(),
+            LegacyRuntimeFilterExecutionClaim::NativeService => Err(
+                "legacy runtime-filter Hub state is unavailable for NativeService query"
+                    .to_string(),
             ),
             LegacyRuntimeFilterExecutionClaim::Unclaimed => {
                 Err("legacy runtime-filter execution mode is unclaimed".to_string())
@@ -1387,7 +1390,7 @@ impl QueryContextManager {
             delivery_expire,
             query_expire,
             true,
-            LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+            LegacyRuntimeFilterExecutionClaim::NativeService,
         )
     }
 
@@ -1404,7 +1407,7 @@ impl QueryContextManager {
             delivery_expire,
             query_expire,
             false,
-            LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+            LegacyRuntimeFilterExecutionClaim::NativeService,
         )
     }
 
@@ -1552,7 +1555,7 @@ impl QueryContextManager {
                         );
                         context
                             .claim_legacy_runtime_filter_execution(
-                                LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                                LegacyRuntimeFilterExecutionClaim::NativeService,
                             )
                             .map_err(|error| {
                                 RuntimeFilterDeploymentInstallError::new(
@@ -1573,7 +1576,7 @@ impl QueryContextManager {
                     };
                     context
                         .claim_legacy_runtime_filter_execution(
-                            LegacyRuntimeFilterExecutionClaim::NativeDisabled,
+                            LegacyRuntimeFilterExecutionClaim::NativeService,
                         )
                         .map_err(|error| {
                             RuntimeFilterDeploymentInstallError::new(
@@ -2156,7 +2159,7 @@ impl QueryContextManager {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         clean_expired_runtime_filter_terminals(&mut guard);
-        if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeService
             && (guard
                 .runtime_filter_deployment_terminals
                 .contains_key(&query_id)
@@ -2166,7 +2169,7 @@ impl QueryContextManager {
         {
             return Err("runtime filter deployment query was already cancelled".to_string());
         }
-        if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeService
             && guard
                 .active
                 .get(&query_id)
@@ -2175,7 +2178,7 @@ impl QueryContextManager {
         {
             return Err("runtime filter deployment query was already cancelled".to_string());
         }
-        if claim == LegacyRuntimeFilterExecutionClaim::NativeDisabled
+        if claim == LegacyRuntimeFilterExecutionClaim::NativeService
             && guard
                 .active
                 .get(&query_id)
@@ -2498,6 +2501,49 @@ impl QueryContextManager {
         guard.second_chance.get(&query_id).and_then(|context| {
             (!context.is_delivery_expired()).then(|| context.runtime_filter_service())
         })
+    }
+
+    pub(crate) fn runtime_filter_context_for_native_execution(
+        &self,
+        query_id: QueryId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<NativeRuntimeFilterExecutionContext, String> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .runtime_filter_deployment_terminals
+            .contains_key(&query_id)
+            || guard
+                .runtime_filter_query_cancellations
+                .contains_key(&query_id)
+        {
+            return Err("runtime filter deployment query was cancelled".to_string());
+        }
+        let context = guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .ok_or_else(|| "runtime filter native execution QueryContext not found".to_string())?;
+        if context.cancelled_by_fe {
+            return Err("runtime filter deployment query was cancelled".to_string());
+        }
+        let claim = context.runtime_filter_deployment.as_ref().ok_or_else(|| {
+            "runtime filter native execution requires deployment state Installed".to_string()
+        })?;
+        if claim.state != RuntimeFilterDeploymentClaimState::Installed {
+            return Err(format!(
+                "runtime filter native execution requires deployment state Installed, current={:?}",
+                claim.state
+            ));
+        }
+        Ok(NativeRuntimeFilterExecutionContext::new(
+            context.runtime_filter_service(),
+            UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            },
+            claim.install.epoch(),
+            fragment_instance_id,
+        ))
     }
 
     pub(crate) fn set_lake_tablet_paths(
@@ -3869,12 +3915,12 @@ mod legacy_runtime_filter_execution_claim_tests {
                 RuntimeFilterParams::new(BTreeMap::new(), BTreeMap::new(), None),
             )
             .expect_err("disabled context must reject legacy params");
-        assert!(error.contains("NativeDisabled"), "{error}");
+        assert!(error.contains("NativeService"), "{error}");
         let guard = mgr.inner.lock().expect("query ctx manager lock");
         let context = guard.active.get(&query_id).expect("query context");
         assert_eq!(
             context.legacy_runtime_filter_execution_claim(),
-            LegacyRuntimeFilterExecutionClaim::NativeDisabled
+            LegacyRuntimeFilterExecutionClaim::NativeService
         );
         assert!(context.runtime_filter_params.is_none());
         assert_eq!(context.num_fragments, 1);
@@ -4302,9 +4348,10 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     use crate::common::types::UniqueId;
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
     use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-        ContributionKind, CoverageWitnessId, NullSemantics, ReductionRequirement,
-        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+        ConsumerActivation, ContributionKind, CoverageWitnessId, NullSemantics,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
     };
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::port::events::{RuntimeFilterEvent, RuntimeFilterEventSink};
@@ -4335,23 +4382,54 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
     }
 
     pub(crate) fn participant_install() -> RuntimeFilterParticipantInstall {
+        participant_install_with_consumer(
+            ConsumerActivation::BlockingSnapshot,
+            BTreeSet::from([ArtifactCapability::Membership]),
+        )
+    }
+
+    pub(crate) fn participant_install_with_consumer(
+        activation: ConsumerActivation,
+        capabilities: BTreeSet<ArtifactCapability>,
+    ) -> RuntimeFilterParticipantInstall {
         let channel_id = ChannelId::new(1);
         let witness_id = CoverageWitnessId::new(2);
+        let is_live = matches!(activation, ConsumerActivation::NonBlockingLive { .. });
+        let coverage = if is_live {
+            Coverage::AllOf(vec![Coverage::Leaf(witness_id)])
+        } else {
+            Coverage::Leaf(witness_id)
+        };
         let deployment = RuntimeFilterChannelDeployment::new(
             channel_id,
             RuntimeFilterLogicalDomain::Membership {
                 value_type: DataType::Int64,
-                null_semantics: NullSemantics::NeverMatches,
+                null_semantics: if is_live {
+                    NullSemantics::NullSafeEqual
+                } else {
+                    NullSemantics::NeverMatches
+                },
             },
             RuntimeFilterLifecycle::CompleteOnce,
-            Coverage::Leaf(witness_id),
-            Coverage::Leaf(witness_id),
+            coverage.clone(),
+            coverage,
             ReductionRequirement::SetUnion,
-            BTreeSet::from([
-                ContributionKind::ValueDomainDelta,
-                ContributionKind::ProducerClosed,
-            ]),
-            CompletionRequirement::ProducerClosed,
+            if is_live {
+                BTreeSet::from([
+                    ContributionKind::FinalDomainShard,
+                    ContributionKind::ProducerClosed,
+                ])
+            } else {
+                BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ])
+            },
+            if is_live {
+                CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen)
+            } else {
+                CompletionRequirement::ProducerClosed
+            },
             RuntimeFilterPolicyRequirement {
                 max_contribution_bytes: 1024,
                 max_artifact_bytes: 1024,
@@ -4367,8 +4445,8 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
             BTreeMap::from([(
                 BindingId::new(4),
                 ConsumerDeployment::new(
-                    ConsumerActivation::BlockingSnapshot,
-                    BTreeSet::from([ArtifactCapability::Membership]),
+                    activation,
+                    capabilities,
                     BTreeSet::from([RouteEdgeId::new(5)]),
                     BTreeSet::from([uid(40)]),
                 ),
@@ -5043,7 +5121,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
         assert_eq!(context.num_active_fragments, 0);
         assert_eq!(
             context.legacy_runtime_filter_execution_claim(),
-            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+            super::LegacyRuntimeFilterExecutionClaim::NativeService
         );
         assert!(Arc::ptr_eq(&before, &context.runtime_filter_service()));
     }
@@ -5144,7 +5222,7 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
         assert_eq!(context.num_active_fragments, 1);
         assert_eq!(
             context.legacy_runtime_filter_execution_claim(),
-            super::LegacyRuntimeFilterExecutionClaim::NativeDisabled
+            super::LegacyRuntimeFilterExecutionClaim::NativeService
         );
         assert!(registry.snapshot(query_key).is_some());
         registry.remove_query(query_key);
@@ -5709,7 +5787,8 @@ mod tests {
 
         use super::super::{
             LookupFetcherLifecycle, QueryContextManager, QueryExecutionKey,
-            RuntimeFilterDeploymentAbortOutcome, RuntimeFilterDeploymentClaimState,
+            RuntimeFilterDeploymentAbortOutcome, RuntimeFilterDeploymentClaim,
+            RuntimeFilterDeploymentClaimState, RuntimeFilterDeploymentCompletion,
             RuntimeFilterDeploymentInstallErrorKind, RuntimeFilterDeploymentInstallOutcome,
         };
         use crate::common::types::UniqueId;
@@ -5729,6 +5808,104 @@ mod tests {
                 transport_max_pending_entries: 128,
                 transport_max_pending_bytes: 1024 * 1024,
             }
+        }
+
+        #[test]
+        fn native_execution_getter_returns_the_query_owned_installed_service() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_101);
+            let finst = UniqueId { hi: 70, lo: 30 };
+            manager
+                .ensure_native_context(
+                    query,
+                    false,
+                    Duration::from_secs(11),
+                    Duration::from_secs(29),
+                )
+                .expect("native query context");
+            let query_owned = {
+                let guard = manager.inner.lock().expect("query manager");
+                guard.active[&query].runtime_filter_service()
+            };
+
+            manager
+                .install_runtime_filter_deployment(query, lifecycle(), participant_install())
+                .expect("installed deployment");
+            let native = manager
+                .runtime_filter_context_for_native_execution(query, finst)
+                .expect("strict native execution context");
+
+            assert!(Arc::ptr_eq(native.service(), &query_owned));
+            assert_eq!(
+                native.query_id(),
+                UniqueId {
+                    hi: query.hi,
+                    lo: query.lo
+                }
+            );
+            assert_eq!(native.epoch(), DeploymentEpoch::new(6));
+            assert_eq!(native.fragment_instance_id(), finst);
+        }
+
+        #[test]
+        fn native_execution_getter_rejects_missing_install_cancelled_and_wrong_query() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_102);
+            let finst = UniqueId { hi: 70, lo: 30 };
+            manager
+                .ensure_native_context(
+                    query,
+                    false,
+                    Duration::from_secs(11),
+                    Duration::from_secs(29),
+                )
+                .expect("native query context");
+
+            let missing = manager
+                .runtime_filter_context_for_native_execution(query, finst)
+                .expect_err("deployment must already be installed");
+            assert!(missing.contains("Installed"), "{missing}");
+
+            let wrong = manager
+                .runtime_filter_context_for_native_execution(query_id(9_999), finst)
+                .expect_err("wrong query cannot borrow another query's service");
+            assert!(wrong.contains("not found"), "{wrong}");
+
+            manager.cancel_query(query, "cancelled for test".to_string());
+            let cancelled = manager
+                .runtime_filter_context_for_native_execution(query, finst)
+                .expect_err("cancelled query cannot start native execution");
+            assert!(cancelled.contains("cancelled"), "{cancelled}");
+        }
+
+        #[test]
+        fn native_execution_getter_rejects_installing_deployment() {
+            let manager = QueryContextManager::new_for_test();
+            let query = query_id(9_103);
+            let lifecycle = lifecycle();
+            manager
+                .ensure_native_context(
+                    query,
+                    false,
+                    lifecycle.delivery_expire,
+                    lifecycle.query_expire,
+                )
+                .expect("native query context");
+            {
+                let mut guard = manager.inner.lock().expect("query manager");
+                let context = guard.active.get_mut(&query).expect("active query");
+                context.runtime_filter_deployment = Some(RuntimeFilterDeploymentClaim {
+                    state: RuntimeFilterDeploymentClaimState::Installing,
+                    lifecycle,
+                    install: participant_install(),
+                    completion: Arc::new(RuntimeFilterDeploymentCompletion::new()),
+                });
+            }
+
+            let error = manager
+                .runtime_filter_context_for_native_execution(query, UniqueId { hi: 70, lo: 30 })
+                .expect_err("installing deployment is not executable");
+            assert!(error.contains("Installing"), "{error}");
         }
 
         fn with_epoch(

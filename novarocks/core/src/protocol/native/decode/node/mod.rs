@@ -54,8 +54,8 @@ use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use crate::exec::node::join::{JoinRuntimeFilterExecution, NativeJoinRuntimeFilterProducerSpec};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::runtime_filter::{
-    NativeRuntimeFilterAvailability, NativeRuntimeFilterConsumerNode,
-    NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract, NativeRuntimeFilterReduction,
+    NativeRuntimeFilterConsumerNode, NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
+    NativeRuntimeFilterReduction,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
@@ -965,7 +965,6 @@ fn attach_hash_join_producers(
             completion_requirement: *completion_requirement,
             contract: native_contract(&binding.contract),
             reduction: native_reduction(&binding.reduction),
-            availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
         });
     }
     join.runtime_filter_execution = JoinRuntimeFilterExecution::Native { producers };
@@ -995,7 +994,6 @@ fn consumer_spec(
         capabilities: capabilities.clone(),
         contract: native_contract(&binding.contract),
         reduction: native_reduction(&binding.reduction),
-        availability: NativeRuntimeFilterAvailability::DeploymentNotInstalled,
     })
 }
 

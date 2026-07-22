@@ -30,6 +30,7 @@ mod m3c_tests;
 mod m4_conformance_tests;
 mod materialization;
 mod memory;
+mod native_execution;
 mod producer;
 mod registry;
 mod reliable_transport;
@@ -81,6 +82,9 @@ use self::materialization::run_materialization_jobs;
 use self::materialization::{
     ClaimedMaterializationJob, MaterializationWorkClaim, PublishCommitOutcome,
     claim_materialization_jobs, execute_materialization_jobs, take_materialization_launch_events,
+};
+pub(crate) use self::native_execution::{
+    InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
 };
 use self::producer::ServiceProducerAdapter;
 use self::registry::{DeploymentRegistry, InstalledDeployment};
@@ -3225,6 +3229,257 @@ mod tests {
                 ),
             )]),
         )
+    }
+
+    mod native_execution_resolution {
+        use super::*;
+        use crate::runtime_filter::service::native_execution::NativeRuntimeFilterExecutionContext;
+
+        fn installed_membership_service() -> (
+            Arc<RuntimeFilterService>,
+            NativeRuntimeFilterExecutionContext,
+        ) {
+            let query = uid(0);
+            let finst = uid(10);
+            let channel = RuntimeFilterChannelDeployment::new(
+                ChannelId::new(1),
+                RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: NullSemantics::NeverMatches,
+                },
+                RuntimeFilterLifecycle::CompleteOnce,
+                Coverage::Leaf(CoverageWitnessId::new(101)),
+                Coverage::Leaf(CoverageWitnessId::new(101)),
+                ReductionRequirement::SetUnion,
+                BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ]),
+                CompletionRequirement::ProducerClosed,
+                RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: 321,
+                    max_artifact_bytes: 4_096,
+                    deadline_ms: 100,
+                    max_retries: 2,
+                },
+                RuntimeFilterCoreBudget::new(8_192),
+                MaterializationPolicy::for_test(),
+                BTreeMap::from([(
+                    BindingId::new(10),
+                    ProducerDeployment::new(CoverageWitnessId::new(101), BTreeSet::from([finst])),
+                )]),
+                BTreeMap::from([(
+                    BindingId::new(30),
+                    ConsumerDeployment::new(
+                        ConsumerActivation::BlockingSnapshot,
+                        BTreeSet::from([
+                            ArtifactCapability::Membership,
+                            ArtifactCapability::EmptyDomain,
+                        ]),
+                        BTreeSet::from([RouteEdgeId::new(40)]),
+                        BTreeSet::from([uid(30)]),
+                    ),
+                )]),
+            );
+            let install = local_participant_install_for_test(RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                RuntimeFilterParticipantId::new(3),
+                BTreeMap::from([(ChannelId::new(1), channel)]),
+            ));
+            let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+                query,
+                Arc::new(Clock(Instant::now())),
+                Arc::new(Events::default()),
+                MemTrackerMemoryAccount::new_root_for_test("native-resolution"),
+            ));
+            service.install(install).expect("valid install");
+            let context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(&service),
+                query,
+                DeploymentEpoch::new(9),
+                finst,
+            );
+            (service, context)
+        }
+
+        #[test]
+        fn resolved_producer_exposes_installed_max_contribution_bytes() {
+            let (_service, context) = installed_membership_service();
+
+            let resolved = context
+                .resolve_producer(
+                    BindingId::new(10),
+                    ChannelId::new(1),
+                    ProducerPortKind::Membership,
+                )
+                .expect("exact installed producer");
+
+            assert_eq!(resolved.max_contribution_bytes(), 321);
+            assert_ne!(resolved.max_contribution_bytes(), 4_096);
+            assert_eq!(
+                resolved.allowed_contribution_kinds(),
+                &BTreeSet::from([
+                    ContributionKind::ValueDomainDelta,
+                    ContributionKind::ProducerClosed,
+                ])
+            );
+            assert_eq!(
+                resolved.completion_requirement(),
+                CompletionRequirement::ProducerClosed
+            );
+            assert_eq!(
+                resolved.reduction_requirement(),
+                ReductionRequirement::SetUnion
+            );
+        }
+
+        #[test]
+        fn native_binding_role_kind_and_contract_mismatch_fail_before_open() {
+            let (service, context) = installed_membership_service();
+
+            let role = context
+                .resolve_producer(
+                    BindingId::new(30),
+                    ChannelId::new(1),
+                    ProducerPortKind::Membership,
+                )
+                .expect_err("consumer binding cannot resolve as producer");
+            assert!(role.to_string().contains("producer role"), "{role}");
+
+            let kind = context
+                .resolve_producer(
+                    BindingId::new(10),
+                    ChannelId::new(1),
+                    ProducerPortKind::OrderedBound,
+                )
+                .expect_err("port-kind drift must fail before open");
+            assert!(kind.to_string().contains("port kind"), "{kind}");
+
+            let _operation = service
+                .operation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let installed = service
+                .registry
+                .active_installation()
+                .expect("installed deployment");
+            let opened = service
+                .open_producer_locked(
+                    &installed,
+                    BindingId::new(10),
+                    uid(10),
+                    2,
+                    ProducerPortKind::Membership,
+                )
+                .expect("failed resolutions had no producer-open side effect");
+            assert_eq!(opened.outcome, SubmitOutcome::Applied);
+        }
+
+        #[test]
+        fn native_pipeline_resolves_exact_fragment_instance() {
+            let (_service, context) = installed_membership_service();
+            context
+                .resolve_producer(
+                    BindingId::new(10),
+                    ChannelId::new(1),
+                    ProducerPortKind::Membership,
+                )
+                .expect("installed fragment instance");
+
+            let wrong_context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(context.service()),
+                context.query_id(),
+                context.epoch(),
+                uid(999),
+            );
+            let error = wrong_context
+                .resolve_producer(
+                    BindingId::new(10),
+                    ChannelId::new(1),
+                    ProducerPortKind::Membership,
+                )
+                .expect_err("uninstalled fragment instance");
+            assert!(error.to_string().contains("fragment instance"), "{error}");
+        }
+
+        #[test]
+        fn native_execution_rejects_aggregator_union_remote_fragment_instance() {
+            let query = uid(0);
+            let (install, binding_id, remote_finst) =
+                super::compiled_three_backend_all_of_aggregator_install();
+            let epoch = install.epoch();
+            let service = Arc::new(RuntimeFilterService::new_with_dependencies(
+                query,
+                Arc::new(Clock(Instant::now())),
+                Arc::new(Events::default()),
+                MemTrackerMemoryAccount::new_root_for_test("native-aggregator-resolution"),
+            ));
+            service.install(install).expect("aggregator install");
+            let context =
+                NativeRuntimeFilterExecutionContext::new(service, query, epoch, remote_finst);
+
+            let error = context
+                .resolve_producer(binding_id, ChannelId::new(5), ProducerPortKind::Membership)
+                .expect_err("aggregator cannot impersonate a remote producer instance");
+            assert!(error.to_string().contains("local participant"), "{error}");
+        }
+
+        #[test]
+        fn native_consumer_resolution_matches_activation_capability_and_fragment() {
+            let (_service, producer_context) = installed_membership_service();
+            let context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(producer_context.service()),
+                producer_context.query_id(),
+                producer_context.epoch(),
+                uid(30),
+            );
+            let resolved = context
+                .resolve_consumer(
+                    BindingId::new(30),
+                    ChannelId::new(1),
+                    SubscriptionKind::BlockingSnapshot,
+                )
+                .expect("exact installed consumer");
+            assert_eq!(
+                resolved.capabilities(),
+                &BTreeSet::from([
+                    ArtifactCapability::Membership,
+                    ArtifactCapability::EmptyDomain,
+                ])
+            );
+            let error = context
+                .resolve_consumer(
+                    BindingId::new(30),
+                    ChannelId::new(1),
+                    SubscriptionKind::NonBlockingLive,
+                )
+                .expect_err("activation drift");
+            assert!(error.to_string().contains("activation"), "{error}");
+        }
+
+        #[test]
+        fn native_consumer_rejects_uninstalled_fragment_instance() {
+            let (_service, producer_context) = installed_membership_service();
+            let wrong_context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(producer_context.service()),
+                producer_context.query_id(),
+                producer_context.epoch(),
+                uid(999),
+            );
+
+            let error = wrong_context
+                .resolve_consumer(
+                    BindingId::new(30),
+                    ChannelId::new(1),
+                    SubscriptionKind::BlockingSnapshot,
+                )
+                .expect_err("consumer fragment instance is not installed");
+
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::UnauthorizedFragmentInstance
+            );
+        }
     }
 
     fn fenced_final_deployment() -> RuntimeFilterChannelDeployment {
