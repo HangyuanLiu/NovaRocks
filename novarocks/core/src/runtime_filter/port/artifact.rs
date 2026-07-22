@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
@@ -482,6 +483,7 @@ pub(crate) enum ArtifactContractError {
     EncodedSizeExceeded,
     RetentionSizeMismatch,
     ResidentSizeOverflow,
+    InvalidMembershipIndex,
 }
 
 impl fmt::Display for ArtifactContractError {
@@ -711,9 +713,143 @@ fn hash_ordered_scalar(digest: &mut Sha256, value: &OrderedScalar) {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentMembershipIndex {
+    kind: ArtifactKind,
+    canonical_digest: [u8; 32],
+    layout: ResidentMembershipIndexLayout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResidentMembershipIndexLayout {
+    EmptyDomain,
+    Fixed {
+        tag: u8,
+        values: Range<usize>,
+        count: usize,
+        width: usize,
+    },
+    Utf8 {
+        payload: Range<usize>,
+        length_offsets: Box<[usize]>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResidentMembershipIndexView<'a> {
+    EmptyDomain,
+    Fixed {
+        tag: u8,
+        values: &'a Range<usize>,
+        count: usize,
+        width: usize,
+    },
+    Utf8 {
+        payload: &'a Range<usize>,
+        length_offsets: &'a [usize],
+    },
+}
+
+impl ResidentMembershipIndex {
+    pub(crate) fn empty_domain(canonical_bytes: &[u8]) -> Self {
+        Self {
+            kind: ArtifactKind::EmptyDomain,
+            canonical_digest: Sha256::digest(canonical_bytes).into(),
+            layout: ResidentMembershipIndexLayout::EmptyDomain,
+        }
+    }
+
+    pub(crate) fn fixed(
+        canonical_bytes: &[u8],
+        tag: u8,
+        values: Range<usize>,
+        count: usize,
+        width: usize,
+    ) -> Self {
+        Self {
+            kind: ArtifactKind::ValueSet,
+            canonical_digest: Sha256::digest(canonical_bytes).into(),
+            layout: ResidentMembershipIndexLayout::Fixed {
+                tag,
+                values,
+                count,
+                width,
+            },
+        }
+    }
+
+    pub(crate) fn utf8(
+        canonical_bytes: &[u8],
+        payload: Range<usize>,
+        length_offsets: Box<[usize]>,
+    ) -> Self {
+        Self {
+            kind: ArtifactKind::ValueSet,
+            canonical_digest: Sha256::digest(canonical_bytes).into(),
+            layout: ResidentMembershipIndexLayout::Utf8 {
+                payload,
+                length_offsets,
+            },
+        }
+    }
+
+    pub(crate) fn view(&self) -> ResidentMembershipIndexView<'_> {
+        match &self.layout {
+            ResidentMembershipIndexLayout::EmptyDomain => ResidentMembershipIndexView::EmptyDomain,
+            ResidentMembershipIndexLayout::Fixed {
+                tag,
+                values,
+                count,
+                width,
+            } => ResidentMembershipIndexView::Fixed {
+                tag: *tag,
+                values,
+                count: *count,
+                width: *width,
+            },
+            ResidentMembershipIndexLayout::Utf8 {
+                payload,
+                length_offsets,
+            } => ResidentMembershipIndexView::Utf8 {
+                payload,
+                length_offsets,
+            },
+        }
+    }
+
+    pub(crate) fn heap_bytes(&self) -> Result<usize, ArtifactContractError> {
+        match &self.layout {
+            ResidentMembershipIndexLayout::Utf8 { length_offsets, .. } => length_offsets
+                .len()
+                .checked_mul(size_of::<usize>())
+                .ok_or(ArtifactContractError::ResidentSizeOverflow),
+            ResidentMembershipIndexLayout::EmptyDomain
+            | ResidentMembershipIndexLayout::Fixed { .. } => Ok(0),
+        }
+    }
+
+    fn validate_binding(
+        &self,
+        kind: ArtifactKind,
+        canonical_bytes: &[u8],
+    ) -> Result<(), ArtifactContractError> {
+        if self.kind != kind
+            || self.canonical_digest != <[u8; 32]>::from(Sha256::digest(canonical_bytes))
+        {
+            return Err(ArtifactContractError::InvalidMembershipIndex);
+        }
+        crate::runtime_filter::materializer::codec::validate_membership_index_binding(
+            canonical_bytes,
+            kind,
+            self,
+        )
+        .map_err(|_| ArtifactContractError::InvalidMembershipIndex)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum PhysicalArtifactPayload {
-    Membership,
+    Membership(Option<ResidentMembershipIndex>),
     Range(Arc<RangeArtifactData>),
 }
 
@@ -747,6 +883,24 @@ impl PhysicalArtifact {
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
 
+    pub(crate) fn accounted_indexed_resident_component_bytes(
+        encoded_bytes: usize,
+        index_heap_bytes: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        Self::accounted_resident_component_bytes(encoded_bytes)?
+            .checked_add(index_heap_bytes)
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
+    pub(crate) fn accounted_indexed_resident_bytes(
+        encoded_bytes: usize,
+        index_heap_bytes: usize,
+    ) -> Result<usize, ArtifactContractError> {
+        Self::accounted_indexed_resident_component_bytes(encoded_bytes, index_heap_bytes)?
+            .checked_add(size_of::<ArtifactRetention>())
+            .ok_or(ArtifactContractError::ResidentSizeOverflow)
+    }
+
     pub(crate) fn from_retained_bytes(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
@@ -771,7 +925,7 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
-            payload: PhysicalArtifactPayload::Membership,
+            payload: PhysicalArtifactPayload::Membership(None),
             retained_memory: Some(Arc::new(retained_memory)),
         })
     }
@@ -803,7 +957,7 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
-            payload: PhysicalArtifactPayload::Membership,
+            payload: PhysicalArtifactPayload::Membership(None),
             retained_memory: Some(retained_memory),
         })
     }
@@ -825,9 +979,104 @@ impl PhysicalArtifact {
             contains_null,
             canonical_bytes,
             canonical_digest,
-            payload: PhysicalArtifactPayload::Membership,
+            payload: PhysicalArtifactPayload::Membership(None),
             retained_memory: None,
         }
+    }
+
+    pub(crate) fn from_indexed_retained_bytes(
+        kind: ArtifactKind,
+        schema_digest: ArtifactSchemaDigest,
+        version: LogicalVersion,
+        contains_null: bool,
+        canonical_bytes: Arc<[u8]>,
+        index: ResidentMembershipIndex,
+        accounted_resident_bytes: usize,
+        retained_memory: ArtifactRetention,
+    ) -> Result<Self, ArtifactContractError> {
+        index.validate_binding(kind, &canonical_bytes)?;
+        let index_heap_bytes = index.heap_bytes()?;
+        if accounted_resident_bytes
+            != Self::accounted_indexed_resident_bytes(canonical_bytes.len(), index_heap_bytes)?
+            || retained_memory.bytes() != accounted_resident_bytes
+            || retained_memory.budget_bytes() != accounted_resident_bytes
+        {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        let canonical_digest = Sha256::digest(&canonical_bytes).into();
+        Ok(Self {
+            kind,
+            codec_version: LEAF_CODEC_VERSION,
+            schema_digest,
+            version,
+            contains_null,
+            canonical_bytes,
+            canonical_digest,
+            payload: PhysicalArtifactPayload::Membership(Some(index)),
+            retained_memory: Some(Arc::new(retained_memory)),
+        })
+    }
+
+    pub(crate) fn from_shared_indexed_retained_bytes(
+        kind: ArtifactKind,
+        schema_digest: ArtifactSchemaDigest,
+        version: LogicalVersion,
+        contains_null: bool,
+        canonical_bytes: Arc<[u8]>,
+        index: ResidentMembershipIndex,
+        accounted_resident_component_bytes: usize,
+        total_accounted_resident_bytes: usize,
+        retained_memory: Arc<ArtifactRetention>,
+    ) -> Result<Self, ArtifactContractError> {
+        index.validate_binding(kind, &canonical_bytes)?;
+        let index_heap_bytes = index.heap_bytes()?;
+        if accounted_resident_component_bytes
+            != Self::accounted_indexed_resident_component_bytes(
+                canonical_bytes.len(),
+                index_heap_bytes,
+            )?
+            || accounted_resident_component_bytes > total_accounted_resident_bytes
+            || retained_memory.bytes() != total_accounted_resident_bytes
+            || retained_memory.budget_bytes() != total_accounted_resident_bytes
+        {
+            return Err(ArtifactContractError::RetentionSizeMismatch);
+        }
+        let canonical_digest = Sha256::digest(&canonical_bytes).into();
+        Ok(Self {
+            kind,
+            codec_version: LEAF_CODEC_VERSION,
+            schema_digest,
+            version,
+            contains_null,
+            canonical_bytes,
+            canonical_digest,
+            payload: PhysicalArtifactPayload::Membership(Some(index)),
+            retained_memory: Some(retained_memory),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_indexed_test(
+        kind: ArtifactKind,
+        schema_digest: ArtifactSchemaDigest,
+        version: LogicalVersion,
+        contains_null: bool,
+        canonical_bytes: Arc<[u8]>,
+        index: ResidentMembershipIndex,
+    ) -> Result<Self, ArtifactContractError> {
+        index.validate_binding(kind, &canonical_bytes)?;
+        let canonical_digest = Sha256::digest(&canonical_bytes).into();
+        Ok(Self {
+            kind,
+            codec_version: LEAF_CODEC_VERSION,
+            schema_digest,
+            version,
+            contains_null,
+            canonical_bytes,
+            canonical_digest,
+            payload: PhysicalArtifactPayload::Membership(Some(index)),
+            retained_memory: None,
+        })
     }
 
     pub(crate) fn accounted_range_resident_component_bytes(
@@ -939,8 +1188,14 @@ impl PhysicalArtifact {
     }
     pub(crate) fn range(&self) -> Option<&RangeArtifactData> {
         match &self.payload {
-            PhysicalArtifactPayload::Membership => None,
+            PhysicalArtifactPayload::Membership(_) => None,
             PhysicalArtifactPayload::Range(data) => Some(data),
+        }
+    }
+    pub(crate) fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
+        match &self.payload {
+            PhysicalArtifactPayload::Membership(index) => index.as_ref(),
+            PhysicalArtifactPayload::Range(_) => None,
         }
     }
     pub(crate) fn retained_memory_bytes(&self) -> usize {
@@ -957,8 +1212,13 @@ impl PhysicalArtifact {
 
     fn accounted_component_bytes(&self) -> Result<usize, ArtifactContractError> {
         match &self.payload {
-            PhysicalArtifactPayload::Membership => {
-                Self::accounted_resident_component_bytes(self.canonical_bytes.len())
+            PhysicalArtifactPayload::Membership(index) => {
+                Self::accounted_indexed_resident_component_bytes(
+                    self.canonical_bytes.len(),
+                    index
+                        .as_ref()
+                        .map_or(Ok(0), ResidentMembershipIndex::heap_bytes)?,
+                )
             }
             PhysicalArtifactPayload::Range(data) => {
                 Self::accounted_range_resident_component_bytes(self.canonical_bytes.len(), data)
@@ -1223,7 +1483,7 @@ mod tests {
 
     use super::{
         ArtifactBundle, ArtifactContractError, ArtifactKind, ArtifactSchemaDigest,
-        ConsumerArtifactProfile, PhysicalArtifact,
+        ConsumerArtifactProfile, PhysicalArtifact, ResidentMembershipIndex,
     };
 
     struct AcceptingMemoryAccount;
@@ -1234,6 +1494,56 @@ mod tests {
         }
 
         fn release(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn indexed_artifact_constructor_revalidates_kind_digest_and_layout_binding() {
+        let bytes: Arc<[u8]> = Arc::from([0_u8; 8]);
+        let digest = ArtifactSchemaDigest::from_canonical_bytes([1; 32]);
+        let version = LogicalVersion::FIRST;
+
+        let wrong_kind = ResidentMembershipIndex::fixed(&bytes, 5, 0..8, 1, 8);
+        assert_eq!(
+            PhysicalArtifact::new_indexed_test(
+                ArtifactKind::EmptyDomain,
+                digest,
+                version,
+                false,
+                bytes.clone(),
+                wrong_kind,
+            )
+            .unwrap_err(),
+            ArtifactContractError::InvalidMembershipIndex
+        );
+
+        let wrong_layout = ResidentMembershipIndex::fixed(&bytes, 5, 0..8, 2, 8);
+        assert_eq!(
+            PhysicalArtifact::new_indexed_test(
+                ArtifactKind::ValueSet,
+                digest,
+                version,
+                false,
+                bytes.clone(),
+                wrong_layout,
+            )
+            .unwrap_err(),
+            ArtifactContractError::InvalidMembershipIndex
+        );
+
+        let stale_digest = ResidentMembershipIndex::fixed(&bytes, 5, 0..8, 1, 8);
+        let mutated: Arc<[u8]> = Arc::from([1_u8; 8]);
+        assert_eq!(
+            PhysicalArtifact::new_indexed_test(
+                ArtifactKind::ValueSet,
+                digest,
+                version,
+                false,
+                mutated,
+                stale_digest,
+            )
+            .unwrap_err(),
+            ArtifactContractError::InvalidMembershipIndex
+        );
     }
 
     #[test]

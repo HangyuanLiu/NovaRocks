@@ -18,6 +18,7 @@
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::runtime_filter::model::contract::NullSemantics;
@@ -25,7 +26,7 @@ use crate::runtime_filter::model::contract::{ComparatorDigest, NullOrder, SortDi
 use crate::runtime_filter::port::artifact::{
     ArtifactKind, ArtifactMembershipSchema, ArtifactMembershipSchemaView, ArtifactSchemaDigest,
     HashContractDigest, LEAF_CODEC_VERSION, PhysicalArtifact, RangeArtifactData,
-    RangeArtifactResidentLayout,
+    RangeArtifactResidentLayout, ResidentMembershipIndex, ResidentMembershipIndexView,
 };
 use crate::runtime_filter::port::identity::LogicalVersion;
 use crate::runtime_filter::port::ordered_bound::{
@@ -43,6 +44,402 @@ const MAGIC: &[u8; 4] = b"NRFL";
 const RANGE_MAGIC: &[u8; 4] = b"NRRG";
 const RANGE_CODEC_VERSION: u16 = 1;
 const FLAG_CONTAINS_NULL: u8 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MembershipIndexPlan {
+    kind: ArtifactKind,
+    layout: MembershipIndexLayoutPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MembershipIndexLayoutPlan {
+    EmptyDomain,
+    Fixed {
+        tag: u8,
+        values: Range<usize>,
+        count: usize,
+        width: usize,
+    },
+    Utf8 {
+        payload: Range<usize>,
+        count: usize,
+    },
+}
+
+impl MembershipIndexPlan {
+    pub(crate) fn heap_bytes(&self) -> Result<usize, ArtifactCodecError> {
+        match self.layout {
+            MembershipIndexLayoutPlan::Utf8 { count, .. } => count
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or(ArtifactCodecError::LengthOverflow),
+            MembershipIndexLayoutPlan::EmptyDomain | MembershipIndexLayoutPlan::Fixed { .. } => {
+                Ok(0)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MembershipProbe<'a> {
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    LargeInt(i128),
+    Float32(f32),
+    Float64(f64),
+    Utf8(&'a str),
+    Date32(i32),
+    Timestamp(i64),
+    Decimal128(i128),
+}
+
+pub(crate) fn inspect_membership_index(
+    encoded: &[u8],
+) -> Result<MembershipIndexPlan, ArtifactCodecError> {
+    let header = parse_header(encoded)?;
+    let payload_start = header.payload.as_ptr() as usize - encoded.as_ptr() as usize;
+    let layout = match header.kind {
+        ArtifactKind::EmptyDomain => {
+            if header.contains_null || !header.payload.is_empty() {
+                return Err(ArtifactCodecError::NonCanonicalPayload);
+            }
+            MembershipIndexLayoutPlan::EmptyDomain
+        }
+        ArtifactKind::ValueSet => {
+            validate_value_set(header.payload, header.contains_null, &header.schema)?;
+            inspect_value_set_layout(header.payload, payload_start)?
+        }
+        _ => return Err(ArtifactCodecError::UnsupportedKind),
+    };
+    Ok(MembershipIndexPlan {
+        kind: header.kind,
+        layout,
+    })
+}
+
+fn inspect_value_set_layout(
+    payload: &[u8],
+    payload_start: usize,
+) -> Result<MembershipIndexLayoutPlan, ArtifactCodecError> {
+    let mut reader = Reader::new(payload);
+    let tag = reader.read_u8()?;
+    if tag == 9 {
+        let count =
+            usize::try_from(reader.read_u64()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+        let start = payload.len() - reader.remaining_len();
+        return Ok(MembershipIndexLayoutPlan::Utf8 {
+            payload: payload_start + start..payload_start + payload.len(),
+            count,
+        });
+    }
+    let width = match tag {
+        1 | 2 => 1,
+        3 => 2,
+        4 | 7 | 10 => 4,
+        5 | 8 => 8,
+        6 => 16,
+        11 => {
+            reader.read_u8()?;
+            match reader.read_u8()? {
+                0 => {}
+                1 => {
+                    let len = usize::try_from(reader.read_u64()?)
+                        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+                    reader.read_exact(len)?;
+                }
+                _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+            }
+            8
+        }
+        12 => {
+            reader.read_u8()?;
+            reader.read_u8()?;
+            16
+        }
+        _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+    };
+    let count =
+        usize::try_from(reader.read_u64()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let start = payload.len() - reader.remaining_len();
+    Ok(MembershipIndexLayoutPlan::Fixed {
+        tag,
+        values: payload_start + start..payload_start + payload.len(),
+        count,
+        width,
+    })
+}
+
+pub(crate) fn build_membership_index(
+    encoded: &[u8],
+    plan: &MembershipIndexPlan,
+) -> Result<ResidentMembershipIndex, ArtifactCodecError> {
+    Ok(match &plan.layout {
+        MembershipIndexLayoutPlan::EmptyDomain => ResidentMembershipIndex::empty_domain(encoded),
+        MembershipIndexLayoutPlan::Fixed {
+            tag,
+            values,
+            count,
+            width,
+        } => ResidentMembershipIndex::fixed(encoded, *tag, values.clone(), *count, *width),
+        MembershipIndexLayoutPlan::Utf8 { payload, count } => {
+            let bytes = encoded
+                .get(payload.clone())
+                .ok_or(ArtifactCodecError::Truncated)?;
+            let mut reader = Reader::new(bytes);
+            let mut offsets = Vec::new();
+            offsets
+                .try_reserve_exact(*count)
+                .map_err(|_| ArtifactCodecError::ResourceUnavailable)?;
+            for _ in 0..*count {
+                offsets.push(payload.start + bytes.len() - reader.remaining_len());
+                let len = usize::try_from(reader.read_u64()?)
+                    .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+                reader.read_exact(len)?;
+            }
+            if !reader.is_empty() {
+                return Err(ArtifactCodecError::TrailingBytes);
+            }
+            ResidentMembershipIndex::utf8(encoded, payload.clone(), offsets.into_boxed_slice())
+        }
+    })
+}
+
+pub(crate) fn validate_membership_index_binding(
+    encoded: &[u8],
+    kind: ArtifactKind,
+    index: &ResidentMembershipIndex,
+) -> Result<(), ArtifactCodecError> {
+    let plan = inspect_membership_index(encoded)?;
+    if plan.kind != kind {
+        return Err(ArtifactCodecError::KindMismatch);
+    }
+    match (&plan.layout, index.view()) {
+        (MembershipIndexLayoutPlan::EmptyDomain, ResidentMembershipIndexView::EmptyDomain) => {
+            Ok(())
+        }
+        (
+            MembershipIndexLayoutPlan::Fixed {
+                tag: expected_tag,
+                values: expected_values,
+                count: expected_count,
+                width: expected_width,
+            },
+            ResidentMembershipIndexView::Fixed {
+                tag,
+                values,
+                count,
+                width,
+            },
+        ) if *expected_tag == tag
+            && expected_values == values
+            && *expected_count == count
+            && *expected_width == width =>
+        {
+            Ok(())
+        }
+        (
+            MembershipIndexLayoutPlan::Utf8 {
+                payload: expected_payload,
+                count,
+            },
+            ResidentMembershipIndexView::Utf8 {
+                payload,
+                length_offsets,
+            },
+        ) if expected_payload == payload && *count == length_offsets.len() => {
+            let bytes = encoded
+                .get(expected_payload.clone())
+                .ok_or(ArtifactCodecError::Truncated)?;
+            let mut reader = Reader::new(bytes);
+            for expected_offset in length_offsets {
+                let actual_offset = expected_payload.start + bytes.len() - reader.remaining_len();
+                if actual_offset != *expected_offset {
+                    return Err(ArtifactCodecError::ContractViolation);
+                }
+                let len = usize::try_from(reader.read_u64()?)
+                    .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+                reader.read_exact(len)?;
+            }
+            if !reader.is_empty() {
+                return Err(ArtifactCodecError::TrailingBytes);
+            }
+            Ok(())
+        }
+        _ => Err(ArtifactCodecError::ContractViolation),
+    }
+}
+
+pub(crate) fn indexed_membership_contains(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    probe: MembershipProbe<'_>,
+) -> Result<bool, ArtifactCodecError> {
+    indexed_membership_contains_inner(encoded, index, probe, |_| {})
+}
+
+fn indexed_membership_contains_inner(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    probe: MembershipProbe<'_>,
+    mut compared: impl FnMut(()),
+) -> Result<bool, ArtifactCodecError> {
+    match index.view() {
+        ResidentMembershipIndexView::EmptyDomain => Ok(false),
+        ResidentMembershipIndexView::Utf8 { length_offsets, .. } => {
+            let MembershipProbe::Utf8(needle) = probe else {
+                return Err(ArtifactCodecError::ContractViolation);
+            };
+            let mut low = 0usize;
+            let mut high = length_offsets.len();
+            while low < high {
+                let middle = low + (high - low) / 2;
+                compared(());
+                match read_indexed_utf8(encoded, length_offsets[middle])?.cmp(needle) {
+                    Ordering::Less => low = middle + 1,
+                    Ordering::Greater => high = middle,
+                    Ordering::Equal => return Ok(true),
+                }
+            }
+            Ok(false)
+        }
+        ResidentMembershipIndexView::Fixed {
+            tag,
+            values,
+            count,
+            width,
+        } => {
+            let bytes = encoded
+                .get(values.clone())
+                .ok_or(ArtifactCodecError::Truncated)?;
+            let expected_len = count
+                .checked_mul(width)
+                .ok_or(ArtifactCodecError::LengthOverflow)?;
+            if bytes.len() != expected_len {
+                return Err(ArtifactCodecError::Truncated);
+            }
+            let needle = fixed_probe(tag, probe)?;
+            let mut low = 0usize;
+            let mut high = count;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let start = middle
+                    .checked_mul(width)
+                    .ok_or(ArtifactCodecError::LengthOverflow)?;
+                let end = start
+                    .checked_add(width)
+                    .ok_or(ArtifactCodecError::LengthOverflow)?;
+                let value = bytes.get(start..end).ok_or(ArtifactCodecError::Truncated)?;
+                compared(());
+                match compare_fixed(tag, value, needle)? {
+                    Ordering::Less => low = middle + 1,
+                    Ordering::Greater => high = middle,
+                    Ordering::Equal => return Ok(true),
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn indexed_membership_contains_counted_for_test(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    probe: MembershipProbe<'_>,
+) -> Result<(bool, usize), ArtifactCodecError> {
+    let mut comparisons = 0usize;
+    let found = indexed_membership_contains_inner(encoded, index, probe, |_| comparisons += 1)?;
+    Ok((found, comparisons))
+}
+
+fn read_indexed_utf8(encoded: &[u8], offset: usize) -> Result<&str, ArtifactCodecError> {
+    let mut reader = Reader::new(encoded.get(offset..).ok_or(ArtifactCodecError::Truncated)?);
+    let len =
+        usize::try_from(reader.read_u64()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    std::str::from_utf8(reader.read_exact(len)?)
+        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+}
+
+#[derive(Clone, Copy)]
+enum FixedProbe {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    U32(u32),
+    U64(u64),
+}
+
+fn fixed_probe(tag: u8, probe: MembershipProbe<'_>) -> Result<FixedProbe, ArtifactCodecError> {
+    Ok(match (tag, probe) {
+        (1, MembershipProbe::Boolean(v)) => FixedProbe::Bool(v),
+        (2, MembershipProbe::Int8(v)) => FixedProbe::I8(v),
+        (3, MembershipProbe::Int16(v)) => FixedProbe::I16(v),
+        (4, MembershipProbe::Int32(v)) | (10, MembershipProbe::Date32(v)) => FixedProbe::I32(v),
+        (5, MembershipProbe::Int64(v)) | (11, MembershipProbe::Timestamp(v)) => FixedProbe::I64(v),
+        (6, MembershipProbe::LargeInt(v)) | (12, MembershipProbe::Decimal128(v)) => {
+            FixedProbe::I128(v)
+        }
+        (7, MembershipProbe::Float32(v)) => FixedProbe::U32(canonical_probe_f32(v)),
+        (8, MembershipProbe::Float64(v)) => FixedProbe::U64(canonical_probe_f64(v)),
+        _ => return Err(ArtifactCodecError::ContractViolation),
+    })
+}
+
+fn compare_fixed(
+    tag: u8,
+    bytes: &[u8],
+    needle: FixedProbe,
+) -> Result<Ordering, ArtifactCodecError> {
+    macro_rules! decode {
+        ($ty:ty) => {
+            <$ty>::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| ArtifactCodecError::Truncated)?,
+            )
+        };
+    }
+    Ok(match (tag, needle) {
+        (1, FixedProbe::Bool(v)) => match bytes {
+            [0] => false.cmp(&v),
+            [1] => true.cmp(&v),
+            _ => return Err(ArtifactCodecError::NonCanonicalPayload),
+        },
+        (2, FixedProbe::I8(v)) => decode!(i8).cmp(&v),
+        (3, FixedProbe::I16(v)) => decode!(i16).cmp(&v),
+        (4 | 10, FixedProbe::I32(v)) => decode!(i32).cmp(&v),
+        (5 | 11, FixedProbe::I64(v)) => decode!(i64).cmp(&v),
+        (6 | 12, FixedProbe::I128(v)) => decode!(i128).cmp(&v),
+        (7, FixedProbe::U32(v)) => f32::from_bits(decode!(u32)).total_cmp(&f32::from_bits(v)),
+        (8, FixedProbe::U64(v)) => f64::from_bits(decode!(u64)).total_cmp(&f64::from_bits(v)),
+        _ => return Err(ArtifactCodecError::ContractViolation),
+    })
+}
+
+fn canonical_probe_f32(value: f32) -> u32 {
+    if value == 0.0 {
+        0
+    } else if value.is_nan() {
+        0x7fc0_0000
+    } else {
+        value.to_bits()
+    }
+}
+
+fn canonical_probe_f64(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else if value.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        value.to_bits()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArtifactDecodeExpectations {
@@ -256,20 +653,51 @@ pub(crate) fn decode_leaf(
         ArtifactKind::Range => return Err(ArtifactCodecError::UnsupportedKind),
     }
 
-    let accounted_resident_bytes = PhysicalArtifact::accounted_resident_bytes(encoded.len())
-        .map_err(|_| ArtifactCodecError::LengthOverflow)?;
+    let index_plan = match header.kind {
+        ArtifactKind::ValueSet | ArtifactKind::EmptyDomain => {
+            Some(inspect_membership_index(encoded)?)
+        }
+        ArtifactKind::Bitset | ArtifactKind::Bloom => None,
+        ArtifactKind::Range => unreachable!("range artifacts returned above"),
+    };
+    let index_heap_bytes = index_plan
+        .as_ref()
+        .map_or(Ok(0), MembershipIndexPlan::heap_bytes)?;
+    let accounted_resident_bytes = if index_plan.is_some() {
+        PhysicalArtifact::accounted_indexed_resident_bytes(encoded.len(), index_heap_bytes)
+    } else {
+        PhysicalArtifact::accounted_resident_bytes(encoded.len())
+    }
+    .map_err(|_| ArtifactCodecError::LengthOverflow)?;
     let retention =
         ArtifactRetention::try_new(accounted_resident_bytes, retained_budget, memory_account)?;
+    let index = index_plan
+        .as_ref()
+        .map(|plan| build_membership_index(encoded, plan))
+        .transpose()?;
     let bytes: Arc<[u8]> = Arc::from(encoded);
-    let artifact = PhysicalArtifact::from_retained_bytes(
-        header.kind,
-        header.schema_digest,
-        header.logical_version,
-        header.contains_null,
-        bytes,
-        accounted_resident_bytes,
-        retention,
-    )
+    let artifact = if let Some(index) = index {
+        PhysicalArtifact::from_indexed_retained_bytes(
+            header.kind,
+            header.schema_digest,
+            header.logical_version,
+            header.contains_null,
+            bytes,
+            index,
+            accounted_resident_bytes,
+            retention,
+        )
+    } else {
+        PhysicalArtifact::from_retained_bytes(
+            header.kind,
+            header.schema_digest,
+            header.logical_version,
+            header.contains_null,
+            bytes,
+            accounted_resident_bytes,
+            retention,
+        )
+    }
     .map_err(|_| ArtifactCodecError::ResourceLimit)?;
     Ok(Arc::new(artifact))
 }
@@ -1384,6 +1812,23 @@ fn decode_leaf_unretained_for_test(
         fn release(&self, _bytes: usize) {}
     }
     let header = parse_header(encoded)?;
+    let index_heap_bytes = if matches!(
+        header.kind,
+        ArtifactKind::ValueSet | ArtifactKind::EmptyDomain
+    ) {
+        inspect_membership_index(encoded)?.heap_bytes()?
+    } else {
+        0
+    };
+    let retained_bytes = if matches!(
+        header.kind,
+        ArtifactKind::ValueSet | ArtifactKind::EmptyDomain
+    ) {
+        PhysicalArtifact::accounted_indexed_resident_bytes(encoded.len(), index_heap_bytes)
+    } else {
+        PhysicalArtifact::accounted_resident_bytes(encoded.len())
+    }
+    .map_err(|_| ArtifactCodecError::LengthOverflow)?;
     decode_leaf(
         encoded,
         ArtifactDecodeExpectations {
@@ -1394,10 +1839,7 @@ fn decode_leaf_unretained_for_test(
             expected_hash_contract: None,
         },
         encoded.len(),
-        Arc::new(ArtifactRetainedBudget::new(
-            PhysicalArtifact::accounted_resident_bytes(encoded.len())
-                .map_err(|_| ArtifactCodecError::LengthOverflow)?,
-        )),
+        Arc::new(ArtifactRetainedBudget::new(retained_bytes)),
         Arc::new(Unlimited),
     )
 }
@@ -1416,7 +1858,7 @@ mod tests {
     };
     use crate::runtime_filter::port::artifact::{
         ArtifactKind, ArtifactMembershipSchema, ArtifactSchemaDigest, HashContractDigest,
-        PhysicalArtifact,
+        PhysicalArtifact, ResidentMembershipIndexView,
     };
     use crate::runtime_filter::port::identity::LogicalVersion;
     use crate::runtime_filter::port::install::MaterializationPolicy;
@@ -1434,9 +1876,10 @@ mod tests {
 
     use super::super::bloom::{BloomHashContract, build_bits};
     use super::{
-        ArtifactCodecError, ArtifactDecodeExpectations, RangeDecodeExpectations, decode_leaf,
-        decode_leaf_unretained_for_test, decode_range, encode_membership_leaf,
-        encode_physical_leaf, encode_range_leaf,
+        ArtifactCodecError, ArtifactDecodeExpectations, MembershipProbe, RangeDecodeExpectations,
+        decode_leaf, decode_leaf_unretained_for_test, decode_range, encode_membership_leaf,
+        encode_physical_leaf, encode_range_leaf, indexed_membership_contains,
+        indexed_membership_contains_counted_for_test, inspect_membership_index,
     };
 
     fn range_codec_fixture() -> (
@@ -1910,6 +2353,128 @@ mod tests {
             .unwrap();
             assert_eq!(decoded.kind(), ArtifactKind::ValueSet);
             assert_eq!(decoded.canonical_bytes(), encoded);
+        }
+    }
+
+    #[test]
+    fn membership_index_heap_is_exactly_accounted_before_build() {
+        let fixed = int64_leaf([1, 2, 3], false);
+        assert_eq!(
+            inspect_membership_index(&fixed)
+                .unwrap()
+                .heap_bytes()
+                .unwrap(),
+            0
+        );
+
+        let values = MembershipValues::utf8(["a", "bb", "ccc"]);
+        let data_type = values.data_type();
+        let encoded = encode_membership_leaf(
+            &ReducedMembershipDomain::new(values, false),
+            NullSemantics::NeverMatches,
+            LogicalVersion::FIRST,
+        )
+        .unwrap();
+        let heap_bytes = inspect_membership_index(&encoded)
+            .unwrap()
+            .heap_bytes()
+            .unwrap();
+        assert_eq!(heap_bytes, 3 * std::mem::size_of::<usize>());
+        let footprint =
+            PhysicalArtifact::accounted_indexed_resident_bytes(encoded.len(), heap_bytes).unwrap();
+        let expectations = ArtifactDecodeExpectations {
+            expected_kind: ArtifactKind::ValueSet,
+            expected_schema_digest: ArtifactSchemaDigest::for_membership(
+                &data_type,
+                NullSemantics::NeverMatches,
+            )
+            .unwrap(),
+            expected_logical_version: LogicalVersion::FIRST,
+            expected_hash_contract: None,
+        };
+        let account = Arc::new(CountingAccount::default());
+        let too_small = Arc::new(ArtifactRetainedBudget::new(footprint - 1));
+        assert_eq!(
+            decode_leaf(
+                &encoded,
+                expectations,
+                encoded.len(),
+                too_small.clone(),
+                account.clone(),
+            )
+            .unwrap_err(),
+            ArtifactCodecError::ResourceLimit
+        );
+        assert_eq!(too_small.retained_bytes(), 0);
+        assert_eq!(account.retained.load(Ordering::SeqCst), 0);
+
+        let exact = Arc::new(ArtifactRetainedBudget::new(footprint));
+        let artifact = decode_leaf(
+            &encoded,
+            expectations,
+            encoded.len(),
+            exact.clone(),
+            account.clone(),
+        )
+        .unwrap();
+        assert_eq!(artifact.retained_memory_bytes(), footprint);
+        assert_eq!(
+            artifact.membership_index().unwrap().heap_bytes().unwrap(),
+            heap_bytes
+        );
+        drop(artifact);
+        assert_eq!(exact.retained_bytes(), 0);
+        assert_eq!(account.retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn malformed_resident_index_never_panics_or_swallows_lookup_errors() {
+        let fixed_bytes = int64_leaf([1, 2], false);
+        let fixed_plan = inspect_membership_index(&fixed_bytes).unwrap();
+        let fixed = super::build_membership_index(&fixed_bytes, &fixed_plan).unwrap();
+        assert_eq!(
+            indexed_membership_contains(
+                &fixed_bytes[..fixed_bytes.len() - 1],
+                &fixed,
+                MembershipProbe::Int64(1),
+            ),
+            Err(ArtifactCodecError::Truncated)
+        );
+
+        let values = MembershipValues::utf8(["x"]);
+        let mut utf8_bytes = encode_membership_leaf(
+            &ReducedMembershipDomain::new(values, false),
+            NullSemantics::NeverMatches,
+            LogicalVersion::FIRST,
+        )
+        .unwrap();
+        let utf8_plan = inspect_membership_index(&utf8_bytes).unwrap();
+        let utf8 = super::build_membership_index(&utf8_bytes, &utf8_plan).unwrap();
+        let ResidentMembershipIndexView::Utf8 { length_offsets, .. } = utf8.view() else {
+            panic!("Utf8 leaf must build an Utf8 index");
+        };
+        let offset = length_offsets[0];
+        utf8_bytes[offset..offset + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(matches!(
+            indexed_membership_contains(&utf8_bytes, &utf8, MembershipProbe::Utf8("x")),
+            Err(ArtifactCodecError::LengthOverflow | ArtifactCodecError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn fixed_membership_probe_is_logarithmic_at_4096_values() {
+        let encoded = int64_leaf(0..4096, false);
+        let plan = inspect_membership_index(&encoded).unwrap();
+        let index = super::build_membership_index(&encoded, &plan).unwrap();
+        for (needle, expected) in [(0, true), (2048, true), (4095, true), (8192, false)] {
+            let (found, comparisons) = indexed_membership_contains_counted_for_test(
+                &encoded,
+                &index,
+                MembershipProbe::Int64(needle),
+            )
+            .unwrap();
+            assert_eq!(found, expected);
+            assert!(comparisons <= 13, "4096 values need at most 13 comparisons");
         }
     }
 
