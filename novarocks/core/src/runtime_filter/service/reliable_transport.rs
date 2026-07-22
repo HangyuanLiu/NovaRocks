@@ -73,7 +73,7 @@ use crate::runtime_filter::router::remote::{
 };
 use crate::service::grpc_runtime_filter_sender::GrpcRuntimeFilterEnvelopeSink;
 
-use super::{CloseRole, LifecycleBarrier, LifecyclePermit};
+use super::{CloseRole, FinalizerCompletion, LifecycleBarrier, LifecyclePermit};
 
 /// Bounded retry / deadline / buffer policy for the reliable transport.
 ///
@@ -478,10 +478,16 @@ impl ReliableEnvelopeTransport {
             }
             CloseRole::Leader => self.lifecycle.wait_for_quiescence(),
         }
+        let completion = FinalizerCompletion::new(&self.lifecycle);
+        let mut first_panic = None;
         // The lifecycle mutex is not held across trait calls. A synchronous shutdown
         // reentry observes this thread as the finalizer and returns deferred; this
         // finalizer then completes the close and wakes every duplicate caller.
-        self.sink.shutdown();
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.sink.shutdown()))
+        {
+            first_panic = Some(payload);
+        }
         #[cfg(test)]
         if let Some(sink) = self
             .sink_override
@@ -490,7 +496,11 @@ impl ReliableEnvelopeTransport {
             .as_ref()
             .cloned()
         {
-            sink.shutdown();
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.shutdown()))
+            {
+                first_panic.get_or_insert(payload);
+            }
         }
         let mut pending = self
             .pending
@@ -500,7 +510,10 @@ impl ReliableEnvelopeTransport {
         pending.frame_refs.clear();
         pending.bytes = 0;
         drop(pending);
-        self.lifecycle.mark_closed();
+        drop(completion);
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// Emit a structured transport lifecycle event through the query's RFD-3 sink.
@@ -1119,6 +1132,15 @@ mod tests {
         ) -> ReliableSendOutcome {
             self.send(route, frame, event_identity(route.route_edge_id()))
         }
+
+        fn lifecycle_closed_for_test(&self) -> bool {
+            self.lifecycle
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .phase
+                == super::super::LifecyclePhase::Closed
+        }
     }
 
     /// Drivable fake sink: records every (route edge, frame) it is handed so a test
@@ -1199,6 +1221,30 @@ mod tests {
 
     struct ReentrantShutdownSink {
         transport: Mutex<Weak<ReliableEnvelopeTransport>>,
+    }
+
+    struct PanicOnceShutdownSink {
+        panic_once: AtomicBool,
+    }
+
+    impl RuntimeFilterEnvelopeSink for PanicOnceShutdownSink {
+        fn try_send(
+            &self,
+            _route: RuntimeFilterRemoteRoute,
+            _envelope: RuntimeFilterTransportEnvelope,
+        ) -> SinkSubmitOutcome {
+            SinkSubmitOutcome::Submitted
+        }
+
+        fn try_recv_completion(&self) -> Option<SinkCompletion> {
+            None
+        }
+
+        fn shutdown(&self) {
+            if self.panic_once.swap(false, Ordering::AcqRel) {
+                panic!("intentional sink shutdown panic");
+            }
+        }
     }
 
     impl RuntimeFilterEnvelopeSink for ReentrantShutdownSink {
@@ -1352,6 +1398,45 @@ mod tests {
             .expect("sink shutdown reentry deadlocked");
         sender.join().expect("reentrant sender thread");
         assert!(matches!(outcome, ReliableSendOutcome::Shutdown));
+    }
+
+    #[test]
+    fn sink_shutdown_panic_closes_transport_and_wakes_duplicate_shutdown() {
+        let transport = Arc::new(ReliableEnvelopeTransport::new(
+            Arc::new(PanicOnceShutdownSink {
+                panic_once: AtomicBool::new(true),
+            }),
+            Arc::new(ManualClock::new(Instant::now())),
+            policy(100, 3, 10_000),
+            Arc::new(NoopEvents),
+        ));
+        transport.send_test(&route(144), frame(5)).expect_buffered();
+        assert_eq!(transport.pending_len(), 1);
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let transport = transport.clone();
+            move || transport.shutdown()
+        }));
+        assert!(first.is_err(), "the original sink panic must be resumed");
+
+        let (second_done_tx, second_done_rx) = mpsc::sync_channel(1);
+        let second_transport = transport.clone();
+        let second = std::thread::spawn(move || {
+            second_transport.shutdown();
+            second_done_tx.send(()).expect("second shutdown complete");
+        });
+        let second_completed = second_done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if second_completed {
+            second.join().expect("second shutdown thread");
+        }
+
+        assert!(
+            second_completed,
+            "duplicate shutdown remained blocked after sink panic"
+        );
+        assert!(transport.lifecycle_closed_for_test());
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(transport.pending_bytes(), 0);
     }
 
     #[test]
