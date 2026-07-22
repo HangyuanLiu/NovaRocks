@@ -184,6 +184,41 @@ impl ProcessGuard {
             }
         }
     }
+
+    #[cfg(unix)]
+    fn shutdown_cleanly(&mut self, timeout: Duration) {
+        let pid = i32::try_from(self.child.id()).expect("child PID fits i32");
+        // SAFETY: `pid` belongs to the child owned by this guard, and SIGINT is
+        // the server's supported graceful-shutdown signal on Unix.
+        let signal_result = unsafe { libc::kill(pid, libc::SIGINT) };
+        assert_eq!(
+            signal_result,
+            0,
+            "send SIGINT to novarocks pid {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child after SIGINT") {
+                assert!(
+                    status.success(),
+                    "novarocks did not exit cleanly after SIGINT: status={status}; stderr={}",
+                    self.read_stderr()
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!(
+                    "timed out after {timeout:?} waiting for novarocks to exit after SIGINT; stderr={}",
+                    self.read_stderr()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for ProcessGuard {
@@ -200,7 +235,9 @@ fn connect_mysql(port: u16) -> MysqlConn {
             .ip_or_hostname(Some("127.0.0.1".to_string()))
             .tcp_port(port)
             .prefer_socket(false)
-            .user(Some("root".to_string()));
+            .user(Some("root".to_string()))
+            .read_timeout(Some(Duration::from_secs(10)))
+            .write_timeout(Some(Duration::from_secs(10)));
         match MysqlConn::new(builder) {
             Ok(conn) => return conn,
             Err(err) => {
@@ -343,12 +380,11 @@ backends = ["127.0.0.1:{be_grpc_port}"]
 struct MultiBeClusterHarness {
     #[allow(dead_code)]
     bes: Vec<ProcessGuard>,
-    _fe: ProcessGuard,
+    fe: Option<ProcessGuard>,
     fe_mysql: u16,
     #[allow(dead_code)]
     _be_configs: Vec<NamedTempFile>,
-    #[allow(dead_code)]
-    _fe_config: NamedTempFile,
+    fe_config: NamedTempFile,
 }
 
 impl MultiBeClusterHarness {
@@ -449,15 +485,29 @@ backends = [{backends_list}]
 
         Self {
             bes,
-            _fe: fe,
+            fe: Some(fe),
             fe_mysql: fe_mysql_port,
             _be_configs: be_configs,
-            _fe_config: fe_config,
+            fe_config,
         }
     }
 
     fn fe_mysql_port(&self) -> u16 {
         self.fe_mysql
+    }
+
+    #[cfg(unix)]
+    fn shutdown_fe_cleanly(&mut self, timeout: Duration) {
+        let mut fe = self.fe.take().expect("FE process must be running");
+        fe.shutdown_cleanly(timeout);
+    }
+
+    #[cfg(unix)]
+    fn restart_fe(&mut self) {
+        assert!(self.fe.is_none(), "old FE process must be stopped");
+        let mut fe = ProcessGuard::spawn(self.fe_config.path());
+        fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+        self.fe = Some(fe);
     }
 
     fn wait_for_be_submit_cancel_match(
@@ -1197,6 +1247,58 @@ fn cross_process_three_be_state_store_baseline() {
         "3-BE multi-fragment query must return sorted results [1, 2]"
     );
     eprintln!("NOVAROCKS_CLUSTER_BASELINE_RESULT fragments=multi rows=[1,2]");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_sqlite_state_store_lifecycle() {
+    let _guard = lock_cluster_mvp();
+    let state_store_dir = tempfile::tempdir_in(runtime_dir()).expect("create state store tempdir");
+    let state_store_path = state_store_dir.path().join("frontend-state.sqlite");
+    assert!(
+        state_store_path.is_absolute(),
+        "SQLite StateStore path must be absolute: {}",
+        state_store_path.display()
+    );
+    let state_store_config = format!(
+        r#"
+[state_store]
+provider = "sqlite"
+path = "{}"
+cluster_id = "cluster-mvp"
+deployment_owner = "fe-1"
+"#,
+        state_store_path.display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_n_be(3, "", &state_store_config);
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("multi-fragment CTE+JOIN query must succeed on 3-BE cluster");
+    assert_eq!(
+        rows,
+        vec![1i64, 2i64],
+        "3-BE multi-fragment query must return sorted results [1, 2]"
+    );
+    drop(conn);
+
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(
+        state_store_path.is_file(),
+        "SQLite state store must exist after the first FE lifecycle"
+    );
+
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let rows: Vec<i64> = conn
+        .query(multi_submit_query_sql())
+        .expect("distributed query must succeed after immediate FE restart");
+    assert_eq!(rows, vec![1i64, 2i64]);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 }
 
 #[test]

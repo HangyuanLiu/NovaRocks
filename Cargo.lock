@@ -3267,6 +3267,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-frontend"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "novarocks",
+ "novarocks-state-store",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
@@ -3275,6 +3289,7 @@ dependencies = [
  "libc",
  "mysql",
  "novarocks",
+ "novarocks-frontend",
  "reqwest",
  "tempfile",
  "tracing",

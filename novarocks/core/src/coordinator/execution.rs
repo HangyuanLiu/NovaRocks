@@ -82,6 +82,21 @@ use crate::coordinator::profile::record_native_standalone_query_profile_report;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
+fn next_standalone_query_id() -> UniqueId {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT_QUERY_LO: AtomicI64 = AtomicI64::new(100);
+
+    // Fragment/exchange keys can outlive an FE process in still-running BEs,
+    // while fragment-instance IDs encode only the query ID's high half. Give
+    // every query a fresh high half so IDs cannot repeat either within one FE
+    // process or across an immediate FE restart.
+    let (uuid_hi, _) = uuid::Uuid::new_v4().as_u64_pair();
+    let hi = uuid_hi as i64;
+    let lo = NEXT_QUERY_LO.fetch_add(1000, Ordering::Relaxed);
+    UniqueId { hi, lo }
+}
+
 /// Result of a coordinated execution, exposing the writer-side outcome to the
 /// engine layer. `write_commit` is set when writers reported a commit input on
 /// the success path. `write_abort` is set when writer-side coordination fails
@@ -430,16 +445,9 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 1. Allocate query id and run the scheduler.
         // ---------------------------------------------------------------
-        use std::sync::atomic::{AtomicI64, Ordering};
-        static NEXT_QUERY_BASE: AtomicI64 = AtomicI64::new(100);
-        let query_base = NEXT_QUERY_BASE.fetch_add(1000, Ordering::Relaxed);
-        // Use query_base for both hi and lo so the scheduler's
-        // `root_backend_idx = query_id.lo % n` scatters across backends per
-        // query instead of always landing on backend 1 % n.
-        let query_id = UniqueId {
-            hi: query_base,
-            lo: query_base,
-        };
+        // The low half keeps the original sequence so
+        // `root_backend_idx = query_id.lo % n` continues to scatter queries.
+        let query_id = next_standalone_query_id();
         let edges = prepared.scheduling_view().edges().to_vec();
 
         debug!(
@@ -2088,6 +2096,15 @@ mod native_contract_tests {
 
     #[derive(Default)]
     struct CountingCoordinatorObserver(AtomicUsize);
+
+    #[test]
+    fn standalone_query_ids_do_not_repeat() {
+        let first = next_standalone_query_id();
+        let second = next_standalone_query_id();
+
+        assert_ne!(first.hi, second.hi);
+        assert_ne!(first.lo, second.lo);
+    }
 
     impl CoordinatorObserver for CountingCoordinatorObserver {
         fn fragment_scheduled(&self) {
