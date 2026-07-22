@@ -2430,7 +2430,7 @@ mod tests {
                 ConsumerDeployment::new(
                     ConsumerActivation::BlockingSnapshot,
                     BTreeSet::from([ArtifactCapability::Membership]),
-                    RouteEdgeId::new(route_edge),
+                    BTreeSet::from([RouteEdgeId::new(route_edge)]),
                     consumer_instances.into_iter().map(uid).collect(),
                 ),
             )]),
@@ -2482,7 +2482,7 @@ mod tests {
                         None,
                     )
                     .unwrap(),
-                    RouteEdgeId::new(40),
+                    BTreeSet::from([RouteEdgeId::new(40)]),
                     BTreeSet::from([uid(30)]),
                 ),
             )]),
@@ -2747,7 +2747,7 @@ mod tests {
                             ArtifactCapability::EmptyDomain,
                         ]),
                         profile,
-                        RouteEdgeId::new(route),
+                        BTreeSet::from([RouteEdgeId::new(route)]),
                         BTreeSet::from([uid(instance)]),
                     ),
                 )
@@ -2940,7 +2940,7 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
-                    RouteEdgeId::new(1),
+                    BTreeSet::from([RouteEdgeId::new(1)]),
                     BTreeSet::from([uid(2)]),
                 ),
             )]),
@@ -3010,7 +3010,7 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
-                    RouteEdgeId::new(1),
+                    BTreeSet::from([RouteEdgeId::new(1)]),
                     BTreeSet::from([uid(2)]),
                 ),
             )]),
@@ -7375,7 +7375,7 @@ mod tests {
                     ArtifactCapability::EmptyDomain,
                 ]),
                 profile.clone(),
-                delivery_route_edge,
+                BTreeSet::from([delivery_route_edge]),
                 BTreeSet::from([consumer_finst]),
             ),
         );

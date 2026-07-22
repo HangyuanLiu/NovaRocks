@@ -604,12 +604,6 @@ impl DeploymentRegistry {
                 events: Vec::new(),
             });
         }
-        if view.is_empty() {
-            return Err(install_error(
-                InstallContractErrorKind::UnsupportedChannelContract,
-                "empty core view with nonempty routing shard is not a valid participant install",
-            ));
-        }
         validate_install(&install)?;
 
         let (flight, leader) = {
@@ -982,6 +976,10 @@ fn validate_view_with_routing<'a>(
         ));
     }
 
+    if let Some(routing_shard) = routing_shard {
+        validate_core_role_completeness(view, routing_shard)?;
+    }
+
     let mut channel_ids = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
     let mut route_ids = BTreeSet::new();
@@ -1001,20 +999,27 @@ fn validate_view_with_routing<'a>(
             }
         }
         for (binding_id, consumer) in channel.consumers() {
-            if !binding_ids.insert(*binding_id)
-                || !route_ids.insert(consumer.loopback_route_edge_id())
-            {
+            if !binding_ids.insert(*binding_id) || consumer.route_edge_ids().is_empty() {
                 return Err(install_error(
                     InstallContractErrorKind::DuplicateIdentity,
-                    "consumer binding and loopback route identities must be unique",
+                    "consumer binding identities must be unique and route sets must be nonempty",
                 ));
+            }
+            for route_edge_id in consumer.route_edge_ids() {
+                if !route_ids.insert(*route_edge_id) {
+                    return Err(install_error(
+                        InstallContractErrorKind::DuplicateIdentity,
+                        "consumer route identities must be unique across the install view",
+                    ));
+                }
             }
         }
     }
 
     let mut profile_encodings = BTreeMap::<ConsumerProfileId, &'a [u8]>::new();
     for channel in view.channels().values() {
-        let allow_consumerless_aggregator = match routing_shard {
+        validate_nonempty_instance_sets(channel)?;
+        let role_requirements = match routing_shard {
             Some(shard) => {
                 let routing = shard.channel(channel.channel_id()).ok_or_else(|| {
                     install_error(
@@ -1027,13 +1032,95 @@ fn validate_view_with_routing<'a>(
                 })?;
                 validate_channel_routing_contract(view.local_participant_id(), channel, routing)?
             }
-            None => false,
+            None => CoreRoleRequirements::producer_and_consumer(),
         };
-        validate_channel(
-            channel,
-            &mut profile_encodings,
-            allow_consumerless_aggregator,
-        )?;
+        validate_channel(channel, &mut profile_encodings, role_requirements)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CoreRoleRequirements {
+    producer: bool,
+    consumer: bool,
+}
+
+impl CoreRoleRequirements {
+    const fn producer_and_consumer() -> Self {
+        Self {
+            producer: true,
+            consumer: true,
+        }
+    }
+}
+
+fn validate_core_role_completeness(
+    view: &RuntimeFilterInstallView,
+    routing_shard: &RuntimeFilterRoutingShard,
+) -> Result<(), InstallContractError> {
+    for (channel_id, routing) in routing_shard.channels() {
+        let requires_core = routing.local_roles().iter().any(|role| {
+            matches!(
+                role,
+                RuntimeFilterRouteRole::Producer(_)
+                    | RuntimeFilterRouteRole::Aggregator
+                    | RuntimeFilterRouteRole::Consumer(_)
+            )
+        });
+        let is_routing_only_relay = routing.local_roles().len() == 1
+            && routing
+                .local_roles()
+                .contains(&RuntimeFilterRouteRole::Relay);
+        match (requires_core, view.channels().contains_key(channel_id)) {
+            (true, false) => {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "routing channel {} requires Core authority for its local roles",
+                        channel_id.get()
+                    ),
+                ));
+            }
+            (false, true) => {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "routing-only channel {} must not carry fake Core authority",
+                        channel_id.get()
+                    ),
+                ));
+            }
+            (false, false) if !is_routing_only_relay => {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    format!(
+                        "routing channel {} has no genuine local role",
+                        channel_id.get()
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_nonempty_instance_sets(
+    channel: &RuntimeFilterChannelDeployment,
+) -> Result<(), InstallContractError> {
+    if channel
+        .producers()
+        .values()
+        .any(|producer| producer.expected_fragment_instances().is_empty())
+        || channel
+            .consumers()
+            .values()
+            .any(|consumer| consumer.expected_fragment_instances().is_empty())
+    {
+        return Err(install_error(
+            InstallContractErrorKind::EmptyExpectedInstances,
+            "producer and consumer expected fragment instances must be non-empty",
+        ));
     }
     Ok(())
 }
@@ -1042,10 +1129,26 @@ fn validate_channel_routing_contract(
     local_participant_id: crate::runtime_filter::port::identity::RuntimeFilterParticipantId,
     channel: &RuntimeFilterChannelDeployment,
     routing: &RuntimeFilterChannelRoutingView,
-) -> Result<bool, InstallContractError> {
+) -> Result<CoreRoleRequirements, InstallContractError> {
     let is_local_aggregator = routing
         .local_roles()
         .contains(&RuntimeFilterRouteRole::Aggregator);
+    let local_producer_bindings = routing
+        .local_roles()
+        .iter()
+        .filter_map(|role| match role {
+            RuntimeFilterRouteRole::Producer(binding_id) => Some(*binding_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let local_consumer_bindings = routing
+        .local_roles()
+        .iter()
+        .filter_map(|role| match role {
+            RuntimeFilterRouteRole::Consumer(binding_id) => Some(*binding_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for (binding_id, producer) in channel.producers() {
         for fragment_instance_id in producer.expected_fragment_instances() {
             let participant_id = routing
@@ -1086,7 +1189,6 @@ fn validate_channel_routing_contract(
             }
         }
     }
-
     if is_local_aggregator {
         for ((binding_id, fragment_instance_id), _) in routing.producer_instances() {
             let installed = channel.producers().get(binding_id).is_some_and(|producer| {
@@ -1105,7 +1207,43 @@ fn validate_channel_routing_contract(
                 ));
             }
         }
-
+    }
+    let expected_producer_instances = routing
+        .producer_instances()
+        .iter()
+        .filter(|(_, participant_id)| {
+            is_local_aggregator || **participant_id == local_participant_id
+        })
+        .fold(
+            BTreeMap::<BindingId, BTreeSet<UniqueId>>::new(),
+            |mut expected, ((binding_id, fragment_instance_id), _)| {
+                expected
+                    .entry(*binding_id)
+                    .or_default()
+                    .insert(*fragment_instance_id);
+                expected
+            },
+        );
+    let installed_producer_instances = channel
+        .producers()
+        .iter()
+        .map(|(binding_id, producer)| (*binding_id, producer.expected_fragment_instances().clone()))
+        .collect::<BTreeMap<_, _>>();
+    if installed_producer_instances != expected_producer_instances {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "Core producer authority does not exactly match local routing producer roles",
+        ));
+    }
+    if !is_local_aggregator
+        && channel.producers().keys().copied().collect::<BTreeSet<_>>() != local_producer_bindings
+    {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "Core producer bindings do not exactly match local Producer roles",
+        ));
+    }
+    if is_local_aggregator {
         let authorized_sources = routing
             .producer_instances()
             .iter()
@@ -1163,16 +1301,43 @@ fn validate_channel_routing_contract(
         }
     }
 
-    if !channel.consumers().is_empty() {
-        return Ok(false);
-    }
-    if !is_local_aggregator {
+    if channel.consumers().keys().copied().collect::<BTreeSet<_>>() != local_consumer_bindings {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
-            "consumerless channel requires local Aggregator authority",
+            "Core consumer bindings do not exactly match local Consumer roles",
         ));
     }
-    Ok(true)
+    for (binding_id, consumer) in channel.consumers() {
+        let expected_routes = routing
+            .inbound_edges()
+            .iter()
+            .filter(|edge| {
+                edge.target().participant_id() == local_participant_id
+                    && edge.target().role() == RuntimeFilterRouteRole::Consumer(*binding_id)
+                    && edge
+                        .allowed_kinds()
+                        .contains(&RuntimeFilterEnvelopeKind::Artifact)
+                    && edge
+                        .allowed_kinds()
+                        .contains(&RuntimeFilterEnvelopeKind::Unavailable)
+            })
+            .map(|edge| edge.route_edge_id())
+            .collect::<BTreeSet<_>>();
+        if consumer.route_edge_ids() != &expected_routes || expected_routes.is_empty() {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                format!(
+                    "consumer binding {} Core route authority does not exactly match inbound routing edges",
+                    binding_id.get()
+                ),
+            ));
+        }
+    }
+
+    Ok(CoreRoleRequirements {
+        producer: is_local_aggregator || !local_producer_bindings.is_empty(),
+        consumer: !local_consumer_bindings.is_empty(),
+    })
 }
 
 /// Test-only shim so RFD-2 deployment-compiler tests (a different module) can
@@ -1181,6 +1346,39 @@ fn validate_channel_routing_contract(
 #[cfg(test)]
 pub(crate) fn validate_view_for_test(view: &RuntimeFilterInstallView) -> Result<(), String> {
     validate_view(view).map_err(|e| format!("{e}"))
+}
+
+struct SubscriptionRouteAlias {
+    subscription: Arc<SubscriptionGroup>,
+    canonical_route_edge_id: RouteEdgeId,
+}
+
+impl crate::runtime_filter::port::subscription::ArtifactDelivery for SubscriptionRouteAlias {
+    fn deliver(
+        &self,
+        _route_edge_id: RouteEdgeId,
+        outcome: crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome,
+    ) {
+        crate::runtime_filter::port::subscription::ArtifactDelivery::deliver(
+            self.subscription.as_ref(),
+            self.canonical_route_edge_id,
+            outcome,
+        );
+    }
+
+    fn deliver_live(
+        &self,
+        _route_edge_id: RouteEdgeId,
+        outcome: Option<crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome>,
+        terminal: Option<crate::runtime_filter::port::subscription::LiveTerminal>,
+    ) {
+        crate::runtime_filter::port::subscription::ArtifactDelivery::deliver_live(
+            self.subscription.as_ref(),
+            self.canonical_route_edge_id,
+            outcome,
+            terminal,
+        );
+    }
 }
 
 struct RoutingBuild {
@@ -1218,46 +1416,52 @@ fn build_routing(
             *channel_id,
             view.epoch(),
         );
-        let channel = channels.get(channel_id).cloned().ok_or_else(|| {
-            install_error(
-                InstallContractErrorKind::UnsupportedChannelContract,
-                "temporary installed graph is missing a validated channel",
-            )
-        })?;
-        let inbound_contract = inbound_contracts.get(channel_id).cloned().ok_or_else(|| {
-            install_error(
-                InstallContractErrorKind::UnsupportedChannelContract,
-                "temporary installed graph is missing an inbound producer contract",
-            )
-        })?;
         let mut capability_routes =
             BTreeMap::<ConsumerProfileId, (ConsumerArtifactProfile, Vec<RouteEdgeId>)>::new();
-        for (binding_id, producer) in deployment.producers() {
-            build.producers.insert(
-                *binding_id,
-                ProducerRoute {
-                    channel_id: *channel_id,
-                    channel: channel.clone(),
-                    expected_instances: producer.expected_fragment_instances().clone(),
-                    kind: match deployment.reduction_requirement() {
-                        ReductionRequirement::SetUnion
-                            if matches!(
-                                deployment.completion_requirement(),
-                                CompletionRequirement::FencedFinalDomain(
-                                    CompletionFenceKind::CommittedDomainFrozen
-                                )
-                            ) =>
-                        {
-                            ProducerPortKind::FinalDomain
-                        }
-                        ReductionRequirement::SetUnion => ProducerPortKind::Membership,
-                        ReductionRequirement::TightenOrderedBound => ProducerPortKind::OrderedBound,
-                        ReductionRequirement::MergeTopKSummary(_) => ProducerPortKind::TopKSummary,
+        if !deployment.producers().is_empty() {
+            let channel = channels.get(channel_id).cloned().ok_or_else(|| {
+                install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "temporary installed graph is missing a validated channel",
+                )
+            })?;
+            let inbound_contract = inbound_contracts.get(channel_id).cloned().ok_or_else(|| {
+                install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "temporary installed graph is missing an inbound producer contract",
+                )
+            })?;
+            for (binding_id, producer) in deployment.producers() {
+                build.producers.insert(
+                    *binding_id,
+                    ProducerRoute {
+                        channel_id: *channel_id,
+                        channel: channel.clone(),
+                        expected_instances: producer.expected_fragment_instances().clone(),
+                        kind: match deployment.reduction_requirement() {
+                            ReductionRequirement::SetUnion
+                                if matches!(
+                                    deployment.completion_requirement(),
+                                    CompletionRequirement::FencedFinalDomain(
+                                        CompletionFenceKind::CommittedDomainFrozen
+                                    )
+                                ) =>
+                            {
+                                ProducerPortKind::FinalDomain
+                            }
+                            ReductionRequirement::SetUnion => ProducerPortKind::Membership,
+                            ReductionRequirement::TightenOrderedBound => {
+                                ProducerPortKind::OrderedBound
+                            }
+                            ReductionRequirement::MergeTopKSummary(_) => {
+                                ProducerPortKind::TopKSummary
+                            }
+                        },
+                        final_domain_seed: final_domain_seeds.get(channel_id).cloned(),
+                        inbound_contract: inbound_contract.clone(),
                     },
-                    final_domain_seed: final_domain_seeds.get(channel_id).cloned(),
-                    inbound_contract: inbound_contract.clone(),
-                },
-            );
+                );
+            }
         }
         for (binding_id, consumer) in deployment.consumers() {
             build
@@ -1272,34 +1476,45 @@ fn build_routing(
                     "consumer profile digest collision carried different canonical bytes",
                 ));
             }
-            let route_edge_id = consumer.loopback_route_edge_id();
+            let canonical_route_edge_id = *consumer
+                .route_edge_ids()
+                .first()
+                .expect("validated consumer route set is nonempty");
             let group = Arc::new(SubscriptionGroup::new(
                 common,
                 *binding_id,
                 consumer.activation(),
-                route_edge_id,
+                canonical_route_edge_id,
                 consumer.expected_fragment_instances().iter().copied(),
                 events.clone(),
             ));
             build.subscriptions.insert(*binding_id, group.clone());
-            build.routes.insert(route_edge_id, group);
-            build
-                .channel_routes
-                .entry(*channel_id)
-                .or_default()
-                .push(route_edge_id);
-            build.route_event_identities.insert(
-                route_edge_id,
-                consumer
-                    .expected_fragment_instances()
-                    .iter()
-                    .copied()
-                    .map(|instance| {
-                        RouteEventIdentity::new(common, *binding_id, instance, route_edge_id)
-                    })
-                    .collect(),
-            );
-            entry.1.push(route_edge_id);
+            for route_edge_id in consumer.route_edge_ids() {
+                build.routes.insert(
+                    *route_edge_id,
+                    Arc::new(SubscriptionRouteAlias {
+                        subscription: group.clone(),
+                        canonical_route_edge_id,
+                    }),
+                );
+                build
+                    .channel_routes
+                    .entry(*channel_id)
+                    .or_default()
+                    .push(*route_edge_id);
+                build.route_event_identities.insert(
+                    *route_edge_id,
+                    consumer
+                        .expected_fragment_instances()
+                        .iter()
+                        .copied()
+                        .map(|instance| {
+                            RouteEventIdentity::new(common, *binding_id, instance, *route_edge_id)
+                        })
+                        .collect(),
+                );
+                entry.1.push(*route_edge_id);
+            }
         }
         let schema = match deployment.logical_domain() {
             RuntimeFilterLogicalDomain::Membership {
@@ -1380,13 +1595,13 @@ fn build_routing(
 fn validate_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
-    allow_consumerless_aggregator: bool,
+    role_requirements: CoreRoleRequirements,
 ) -> Result<(), InstallContractError> {
     if matches!(
         channel.logical_domain(),
         RuntimeFilterLogicalDomain::OrderedBound(_)
     ) {
-        return validate_ordered_channel(channel, profile_encodings, allow_consumerless_aggregator);
+        return validate_ordered_channel(channel, profile_encodings, role_requirements);
     }
     let RuntimeFilterLogicalDomain::Membership {
         value_type,
@@ -1430,12 +1645,12 @@ fn validate_channel<'a>(
             "membership data type is not supported by the runtime filter port",
         ));
     }
-    if channel.producers().is_empty()
-        || (channel.consumers().is_empty() && !allow_consumerless_aggregator)
+    if channel.producers().is_empty() != !role_requirements.producer
+        || channel.consumers().is_empty() != !role_requirements.consumer
     {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
-            "M1 channel requires at least one producer and one consumer binding",
+            "Membership Core roles do not match the routing requirements",
         ));
     }
     if channel.policy().max_contribution_bytes == 0
@@ -1500,8 +1715,29 @@ fn validate_channel<'a>(
             "CompleteOnce availability and terminal coverage must be canonically equivalent",
         ));
     }
-    validate_coverage(channel.availability_coverage(), channel)?;
-    validate_coverage(channel.terminal_coverage(), channel)?;
+    if role_requirements.producer {
+        validate_coverage(channel.availability_coverage(), channel)?;
+        validate_coverage(channel.terminal_coverage(), channel)?;
+    } else {
+        channel
+            .availability_coverage()
+            .validate_shape()
+            .map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    format!("invalid coverage shape: {error:?}"),
+                )
+            })?;
+        channel
+            .terminal_coverage()
+            .validate_shape()
+            .map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    format!("invalid coverage shape: {error:?}"),
+                )
+            })?;
+    }
 
     for producer in channel.producers().values() {
         if producer.expected_fragment_instances().is_empty() {
@@ -1631,7 +1867,7 @@ fn validate_channel<'a>(
             }
         }
     }
-    if !allow_consumerless_aggregator
+    if role_requirements.consumer
         && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
     {
         return Err(install_error(
@@ -1645,7 +1881,7 @@ fn validate_channel<'a>(
 fn validate_ordered_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
-    allow_consumerless_aggregator: bool,
+    role_requirements: CoreRoleRequirements,
 ) -> Result<(), InstallContractError> {
     let RuntimeFilterLogicalDomain::OrderedBound(plan) = channel.logical_domain() else {
         unreachable!("ordered validator is called only for ordered channels")
@@ -1711,12 +1947,12 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if channel.producers().is_empty()
-        || (channel.consumers().is_empty() && !allow_consumerless_aggregator)
+    if channel.producers().is_empty() != !role_requirements.producer
+        || channel.consumers().is_empty() != !role_requirements.consumer
     {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
-            "ordered channel requires at least one producer and one consumer binding",
+            "ordered Core roles do not match the routing requirements",
         ));
     }
     if channel.policy().max_contribution_bytes == 0
@@ -1771,8 +2007,29 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    validate_coverage(channel.availability_coverage(), channel)?;
-    validate_coverage(channel.terminal_coverage(), channel)?;
+    if role_requirements.producer {
+        validate_coverage(channel.availability_coverage(), channel)?;
+        validate_coverage(channel.terminal_coverage(), channel)?;
+    } else {
+        channel
+            .availability_coverage()
+            .validate_shape()
+            .map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    format!("invalid coverage shape: {error:?}"),
+                )
+            })?;
+        channel
+            .terminal_coverage()
+            .validate_shape()
+            .map_err(|error| {
+                install_error(
+                    InstallContractErrorKind::InvalidCoverage,
+                    format!("invalid coverage shape: {error:?}"),
+                )
+            })?;
+    }
 
     let mut unique_profiles = BTreeSet::new();
     for consumer in channel.consumers().values() {
@@ -1816,7 +2073,7 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if !allow_consumerless_aggregator
+    if role_requirements.consumer
         && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
     {
         return Err(install_error(
@@ -1831,7 +2088,11 @@ fn validate_ordered_channel<'a>(
 fn validate_channel_contract(
     channel: &RuntimeFilterChannelDeployment,
 ) -> Result<(), InstallContractError> {
-    validate_channel(channel, &mut BTreeMap::new(), false)
+    validate_channel(
+        channel,
+        &mut BTreeMap::new(),
+        CoreRoleRequirements::producer_and_consumer(),
+    )
 }
 
 fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
@@ -1932,6 +2193,9 @@ fn build_channels(
     let mut final_domain_seeds = BTreeMap::new();
     let mut inbound_contracts = BTreeMap::new();
     for (channel_id, deployment) in view.channels() {
+        if deployment.producers().is_empty() {
+            continue;
+        }
         let final_domain_contract = match (
             deployment.logical_domain(),
             deployment.completion_requirement(),
@@ -2295,7 +2559,7 @@ mod tests {
                 ConsumerDeployment::new(
                     ConsumerActivation::BlockingSnapshot,
                     BTreeSet::from([ArtifactCapability::Membership]),
-                    RouteEdgeId::new(route),
+                    BTreeSet::from([RouteEdgeId::new(route)]),
                     BTreeSet::from([uid(consumer.into())]),
                 ),
             )]),
@@ -2347,7 +2611,7 @@ mod tests {
                         None,
                     )
                     .unwrap(),
-                    RouteEdgeId::new(40),
+                    BTreeSet::from([RouteEdgeId::new(40)]),
                     BTreeSet::from([uid(30)]),
                 ),
             )]),
@@ -2400,7 +2664,7 @@ mod tests {
                 ConsumerActivation::BlockingSnapshot,
                 consumer.capabilities().clone(),
                 consumer.artifact_profile().clone(),
-                consumer.loopback_route_edge_id(),
+                consumer.route_edge_ids().clone(),
                 consumer.expected_fragment_instances().clone(),
             ),
         );
@@ -2459,7 +2723,7 @@ mod tests {
                         activation,
                         capabilities,
                         profile,
-                        consumer.loopback_route_edge_id(),
+                        consumer.route_edge_ids().clone(),
                         consumer.expected_fragment_instances().clone(),
                     ),
                 )]),
@@ -2534,7 +2798,7 @@ mod tests {
                     },
                     BTreeSet::from([ArtifactCapability::OrderedRange]),
                     ConsumerArtifactProfile::new_ordered_range(order_digest).unwrap(),
-                    RouteEdgeId::new(40),
+                    BTreeSet::from([RouteEdgeId::new(40)]),
                     BTreeSet::from([uid(30)]),
                 ),
             )]),
@@ -2817,7 +3081,7 @@ mod tests {
                 ConsumerActivation::BlockingSnapshot,
                 consumer.capabilities().clone(),
                 consumer.artifact_profile().clone(),
-                consumer.loopback_route_edge_id(),
+                consumer.route_edge_ids().clone(),
                 consumer.expected_fragment_instances().clone(),
             ),
         );
@@ -2848,7 +3112,7 @@ mod tests {
                 consumer.activation(),
                 consumer.capabilities().clone(),
                 ConsumerArtifactProfile::new_ordered_range(wrong_digest).unwrap(),
-                consumer.loopback_route_edge_id(),
+                consumer.route_edge_ids().clone(),
                 consumer.expected_fragment_instances().clone(),
             ),
         );
@@ -2882,8 +3146,6 @@ mod tests {
         EmptyConsumerInstances,
         NonBlockingConsumer,
         MissingMembershipCapability,
-        MissingProducer,
-        MissingConsumer,
         DuplicateProducerWitness,
     }
 
@@ -2955,7 +3217,7 @@ mod tests {
                     ConsumerDeployment::new(
                         ConsumerActivation::BlockingSnapshot,
                         BTreeSet::from([ArtifactCapability::Membership]),
-                        RouteEdgeId::new(40),
+                        BTreeSet::from([RouteEdgeId::new(40)]),
                         BTreeSet::new(),
                     ),
                 );
@@ -2968,7 +3230,7 @@ mod tests {
                             late_apply: LateApplyGranularity::Batch,
                         },
                         BTreeSet::from([ArtifactCapability::Membership]),
-                        RouteEdgeId::new(40),
+                        BTreeSet::from([RouteEdgeId::new(40)]),
                         BTreeSet::from([uid(30)]),
                     ),
                 );
@@ -2979,13 +3241,11 @@ mod tests {
                     ConsumerDeployment::new(
                         ConsumerActivation::BlockingSnapshot,
                         BTreeSet::from([ArtifactCapability::EmptyDomain]),
-                        RouteEdgeId::new(40),
+                        BTreeSet::from([RouteEdgeId::new(40)]),
                         BTreeSet::from([uid(30)]),
                     ),
                 );
             }
-            InvalidDeployment::MissingProducer => producers.clear(),
-            InvalidDeployment::MissingConsumer => consumers.clear(),
             InvalidDeployment::DuplicateProducerWitness => {
                 producers.insert(
                     BindingId::new(11),
@@ -3134,6 +3394,56 @@ mod tests {
         )
     }
 
+    fn without_producers(
+        channel: &RuntimeFilterChannelDeployment,
+    ) -> RuntimeFilterChannelDeployment {
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            BTreeMap::new(),
+            channel.consumers().clone(),
+        )
+    }
+
+    fn inbound_to_consumer(
+        channel_id: ChannelId,
+        route_edge_id: RouteEdgeId,
+        binding_id: BindingId,
+        source_participant: RuntimeFilterParticipantId,
+        target_participant: RuntimeFilterParticipantId,
+    ) -> RuntimeFilterRoutingEdgeView {
+        RuntimeFilterRoutingEdgeView::new(
+            channel_id,
+            route_edge_id,
+            RuntimeFilterRouteEndpointView::new(
+                source_participant,
+                RuntimeFilterRouteRole::Producer(BindingId::new(10)),
+            ),
+            RuntimeFilterRouteEndpointView::new(
+                target_participant,
+                RuntimeFilterRouteRole::Consumer(binding_id),
+            ),
+            RuntimeFilterRoutePeer::Remote {
+                participant_id: source_participant,
+                endpoint: RuntimeEndpoint::new("remote-producer", 9060).unwrap(),
+            },
+            BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]),
+        )
+        .unwrap()
+    }
+
     fn consumerless_channels() -> [RuntimeFilterChannelDeployment; 2] {
         [
             without_consumers(&channel(1, 10, 20, 30, 40)),
@@ -3204,14 +3514,22 @@ mod tests {
         let channel = first.routing_shard().channel(ChannelId::new(1)).unwrap();
         let mut roles = channel.local_roles().clone();
         roles.insert(RuntimeFilterRouteRole::Relay);
-        let changed = routing_shard(
+        let changed = RuntimeFilterRoutingShard::new(
             first.epoch(),
             first.local_participant_id(),
-            ChannelId::new(1),
-            roles,
-            channel.producer_instances().clone(),
-            Vec::new(),
-        );
+            BTreeMap::from([(
+                ChannelId::new(1),
+                RuntimeFilterChannelRoutingView::new(
+                    ChannelId::new(1),
+                    roles,
+                    channel.producer_instances().clone(),
+                    channel.inbound_edges().to_vec(),
+                    channel.outbound_edges().to_vec(),
+                )
+                .unwrap(),
+            )]),
+        )
+        .unwrap();
 
         assert_install_error(
             registry
@@ -3510,7 +3828,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_core_and_nonempty_routing_is_not_ignored() {
+    fn routing_only_relay_accepts_empty_core() {
         let core = core_view([]);
         let routing = routing_shard(
             core.epoch(),
@@ -3521,12 +3839,103 @@ mod tests {
             Vec::new(),
         );
 
-        assert_install_error(
+        assert_eq!(
             registry()
                 .install(participant_install(core, routing))
-                .unwrap_err(),
+                .unwrap()
+                .outcome(),
+            InstallOutcome::Installed,
+        );
+    }
+
+    #[test]
+    fn producer_only_and_consumer_only_core_channels_are_valid() {
+        let full = channel(1, 10, 20, 30, 40);
+        let producer_core = core_view([(1, without_consumers(&full))]);
+        let participant = producer_core.local_participant_id();
+        let producer_routing = routing_shard(
+            producer_core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Producer(BindingId::new(10))]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
+            Vec::new(),
+        );
+        assert_eq!(
+            registry()
+                .install(participant_install(producer_core, producer_routing))
+                .unwrap()
+                .outcome(),
+            InstallOutcome::Installed,
+        );
+
+        let consumer_core = core_view([(1, without_producers(&full))]);
+        let participant = consumer_core.local_participant_id();
+        let remote = RuntimeFilterParticipantId::new(4);
+        let consumer_routing = routing_shard(
+            consumer_core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Consumer(BindingId::new(30))]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+            vec![inbound_to_consumer(
+                ChannelId::new(1),
+                RouteEdgeId::new(40),
+                BindingId::new(30),
+                remote,
+                participant,
+            )],
+        );
+        assert_eq!(
+            registry()
+                .install(participant_install(consumer_core, consumer_routing))
+                .unwrap()
+                .outcome(),
+            InstallOutcome::Installed,
+        );
+    }
+
+    #[test]
+    fn role_required_core_authority_cannot_be_omitted() {
+        let core = core_view([]);
+        let participant = core.local_participant_id();
+        let routing = RuntimeFilterRoutingShard::new(
+            core.epoch(),
+            participant,
+            BTreeMap::from([
+                (
+                    ChannelId::new(2),
+                    RuntimeFilterChannelRoutingView::new(
+                        ChannelId::new(2),
+                        BTreeSet::from([RuntimeFilterRouteRole::Consumer(BindingId::new(30))]),
+                        BTreeMap::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    ChannelId::new(1),
+                    RuntimeFilterChannelRoutingView::new(
+                        ChannelId::new(1),
+                        BTreeSet::from([RuntimeFilterRouteRole::Producer(BindingId::new(10))]),
+                        BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let error = registry()
+            .install(participant_install(core, routing))
+            .unwrap_err();
+        assert_install_error(
+            error,
             InstallContractErrorKind::UnsupportedChannelContract,
-            "empty core view with nonempty routing shard",
+            "routing channel 1 requires Core authority",
         );
     }
 
@@ -3561,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn consumerless_non_aggregator_channel_is_rejected() {
+    fn producer_only_non_aggregator_channel_is_valid() {
         for channel in consumerless_channels() {
             let core = core_view([(1, channel)]);
             let participant = core.local_participant_id();
@@ -3574,12 +3983,12 @@ mod tests {
                 Vec::new(),
             );
 
-            assert_install_error(
+            assert_eq!(
                 registry()
                     .install(participant_install(core, routing))
-                    .unwrap_err(),
-                InstallContractErrorKind::UnsupportedChannelContract,
-                "consumerless channel requires local Aggregator authority",
+                    .unwrap()
+                    .outcome(),
+                InstallOutcome::Installed,
             );
         }
     }
@@ -3666,7 +4075,7 @@ mod tests {
                     consumer.activation(),
                     capabilities,
                     profile,
-                    consumer.loopback_route_edge_id(),
+                    consumer.route_edge_ids().clone(),
                     consumer.expected_fragment_instances().clone(),
                 ),
             )]),
@@ -4471,14 +4880,6 @@ mod tests {
             (
                 InvalidDeployment::MissingMembershipCapability,
                 InstallContractErrorKind::MissingMembershipCapability,
-            ),
-            (
-                InvalidDeployment::MissingProducer,
-                InstallContractErrorKind::UnsupportedChannelContract,
-            ),
-            (
-                InvalidDeployment::MissingConsumer,
-                InstallContractErrorKind::UnsupportedChannelContract,
             ),
             (
                 InvalidDeployment::DuplicateProducerWitness,

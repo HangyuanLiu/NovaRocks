@@ -141,17 +141,33 @@ impl RuntimeFilterDeploymentExtension {
         }
 
         plan.install_views
-            .iter()
-            .map(|(participant, view)| {
-                let routing_shard = plan.routing_shards.get(participant).ok_or(
+            .keys()
+            .copied()
+            .chain(
+                plan.routing_shards
+                    .iter()
+                    .filter_map(|(participant, shard)| {
+                        (!shard.channels().is_empty()).then_some(*participant)
+                    }),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|participant| {
+                let view = plan
+                    .install_views
+                    .get(&participant)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        RuntimeFilterInstallView::new(plan.epoch, participant, BTreeMap::new())
+                    });
+                let routing_shard = plan.routing_shards.get(&participant).ok_or(
                     DeploymentInstallError::MissingRoutingShard {
                         participant: participant.get(),
                     },
                 )?;
-                let install =
-                    RuntimeFilterParticipantInstall::new(view.clone(), routing_shard.clone());
-                validate_install_identity(plan.epoch, *participant, &install)?;
-                Ok((*participant, install))
+                let install = RuntimeFilterParticipantInstall::new(view, routing_shard.clone());
+                validate_install_identity(plan.epoch, participant, &install)?;
+                Ok((participant, install))
             })
             .collect()
     }

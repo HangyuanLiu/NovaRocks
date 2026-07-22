@@ -258,7 +258,7 @@ mod tests {
         ConsumerDeployment::new(
             ConsumerActivation::BlockingSnapshot,
             BTreeSet::from([ArtifactCapability::Membership]),
-            RouteEdgeId::new(CONSUMER_ROUTE),
+            BTreeSet::from([RouteEdgeId::new(CONSUMER_ROUTE)]),
             BTreeSet::from([CONSUMER_FINST]),
         )
     }
@@ -336,32 +336,34 @@ mod tests {
             outbound_edges.push(edge);
         }
         // Each consumer gets a loopback aggregator -> consumer delivery edge keyed by
-        // its own `loopback_route_edge_id`, admitting the delivery kinds. This is what
+        // its own route edge set, admitting the delivery kinds. This is what
         // lets `dispatch_inbound_consumer` authorize an `Artifact` / `Unavailable`
         // envelope and reach the target subscription (mirrors the M2C consumer-ingress
         // install fixture).
         for (binding_id, consumer) in channel.consumers() {
             local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
-            let edge = RuntimeFilterRoutingEdgeView::new(
-                channel_id,
-                consumer.loopback_route_edge_id(),
-                RuntimeFilterRouteEndpointView::new(
-                    participant,
-                    RuntimeFilterRouteRole::Aggregator,
-                ),
-                RuntimeFilterRouteEndpointView::new(
-                    participant,
-                    RuntimeFilterRouteRole::Consumer(*binding_id),
-                ),
-                RuntimeFilterRoutePeer::Loopback,
-                BTreeSet::from([
-                    RuntimeFilterEnvelopeKind::Artifact,
-                    RuntimeFilterEnvelopeKind::Unavailable,
-                ]),
-            )
-            .unwrap();
-            inbound_edges.push(edge.clone());
-            outbound_edges.push(edge);
+            for route_edge_id in consumer.route_edge_ids() {
+                let edge = RuntimeFilterRoutingEdgeView::new(
+                    channel_id,
+                    *route_edge_id,
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Aggregator,
+                    ),
+                    RuntimeFilterRouteEndpointView::new(
+                        participant,
+                        RuntimeFilterRouteRole::Consumer(*binding_id),
+                    ),
+                    RuntimeFilterRoutePeer::Loopback,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
+                )
+                .unwrap();
+                inbound_edges.push(edge.clone());
+                outbound_edges.push(edge);
+            }
         }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
             channel_id,

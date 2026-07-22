@@ -93,14 +93,13 @@ fn consumer_artifact_profile(
 
 /// Project the role graph + placement into per-participant install views.
 ///
-/// LOOPBACK ONLY (RFD-2 range decision): only consumers reachable via a
-/// `Loopback` route edge are projected; remote-route consumers stay in the
-/// coordinator-side plan for RFD-4. The count of skipped remote consumers is
-/// logged (no silent truncation).
+/// Every participant receives Core authority for its real local producer and
+/// consumer roles. Aggregators additionally receive query-global producer
+/// authority so reduction agrees with the routing shard.
 ///
 /// PRECONDITION: the caller (RFD-2's `compile`) MUST supply `channel_specs`,
 /// `producer_witness`, and `consumer_facts` entries covering every channel /
-/// producer binding / loopback-consumer binding present in `role_graph`. A
+/// producer binding / consumer binding present in `role_graph`. A
 /// missing entry is logged (`tracing::warn!`) and the offending binding/channel
 /// is skipped rather than panicking, except for an Aggregator's producer
 /// authority: every producer witness and placement must be present so the Core
@@ -129,8 +128,6 @@ pub(crate) fn project_install_views(
             ),
         >,
     > = BTreeMap::new();
-    let mut skipped_remote_consumers = 0usize;
-
     for (channel_id, cg) in &role_graph.channels {
         let Some(spec) = channel_specs.get(channel_id) else {
             tracing::warn!(
@@ -220,24 +217,45 @@ pub(crate) fn project_install_views(
                     .insert(binding, ProducerDeployment::new(witness, expected));
             }
         }
-        // Consumers: only those reachable through a Loopback route edge.
-        let loopback: BTreeMap<(RuntimeFilterParticipantId, BindingId), RouteEdgeId> = cg
+        // Consumers own every inbound delivery edge authorized by routing.
+        // Loopback, direct remote, and aggregator delivery use one stable set.
+        let inbound_routes: BTreeMap<
+            (RuntimeFilterParticipantId, BindingId),
+            BTreeSet<RouteEdgeId>,
+        > = cg
             .routes
             .iter()
-            .filter(|r| r.kind == RouteKind::Loopback)
-            .map(|r| ((r.to.participant, r.to.binding), r.edge_id))
-            .collect();
+            .filter(|route| {
+                matches!(
+                    route.kind,
+                    RouteKind::Loopback | RouteKind::ReplicaDirect | RouteKind::FromAggregator
+                )
+            })
+            .fold(BTreeMap::new(), |mut routes, route| {
+                routes
+                    .entry((route.to.participant, route.to.binding))
+                    .or_default()
+                    .insert(route.edge_id);
+                routes
+            });
         for (participant, bindings) in &cg.consumers {
             for binding in bindings {
-                let Some(route_edge_id) = loopback.get(&(*participant, *binding)).copied() else {
-                    skipped_remote_consumers += 1;
-                    continue;
+                let Some(route_edge_ids) = inbound_routes.get(&(*participant, *binding)).cloned()
+                else {
+                    return Err(DeploymentError::InvalidInstallProjection {
+                        detail: format!(
+                            "runtime filter consumer projection missing inbound route for channel {} binding {} participant {}",
+                            channel_id.get(),
+                            binding.get(),
+                            participant.get()
+                        ),
+                    });
                 };
                 let Some(facts) = consumer_facts.get(binding) else {
                     tracing::warn!(
                         channel = channel_id.get(),
                         binding = binding.get(),
-                        "RFD-2 projection: loopback consumer binding missing consumer_facts; skipped"
+                        "RFD-2 projection: consumer binding missing consumer_facts; skipped"
                     );
                     continue;
                 };
@@ -258,7 +276,7 @@ pub(crate) fn project_install_views(
                             facts.activation,
                             facts.capabilities.clone(),
                             profile,
-                            route_edge_id,
+                            route_edge_ids,
                             expected,
                         ),
                     );
@@ -266,22 +284,10 @@ pub(crate) fn project_install_views(
         }
     }
 
-    if skipped_remote_consumers > 0 {
-        tracing::info!(
-            skipped_remote_consumers,
-            "RFD-2 projected loopback only; remote consumer(s) deferred to RFD-4 transport"
-        );
-    }
-
     let mut views = BTreeMap::new();
     for (participant, channels) in per_participant {
         let mut channel_deployments = BTreeMap::new();
         for (channel_id, (producers, consumers)) in channels {
-            if consumers.is_empty()
-                && role_graph.channels[&channel_id].aggregator != Some(participant)
-            {
-                continue;
-            }
             let spec = &channel_specs[&channel_id];
             channel_deployments.insert(
                 channel_id,
@@ -321,10 +327,13 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
+    use crate::coordinator::cluster::LiveBackendSnapshot;
     use crate::runtime_filter::deployment::role_graph::*;
+    use crate::runtime_filter::deployment::routing_shard::project_routing_shards;
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
     use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
 
     fn membership_channel(id: u32) -> ChannelProjectionSpec {
         ChannelProjectionSpec {
@@ -415,6 +424,103 @@ mod tests {
             hi: raw,
             lo: raw + 100,
         }
+    }
+
+    fn consumer_route_ids(consumer: &ConsumerDeployment) -> BTreeSet<RouteEdgeId> {
+        consumer.route_edge_ids().clone()
+    }
+
+    fn projection_backends(participants: impl IntoIterator<Item = u32>) -> LiveBackendSnapshot {
+        LiveBackendSnapshot::new(
+            participants
+                .into_iter()
+                .map(|participant| {
+                    (
+                        usize::try_from(participant).unwrap(),
+                        format!("10.0.0.{participant}:9060").parse().unwrap(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn direct_projection_fixture(
+        reverse_routes: bool,
+    ) -> (
+        RoleGraph,
+        BTreeMap<ChannelId, ChannelProjectionSpec>,
+        BTreeMap<BindingId, ConsumerBindingFacts>,
+        BindingInstanceIndex,
+    ) {
+        let channel_id = ChannelId::new(5);
+        let producer_binding = BindingId::new(10);
+        let consumer_binding = BindingId::new(11);
+        let producer_a = pid(2);
+        let producer_b = pid(7);
+        let consumer = pid(11);
+        let mut routes = vec![
+            RouteEdge {
+                channel: channel_id,
+                edge_id: RouteEdgeId::new(9),
+                kind: RouteKind::ReplicaDirect,
+                from: RouteEndpoint {
+                    participant: producer_a,
+                    binding: producer_binding,
+                },
+                to: RouteEndpoint {
+                    participant: consumer,
+                    binding: consumer_binding,
+                },
+            },
+            RouteEdge {
+                channel: channel_id,
+                edge_id: RouteEdgeId::new(4),
+                kind: RouteKind::ReplicaDirect,
+                from: RouteEndpoint {
+                    participant: producer_b,
+                    binding: producer_binding,
+                },
+                to: RouteEndpoint {
+                    participant: consumer,
+                    binding: consumer_binding,
+                },
+            },
+        ];
+        if reverse_routes {
+            routes.reverse();
+        }
+        let mut channel = ChannelRoleGraph::empty(channel_id);
+        channel
+            .producers
+            .insert(producer_a, BTreeSet::from([producer_binding]));
+        channel
+            .producers
+            .insert(producer_b, BTreeSet::from([producer_binding]));
+        channel
+            .consumers
+            .insert(consumer, BTreeSet::from([consumer_binding]));
+        channel.routes = routes;
+        (
+            RoleGraph {
+                channels: BTreeMap::from([(channel_id, channel)]),
+            },
+            BTreeMap::from([(channel_id, membership_channel(channel_id.get()))]),
+            BTreeMap::from([membership_consumer_facts(consumer_binding.get())]),
+            BTreeMap::from([
+                (
+                    (channel_id, producer_binding, producer_a),
+                    BTreeSet::from([finst(2)]),
+                ),
+                (
+                    (channel_id, producer_binding, producer_b),
+                    BTreeSet::from([finst(7)]),
+                ),
+                (
+                    (channel_id, consumer_binding, consumer),
+                    BTreeSet::from([finst(11)]),
+                ),
+            ]),
+        )
     }
 
     fn all_of_projection_fixture() -> (
@@ -566,6 +672,111 @@ mod tests {
     }
 
     #[test]
+    fn remote_direct_consumer_core_routes_match_routing_shard() {
+        let (role_graph, channel_specs, consumer_facts, instances) =
+            direct_projection_fixture(false);
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
+        let routing = project_routing_shards(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &instances,
+            &projection_backends([2, 7, 11]),
+        )
+        .expect("routing projection succeeds");
+        let core_routes = consumer_route_ids(
+            &views[&pid(11)].channels()[&ChannelId::new(5)].consumers()[&BindingId::new(11)],
+        );
+        let routing_routes = routing[&pid(11)].channels()[&ChannelId::new(5)]
+            .inbound_edges()
+            .iter()
+            .map(|edge| edge.route_edge_id())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(core_routes, routing_routes);
+    }
+
+    #[test]
+    fn aggregate_remote_consumer_core_routes_match_from_aggregator_edges() {
+        let (role_graph, channel_specs, consumer_facts, instances) = all_of_projection_fixture();
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
+        let routing = project_routing_shards(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &instances,
+            &projection_backends([2, 7, 11, 13]),
+        )
+        .expect("routing projection succeeds");
+        let core_routes = consumer_route_ids(
+            &views[&pid(11)].channels()[&ChannelId::new(5)].consumers()[&BindingId::new(11)],
+        );
+        let routing_routes = routing[&pid(11)].channels()[&ChannelId::new(5)]
+            .inbound_edges()
+            .iter()
+            .filter(|edge| edge.source().role() == RuntimeFilterRouteRole::Aggregator)
+            .map(|edge| edge.route_edge_id())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(core_routes, routing_routes);
+    }
+
+    #[test]
+    fn consumer_with_multiple_inbound_routes_keeps_every_route() {
+        let (role_graph, channel_specs, consumer_facts, instances) =
+            direct_projection_fixture(false);
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
+        let consumer =
+            &views[&pid(11)].channels()[&ChannelId::new(5)].consumers()[&BindingId::new(11)];
+        assert_eq!(
+            consumer_route_ids(consumer),
+            BTreeSet::from([RouteEdgeId::new(4), RouteEdgeId::new(9)])
+        );
+
+        let (reversed_graph, reversed_specs, reversed_facts, reversed_instances) =
+            direct_projection_fixture(true);
+        let reversed = project_install_views(
+            DeploymentEpoch::new(9),
+            &reversed_graph,
+            &reversed_specs,
+            &reversed_facts,
+            &reversed_instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("reordered projection succeeds");
+        assert_eq!(
+            views, reversed,
+            "route input order must not affect install views"
+        );
+    }
+
+    #[test]
     fn all_of_aggregator_projects_union_of_remote_producer_instances() {
         let views = project_all_of_fixture().expect("projection succeeds");
 
@@ -595,11 +806,19 @@ mod tests {
     }
 
     #[test]
-    fn source_only_non_aggregator_producer_stays_routing_only_until_rfd6() {
+    fn source_only_non_aggregator_producer_gets_local_core_authority() {
         let views = project_all_of_fixture().expect("projection succeeds");
 
-        assert!(!views.contains_key(&pid(7)));
-        assert!(!views.contains_key(&pid(13)));
+        assert_eq!(
+            views[&pid(7)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(7)])
+        );
+        assert_eq!(
+            views[&pid(13)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(20)]
+                .expected_fragment_instances(),
+            &BTreeSet::from([finst(13)])
+        );
         assert_eq!(
             views[&pid(2)].channels()[&ChannelId::new(5)].producers()[&BindingId::new(10)]
                 .expected_fragment_instances(),
@@ -613,10 +832,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_only_consumer_still_has_no_install_view_until_m2c() {
+    fn remote_only_consumer_gets_from_aggregator_core_authority() {
         let views = project_all_of_fixture().expect("projection succeeds");
 
-        assert!(!views.contains_key(&pid(11)));
+        assert_eq!(
+            views[&pid(11)].channels()[&ChannelId::new(5)].consumers()[&BindingId::new(11)]
+                .route_edge_ids(),
+            &BTreeSet::from([RouteEdgeId::new(5)])
+        );
     }
 
     #[test]
@@ -803,11 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_consumer_without_loopback_route_is_excluded_from_views() {
-        // Producer lives on participant 0; consumer lives on participant 1 with
-        // NO Loopback route between them (e.g. a ToAggregator/FromAggregator
-        // shape not yet wired to the M1 install DTO). RFD-2 projects loopback
-        // consumers only, so binding 11 must never surface in any install view.
+    fn consumer_without_authorized_inbound_route_is_rejected() {
         let producer_participant = RuntimeFilterParticipantId::new(0);
         let consumer_participant = RuntimeFilterParticipantId::new(1);
         let finst = UniqueId { hi: 1, lo: 2 };
@@ -840,7 +1059,7 @@ mod tests {
 
         let consumer_facts = BTreeMap::from([membership_consumer_facts(11)]);
 
-        let views = project_install_views(
+        let error = project_install_views(
             DeploymentEpoch::new(9),
             &role_graph,
             &channel_specs,
@@ -849,23 +1068,12 @@ mod tests {
             crate::runtime_filter::port::install::RuntimeFilterCoreBudget::new(512),
             MaterializationPolicy::for_test(),
         )
-        .expect("projection succeeds");
+        .unwrap_err();
 
-        // The remote consumer must never be silently promoted into a view.
-        assert!(
-            !views.values().any(|v| v
-                .channels()
-                .values()
-                .any(|c| c.consumers().contains_key(&BindingId::new(11)))),
-            "remote (non-loopback) consumer binding must not be projected into any install view"
-        );
-        assert!(
-            views.get(&consumer_participant).is_none(),
-            "a participant with only a skipped remote consumer must get no view"
-        );
-        assert!(
-            views.get(&producer_participant).is_none(),
-            "a source-only non-aggregator producer remains routing-only until RFD-6"
-        );
+        assert!(matches!(
+            error,
+            DeploymentError::InvalidInstallProjection { detail }
+                if detail.contains("consumer projection missing inbound route")
+        ));
     }
 }

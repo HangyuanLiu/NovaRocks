@@ -587,7 +587,7 @@ mod tests {
         ConsumerDeployment::new(
             ConsumerActivation::BlockingSnapshot,
             BTreeSet::from([ArtifactCapability::Membership]),
-            RouteEdgeId::new(40),
+            BTreeSet::from([RouteEdgeId::new(40)]),
             BTreeSet::from([CONSUMER_FINST]),
         )
     }
@@ -701,7 +701,7 @@ mod tests {
             },
             BTreeSet::from([ArtifactCapability::OrderedRange]),
             ConsumerArtifactProfile::new_ordered_range(order_contract().digest()).unwrap(),
-            RouteEdgeId::new(40),
+            BTreeSet::from([RouteEdgeId::new(40)]),
             BTreeSet::from([CONSUMER_FINST]),
         )
     }
@@ -799,7 +799,7 @@ mod tests {
                         None,
                     )
                     .unwrap(),
-                    RouteEdgeId::new(40),
+                    BTreeSet::from([RouteEdgeId::new(40)]),
                     BTreeSet::from([CONSUMER_FINST]),
                 ),
             )]),

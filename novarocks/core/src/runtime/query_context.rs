@@ -3045,7 +3045,7 @@ mod runtime_filter_service_lifecycle_tests {
                 ConsumerDeployment::new(
                     ConsumerActivation::BlockingSnapshot,
                     BTreeSet::from([ArtifactCapability::Membership]),
-                    RouteEdgeId::new(5),
+                    BTreeSet::from([RouteEdgeId::new(5)]),
                     BTreeSet::from([uid(40)]),
                 ),
             )]),

@@ -223,7 +223,7 @@ fn deployment_for(
                     None,
                 )
                 .unwrap(),
-                RouteEdgeId::new(40),
+                BTreeSet::from([RouteEdgeId::new(40)]),
                 BTreeSet::from([uid(30)]),
             ),
         )]),
