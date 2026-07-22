@@ -612,6 +612,28 @@ mod tests {
     // cross-participant compiler topology; this hand-built fixture is the M2B3
     // `inbound_loopback_install_for_test` shape extended with delivery edges.)
     fn install(service: &RuntimeFilterService, channel: RuntimeFilterChannelDeployment) {
+        let consumer_route_kinds = channel
+            .consumers()
+            .values()
+            .flat_map(|consumer| consumer.route_edge_ids().iter().copied())
+            .map(|route_edge_id| {
+                (
+                    route_edge_id,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
+                )
+            })
+            .collect();
+        install_with_consumer_route_kinds(service, channel, consumer_route_kinds);
+    }
+
+    fn install_with_consumer_route_kinds(
+        service: &RuntimeFilterService,
+        channel: RuntimeFilterChannelDeployment,
+        consumer_route_kinds: BTreeMap<RouteEdgeId, BTreeSet<RuntimeFilterEnvelopeKind>>,
+    ) {
         let epoch = DeploymentEpoch::new(EPOCH);
         let participant = RuntimeFilterParticipantId::new(3);
         let channel_id = channel.channel_id();
@@ -660,10 +682,7 @@ mod tests {
                         RuntimeFilterRouteRole::Consumer(*binding_id),
                     ),
                     RuntimeFilterRoutePeer::Loopback,
-                    BTreeSet::from([
-                        RuntimeFilterEnvelopeKind::Artifact,
-                        RuntimeFilterEnvelopeKind::Unavailable,
-                    ]),
+                    consumer_route_kinds.get(route_edge_id).cloned().unwrap(),
                 )
                 .unwrap();
                 inbound_edges.push(edge.clone());
@@ -1027,6 +1046,97 @@ mod tests {
             ),
             "the subscription must observe the Unavailable reason, got {acquired:?}"
         );
+    }
+
+    #[test]
+    fn split_kind_consumer_routes_dispatch_through_same_subscription() {
+        let service = service();
+        let channel = membership_channel(4096);
+        let consumer = channel
+            .consumers()
+            .get(&BindingId::new(CONSUMER_BINDING))
+            .unwrap();
+        let mut consumers = channel.consumers().clone();
+        consumers.insert(
+            BindingId::new(CONSUMER_BINDING),
+            ConsumerDeployment::with_profile(
+                consumer.activation(),
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+                BTreeSet::from([RouteEdgeId::new(CONSUMER_ROUTE), RouteEdgeId::new(41)]),
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        let channel = RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        );
+        install_with_consumer_route_kinds(
+            &service,
+            channel,
+            BTreeMap::from([
+                (
+                    RouteEdgeId::new(CONSUMER_ROUTE),
+                    BTreeSet::from([RuntimeFilterEnvelopeKind::Artifact]),
+                ),
+                (
+                    RouteEdgeId::new(41),
+                    BTreeSet::from([RuntimeFilterEnvelopeKind::Unavailable]),
+                ),
+            ]),
+        );
+
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (artifact_digest, artifact_payload) = encode_bundle(&bundle, &profile);
+        let (unavailable_digest, unavailable_payload) = encode_unavailable(
+            UnavailableReason::ProducerFailed,
+            ArtifactDecodeExpectation::new(&profile),
+            ROOMY,
+        )
+        .unwrap()
+        .into_parts();
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(artifact_env(
+                    CONSUMER_ROUTE,
+                    1,
+                    artifact_digest,
+                    artifact_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Unavailable,
+                    CHANNEL,
+                    EPOCH,
+                    41,
+                    2,
+                    unavailable_digest,
+                    unavailable_payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+        );
+
+        let observation = observe(&service);
+        assert_eq!(observation.snapshot_digest, Some(bundle.canonical_digest()));
+        assert_eq!(observation.delivery_calls, 2);
     }
 
     #[test]

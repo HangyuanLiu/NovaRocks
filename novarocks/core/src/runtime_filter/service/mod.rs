@@ -4349,7 +4349,7 @@ mod tests {
             common,
             BindingId::new(50),
             ConsumerActivation::BlockingSnapshot,
-            RouteEdgeId::new(70),
+            [RouteEdgeId::new(70)],
             [uid(50)],
             direct_events,
         ));
@@ -4372,7 +4372,7 @@ mod tests {
             common,
             BindingId::new(51),
             ConsumerActivation::BlockingSnapshot,
-            RouteEdgeId::new(71),
+            [RouteEdgeId::new(71)],
             [uid(51)],
             codec_events,
         ));

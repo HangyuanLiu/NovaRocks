@@ -445,7 +445,9 @@ impl InstalledDeployment {
         let live_routes = self
             .subscriptions
             .values()
-            .filter_map(|subscription| subscription.live_route_edge_id())
+            .filter_map(|subscription| subscription.live_route_edge_ids())
+            .flatten()
+            .copied()
             .collect::<BTreeSet<_>>();
         for (channel_id, plan) in &self.artifact_channels {
             for group in plan.groups() {
@@ -977,7 +979,50 @@ fn validate_view_with_routing<'a>(
     }
 
     if let Some(routing_shard) = routing_shard {
-        validate_core_role_completeness(view, routing_shard)?;
+        for (channel_id, routing) in routing_shard.channels() {
+            let requires_core = routing.local_roles().iter().any(|role| {
+                matches!(
+                    role,
+                    RuntimeFilterRouteRole::Producer(_)
+                        | RuntimeFilterRouteRole::Aggregator
+                        | RuntimeFilterRouteRole::Consumer(_)
+                )
+            });
+            let is_routing_only_relay = routing.local_roles().len() == 1
+                && routing
+                    .local_roles()
+                    .contains(&RuntimeFilterRouteRole::Relay);
+            match (requires_core, view.channels().contains_key(channel_id)) {
+                (true, false) => {
+                    return Err(install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "routing channel {} requires Core authority for its local roles",
+                            channel_id.get()
+                        ),
+                    ));
+                }
+                (false, true) => {
+                    return Err(install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "routing-only channel {} must not carry fake Core authority",
+                            channel_id.get()
+                        ),
+                    ));
+                }
+                (false, false) if !is_routing_only_relay => {
+                    return Err(install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        format!(
+                            "routing channel {} has no genuine local role",
+                            channel_id.get()
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
 
     let mut channel_ids = BTreeSet::new();
@@ -1018,7 +1063,20 @@ fn validate_view_with_routing<'a>(
 
     let mut profile_encodings = BTreeMap::<ConsumerProfileId, &'a [u8]>::new();
     for channel in view.channels().values() {
-        validate_nonempty_instance_sets(channel)?;
+        if channel
+            .producers()
+            .values()
+            .any(|producer| producer.expected_fragment_instances().is_empty())
+            || channel
+                .consumers()
+                .values()
+                .any(|consumer| consumer.expected_fragment_instances().is_empty())
+        {
+            return Err(install_error(
+                InstallContractErrorKind::EmptyExpectedInstances,
+                "producer and consumer expected fragment instances must be non-empty",
+            ));
+        }
         let role_requirements = match routing_shard {
             Some(shard) => {
                 let routing = shard.channel(channel.channel_id()).ok_or_else(|| {
@@ -1032,95 +1090,9 @@ fn validate_view_with_routing<'a>(
                 })?;
                 validate_channel_routing_contract(view.local_participant_id(), channel, routing)?
             }
-            None => CoreRoleRequirements::producer_and_consumer(),
+            None => (true, true),
         };
         validate_channel(channel, &mut profile_encodings, role_requirements)?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct CoreRoleRequirements {
-    producer: bool,
-    consumer: bool,
-}
-
-impl CoreRoleRequirements {
-    const fn producer_and_consumer() -> Self {
-        Self {
-            producer: true,
-            consumer: true,
-        }
-    }
-}
-
-fn validate_core_role_completeness(
-    view: &RuntimeFilterInstallView,
-    routing_shard: &RuntimeFilterRoutingShard,
-) -> Result<(), InstallContractError> {
-    for (channel_id, routing) in routing_shard.channels() {
-        let requires_core = routing.local_roles().iter().any(|role| {
-            matches!(
-                role,
-                RuntimeFilterRouteRole::Producer(_)
-                    | RuntimeFilterRouteRole::Aggregator
-                    | RuntimeFilterRouteRole::Consumer(_)
-            )
-        });
-        let is_routing_only_relay = routing.local_roles().len() == 1
-            && routing
-                .local_roles()
-                .contains(&RuntimeFilterRouteRole::Relay);
-        match (requires_core, view.channels().contains_key(channel_id)) {
-            (true, false) => {
-                return Err(install_error(
-                    InstallContractErrorKind::UnsupportedChannelContract,
-                    format!(
-                        "routing channel {} requires Core authority for its local roles",
-                        channel_id.get()
-                    ),
-                ));
-            }
-            (false, true) => {
-                return Err(install_error(
-                    InstallContractErrorKind::UnsupportedChannelContract,
-                    format!(
-                        "routing-only channel {} must not carry fake Core authority",
-                        channel_id.get()
-                    ),
-                ));
-            }
-            (false, false) if !is_routing_only_relay => {
-                return Err(install_error(
-                    InstallContractErrorKind::UnsupportedChannelContract,
-                    format!(
-                        "routing channel {} has no genuine local role",
-                        channel_id.get()
-                    ),
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn validate_nonempty_instance_sets(
-    channel: &RuntimeFilterChannelDeployment,
-) -> Result<(), InstallContractError> {
-    if channel
-        .producers()
-        .values()
-        .any(|producer| producer.expected_fragment_instances().is_empty())
-        || channel
-            .consumers()
-            .values()
-            .any(|consumer| consumer.expected_fragment_instances().is_empty())
-    {
-        return Err(install_error(
-            InstallContractErrorKind::EmptyExpectedInstances,
-            "producer and consumer expected fragment instances must be non-empty",
-        ));
     }
     Ok(())
 }
@@ -1129,7 +1101,7 @@ fn validate_channel_routing_contract(
     local_participant_id: crate::runtime_filter::port::identity::RuntimeFilterParticipantId,
     channel: &RuntimeFilterChannelDeployment,
     routing: &RuntimeFilterChannelRoutingView,
-) -> Result<CoreRoleRequirements, InstallContractError> {
+) -> Result<(bool, bool), InstallContractError> {
     let is_local_aggregator = routing
         .local_roles()
         .contains(&RuntimeFilterRouteRole::Aggregator);
@@ -1314,12 +1286,12 @@ fn validate_channel_routing_contract(
             .filter(|edge| {
                 edge.target().participant_id() == local_participant_id
                     && edge.target().role() == RuntimeFilterRouteRole::Consumer(*binding_id)
-                    && edge
+                    && (edge
                         .allowed_kinds()
                         .contains(&RuntimeFilterEnvelopeKind::Artifact)
-                    && edge
-                        .allowed_kinds()
-                        .contains(&RuntimeFilterEnvelopeKind::Unavailable)
+                        || edge
+                            .allowed_kinds()
+                            .contains(&RuntimeFilterEnvelopeKind::Unavailable))
             })
             .map(|edge| edge.route_edge_id())
             .collect::<BTreeSet<_>>();
@@ -1334,10 +1306,10 @@ fn validate_channel_routing_contract(
         }
     }
 
-    Ok(CoreRoleRequirements {
-        producer: is_local_aggregator || !local_producer_bindings.is_empty(),
-        consumer: !local_consumer_bindings.is_empty(),
-    })
+    Ok((
+        is_local_aggregator || !local_producer_bindings.is_empty(),
+        !local_consumer_bindings.is_empty(),
+    ))
 }
 
 /// Test-only shim so RFD-2 deployment-compiler tests (a different module) can
@@ -1346,39 +1318,6 @@ fn validate_channel_routing_contract(
 #[cfg(test)]
 pub(crate) fn validate_view_for_test(view: &RuntimeFilterInstallView) -> Result<(), String> {
     validate_view(view).map_err(|e| format!("{e}"))
-}
-
-struct SubscriptionRouteAlias {
-    subscription: Arc<SubscriptionGroup>,
-    canonical_route_edge_id: RouteEdgeId,
-}
-
-impl crate::runtime_filter::port::subscription::ArtifactDelivery for SubscriptionRouteAlias {
-    fn deliver(
-        &self,
-        _route_edge_id: RouteEdgeId,
-        outcome: crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome,
-    ) {
-        crate::runtime_filter::port::subscription::ArtifactDelivery::deliver(
-            self.subscription.as_ref(),
-            self.canonical_route_edge_id,
-            outcome,
-        );
-    }
-
-    fn deliver_live(
-        &self,
-        _route_edge_id: RouteEdgeId,
-        outcome: Option<crate::runtime_filter::port::subscription::ArtifactDeliveryOutcome>,
-        terminal: Option<crate::runtime_filter::port::subscription::LiveTerminal>,
-    ) {
-        crate::runtime_filter::port::subscription::ArtifactDelivery::deliver_live(
-            self.subscription.as_ref(),
-            self.canonical_route_edge_id,
-            outcome,
-            terminal,
-        );
-    }
 }
 
 struct RoutingBuild {
@@ -1476,15 +1415,11 @@ fn build_routing(
                     "consumer profile digest collision carried different canonical bytes",
                 ));
             }
-            let canonical_route_edge_id = *consumer
-                .route_edge_ids()
-                .first()
-                .expect("validated consumer route set is nonempty");
             let group = Arc::new(SubscriptionGroup::new(
                 common,
                 *binding_id,
                 consumer.activation(),
-                canonical_route_edge_id,
+                consumer.route_edge_ids().iter().copied(),
                 consumer.expected_fragment_instances().iter().copied(),
                 events.clone(),
             ));
@@ -1492,10 +1427,8 @@ fn build_routing(
             for route_edge_id in consumer.route_edge_ids() {
                 build.routes.insert(
                     *route_edge_id,
-                    Arc::new(SubscriptionRouteAlias {
-                        subscription: group.clone(),
-                        canonical_route_edge_id,
-                    }),
+                    group.clone()
+                        as Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>,
                 );
                 build
                     .channel_routes
@@ -1595,7 +1528,7 @@ fn build_routing(
 fn validate_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
-    role_requirements: CoreRoleRequirements,
+    role_requirements: (bool, bool),
 ) -> Result<(), InstallContractError> {
     if matches!(
         channel.logical_domain(),
@@ -1645,8 +1578,9 @@ fn validate_channel<'a>(
             "membership data type is not supported by the runtime filter port",
         ));
     }
-    if channel.producers().is_empty() != !role_requirements.producer
-        || channel.consumers().is_empty() != !role_requirements.consumer
+    let (requires_producer, requires_consumer) = role_requirements;
+    if channel.producers().is_empty() != !requires_producer
+        || channel.consumers().is_empty() != !requires_consumer
     {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
@@ -1715,7 +1649,7 @@ fn validate_channel<'a>(
             "CompleteOnce availability and terminal coverage must be canonically equivalent",
         ));
     }
-    if role_requirements.producer {
+    if requires_producer {
         validate_coverage(channel.availability_coverage(), channel)?;
         validate_coverage(channel.terminal_coverage(), channel)?;
     } else {
@@ -1867,9 +1801,7 @@ fn validate_channel<'a>(
             }
         }
     }
-    if role_requirements.consumer
-        && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
-    {
+    if requires_consumer && materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
         return Err(install_error(
             InstallContractErrorKind::InvalidPolicy,
             "max concurrent materialization jobs exceeds normalized unique profile count",
@@ -1881,7 +1813,7 @@ fn validate_channel<'a>(
 fn validate_ordered_channel<'a>(
     channel: &'a RuntimeFilterChannelDeployment,
     profile_encodings: &mut BTreeMap<ConsumerProfileId, &'a [u8]>,
-    role_requirements: CoreRoleRequirements,
+    role_requirements: (bool, bool),
 ) -> Result<(), InstallContractError> {
     let RuntimeFilterLogicalDomain::OrderedBound(plan) = channel.logical_domain() else {
         unreachable!("ordered validator is called only for ordered channels")
@@ -1947,8 +1879,9 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if channel.producers().is_empty() != !role_requirements.producer
-        || channel.consumers().is_empty() != !role_requirements.consumer
+    let (requires_producer, requires_consumer) = role_requirements;
+    if channel.producers().is_empty() != !requires_producer
+        || channel.consumers().is_empty() != !requires_consumer
     {
         return Err(install_error(
             InstallContractErrorKind::UnsupportedChannelContract,
@@ -2007,7 +1940,7 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if role_requirements.producer {
+    if requires_producer {
         validate_coverage(channel.availability_coverage(), channel)?;
         validate_coverage(channel.terminal_coverage(), channel)?;
     } else {
@@ -2073,9 +2006,7 @@ fn validate_ordered_channel<'a>(
             ));
         }
     }
-    if role_requirements.consumer
-        && materialization_policy.max_concurrent_jobs() > unique_profiles.len()
-    {
+    if requires_consumer && materialization_policy.max_concurrent_jobs() > unique_profiles.len() {
         return Err(install_error(
             InstallContractErrorKind::InvalidPolicy,
             "max concurrent materialization jobs exceeds normalized unique profile count",
@@ -2088,11 +2019,7 @@ fn validate_ordered_channel<'a>(
 fn validate_channel_contract(
     channel: &RuntimeFilterChannelDeployment,
 ) -> Result<(), InstallContractError> {
-    validate_channel(
-        channel,
-        &mut BTreeMap::new(),
-        CoreRoleRequirements::producer_and_consumer(),
-    )
+    validate_channel(channel, &mut BTreeMap::new(), (true, true))
 }
 
 fn bitset_schema_is_feasible(data_type: &arrow::datatypes::DataType) -> bool {
@@ -3414,12 +3341,67 @@ mod tests {
         )
     }
 
+    fn with_consumer_routes(
+        channel: &RuntimeFilterChannelDeployment,
+        binding_id: BindingId,
+        route_edge_ids: BTreeSet<RouteEdgeId>,
+    ) -> RuntimeFilterChannelDeployment {
+        let consumer = channel.consumers().get(&binding_id).unwrap();
+        let mut consumers = channel.consumers().clone();
+        consumers.insert(
+            binding_id,
+            ConsumerDeployment::with_profile(
+                consumer.activation(),
+                consumer.capabilities().clone(),
+                consumer.artifact_profile().clone(),
+                route_edge_ids,
+                consumer.expected_fragment_instances().clone(),
+            ),
+        );
+        RuntimeFilterChannelDeployment::new(
+            channel.channel_id(),
+            channel.logical_domain().clone(),
+            channel.lifecycle(),
+            channel.availability_coverage().clone(),
+            channel.terminal_coverage().clone(),
+            channel.reduction_requirement(),
+            channel.allowed_contribution_kinds().clone(),
+            channel.completion_requirement(),
+            channel.policy(),
+            channel.core_budget(),
+            channel.materialization_policy(),
+            channel.producers().clone(),
+            consumers,
+        )
+    }
+
     fn inbound_to_consumer(
         channel_id: ChannelId,
         route_edge_id: RouteEdgeId,
         binding_id: BindingId,
         source_participant: RuntimeFilterParticipantId,
         target_participant: RuntimeFilterParticipantId,
+    ) -> RuntimeFilterRoutingEdgeView {
+        inbound_to_consumer_with_kinds(
+            channel_id,
+            route_edge_id,
+            binding_id,
+            source_participant,
+            target_participant,
+            BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::Unavailable,
+            ]),
+        )
+    }
+
+    fn inbound_to_consumer_with_kinds(
+        channel_id: ChannelId,
+        route_edge_id: RouteEdgeId,
+        binding_id: BindingId,
+        source_participant: RuntimeFilterParticipantId,
+        target_participant: RuntimeFilterParticipantId,
+        allowed_kinds: BTreeSet<RuntimeFilterEnvelopeKind>,
     ) -> RuntimeFilterRoutingEdgeView {
         RuntimeFilterRoutingEdgeView::new(
             channel_id,
@@ -3436,10 +3418,7 @@ mod tests {
                 participant_id: source_participant,
                 endpoint: RuntimeEndpoint::new("remote-producer", 9060).unwrap(),
             },
-            BTreeSet::from([
-                RuntimeFilterEnvelopeKind::Artifact,
-                RuntimeFilterEnvelopeKind::Unavailable,
-            ]),
+            allowed_kinds,
         )
         .unwrap()
     }
@@ -3893,6 +3872,57 @@ mod tests {
                 .outcome(),
             InstallOutcome::Installed,
         );
+    }
+
+    #[test]
+    fn artifact_only_and_unavailable_only_routes_share_consumer_profile() {
+        let full = channel(1, 10, 20, 30, 40);
+        let consumer_only = without_producers(&with_consumer_routes(
+            &full,
+            BindingId::new(30),
+            BTreeSet::from([RouteEdgeId::new(40), RouteEdgeId::new(41)]),
+        ));
+        let core = core_view([(1, consumer_only)]);
+        let participant = core.local_participant_id();
+        let remote = RuntimeFilterParticipantId::new(4);
+        let routing = routing_shard(
+            core.epoch(),
+            participant,
+            ChannelId::new(1),
+            BTreeSet::from([RuntimeFilterRouteRole::Consumer(BindingId::new(30))]),
+            BTreeMap::from([((BindingId::new(10), uid(10)), remote)]),
+            vec![
+                inbound_to_consumer_with_kinds(
+                    ChannelId::new(1),
+                    RouteEdgeId::new(40),
+                    BindingId::new(30),
+                    remote,
+                    participant,
+                    BTreeSet::from([RuntimeFilterEnvelopeKind::Artifact]),
+                ),
+                inbound_to_consumer_with_kinds(
+                    ChannelId::new(1),
+                    RouteEdgeId::new(41),
+                    BindingId::new(30),
+                    remote,
+                    participant,
+                    BTreeSet::from([RuntimeFilterEnvelopeKind::Unavailable]),
+                ),
+            ],
+        );
+        let registry = registry();
+        registry
+            .install(participant_install(core, routing))
+            .unwrap();
+
+        let installed = registry.active_installation().unwrap();
+        let artifact_profile = installed
+            .profile_for_route(ChannelId::new(1), RouteEdgeId::new(40))
+            .unwrap();
+        let unavailable_profile = installed
+            .profile_for_route(ChannelId::new(1), RouteEdgeId::new(41))
+            .unwrap();
+        assert!(std::ptr::eq(artifact_profile, unavailable_profile));
     }
 
     #[test]
