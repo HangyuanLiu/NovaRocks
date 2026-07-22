@@ -11,3 +11,7 @@ async-trait = "0.1"
 bytes = "1"
 novarocks-state-store = { path = "../state-store" }
 sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

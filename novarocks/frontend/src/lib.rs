@@ -15,4 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod application;
 pub mod deployment;
+
+pub use application::{
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+};

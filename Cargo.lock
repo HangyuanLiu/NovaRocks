@@ -3274,6 +3274,8 @@ dependencies = [
  "bytes",
  "novarocks-state-store",
  "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
