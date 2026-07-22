@@ -17,8 +17,8 @@
 
 pub(crate) mod decode;
 pub(crate) mod encode;
-pub(crate) mod type_mapping;
 mod runtime_filter_install;
+pub(crate) mod type_mapping;
 
 // Narrow Task 4/5 surface: handlers and client adapters need only these DTOs
 // and boundary entry points, not the codec implementation module.
