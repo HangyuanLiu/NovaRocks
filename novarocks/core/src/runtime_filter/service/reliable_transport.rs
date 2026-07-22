@@ -44,9 +44,8 @@
 //! buffer, so this module only emits for frames it actually holds.
 //!
 //! Retry and deadline timing are driven by the injected [`RuntimeFilterClock`] and
-//! an explicit `drive_retries(now)` call: there is no background thread and no live
-//! timer here. The live network sender and the production tick loop are RFD-6; this
-//! task builds only the substrate and exercises it through an injectable fake sink.
+//! the query manager's bounded production tick. There is no per-query background
+//! thread or timer here.
 //!
 //! The transport is kind-agnostic: it keys, waits, and releases purely by delivery
 //! route identity. It never inspects the producer's semantic kind (Join / TopN /
@@ -371,6 +370,7 @@ pub(crate) struct ReliableEnvelopeTransport {
     pending: Mutex<PendingBuffer>,
     next_sequence: AtomicU64,
     shutdown: AtomicBool,
+    submission_gate: Mutex<()>,
     // The RFD-3 lifecycle event sink the Service assembles from its own `EventEmitter`.
     // Structured `TransportEnvelope` events flow through this SAME sink — never a second
     // registry — so the sender-side transport lifecycle is observable end to end.
@@ -393,6 +393,7 @@ impl ReliableEnvelopeTransport {
             pending: Mutex::new(PendingBuffer::default()),
             next_sequence: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
+            submission_gate: Mutex::new(()),
             event_sink,
         }
     }
@@ -434,10 +435,31 @@ impl ReliableEnvelopeTransport {
     }
 
     pub(crate) fn shutdown(&self) {
-        if self.shutdown.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            // Serialize terminalization with the complete `try_send` call. Once this
+            // guard is acquired every earlier submission has returned; setting the
+            // terminal bit here prevents every later submitter from entering the sink.
+            let _submission = self
+                .submission_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.shutdown.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
+        // Sink shutdown may run implementation callbacks, so never hold the lifecycle
+        // gate while invoking it. The terminal bit already revoked new send authority.
         self.sink.shutdown();
+        #[cfg(test)]
+        if let Some(sink) = self
+            .sink_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            sink.shutdown();
+        }
         let mut pending = self
             .pending
             .lock()
@@ -526,7 +548,7 @@ impl ReliableEnvelopeTransport {
         let route_identity = key.into_route_identity();
         let envelope =
             Self::transport_envelope(key, kind, identity, frame.as_ref(), policy.deadline);
-        match self.resolve_sink().try_send(route.clone(), envelope) {
+        match self.submit(route.clone(), envelope) {
             SinkSubmitOutcome::Submitted => {
                 self.emit(identity, TransportEventKind::Sent, bytes);
                 ReliableSendOutcome::Buffered(route_identity)
@@ -582,6 +604,13 @@ impl ReliableEnvelopeTransport {
         };
         let key = PendingKey::from_delivery(delivery);
         let released = {
+            let _submission = self
+                .submission_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.shutdown.load(Ordering::Acquire) {
+                return EnvelopeAckOutcome::Unknown;
+            }
             let mut pending = self
                 .pending
                 .lock()
@@ -669,12 +698,11 @@ impl ReliableEnvelopeTransport {
         // Re-hand retries outside the buffer lock (see `send`). The re-hand order
         // within a tick is unspecified (it follows HashMap iteration), so no caller
         // may depend on it; only `failed_open` is sorted below for determinism.
-        let sink = self.resolve_sink();
         for (key, route, frame, kind, identity, bytes) in &to_send {
             let envelope =
                 Self::transport_envelope(*key, *kind, *identity, frame.as_ref(), policy.deadline);
             if matches!(
-                sink.try_send(route.clone(), envelope),
+                self.submit(route.clone(), envelope),
                 SinkSubmitOutcome::Submitted
             ) {
                 self.emit(*identity, TransportEventKind::Retried, *bytes);
@@ -705,9 +733,8 @@ impl ReliableEnvelopeTransport {
         if self.shutdown.load(Ordering::Acquire) {
             return ReliableTransportTick::default();
         }
-        let sink = self.resolve_sink();
         let mut contract_failed = Vec::new();
-        while let Some(completion) = sink.try_recv_completion() {
+        while let Some(completion) = self.try_recv_completion() {
             match completion {
                 SinkCompletion::Ack(identity, status) => {
                     if matches!(self.on_ack(&identity, status), EnvelopeAckOutcome::Rejected) {
@@ -737,6 +764,32 @@ impl ReliableEnvelopeTransport {
         });
         tick.failed_open = contract_failed;
         tick
+    }
+
+    fn submit(
+        &self,
+        route: RuntimeFilterRemoteRoute,
+        envelope: RuntimeFilterTransportEnvelope,
+    ) -> SinkSubmitOutcome {
+        let _submission = self
+            .submission_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.shutdown.load(Ordering::Acquire) {
+            return SinkSubmitOutcome::Shutdown;
+        }
+        self.resolve_sink().try_send(route, envelope)
+    }
+
+    fn try_recv_completion(&self) -> Option<SinkCompletion> {
+        let _submission = self
+            .submission_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        self.resolve_sink().try_recv_completion()
     }
 
     /// Resolve the sink to transmit through: the test override when installed,

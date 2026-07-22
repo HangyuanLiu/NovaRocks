@@ -1101,7 +1101,7 @@ impl QueryContextManager {
     }
 
     fn clean_expired(&self) {
-        let expired = {
+        let (expired, active_services, runtime_filter_now) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let runtime_filter_now = runtime_filter_terminal_now(&guard);
             clean_expired_runtime_filter_terminals(&mut guard);
@@ -1144,12 +1144,21 @@ impl QueryContextManager {
                     .into_iter()
                     .filter_map(|qid| guard.active.remove(&qid).map(|ctx| (qid, ctx))),
             );
-            expired
+            let active_services = guard
+                .active
+                .values()
+                .chain(guard.second_chance.values())
+                .map(QueryContext::runtime_filter_service)
+                .collect::<Vec<_>>();
+            (expired, active_services, runtime_filter_now)
         };
         for (qid, ctx) in expired {
             ctx.runtime_filter_service().shutdown();
             drop(ctx);
             self.remove_runtime_filter_lifecycle_if_context_absent(qid);
+        }
+        for service in active_services {
+            service.tick(runtime_filter_now);
         }
     }
 
@@ -5202,6 +5211,391 @@ pub(crate) mod runtime_filter_service_lifecycle_tests {
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod runtime_filter_tick {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, Weak, mpsc};
+        use std::time::{Duration, Instant};
+
+        use super::super::{QueryContextManager, QueryId};
+        use crate::common::types::UniqueId;
+        use crate::runtime::endpoint::RuntimeEndpoint;
+        use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
+        use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+        use crate::runtime_filter::port::events::{
+            RuntimeFilterEvent, RuntimeFilterEventIdentity, RuntimeFilterEventSink,
+            TransportRouteEventIdentity,
+        };
+        use crate::runtime_filter::port::identity::{
+            DeploymentEpoch, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
+        };
+        use crate::runtime_filter::port::routing::{
+            RuntimeFilterRemoteRoute, RuntimeFilterRouteRole,
+        };
+        use crate::runtime_filter::port::support::{
+            MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
+        };
+        use crate::runtime_filter::port::transport::{
+            DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterRouteIdentity,
+            RuntimeFilterTransportEnvelope,
+        };
+        use crate::runtime_filter::router::remote::{
+            RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+        };
+        use crate::runtime_filter::service::{ReliableTransportPolicy, RuntimeFilterService};
+
+        const WAIT: Duration = Duration::from_secs(1);
+        const RETRY: Duration = Duration::from_millis(10);
+        const DEADLINE: Duration = Duration::from_millis(20);
+
+        struct ManualClock(Mutex<Instant>);
+
+        impl RuntimeFilterClock for ManualClock {
+            fn now(&self) -> Instant {
+                *self.0.lock().expect("manual clock")
+            }
+        }
+
+        struct NoopEvents;
+
+        impl RuntimeFilterEventSink for NoopEvents {
+            fn record(&self, _event: RuntimeFilterEvent) {}
+        }
+
+        struct NoopMemory;
+
+        impl RuntimeFilterMemoryAccount for NoopMemory {
+            fn try_consume(&self, _bytes: usize) -> Result<(), MemoryAccountError> {
+                Ok(())
+            }
+
+            fn release(&self, _bytes: usize) {}
+        }
+
+        struct TickSink {
+            attempts: AtomicUsize,
+            recorded: AtomicUsize,
+            shutdown: AtomicBool,
+            completions: Mutex<VecDeque<SinkCompletion>>,
+            lock_probe: Mutex<Option<(Weak<QueryContextManager>, QueryId, mpsc::SyncSender<bool>)>>,
+            retry_gate: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+        }
+
+        impl TickSink {
+            fn plain() -> Arc<Self> {
+                Arc::new(Self {
+                    attempts: AtomicUsize::new(0),
+                    recorded: AtomicUsize::new(0),
+                    shutdown: AtomicBool::new(false),
+                    completions: Mutex::new(VecDeque::new()),
+                    lock_probe: Mutex::new(None),
+                    retry_gate: Mutex::new(None),
+                })
+            }
+
+            fn with_lock_probe(
+                manager: &Arc<QueryContextManager>,
+                query_id: QueryId,
+            ) -> (Arc<Self>, mpsc::Receiver<bool>) {
+                let sink = Self::plain();
+                let (probe_tx, probe_rx) = mpsc::sync_channel(1);
+                *sink.lock_probe.lock().expect("lock probe") =
+                    Some((Arc::downgrade(manager), query_id, probe_tx));
+                (sink, probe_rx)
+            }
+
+            fn with_blocked_retry() -> (Arc<Self>, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+                let sink = Self::plain();
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                *sink.retry_gate.lock().expect("retry gate") = Some((entered_tx, release_rx));
+                (sink, entered_rx, release_tx)
+            }
+
+            fn send_count(&self) -> usize {
+                self.recorded.load(Ordering::Acquire)
+            }
+
+            fn push_completion(&self, completion: SinkCompletion) {
+                self.completions
+                    .lock()
+                    .expect("completion queue")
+                    .push_back(completion);
+            }
+        }
+
+        impl RuntimeFilterEnvelopeSink for TickSink {
+            fn try_send(
+                &self,
+                _route: RuntimeFilterRemoteRoute,
+                _envelope: RuntimeFilterTransportEnvelope,
+            ) -> SinkSubmitOutcome {
+                let attempt = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
+                if attempt == 2
+                    && let Some((entered, release)) =
+                        self.retry_gate.lock().expect("retry gate").take()
+                {
+                    entered.send(()).expect("retry entered");
+                    release.recv_timeout(WAIT).expect("retry released");
+                }
+                self.recorded.fetch_add(1, Ordering::AcqRel);
+                SinkSubmitOutcome::Submitted
+            }
+
+            fn try_recv_completion(&self) -> Option<SinkCompletion> {
+                if let Some((manager, query_id, sender)) =
+                    self.lock_probe.lock().expect("lock probe").take()
+                {
+                    let lock_was_free = manager.upgrade().is_some_and(|manager| {
+                        let lock_was_free = manager.inner.try_lock().is_ok();
+                        lock_was_free
+                            && manager
+                                .runtime_filter_service_for_ingress(query_id)
+                                .is_some()
+                    });
+                    sender.send(lock_was_free).expect("lock probe result");
+                }
+                self.completions
+                    .lock()
+                    .expect("completion queue")
+                    .pop_front()
+            }
+
+            fn shutdown(&self) {
+                self.shutdown.store(true, Ordering::Release);
+            }
+        }
+
+        fn query_id(lo: i64) -> QueryId {
+            QueryId { hi: 97, lo }
+        }
+
+        fn route() -> RuntimeFilterRemoteRoute {
+            RuntimeFilterRemoteRoute::new(
+                RouteEdgeId::new(11),
+                RuntimeFilterParticipantId::new(12),
+                RuntimeEndpoint::new("127.0.0.1", 19060).expect("endpoint"),
+                RuntimeFilterRouteRole::Consumer(BindingId::new(13)),
+            )
+            .expect("remote route")
+        }
+
+        fn identity() -> TransportRouteEventIdentity {
+            TransportRouteEventIdentity::new(
+                RuntimeFilterEventIdentity::new(
+                    UniqueId { hi: 97, lo: 1 },
+                    RuntimeFilterParticipantId::new(14),
+                    ChannelId::new(15),
+                    DeploymentEpoch::new(16),
+                ),
+                RouteEdgeId::new(11),
+            )
+        }
+
+        fn install_service(
+            manager: &Arc<QueryContextManager>,
+            query_id: QueryId,
+            started: Instant,
+            sink: Arc<TickSink>,
+        ) -> Arc<RuntimeFilterService> {
+            manager
+                .ensure_native_context(
+                    query_id,
+                    false,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                )
+                .expect("native context");
+            let service = Arc::new(RuntimeFilterService::new_for_lifecycle_test(
+                UniqueId {
+                    hi: query_id.hi,
+                    lo: query_id.lo,
+                },
+                Arc::new(ManualClock(Mutex::new(started))),
+                Arc::new(NoopEvents),
+                Arc::new(NoopMemory),
+            ));
+            service.set_remote_sink_for_test(sink);
+            service
+                .configure_transport(ReliableTransportPolicy::new(RETRY, 2, DEADLINE, 8, 4096))
+                .expect("transport policy");
+            let mut guard = manager.inner.lock().expect("query manager");
+            guard
+                .active
+                .get_mut(&query_id)
+                .expect("active context")
+                .runtime_filter_service = service.clone();
+            service
+        }
+
+        fn seed_pending(service: &RuntimeFilterService) {
+            service.seed_remote_transport_for_test(
+                &route(),
+                Arc::new(EncodedArtifactFrame::from_parts_for_test(
+                    [9; 32],
+                    vec![1, 2, 3],
+                )),
+                identity(),
+            );
+            assert_eq!(service.transport_pending_len_for_test(), 1);
+        }
+
+        fn set_manager_now(manager: &QueryContextManager, now: Instant) {
+            manager
+                .inner
+                .lock()
+                .expect("query manager")
+                .runtime_filter_terminal_now = Some(now);
+        }
+
+        fn run_cleanup_joined(manager: Arc<QueryContextManager>) {
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            let cleanup = std::thread::spawn(move || {
+                manager.clean_expired_for_test();
+                done_tx.send(()).expect("cleanup complete");
+            });
+            done_rx.recv_timeout(WAIT).expect("cleanup joined in time");
+            cleanup.join().expect("cleanup thread");
+        }
+
+        #[test]
+        fn manager_tick_drives_retry_and_deadline_without_manual_test_hook() {
+            let manager = QueryContextManager::new_for_test();
+            let query_id = query_id(1);
+            let started = Instant::now();
+            set_manager_now(&manager, started);
+            let sink = TickSink::plain();
+            let service = install_service(&manager, query_id, started, sink.clone());
+            seed_pending(&service);
+            assert_eq!(sink.send_count(), 1);
+
+            set_manager_now(&manager, started + RETRY);
+            run_cleanup_joined(manager.clone());
+            assert_eq!(sink.send_count(), 2, "manager tick must drive one retry");
+            assert_eq!(service.transport_pending_len_for_test(), 1);
+
+            set_manager_now(&manager, started + DEADLINE);
+            run_cleanup_joined(manager);
+            assert_eq!(service.transport_pending_len_for_test(), 0);
+            assert_eq!(sink.send_count(), 2, "deadline must not send again");
+        }
+
+        #[test]
+        fn manager_never_ticks_service_while_holding_inner_lock() {
+            let manager = QueryContextManager::new_for_test();
+            let query_id = query_id(2);
+            let started = Instant::now();
+            set_manager_now(&manager, started);
+            let (sink, probe_rx) = TickSink::with_lock_probe(&manager, query_id);
+            let _service = install_service(&manager, query_id, started, sink);
+
+            run_cleanup_joined(manager);
+            assert!(
+                probe_rx.recv_timeout(WAIT).expect("tick lock probe"),
+                "tick callback must be able to reenter the manager"
+            );
+        }
+
+        #[test]
+        fn cleanup_race_cannot_resurrect_or_send_after_abort() {
+            let manager = QueryContextManager::new_for_test();
+            let query_id = query_id(3);
+            let epoch = DeploymentEpoch::new(16);
+            let started = Instant::now();
+            set_manager_now(&manager, started + RETRY);
+            let (sink, retry_entered_rx, release_retry_tx) = TickSink::with_blocked_retry();
+            let service = install_service(&manager, query_id, started, sink.clone());
+            seed_pending(&service);
+
+            let (cleanup_done_tx, cleanup_done_rx) = mpsc::sync_channel(1);
+            let cleanup_manager = manager.clone();
+            let cleanup = std::thread::spawn(move || {
+                cleanup_manager.clean_expired_for_test();
+                cleanup_done_tx.send(()).expect("cleanup complete");
+            });
+            retry_entered_rx
+                .recv_timeout(WAIT)
+                .expect("cleanup tick entered retry send");
+
+            let (abort_done_tx, abort_done_rx) = mpsc::sync_channel(1);
+            let abort_manager = manager.clone();
+            let abort_sink = sink.clone();
+            let abort = std::thread::spawn(move || {
+                let result = abort_manager.abort_runtime_filter_deployment(query_id, epoch);
+                abort_done_tx
+                    .send((result, abort_sink.send_count()))
+                    .expect("abort complete");
+            });
+            assert!(
+                abort_done_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err(),
+                "abort must wait for the admitted retry submission"
+            );
+            release_retry_tx.send(()).expect("release retry");
+            cleanup_done_rx
+                .recv_timeout(WAIT)
+                .expect("cleanup joined in time");
+            let (abort_result, sends_at_abort) = abort_done_rx
+                .recv_timeout(WAIT)
+                .expect("abort joined in time");
+            cleanup.join().expect("cleanup thread");
+            abort.join().expect("abort thread");
+            abort_result.expect("abort succeeds");
+
+            assert_eq!(sink.send_count(), sends_at_abort, "no post-abort send");
+            assert!(
+                manager
+                    .runtime_filter_service_for_ingress(query_id)
+                    .is_none()
+            );
+            sink.push_completion(SinkCompletion::Ack(
+                RuntimeFilterRouteIdentity::delivery(
+                    DeliveryRouteIdentity::try_new(RouteEdgeId::new(11), ProducerSequence::new(1))
+                        .expect("delivery identity"),
+                ),
+                RuntimeFilterAcceptStatus::Accepted,
+            ));
+            service.tick(started + DEADLINE + RETRY);
+            assert_eq!(sink.send_count(), sends_at_abort, "late tick is terminal");
+            assert_eq!(service.transport_pending_len_for_test(), 0);
+            assert!(
+                manager
+                    .runtime_filter_service_for_ingress(query_id)
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn manager_shutdown_drains_live_sink() {
+            let manager = QueryContextManager::new_for_test();
+            let query_id = query_id(4);
+            let started = Instant::now();
+            set_manager_now(&manager, started);
+            let sink = TickSink::plain();
+            let service = install_service(&manager, query_id, started, sink.clone());
+            seed_pending(&service);
+            {
+                let mut guard = manager.inner.lock().expect("query manager");
+                guard
+                    .active
+                    .get_mut(&query_id)
+                    .expect("active context")
+                    .query_deadline = Instant::now() - Duration::from_millis(1);
+            }
+
+            run_cleanup_joined(manager.clone());
+
+            assert!(sink.shutdown.load(Ordering::Acquire));
+            assert_eq!(service.transport_pending_len_for_test(), 0);
+            assert!(
+                manager
+                    .runtime_filter_service_for_ingress(query_id)
+                    .is_none()
+            );
+        }
+    }
+
     pub(super) mod runtime_filter_deployment {
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::{Duration, Instant};

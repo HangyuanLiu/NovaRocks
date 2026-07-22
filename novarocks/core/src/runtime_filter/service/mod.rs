@@ -34,6 +34,7 @@ mod reliable_transport;
 mod subscription;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::Instant;
@@ -53,9 +54,9 @@ use crate::runtime_filter::port::events::{
 use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
-    FinalDomainProducerAdapter, InstallContractError, InstallOutcome, OrderedBoundProducerAdapter,
-    ProducerAdapter, ProducerHandle, ProducerHandleWeak, ProducerPortKind,
-    RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
+    FinalDomainProducerAdapter, InstallContractError, InstallContractErrorKind, InstallOutcome,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerHandleWeak,
+    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::routing::{
@@ -1117,6 +1118,7 @@ pub(crate) struct RuntimeFilterService {
     #[cfg(test)]
     after_registry_cancel_before_channel_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     operation: Mutex<()>,
+    terminal: AtomicBool,
     // Unified, per-channel ingress dedupe + `(query, epoch)` tombstone (M3 Task 3).
     // Both ingress directions consult it; teardown (`cancel`) retires this query/epoch
     // into its tombstone. It subsumes the former `delivered_versions` ledger (the
@@ -1191,14 +1193,31 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_registry_cancel_before_channel_cancel: Mutex::new(None),
             operation: Mutex::new(()),
+            terminal: AtomicBool::new(false),
             dedupe: IngressDedupe::new(query_id),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_lifecycle_test(
+        query_id: UniqueId,
+        clock: Arc<dyn RuntimeFilterClock>,
+        event_sink: Arc<dyn RuntimeFilterEventSink>,
+        memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    ) -> Self {
+        Self::new_with_dependencies(query_id, clock, event_sink, memory_account)
     }
 
     pub(crate) fn install(
         &self,
         install: RuntimeFilterParticipantInstall,
     ) -> Result<InstallOutcome, InstallContractError> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(InstallContractError::new(
+                InstallContractErrorKind::ServiceClosed,
+                "runtime filter service is terminal",
+            ));
+        }
         let result = self.registry.install(install)?;
         let outcome = result.outcome();
         Ok(outcome)
@@ -1208,6 +1227,9 @@ impl RuntimeFilterService {
         &self,
         policy: ReliableTransportPolicy,
     ) -> Result<(), String> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Err("runtime filter service is terminal".to_string());
+        }
         self.reliable_transport.configure_policy(policy)
     }
 
@@ -1544,6 +1566,9 @@ impl RuntimeFilterService {
     }
 
     pub(crate) fn expire_deadlines(&self, now: Instant) {
+        if self.terminal.load(Ordering::Acquire) {
+            return;
+        }
         let installed = {
             let _operation = self
                 .operation
@@ -1561,14 +1586,38 @@ impl RuntimeFilterService {
         }
     }
 
+    /// Advance every time-owned Service subsystem from one manager-provided instant.
+    /// Channel deadlines and reliable transport completions/retries share this sole
+    /// production driver so their lifecycle cannot drift into separate timer owners.
+    pub(crate) fn tick(&self, now: Instant) {
+        if self.terminal.load(Ordering::Acquire) {
+            return;
+        }
+        self.expire_deadlines(now);
+        if self.terminal.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.reliable_transport.drain_completions_and_drive(now);
+    }
+
     pub(crate) fn cancel(&self) {
         let installed = {
             let _operation = self
                 .operation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            self.registry.cancel()
+            if self.terminal.swap(true, Ordering::AcqRel) {
+                None
+            } else {
+                self.registry.cancel()
+            }
         };
+        // Terminalize outbound authority before any channel-cancellation callback can
+        // reenter delivery. The transport waits for an already-admitted nonblocking
+        // submission to finish, then closes its sink and releases every pending frame.
+        // Repeated callers also pass through this idempotent barrier, so none can
+        // return while another caller is still closing an admitted submission.
+        self.reliable_transport.shutdown();
         if let Some(cancelled) = installed {
             // Tombstone this (query, epoch) so a late/duplicate envelope arriving after
             // teardown is rejected without rebuilding context (M2B3 lookup-only). Both
@@ -1594,7 +1643,6 @@ impl RuntimeFilterService {
 
     pub(crate) fn shutdown(&self) {
         self.cancel();
-        self.reliable_transport.shutdown();
     }
 
     pub(crate) fn shutdown_transport(&self) {
@@ -1606,7 +1654,7 @@ impl RuntimeFilterService {
     /// delivery tests override it here rather than threading a sink through every
     /// `new_with_dependencies` call site.
     #[cfg(test)]
-    fn set_remote_sink_for_test(
+    pub(crate) fn set_remote_sink_for_test(
         &self,
         sink: Arc<dyn crate::runtime_filter::router::remote::RuntimeFilterEnvelopeSink>,
     ) {
@@ -1618,6 +1666,24 @@ impl RuntimeFilterService {
     #[cfg(test)]
     fn reliable_transport(&self) -> &ReliableEnvelopeTransport {
         &self.reliable_transport
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_remote_transport_for_test(
+        &self,
+        route: &crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
+        frame: Arc<crate::runtime_filter::codec::artifact::EncodedArtifactFrame>,
+        identity: TransportRouteEventIdentity,
+    ) {
+        assert!(matches!(
+            self.reliable_transport.send(route, frame, identity),
+            ReliableSendOutcome::Buffered(_)
+        ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_pending_len_for_test(&self) -> usize {
+        self.reliable_transport.pending_len()
     }
 
     #[cfg(test)]
@@ -2625,6 +2691,11 @@ mod tests {
         let channel_id = ChannelId::new(5);
         let producer_binding = BindingId::new(10);
         let remote_producer = UniqueId { hi: 1, lo: 4 };
+        // The shared fixture places this producer on backend index 7. Participant
+        // identities are deliberately nonzero, so the compiler projects backend N
+        // as participant N + 1 rather than preserving the backend index verbatim.
+        let remote_participant =
+            crate::runtime_filter::deployment::participant_id_for_backend(7).unwrap();
         let mut plan = super::test_support::compiled_three_backend_all_of_plan();
         let aggregator = plan
             .routing_shards
@@ -2645,9 +2716,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             routing_channel.producer_participant(producer_binding, remote_producer),
-            Some(RuntimeFilterParticipantId::new(7))
+            Some(remote_participant)
         );
-        assert_ne!(aggregator, RuntimeFilterParticipantId::new(7));
+        assert_ne!(aggregator, remote_participant);
         let core_view = plan.install_views.remove(&aggregator).unwrap();
         let routing_shard = plan.routing_shards.remove(&aggregator).unwrap();
         (
