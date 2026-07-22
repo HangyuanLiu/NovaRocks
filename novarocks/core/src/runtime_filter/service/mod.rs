@@ -19,6 +19,8 @@ mod consumer_ingress;
 mod dedupe;
 mod inbound;
 #[cfg(test)]
+mod live_deployment_conformance_tests;
+#[cfg(test)]
 mod m3a_tests;
 #[cfg(test)]
 mod m3b_tests;
@@ -372,9 +374,11 @@ impl RuntimeFilterEventSink for EventEmitter {
 }
 
 struct ActionDispatcher {
+    query_id: UniqueId,
     registry: Arc<DeploymentRegistry>,
     events: Arc<EventEmitter>,
     memory_account: Arc<dyn RuntimeFilterMemoryAccount>,
+    reliable_transport: Arc<ReliableEnvelopeTransport>,
     channels: Mutex<BTreeMap<ChannelId, Arc<ChannelDispatchFlight>>>,
     #[cfg(test)]
     after_claim: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -826,6 +830,7 @@ impl ActionDispatcher {
         };
         let mut events = Vec::new();
         let mut deliveries = Vec::new();
+        let mut remote_deliveries = Vec::new();
         let mut error = None;
         match action {
             ChannelAction::None | ChannelAction::Progress { .. } => {}
@@ -997,6 +1002,13 @@ impl ActionDispatcher {
                             }
                         }
                     }
+                    if let Some(outcome) = delivery_outcome.as_ref() {
+                        remote_deliveries.push((
+                            work.group.profile().clone(),
+                            work.group.route_edges().to_vec(),
+                            outcome.clone(),
+                        ));
+                    }
                     if !delivered_before_notify {
                         deliveries.push((
                             work.group.route_edges().to_vec(),
@@ -1009,10 +1021,16 @@ impl ActionDispatcher {
             ChannelAction::Unavailable { reason, .. } => {
                 if let Some(plan) = installed.artifact_plan(channel_id) {
                     for group in plan.groups() {
+                        let outcome = ArtifactDeliveryOutcome::Unavailable(*reason);
                         deliveries.push((
                             group.route_edges().to_vec(),
-                            Some(ArtifactDeliveryOutcome::Unavailable(*reason)),
+                            Some(outcome.clone()),
                             Some(LiveTerminal::Unavailable(*reason)),
+                        ));
+                        remote_deliveries.push((
+                            group.profile().clone(),
+                            group.route_edges().to_vec(),
+                            outcome,
                         ));
                     }
                 }
@@ -1027,7 +1045,90 @@ impl ActionDispatcher {
                 .router()
                 .route_live(&route_edges, outcome.as_ref(), terminal);
         }
+        for (profile, route_edges, outcome) in remote_deliveries {
+            if let Err(delivery_error) = self.deliver_remote_artifact(
+                &installed,
+                channel_id,
+                &profile,
+                route_edges,
+                &outcome,
+            ) {
+                error.get_or_insert_with(|| {
+                    violation(
+                        RuntimeContractViolationKind::ServiceUnavailable,
+                        delivery_error.to_string(),
+                    )
+                });
+            }
+        }
         (batch, error)
+    }
+
+    fn deliver_remote_artifact(
+        &self,
+        installed: &InstalledDeployment,
+        channel_id: ChannelId,
+        profile: &ConsumerArtifactProfile,
+        route_edge_ids: Vec<RouteEdgeId>,
+        outcome: &ArtifactDeliveryOutcome,
+    ) -> Result<(), ArtifactDeliveryError> {
+        let envelope_kind = match outcome {
+            ArtifactDeliveryOutcome::Published(_) => RuntimeFilterEnvelopeKind::Artifact,
+            ArtifactDeliveryOutcome::Unavailable(_) => RuntimeFilterEnvelopeKind::Unavailable,
+            ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
+                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+            }
+        };
+        let intent = RuntimeFilterDeliveryRouteIntent::new(
+            installed.epoch(),
+            channel_id,
+            route_edge_ids,
+            envelope_kind,
+        )?;
+        let decision = installed.role_router().route_delivery(intent)?;
+        if decision.remote_routes().is_empty() {
+            return Ok(());
+        }
+        let max_encoded = max_encoded_len_for_artifact_budget(
+            installed
+                .artifact_plan(channel_id)
+                .ok_or(ArtifactDeliveryError::NotInstalled)?
+                .max_artifact_bytes(),
+        )?;
+        let expectation = ArtifactDecodeExpectation::new(profile);
+        let frame = Arc::new(match outcome {
+            ArtifactDeliveryOutcome::Published(bundle) => {
+                encode_artifact_bundle(bundle, expectation, max_encoded)?
+            }
+            ArtifactDeliveryOutcome::Unavailable(reason) => {
+                encode_unavailable(*reason, expectation, max_encoded)?
+            }
+            ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
+                unreachable!("non-deliverable outcomes are rejected above")
+            }
+        });
+        let common = RuntimeFilterEventIdentity::new(
+            self.query_id,
+            installed.participant_id(),
+            channel_id,
+            installed.epoch(),
+        );
+        for route in decision.remote_routes() {
+            let identity = TransportRouteEventIdentity::new(common, route.route_edge_id());
+            if let ReliableSendOutcome::ResourceLimit(_limit) = self.reliable_transport.send_kind(
+                route,
+                Arc::clone(&frame),
+                identity,
+                envelope_kind,
+            ) {
+                self.events.record(RuntimeFilterEvent::TransportEnvelope {
+                    identity,
+                    kind: TransportEventKind::FailedOpen(TransportFailOpenReason::ResourceLimit),
+                    bytes: frame.payload().len(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1338,7 +1439,7 @@ pub(crate) struct RuntimeFilterService {
     // Sender-side reliable transport for the outbound remote leg: buffers each
     // wire-encoded remote frame for ack-release and bounded retry, failing open on
     // deadline. Query-scoped so its in-flight buffer persists across delivery calls.
-    reliable_transport: ReliableEnvelopeTransport,
+    reliable_transport: Arc<ReliableEnvelopeTransport>,
 }
 
 pub(super) struct OpenedProducer {
@@ -1381,10 +1482,19 @@ impl RuntimeFilterService {
             memory_account.clone(),
             events.clone(),
         ));
+        // The reliable transport emits its structured `TransportEnvelope` events through
+        // the SAME `EventEmitter` the registry and dispatcher already use — one query-
+        // scoped lifecycle sink, never a second registry.
+        let reliable_transport = Arc::new(ReliableEnvelopeTransport::for_query(
+            clock.clone(),
+            events.clone(),
+        ));
         let dispatcher = Arc::new(ActionDispatcher {
+            query_id,
             registry: registry.clone(),
             events: events.clone(),
             memory_account: memory_account.clone(),
+            reliable_transport: reliable_transport.clone(),
             channels: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             after_claim: Mutex::new(None),
@@ -1401,11 +1511,6 @@ impl RuntimeFilterService {
             #[cfg(test)]
             after_owner_finish: Mutex::new(None),
         });
-        // The reliable transport emits its structured `TransportEnvelope` events through
-        // the SAME `EventEmitter` the registry and dispatcher already use — one query-
-        // scoped lifecycle sink, never a second registry.
-        let reliable_transport =
-            ReliableEnvelopeTransport::for_query(clock.clone(), events.clone());
         Self {
             _query_id: query_id,
             _clock: clock,
@@ -1467,6 +1572,15 @@ impl RuntimeFilterService {
             return Err("runtime filter service is terminal".to_string());
         };
         self.reliable_transport.configure_policy(policy)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_participant_install_for_test(
+        &self,
+    ) -> Option<RuntimeFilterParticipantInstall> {
+        self.registry
+            .active_installation()
+            .map(|installed| installed.participant_install_for_test())
     }
 
     pub(crate) fn open_producer(
@@ -3189,6 +3303,35 @@ mod tests {
     pub(super) fn inbound_loopback_install_for_test(
         channel: RuntimeFilterChannelDeployment,
     ) -> RuntimeFilterParticipantInstall {
+        let mut grouped = BTreeMap::<
+            crate::runtime_filter::port::artifact::ConsumerProfileId,
+            (
+                crate::runtime_filter::port::artifact::ConsumerArtifactProfile,
+                BTreeSet<RouteEdgeId>,
+            ),
+        >::new();
+        for consumer in channel.consumers().values() {
+            grouped
+                .entry(consumer.artifact_profile().id())
+                .or_insert_with(|| (consumer.artifact_profile().clone(), BTreeSet::new()))
+                .1
+                .extend(consumer.route_edge_ids().iter().copied());
+        }
+        let channel = channel.with_outbound_materialization_groups(
+            grouped
+                .into_iter()
+                .map(|(profile_id, (profile, routes))| {
+                    (
+                        profile_id,
+                        OutboundMaterializationGroup::new(
+                            OutboundMaterializationOwner::Aggregator,
+                            profile,
+                            routes,
+                        ),
+                    )
+                })
+                .collect(),
+        );
         let epoch = DeploymentEpoch::new(9);
         let participant = RuntimeFilterParticipantId::new(3);
         let channel_id = channel.channel_id();
@@ -7869,7 +8012,23 @@ mod tests {
             local_consumers
                 .iter()
                 .map(|(binding, route, instance)| (*binding, *route, *instance, profile.clone())),
-        );
+        )
+        .with_outbound_materialization_groups(BTreeMap::from([(
+            profile.id(),
+            OutboundMaterializationGroup::new(
+                OutboundMaterializationOwner::Aggregator,
+                profile.clone(),
+                local_consumers
+                    .iter()
+                    .map(|(_, route, _)| RouteEdgeId::new(*route))
+                    .chain(
+                        remote_consumers
+                            .iter()
+                            .map(|(_, route, _, _)| RouteEdgeId::new(*route)),
+                    )
+                    .collect(),
+            ),
+        )]));
         let core_view = RuntimeFilterInstallView::new(
             epoch,
             aggregator,
@@ -8442,7 +8601,8 @@ mod tests {
             template.materialization_policy(),
             template.producers().clone(),
             consumers,
-        );
+        )
+        .with_outbound_materialization_groups(template.outbound_materialization_groups().clone());
         let mut channels = core_view.channels().clone();
         channels.insert(channel_id, consumer_channel);
         let augmented_core =

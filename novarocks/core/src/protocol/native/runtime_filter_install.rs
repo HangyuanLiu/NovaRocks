@@ -34,7 +34,8 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
-    ConsumerDeployment, MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
+    ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+    OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
     RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
 };
 use crate::runtime_filter::port::ordered_bound::OrderContractDigest;
@@ -570,6 +571,11 @@ fn encode_core_channel(
             .iter()
             .map(|(binding, consumer)| encode_consumer(*binding, consumer))
             .collect::<CodecResult<Vec<_>>>()?,
+        outbound_materialization_groups: channel
+            .outbound_materialization_groups()
+            .values()
+            .map(encode_outbound_materialization_group)
+            .collect::<CodecResult<Vec<_>>>()?,
     })
 }
 
@@ -684,6 +690,20 @@ fn decode_core_channel(
             ));
         }
     }
+    let mut groups = BTreeMap::new();
+    for (index, group) in wire.outbound_materialization_groups.iter().enumerate() {
+        let item_path = path
+            .clone()
+            .field("outbound_materialization_groups")
+            .index(index);
+        let group = decode_outbound_materialization_group(group, item_path.clone())?;
+        if groups.insert(group.profile().id(), group).is_some() {
+            return Err(duplicate(
+                item_path,
+                "duplicate outbound materialization profile",
+            ));
+        }
+    }
     Ok(RuntimeFilterChannelDeployment::new(
         ChannelId::new(wire.channel_id),
         domain,
@@ -698,7 +718,78 @@ fn decode_core_channel(
         materialization,
         producers,
         consumers,
-    ))
+    )
+    .with_outbound_materialization_groups(groups))
+}
+
+fn encode_outbound_materialization_group(
+    group: &OutboundMaterializationGroup,
+) -> CodecResult<filter::RuntimeFilterOutboundMaterializationGroup> {
+    if group.route_edge_ids().is_empty() {
+        return Err(invalid(
+            FieldPath::root("runtime_filter_install").field("outbound_materialization_groups"),
+            "outbound materialization route set must be nonempty",
+        ));
+    }
+    Ok(filter::RuntimeFilterOutboundMaterializationGroup {
+        owner: match group.owner() {
+            OutboundMaterializationOwner::DirectSource => {
+                filter::RuntimeFilterOutboundMaterializationOwner::DirectSource as i32
+            }
+            OutboundMaterializationOwner::Aggregator => {
+                filter::RuntimeFilterOutboundMaterializationOwner::Aggregator as i32
+            }
+        },
+        artifact_profile: Some(encode_artifact_profile(group.profile())?),
+        route_edge_ids: group
+            .route_edge_ids()
+            .iter()
+            .map(|route| route.get())
+            .collect(),
+    })
+}
+
+fn decode_outbound_materialization_group(
+    wire: &filter::RuntimeFilterOutboundMaterializationGroup,
+    path: FieldPath,
+) -> CodecResult<OutboundMaterializationGroup> {
+    let owner = match filter::RuntimeFilterOutboundMaterializationOwner::try_from(wire.owner) {
+        Ok(filter::RuntimeFilterOutboundMaterializationOwner::DirectSource) => {
+            OutboundMaterializationOwner::DirectSource
+        }
+        Ok(filter::RuntimeFilterOutboundMaterializationOwner::Aggregator) => {
+            OutboundMaterializationOwner::Aggregator
+        }
+        Ok(filter::RuntimeFilterOutboundMaterializationOwner::Unspecified) | Err(_) => {
+            return Err(codec_error(
+                path.clone().field("owner"),
+                ProtocolErrorKind::InvalidEnum,
+                format!("invalid outbound materialization owner={}", wire.owner),
+            ));
+        }
+    };
+    let profile = decode_artifact_profile(
+        wire.artifact_profile.as_ref(),
+        path.clone().field("artifact_profile"),
+    )?;
+    let mut routes = BTreeSet::new();
+    for (index, raw) in wire.route_edge_ids.iter().copied().enumerate() {
+        let item_path = path.clone().field("route_edge_ids").index(index);
+        reject_zero(u64::from(raw), item_path.clone(), "route edge id")?;
+        if !routes.insert(RouteEdgeId::new(raw)) {
+            return Err(duplicate(
+                item_path,
+                "duplicate outbound materialization route edge id",
+            ));
+        }
+    }
+    if routes.is_empty() {
+        return Err(invalid(
+            path.field("route_edge_ids"),
+            "outbound materialization route edge ids must be nonempty",
+        ));
+    }
+    Ok(OutboundMaterializationGroup::new(owner, profile, routes))
 }
 
 fn encode_coverage(coverage: &Coverage) -> CodecResult<filter::RuntimeFilterCoverage> {
@@ -1538,9 +1629,9 @@ mod tests {
         DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::install::{
-        ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
-        RuntimeFilterParticipantInstall,
+        ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+        OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
     };
     use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
     use crate::runtime_filter::port::routing::{
@@ -1604,13 +1695,13 @@ mod tests {
                 BTreeSet::from([producer_instance]),
             ),
         )]);
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .expect("valid membership profile");
         let consumers = consumer_binding
             .map(|binding| {
-                let profile = ConsumerArtifactProfile::new(
-                    BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
-                    None,
-                )
-                .expect("valid membership profile");
                 BTreeMap::from([(
                     BindingId::new(binding),
                     ConsumerDeployment::with_profile(
@@ -1619,12 +1710,24 @@ mod tests {
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
                         ]),
-                        profile,
-                        route_edge_ids,
+                        profile.clone(),
+                        route_edge_ids.clone(),
                         BTreeSet::from([UniqueId {
                             hi: i64::from(channel_id),
                             lo: 2,
                         }]),
+                    ),
+                )])
+            })
+            .unwrap_or_default();
+        let materialization_groups = consumer_binding
+            .map(|_| {
+                BTreeMap::from([(
+                    profile.id(),
+                    OutboundMaterializationGroup::new(
+                        OutboundMaterializationOwner::DirectSource,
+                        profile,
+                        route_edge_ids,
                     ),
                 )])
             })
@@ -1656,6 +1759,7 @@ mod tests {
             producers,
             consumers,
         )
+        .with_outbound_materialization_groups(materialization_groups)
     }
 
     fn direct_install() -> RuntimeFilterParticipantInstall {
@@ -1744,6 +1848,7 @@ mod tests {
             channel.producers().clone(),
             channel.consumers().clone(),
         )
+        .with_outbound_materialization_groups(channel.outbound_materialization_groups().clone())
     }
 
     fn with_core_budget(
@@ -1765,6 +1870,7 @@ mod tests {
             channel.producers().clone(),
             channel.consumers().clone(),
         )
+        .with_outbound_materialization_groups(channel.outbound_materialization_groups().clone())
     }
 
     fn with_policy(
@@ -1786,6 +1892,7 @@ mod tests {
             channel.producers().clone(),
             channel.consumers().clone(),
         )
+        .with_outbound_materialization_groups(channel.outbound_materialization_groups().clone())
     }
 
     fn with_empty_consumer_capabilities(
@@ -1807,6 +1914,7 @@ mod tests {
                 )
             })
             .collect();
+        let groups = channel.outbound_materialization_groups().clone();
         RuntimeFilterChannelDeployment::new(
             channel.channel_id(),
             channel.logical_domain().clone(),
@@ -1822,6 +1930,7 @@ mod tests {
             channel.producers().clone(),
             consumers,
         )
+        .with_outbound_materialization_groups(groups)
     }
 
     fn with_empty_local_roles(
@@ -1895,6 +2004,22 @@ mod tests {
                 )
             })
             .collect();
+        let groups = channel
+            .outbound_materialization_groups()
+            .values()
+            .map(|group| {
+                let profile = ConsumerArtifactProfile::new_ordered_range(digest)
+                    .expect("valid range profile");
+                (
+                    profile.id(),
+                    OutboundMaterializationGroup::new(
+                        group.owner(),
+                        profile,
+                        group.route_edge_ids().clone(),
+                    ),
+                )
+            })
+            .collect();
         RuntimeFilterChannelDeployment::new(
             channel.channel_id(),
             RuntimeFilterLogicalDomain::OrderedBound(order),
@@ -1913,6 +2038,7 @@ mod tests {
             channel.producers().clone(),
             consumers,
         )
+        .with_outbound_materialization_groups(groups)
     }
 
     fn final_domain_channel(
@@ -1958,6 +2084,7 @@ mod tests {
             channel.producers().clone(),
             consumers,
         )
+        .with_outbound_materialization_groups(channel.outbound_materialization_groups().clone())
     }
 
     fn ordered_topk_channel(
@@ -1999,7 +2126,7 @@ mod tests {
                 max_retries: 2,
             },
             RuntimeFilterCoreBudget::new(4096),
-            MaterializationPolicy::new(8, 5, 17, 1, 4096, 1024, 2)
+            MaterializationPolicy::new(8, 5, 17, 1, 4096, 1024, 1)
                 .expect("valid materialization policy"),
             BTreeMap::from([(
                 BindingId::new(producer_binding),
@@ -2058,6 +2185,23 @@ mod tests {
             ]),
         );
         let core = ordered_topk_channel(channel_id.get(), producer.get());
+        let RuntimeFilterLogicalDomain::OrderedBound(order) = core.logical_domain() else {
+            unreachable!("TopK fixture is ordered")
+        };
+        let profile = ConsumerArtifactProfile::new_ordered_range(
+            RuntimeOrderContract::try_from_plan(order)
+                .expect("valid order contract")
+                .digest(),
+        )
+        .expect("valid range profile");
+        let core = core.with_outbound_materialization_groups(BTreeMap::from([(
+            profile.id(),
+            OutboundMaterializationGroup::new(
+                OutboundMaterializationOwner::Aggregator,
+                profile,
+                BTreeSet::from([RouteEdgeId::new(201)]),
+            ),
+        )]));
         let routing = RuntimeFilterChannelRoutingView::new(
             channel_id,
             BTreeSet::from([RuntimeFilterRouteRole::Aggregator]),
@@ -2121,6 +2265,69 @@ mod tests {
             assert_eq!(decoded.lifecycle, lifecycle_options());
             assert_eq!(decoded.install, install);
         }
+    }
+
+    #[test]
+    fn outbound_materialization_group_wire_contract_is_strict() {
+        let request = encode_participant_install(QUERY, lifecycle_options(), &direct_install())
+            .expect("encode direct install with materialization authority");
+        let group =
+            &request.install.as_ref().unwrap().core_channels[0].outbound_materialization_groups[0];
+        assert_eq!(
+            group.owner,
+            filter::RuntimeFilterOutboundMaterializationOwner::DirectSource as i32
+        );
+        assert!(group.artifact_profile.is_some());
+        assert_eq!(group.route_edge_ids, vec![100]);
+        assert_eq!(
+            decode_participant_install(&request).unwrap().install,
+            direct_install()
+        );
+
+        let mut missing_profile = request.clone();
+        missing_profile.install.as_mut().unwrap().core_channels[0]
+            .outbound_materialization_groups[0]
+            .artifact_profile = None;
+        assert!(decode_participant_install(&missing_profile).is_err());
+
+        let mut unspecified_owner = request.clone();
+        unspecified_owner.install.as_mut().unwrap().core_channels[0]
+            .outbound_materialization_groups[0]
+            .owner = filter::RuntimeFilterOutboundMaterializationOwner::Unspecified as i32;
+        assert!(decode_participant_install(&unspecified_owner).is_err());
+
+        let mut unknown_owner = request.clone();
+        unknown_owner.install.as_mut().unwrap().core_channels[0].outbound_materialization_groups
+            [0]
+        .owner = 999;
+        assert!(decode_participant_install(&unknown_owner).is_err());
+
+        let mut duplicate_profile = request.clone();
+        let duplicate = duplicate_profile.install.as_ref().unwrap().core_channels[0]
+            .outbound_materialization_groups[0]
+            .clone();
+        duplicate_profile.install.as_mut().unwrap().core_channels[0]
+            .outbound_materialization_groups
+            .push(duplicate);
+        assert!(decode_participant_install(&duplicate_profile).is_err());
+
+        let mut duplicate_route = request.clone();
+        duplicate_route.install.as_mut().unwrap().core_channels[0].outbound_materialization_groups
+            [0]
+        .route_edge_ids
+        .push(100);
+        assert!(decode_participant_install(&duplicate_route).is_err());
+
+        let mut edge_drift = request.clone();
+        edge_drift.install.as_mut().unwrap().core_channels[0].outbound_materialization_groups[0]
+            .route_edge_ids[0] = 101;
+        assert!(decode_participant_install(&edge_drift).is_err());
+
+        let mut missing_authority = request;
+        missing_authority.install.as_mut().unwrap().core_channels[0]
+            .outbound_materialization_groups
+            .clear();
+        assert!(decode_participant_install(&missing_authority).is_err());
     }
 
     #[test]

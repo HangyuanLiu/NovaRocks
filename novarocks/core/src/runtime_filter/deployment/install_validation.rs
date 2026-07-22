@@ -39,7 +39,8 @@ use crate::runtime_filter::port::artifact::{
 };
 use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
 use crate::runtime_filter::port::install::{
-    RuntimeFilterChannelDeployment, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+    OutboundMaterializationOwner, RuntimeFilterChannelDeployment, RuntimeFilterInstallView,
+    RuntimeFilterParticipantInstall,
 };
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::producer::{InstallContractError, InstallContractErrorKind};
@@ -383,10 +384,121 @@ fn validate_channel_routing_contract(
             ));
         }
     }
+    validate_outbound_materialization_contract(local_participant_id, channel, routing)?;
     Ok((
         is_local_aggregator || !local_producer_bindings.is_empty(),
         !local_consumer_bindings.is_empty(),
     ))
+}
+
+fn validate_outbound_materialization_contract(
+    local_participant_id: RuntimeFilterParticipantId,
+    channel: &RuntimeFilterChannelDeployment,
+    routing: &RuntimeFilterChannelRoutingView,
+) -> Result<(), InstallContractError> {
+    let mut expected = BTreeMap::new();
+    for edge in routing.outbound_edges().iter().filter(|edge| {
+        edge.allowed_kinds()
+            .contains(&RuntimeFilterEnvelopeKind::Artifact)
+    }) {
+        if edge.source().participant_id() != local_participant_id
+            || !edge
+                .allowed_kinds()
+                .contains(&RuntimeFilterEnvelopeKind::Artifact)
+            || !edge
+                .allowed_kinds()
+                .contains(&RuntimeFilterEnvelopeKind::Unavailable)
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "outbound materialization edge must originate locally and allow Artifact and Unavailable",
+            ));
+        }
+        let owner = match edge.source().role() {
+            RuntimeFilterRouteRole::Producer(_) => OutboundMaterializationOwner::DirectSource,
+            RuntimeFilterRouteRole::Aggregator => OutboundMaterializationOwner::Aggregator,
+            _ => {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "outbound materialization edge must originate from a Producer or Aggregator role",
+                ));
+            }
+        };
+        if expected.insert(edge.route_edge_id(), owner).is_some() {
+            return Err(install_error(
+                InstallContractErrorKind::DuplicateIdentity,
+                "outbound materialization route identity is duplicated",
+            ));
+        }
+    }
+
+    let mut actual = BTreeMap::new();
+    for (profile_id, group) in channel.outbound_materialization_groups() {
+        if *profile_id != group.profile().id() || group.route_edge_ids().is_empty() {
+            return Err(install_error(
+                InstallContractErrorKind::DuplicateIdentity,
+                "outbound materialization profile key must match and own a nonempty route set",
+            ));
+        }
+        let owner_role_present = match group.owner() {
+            OutboundMaterializationOwner::DirectSource => routing
+                .local_roles()
+                .iter()
+                .any(|role| matches!(role, RuntimeFilterRouteRole::Producer(_))),
+            OutboundMaterializationOwner::Aggregator => routing
+                .local_roles()
+                .contains(&RuntimeFilterRouteRole::Aggregator),
+        };
+        if !owner_role_present {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "outbound materialization owner has no matching local routing role",
+            ));
+        }
+        for route in group.route_edge_ids() {
+            if actual.insert(*route, group.owner()).is_some() {
+                return Err(install_error(
+                    InstallContractErrorKind::DuplicateIdentity,
+                    "outbound materialization route belongs to more than one profile group",
+                ));
+            }
+        }
+    }
+    if actual != expected {
+        return Err(install_error(
+            InstallContractErrorKind::UnsupportedChannelContract,
+            "outbound materialization groups do not exactly cover local Artifact/Unavailable edges",
+        ));
+    }
+    for (binding_id, consumer) in channel.consumers() {
+        for route in consumer.route_edge_ids() {
+            let is_loopback_outbound = routing.outbound_edges().iter().any(|edge| {
+                edge.route_edge_id() == *route
+                    && edge.target().role() == RuntimeFilterRouteRole::Consumer(*binding_id)
+            });
+            if is_loopback_outbound {
+                let Some(group) = channel
+                    .outbound_materialization_groups()
+                    .values()
+                    .find(|group| group.route_edge_ids().contains(route))
+                else {
+                    return Err(install_error(
+                        InstallContractErrorKind::UnsupportedChannelContract,
+                        "loopback consumer route is missing materialization authority",
+                    ));
+                };
+                if group.profile().canonical_bytes()
+                    != consumer.artifact_profile().canonical_bytes()
+                {
+                    return Err(install_error(
+                        InstallContractErrorKind::ConflictingDeployment,
+                        "loopback consumer and materializer profiles differ",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_aggregator_edges(
@@ -556,7 +668,62 @@ fn validate_membership_channel<'a>(
             profile_encodings,
         )?;
     }
-    validate_materialization_concurrency(channel, role_requirements.1, unique_profiles.len())
+    let mut materialization_profiles = BTreeSet::new();
+    for group in channel.outbound_materialization_groups().values() {
+        let profile = group.profile();
+        if !profile.accepts(ArtifactKind::EmptyDomain) {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "Membership materialization profile must accept EmptyDomain",
+            ));
+        }
+        let value_set = profile.accepts(ArtifactKind::ValueSet);
+        let bitset = profile.accepts(ArtifactKind::Bitset) && bitset_schema_is_feasible(value_type);
+        let bloom = profile.accepts(ArtifactKind::Bloom);
+        if !value_set && !bitset && !bloom || profile.accepts(ArtifactKind::Range) {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "Membership materialization profile has no feasible membership representation",
+            ));
+        }
+        if matches!(
+            channel.logical_domain(),
+            RuntimeFilterLogicalDomain::Membership {
+                null_semantics:
+                    crate::runtime_filter::model::contract::NullSemantics::NullSafeEqual,
+                ..
+            }
+        ) && !value_set
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "NullSafeEqual Membership materialization profile must accept ValueSet",
+            ));
+        }
+        if bloom {
+            let expected = BloomHashContract::new(&schema, channel.materialization_policy())
+                .map_err(|_| {
+                    install_error(
+                        InstallContractErrorKind::InvalidPolicy,
+                        "materialization Bloom policy is not supported",
+                    )
+                })?
+                .digest();
+            if profile.bloom_hash_contract() != Some(expected) {
+                return Err(install_error(
+                    InstallContractErrorKind::UnsupportedChannelContract,
+                    "Bloom materialization profile does not match channel schema and policy",
+                ));
+            }
+        }
+        validate_profile_identity(profile, profile_encodings)?;
+        materialization_profiles.insert((profile.id(), profile.canonical_bytes()));
+    }
+    validate_materialization_concurrency(
+        channel,
+        !channel.outbound_materialization_groups().is_empty(),
+        materialization_profiles.len(),
+    )
 }
 
 fn validate_membership_consumer<'a>(
@@ -777,7 +944,25 @@ fn validate_ordered_channel<'a>(
         unique_profiles.insert((profile.id(), profile.canonical_bytes()));
         validate_profile_identity(profile, profile_encodings)?;
     }
-    validate_materialization_concurrency(channel, role_requirements.1, unique_profiles.len())
+    let mut materialization_profiles = BTreeSet::new();
+    for group in channel.outbound_materialization_groups().values() {
+        let profile = group.profile();
+        if profile.accepted_kinds() != &BTreeSet::from([ArtifactKind::Range])
+            || profile.order_contract_digest() != Some(contract.digest())
+        {
+            return Err(install_error(
+                InstallContractErrorKind::UnsupportedChannelContract,
+                "ordered materialization profile must accept only Range with the channel order digest",
+            ));
+        }
+        validate_profile_identity(profile, profile_encodings)?;
+        materialization_profiles.insert((profile.id(), profile.canonical_bytes()));
+    }
+    validate_materialization_concurrency(
+        channel,
+        !channel.outbound_materialization_groups().is_empty(),
+        materialization_profiles.len(),
+    )
 }
 
 fn validate_common_channel(
@@ -878,10 +1063,11 @@ fn validate_profile_identity<'a>(
 
 fn validate_materialization_concurrency(
     channel: &RuntimeFilterChannelDeployment,
-    requires_consumer: bool,
+    owns_materialization: bool,
     unique_profiles: usize,
 ) -> Result<(), InstallContractError> {
-    if requires_consumer && channel.materialization_policy().max_concurrent_jobs() > unique_profiles
+    if owns_materialization
+        && channel.materialization_policy().max_concurrent_jobs() > unique_profiles
     {
         return Err(install_error(
             InstallContractErrorKind::InvalidPolicy,

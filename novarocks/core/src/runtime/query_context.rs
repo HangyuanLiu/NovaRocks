@@ -1093,6 +1093,22 @@ impl QueryContextManager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_live_test() -> (Arc<Self>, thread::JoinHandle<()>) {
+        let manager = Arc::new(Self {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        });
+        let clean_manager = Arc::clone(&manager);
+        let clean_handle = thread::spawn(move || clean_manager.clean_loop());
+        (manager, clean_handle)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_clean_loop_for_test(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
     fn clean_loop(self: Arc<Self>) {
         while !self.stopped.load(Ordering::Relaxed) {
             self.clean_expired();
@@ -1200,6 +1216,17 @@ impl QueryContextManager {
             .lock()
             .expect("query_ctx_manager lock")
             .before_runtime_filter_service_install = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_runtime_filter_installed_publish_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.inner
+            .lock()
+            .expect("query_ctx_manager lock")
+            .before_runtime_filter_installed_publish = Some(hook);
     }
 
     #[cfg(test)]

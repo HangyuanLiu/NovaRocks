@@ -35,6 +35,7 @@ use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::service::Routes;
+#[cfg(test)]
 use tonic::transport::Server;
 
 #[cfg(feature = "compat")]
@@ -209,6 +210,146 @@ impl GrpcService {
                 "report-only NovaRocksGrpc endpoint rejects local execution RPC: {rpc_name}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct IndependentGrpcRuntimeFilterNode {
+    endpoint: SocketAddr,
+    manager: Arc<crate::runtime::query_context::QueryContextManager>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    server_handle: Option<JoinHandle<()>>,
+    clean_handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl IndependentGrpcRuntimeFilterNode {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub(crate) fn start() -> Result<Self, String> {
+        let listener = bind_tcp_listener("127.0.0.1", 0, "independent runtime-filter gRPC")?;
+        let endpoint = listener
+            .local_addr()
+            .map_err(|error| format!("read independent runtime-filter address failed: {error}"))?;
+        let (manager, clean_handle) =
+            crate::runtime::query_context::QueryContextManager::new_for_live_test();
+        let service_manager = Arc::clone(&manager);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let server_handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
+                .build()
+                .expect("build independent runtime-filter gRPC runtime");
+            runtime.block_on(async move {
+                let listener = TokioTcpListener::from_std(listener)
+                    .expect("create independent runtime-filter Tokio listener");
+                let service = GrpcService::full_execution_with_runtime_filter_manager(
+                    Arc::new(CoordinatorExecStatusReportHandler),
+                    service_manager,
+                );
+                let service =
+                    proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service)
+                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                let app = build_novarocks_http_app(Routes::new(service));
+                let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let _ = ready_tx.send(());
+                server
+                    .await
+                    .expect("independent runtime-filter gRPC server failed");
+            });
+        });
+        ready_rx.recv_timeout(Self::WAIT).map_err(|error| {
+            format!("independent runtime-filter gRPC server did not become ready: {error}")
+        })?;
+        Ok(Self {
+            endpoint,
+            manager,
+            shutdown_tx: Some(shutdown_tx),
+            server_handle: Some(server_handle),
+            clean_handle: Some(clean_handle),
+        })
+    }
+
+    pub(crate) const fn endpoint(&self) -> SocketAddr {
+        self.endpoint
+    }
+
+    pub(crate) fn manager(&self) -> &Arc<crate::runtime::query_context::QueryContextManager> {
+        &self.manager
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), String> {
+        self.manager.stop_clean_loop_for_test();
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+        let mut failures = Vec::new();
+        if let Some(handle) = self.server_handle.take()
+            && let Err(error) =
+                join_independent_runtime_filter_thread(handle, "gRPC server", Self::WAIT)
+        {
+            failures.push(error);
+        }
+        if let Some(handle) = self.clean_handle.take()
+            && let Err(error) =
+                join_independent_runtime_filter_thread(handle, "manager clean loop", Self::WAIT)
+        {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IndependentGrpcRuntimeFilterNode {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+fn join_independent_runtime_filter_thread(
+    handle: JoinHandle<()>,
+    label: &'static str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let (joined_tx, joined_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = joined_tx.send(handle.join());
+    });
+    match joined_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(payload)) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|value| (*value).to_string())
+                })
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            Err(format!(
+                "independent runtime-filter {label} panicked: {detail}"
+            ))
+        }
+        Err(error) => Err(format!(
+            "independent runtime-filter {label} did not stop within {timeout:?}: {error}"
+        )),
     }
 }
 

@@ -373,9 +373,9 @@ mod tests {
         RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::install::{
-        ConsumerDeployment, MaterializationPolicy, ProducerDeployment,
-        RuntimeFilterChannelDeployment, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
-        RuntimeFilterParticipantInstall,
+        ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+        OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
+        RuntimeFilterCoreBudget, RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
     };
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, OrderedScalar, OrderedTuple, RuntimeOrderContract,
@@ -605,14 +605,9 @@ mod tests {
         )
     }
 
-    // Install participant 3 as a colocated aggregator + producer + consumer. Each
-    // producer contributes a loopback ToAggregator edge; each consumer a loopback
-    // FromAggregator delivery edges whose route edge ids are the consumer's own
-    // route set. The consumer-ingress dispatch is topology-agnostic:
-    // it authorizes the inbound delivery edge and delivers into the subscription
-    // registered under that same route edge id. (Task 5 proves the production
-    // cross-participant compiler topology; this hand-built fixture is the M2B3
-    // `inbound_loopback_install_for_test` shape extended with delivery edges.)
+    // Install participant 3 as a producer/aggregator plus a consumer receiving from
+    // a remote aggregator. Consumer ingress owns only inbound delivery-profile
+    // authority; it does not imply local outbound materialization authority.
     fn install(service: &RuntimeFilterService, channel: RuntimeFilterChannelDeployment) {
         let consumer_route_kinds = channel
             .consumers()
@@ -628,13 +623,35 @@ mod tests {
                 )
             })
             .collect();
-        install_with_consumer_route_kinds(service, channel, consumer_route_kinds);
+        install_with_consumer_route_kinds(service, channel, consumer_route_kinds, false);
+    }
+
+    fn install_with_loopback_delivery(
+        service: &RuntimeFilterService,
+        channel: RuntimeFilterChannelDeployment,
+    ) {
+        let consumer_route_kinds = channel
+            .consumers()
+            .values()
+            .flat_map(|consumer| consumer.route_edge_ids().iter().copied())
+            .map(|route_edge_id| {
+                (
+                    route_edge_id,
+                    BTreeSet::from([
+                        RuntimeFilterEnvelopeKind::Artifact,
+                        RuntimeFilterEnvelopeKind::Unavailable,
+                    ]),
+                )
+            })
+            .collect();
+        install_with_consumer_route_kinds(service, channel, consumer_route_kinds, true);
     }
 
     fn install_with_consumer_route_kinds(
         service: &RuntimeFilterService,
         channel: RuntimeFilterChannelDeployment,
         consumer_route_kinds: BTreeMap<RouteEdgeId, BTreeSet<RuntimeFilterEnvelopeKind>>,
+        loopback_delivery: bool,
     ) {
         let epoch = DeploymentEpoch::new(EPOCH);
         let participant = RuntimeFilterParticipantId::new(3);
@@ -672,23 +689,41 @@ mod tests {
         for (binding_id, consumer) in channel.consumers() {
             local_roles.insert(RuntimeFilterRouteRole::Consumer(*binding_id));
             for route_edge_id in consumer.route_edge_ids() {
+                let source_participant = if loopback_delivery {
+                    participant
+                } else {
+                    RuntimeFilterParticipantId::new(4)
+                };
                 let edge = RuntimeFilterRoutingEdgeView::new(
                     channel_id,
                     *route_edge_id,
                     RuntimeFilterRouteEndpointView::new(
-                        participant,
+                        source_participant,
                         RuntimeFilterRouteRole::Aggregator,
                     ),
                     RuntimeFilterRouteEndpointView::new(
                         participant,
                         RuntimeFilterRouteRole::Consumer(*binding_id),
                     ),
-                    RuntimeFilterRoutePeer::Loopback,
+                    if loopback_delivery {
+                        RuntimeFilterRoutePeer::Loopback
+                    } else {
+                        RuntimeFilterRoutePeer::Remote {
+                            participant_id: source_participant,
+                            endpoint: crate::runtime::endpoint::RuntimeEndpoint::new(
+                                "remote-aggregator",
+                                9060,
+                            )
+                            .unwrap(),
+                        }
+                    },
                     consumer_route_kinds.get(route_edge_id).cloned().unwrap(),
                 )
                 .unwrap();
                 inbound_edges.push(edge.clone());
-                outbound_edges.push(edge);
+                if loopback_delivery {
+                    outbound_edges.push(edge);
+                }
             }
         }
         let routing_channel = RuntimeFilterChannelRoutingView::new(
@@ -705,6 +740,38 @@ mod tests {
             BTreeMap::from([(channel_id, routing_channel)]),
         )
         .unwrap();
+        let channel = if loopback_delivery {
+            let grouped =
+                channel
+                    .consumers()
+                    .values()
+                    .fold(BTreeMap::new(), |mut groups, consumer| {
+                        groups
+                            .entry(consumer.artifact_profile().id())
+                            .or_insert_with(|| {
+                                (consumer.artifact_profile().clone(), BTreeSet::new())
+                            })
+                            .1
+                            .extend(consumer.route_edge_ids().iter().copied());
+                        groups
+                    });
+            let groups = grouped
+                .into_iter()
+                .map(|(profile_id, (profile, routes))| {
+                    (
+                        profile_id,
+                        OutboundMaterializationGroup::new(
+                            OutboundMaterializationOwner::Aggregator,
+                            profile,
+                            routes,
+                        ),
+                    )
+                })
+                .collect();
+            channel.with_outbound_materialization_groups(groups)
+        } else {
+            channel
+        };
         let core_view = RuntimeFilterInstallView::new(
             epoch,
             participant,
@@ -1097,6 +1164,7 @@ mod tests {
                     BTreeSet::from([RuntimeFilterEnvelopeKind::Unavailable]),
                 ),
             ]),
+            false,
         );
 
         let profile = membership_profile();
@@ -1633,7 +1701,7 @@ mod tests {
         // (a) loopback: the outbound bridge routes the in-memory bundle straight into the
         //     local subscription with no wire encode.
         let loopback_service = service();
-        install(&loopback_service, channel());
+        install_with_loopback_delivery(&loopback_service, channel());
         // The panicking sink asserts the loopback-only scope never reaches the remote
         // transport, even though nothing is expected to be transmitted.
         loopback_service.set_remote_sink_for_test(Arc::new(NoopRemoteSink));

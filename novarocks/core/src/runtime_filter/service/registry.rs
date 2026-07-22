@@ -263,6 +263,7 @@ pub(super) struct InstalledDeployment {
     role_router: Arc<RoleRouter>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    delivery_profiles: BTreeMap<(ChannelId, RouteEdgeId), ConsumerArtifactProfile>,
     artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
     publish_gate: ArtifactPublishGate,
 }
@@ -364,6 +365,11 @@ impl InstalledDeployment {
         self.install.core_view().local_participant_id()
     }
 
+    #[cfg(test)]
+    pub(super) fn participant_install_for_test(&self) -> RuntimeFilterParticipantInstall {
+        self.install.clone()
+    }
+
     pub(super) fn router(&self) -> &LoopbackRouter {
         &self.router
     }
@@ -406,20 +412,15 @@ impl InstalledDeployment {
     /// Install-owned consumer profile authority for an inbound delivery edge.
     ///
     /// The consumer-ingress dispatch uses this to recover the profile the wire
-    /// codec must decode against: it is the single capability group whose
-    /// authorized delivery scope contains `route_edge_id`. This never inspects the
-    /// subscription map; it reads only the frozen artifact plan.
+    /// codec must decode against. This authority is frozen from the local
+    /// `ConsumerDeployment`; it is intentionally separate from outbound
+    /// materialization groups, which consumer-only participants do not own.
     pub(super) fn profile_for_route(
         &self,
         channel_id: ChannelId,
         route_edge_id: RouteEdgeId,
     ) -> Option<&ConsumerArtifactProfile> {
-        self.artifact_channels.get(&channel_id).and_then(|plan| {
-            plan.groups()
-                .iter()
-                .find(|group| group.route_edges().contains(&route_edge_id))
-                .map(CapabilityGroup::profile)
-        })
+        self.delivery_profiles.get(&(channel_id, route_edge_id))
     }
 
     fn invalidate_artifact_publication(&self) -> BTreeMap<ChannelId, Vec<RouteEdgeId>> {
@@ -729,6 +730,7 @@ impl DeploymentRegistry {
             role_router,
             channel_routes: routing.channel_routes,
             route_event_identities: routing.route_event_identities,
+            delivery_profiles: routing.delivery_profiles,
             artifact_channels: routing.artifact_channels,
             publish_gate,
         });
@@ -939,6 +941,7 @@ struct RoutingBuild {
         BTreeMap<RouteEdgeId, Arc<dyn crate::runtime_filter::port::subscription::ArtifactDelivery>>,
     channel_routes: BTreeMap<ChannelId, Vec<RouteEdgeId>>,
     route_event_identities: BTreeMap<RouteEdgeId, Vec<RouteEventIdentity>>,
+    delivery_profiles: BTreeMap<(ChannelId, RouteEdgeId), ConsumerArtifactProfile>,
     artifact_channels: BTreeMap<ChannelId, ChannelArtifactPlan>,
 }
 
@@ -957,6 +960,7 @@ fn build_routing(
         routes: BTreeMap::new(),
         channel_routes: BTreeMap::new(),
         route_event_identities: BTreeMap::new(),
+        delivery_profiles: BTreeMap::new(),
         artifact_channels: BTreeMap::new(),
     };
     for (channel_id, deployment) in view.channels() {
@@ -1017,15 +1021,6 @@ fn build_routing(
             build
                 .consumer_activations
                 .insert(*binding_id, consumer.activation());
-            let entry = capability_routes
-                .entry(consumer.artifact_profile().id())
-                .or_insert_with(|| (consumer.artifact_profile().clone(), Vec::new()));
-            if entry.0.canonical_bytes() != consumer.artifact_profile().canonical_bytes() {
-                return Err(install_error(
-                    InstallContractErrorKind::ConflictingDeployment,
-                    "consumer profile digest collision carried different canonical bytes",
-                ));
-            }
             let group = Arc::new(SubscriptionGroup::new(
                 common,
                 *binding_id,
@@ -1036,6 +1031,16 @@ fn build_routing(
             ));
             build.subscriptions.insert(*binding_id, group.clone());
             for route_edge_id in consumer.route_edge_ids() {
+                if let Some(existing) = build.delivery_profiles.insert(
+                    (*channel_id, *route_edge_id),
+                    consumer.artifact_profile().clone(),
+                ) && existing.canonical_bytes() != consumer.artifact_profile().canonical_bytes()
+                {
+                    return Err(install_error(
+                        InstallContractErrorKind::ConflictingDeployment,
+                        "delivery route maps to conflicting consumer artifact profiles",
+                    ));
+                }
                 build.routes.insert(
                     *route_edge_id,
                     group.clone()
@@ -1057,7 +1062,27 @@ fn build_routing(
                         })
                         .collect(),
                 );
-                entry.1.push(*route_edge_id);
+            }
+        }
+        for (profile_id, materialization_group) in deployment.outbound_materialization_groups() {
+            let entry = capability_routes.entry(*profile_id).or_insert_with(|| {
+                (
+                    materialization_group.profile().clone(),
+                    materialization_group
+                        .route_edge_ids()
+                        .iter()
+                        .copied()
+                        .collect(),
+                )
+            });
+            if entry.0.canonical_bytes() != materialization_group.profile().canonical_bytes()
+                || entry.1.iter().copied().collect::<BTreeSet<_>>()
+                    != *materialization_group.route_edge_ids()
+            {
+                return Err(install_error(
+                    InstallContractErrorKind::ConflictingDeployment,
+                    "outbound materialization profile group conflicts with its canonical identity",
+                ));
             }
         }
         let schema = match deployment.logical_domain() {
@@ -1383,6 +1408,7 @@ fn channels_equivalent(
         && left.materialization_policy() == right.materialization_policy()
         && left.producers() == right.producers()
         && left.consumers() == right.consumers()
+        && left.outbound_materialization_groups() == right.outbound_materialization_groups()
 }
 
 fn cancelled_install() -> InstallContractError {
@@ -2545,30 +2571,10 @@ mod tests {
         let core = core_view([(1, channel(1, 10, 20, 30, 40))]);
         let first = local_install(core.clone());
         registry.install(first.clone()).unwrap();
-        let channel = first.routing_shard().channel(ChannelId::new(1)).unwrap();
-        let mut roles = channel.local_roles().clone();
-        roles.insert(RuntimeFilterRouteRole::Relay);
-        let changed = RuntimeFilterRoutingShard::new(
-            first.epoch(),
-            first.local_participant_id(),
-            BTreeMap::from([(
-                ChannelId::new(1),
-                RuntimeFilterChannelRoutingView::new(
-                    ChannelId::new(1),
-                    roles,
-                    channel.producer_instances().clone(),
-                    channel.inbound_edges().to_vec(),
-                    channel.outbound_edges().to_vec(),
-                )
-                .unwrap(),
-            )]),
-        )
-        .unwrap();
+        let changed = local_install(core_view([(1, channel(1, 10, 20, 30, 41))]));
 
         assert_install_error(
-            registry
-                .install(participant_install(core, changed))
-                .unwrap_err(),
+            registry.install(changed).unwrap_err(),
             InstallContractErrorKind::ConflictingDeployment,
             "different installed composite",
         );
@@ -2895,12 +2901,20 @@ mod tests {
             BTreeMap::from([((BindingId::new(10), uid(10)), participant)]),
             Vec::new(),
         );
+        let producer_registry = registry();
         assert_eq!(
-            registry()
+            producer_registry
                 .install(participant_install(producer_core, producer_routing))
                 .unwrap()
                 .outcome(),
             InstallOutcome::Installed,
+        );
+        let producer_installed = producer_registry.active_installation().unwrap();
+        assert!(
+            producer_installed
+                .profile_for_route(ChannelId::new(1), RouteEdgeId::new(40))
+                .is_none(),
+            "producer-only installs must not gain inbound consumer profile authority"
         );
 
         let consumer_core = core_view([(1, without_producers(&full))]);
@@ -2971,13 +2985,41 @@ mod tests {
             .unwrap();
 
         let installed = registry.active_installation().unwrap();
+        assert!(
+            installed
+                .artifact_plan(ChannelId::new(1))
+                .unwrap()
+                .groups()
+                .is_empty(),
+            "consumer-only installs must not gain outbound materialization authority"
+        );
         let artifact_profile = installed
             .profile_for_route(ChannelId::new(1), RouteEdgeId::new(40))
             .unwrap();
         let unavailable_profile = installed
             .profile_for_route(ChannelId::new(1), RouteEdgeId::new(41))
             .unwrap();
-        assert!(std::ptr::eq(artifact_profile, unavailable_profile));
+        assert_eq!(
+            artifact_profile.canonical_bytes(),
+            unavailable_profile.canonical_bytes()
+        );
+        assert!(
+            installed
+                .profile_for_route(ChannelId::new(1), RouteEdgeId::new(42))
+                .is_none()
+        );
+        assert!(
+            installed
+                .role_router()
+                .authorize_delivery(
+                    installed.epoch(),
+                    ChannelId::new(1),
+                    RouteEdgeId::new(40),
+                    RuntimeFilterEnvelopeKind::Contribution,
+                )
+                .is_err(),
+            "consumer ingress never authorizes producer-direction envelopes"
+        );
     }
 
     #[test]

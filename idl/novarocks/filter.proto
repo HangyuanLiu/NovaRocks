@@ -208,6 +208,18 @@ message RuntimeFilterConsumerDeployment {
   repeated novarocks.common.UniqueId expected_fragment_instances = 6;
 }
 
+enum RuntimeFilterOutboundMaterializationOwner {
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_UNSPECIFIED = 0;
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_DIRECT_SOURCE = 1;
+  RUNTIME_FILTER_OUTBOUND_MATERIALIZATION_OWNER_AGGREGATOR = 2;
+}
+
+message RuntimeFilterOutboundMaterializationGroup {
+  RuntimeFilterOutboundMaterializationOwner owner = 1;
+  RuntimeFilterConsumerArtifactProfile artifact_profile = 2;
+  repeated uint32 route_edge_ids = 3;
+}
+
 // The TypeDesc supplies the expression/value type required by the shared plan
 // contract decoder; the contract remains the canonical typed logical-domain
 // authority and cross-checks this type.
@@ -230,6 +242,7 @@ message RuntimeFilterChannelDeployment {
   RuntimeFilterMaterializationPolicy materialization_policy = 11;
   repeated RuntimeFilterProducerDeployment producers = 12;
   repeated RuntimeFilterConsumerDeployment consumers = 13;
+  repeated RuntimeFilterOutboundMaterializationGroup outbound_materialization_groups = 14;
 }
 
 message RuntimeFilterRouteRole {

@@ -31,7 +31,8 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
 };
 use crate::runtime_filter::port::install::{
-    ConsumerDeployment, MaterializationPolicy, ProducerDeployment, RuntimeFilterChannelDeployment,
+    ConsumerDeployment, MaterializationPolicy, OutboundMaterializationGroup,
+    OutboundMaterializationOwner, ProducerDeployment, RuntimeFilterChannelDeployment,
     RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
@@ -126,6 +127,21 @@ pub(crate) fn project_install_views(
                 BTreeMap<BindingId, ProducerDeployment>,
                 BTreeMap<BindingId, ConsumerDeployment>,
             ),
+        >,
+    > = BTreeMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut materialization_groups: BTreeMap<
+        RuntimeFilterParticipantId,
+        BTreeMap<
+            ChannelId,
+            BTreeMap<
+                crate::runtime_filter::port::artifact::ConsumerProfileId,
+                (
+                    OutboundMaterializationOwner,
+                    ConsumerArtifactProfile,
+                    BTreeSet<RouteEdgeId>,
+                ),
+            >,
         >,
     > = BTreeMap::new();
     for (channel_id, cg) in &role_graph.channels {
@@ -282,6 +298,43 @@ pub(crate) fn project_install_views(
                     );
             }
         }
+        for route in &cg.routes {
+            let owner = match route.kind {
+                RouteKind::Loopback | RouteKind::ReplicaDirect => {
+                    OutboundMaterializationOwner::DirectSource
+                }
+                RouteKind::FromAggregator => OutboundMaterializationOwner::Aggregator,
+                RouteKind::ToAggregator => continue,
+            };
+            let facts = consumer_facts.get(&route.to.binding).ok_or_else(|| {
+                DeploymentError::InvalidInstallProjection {
+                    detail: format!(
+                        "runtime filter materialization projection missing consumer facts for channel {} binding {}",
+                        channel_id.get(),
+                        route.to.binding.get()
+                    ),
+                }
+            })?;
+            let profile = consumer_artifact_profile(&spec.logical_domain, &facts.capabilities)?;
+            let profile_id = profile.id();
+            let group = materialization_groups
+                .entry(route.from.participant)
+                .or_default()
+                .entry(*channel_id)
+                .or_default()
+                .entry(profile_id)
+                .or_insert_with(|| (owner, profile.clone(), BTreeSet::new()));
+            if group.0 != owner || group.1.canonical_bytes() != profile.canonical_bytes() {
+                return Err(DeploymentError::InvalidInstallProjection {
+                    detail: format!(
+                        "runtime filter materialization profile collision for channel {} profile {:?}",
+                        channel_id.get(),
+                        profile_id
+                    ),
+                });
+            }
+            group.2.insert(route.edge_id);
+        }
     }
 
     let mut views = BTreeMap::new();
@@ -289,6 +342,18 @@ pub(crate) fn project_install_views(
         let mut channel_deployments = BTreeMap::new();
         for (channel_id, (producers, consumers)) in channels {
             let spec = &channel_specs[&channel_id];
+            let groups = materialization_groups
+                .get(&participant)
+                .and_then(|channels| channels.get(&channel_id))
+                .into_iter()
+                .flat_map(|groups| groups.iter())
+                .map(|(profile_id, (owner, profile, routes))| {
+                    (
+                        *profile_id,
+                        OutboundMaterializationGroup::new(*owner, profile.clone(), routes.clone()),
+                    )
+                })
+                .collect();
             channel_deployments.insert(
                 channel_id,
                 RuntimeFilterChannelDeployment::new(
@@ -305,7 +370,8 @@ pub(crate) fn project_install_views(
                     materialization,
                     producers,
                     consumers,
-                ),
+                )
+                .with_outbound_materialization_groups(groups),
             );
         }
         if channel_deployments.is_empty() {
@@ -702,6 +768,64 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(core_routes, routing_routes);
+    }
+
+    #[test]
+    fn direct_sources_own_only_their_outbound_materialization_routes() {
+        let (role_graph, channel_specs, consumer_facts, instances) =
+            direct_projection_fixture(false);
+        let views = project_install_views(
+            DeploymentEpoch::new(9),
+            &role_graph,
+            &channel_specs,
+            &consumer_facts,
+            &instances,
+            RuntimeFilterCoreBudget::new(512),
+            MaterializationPolicy::for_test(),
+        )
+        .expect("projection succeeds");
+
+        let direct_a =
+            views[&pid(2)].channels()[&ChannelId::new(5)].outbound_materialization_groups();
+        let direct_b =
+            views[&pid(7)].channels()[&ChannelId::new(5)].outbound_materialization_groups();
+        assert_eq!(direct_a.len(), 1);
+        assert_eq!(direct_b.len(), 1);
+        assert_eq!(
+            direct_a.values().next().unwrap().route_edge_ids(),
+            &BTreeSet::from([RouteEdgeId::new(9)])
+        );
+        assert_eq!(
+            direct_b.values().next().unwrap().route_edge_ids(),
+            &BTreeSet::from([RouteEdgeId::new(4)])
+        );
+        assert!(
+            views[&pid(11)].channels()[&ChannelId::new(5)]
+                .outbound_materialization_groups()
+                .is_empty(),
+            "consumer-only participants never own materialization"
+        );
+    }
+
+    #[test]
+    fn only_allof_aggregator_owns_outbound_materialization() {
+        let views = project_all_of_fixture().expect("projection succeeds");
+
+        let aggregator =
+            views[&pid(2)].channels()[&ChannelId::new(5)].outbound_materialization_groups();
+        assert_eq!(aggregator.len(), 1);
+        assert_eq!(
+            aggregator.values().next().unwrap().route_edge_ids(),
+            &BTreeSet::from([RouteEdgeId::new(5)])
+        );
+        for participant in [pid(7), pid(13), pid(11)] {
+            assert!(
+                views[&participant].channels()[&ChannelId::new(5)]
+                    .outbound_materialization_groups()
+                    .is_empty(),
+                "contribution-only producers and consumer-only participants do not materialize"
+            );
+        }
     }
 
     #[test]
