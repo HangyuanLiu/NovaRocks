@@ -1574,6 +1574,9 @@ fn encode_envelope_kind(kind: RuntimeFilterEnvelopeKind) -> i32 {
         RuntimeFilterEnvelopeKind::ProducerClosed => {
             filter::RuntimeFilterEnvelopeKind::ProducerClosed as i32
         }
+        RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+            filter::RuntimeFilterEnvelopeKind::ProducerUnavailable as i32
+        }
         RuntimeFilterEnvelopeKind::Unavailable => {
             filter::RuntimeFilterEnvelopeKind::Unavailable as i32
         }
@@ -1598,6 +1601,9 @@ fn decode_envelope_kind(raw: i32, path: FieldPath) -> CodecResult<RuntimeFilterE
         Ok(filter::RuntimeFilterEnvelopeKind::Artifact) => Ok(RuntimeFilterEnvelopeKind::Artifact),
         Ok(filter::RuntimeFilterEnvelopeKind::ProducerClosed) => {
             Ok(RuntimeFilterEnvelopeKind::ProducerClosed)
+        }
+        Ok(filter::RuntimeFilterEnvelopeKind::ProducerUnavailable) => {
+            Ok(RuntimeFilterEnvelopeKind::ProducerUnavailable)
         }
         Ok(filter::RuntimeFilterEnvelopeKind::Unavailable) => {
             Ok(RuntimeFilterEnvelopeKind::Unavailable)

@@ -28,9 +28,10 @@ use crate::runtime_filter::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
 };
 use crate::runtime_filter::port::transport::{
-    ContributionRouteIdentity, DeliveryRouteIdentity, ProducerOpenMetadata,
-    RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress,
-    RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportError,
+    ContributionRouteIdentity, DeliveryRouteIdentity, ProducerInstanceRouteIdentity,
+    ProducerOpenMetadata, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
+    RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
+    RuntimeFilterTransportError,
 };
 
 pub(crate) type NativeRuntimeFilterRequest = proto::filter::TransmitRuntimeFilterRequest;
@@ -307,6 +308,9 @@ fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
         proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
             Ok(RuntimeFilterEnvelopeKind::ProducerClosed)
         }
+        proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+            Ok(RuntimeFilterEnvelopeKind::ProducerUnavailable)
+        }
         proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
             Ok(RuntimeFilterEnvelopeKind::Unavailable)
         }
@@ -331,6 +335,9 @@ fn encode_kind(kind: RuntimeFilterEnvelopeKind) -> proto::filter::RuntimeFilterE
         RuntimeFilterEnvelopeKind::Artifact => proto::filter::RuntimeFilterEnvelopeKind::Artifact,
         RuntimeFilterEnvelopeKind::ProducerClosed => {
             proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed
+        }
+        RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable
         }
         RuntimeFilterEnvelopeKind::Unavailable => {
             proto::filter::RuntimeFilterEnvelopeKind::Unavailable
@@ -363,13 +370,21 @@ fn encode_route_identity(
             partition_id: identity.partition_id().get(),
             sequence: identity.sequence().get(),
         })
-    } else {
-        let identity = identity
-            .as_delivery()
-            .expect("runtime filter route identity is contribution or delivery");
+    } else if let Some(identity) = identity.as_delivery() {
         Value::Delivery(proto::filter::RuntimeFilterDeliveryRouteIdentity {
             route_edge_id: identity.route_edge_id().get(),
             sequence: identity.sequence().get(),
+        })
+    } else {
+        let identity = identity
+            .as_producer_instance()
+            .expect("runtime filter route identity is typed");
+        Value::ProducerInstance(proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
+            producer_binding_id: identity.producer_binding_id().get(),
+            fragment_instance_id: Some(proto::common::UniqueId {
+                hi: identity.fragment_instance_id().hi,
+                lo: identity.fragment_instance_id().lo,
+            }),
         })
     };
     proto::filter::RuntimeFilterRouteIdentity { value: Some(value) }
@@ -404,6 +419,20 @@ fn decode_route_identity(
             )
             .map_err(transport_error)?;
             Ok(RuntimeFilterRouteIdentity::delivery(identity))
+        }
+        Some(Value::ProducerInstance(identity)) => {
+            let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
+                invalid_argument("runtime filter fragment instance id is missing")
+            })?;
+            let identity = ProducerInstanceRouteIdentity::try_new(
+                BindingId::new(identity.producer_binding_id),
+                UniqueId {
+                    hi: fragment_instance_id.hi,
+                    lo: fragment_instance_id.lo,
+                },
+            )
+            .map_err(transport_error)?;
+            Ok(RuntimeFilterRouteIdentity::producer_instance(identity))
         }
         None => Err(invalid_argument(
             "runtime filter route identity value is missing",
@@ -598,6 +627,19 @@ mod tests {
         }
     }
 
+    fn producer_instance_route() -> proto::filter::RuntimeFilterRouteIdentity {
+        proto::filter::RuntimeFilterRouteIdentity {
+            value: Some(
+                proto::filter::runtime_filter_route_identity::Value::ProducerInstance(
+                    proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
+                        producer_binding_id: 17,
+                        fragment_instance_id: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
+                    },
+                ),
+            ),
+        }
+    }
+
     fn valid_wire_envelope(
         kind: proto::filter::RuntimeFilterEnvelopeKind,
     ) -> proto::filter::RuntimeFilterEnvelope {
@@ -621,6 +663,11 @@ mod tests {
                 Some(proto::filter::RuntimeFilterProducerOpenMetadata {
                     local_partition_count: 24,
                 }),
+            ),
+            proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable => (
+                producer_instance_route(),
+                b"producer-unavailable".to_vec(),
+                None,
             ),
             proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
                 (delivery_route(), b"unavailable".to_vec(), None)
@@ -674,6 +721,11 @@ mod tests {
                 b"".as_slice(),
             ),
             (
+                proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+                b"producer-unavailable".as_slice(),
+            ),
+            (
                 proto::filter::RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::Unavailable,
                 b"unavailable".as_slice(),
@@ -722,6 +774,14 @@ mod tests {
                     assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 18, lo: 19 });
                     assert_eq!(identity.partition_id(), PartitionId::new(20));
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
+                }
+                RuntimeFilterEnvelopeKind::ProducerUnavailable => {
+                    let identity = envelope
+                        .route_identity()
+                        .as_producer_instance()
+                        .expect("producer-instance identity");
+                    assert_eq!(identity.producer_binding_id(), BindingId::new(17));
+                    assert_eq!(identity.fragment_instance_id(), UniqueId { hi: 18, lo: 19 });
                 }
                 RuntimeFilterEnvelopeKind::Artifact
                 | RuntimeFilterEnvelopeKind::FinalArtifact

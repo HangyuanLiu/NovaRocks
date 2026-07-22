@@ -54,7 +54,7 @@ pub(crate) fn canonical_route_allowed_kinds(
             Some(BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
             ]))
         }
         _ => None,
@@ -316,7 +316,9 @@ impl RuntimeFilterProducerRouteIntent {
         let role = RuntimeFilterRouteRole::Producer(producer_binding_id);
         if !matches!(
             envelope_kind,
-            RuntimeFilterEnvelopeKind::Contribution | RuntimeFilterEnvelopeKind::ProducerClosed
+            RuntimeFilterEnvelopeKind::Contribution
+                | RuntimeFilterEnvelopeKind::ProducerClosed
+                | RuntimeFilterEnvelopeKind::ProducerUnavailable
         ) {
             return Err(RuntimeFilterRouteContractError::ForbiddenOutboundKind {
                 channel: channel_id,
@@ -453,6 +455,11 @@ impl RuntimeFilterRemoteRoute {
 
     pub(crate) const fn target_role(&self) -> RuntimeFilterRouteRole {
         self.target_role
+    }
+
+    /// Deterministic retained charge for the per-pending-entry route clone.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.endpoint.retained_host_capacity())
     }
 }
 

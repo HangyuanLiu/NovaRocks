@@ -75,7 +75,7 @@ pub(crate) trait RuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static {
     async fn transmit(
         &self,
         route: RuntimeFilterRemoteRoute,
-        envelope: RuntimeFilterEnvelope,
+        envelope: Arc<RuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError>;
 }
@@ -87,16 +87,20 @@ impl RuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
     async fn transmit(
         &self,
         route: RuntimeFilterRemoteRoute,
-        envelope: RuntimeFilterEnvelope,
+        envelope: Arc<RuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
         // The endpoint is install-owned route authority. The raw backend index never
         // crosses this seam and cannot be confused with participant (+1) identity.
         let client = NovaRocksGrpcRemoteClient::new_runtime_endpoint(route.endpoint())
             .map_err(RuntimeFilterUnaryError::transport)?;
+        // Deliberately encode at the unary boundary instead of retaining a second
+        // protobuf copy beside the semantic envelope. The sink queues are bounded and
+        // `run_worker` awaits one request at a time, so at most one transient protobuf
+        // encoding is live per sink worker while retries keep sharing the same Arc.
         let response = client
             .transmit_runtime_filter_envelope_async(
-                encode_runtime_filter_envelope(&envelope),
+                encode_runtime_filter_envelope(envelope.as_ref()),
                 deadline,
             )
             .await
@@ -317,7 +321,7 @@ mod tests {
     };
 
     struct FakeUnaryClient {
-        seen: mpsc::Sender<(RuntimeFilterRemoteRoute, RuntimeFilterEnvelope)>,
+        seen: mpsc::Sender<(RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>)>,
         responses: Mutex<VecDeque<Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError>>>,
         gate: Option<Arc<Semaphore>>,
     }
@@ -327,7 +331,7 @@ mod tests {
         async fn transmit(
             &self,
             route: RuntimeFilterRemoteRoute,
-            envelope: RuntimeFilterEnvelope,
+            envelope: Arc<RuntimeFilterEnvelope>,
             _deadline: Duration,
         ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
             self.seen
@@ -355,13 +359,13 @@ mod tests {
         async fn transmit(
             &self,
             _route: RuntimeFilterRemoteRoute,
-            envelope: RuntimeFilterEnvelope,
+            envelope: Arc<RuntimeFilterEnvelope>,
             _deadline: Duration,
         ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
             let response = crate::proto::filter::RuntimeFilterEnvelopeResponse {
                 acked_route_identity:
                     crate::service::grpc_runtime_filter_adapter::encode_runtime_filter_envelope(
-                        &envelope,
+                        envelope.as_ref(),
                     )
                     .route_identity,
                 accept_status: crate::proto::filter::RuntimeFilterAcceptStatus::Unspecified as i32,
@@ -390,25 +394,27 @@ mod tests {
 
     fn envelope(edge: u32, sequence: u64) -> RuntimeFilterTransportEnvelope {
         RuntimeFilterTransportEnvelope::new(
-            RuntimeFilterEnvelope::try_new(
-                RuntimeFilterEnvelopeKind::Artifact,
-                UniqueId { hi: 11, lo: 12 },
-                ChannelId::new(13),
-                DeploymentEpoch::new(14),
-                identity(edge, sequence),
-                None,
-                None,
-                &[15; 32],
-                b"complete-domain-envelope".to_vec(),
-            )
-            .expect("domain envelope"),
+            Arc::new(
+                RuntimeFilterEnvelope::try_new(
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    UniqueId { hi: 11, lo: 12 },
+                    ChannelId::new(13),
+                    DeploymentEpoch::new(14),
+                    identity(edge, sequence),
+                    None,
+                    None,
+                    &[15; 32],
+                    b"complete-domain-envelope".to_vec(),
+                )
+                .expect("domain envelope"),
+            ),
             Duration::from_secs(2),
         )
     }
 
     fn recv_seen(
-        receiver: &mut mpsc::Receiver<(RuntimeFilterRemoteRoute, RuntimeFilterEnvelope)>,
-    ) -> (RuntimeFilterRemoteRoute, RuntimeFilterEnvelope) {
+        receiver: &mut mpsc::Receiver<(RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>)>,
+    ) -> (RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>) {
         data_block_on(async {
             tokio::time::timeout(Duration::from_secs(1), receiver.recv())
                 .await

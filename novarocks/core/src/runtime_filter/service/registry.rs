@@ -162,6 +162,28 @@ impl InboundProducerContract {
             Self::FinalDomain { .. } => ProducerPortKind::FinalDomain,
         }
     }
+
+    pub(super) fn codec_expectation(
+        &self,
+        stream: crate::runtime_filter::port::identity::ProducerStreamId,
+        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+    ) -> crate::runtime_filter::codec::contribution::ContributionCodecExpectation<'_> {
+        use crate::runtime_filter::codec::contribution::ContributionCodecExpectation;
+        match self {
+            Self::Membership { schema, .. } => ContributionCodecExpectation::Membership(schema),
+            Self::OrderedBound { contract, .. } => {
+                ContributionCodecExpectation::OrderedBound(contract)
+            }
+            Self::TopKSummary { contract, .. } => {
+                ContributionCodecExpectation::TopKSummary(contract)
+            }
+            Self::FinalDomain { contract, .. } => ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2342,7 +2364,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
             ]),
         )
     }
@@ -2864,7 +2886,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
-                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::ProducerUnavailable,
                     ]),
                 ),
                 inbound_to_aggregator_with(
@@ -2876,7 +2898,7 @@ mod tests {
                     BTreeSet::from([
                         RuntimeFilterEnvelopeKind::Contribution,
                         RuntimeFilterEnvelopeKind::ProducerClosed,
-                        RuntimeFilterEnvelopeKind::Unavailable,
+                        RuntimeFilterEnvelopeKind::ProducerUnavailable,
                     ]),
                 ),
             ],

@@ -51,10 +51,12 @@
 //! route identity. It never inspects the producer's semantic kind (Join / TopN /
 //! aggregate) to decide routing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::runtime_filter::codec::artifact::EncodedArtifactFrame;
 use crate::runtime_filter::port::events::{
@@ -88,7 +90,10 @@ use super::{
 /// an ack that finally arrives before the deadline still releases cleanly.
 ///
 /// `max_pending_entries` and `max_pending_bytes` are the M3 Task 4 self-owned buffer
-/// ceilings. They bound the sender-side buffer purely through the transport's OWN
+/// ceilings. Bytes charge each envelope's deterministic inline size plus retained
+/// payload capacity, and each entry's inline route plus retained endpoint-host capacity;
+/// allocator/control-block and pending-entry overhead is bounded by the entry ceiling. They
+/// bound the sender-side buffer purely through the transport's OWN
 /// counters — RF buffer memory is deliberately NOT wired into the global MemTracker
 /// this milestone. Offering a frame that would exceed either returns
 /// [`ReliableSendOutcome::ResourceLimit`] instead of buffering: an explicit resource
@@ -148,10 +153,10 @@ const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
 // ack cadence keeps the live buffer far smaller even when broadcasting to a large
 // cluster.
 const DEFAULT_MAX_PENDING_ENTRIES: usize = 1 << 16;
-// `DEFAULT_MAX_PENDING_BYTES`: 256 MiB of DISTINCT buffered serialized frames per
-// query. Each frame is itself bounded by its channel's `max_artifact_bytes` wire
-// ceiling, and a broadcast frame shared across routes is metered once (see
-// `PendingBuffer`), so a handful of in-flight artifact versions stay well under this.
+// `DEFAULT_MAX_PENDING_BYTES`: 256 MiB of DISTINCT buffered retained-envelope charge
+// plus per-entry retained route charge per query. Each complete immutable envelope is
+// itself bounded by its channel's wire ceiling and is metered for as long as that exact
+// allocation remains pending.
 const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 impl Default for ReliableTransportPolicy {
@@ -171,32 +176,92 @@ impl Default for ReliableTransportPolicy {
 /// the transport assigns sequences starting at 1), so it round-trips losslessly to a
 /// [`DeliveryRouteIdentity`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct PendingKey {
-    route_edge_id: RouteEdgeId,
-    sequence: ProducerSequence,
+enum PendingKey {
+    Delivery {
+        route_edge_id: RouteEdgeId,
+        sequence: ProducerSequence,
+    },
+    Contribution {
+        binding_id: crate::runtime_filter::model::contract::BindingId,
+        fragment_instance_id: crate::common::types::UniqueId,
+        partition_id: crate::runtime_filter::port::identity::PartitionId,
+        sequence: ProducerSequence,
+    },
+    ProducerInstance {
+        binding_id: crate::runtime_filter::model::contract::BindingId,
+        fragment_instance_id: crate::common::types::UniqueId,
+    },
 }
 
 impl PendingKey {
-    fn from_delivery(identity: &DeliveryRouteIdentity) -> Self {
-        Self {
-            route_edge_id: identity.route_edge_id(),
-            sequence: identity.sequence(),
+    fn from_identity(identity: &RuntimeFilterRouteIdentity) -> Self {
+        if let Some(identity) = identity.as_delivery() {
+            Self::Delivery {
+                route_edge_id: identity.route_edge_id(),
+                sequence: identity.sequence(),
+            }
+        } else if let Some(identity) = identity.as_contribution() {
+            Self::Contribution {
+                binding_id: identity.producer_binding_id(),
+                fragment_instance_id: identity.fragment_instance_id(),
+                partition_id: identity.partition_id(),
+                sequence: identity.sequence(),
+            }
+        } else {
+            let identity = identity
+                .as_producer_instance()
+                .expect("runtime filter route identity is typed");
+            Self::ProducerInstance {
+                binding_id: identity.producer_binding_id(),
+                fragment_instance_id: identity.fragment_instance_id(),
+            }
         }
     }
 
     fn into_route_identity(self) -> RuntimeFilterRouteIdentity {
-        RuntimeFilterRouteIdentity::delivery(
-            DeliveryRouteIdentity::try_new(self.route_edge_id, self.sequence)
-                .expect("pending keys carry validated non-zero delivery coordinates"),
-        )
+        use crate::runtime_filter::port::transport::{
+            ContributionRouteIdentity, ProducerInstanceRouteIdentity,
+        };
+        match self {
+            Self::Delivery {
+                route_edge_id,
+                sequence,
+            } => RuntimeFilterRouteIdentity::delivery(
+                DeliveryRouteIdentity::try_new(route_edge_id, sequence)
+                    .expect("pending keys carry validated delivery coordinates"),
+            ),
+            Self::Contribution {
+                binding_id,
+                fragment_instance_id,
+                partition_id,
+                sequence,
+            } => RuntimeFilterRouteIdentity::contribution(
+                ContributionRouteIdentity::try_new(
+                    binding_id,
+                    fragment_instance_id,
+                    partition_id,
+                    sequence,
+                )
+                .expect("pending keys carry validated contribution coordinates"),
+            ),
+            Self::ProducerInstance {
+                binding_id,
+                fragment_instance_id,
+            } => RuntimeFilterRouteIdentity::producer_instance(
+                ProducerInstanceRouteIdentity::try_new(binding_id, fragment_instance_id)
+                    .expect("pending keys carry validated producer-instance coordinates"),
+            ),
+        }
     }
 }
 
 /// A buffered in-flight frame awaiting acknowledgement.
 struct PendingEntry {
-    frame: Arc<EncodedArtifactFrame>,
+    envelope: Arc<RuntimeFilterEnvelope>,
+    allocation: usize,
+    retained_bytes: usize,
+    route_retained_bytes: usize,
     route: RuntimeFilterRemoteRoute,
-    kind: RuntimeFilterEnvelopeKind,
     attempts: u32,
     first_sent_at: Instant,
     last_sent_at: Instant,
@@ -205,14 +270,71 @@ struct PendingEntry {
     event_identity: TransportRouteEventIdentity,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedWitness {
+    route_fingerprint: [u8; 32],
+    fingerprint: [u8; 32],
+}
+
+#[derive(Default)]
+struct RetiredIdentityFilter {
+    bits: Vec<u64>,
+}
+
+// Query-scoped 8 KiB no-false-negative retirement filter. False positives are safe:
+// producer adapters map `RetiredIdentity` to RF fail-open, never to a query error.
+const RETIRED_IDENTITY_FILTER_BITS: usize = 1 << 16;
+
+impl RetiredIdentityFilter {
+    fn ensure_capacity(&mut self) {
+        if self.bits.is_empty() {
+            self.bits.resize(RETIRED_IDENTITY_FILTER_BITS / 64, 0);
+        }
+    }
+
+    fn indices(&self, key: PendingKey) -> [usize; 3] {
+        let digest = pending_key_fingerprint(key);
+        let bit_count = self.bits.len() * 64;
+        let index = |offset: usize| {
+            usize::try_from(u64::from_le_bytes(
+                digest[offset..offset + 8]
+                    .try_into()
+                    .expect("fingerprint chunk has fixed width"),
+            ))
+            .unwrap_or(0)
+                % bit_count
+        };
+        [index(0), index(8), index(16)]
+    }
+
+    fn insert(&mut self, key: PendingKey) {
+        if matches!(key, PendingKey::Delivery { .. }) {
+            return;
+        }
+        self.ensure_capacity();
+        for index in self.indices(key) {
+            self.bits[index / 64] |= 1_u64 << (index % 64);
+        }
+    }
+
+    fn might_contain(&self, key: PendingKey) -> bool {
+        !matches!(key, PendingKey::Delivery { .. })
+            && !self.bits.is_empty()
+            && self
+                .indices(key)
+                .into_iter()
+                .all(|index| self.bits[index / 64] & (1_u64 << (index % 64)) != 0)
+    }
+}
+
 /// Which self-owned transport ceiling a `send` would exceed. Kept distinct so a
 /// later task's structured degradation event can name the limit that tripped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransportResourceLimit {
     /// Buffering another frame would exceed the pending-entry count ceiling.
     PendingEntries,
-    /// Buffering another distinct frame would exceed the buffered serialized-byte
-    /// ceiling.
+    /// Buffering another distinct frame would exceed the retained envelope-and-route
+    /// byte ceiling.
     SerializedBytes,
 }
 
@@ -232,6 +354,38 @@ pub(crate) enum ReliableSendOutcome {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReliableSendError {
+    IdentityConflict,
+    RetiredIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReliableFailedOpenWork {
+    route: RuntimeFilterRemoteRoute,
+    envelope: Arc<RuntimeFilterEnvelope>,
+    event_identity: TransportRouteEventIdentity,
+    reason: TransportFailOpenReason,
+}
+
+impl ReliableFailedOpenWork {
+    pub(crate) const fn route(&self) -> &RuntimeFilterRemoteRoute {
+        &self.route
+    }
+
+    pub(crate) const fn envelope(&self) -> &Arc<RuntimeFilterEnvelope> {
+        &self.envelope
+    }
+
+    pub(crate) const fn event_identity(&self) -> TransportRouteEventIdentity {
+        self.event_identity
+    }
+
+    pub(crate) const fn reason(&self) -> TransportFailOpenReason {
+        self.reason
+    }
+}
+
 #[cfg(test)]
 impl ReliableSendOutcome {
     /// The stamped delivery identity of a buffered send, or a panic if the send was
@@ -249,26 +403,28 @@ impl ReliableSendOutcome {
 
 /// The query-scoped in-flight buffer plus its self-owned counters.
 ///
-/// Byte metering is per unique frame ALLOCATION, not per entry: a broadcast frame
-/// that fans out to several routes is one [`Arc`] allocation shared across entries,
-/// so its serialized bytes are counted once. Counting per entry would count a shared
-/// frame N times, misrepresenting real memory and rejecting legitimate wide fan-out.
-/// `frame_refs` keys on the frame allocation address (`Arc::as_ptr` as `usize`); while
-/// a frame has at least one buffered entry we hold an `Arc` to it, so its address is
-/// stable and unique, and `bytes` is adjusted only on the 0<->1 reference transition.
+/// Byte metering charges the deterministic inline envelope plus its retained payload
+/// capacity once per envelope allocation, and the inline route plus retained endpoint-host
+/// capacity once per pending entry. Arc/control-block, allocator, and pending-entry fixed
+/// overhead are bounded separately by the entry ceiling. Route-specific broadcast entries
+/// are each charged; retries reuse the same allocation and add no charge.
+/// `allocation_refs` keys on `Arc::as_ptr`; while an envelope remains pending its address
+/// is stable, and `bytes` changes only on the allocation's 0<->1 reference transition.
 #[derive(Default)]
 struct PendingBuffer {
     entries: HashMap<PendingKey, PendingEntry>,
     bytes: usize,
-    frame_refs: HashMap<usize, usize>,
+    allocation_refs: HashMap<usize, usize>,
+    completed: HashMap<PendingKey, CompletedWitness>,
+    completed_order: VecDeque<PendingKey>,
+    retired: RetiredIdentityFilter,
 }
 
 impl PendingBuffer {
     /// Admit a new entry under the ceilings. On success the entry is inserted and its
-    /// frame's bytes are metered (once per unique allocation); on a ceiling breach
-    /// nothing is inserted and the tripped limit is returned. Every `send` stamps a
-    /// fresh monotonic sequence, so `key` is always genuinely new — this never
-    /// overwrites, so idempotency is not a concern on the sender buffer.
+    /// envelope's bytes are metered (once per unique allocation); on a ceiling breach
+    /// nothing is inserted and the tripped limit is returned. `send_prepared` resolves
+    /// exact duplicates and conflicts before admission, so this insertion never overwrites.
     fn admit(
         &mut self,
         key: PendingKey,
@@ -279,43 +435,161 @@ impl PendingBuffer {
         if self.entries.len() >= max_entries {
             return Err(TransportResourceLimit::PendingEntries);
         }
-        let allocation = Arc::as_ptr(&entry.frame) as usize;
-        let is_new_allocation = !self.frame_refs.contains_key(&allocation);
-        // Only a genuinely-new allocation adds bytes; a broadcast frame already
-        // buffered for another route adds none, so wide fan-out of one frame is never
-        // byte-rejected once the first route fits.
-        let added = if is_new_allocation {
-            entry.frame.payload().len()
+        let allocation = entry.allocation;
+        let is_new_allocation = !self.allocation_refs.contains_key(&allocation);
+        // A route-specific envelope allocation adds bytes once. Retrying the same Arc
+        // never calls admission and therefore never charges the allocation again.
+        let envelope_added = if is_new_allocation {
+            entry.retained_bytes
         } else {
             0
         };
+        let added = envelope_added.saturating_add(entry.route_retained_bytes);
         if self.bytes.saturating_add(added) > max_bytes {
             return Err(TransportResourceLimit::SerializedBytes);
         }
-        *self.frame_refs.entry(allocation).or_insert(0) += 1;
+        *self.allocation_refs.entry(allocation).or_insert(0) += 1;
         self.bytes += added;
         // Underscore-bound so the assertion's variable is not flagged unused in release
         // builds, where `debug_assert!` compiles out.
         let _previous = self.entries.insert(key, entry);
         debug_assert!(
             _previous.is_none(),
-            "reliable transport stamps a fresh sequence per send, so keys are unique"
+            "reliable transport admission requires a unique pending identity"
         );
         Ok(())
     }
 
-    /// Release the accounting for an entry's frame: drop one reference, and when the
+    /// Release the accounting for an entry's envelope: drop one reference, and when the
     /// last reference to an allocation goes away, reclaim its bytes.
-    fn release(&mut self, frame: &Arc<EncodedArtifactFrame>) {
-        let allocation = Arc::as_ptr(frame) as usize;
-        if let Some(refs) = self.frame_refs.get_mut(&allocation) {
+    fn release(&mut self, entry: &PendingEntry) {
+        self.bytes = self.bytes.saturating_sub(entry.route_retained_bytes);
+        let allocation = entry.allocation;
+        if let Some(refs) = self.allocation_refs.get_mut(&allocation) {
             *refs -= 1;
             if *refs == 0 {
-                self.frame_refs.remove(&allocation);
-                self.bytes = self.bytes.saturating_sub(frame.payload().len());
+                self.allocation_refs.remove(&allocation);
+                self.bytes = self.bytes.saturating_sub(entry.retained_bytes);
             }
         }
     }
+
+    fn record_completed(&mut self, key: PendingKey, entry: &PendingEntry, max_entries: usize) {
+        if self.completed.contains_key(&key) {
+            return;
+        }
+        while self.completed.len() >= max_entries {
+            let Some(oldest) = self.completed_order.pop_front() else {
+                break;
+            };
+            self.completed.remove(&oldest);
+        }
+        self.completed.insert(
+            key,
+            CompletedWitness {
+                route_fingerprint: route_fingerprint(&entry.route),
+                fingerprint: envelope_fingerprint(&entry.envelope),
+            },
+        );
+        self.completed_order.push_back(key);
+        self.retired.insert(key);
+    }
+}
+
+fn pending_key_fingerprint(key: PendingKey) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    match key {
+        PendingKey::Delivery {
+            route_edge_id,
+            sequence,
+        } => {
+            digest.update([1]);
+            digest.update(route_edge_id.get().to_le_bytes());
+            digest.update(sequence.get().to_le_bytes());
+        }
+        PendingKey::Contribution {
+            binding_id,
+            fragment_instance_id,
+            partition_id,
+            sequence,
+        } => {
+            digest.update([2]);
+            digest.update(binding_id.get().to_le_bytes());
+            digest.update(fragment_instance_id.hi.to_le_bytes());
+            digest.update(fragment_instance_id.lo.to_le_bytes());
+            digest.update(partition_id.get().to_le_bytes());
+            digest.update(sequence.get().to_le_bytes());
+        }
+        PendingKey::ProducerInstance {
+            binding_id,
+            fragment_instance_id,
+        } => {
+            digest.update([3]);
+            digest.update(binding_id.get().to_le_bytes());
+            digest.update(fragment_instance_id.hi.to_le_bytes());
+            digest.update(fragment_instance_id.lo.to_le_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
+fn route_fingerprint(route: &RuntimeFilterRemoteRoute) -> [u8; 32] {
+    use crate::runtime_filter::port::routing::RuntimeFilterRouteRole;
+
+    let mut digest = Sha256::new();
+    digest.update(route.route_edge_id().get().to_le_bytes());
+    digest.update(route.peer_participant_id().get().to_le_bytes());
+    digest.update(route.endpoint().host().as_bytes());
+    digest.update(route.endpoint().port().to_le_bytes());
+    match route.target_role() {
+        RuntimeFilterRouteRole::Producer(binding) => {
+            digest.update([1]);
+            digest.update(binding.get().to_le_bytes());
+        }
+        RuntimeFilterRouteRole::Aggregator => digest.update([2]),
+        RuntimeFilterRouteRole::Relay => digest.update([3]),
+        RuntimeFilterRouteRole::Consumer(binding) => {
+            digest.update([4]);
+            digest.update(binding.get().to_le_bytes());
+        }
+    }
+    digest.finalize().into()
+}
+
+fn envelope_fingerprint(envelope: &RuntimeFilterEnvelope) -> [u8; 32] {
+    let kind_tag = match envelope.kind() {
+        RuntimeFilterEnvelopeKind::Contribution => 1,
+        RuntimeFilterEnvelopeKind::Artifact => 2,
+        RuntimeFilterEnvelopeKind::ProducerClosed => 3,
+        RuntimeFilterEnvelopeKind::ProducerUnavailable => 4,
+        RuntimeFilterEnvelopeKind::Unavailable => 5,
+        RuntimeFilterEnvelopeKind::Ack => 6,
+        RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => 7,
+        RuntimeFilterEnvelopeKind::DegradedLogical => 8,
+        RuntimeFilterEnvelopeKind::FinalArtifact => 9,
+    };
+    let mut digest = Sha256::new();
+    digest.update([kind_tag]);
+    digest.update(envelope.query_id().hi.to_le_bytes());
+    digest.update(envelope.query_id().lo.to_le_bytes());
+    digest.update(envelope.channel_id().get().to_le_bytes());
+    digest.update(envelope.deployment_epoch().get().to_le_bytes());
+    match envelope.producer_open() {
+        Some(open) => {
+            digest.update([1]);
+            digest.update(open.local_partition_count().get().to_le_bytes());
+        }
+        None => digest.update([0]),
+    }
+    match envelope.accept_status() {
+        Some(RuntimeFilterAcceptStatus::Accepted) => digest.update([1]),
+        Some(RuntimeFilterAcceptStatus::Duplicate) => digest.update([2]),
+        Some(RuntimeFilterAcceptStatus::Rejected) => digest.update([3]),
+        None => digest.update([0]),
+    }
+    digest.update(envelope.schema_digest());
+    digest.update(envelope.payload());
+    digest.finalize().into()
 }
 
 /// The result of applying an ack to the buffer.
@@ -340,6 +614,7 @@ pub(crate) enum EnvelopeAckOutcome {
 pub(crate) struct ReliableTransportTick {
     retried: usize,
     failed_open: Vec<RuntimeFilterRouteIdentity>,
+    failed_open_work: Vec<ReliableFailedOpenWork>,
 }
 
 impl ReliableTransportTick {
@@ -353,6 +628,10 @@ impl ReliableTransportTick {
     /// unaffected. A later task emits a structured degradation event for each.
     pub(crate) fn failed_open(&self) -> &[RuntimeFilterRouteIdentity] {
         &self.failed_open
+    }
+
+    pub(crate) fn failed_open_work(&self) -> &[ReliableFailedOpenWork] {
+        &self.failed_open_work
     }
 
     /// True when the tick neither retried nor failed anything open.
@@ -372,6 +651,8 @@ pub(crate) struct ReliableEnvelopeTransport {
     sink_override: Mutex<Option<Arc<dyn RuntimeFilterEnvelopeSink>>>,
     #[cfg(test)]
     before_event_emit: Mutex<Option<Arc<dyn Fn(TransportEventKind) + Send + Sync>>>,
+    #[cfg(test)]
+    admitted_envelopes: Mutex<Vec<(RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>)>>,
     clock: Arc<dyn RuntimeFilterClock>,
     policy: Mutex<ReliableTransportPolicy>,
     pending: Mutex<PendingBuffer>,
@@ -417,6 +698,8 @@ impl ReliableEnvelopeTransport {
             sink_override: Mutex::new(None),
             #[cfg(test)]
             before_event_emit: Mutex::new(None),
+            #[cfg(test)]
+            admitted_envelopes: Mutex::new(Vec::new()),
             clock,
             policy: Mutex::new(policy),
             pending: Mutex::new(PendingBuffer::default()),
@@ -447,17 +730,16 @@ impl ReliableEnvelopeTransport {
         if *current == policy {
             return Ok(());
         }
-        if !self
+        let pending = self
             .pending
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entries
-            .is_empty()
-        {
+            .unwrap_or_else(|error| error.into_inner());
+        if !pending.entries.is_empty() || !pending.completed.is_empty() {
             return Err(
                 "runtime filter transport policy cannot change after delivery starts".into(),
             );
         }
+        drop(pending);
         *current = policy;
         Ok(())
     }
@@ -511,7 +793,10 @@ impl ReliableEnvelopeTransport {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         pending.entries.clear();
-        pending.frame_refs.clear();
+        pending.allocation_refs.clear();
+        pending.completed.clear();
+        pending.completed_order.clear();
+        pending.retired.bits.clear();
         pending.bytes = 0;
         drop(pending);
         drop(completion);
@@ -553,7 +838,7 @@ impl ReliableEnvelopeTransport {
     ///
     /// On success returns [`ReliableSendOutcome::Buffered`] with the delivery route
     /// identity the transport stamped, so an ack can later address exactly this
-    /// in-flight frame. When the pending-entry count or the buffered serialized-byte
+    /// in-flight frame. When the pending-entry count or retained envelope-and-route byte
     /// ceiling would be exceeded the frame is NOT buffered and NOT transmitted, and
     /// [`ReliableSendOutcome::ResourceLimit`] is returned — an explicit resource
     /// rejection the caller degrades the route on, distinct from the deadline fail-open.
@@ -573,16 +858,57 @@ impl ReliableEnvelopeTransport {
         identity: TransportRouteEventIdentity,
         kind: RuntimeFilterEnvelopeKind,
     ) -> ReliableSendOutcome {
-        let Some(call) = TransportCall::admit(self) else {
-            return ReliableSendOutcome::Shutdown;
-        };
         let sequence = ProducerSequence::new(self.next_sequence.fetch_add(1, Ordering::Relaxed));
-        let key = PendingKey {
-            route_edge_id: route.route_edge_id(),
-            sequence,
+        let route_identity = RuntimeFilterRouteIdentity::delivery(
+            DeliveryRouteIdentity::try_new(route.route_edge_id(), sequence)
+                .expect("installed delivery route carries non-zero coordinates"),
+        );
+        let common = identity.common();
+        let envelope = Arc::new(
+            RuntimeFilterEnvelope::try_new(
+                kind,
+                common.query_id(),
+                common.channel_id(),
+                common.epoch(),
+                route_identity,
+                None,
+                None,
+                frame.profile_digest(),
+                frame.payload().to_vec(),
+            )
+            .expect("installed delivery route and encoded frame form a valid envelope"),
+        );
+        self.send_prepared(route, envelope, identity)
+            .expect("transport-assigned delivery identity cannot conflict")
+    }
+
+    pub(crate) fn send_envelope(
+        &self,
+        route: &RuntimeFilterRemoteRoute,
+        envelope: Arc<RuntimeFilterEnvelope>,
+        identity: TransportRouteEventIdentity,
+    ) -> Result<ReliableSendOutcome, ReliableSendError> {
+        self.send_prepared(route, envelope, identity)
+    }
+
+    fn send_prepared(
+        &self,
+        route: &RuntimeFilterRemoteRoute,
+        envelope: Arc<RuntimeFilterEnvelope>,
+        identity: TransportRouteEventIdentity,
+    ) -> Result<ReliableSendOutcome, ReliableSendError> {
+        let Some(call) = TransportCall::admit(self) else {
+            return Ok(ReliableSendOutcome::Shutdown);
         };
+        let key = PendingKey::from_identity(envelope.route_identity());
+        let route_identity = envelope.route_identity().clone();
+        let allocation = Arc::as_ptr(&envelope) as usize;
+        let retained_bytes = envelope.retained_bytes();
+        let route_retained_bytes = route.retained_bytes();
+        let fingerprint = envelope_fingerprint(&envelope);
+        let route_digest = route_fingerprint(route);
         let now = self.clock.now();
-        let bytes = frame.payload().len();
+        let bytes = envelope.payload().len();
         let policy = *self
             .policy
             .lock()
@@ -592,12 +918,31 @@ impl ReliableEnvelopeTransport {
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            if let Some(completed) = pending.completed.get(&key) {
+                if completed.route_fingerprint == route_digest
+                    && completed.fingerprint == fingerprint
+                {
+                    return Ok(ReliableSendOutcome::Buffered(route_identity));
+                }
+                return Err(ReliableSendError::IdentityConflict);
+            }
+            if let Some(existing) = pending.entries.get(&key) {
+                if existing.route == *route && existing.envelope.as_ref() == envelope.as_ref() {
+                    return Ok(ReliableSendOutcome::Buffered(route_identity));
+                }
+                return Err(ReliableSendError::IdentityConflict);
+            }
+            if pending.retired.might_contain(key) {
+                return Err(ReliableSendError::RetiredIdentity);
+            }
             if let Err(limit) = pending.admit(
                 key,
                 PendingEntry {
-                    frame: Arc::clone(&frame),
+                    envelope: Arc::clone(&envelope),
+                    allocation,
+                    retained_bytes,
+                    route_retained_bytes,
                     route: route.clone(),
-                    kind,
                     attempts: 1,
                     first_sent_at: now,
                     last_sent_at: now,
@@ -606,29 +951,31 @@ impl ReliableEnvelopeTransport {
                 policy.max_pending_entries,
                 policy.max_pending_bytes,
             ) {
-                // Over a self-owned ceiling: the frame is neither buffered nor put on
-                // the wire, and NO transport event is emitted here — the frame never
-                // entered the buffer. The Service's `send` call site emits the
-                // resource-limit fail-open event and degrades the route.
-                return ReliableSendOutcome::ResourceLimit(limit);
+                return Ok(ReliableSendOutcome::ResourceLimit(limit));
             }
         }
-        let route_identity = key.into_route_identity();
-        let envelope =
-            Self::transport_envelope(key, kind, identity, frame.as_ref(), policy.deadline);
-        let submit = self.resolve_sink().try_send(route.clone(), envelope);
+        #[cfg(test)]
+        self.admitted_envelopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((route.clone(), Arc::clone(&envelope)));
+        let transport_envelope =
+            RuntimeFilterTransportEnvelope::new(Arc::clone(&envelope), policy.deadline);
+        let submit = self
+            .resolve_sink()
+            .try_send(route.clone(), transport_envelope);
         if !self.lifecycle.is_running() {
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if let Some(entry) = pending.entries.remove(&key) {
-                pending.release(&entry.frame);
+                pending.release(&entry);
             }
-            return ReliableSendOutcome::Shutdown;
+            return Ok(ReliableSendOutcome::Shutdown);
         }
         drop(call);
-        match submit {
+        let outcome = match submit {
             SinkSubmitOutcome::Submitted => {
                 if self.emit(identity, TransportEventKind::Sent, bytes) {
                     ReliableSendOutcome::Buffered(route_identity)
@@ -643,34 +990,12 @@ impl ReliableEnvelopeTransport {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 if let Some(entry) = pending.entries.remove(&key) {
-                    pending.release(&entry.frame);
+                    pending.release(&entry);
                 }
                 ReliableSendOutcome::Shutdown
             }
-        }
-    }
-
-    fn transport_envelope(
-        key: PendingKey,
-        kind: RuntimeFilterEnvelopeKind,
-        event_identity: TransportRouteEventIdentity,
-        frame: &EncodedArtifactFrame,
-        rpc_deadline: Duration,
-    ) -> RuntimeFilterTransportEnvelope {
-        let common = event_identity.common();
-        let envelope = RuntimeFilterEnvelope::try_new(
-            kind,
-            common.query_id(),
-            common.channel_id(),
-            common.epoch(),
-            key.into_route_identity(),
-            None,
-            None,
-            frame.profile_digest(),
-            frame.payload().to_vec(),
-        )
-        .expect("installed route and encoded frame form a valid domain envelope");
-        RuntimeFilterTransportEnvelope::new(envelope, rpc_deadline)
+        };
+        Ok(outcome)
     }
 
     /// Apply an ack for `identity` with `status`, releasing the matching buffered
@@ -683,7 +1008,7 @@ impl ReliableEnvelopeTransport {
         let Some(call) = TransportCall::admit(self) else {
             return EnvelopeAckOutcome::Unknown;
         };
-        let (outcome, event) = self.on_ack_admitted(identity, status);
+        let (outcome, event, _failed_open_work) = self.on_ack_admitted(identity, status);
         drop(call);
         if let Some((event_identity, bytes)) = event {
             let _ = self.emit(event_identity, TransportEventKind::Acked(status), bytes);
@@ -698,34 +1023,49 @@ impl ReliableEnvelopeTransport {
     ) -> (
         EnvelopeAckOutcome,
         Option<(TransportRouteEventIdentity, usize)>,
+        Option<ReliableFailedOpenWork>,
     ) {
-        let Some(delivery) = identity.as_delivery() else {
-            // Only delivery frames are buffered today; `Contribution` acks converge
-            // here in RFD-6. A non-delivery identity therefore matches nothing.
-            return (EnvelopeAckOutcome::Unknown, None);
-        };
-        let key = PendingKey::from_delivery(delivery);
+        let key = PendingKey::from_identity(identity);
+        let max_completed = self
+            .policy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .max_pending_entries;
         let released = {
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             pending.entries.remove(&key).map(|entry| {
-                pending.release(&entry.frame);
-                (entry.event_identity, entry.frame.payload().len())
+                pending.release(&entry);
+                if matches!(
+                    status,
+                    RuntimeFilterAcceptStatus::Accepted | RuntimeFilterAcceptStatus::Duplicate
+                ) {
+                    pending.record_completed(key, &entry, max_completed);
+                }
+                entry
             })
         };
         match released {
             // Already released, or a duplicate / out-of-order ack for an identity that
             // is no longer in flight. A no-op — never a re-delivery, and no event.
-            None => (EnvelopeAckOutcome::Unknown, None),
-            Some((event_identity, bytes)) => {
+            None => (EnvelopeAckOutcome::Unknown, None, None),
+            Some(entry) => {
                 let outcome = match status {
                     RuntimeFilterAcceptStatus::Accepted => EnvelopeAckOutcome::Released,
                     RuntimeFilterAcceptStatus::Duplicate => EnvelopeAckOutcome::ReleasedOnDuplicate,
                     RuntimeFilterAcceptStatus::Rejected => EnvelopeAckOutcome::Rejected,
                 };
-                (outcome, Some((event_identity, bytes)))
+                let event = Some((entry.event_identity, entry.envelope.payload().len()));
+                let failed_open_work = matches!(status, RuntimeFilterAcceptStatus::Rejected)
+                    .then_some(ReliableFailedOpenWork {
+                        route: entry.route,
+                        envelope: entry.envelope,
+                        event_identity: entry.event_identity,
+                        reason: TransportFailOpenReason::ContractRejected,
+                    });
+                (outcome, event, failed_open_work)
             }
         }
     }
@@ -757,14 +1097,12 @@ impl ReliableEnvelopeTransport {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut to_send: Vec<(
-            PendingKey,
             RuntimeFilterRemoteRoute,
-            Arc<EncodedArtifactFrame>,
-            RuntimeFilterEnvelopeKind,
+            Arc<RuntimeFilterEnvelope>,
             TransportRouteEventIdentity,
             usize,
         )> = Vec::new();
-        let mut failed_open: Vec<(PendingKey, TransportRouteEventIdentity, usize)> = Vec::new();
+        let mut failed_open: Vec<(PendingKey, ReliableFailedOpenWork, usize)> = Vec::new();
         {
             let mut pending = self
                 .pending
@@ -787,20 +1125,28 @@ impl ReliableEnvelopeTransport {
                     entry.attempts += 1;
                     entry.last_sent_at = now;
                     to_send.push((
-                        *key,
                         entry.route.clone(),
-                        Arc::clone(&entry.frame),
-                        entry.kind,
+                        Arc::clone(&entry.envelope),
                         entry.event_identity,
-                        entry.frame.payload().len(),
+                        entry.envelope.payload().len(),
                     ));
                 }
             }
             // Remove the deadline-expired frames, reclaiming their byte accounting.
             for key in expired {
                 if let Some(entry) = pending.entries.remove(&key) {
-                    pending.release(&entry.frame);
-                    failed_open.push((key, entry.event_identity, entry.frame.payload().len()));
+                    pending.release(&entry);
+                    let bytes = entry.envelope.payload().len();
+                    failed_open.push((
+                        key,
+                        ReliableFailedOpenWork {
+                            route: entry.route,
+                            envelope: entry.envelope,
+                            event_identity: entry.event_identity,
+                            reason: TransportFailOpenReason::Deadline,
+                        },
+                        bytes,
+                    ));
                 }
             }
         }
@@ -808,14 +1154,15 @@ impl ReliableEnvelopeTransport {
         // within a tick is unspecified (it follows HashMap iteration), so no caller
         // may depend on it; only `failed_open` is sorted below for determinism.
         let mut events = Vec::new();
-        for (key, route, frame, kind, identity, bytes) in &to_send {
+        for (route, envelope, identity, bytes) in &to_send {
             if !self.lifecycle.is_running() {
                 break;
             }
-            let envelope =
-                Self::transport_envelope(*key, *kind, *identity, frame.as_ref(), policy.deadline);
             if matches!(
-                self.resolve_sink().try_send(route.clone(), envelope),
+                self.resolve_sink().try_send(
+                    route.clone(),
+                    RuntimeFilterTransportEnvelope::new(Arc::clone(envelope), policy.deadline),
+                ),
                 SinkSubmitOutcome::Submitted
             ) && self.lifecycle.is_running()
             {
@@ -826,20 +1173,23 @@ impl ReliableEnvelopeTransport {
         // are deterministic regardless of HashMap iteration order.
         failed_open.sort_unstable_by_key(|(key, _, _)| *key);
         let mut failed_identities = Vec::with_capacity(failed_open.len());
-        for (key, identity, bytes) in failed_open {
+        let mut failed_open_work = Vec::with_capacity(failed_open.len());
+        for (key, work, bytes) in failed_open {
             if self.lifecycle.is_running() {
                 events.push((
-                    identity,
+                    work.event_identity,
                     TransportEventKind::FailedOpen(TransportFailOpenReason::Deadline),
                     bytes,
                 ));
             }
             failed_identities.push(key.into_route_identity());
+            failed_open_work.push(work);
         }
         (
             ReliableTransportTick {
                 retried: to_send.len(),
                 failed_open: failed_identities,
+                failed_open_work,
             },
             events,
         )
@@ -853,6 +1203,7 @@ impl ReliableEnvelopeTransport {
             return ReliableTransportTick::default();
         };
         let mut contract_failed = Vec::new();
+        let mut contract_failed_work = Vec::new();
         let mut events = Vec::new();
         while let Some(completion) = self.resolve_sink().try_recv_completion() {
             if !self.lifecycle.is_running() {
@@ -860,19 +1211,25 @@ impl ReliableEnvelopeTransport {
             }
             match completion {
                 SinkCompletion::Ack(identity, status) => {
-                    let (outcome, event) = self.on_ack_admitted(&identity, status);
+                    let (outcome, event, work) = self.on_ack_admitted(&identity, status);
                     if matches!(outcome, EnvelopeAckOutcome::Rejected) {
                         contract_failed.push(identity);
+                        if let Some(work) = work {
+                            contract_failed_work.push(work);
+                        }
                     }
                     if let Some((event_identity, bytes)) = event {
                         events.push((event_identity, TransportEventKind::Acked(status), bytes));
                     }
                 }
                 SinkCompletion::TransportFailure(identity, error) if error.is_contract() => {
-                    let (outcome, event) =
+                    let (outcome, event, work) =
                         self.on_ack_admitted(&identity, RuntimeFilterAcceptStatus::Rejected);
                     if matches!(outcome, EnvelopeAckOutcome::Rejected) {
                         contract_failed.push(identity);
+                        if let Some(work) = work {
+                            contract_failed_work.push(work);
+                        }
                     }
                     if let Some((event_identity, bytes)) = event {
                         events.push((
@@ -894,12 +1251,11 @@ impl ReliableEnvelopeTransport {
         let (mut tick, mut drive_events) = self.drive_retries_admitted(now);
         events.append(&mut drive_events);
         contract_failed.append(&mut tick.failed_open);
-        contract_failed.sort_by_key(|identity| {
-            identity
-                .as_delivery()
-                .map(|delivery| (delivery.route_edge_id(), delivery.sequence()))
-        });
+        contract_failed.sort_by_key(PendingKey::from_identity);
+        contract_failed_work
+            .sort_by_key(|work| PendingKey::from_identity(work.envelope.route_identity()));
         tick.failed_open = contract_failed;
+        tick.failed_open_work.extend(contract_failed_work);
         drop(call);
         for (identity, kind, bytes) in events {
             let _ = self.emit(identity, kind, bytes);
@@ -933,15 +1289,34 @@ impl ReliableEnvelopeTransport {
             .len()
     }
 
-    /// The distinct serialized-frame bytes currently buffered (per-unique-allocation;
-    /// a broadcast frame counts once). Test seam for the self-owned byte ceiling and
-    /// the release-to-zero teardown assertion.
+    /// The deterministic inline-envelope plus retained-payload bytes (per unique allocation)
+    /// and per-entry retained route bytes currently buffered. Retries do not re-meter either
+    /// charge. Test seam for the self-owned byte ceiling and release-to-zero assertion.
     #[cfg(test)]
     pub(super) fn pending_bytes(&self) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .bytes
+    }
+
+    #[cfg(test)]
+    fn completed_witness_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .completed
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn saturate_retired_filter_for_test(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending.retired.ensure_capacity();
+        pending.retired.bits.fill(u64::MAX);
     }
 
     /// Override the live production sink with a fake. This test-only seam lets
@@ -961,11 +1336,22 @@ impl ReliableEnvelopeTransport {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(hook);
     }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_envelopes_for_test(
+        &self,
+    ) -> Vec<(RuntimeFilterRemoteRoute, Arc<RuntimeFilterEnvelope>)> {
+        self.admitted_envelopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::mem::size_of;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
@@ -983,12 +1369,14 @@ mod tests {
         TransportFailOpenReason, TransportRouteEventIdentity,
     };
     use crate::runtime_filter::port::identity::{
-        DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
+        DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId, RuntimeFilterParticipantId,
     };
     use crate::runtime_filter::port::routing::{RuntimeFilterRemoteRoute, RuntimeFilterRouteRole};
     use crate::runtime_filter::port::support::RuntimeFilterClock;
     use crate::runtime_filter::port::transport::{
-        RuntimeFilterAcceptStatus, RuntimeFilterTransportEnvelope,
+        ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+        RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
     };
     use crate::runtime_filter::router::remote::{
         RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
@@ -1150,6 +1538,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         sends: Mutex<Vec<(RouteEdgeId, EncodedArtifactFrame)>>,
+        envelopes: Mutex<Vec<Arc<RuntimeFilterEnvelope>>>,
         completions: Mutex<VecDeque<SinkCompletion>>,
         shutdown: AtomicBool,
     }
@@ -1163,7 +1552,12 @@ mod tests {
             if self.shutdown.load(Ordering::Acquire) {
                 return SinkSubmitOutcome::Shutdown;
             }
-            let envelope = envelope.envelope();
+            let domain_envelope = Arc::clone(envelope.envelope_arc());
+            self.envelopes
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&domain_envelope));
+            let envelope = domain_envelope.as_ref();
             self.sends.lock().unwrap().push((
                 route.route_edge_id(),
                 EncodedArtifactFrame::from_parts_for_test(
@@ -1194,6 +1588,10 @@ mod tests {
 
         fn frames(&self) -> Vec<(RouteEdgeId, EncodedArtifactFrame)> {
             self.sends.lock().unwrap().clone()
+        }
+
+        fn envelopes(&self) -> Vec<Arc<RuntimeFilterEnvelope>> {
+            self.envelopes.lock().unwrap().clone()
         }
 
         fn complete(&self, completion: SinkCompletion) {
@@ -1361,6 +1759,10 @@ mod tests {
         ))
     }
 
+    fn retained_envelope_bytes(payload_bytes: usize) -> usize {
+        size_of::<RuntimeFilterEnvelope>() + payload_bytes + route(30).retained_bytes()
+    }
+
     fn route(edge: u32) -> RuntimeFilterRemoteRoute {
         RuntimeFilterRemoteRoute::new(
             RouteEdgeId::new(edge),
@@ -1369,6 +1771,533 @@ mod tests {
             RuntimeFilterRouteRole::Consumer(BindingId::new(edge)),
         )
         .unwrap()
+    }
+
+    fn contribution_envelope(sequence: u64, tag: u8) -> Arc<RuntimeFilterEnvelope> {
+        Arc::new(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::Contribution,
+                UniqueId { hi: 1, lo: 1 },
+                ChannelId::new(5),
+                DeploymentEpoch::new(9),
+                RuntimeFilterRouteIdentity::contribution(
+                    ContributionRouteIdentity::try_new(
+                        BindingId::new(91),
+                        UniqueId { hi: 92, lo: 93 },
+                        PartitionId::new(0),
+                        ProducerSequence::new(sequence),
+                    )
+                    .unwrap(),
+                ),
+                Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                None,
+                &[tag; 32],
+                vec![tag; 8],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn producer_unavailable_envelope(tag: u8) -> Arc<RuntimeFilterEnvelope> {
+        Arc::new(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+                UniqueId { hi: 1, lo: 1 },
+                ChannelId::new(5),
+                DeploymentEpoch::new(9),
+                RuntimeFilterRouteIdentity::producer_instance(
+                    ProducerInstanceRouteIdentity::try_new(
+                        BindingId::new(91),
+                        UniqueId { hi: 92, lo: 93 },
+                    )
+                    .unwrap(),
+                ),
+                None,
+                None,
+                &[tag; 32],
+                vec![tag],
+            )
+            .unwrap(),
+        )
+    }
+
+    fn producer_closed_envelope(sequence: u64) -> Arc<RuntimeFilterEnvelope> {
+        Arc::new(
+            RuntimeFilterEnvelope::try_new(
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                UniqueId { hi: 1, lo: 1 },
+                ChannelId::new(5),
+                DeploymentEpoch::new(9),
+                RuntimeFilterRouteIdentity::contribution(
+                    ContributionRouteIdentity::try_new(
+                        BindingId::new(91),
+                        UniqueId { hi: 92, lo: 93 },
+                        PartitionId::new(0),
+                        ProducerSequence::new(sequence),
+                    )
+                    .unwrap(),
+                ),
+                Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                None,
+                &[7; 32],
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn contribution_retry_preserves_canonical_identity_and_payload() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(100, 3, 10_000));
+        let envelope = contribution_envelope(7, 44);
+        let expected_identity = envelope.route_identity().clone();
+        transport
+            .send_envelope(
+                &route(30),
+                Arc::clone(&envelope),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(transport.drive_retries(clock.now()).retried(), 1);
+
+        let seen = sink.envelopes();
+        assert_eq!(seen.len(), 2);
+        assert!(Arc::ptr_eq(&seen[0], &envelope));
+        assert!(Arc::ptr_eq(&seen[0], &seen[1]));
+        assert_eq!(seen[0].route_identity(), &expected_identity);
+        assert_eq!(seen[0].payload().as_ptr(), seen[1].payload().as_ptr());
+        assert_eq!(seen[0].payload(), &[44; 8]);
+    }
+
+    #[test]
+    fn accepted_or_duplicate_ack_releases_contribution() {
+        for status in [
+            RuntimeFilterAcceptStatus::Accepted,
+            RuntimeFilterAcceptStatus::Duplicate,
+        ] {
+            let Harness {
+                transport,
+                sink,
+                clock,
+            } = harness(policy(100, 3, 10_000));
+            let envelope = contribution_envelope(
+                if status == RuntimeFilterAcceptStatus::Accepted {
+                    8
+                } else {
+                    9
+                },
+                45,
+            );
+            let identity = envelope.route_identity().clone();
+            transport
+                .send_envelope(
+                    &route(30),
+                    Arc::clone(&envelope),
+                    event_identity(RouteEdgeId::new(30)),
+                )
+                .unwrap()
+                .expect_buffered();
+            assert_eq!(transport.pending_len(), 1);
+            assert_eq!(transport.pending_bytes(), retained_envelope_bytes(8));
+            let adjacent_identity = contribution_envelope(
+                if status == RuntimeFilterAcceptStatus::Accepted {
+                    108
+                } else {
+                    109
+                },
+                45,
+            )
+            .route_identity()
+            .clone();
+            assert_eq!(
+                transport.on_ack(&adjacent_identity, status),
+                EnvelopeAckOutcome::Unknown
+            );
+            assert_eq!(transport.pending_len(), 1);
+            assert!(matches!(
+                transport.on_ack(&identity, status),
+                EnvelopeAckOutcome::Released | EnvelopeAckOutcome::ReleasedOnDuplicate
+            ));
+            assert_eq!(transport.pending_len(), 0);
+            assert_eq!(transport.pending_bytes(), 0);
+            clock.advance(Duration::from_millis(100));
+            assert!(transport.drive_retries(clock.now()).is_quiescent());
+            assert_eq!(sink.count(), 1);
+        }
+    }
+
+    #[test]
+    fn canonical_identity_conflict_survives_accepted_or_duplicate_ack() {
+        for status in [
+            RuntimeFilterAcceptStatus::Accepted,
+            RuntimeFilterAcceptStatus::Duplicate,
+        ] {
+            let Harness {
+                transport,
+                sink,
+                clock: _clock,
+            } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
+            let original = contribution_envelope(70, 1);
+            let identity = original.route_identity().clone();
+            transport
+                .send_envelope(
+                    &route(30),
+                    Arc::clone(&original),
+                    event_identity(RouteEdgeId::new(30)),
+                )
+                .unwrap()
+                .expect_buffered();
+            assert!(matches!(
+                transport.on_ack(&identity, status),
+                EnvelopeAckOutcome::Released | EnvelopeAckOutcome::ReleasedOnDuplicate
+            ));
+
+            transport
+                .send_envelope(
+                    &route(30),
+                    Arc::clone(&original),
+                    event_identity(RouteEdgeId::new(30)),
+                )
+                .expect("an exact acknowledged replay stays deterministic")
+                .expect_buffered();
+            assert_eq!(transport.pending_len(), 0);
+            assert_eq!(sink.count(), 1, "an exact replay is never re-enqueued");
+
+            let conflict = contribution_envelope(70, 2);
+            assert_eq!(
+                transport
+                    .send_envelope(&route(30), conflict, event_identity(RouteEdgeId::new(30)),),
+                Err(super::ReliableSendError::IdentityConflict)
+            );
+            assert_eq!(transport.pending_len(), 0);
+            assert_eq!(
+                sink.count(),
+                1,
+                "a conflicting replay never reaches the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_identity_witnesses_are_bounded_by_the_entry_ceiling() {
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
+        let mut latest = None;
+        for sequence in 90..93 {
+            let envelope = contribution_envelope(sequence, sequence as u8);
+            let identity = envelope.route_identity().clone();
+            transport
+                .send_envelope(
+                    &route(30),
+                    Arc::clone(&envelope),
+                    event_identity(RouteEdgeId::new(30)),
+                )
+                .unwrap()
+                .expect_buffered();
+            transport.on_ack(&identity, RuntimeFilterAcceptStatus::Accepted);
+            latest = Some(envelope);
+        }
+        assert_eq!(transport.completed_witness_len(), 2);
+        let sends = sink.count();
+        transport
+            .send_envelope(
+                &route(30),
+                latest.unwrap(),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(sink.count(), sends);
+    }
+
+    #[test]
+    fn evicted_retired_identity_cannot_reenter_while_a_gap_identity_can() {
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
+        for sequence in 1..=3 {
+            let envelope = contribution_envelope(sequence, sequence as u8);
+            let identity = envelope.route_identity().clone();
+            transport
+                .send_envelope(&route(30), envelope, event_identity(RouteEdgeId::new(30)))
+                .unwrap()
+                .expect_buffered();
+            transport.on_ack(&identity, RuntimeFilterAcceptStatus::Accepted);
+        }
+        assert_eq!(transport.completed_witness_len(), 2);
+        assert_eq!(sink.count(), 3);
+
+        assert_eq!(
+            transport.send_envelope(
+                &route(30),
+                contribution_envelope(1, 99),
+                event_identity(RouteEdgeId::new(30)),
+            ),
+            Err(super::ReliableSendError::RetiredIdentity)
+        );
+        assert_eq!(transport.pending_len(), 0);
+        assert_eq!(sink.count(), 3, "retired identity never re-enters the wire");
+
+        transport
+            .send_envelope(
+                &route(30),
+                contribution_envelope(5, 5),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        assert_eq!(transport.pending_len(), 1);
+        assert_eq!(
+            sink.count(),
+            4,
+            "a never-retired gap identity remains valid"
+        );
+    }
+
+    #[test]
+    fn saturated_retirement_filter_is_safe_for_pending_retry_and_fresh_delivery() {
+        let Harness {
+            transport,
+            sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, 2, ROOMY_MAX_BYTES));
+        let pending = contribution_envelope(40, 4);
+        transport
+            .send_envelope(
+                &route(30),
+                Arc::clone(&pending),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        transport.saturate_retired_filter_for_test();
+
+        transport
+            .send_envelope(&route(30), pending, event_identity(RouteEdgeId::new(30)))
+            .expect("pending exact retry precedes probabilistic retirement")
+            .expect_buffered();
+        assert_eq!(sink.count(), 1, "pending exact retry is not re-enqueued");
+        assert_eq!(
+            transport.send_envelope(
+                &route(30),
+                contribution_envelope(41, 5),
+                event_identity(RouteEdgeId::new(30)),
+            ),
+            Err(super::ReliableSendError::RetiredIdentity)
+        );
+        assert_eq!(sink.count(), 1, "Bloom-only hit never reaches the wire");
+
+        let delivery = transport.send_test(&route(31), frame(9)).expect_buffered();
+        assert_eq!(
+            sink.count(),
+            2,
+            "fresh internal delivery bypasses producer retirement"
+        );
+        assert!(delivery.as_delivery().is_some());
+    }
+
+    #[test]
+    fn pending_retained_charge_includes_route_and_endpoint_host() {
+        let route = route(30);
+        let envelope = contribution_envelope(120, 7);
+        let expected = envelope.retained_bytes() + route.retained_bytes();
+        let Harness {
+            transport,
+            sink: _sink,
+            clock: _clock,
+        } = harness(policy_bounded(100, 3, 10_000, 2, expected));
+        transport
+            .send_envelope(&route, envelope, event_identity(RouteEdgeId::new(30)))
+            .unwrap()
+            .expect_buffered();
+        assert_eq!(transport.pending_bytes(), expected);
+    }
+
+    #[test]
+    fn retained_envelope_accounting_exact_fit_over_limit_and_retry_stable() {
+        let contribution = contribution_envelope(80, 8);
+        let contribution_bytes = contribution.retained_bytes() + route(30).retained_bytes();
+        let exact = harness(policy_bounded(100, 3, 10_000, 4, contribution_bytes));
+        let identity = exact
+            .transport
+            .send_envelope(
+                &route(30),
+                Arc::clone(&contribution),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        assert_eq!(exact.transport.pending_bytes(), contribution_bytes);
+        exact.clock.advance(Duration::from_millis(100));
+        assert_eq!(
+            exact.transport.drive_retries(exact.clock.now()).retried(),
+            1
+        );
+        assert_eq!(exact.transport.pending_bytes(), contribution_bytes);
+        exact
+            .transport
+            .on_ack(&identity, RuntimeFilterAcceptStatus::Accepted);
+        assert_eq!(exact.transport.pending_bytes(), 0);
+
+        let over = harness(policy_bounded(100, 3, 10_000, 4, contribution_bytes - 1));
+        assert_eq!(
+            over.transport.send_envelope(
+                &route(30),
+                contribution,
+                event_identity(RouteEdgeId::new(30)),
+            ),
+            Ok(ReliableSendOutcome::ResourceLimit(
+                TransportResourceLimit::SerializedBytes
+            ))
+        );
+
+        for (edge, envelope) in [
+            (31, producer_closed_envelope(81)),
+            (32, producer_unavailable_envelope(9)),
+        ] {
+            let retained = envelope.retained_bytes() + route(edge).retained_bytes();
+            assert!(retained > 0);
+            let terminal = harness(policy_bounded(100, 3, 10_000, 4, retained));
+            terminal
+                .transport
+                .send_envelope(
+                    &route(edge),
+                    envelope,
+                    event_identity(RouteEdgeId::new(edge)),
+                )
+                .unwrap()
+                .expect_buffered();
+            assert_eq!(terminal.transport.pending_bytes(), retained);
+        }
+    }
+
+    #[test]
+    fn async_rejected_or_mismatched_ack_fails_route_open() {
+        for completion in [
+            None,
+            Some(SinkTransportError::contract(
+                "runtime filter ACK identity mismatch",
+            )),
+        ] {
+            let Harness {
+                transport,
+                sink,
+                clock,
+            } = harness(policy(100, 3, 10_000));
+            let envelope = contribution_envelope(10, 46);
+            let identity = envelope.route_identity().clone();
+            transport
+                .send_envelope(
+                    &route(30),
+                    Arc::clone(&envelope),
+                    event_identity(RouteEdgeId::new(30)),
+                )
+                .unwrap()
+                .expect_buffered();
+            match completion {
+                None => sink.complete(SinkCompletion::Ack(
+                    identity.clone(),
+                    RuntimeFilterAcceptStatus::Rejected,
+                )),
+                Some(error) => {
+                    sink.complete(SinkCompletion::TransportFailure(identity.clone(), error))
+                }
+            }
+
+            let tick = transport.drain_completions_and_drive(clock.now());
+            assert_eq!(tick.failed_open(), &[identity]);
+            assert_eq!(tick.failed_open_work().len(), 1);
+            assert_eq!(
+                tick.failed_open_work()[0].reason(),
+                TransportFailOpenReason::ContractRejected
+            );
+            assert!(Arc::ptr_eq(
+                tick.failed_open_work()[0].envelope(),
+                &envelope
+            ));
+            assert_eq!(transport.pending_len(), 0);
+        }
+    }
+
+    #[test]
+    fn contribution_deadline_degrades_filter_without_query_failure() {
+        let Harness {
+            transport,
+            sink: _,
+            clock,
+        } = harness(policy(50, 2, 150));
+        let envelope = contribution_envelope(11, 47);
+        let identity = envelope.route_identity().clone();
+        transport
+            .send_envelope(
+                &route(30),
+                Arc::clone(&envelope),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        clock.advance(Duration::from_millis(200));
+
+        let tick = transport.drive_retries(clock.now());
+        assert_eq!(tick.failed_open(), &[identity]);
+        assert_eq!(tick.failed_open_work().len(), 1);
+        assert_eq!(
+            tick.failed_open_work()[0].reason(),
+            TransportFailOpenReason::Deadline
+        );
+        assert!(Arc::ptr_eq(
+            tick.failed_open_work()[0].envelope(),
+            &envelope
+        ));
+        assert_eq!(transport.pending_len(), 0);
+    }
+
+    #[test]
+    fn producer_unavailable_send_failure_does_not_recurse() {
+        let Harness {
+            transport,
+            sink,
+            clock,
+        } = harness(policy(50, 2, 150));
+        let envelope = producer_unavailable_envelope(48);
+        transport
+            .send_envelope(
+                &route(30),
+                Arc::clone(&envelope),
+                event_identity(RouteEdgeId::new(30)),
+            )
+            .unwrap()
+            .expect_buffered();
+        clock.advance(Duration::from_millis(200));
+
+        let tick = transport.drive_retries(clock.now());
+        assert_eq!(tick.failed_open_work().len(), 1);
+        assert_eq!(
+            tick.failed_open_work()[0].envelope().kind(),
+            RuntimeFilterEnvelopeKind::ProducerUnavailable
+        );
+        assert_eq!(sink.count(), 1);
+        assert_eq!(transport.pending_len(), 0);
+
+        clock.advance(Duration::from_millis(1_000));
+        assert!(transport.drive_retries(clock.now()).is_quiescent());
+        assert_eq!(
+            sink.count(),
+            1,
+            "failure must not synthesize another unavailable"
+        );
     }
 
     fn frame(tag: u8) -> Arc<EncodedArtifactFrame> {
@@ -1747,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn reliable_transport_broadcast_fanout_shares_one_frame_and_acks_independently() {
+    fn reliable_transport_broadcast_fanout_retains_complete_envelopes_and_acks_independently() {
         let Harness {
             transport,
             sink,
@@ -1765,8 +2694,8 @@ mod tests {
             .send_test(&route(31), Arc::clone(&payload))
             .expect_buffered();
 
-        // The single frame is shared (not re-serialized): caller + 2 buffered clones.
-        assert_eq!(Arc::strong_count(&payload), 3);
+        // Pending owns complete immutable envelopes, not a borrowed frame allocation.
+        assert_eq!(Arc::strong_count(&payload), 1);
         assert_eq!(transport.pending_len(), 2);
 
         // Both routes received the identical bytes.
@@ -1777,13 +2706,13 @@ mod tests {
             assert_eq!(&transmitted, payload.as_ref());
         }
 
-        // Acking one route releases only its entry; the shared frame Arc drops by one.
+        // Acking one route releases only its complete envelope entry.
         assert_eq!(
             transport.on_ack(&route_a, RuntimeFilterAcceptStatus::Accepted),
             EnvelopeAckOutcome::Released
         );
         assert_eq!(transport.pending_len(), 1);
-        assert_eq!(Arc::strong_count(&payload), 2);
+        assert_eq!(Arc::strong_count(&payload), 1);
 
         assert_eq!(
             transport.on_ack(&route_b, RuntimeFilterAcceptStatus::Accepted),
@@ -1838,7 +2767,8 @@ mod tests {
 
     #[test]
     fn transport_bounded_serialized_buffer_rejects_new_frame_at_byte_ceiling() {
-        // Byte ceiling of 10: distinct frames are admitted until their serialized
+        // Byte ceiling holds two inline envelopes plus ten retained payload bytes:
+        // distinct frames are admitted until their retained charge
         // bytes would exceed the cap, then a new frame is refused with an explicit
         // ResourceLimit. The cap rejects only strictly-greater, so the exact-fit send
         // is still admitted.
@@ -1846,12 +2776,18 @@ mod tests {
             transport,
             sink,
             clock: _clock,
-        } = harness(policy_bounded(100, 3, 10_000, ROOMY_MAX_ENTRIES, 10));
+        } = harness(policy_bounded(
+            100,
+            3,
+            10_000,
+            ROOMY_MAX_ENTRIES,
+            retained_envelope_bytes(6) + retained_envelope_bytes(4),
+        ));
 
         let _a = transport
             .send_test(&route(30), frame_sized(1, 6))
             .expect_buffered();
-        assert_eq!(transport.pending_bytes(), 6);
+        assert_eq!(transport.pending_bytes(), retained_envelope_bytes(6));
 
         // 6 + 6 = 12 > 10: refused on the byte ceiling.
         assert_eq!(
@@ -1863,13 +2799,16 @@ mod tests {
             1,
             "a byte-refused frame is not buffered"
         );
-        assert_eq!(transport.pending_bytes(), 6);
+        assert_eq!(transport.pending_bytes(), retained_envelope_bytes(6));
 
         // 6 + 4 = 10 == cap: admitted.
         let _b = transport
             .send_test(&route(32), frame_sized(3, 4))
             .expect_buffered();
-        assert_eq!(transport.pending_bytes(), 10);
+        assert_eq!(
+            transport.pending_bytes(),
+            retained_envelope_bytes(6) + retained_envelope_bytes(4)
+        );
         assert_eq!(sink.count(), 2);
 
         // Any further distinct byte is refused.
@@ -1880,16 +2819,20 @@ mod tests {
     }
 
     #[test]
-    fn transport_bounded_broadcast_frame_meters_shared_bytes_once() {
-        // A broadcast frame fans out to several routes as one shared allocation, so
-        // its serialized bytes are metered once. Under a per-entry meter both routes
-        // would exceed a 10-byte cap (2 x 6 = 12); metering per allocation keeps it at
-        // 6 and admits the whole fan-out.
+    fn transport_bounded_complete_envelope_allocations_are_each_metered_once() {
+        // Each route owns a distinct complete envelope allocation. Retry reuses those
+        // same Arcs and must not increase accounting.
         let Harness {
             transport,
             sink,
             clock: _clock,
-        } = harness(policy_bounded(100, 3, 10_000, ROOMY_MAX_ENTRIES, 10));
+        } = harness(policy_bounded(
+            100,
+            3,
+            10_000,
+            ROOMY_MAX_ENTRIES,
+            retained_envelope_bytes(6) * 2,
+        ));
         let payload = frame_sized(9, 6);
 
         let route_a = transport
@@ -1901,17 +2844,24 @@ mod tests {
         assert_eq!(transport.pending_len(), 2);
         assert_eq!(
             transport.pending_bytes(),
-            6,
-            "a shared frame is metered once, not per route"
+            retained_envelope_bytes(6) * 2,
+            "each actually retained complete envelope is metered once"
         );
         assert_eq!(sink.count(), 2);
 
-        // The shared allocation (and its bytes) survive until the last reference drops.
+        transport.drive_retries(transport.clock.now() + Duration::from_millis(100));
+        assert_eq!(
+            transport.pending_bytes(),
+            retained_envelope_bytes(6) * 2,
+            "retry does not re-meter Arcs"
+        );
+
+        // Each ACK releases exactly the allocation addressed by its identity.
         assert_eq!(
             transport.on_ack(&route_a, RuntimeFilterAcceptStatus::Accepted),
             EnvelopeAckOutcome::Released,
         );
-        assert_eq!(transport.pending_bytes(), 6);
+        assert_eq!(transport.pending_bytes(), retained_envelope_bytes(6));
         assert_eq!(
             transport.on_ack(&route_b, RuntimeFilterAcceptStatus::Accepted),
             EnvelopeAckOutcome::Released,
@@ -1944,7 +2894,10 @@ mod tests {
             .send_test(&route(31), frame_sized(2, 7))
             .expect_buffered();
         assert_eq!(transport.pending_len(), 2);
-        assert_eq!(transport.pending_bytes(), 12);
+        assert_eq!(
+            transport.pending_bytes(),
+            retained_envelope_bytes(5) + retained_envelope_bytes(7)
+        );
 
         // Ack-release frees both entries and reclaims their bytes.
         transport.on_ack(&a, RuntimeFilterAcceptStatus::Accepted);
@@ -1956,7 +2909,7 @@ mod tests {
         let _c = transport
             .send_test(&route(32), frame_sized(3, 9))
             .expect_buffered();
-        assert_eq!(transport.pending_bytes(), 9);
+        assert_eq!(transport.pending_bytes(), retained_envelope_bytes(9));
         clock.advance(Duration::from_millis(300));
         let tick = transport.drive_retries(clock.now());
         assert_eq!(tick.failed_open().len(), 1);

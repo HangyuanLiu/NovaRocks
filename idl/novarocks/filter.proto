@@ -76,6 +76,7 @@ enum RuntimeFilterEnvelopeKind {
   RUNTIME_FILTER_ENVELOPE_KIND_COMPLETED_WITHOUT_ARTIFACT = 6;
   RUNTIME_FILTER_ENVELOPE_KIND_DEGRADED_LOGICAL = 7;
   RUNTIME_FILTER_ENVELOPE_KIND_FINAL_ARTIFACT = 8;
+  RUNTIME_FILTER_ENVELOPE_KIND_PRODUCER_UNAVAILABLE = 9;
 }
 
 message RuntimeFilterContributionRouteIdentity {
@@ -90,10 +91,16 @@ message RuntimeFilterDeliveryRouteIdentity {
   uint64 sequence = 2;
 }
 
+message RuntimeFilterProducerInstanceRouteIdentity {
+  uint32 producer_binding_id = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+}
+
 message RuntimeFilterRouteIdentity {
   oneof value {
     RuntimeFilterContributionRouteIdentity contribution = 1;
     RuntimeFilterDeliveryRouteIdentity delivery = 2;
+    RuntimeFilterProducerInstanceRouteIdentity producer_instance = 3;
   }
 }
 

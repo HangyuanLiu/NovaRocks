@@ -18,6 +18,9 @@
 use std::error::Error;
 use std::fmt;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
@@ -239,11 +242,61 @@ pub(crate) fn encoded_contribution_len(
     encoded_frame_len_from_body_len(body_len)
 }
 
+/// Validate only the typed contribution/installed-contract relationship. This does
+/// not walk or allocate the contribution body, so callers can preserve structural
+/// errors even after a producer becomes terminal without encoding a large payload.
+pub(crate) fn validate_contribution_contract(
+    contribution: &RuntimeFilterContribution,
+    expectation: ContributionCodecExpectation<'_>,
+) -> Result<(), ContributionCodecError> {
+    match (contribution, expectation) {
+        (
+            RuntimeFilterContribution::Membership(delta),
+            ContributionCodecExpectation::Membership(schema),
+        ) if delta.matches_data_type(schema.data_type()) => Ok(()),
+        (
+            RuntimeFilterContribution::OrderedBound(update),
+            ContributionCodecExpectation::OrderedBound(contract),
+        ) if update.order_contract_digest() == contract.digest() => Ok(()),
+        (
+            RuntimeFilterContribution::TopKSummary(summary),
+            ContributionCodecExpectation::TopKSummary(contract),
+        ) if summary.contract_digest() == contract.digest() => Ok(()),
+        (
+            RuntimeFilterContribution::FinalDomain(shard),
+            ContributionCodecExpectation::FinalDomain {
+                contract,
+                stream,
+                sequence,
+            },
+        ) => verify_final_domain_scope(shard, contract, stream, sequence),
+        (RuntimeFilterContribution::Membership(_), ContributionCodecExpectation::Membership(_))
+        | (
+            RuntimeFilterContribution::OrderedBound(_),
+            ContributionCodecExpectation::OrderedBound(_),
+        )
+        | (
+            RuntimeFilterContribution::TopKSummary(_),
+            ContributionCodecExpectation::TopKSummary(_),
+        ) => Err(ContributionCodecError::SchemaMismatch),
+        _ => Err(ContributionCodecError::KindMismatch),
+    }
+}
+
 pub(crate) fn encode_contribution(
     contribution: &RuntimeFilterContribution,
     expectation: ContributionCodecExpectation<'_>,
     max_encoded_bytes: usize,
 ) -> Result<EncodedContribution, ContributionCodecError> {
+    #[cfg(test)]
+    if REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST.with(Cell::get) {
+        return encode_contribution_with_allocator(
+            contribution,
+            expectation,
+            max_encoded_bytes,
+            &AlwaysRejectContributionFrameAllocator,
+        );
+    }
     encode_contribution_with_allocator(
         contribution,
         expectation,
@@ -323,6 +376,9 @@ trait ContributionFrameAllocator {
 
 struct SystemContributionFrameAllocator;
 
+#[cfg(test)]
+struct AlwaysRejectContributionFrameAllocator;
+
 impl ContributionFrameAllocator for SystemContributionFrameAllocator {
     fn allocate(&self, exact_len: usize) -> Result<Vec<u8>, ContributionCodecError> {
         let mut payload = Vec::new();
@@ -331,6 +387,35 @@ impl ContributionFrameAllocator for SystemContributionFrameAllocator {
             .map_err(|_| ContributionCodecError::ResourceLimit)?;
         Ok(payload)
     }
+}
+
+#[cfg(test)]
+impl ContributionFrameAllocator for AlwaysRejectContributionFrameAllocator {
+    fn allocate(&self, _exact_len: usize) -> Result<Vec<u8>, ContributionCodecError> {
+        Err(ContributionCodecError::ResourceLimit)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run a real contribution encode through a deterministic rejecting allocator on this
+/// test thread. The thread-local scope keeps parallel adapter tests isolated.
+#[cfg(test)]
+pub(crate) fn with_rejecting_contribution_allocator_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST.with(|reject| reject.set(self.0));
+        }
+    }
+
+    let previous = REJECT_CONTRIBUTION_ALLOCATION_FOR_TEST.with(|reject| reject.replace(true));
+    let _reset = Reset(previous);
+    run()
 }
 
 fn encode_contribution_with_allocator(

@@ -17,3 +17,4 @@
 
 pub(crate) mod artifact;
 pub(crate) mod contribution;
+pub(crate) mod producer;

@@ -67,11 +67,13 @@ use crate::runtime_filter::model::contract::{BindingId, ChannelId};
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, LogicalVersion, PartitionId, ProducerSequence, RouteEdgeId,
 };
+use crate::runtime_filter::port::transport::ProducerInstanceRouteIdentity;
 use crate::runtime_filter::port::transport::{ContributionRouteIdentity, DeliveryRouteIdentity};
 
 /// Per-channel key for a producer contribution transport identity. It is exactly
 /// the `ContributionRouteIdentity` (binding + finst + partition + sequence).
 type ContributionKey = (BindingId, UniqueId, PartitionId, ProducerSequence);
+type ProducerInstanceKey = (BindingId, UniqueId);
 
 /// Per-channel key for a consumer delivery transport identity. It is exactly the
 /// `DeliveryRouteIdentity` (route edge + sequence).
@@ -93,6 +95,8 @@ pub(super) enum ContributionAdmission {
     /// growing without bound. An already-recorded identity is never `ResourceLimit`.
     ResourceLimit,
 }
+
+pub(super) type ProducerInstanceAdmission = ContributionAdmission;
 
 /// Result of admitting a consumer delivery transport / logical identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +175,7 @@ struct DedupeState {
     /// (1) producer transport-identity index, per channel, each identity carrying
     /// the content digest of its first arrival for the retry-vs-conflict guard.
     contributions: BTreeMap<ChannelId, BTreeMap<ContributionKey, [u8; 32]>>,
+    producer_instances: BTreeMap<ChannelId, BTreeMap<ProducerInstanceKey, [u8; 32]>>,
     /// (1) consumer transport-identity index, per channel.
     deliveries: BTreeMap<ChannelId, BTreeSet<DeliveryKey>>,
     /// (2) absorbed logical delivery idempotency, per channel.
@@ -243,6 +248,30 @@ impl IngressDedupe {
                     slot.insert(content_digest);
                     ContributionAdmission::Fresh
                 }
+            }
+        }
+    }
+
+    pub(super) fn admit_producer_instance(
+        &self,
+        channel_id: ChannelId,
+        route: &ProducerInstanceRouteIdentity,
+        content_digest: [u8; 32],
+    ) -> ProducerInstanceAdmission {
+        let key = (route.producer_binding_id(), route.fragment_instance_id());
+        let ceiling = self.max_identities_per_channel;
+        let mut state = self.lock();
+        let channel = state.producer_instances.entry(channel_id).or_default();
+        let occupancy = channel.len();
+        match channel.entry(key) {
+            Entry::Occupied(slot) if *slot.get() == content_digest => {
+                ProducerInstanceAdmission::DuplicateRetry
+            }
+            Entry::Occupied(_) => ProducerInstanceAdmission::Conflict,
+            Entry::Vacant(_) if occupancy >= ceiling => ProducerInstanceAdmission::ResourceLimit,
+            Entry::Vacant(slot) => {
+                slot.insert(content_digest);
+                ProducerInstanceAdmission::Fresh
             }
         }
     }

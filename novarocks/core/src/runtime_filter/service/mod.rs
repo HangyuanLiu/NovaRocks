@@ -46,6 +46,7 @@ use crate::runtime_filter::codec::artifact::{
     ArtifactDecodeExpectation, ArtifactWireCodecError, encode_artifact_bundle,
     encode_completed_without_artifact, encode_unavailable, max_encoded_len_for_artifact_budget,
 };
+use crate::runtime_filter::codec::producer::encode_producer_failure;
 use crate::runtime_filter::core::channel::ChannelAction;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, ConsumerActivation};
 use crate::runtime_filter::port::artifact::ConsumerArtifactProfile;
@@ -57,18 +58,22 @@ use crate::runtime_filter::port::identity::RouteEdgeId;
 use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::runtime_filter::port::producer::{
     FinalDomainProducerAdapter, InstallContractError, InstallContractErrorKind, InstallOutcome,
-    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerHandleWeak,
-    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
-    TopKSummaryProducerAdapter,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
+    ProducerHandleWeak, ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
+    SubmitOutcome, TopKSummaryProducerAdapter,
 };
 use crate::runtime_filter::port::routing::{
-    RuntimeFilterDeliveryRouteIntent, RuntimeFilterRouteContractError, RuntimeFilterRouteDecision,
+    RuntimeFilterDeliveryRouteIntent, RuntimeFilterProducerRouteIntent,
+    RuntimeFilterRouteContractError, RuntimeFilterRouteDecision,
 };
 use crate::runtime_filter::port::subscription::{
     ArtifactDeliveryOutcome, LiveTerminal, SubscriptionHandle, SubscriptionKind,
 };
 use crate::runtime_filter::port::support::{RuntimeFilterClock, RuntimeFilterMemoryAccount};
-use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+use crate::runtime_filter::port::transport::{
+    ProducerInstanceRouteIdentity, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+    RuntimeFilterRouteIdentity,
+};
 
 pub(crate) use self::consumer_ingress::{
     InboundConsumerDispatchError, InboundConsumerDispatchErrorKind, InboundConsumerDispatchOutcome,
@@ -86,11 +91,11 @@ use self::materialization::{
 pub(crate) use self::native_execution::{
     InstalledNativeRuntimeFilterContract, NativeRuntimeFilterExecutionContext,
 };
-use self::producer::ServiceProducerAdapter;
+use self::producer::{RemoteProducerAdapter, RemoteProducerState, ServiceProducerAdapter};
 use self::registry::{DeploymentRegistry, InstalledDeployment};
 pub(crate) use self::reliable_transport::ReliableTransportPolicy;
 use self::reliable_transport::{
-    ReliableEnvelopeTransport, ReliableSendOutcome, TransportResourceLimit,
+    ReliableEnvelopeTransport, ReliableFailedOpenWork, ReliableSendOutcome, TransportResourceLimit,
 };
 
 struct EventQueueState {
@@ -1544,6 +1549,7 @@ pub(crate) struct RuntimeFilterService {
     registry: Arc<DeploymentRegistry>,
     dispatcher: Arc<ActionDispatcher>,
     producer_handles: Mutex<BTreeMap<(BindingId, UniqueId), ProducerHandleWeak>>,
+    remote_producer_states: Mutex<BTreeMap<(BindingId, UniqueId), Arc<RemoteProducerState>>>,
     #[cfg(test)]
     producer_test_handles: Mutex<BTreeMap<(BindingId, UniqueId), Weak<ServiceProducerAdapter>>>,
     // Deterministic inbound-lifecycle seams. Each is a one-shot hook taken and run
@@ -1657,6 +1663,7 @@ impl RuntimeFilterService {
             dispatcher,
             reliable_transport,
             producer_handles: Mutex::new(BTreeMap::new()),
+            remote_producer_states: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             producer_test_handles: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -1736,18 +1743,177 @@ impl RuntimeFilterService {
             .registry
             .active_installation()
             .ok_or_else(service_cancelled)?;
-        Ok(self
-            .open_producer_locked(
-                &installed,
-                binding_id,
-                fragment_instance_id,
-                local_partition_count,
-                requested,
-            )?
-            .handle)
+        let route = installed.producer(binding_id).ok_or_else(|| {
+            violation(
+                RuntimeContractViolationKind::UnauthorizedBinding,
+                "producer binding is not installed on this participant",
+            )
+        })?;
+        if installed.producer_participant(route.channel_id(), binding_id, fragment_instance_id)
+            != Some(installed.participant_id())
+        {
+            return Err(violation(
+                RuntimeContractViolationKind::UnauthorizedFragmentInstance,
+                "producer fragment instance is owned by another participant",
+            ));
+        }
+        if route.kind != requested {
+            return Err(violation(
+                RuntimeContractViolationKind::ProducerPortMismatch,
+                "requested producer port does not match the installed channel contract",
+            ));
+        }
+        route.channel.preflight_remote_open(
+            binding_id,
+            fragment_instance_id,
+            local_partition_count,
+            crate::runtime_filter::port::identity::PartitionId::new(0),
+        )?;
+        let producer_intent = RuntimeFilterProducerRouteIntent::new(
+            installed.epoch(),
+            route.channel_id(),
+            binding_id,
+            RuntimeFilterEnvelopeKind::Contribution,
+        )
+        .map_err(|error| {
+            violation(
+                RuntimeContractViolationKind::ServiceUnavailable,
+                error.to_string(),
+            )
+        })?;
+        match installed.role_router().route_producer(producer_intent) {
+            Ok(decision)
+                if decision.remote_routes().len() == 1
+                    && decision.loopback_route_edge_ids().is_empty() =>
+            {
+                self.open_remote_producer_locked(
+                    &installed,
+                    route,
+                    decision.remote_routes()[0].clone(),
+                    binding_id,
+                    fragment_instance_id,
+                    local_partition_count,
+                    requested,
+                )
+            }
+            Ok(decision)
+                if decision.remote_routes().is_empty()
+                    && decision.loopback_route_edge_ids().len() == 1 =>
+            {
+                Ok(self
+                    .open_inbound_core_locked(
+                        &installed,
+                        binding_id,
+                        fragment_instance_id,
+                        local_partition_count,
+                        requested,
+                    )?
+                    .handle)
+            }
+            Err(RuntimeFilterRouteContractError::ForbiddenOutboundKind { .. }) => Ok(self
+                .open_inbound_core_locked(
+                    &installed,
+                    binding_id,
+                    fragment_instance_id,
+                    local_partition_count,
+                    requested,
+                )?
+                .handle),
+            Ok(_) | Err(_) => Err(violation(
+                RuntimeContractViolationKind::ServiceUnavailable,
+                "installed producer route does not resolve to one frozen dispatch target",
+            )),
+        }
     }
 
-    pub(super) fn open_producer_locked(
+    fn open_remote_producer_locked(
+        &self,
+        installed: &Arc<InstalledDeployment>,
+        route: &registry::ProducerRoute,
+        remote_route: crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+        local_partition_count: u32,
+        requested: ProducerPortKind,
+    ) -> Result<ProducerHandle, RuntimeContractViolation> {
+        let key = (binding_id, fragment_instance_id);
+        let state = {
+            let mut states = self
+                .remote_producer_states
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(state) = states.get(&key) {
+                state.validate_open(
+                    installed.epoch(),
+                    &remote_route,
+                    requested,
+                    local_partition_count,
+                )?;
+                Arc::clone(state)
+            } else {
+                let state = Arc::new(RemoteProducerState::new(
+                    installed.epoch(),
+                    remote_route.clone(),
+                    requested,
+                    local_partition_count,
+                ));
+                states.insert(key, Arc::clone(&state));
+                state
+            }
+        };
+        let mut handles = self
+            .producer_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = handles.get(&key) {
+            if cached.kind() != requested {
+                return Err(violation(
+                    RuntimeContractViolationKind::ProducerPortMismatch,
+                    "cached producer port does not match the requested channel contract",
+                ));
+            }
+            if let Some(handle) = cached.upgrade() {
+                return Ok(handle);
+            }
+        }
+        let concrete = Arc::new(RemoteProducerAdapter::new(
+            self._query_id,
+            installed.participant_id(),
+            route.channel_id(),
+            installed.epoch(),
+            remote_route,
+            route.channel.clone(),
+            binding_id,
+            fragment_instance_id,
+            local_partition_count,
+            route.inbound_contract().clone(),
+            self.reliable_transport.clone(),
+            self.dispatcher.clone(),
+            state,
+        ));
+        let handle = match requested {
+            ProducerPortKind::Membership => {
+                let typed: Arc<dyn ProducerAdapter> = concrete;
+                ProducerHandle::Membership(typed)
+            }
+            ProducerPortKind::OrderedBound => {
+                let typed: Arc<dyn OrderedBoundProducerAdapter> = concrete;
+                ProducerHandle::OrderedBound(typed)
+            }
+            ProducerPortKind::TopKSummary => {
+                let typed: Arc<dyn TopKSummaryProducerAdapter> = concrete;
+                ProducerHandle::TopKSummary(typed)
+            }
+            ProducerPortKind::FinalDomain => {
+                let typed: Arc<dyn FinalDomainProducerAdapter> = concrete;
+                ProducerHandle::FinalDomain(typed)
+            }
+        };
+        handles.insert(key, handle.downgrade());
+        Ok(handle)
+    }
+
+    pub(super) fn open_inbound_core_locked(
         &self,
         installed: &Arc<InstalledDeployment>,
         binding_id: BindingId,
@@ -2117,7 +2283,82 @@ impl RuntimeFilterService {
         if !self.lifecycle.is_running() {
             return;
         }
-        let _ = self.reliable_transport.drain_completions_and_drive(now);
+        let tick = self.reliable_transport.drain_completions_and_drive(now);
+        for work in tick.failed_open_work() {
+            self.handle_failed_transport_open(work);
+        }
+    }
+
+    fn handle_failed_transport_open(&self, work: &ReliableFailedOpenWork) {
+        let producer = if let Some(identity) = work.envelope().route_identity().as_contribution() {
+            Some((
+                identity.producer_binding_id(),
+                identity.fragment_instance_id(),
+            ))
+        } else {
+            work.envelope()
+                .route_identity()
+                .as_producer_instance()
+                .map(|identity| {
+                    (
+                        identity.producer_binding_id(),
+                        identity.fragment_instance_id(),
+                    )
+                })
+        };
+        let Some((binding_id, fragment_instance_id)) = producer else {
+            return;
+        };
+        if let Some(state) = self
+            .remote_producer_states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(binding_id, fragment_instance_id))
+            .cloned()
+        {
+            state.mark_failed();
+        }
+        if let Some(installed) = self.registry.active_installation()
+            && let Some(route) = installed.producer(binding_id)
+            && let Ok(action) = route.channel.fail_instance(
+                binding_id,
+                fragment_instance_id,
+                ProducerFailureReason::UpstreamUnavailable,
+            )
+        {
+            let _ = self.dispatcher.dispatch(route.channel_id(), action);
+        }
+        if work.envelope().kind() == RuntimeFilterEnvelopeKind::ProducerUnavailable {
+            return;
+        }
+        let Some(identity) = work.envelope().route_identity().as_contribution() else {
+            return;
+        };
+        let Ok(producer_identity) = ProducerInstanceRouteIdentity::try_new(
+            identity.producer_binding_id(),
+            identity.fragment_instance_id(),
+        ) else {
+            return;
+        };
+        let common = work.event_identity().common();
+        let Ok(envelope) = RuntimeFilterEnvelope::try_new(
+            RuntimeFilterEnvelopeKind::ProducerUnavailable,
+            common.query_id(),
+            common.channel_id(),
+            common.epoch(),
+            RuntimeFilterRouteIdentity::producer_instance(producer_identity),
+            None,
+            None,
+            work.envelope().schema_digest(),
+            encode_producer_failure(ProducerFailureReason::UpstreamUnavailable),
+        ) else {
+            return;
+        };
+        let _ = self.reliable_transport.send_envelope(
+            work.route(),
+            Arc::new(envelope),
+            work.event_identity(),
+        );
     }
 
     pub(crate) fn cancel(&self) {
@@ -2256,6 +2497,28 @@ impl RuntimeFilterService {
     #[cfg(test)]
     pub(crate) fn transport_pending_len_for_test(&self) -> usize {
         self.reliable_transport.pending_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_transport_envelopes_for_test(
+        &self,
+    ) -> Vec<(
+        crate::runtime_filter::port::routing::RuntimeFilterRemoteRoute,
+        Arc<crate::runtime_filter::port::transport::RuntimeFilterEnvelope>,
+    )> {
+        self.reliable_transport.admitted_envelopes_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_producer_handle_exists_for_test(
+        &self,
+        binding_id: BindingId,
+        fragment_instance_id: UniqueId,
+    ) -> bool {
+        self.producer_test_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&(binding_id, fragment_instance_id))
     }
 
     #[cfg(test)]
@@ -2676,7 +2939,7 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex, Weak, mpsc};
     use std::time::{Duration, Instant};
@@ -2690,6 +2953,7 @@ mod tests {
     use crate::runtime_filter::codec::artifact::{
         ArtifactDecodeExpectation, EncodedArtifactFrame, decode_artifact_bundle, decode_unavailable,
     };
+    use crate::runtime_filter::codec::producer::encode_producer_failure;
     use crate::runtime_filter::deployment::RuntimeFilterDeploymentPolicy;
     use crate::runtime_filter::deployment::compiler::compile;
     use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
@@ -2720,7 +2984,7 @@ mod tests {
     };
     use crate::runtime_filter::port::producer::{
         InstallOutcome, ProducerAdapter, ProducerFailureReason, ProducerHandle, ProducerPortKind,
-        RuntimeContractViolationKind, SubmitOutcome,
+        RuntimeContractViolation, RuntimeContractViolationKind, SubmitOutcome,
     };
     use crate::runtime_filter::port::routing::{
         RuntimeFilterChannelRoutingView, RuntimeFilterRemoteRoute, RuntimeFilterRouteEndpointView,
@@ -2737,19 +3001,24 @@ mod tests {
         RetainedMemoryReservation, RuntimeFilterClock, RuntimeFilterMemoryAccount,
         TemporaryContributionLease,
     };
-    use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+    use crate::runtime_filter::port::transport::{
+        ContributionRouteIdentity, ProducerInstanceRouteIdentity, ProducerOpenMetadata,
+        RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind,
+        RuntimeFilterRouteIdentity,
+    };
     use crate::runtime_filter::port::value_domain::{
         LogicalSnapshot, MembershipValues, ReducedMembershipDomain, ValueDomainDelta,
     };
     use crate::runtime_filter::router::loopback::LoopbackRouter;
     use crate::runtime_filter::router::remote::{
-        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome,
+        RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
     use super::reliable_transport::{EnvelopeAckOutcome, TransportResourceLimit};
+    use super::reliable_transport::{ReliableSendOutcome, ReliableTransportPolicy};
     use super::subscription::SubscriptionGroup;
     use super::{
         ActionDispatcher, ArtifactDeliveryError, ChannelAction, EventBatchCompletion, EventEmitter,
@@ -3364,7 +3633,7 @@ mod tests {
                 .active_installation()
                 .expect("installed deployment");
             let opened = service
-                .open_producer_locked(
+                .open_inbound_core_locked(
                     &installed,
                     BindingId::new(10),
                     uid(10),
@@ -3403,11 +3672,10 @@ mod tests {
         }
 
         #[test]
-        fn native_execution_rejects_aggregator_union_remote_fragment_instance() {
+        fn local_operator_cannot_open_remote_fragment_instance_on_aggregator() {
             let query = uid(0);
             let (install, binding_id, remote_finst) =
                 super::compiled_three_backend_all_of_aggregator_install();
-            let epoch = install.epoch();
             let service = Arc::new(RuntimeFilterService::new_with_dependencies(
                 query,
                 Arc::new(Clock(Instant::now())),
@@ -3415,13 +3683,15 @@ mod tests {
                 MemTrackerMemoryAccount::new_root_for_test("native-aggregator-resolution"),
             ));
             service.install(install).expect("aggregator install");
-            let context =
-                NativeRuntimeFilterExecutionContext::new(service, query, epoch, remote_finst);
 
-            let error = context
-                .resolve_producer(binding_id, ChannelId::new(5), ProducerPortKind::Membership)
+            let error = service
+                .open_producer(binding_id, remote_finst, 1, ProducerPortKind::Membership)
                 .expect_err("aggregator cannot impersonate a remote producer instance");
-            assert!(error.to_string().contains("local participant"), "{error}");
+            assert_eq!(
+                error.kind(),
+                RuntimeContractViolationKind::UnauthorizedFragmentInstance
+            );
+            assert!(!service.core_producer_handle_exists_for_test(binding_id, remote_finst));
         }
 
         #[test]
@@ -3749,7 +4019,7 @@ mod tests {
                 BTreeSet::from([
                     RuntimeFilterEnvelopeKind::Contribution,
                     RuntimeFilterEnvelopeKind::ProducerClosed,
-                    RuntimeFilterEnvelopeKind::Unavailable,
+                    RuntimeFilterEnvelopeKind::ProducerUnavailable,
                 ]),
             )
             .unwrap();
@@ -7086,6 +7356,28 @@ mod tests {
     }
 
     #[test]
+    fn local_preflight_contract_error_fails_synchronously() {
+        let fixture = fixture();
+        install_one(&fixture);
+
+        let error = fixture
+            .service
+            .open_producer(BindingId::new(10), uid(99), 1, ProducerPortKind::Membership)
+            .expect_err("an uninstalled local fragment instance must fail before dispatch");
+
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::UnauthorizedFragmentInstance
+        );
+        assert_eq!(fixture.service.transport_pending_len_for_test(), 0);
+        assert!(
+            !fixture
+                .service
+                .core_producer_handle_exists_for_test(BindingId::new(10), uid(99))
+        );
+    }
+
+    #[test]
     fn invalid_partition_precedes_rejecting_temporary_memory_account() {
         let account = Arc::new(RejectingMemoryAccount::default());
         let service = RuntimeFilterService::new_with_dependencies(
@@ -8355,6 +8647,8 @@ mod tests {
                 crate::runtime_filter::port::transport::RuntimeFilterEnvelope,
             )>,
         >,
+        completions: Mutex<VecDeque<SinkCompletion>>,
+        before_send: Mutex<Option<Arc<dyn Fn(RuntimeFilterEnvelopeKind) + Send + Sync + 'static>>>,
     }
 
     impl RuntimeFilterEnvelopeSink for RecordingRemoteSink {
@@ -8364,6 +8658,15 @@ mod tests {
             envelope: crate::runtime_filter::port::transport::RuntimeFilterTransportEnvelope,
         ) -> SinkSubmitOutcome {
             let envelope = envelope.envelope().clone();
+            let hook = self
+                .before_send
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .cloned();
+            if let Some(hook) = hook {
+                hook(envelope.kind());
+            }
             self.envelopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -8372,13 +8675,33 @@ mod tests {
         }
 
         fn try_recv_completion(&self) -> Option<SinkCompletion> {
-            None
+            self.completions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
         }
 
         fn shutdown(&self) {}
     }
 
     impl RecordingRemoteSink {
+        fn set_before_send(
+            &self,
+            hook: Arc<dyn Fn(RuntimeFilterEnvelopeKind) + Send + Sync + 'static>,
+        ) {
+            *self
+                .before_send
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+        }
+
+        fn complete(&self, completion: SinkCompletion) {
+            self.completions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push_back(completion);
+        }
+
         fn frames(&self) -> Vec<(RouteEdgeId, EncodedArtifactFrame)> {
             self.envelopes
                 .lock()
@@ -8604,7 +8927,7 @@ mod tests {
             BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
-                RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
             ]),
         )
         .unwrap();
@@ -9575,6 +9898,913 @@ mod tests {
             remote_delivery_edge,
             started,
         }
+    }
+
+    struct ProducerFailedOpenFixture {
+        service: Arc<RuntimeFilterService>,
+        events: Arc<Events>,
+        remote_sink: Arc<RecordingRemoteSink>,
+        route: RuntimeFilterRemoteRoute,
+        event_identity: TransportRouteEventIdentity,
+        started: Instant,
+    }
+
+    fn producer_failed_open_fixture() -> ProducerFailedOpenFixture {
+        let fixture = fixture();
+        assert_eq!(
+            fixture
+                .service
+                .install(view([deployment(1, 10, 30, 40, [10], [30], 10_000)]))
+                .unwrap(),
+            InstallOutcome::Installed
+        );
+        fixture
+            .service
+            .configure_transport(ReliableTransportPolicy::new(
+                Duration::from_millis(50),
+                2,
+                Duration::from_millis(150),
+                16,
+                4096,
+            ))
+            .unwrap();
+        fixture
+            .service
+            .open_producer(BindingId::new(10), uid(10), 1, ProducerPortKind::Membership)
+            .unwrap();
+        let remote_sink = Arc::new(RecordingRemoteSink::default());
+        fixture
+            .service
+            .set_remote_sink_for_test(remote_sink.clone());
+        let route = RuntimeFilterRemoteRoute::new(
+            RouteEdgeId::new(99),
+            RuntimeFilterParticipantId::new(7),
+            RuntimeEndpoint::new("10.0.0.7", 9060).unwrap(),
+            RuntimeFilterRouteRole::Aggregator,
+        )
+        .unwrap();
+        let event_identity = TransportRouteEventIdentity::new(
+            RuntimeFilterEventIdentity::new(
+                uid(0),
+                RuntimeFilterParticipantId::new(3),
+                ChannelId::new(1),
+                DeploymentEpoch::new(9),
+            ),
+            route.route_edge_id(),
+        );
+        ProducerFailedOpenFixture {
+            service: fixture.service,
+            events: fixture.events,
+            remote_sink,
+            route,
+            event_identity,
+            started: fixture.started,
+        }
+    }
+
+    fn remote_membership_install(
+        value_type: DataType,
+        max_contribution_bytes: usize,
+    ) -> RuntimeFilterParticipantInstall {
+        let channel_id = ChannelId::new(1);
+        let binding_id = BindingId::new(10);
+        let witness = CoverageWitnessId::new(101);
+        let participant = RuntimeFilterParticipantId::new(3);
+        let remote_participant = RuntimeFilterParticipantId::new(7);
+        let channel = RuntimeFilterChannelDeployment::new(
+            channel_id,
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics: NullSemantics::NeverMatches,
+            },
+            RuntimeFilterLifecycle::CompleteOnce,
+            Coverage::Leaf(witness),
+            Coverage::Leaf(witness),
+            ReductionRequirement::SetUnion,
+            BTreeSet::from([
+                ContributionKind::ValueDomainDelta,
+                ContributionKind::ProducerClosed,
+            ]),
+            CompletionRequirement::ProducerClosed,
+            RuntimeFilterPolicyRequirement {
+                max_contribution_bytes: u64::try_from(max_contribution_bytes).unwrap(),
+                max_artifact_bytes: 1024,
+                deadline_ms: 10_000,
+                max_retries: 2,
+            },
+            RuntimeFilterCoreBudget::new(8192),
+            MaterializationPolicy::for_test(),
+            BTreeMap::from([(
+                binding_id,
+                ProducerDeployment::new(witness, BTreeSet::from([uid(10)])),
+            )]),
+            BTreeMap::new(),
+        );
+        let producer_role = RuntimeFilterRouteRole::Producer(binding_id);
+        let edge = RuntimeFilterRoutingEdgeView::new(
+            channel_id,
+            RouteEdgeId::new(99),
+            RuntimeFilterRouteEndpointView::new(participant, producer_role),
+            RuntimeFilterRouteEndpointView::new(
+                remote_participant,
+                RuntimeFilterRouteRole::Aggregator,
+            ),
+            RuntimeFilterRoutePeer::Remote {
+                participant_id: remote_participant,
+                endpoint: RuntimeEndpoint::new("10.0.0.7", 9060).unwrap(),
+            },
+            BTreeSet::from([
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerClosed,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+            ]),
+        )
+        .unwrap();
+        let routing_channel = RuntimeFilterChannelRoutingView::new(
+            channel_id,
+            BTreeSet::from([producer_role]),
+            BTreeMap::from([((binding_id, uid(10)), participant)]),
+            Vec::new(),
+            vec![edge],
+        )
+        .unwrap();
+        RuntimeFilterParticipantInstall::new(
+            RuntimeFilterInstallView::new(
+                DeploymentEpoch::new(9),
+                participant,
+                BTreeMap::from([(channel_id, channel)]),
+            ),
+            RuntimeFilterRoutingShard::new(
+                DeploymentEpoch::new(9),
+                participant,
+                BTreeMap::from([(channel_id, routing_channel)]),
+            )
+            .unwrap(),
+        )
+    }
+
+    struct RemoteProducerFixture {
+        service: Arc<RuntimeFilterService>,
+        sink: Arc<RecordingRemoteSink>,
+        started: Instant,
+    }
+
+    fn remote_producer_fixture(
+        value_type: DataType,
+        max_contribution_bytes: usize,
+    ) -> RemoteProducerFixture {
+        let fixture = fixture();
+        fixture
+            .service
+            .install(remote_membership_install(
+                value_type,
+                max_contribution_bytes,
+            ))
+            .unwrap();
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        RemoteProducerFixture {
+            service: fixture.service,
+            sink,
+            started: fixture.started,
+        }
+    }
+
+    fn open_remote_membership(
+        fixture: &RemoteProducerFixture,
+        local_partition_count: u32,
+    ) -> Result<Arc<dyn ProducerAdapter>, RuntimeContractViolation> {
+        fixture
+            .service
+            .open_producer(
+                BindingId::new(10),
+                uid(10),
+                local_partition_count,
+                ProducerPortKind::Membership,
+            )
+            .and_then(|handle| handle.into_membership())
+    }
+
+    #[test]
+    fn remote_valid_oversized_utf8_membership_fails_open_without_query_error() {
+        let fixture = remote_producer_fixture(DataType::Utf8, 8);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let outcome = producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(
+                    MembershipValues::utf8(["a structurally valid but oversized scalar"]),
+                    false,
+                ),
+            )
+            .expect("oversized legal contribution must fail only the optimization");
+        assert_eq!(outcome, SubmitOutcome::TerminalNoop);
+        assert_eq!(
+            fixture
+                .sink
+                .envelopes()
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![RuntimeFilterEnvelopeKind::ProducerUnavailable]
+        );
+        assert!(fixture.service.lifecycle.is_running());
+
+        let invalid = remote_producer_fixture(DataType::Utf8, 1024);
+        let producer = open_remote_membership(&invalid, 1).unwrap();
+        let error = producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .expect_err("schema/type mismatch remains a synchronous contract error");
+        assert_eq!(error.kind(), RuntimeContractViolationKind::TypeMismatch);
+        assert!(invalid.sink.envelopes().is_empty());
+    }
+
+    #[test]
+    fn remote_final_encode_allocator_rejection_fails_open_without_query_error() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let outcome = crate::runtime_filter::codec::contribution::with_rejecting_contribution_allocator_for_test(
+            || {
+                producer.submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+            },
+        )
+        .expect("allocation rejection must fail only the optimization");
+        assert_eq!(outcome, SubmitOutcome::TerminalNoop);
+        assert_eq!(
+            fixture
+                .sink
+                .envelopes()
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![RuntimeFilterEnvelopeKind::ProducerUnavailable]
+        );
+        assert!(fixture.service.lifecycle.is_running());
+    }
+
+    #[test]
+    fn remote_reopen_freezes_partition_count_even_after_handle_expires() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let first = open_remote_membership(&fixture, 1).unwrap();
+        let live_error = open_remote_membership(&fixture, 2)
+            .err()
+            .expect("live reopen must fail");
+        assert_eq!(
+            live_error.kind(),
+            RuntimeContractViolationKind::PartitionCountConflict
+        );
+        drop(first);
+        let expired_error = open_remote_membership(&fixture, 2)
+            .err()
+            .expect("expired reopen must fail");
+        assert_eq!(
+            expired_error.kind(),
+            RuntimeContractViolationKind::PartitionCountConflict
+        );
+    }
+
+    #[test]
+    fn remote_handle_close_then_submit_is_outside_terminal_range_without_enqueue() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(0))
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        let sends = fixture.sink.envelopes().len();
+        let error = producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .expect_err("a contribution at the terminal sequence must be rejected");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::SequenceOutsideTerminalRange
+        );
+        assert_eq!(fixture.sink.envelopes().len(), sends);
+    }
+
+    #[test]
+    fn remote_handle_fail_then_submit_is_terminal_noop_without_enqueue() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        assert_eq!(
+            producer
+                .fail(ProducerFailureReason::ExecutionFailed)
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        let sends = fixture.sink.envelopes().len();
+        assert_eq!(
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        assert_eq!(fixture.sink.envelopes().len(), sends);
+    }
+
+    #[test]
+    fn remote_handle_async_failed_open_then_submit_is_terminal_noop_without_enqueue() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .unwrap();
+        let contribution = fixture.sink.envelopes()[0].1.clone();
+        fixture.sink.complete(SinkCompletion::Ack(
+            contribution.route_identity().clone(),
+            RuntimeFilterAcceptStatus::Rejected,
+        ));
+        fixture.service.tick(fixture.started);
+        let sends = fixture.sink.envelopes().len();
+        assert_eq!(
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ValueDomainDelta::new(MembershipValues::int64([8]), false),
+                )
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        assert_eq!(fixture.sink.envelopes().len(), sends);
+    }
+
+    #[test]
+    fn remote_close_before_gap_allows_missing_sequences_to_fill() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(2))
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        assert_eq!(
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    ValueDomainDelta::new(MembershipValues::int64([8]), false),
+                )
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        assert_eq!(
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+                .unwrap(),
+            SubmitOutcome::Applied
+        );
+        assert_eq!(fixture.sink.envelopes().len(), 3);
+    }
+
+    #[test]
+    fn remote_exact_close_replay_is_duplicate_without_enqueue() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+            .unwrap();
+        let sends = fixture.sink.envelopes().len();
+        assert_eq!(
+            producer
+                .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                .unwrap(),
+            SubmitOutcome::Duplicate
+        );
+        assert_eq!(fixture.sink.envelopes().len(), sends);
+    }
+
+    #[test]
+    fn remote_conflicting_terminal_sequence_is_synchronous_error() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(2))
+            .unwrap();
+        let error = producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(3))
+            .expect_err("terminal sequence is frozen on first close");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::ConflictingTerminalSequence
+        );
+    }
+
+    #[test]
+    fn remote_sequence_at_or_above_terminal_is_synchronous_error() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(2))
+            .unwrap();
+        let error = producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(2),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .expect_err("terminal range is exclusive");
+        assert_eq!(
+            error.kind(),
+            RuntimeContractViolationKind::SequenceOutsideTerminalRange
+        );
+    }
+
+    #[test]
+    fn remote_terminal_still_rejects_invalid_partition_and_type_before_noop() {
+        let invalid_partition = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&invalid_partition, 1).unwrap();
+        producer
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .unwrap();
+        let error = producer
+            .submit(
+                PartitionId::new(1),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .expect_err("partition preflight remains structural after terminal");
+        assert_eq!(error.kind(), RuntimeContractViolationKind::InvalidPartition);
+
+        let invalid_type = remote_producer_fixture(DataType::Utf8, 1024);
+        let producer = open_remote_membership(&invalid_type, 1).unwrap();
+        producer
+            .fail(ProducerFailureReason::ExecutionFailed)
+            .unwrap();
+        let sends = invalid_type.sink.envelopes().len();
+        let error = producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            )
+            .expect_err("type preflight remains structural after terminal");
+        assert_eq!(error.kind(), RuntimeContractViolationKind::TypeMismatch);
+        assert_eq!(invalid_type.sink.envelopes().len(), sends);
+    }
+
+    #[test]
+    fn remote_fail_linearizes_after_an_admitted_submit_send() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        fixture.sink.set_before_send({
+            let released = Arc::clone(&released);
+            Arc::new(move |kind| {
+                if kind != RuntimeFilterEnvelopeKind::Contribution {
+                    return;
+                }
+                entered_tx.send(()).expect("submit send entered");
+                let (lock, wake) = &*released;
+                let mut ready = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*ready {
+                    ready = wake.wait(ready).unwrap_or_else(|error| error.into_inner());
+                }
+            })
+        });
+
+        let submit = {
+            let producer = Arc::clone(&producer);
+            std::thread::spawn(move || {
+                producer.submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+            })
+        };
+        entered_rx.recv().expect("submit reached the send barrier");
+        let (fail_done_tx, fail_done_rx) = mpsc::sync_channel(1);
+        let fail = {
+            let producer = Arc::clone(&producer);
+            std::thread::spawn(move || {
+                let outcome = producer.fail(ProducerFailureReason::ExecutionFailed);
+                fail_done_tx.send(outcome).expect("report fail outcome");
+            })
+        };
+        assert!(
+            fail_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "fail must wait behind the admitted submit linearization barrier"
+        );
+        {
+            let (lock, wake) = &*released;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+        assert_eq!(submit.join().unwrap().unwrap(), SubmitOutcome::Applied);
+        assert_eq!(
+            fail_done_rx.recv().unwrap().unwrap(),
+            SubmitOutcome::Applied
+        );
+        fail.join().unwrap();
+        assert_eq!(
+            fixture
+                .sink
+                .envelopes()
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_same_thread_reentrant_fail_does_not_deadlock_and_fails_open_once() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let (reentrant_tx, reentrant_rx) = mpsc::sync_channel(1);
+        fixture.sink.set_before_send({
+            let producer = Arc::clone(&producer);
+            Arc::new(move |kind| {
+                if kind == RuntimeFilterEnvelopeKind::Contribution {
+                    let result = producer.fail(ProducerFailureReason::ExecutionFailed);
+                    reentrant_tx
+                        .send(result)
+                        .expect("report same-thread reentrant fail");
+                }
+            })
+        });
+
+        let (submit_tx, submit_rx) = mpsc::sync_channel(1);
+        let submit = std::thread::spawn(move || {
+            let result = producer.submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            );
+            submit_tx.send(result).expect("report outer submit");
+        });
+
+        assert_eq!(
+            reentrant_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("same-thread reentrant fail must not deadlock")
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        assert_eq!(
+            submit_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("outer submit must complete after deferred fail-open")
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        submit.join().unwrap();
+        assert_eq!(
+            fixture
+                .sink
+                .envelopes()
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeFilterEnvelopeKind::Contribution,
+                RuntimeFilterEnvelopeKind::ProducerUnavailable,
+            ]
+        );
+        assert!(fixture.service.lifecycle.is_running());
+    }
+
+    #[test]
+    fn remote_same_thread_async_mark_failed_is_deferred_without_deadlock() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let state = fixture
+            .service
+            .remote_producer_states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(BindingId::new(10), uid(10)))
+            .cloned()
+            .expect("open remote producer freezes shared state");
+        let (marked_tx, marked_rx) = mpsc::sync_channel(1);
+        fixture.sink.set_before_send(Arc::new(move |kind| {
+            if kind == RuntimeFilterEnvelopeKind::Contribution {
+                state.mark_failed();
+                marked_tx
+                    .send(())
+                    .expect("report same-thread async failure mark");
+            }
+        }));
+
+        let (submit_tx, submit_rx) = mpsc::sync_channel(1);
+        let submit = std::thread::spawn(move || {
+            let result = producer.submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                ValueDomainDelta::new(MembershipValues::int64([7]), false),
+            );
+            submit_tx.send(result).expect("report outer submit");
+        });
+        marked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-thread async mark_failed must not wait on its owner");
+        assert_eq!(
+            submit_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("outer submit completes after deferred async failure")
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        submit.join().unwrap();
+        assert_eq!(
+            fixture
+                .sink
+                .envelopes()
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![RuntimeFilterEnvelopeKind::Contribution]
+        );
+        assert!(fixture.service.lifecycle.is_running());
+    }
+
+    #[test]
+    fn remote_panicking_send_drops_permit_and_wakes_waiting_fail() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        fixture.sink.set_before_send({
+            let released = Arc::clone(&released);
+            Arc::new(move |kind| {
+                if kind != RuntimeFilterEnvelopeKind::Contribution {
+                    return;
+                }
+                entered_tx.send(()).expect("submit send entered");
+                let (lock, wake) = &*released;
+                let mut ready = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*ready {
+                    ready = wake.wait(ready).unwrap_or_else(|error| error.into_inner());
+                }
+                panic!("intentional remote sink panic");
+            })
+        });
+
+        let submit = {
+            let producer = Arc::clone(&producer);
+            std::thread::spawn(move || {
+                producer.submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+            })
+        };
+        entered_rx.recv().expect("submit reached the send barrier");
+        let (fail_tx, fail_rx) = mpsc::sync_channel(1);
+        let fail = std::thread::spawn(move || {
+            fail_tx
+                .send(producer.fail(ProducerFailureReason::ExecutionFailed))
+                .expect("report waiting fail result");
+        });
+        assert!(
+            fail_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "concurrent fail must wait while the operation permit is owned"
+        );
+        {
+            let (lock, wake) = &*released;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+        assert!(
+            submit.join().is_err(),
+            "sink panic must unwind outer submit"
+        );
+        assert_eq!(
+            fail_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("permit Drop must wake a waiting fail")
+                .unwrap(),
+            SubmitOutcome::TerminalNoop
+        );
+        fail.join().unwrap();
+        assert!(fixture.sink.envelopes().is_empty());
+    }
+
+    #[test]
+    fn remote_bloom_only_retirement_hit_fails_open_without_query_error_or_enqueue() {
+        let fixture = remote_producer_fixture(DataType::Int64, 1024);
+        fixture
+            .service
+            .reliable_transport()
+            .saturate_retired_filter_for_test();
+        let producer = open_remote_membership(&fixture, 1).unwrap();
+        assert_eq!(
+            producer
+                .submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    ValueDomainDelta::new(MembershipValues::int64([7]), false),
+                )
+                .expect("probabilistic retirement is never a query-facing error"),
+            SubmitOutcome::TerminalNoop
+        );
+        assert!(fixture.sink.envelopes().is_empty());
+        assert!(fixture.service.lifecycle.is_running());
+    }
+
+    fn producer_transport_envelope(kind: RuntimeFilterEnvelopeKind) -> Arc<RuntimeFilterEnvelope> {
+        let (identity, producer_open, payload) = match kind {
+            RuntimeFilterEnvelopeKind::Contribution => (
+                RuntimeFilterRouteIdentity::contribution(
+                    ContributionRouteIdentity::try_new(
+                        BindingId::new(10),
+                        uid(10),
+                        PartitionId::new(0),
+                        ProducerSequence::new(0),
+                    )
+                    .unwrap(),
+                ),
+                Some(ProducerOpenMetadata::try_new(1).unwrap()),
+                vec![1],
+            ),
+            RuntimeFilterEnvelopeKind::ProducerUnavailable => (
+                RuntimeFilterRouteIdentity::producer_instance(
+                    ProducerInstanceRouteIdentity::try_new(BindingId::new(10), uid(10)).unwrap(),
+                ),
+                None,
+                encode_producer_failure(ProducerFailureReason::UpstreamUnavailable),
+            ),
+            other => panic!("unsupported producer transport fixture kind {other:?}"),
+        };
+        Arc::new(
+            RuntimeFilterEnvelope::try_new(
+                kind,
+                uid(0),
+                ChannelId::new(1),
+                DeploymentEpoch::new(9),
+                identity,
+                producer_open,
+                None,
+                &[7; 32],
+                payload,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn assert_service_failed_open_once(fx: &ProducerFailedOpenFixture) {
+        let channel = fx.service.registry.channel(ChannelId::new(1)).unwrap();
+        assert!(channel.is_terminal());
+        assert!(matches!(
+            fx.service
+                .subscribe(
+                    BindingId::new(30),
+                    uid(30),
+                    SubscriptionKind::BlockingSnapshot,
+                )
+                .unwrap()
+                .into_blocking()
+                .unwrap()
+                .acquire(Duration::ZERO),
+            ArtifactAcquireOutcome::Unavailable(UnavailableReason::ProducerFailed)
+        ));
+        let failed_events = fx
+            .events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, RuntimeFilterEvent::ProducerInstanceFailed { .. }))
+            .count();
+        assert_eq!(failed_events, 1, "producer instance fails exactly once");
+        assert!(fx.service.lifecycle.is_running());
+        assert!(fx.service.registry.active_installation().is_some());
+    }
+
+    fn ack_synthesized_unavailable(fx: &ProducerFailedOpenFixture) {
+        let unavailable = fx
+            .remote_sink
+            .envelopes()
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .find(|envelope| envelope.kind() == RuntimeFilterEnvelopeKind::ProducerUnavailable)
+            .expect("failed contribution synthesizes producer unavailable");
+        fx.remote_sink.complete(SinkCompletion::Ack(
+            unavailable.route_identity().clone(),
+            RuntimeFilterAcceptStatus::Accepted,
+        ));
+        fx.service.tick(fx.started + Duration::from_millis(201));
+        assert_eq!(fx.service.transport_pending_len_for_test(), 0);
+    }
+
+    #[test]
+    fn async_rejected_or_mismatched_ack_fails_route_open() {
+        for mismatch in [false, true] {
+            let fx = producer_failed_open_fixture();
+            let envelope = producer_transport_envelope(RuntimeFilterEnvelopeKind::Contribution);
+            let identity = envelope.route_identity().clone();
+            assert!(matches!(
+                fx.service.reliable_transport().send_envelope(
+                    &fx.route,
+                    envelope,
+                    fx.event_identity,
+                ),
+                Ok(ReliableSendOutcome::Buffered(_))
+            ));
+            if mismatch {
+                fx.remote_sink.complete(SinkCompletion::TransportFailure(
+                    identity,
+                    SinkTransportError::contract("runtime filter ACK identity mismatch"),
+                ));
+            } else {
+                fx.remote_sink.complete(SinkCompletion::Ack(
+                    identity,
+                    RuntimeFilterAcceptStatus::Rejected,
+                ));
+            }
+
+            fx.service.tick(fx.started);
+            assert_service_failed_open_once(&fx);
+            ack_synthesized_unavailable(&fx);
+            fx.service.tick(fx.started + Duration::from_secs(1));
+            assert_service_failed_open_once(&fx);
+        }
+    }
+
+    #[test]
+    fn contribution_deadline_degrades_filter_without_query_failure() {
+        let fx = producer_failed_open_fixture();
+        let envelope = producer_transport_envelope(RuntimeFilterEnvelopeKind::Contribution);
+        assert!(matches!(
+            fx.service
+                .reliable_transport()
+                .send_envelope(&fx.route, envelope, fx.event_identity,),
+            Ok(ReliableSendOutcome::Buffered(_))
+        ));
+
+        fx.service.tick(fx.started + Duration::from_millis(200));
+        assert_service_failed_open_once(&fx);
+        ack_synthesized_unavailable(&fx);
+        fx.service.tick(fx.started + Duration::from_secs(1));
+        assert_service_failed_open_once(&fx);
+    }
+
+    #[test]
+    fn producer_unavailable_send_failure_does_not_recurse() {
+        let fx = producer_failed_open_fixture();
+        let envelope = producer_transport_envelope(RuntimeFilterEnvelopeKind::ProducerUnavailable);
+        let identity = envelope.route_identity().clone();
+        assert!(matches!(
+            fx.service
+                .reliable_transport()
+                .send_envelope(&fx.route, envelope, fx.event_identity,),
+            Ok(ReliableSendOutcome::Buffered(_))
+        ));
+        fx.remote_sink.complete(SinkCompletion::TransportFailure(
+            identity,
+            SinkTransportError::contract("runtime filter ACK identity mismatch"),
+        ));
+
+        fx.service.tick(fx.started);
+        assert_service_failed_open_once(&fx);
+        assert_eq!(fx.service.transport_pending_len_for_test(), 0);
+        assert_eq!(fx.remote_sink.envelopes().len(), 1);
+        for step in 1..=3 {
+            fx.service.tick(fx.started + Duration::from_secs(step));
+        }
+        assert_eq!(fx.service.transport_pending_len_for_test(), 0);
+        assert_eq!(
+            fx.remote_sink.envelopes().len(),
+            1,
+            "failed ProducerUnavailable must not synthesize another ProducerUnavailable"
+        );
+        assert_service_failed_open_once(&fx);
     }
 
     #[test]

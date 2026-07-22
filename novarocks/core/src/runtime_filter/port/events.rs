@@ -239,6 +239,9 @@ pub(crate) enum TransportFailOpenReason {
     /// A self-owned sender-buffer ceiling refused the frame before it was buffered or
     /// put on the wire (M3 Task 4 `ResourceLimit`).
     ResourceLimit,
+    /// The peer rejected the canonical envelope or returned a response that violated
+    /// the ACK contract. The route degrades without failing the query.
+    ContractRejected,
 }
 
 /// One step in a remote delivery frame's sender-side reliable-transport lifecycle.

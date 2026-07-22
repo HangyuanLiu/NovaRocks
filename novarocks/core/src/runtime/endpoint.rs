@@ -45,6 +45,10 @@ impl RuntimeEndpoint {
         &self.host
     }
 
+    pub(crate) fn retained_host_capacity(&self) -> usize {
+        self.host.capacity()
+    }
+
     pub(crate) fn port(&self) -> i32 {
         self.port
     }
