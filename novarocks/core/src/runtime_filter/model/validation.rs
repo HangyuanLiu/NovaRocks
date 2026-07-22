@@ -29,10 +29,7 @@ use super::graph::{
     ApplyPoint, ConsumerRequirement, ProducerRequirement, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
 };
-use super::policy::{
-    MAX_ARTIFACT_BYTES, MAX_DEADLINE_MS, MAX_RETRIES, RuntimeFilterPolicyValidationError,
-    validate_runtime_filter_policy,
-};
+use super::policy::{RuntimeFilterPolicyValidationError, validate_runtime_filter_policy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PolicyField {
@@ -658,6 +655,7 @@ mod tests {
     use super::super::coverage::{Coverage, CoverageShapeError};
     use super::super::graph::tests::*;
     use super::super::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
+    use super::super::policy::{MAX_ARTIFACT_BYTES, MAX_DEADLINE_MS, MAX_RETRIES};
     use super::*;
 
     fn join_graph() -> RuntimeFilterGraph {
