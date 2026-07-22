@@ -20,12 +20,12 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::schema::{
-    BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanOp, SchemaTable,
+    BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanSource, SchemaTable,
     SchemaUserIdentity, SchemaUserRoles,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{BoundScanRanges, ScanNode, ScanSource};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::warn;
@@ -157,18 +157,19 @@ fn lower_supported_schema_scan_node(
     let context = decode_schema_scan_context(schema_scan);
     let _ = require_scan_ranges;
     let should_scan = schema_scan_selected(node.node_id, scan_assignments)?;
-    let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
+    let source = SchemaScanSource::new(
         table,
         context,
         output_chunk_schema.clone(),
-        should_scan,
         external_dependencies
             .and_then(|draft| draft.frontend_endpoint())
             .cloned(),
-    )))
-    .with_node_id(node.node_id)
-    .with_output_chunk_schema(output_chunk_schema)
-    .with_local_rf_waiting_set(local_rf_waiting_set(node));
+    );
+    let op = source.bind(BoundScanRanges::SchemaSelection { should_scan })?;
+    let scan = ScanNode::new(op)
+        .with_node_id(node.node_id)
+        .with_output_chunk_schema(output_chunk_schema)
+        .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::IcebergMetadataScanRange;
 use crate::connector::iceberg::delete_file::IcebergDeleteFileSpec;
 use crate::connector::iceberg::equality_delete::EqualityDeleteSet;
 #[cfg(feature = "compat")]
@@ -352,6 +353,58 @@ pub trait ScanOp: Send + Sync {
         Ok(None)
     }
 }
+
+/// Instance-decoded, proto-free connector ranges handed to [`ScanSource::bind`].
+///
+/// The wire -> connector-range conversion (and its native/compat divergence)
+/// lives in the decoders (`protocol/*/decode`); this enum is that conversion's
+/// already-enriched output. Keeping it proto-free lets the wire-free connector
+/// layer materialize a per-instance [`ScanOp`] from static config plus these
+/// ranges.
+///
+/// The `File`, `StarRocksTablet`, and `IcebergMetadata` variants are populated
+/// by later KRN-1 connector tasks; only `None` (jdbc) and `SchemaSelection`
+/// (schema) are consumed today.
+pub enum BoundScanRanges {
+    /// No ranges; the op emits a single morsel (jdbc/mysql).
+    None,
+    /// Schema scans carry only the per-instance assignment gate.
+    SchemaSelection { should_scan: bool },
+    /// File-based (HDFS / Iceberg data) ranges.
+    File {
+        ranges: Vec<FileScanRange>,
+        has_more: bool,
+    },
+    /// StarRocks lake/tablet ranges (compat mode only).
+    #[cfg(feature = "compat")]
+    StarRocksTablet {
+        ranges: Vec<StarRocksScanRange>,
+        has_more: bool,
+    },
+    /// Iceberg metadata-table ranges.
+    IcebergMetadata {
+        ranges: Vec<IcebergMetadataScanRange>,
+    },
+}
+
+/// Static, proto-free description of a scan source that materializes a
+/// per-instance [`ScanOp`] from [`BoundScanRanges`].
+///
+/// `bind` performs only "connector-ranges + static config -> op"; all wire
+/// decoding happens earlier in the decoders. This keeps the connector layer
+/// uniform and free of proto/thrift types. Later KRN-1 phases store an
+/// `Arc<dyn ScanSource>` on `ScanNode` and call `bind` at execution time.
+pub trait ScanSource: Send + Sync {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String>;
+
+    fn profile_name(&self) -> Option<String> {
+        None
+    }
+}
+
+// Compile-time object-safety assertion for `ScanSource`.
+#[cfg(test)]
+const _: fn(&dyn ScanSource) = |_scan_source: &dyn ScanSource| {};
 
 /// Metadata needed to re-scan a lake tablet for late materialization lookups.
 #[derive(Clone, Debug)]

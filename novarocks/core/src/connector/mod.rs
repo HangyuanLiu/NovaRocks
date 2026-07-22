@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use crate::exec::node::scan::ScanNode;
+use crate::exec::node::scan::{BoundScanRanges, ScanNode, ScanSource};
 
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
@@ -537,7 +537,11 @@ impl ScanConnector for JdbcConnector {
 
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
-            ScanConfig::Jdbc(cfg) => Ok(ScanNode::new(Arc::new(jdbc::JdbcScanOp::new(cfg)))),
+            ScanConfig::Jdbc(cfg) => {
+                let source = jdbc::JdbcScanSource::new(cfg);
+                let op = source.bind(BoundScanRanges::None)?;
+                Ok(ScanNode::new(op))
+            }
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name

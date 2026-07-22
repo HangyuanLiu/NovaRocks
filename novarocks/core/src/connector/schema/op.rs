@@ -24,7 +24,7 @@ use regex::Regex;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
+use crate::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanMorsels, ScanOp, ScanSource};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::backend_id;
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -679,6 +679,51 @@ impl ScanOp for SchemaScanOp {
     }
 }
 
+/// Static [`ScanSource`] for information-schema / BE schema scans.
+///
+/// Schema scans have no scan ranges, but they do carry a per-instance
+/// `should_scan` assignment gate. That gate is NOT static: it arrives via
+/// [`BoundScanRanges::SchemaSelection`] at bind time. Every other field is
+/// fixed at decode time and stored here.
+pub(crate) struct SchemaScanSource {
+    table: SchemaTable,
+    context: SchemaScanContext,
+    output_chunk_schema: ChunkSchemaRef,
+    fe_addr: Option<RuntimeEndpoint>,
+}
+
+impl SchemaScanSource {
+    pub(crate) fn new(
+        table: SchemaTable,
+        context: SchemaScanContext,
+        output_chunk_schema: ChunkSchemaRef,
+        fe_addr: Option<RuntimeEndpoint>,
+    ) -> Self {
+        Self {
+            table,
+            context,
+            output_chunk_schema,
+            fe_addr,
+        }
+    }
+}
+
+impl ScanSource for SchemaScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        let should_scan = matches!(
+            ranges,
+            BoundScanRanges::SchemaSelection { should_scan: true }
+        );
+        Ok(Arc::new(SchemaScanOp::new(
+            self.table.clone(),
+            self.context.clone(),
+            Arc::clone(&self.output_chunk_schema),
+            should_scan,
+            self.fe_addr.clone(),
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -807,6 +852,86 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("txn as int64");
         assert_eq!(txn_col.value(0), 888);
+
+        super::be_tablet_write_log_store::clear_for_test();
+    }
+
+    #[test]
+    fn schema_scan_source_bind_gates_scan_on_selection() {
+        let _guard = crate::connector::schema::test_lock()
+            .lock()
+            .expect("schema scan test lock");
+        super::be_tablet_write_log_store::clear_for_test();
+        super::be_tablet_write_log_store::set_options_for_test(true, 16);
+        super::be_tablet_write_log_store::record_load(
+            crate::connector::schema::BeTabletWriteLoadLogRecord {
+                backend_id: 1,
+                begin_time_ms: 1000,
+                finish_time_ms: 2000,
+                txn_id: 888,
+                tablet_id: 9,
+                table_id: 7,
+                partition_id: 8,
+                input_rows: 10,
+                input_bytes: 20,
+                output_rows: 10,
+                output_bytes: 20,
+                output_segments: 1,
+                label: None,
+            },
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "TXN_ID",
+            DataType::Int64,
+            false,
+        )]));
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema");
+        // A single static source binds different per-instance `should_scan` gates.
+        let source = SchemaScanSource::new(
+            SchemaTable::Be(BeSchemaTable::TabletWriteLog),
+            ctx("be_tablet_write_log"),
+            chunk_schema,
+            None,
+        );
+
+        let morsel = || ScanMorsel::Schema {
+            table_name: "be_tablet_write_log".to_string(),
+        };
+
+        let selected = source
+            .bind(BoundScanRanges::SchemaSelection { should_scan: true })
+            .expect("bind selected");
+        let mut selected_iter = selected
+            .execute_iter(morsel(), None, None)
+            .expect("execute selected");
+        assert!(
+            selected_iter.next().is_some(),
+            "selected schema scan should emit a chunk"
+        );
+
+        let unselected = source
+            .bind(BoundScanRanges::SchemaSelection { should_scan: false })
+            .expect("bind unselected");
+        let mut unselected_iter = unselected
+            .execute_iter(morsel(), None, None)
+            .expect("execute unselected");
+        assert!(
+            unselected_iter.next().is_none(),
+            "unselected schema scan should emit nothing"
+        );
+
+        // `None` ranges (the non-schema variant) must also gate the scan off.
+        let none_gated = source.bind(BoundScanRanges::None).expect("bind none-gated");
+        let mut none_iter = none_gated
+            .execute_iter(morsel(), None, None)
+            .expect("execute none-gated");
+        assert!(
+            none_iter.next().is_none(),
+            "non-selection ranges must not select the scan"
+        );
 
         super::be_tablet_write_log_store::clear_for_test();
     }
