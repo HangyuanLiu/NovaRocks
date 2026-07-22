@@ -16,15 +16,22 @@
 // under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+
+use crate::common::types::UniqueId;
 use crate::coordinator::cluster::LiveBackendSnapshot;
 use crate::coordinator::dispatch::FragmentDispatcher;
 use crate::coordinator::runtime_filter_deployment::{
     DeploymentEpochAllocator, NativeRuntimeFilterDeploymentPolicyProvider,
 };
+use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 
 pub(crate) trait RuntimeFilterDeploymentPolicyProvider: Send + Sync + 'static {
     fn policy_for(
@@ -32,6 +39,26 @@ pub(crate) trait RuntimeFilterDeploymentPolicyProvider: Send + Sync + 'static {
         graph: &RuntimeFilterGraph,
         backends: &LiveBackendSnapshot,
     ) -> Result<RuntimeFilterQueryDeploymentPolicy, String>;
+}
+
+#[async_trait]
+pub(crate) trait RuntimeFilterDeploymentControlPort: Send + Sync + 'static {
+    async fn install(
+        &self,
+        query_id: UniqueId,
+        lifecycle: RuntimeFilterQueryLifecycleOptions,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<(), String>;
+
+    async fn abort(
+        &self,
+        query_id: UniqueId,
+        epoch: DeploymentEpoch,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+    ) -> Result<(), String>;
 }
 
 pub(crate) trait CoordinatorObserver: Send + Sync + 'static {
@@ -51,6 +78,7 @@ pub(crate) struct CoordinatorExecutionPorts {
     pub(crate) observer: Arc<dyn CoordinatorObserver>,
     pub(crate) runtime_filter_policy_provider: Arc<dyn RuntimeFilterDeploymentPolicyProvider>,
     pub(crate) deployment_epoch_allocator: DeploymentEpochAllocator,
+    pub(crate) runtime_filter_deployment_control: Arc<dyn RuntimeFilterDeploymentControlPort>,
 }
 
 impl CoordinatorExecutionPorts {
@@ -58,6 +86,7 @@ impl CoordinatorExecutionPorts {
         dispatcher: Arc<dyn FragmentDispatcher>,
         report_endpoint: RuntimeEndpoint,
         observer: Arc<dyn CoordinatorObserver>,
+        runtime_filter_deployment_control: Arc<dyn RuntimeFilterDeploymentControlPort>,
     ) -> Self {
         Self {
             dispatcher,
@@ -69,6 +98,35 @@ impl CoordinatorExecutionPorts {
                 ),
             ),
             deployment_epoch_allocator: DeploymentEpochAllocator,
+            runtime_filter_deployment_control,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct RejectingTestRuntimeFilterDeploymentControl;
+
+#[cfg(test)]
+#[async_trait]
+impl RuntimeFilterDeploymentControlPort for RejectingTestRuntimeFilterDeploymentControl {
+    async fn install(
+        &self,
+        _query_id: UniqueId,
+        _lifecycle: RuntimeFilterQueryLifecycleOptions,
+        _deadline: Duration,
+        _participant: RuntimeFilterParticipantId,
+        _install: RuntimeFilterParticipantInstall,
+    ) -> Result<(), String> {
+        Err("test coordinator did not inject a runtime filter deployment control".to_string())
+    }
+
+    async fn abort(
+        &self,
+        _query_id: UniqueId,
+        _epoch: DeploymentEpoch,
+        _deadline: Duration,
+        _participant: RuntimeFilterParticipantId,
+    ) -> Result<(), String> {
+        Err("test coordinator did not inject a runtime filter deployment control".to_string())
     }
 }

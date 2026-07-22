@@ -73,8 +73,9 @@ pub(crate) fn compile(
         .map_err(|_| DeploymentError::FragmentCycle)?;
 
     // 3. Resolve per-(channel,binding) participant placement + the expected
-    // finst instances from the scheduling plan. `participant == backend_idx`,
-    // checked against the live snapshot.
+    // finst instances from the scheduling plan. Participant identity is the
+    // checked, nonzero deployment identity derived from `backend_idx`; the
+    // original backend index remains the scheduling and endpoint-map key.
     let mut known_backends = BTreeSet::new();
     for (backend_idx, _) in backends.entries() {
         let _ = participant_id_for_backend(*backend_idx)?;
@@ -541,28 +542,28 @@ mod tests {
         by_fragment.insert(
             1u32,
             vec![
-                placement(1, 0, 2, UniqueId { hi: 1, lo: 1 }),
-                placement(1, 1, 11, UniqueId { hi: 1, lo: 2 }),
+                placement(1, 0, 1, UniqueId { hi: 1, lo: 1 }),
+                placement(1, 1, 10, UniqueId { hi: 1, lo: 2 }),
             ],
         );
         by_fragment.insert(
             2u32,
             vec![
-                placement(2, 0, 2, UniqueId { hi: 1, lo: 3 }),
-                placement(2, 1, 7, UniqueId { hi: 1, lo: 4 }),
+                placement(2, 0, 1, UniqueId { hi: 1, lo: 3 }),
+                placement(2, 1, 6, UniqueId { hi: 1, lo: 4 }),
             ],
         );
         let scheduling = SchedulingPlan {
             root_fragment_id: 1,
             by_fragment,
             root_finst_id: UniqueId { hi: 1, lo: 1 },
-            root_backend_idx: 2,
+            root_backend_idx: 1,
         };
         let backends = LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
-            (99, "10.0.0.99:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
+            (6, "10.0.0.7:9060".parse().unwrap()),
+            (10, "10.0.0.11:9060".parse().unwrap()),
+            (98, "10.0.0.99:9060".parse().unwrap()),
         ]);
         (
             graph,
@@ -697,10 +698,14 @@ mod tests {
             core_instances,
             &BTreeSet::from([UniqueId { hi: 1, lo: 3 }, UniqueId { hi: 1, lo: 4 }])
         );
-        assert!(aggregator_channel.consumers().is_empty());
-        assert!(!plan.install_views.contains_key(&remote_producer));
+        assert!(
+            aggregator_channel
+                .consumers()
+                .contains_key(&BindingId::new(11))
+        );
+        assert!(plan.install_views.contains_key(&remote_producer));
         assert!(plan.routing_shards.contains_key(&remote_producer));
-        assert!(!plan.install_views.contains_key(&remote_consumer));
+        assert!(plan.install_views.contains_key(&remote_consumer));
         assert!(plan.routing_shards.contains_key(&remote_consumer));
 
         let installs = RuntimeFilterDeploymentExtension::new()
@@ -811,8 +816,7 @@ mod tests {
 
     #[test]
     fn compiler_rejects_backend_id_out_of_range_before_placement_projection() {
-        let backend_idx =
-            usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit backend identity");
+        let backend_idx = usize::try_from(u32::MAX).expect("64-bit backend identity");
         let (graph, scheduling, edges, _, policy) = all_of_compiler_fixture();
         let backends = LiveBackendSnapshot::new(vec![
             (0, "10.0.0.1:9060".parse().unwrap()),
@@ -922,7 +926,7 @@ mod tests {
         )
         .unwrap();
         let deployment =
-            &plan.install_views[&RuntimeFilterParticipantId::new(0)].channels()[&ChannelId::new(5)];
+            &plan.install_views[&RuntimeFilterParticipantId::new(1)].channels()[&ChannelId::new(5)];
         assert_eq!(
             deployment.reduction_requirement(),
             ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap())

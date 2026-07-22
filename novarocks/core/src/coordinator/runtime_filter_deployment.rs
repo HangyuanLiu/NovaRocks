@@ -15,18 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures::future::join_all;
+
+use crate::common::types::UniqueId;
 use crate::coordinator::cluster::LiveBackendSnapshot;
-use crate::coordinator::ports::RuntimeFilterDeploymentPolicyProvider;
+use crate::coordinator::ports::{
+    RuntimeFilterDeploymentControlPort, RuntimeFilterDeploymentPolicyProvider,
+};
+use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime_filter::deployment::{
     RuntimeFilterDeploymentPolicy, RuntimeFilterQueryDeploymentPolicy,
     RuntimeFilterQueryTransportPolicy,
 };
 use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::port::identity::DeploymentEpoch;
-use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
+use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
+use crate::runtime_filter::port::install::{
+    MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterParticipantInstall,
+};
 
 const BLOOM_BITS_PER_KEY: u64 = 8;
 const BLOOM_HASH_COUNT: u32 = 5;
@@ -162,9 +174,121 @@ pub(crate) fn prepare_runtime_filter_deployment(
     if graph.is_empty() {
         return Ok(None);
     }
-    let policy = policy_provider.policy_for(graph, backends)?;
     let epoch = epoch_allocator.allocate()?;
+    let policy = policy_provider.policy_for(graph, backends)?;
     Ok(Some(PreparedRuntimeFilterDeployment { epoch, policy }))
+}
+
+pub(crate) struct RuntimeFilterInstallBarrier {
+    control: Arc<dyn RuntimeFilterDeploymentControlPort>,
+}
+
+impl RuntimeFilterInstallBarrier {
+    pub(crate) fn new(control: Arc<dyn RuntimeFilterDeploymentControlPort>) -> Self {
+        Self { control }
+    }
+
+    pub(crate) fn install_all_or_rollback(
+        &self,
+        query_id: UniqueId,
+        epoch: DeploymentEpoch,
+        lifecycle: RuntimeFilterQueryLifecycleOptions,
+        deadline: Duration,
+        mut installs: Vec<(RuntimeFilterParticipantId, RuntimeFilterParticipantInstall)>,
+    ) -> Result<(), String> {
+        installs.sort_by_key(|(participant, _)| *participant);
+        let mut seen = BTreeSet::new();
+        for (participant, install) in &installs {
+            if !seen.insert(*participant) {
+                return Err(format!(
+                    "duplicate runtime filter install participant {}",
+                    participant.get()
+                ));
+            }
+            if install.epoch() != epoch || install.local_participant_id() != *participant {
+                return Err(format!(
+                    "runtime filter install identity mismatch for participant {} under epoch {}",
+                    participant.get(),
+                    epoch.get()
+                ));
+            }
+        }
+
+        let install_results = data_block_on(async {
+            join_all(installs.into_iter().map(|(participant, install)| {
+                let control = Arc::clone(&self.control);
+                async move {
+                    let result = control
+                        .install(query_id, lifecycle, deadline, participant, install)
+                        .await;
+                    (participant, result)
+                }
+            }))
+            .await
+        })
+        .map_err(|error| format!("runtime filter install runtime failed: {error}"))?;
+
+        let mut acknowledged = Vec::new();
+        let mut install_failures = Vec::new();
+        for (participant, result) in install_results {
+            match result {
+                Ok(()) => acknowledged.push(participant),
+                Err(error) => install_failures.push((participant, error)),
+            }
+        }
+        if install_failures.is_empty() {
+            return Ok(());
+        }
+
+        let rollback_results = data_block_on(async {
+            join_all(acknowledged.into_iter().map(|participant| {
+                let control = Arc::clone(&self.control);
+                async move {
+                    let result = control.abort(query_id, epoch, deadline, participant).await;
+                    (participant, result)
+                }
+            }))
+            .await
+        });
+        let mut rollback_runtime_failure = None;
+        let rollback_failures = match rollback_results {
+            Ok(results) => results
+                .into_iter()
+                .filter_map(|(participant, result)| result.err().map(|error| (participant, error)))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                rollback_runtime_failure = Some(error);
+                Vec::new()
+            }
+        };
+
+        let (primary_participant, primary_error) = &install_failures[0];
+        let mut message = format!(
+            "runtime filter install failed for participant {}: {}",
+            primary_participant.get(),
+            primary_error
+        );
+        if install_failures.len() > 1 {
+            let additional = install_failures[1..]
+                .iter()
+                .map(|(participant, error)| format!("participant {}: {error}", participant.get()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            message.push_str(&format!("; additional install failures: [{additional}]"));
+        }
+        if !rollback_failures.is_empty() {
+            let rollback = rollback_failures
+                .iter()
+                .map(|(participant, error)| format!("participant {}: {error}", participant.get()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            message.push_str(&format!("; rollback failures: [{rollback}]"));
+        }
+        if let Some(error) = rollback_runtime_failure {
+            message.push_str(&format!("; rollback runtime failure: {error}"));
+        }
+        Err(message)
+    }
 }
 
 #[cfg(test)]

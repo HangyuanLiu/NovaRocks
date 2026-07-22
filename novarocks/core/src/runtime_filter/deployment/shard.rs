@@ -436,7 +436,7 @@ mod tests {
                 .into_iter()
                 .map(|participant| {
                     (
-                        usize::try_from(participant).unwrap(),
+                        usize::try_from(participant - 1).unwrap(),
                         format!("10.0.0.{participant}:9060").parse().unwrap(),
                     )
                 })
@@ -929,7 +929,7 @@ mod tests {
 
     #[test]
     fn projection_preserves_top_k_summary_requirement() {
-        let participant = RuntimeFilterParticipantId::new(0);
+        let participant = RuntimeFilterParticipantId::new(1);
         let mut channel_graph = ChannelRoleGraph::empty(ChannelId::new(5));
         channel_graph
             .producers
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn loopback_projection_passes_be_side_validate_view() {
-        let part = RuntimeFilterParticipantId::new(0);
+        let part = RuntimeFilterParticipantId::new(1);
         let finst = UniqueId { hi: 1, lo: 2 };
         let mut cg = ChannelRoleGraph::empty(ChannelId::new(5));
         cg.producers
@@ -1030,8 +1030,8 @@ mod tests {
 
     #[test]
     fn consumer_without_authorized_inbound_route_is_rejected() {
-        let producer_participant = RuntimeFilterParticipantId::new(0);
-        let consumer_participant = RuntimeFilterParticipantId::new(1);
+        let producer_participant = RuntimeFilterParticipantId::new(1);
+        let consumer_participant = RuntimeFilterParticipantId::new(2);
         let finst = UniqueId { hi: 1, lo: 2 };
 
         let mut cg = ChannelRoleGraph::empty(ChannelId::new(5));

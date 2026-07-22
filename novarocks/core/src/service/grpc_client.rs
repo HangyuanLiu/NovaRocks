@@ -181,6 +181,36 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(|e| format!("heartbeat rpc failed: {e}"))
     }
 
+    pub(crate) async fn install_runtime_filter_deployment_async(
+        &self,
+        request: proto::filter::InstallRuntimeFilterDeploymentRequest,
+        deadline: Duration,
+    ) -> Result<proto::filter::InstallRuntimeFilterDeploymentResponse, String> {
+        let mut client = self.make_async_client().await?;
+        let mut request = Request::new(request);
+        request.set_timeout(deadline);
+        client
+            .install_runtime_filter_deployment(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| format!("install_runtime_filter_deployment rpc failed: {error}"))
+    }
+
+    pub(crate) async fn abort_runtime_filter_deployment_async(
+        &self,
+        request: proto::filter::AbortRuntimeFilterDeploymentRequest,
+        deadline: Duration,
+    ) -> Result<proto::filter::AbortRuntimeFilterDeploymentResponse, String> {
+        let mut client = self.make_async_client().await?;
+        let mut request = Request::new(request);
+        request.set_timeout(deadline);
+        client
+            .abort_runtime_filter_deployment(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| format!("abort_runtime_filter_deployment rpc failed: {error}"))
+    }
+
     pub fn blocking_heartbeat(
         &self,
         req: proto::novarocks::HeartbeatRequest,

@@ -489,9 +489,9 @@ mod tests {
 
     fn backends() -> LiveBackendSnapshot {
         LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
+            (6, "10.0.0.7:9060".parse().unwrap()),
+            (10, "10.0.0.11:9060".parse().unwrap()),
         ])
     }
 
@@ -748,14 +748,14 @@ mod tests {
     }
 
     #[test]
-    fn participant_zero_is_a_valid_routing_participant() {
+    fn backend_zero_maps_to_nonzero_routing_participant() {
         let channel_id = ChannelId::new(1);
         let producer_binding = BindingId::new(10);
         let consumer_binding = BindingId::new(20);
         let mut channel = ChannelRoleGraph::empty(channel_id);
         channel
             .producers
-            .insert(pid(0), BTreeSet::from([producer_binding]));
+            .insert(pid(1), BTreeSet::from([producer_binding]));
         channel
             .consumers
             .insert(pid(2), BTreeSet::from([consumer_binding]));
@@ -764,7 +764,7 @@ mod tests {
             edge_id: RouteEdgeId::new(1),
             kind: RouteKind::ReplicaDirect,
             from: RouteEndpoint {
-                participant: pid(0),
+                participant: pid(1),
                 binding: producer_binding,
             },
             to: RouteEndpoint {
@@ -776,24 +776,24 @@ mod tests {
             channels: BTreeMap::from([(channel_id, channel)]),
         };
         let instances = BTreeMap::from([(
-            (channel_id, producer_binding, pid(0)),
+            (channel_id, producer_binding, pid(1)),
             BTreeSet::from([finst(0)]),
         )]);
         let backends = LiveBackendSnapshot::new(vec![
             (0, "10.0.0.1:9060".parse().unwrap()),
-            (2, "10.0.0.2:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
         ]);
 
         let shards = project_routing_shards(DeploymentEpoch::new(9), &graph, &instances, &backends)
-            .expect("participant zero must remain valid");
+            .expect("backend zero maps to participant one");
 
-        assert!(shards.contains_key(&pid(0)));
+        assert!(shards.contains_key(&pid(1)));
         assert_eq!(
             shards[&pid(2)]
                 .channel(channel_id)
                 .unwrap()
                 .producer_participant(producer_binding, finst(0)),
-            Some(pid(0))
+            Some(pid(1))
         );
     }
 
@@ -839,10 +839,10 @@ mod tests {
     fn projector_rejects_duplicate_backend_id_unknown_endpoint_and_duplicate_edge_id() {
         let (graph, instances) = all_of_fixture();
         let duplicate_backends = LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (2, "10.0.0.22:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
-            (11, "10.0.0.11:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
+            (1, "10.0.0.22:9060".parse().unwrap()),
+            (6, "10.0.0.7:9060".parse().unwrap()),
+            (10, "10.0.0.11:9060".parse().unwrap()),
         ]);
         assert_eq!(
             project_routing_shards(
@@ -851,12 +851,12 @@ mod tests {
                 &instances,
                 &duplicate_backends,
             ),
-            Err(DeploymentError::DuplicateBackend { backend_idx: 2 })
+            Err(DeploymentError::DuplicateBackend { backend_idx: 1 })
         );
 
         let missing_backend = LiveBackendSnapshot::new(vec![
-            (2, "10.0.0.2:9060".parse().unwrap()),
-            (7, "10.0.0.7:9060".parse().unwrap()),
+            (1, "10.0.0.2:9060".parse().unwrap()),
+            (6, "10.0.0.7:9060".parse().unwrap()),
         ]);
         assert_eq!(
             project_routing_shards(
@@ -910,8 +910,7 @@ mod tests {
 
     #[test]
     fn projector_rejects_backend_ids_that_do_not_fit_participant_identity() {
-        let backend_idx =
-            usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit backend identity");
+        let backend_idx = usize::try_from(u32::MAX).expect("64-bit backend identity");
         let backends =
             LiveBackendSnapshot::new(vec![(backend_idx, "10.0.0.1:9060".parse().unwrap())]);
 

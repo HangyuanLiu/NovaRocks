@@ -27,11 +27,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(test)]
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::coordinator::dispatch::{FetchOutcome, FragmentDispatcher, NativeFragmentEnvelope};
+use crate::coordinator::ports::RuntimeFilterDeploymentControlPort;
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
@@ -42,6 +44,13 @@ use crate::proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
+use crate::protocol::native::{
+    RuntimeFilterQueryLifecycleOptions, encode_abort_runtime_filter_deployment,
+    encode_participant_install,
+};
+use crate::runtime_filter::deployment::participant_id_for_backend;
+use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
@@ -51,6 +60,185 @@ use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REMOTE_FETCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct GrpcRuntimeFilterDeploymentControl {
+    clients: BTreeMap<RuntimeFilterParticipantId, NovaRocksGrpcRemoteClient>,
+    endpoints: BTreeMap<RuntimeFilterParticipantId, SocketAddr>,
+}
+
+impl GrpcRuntimeFilterDeploymentControl {
+    pub(crate) fn new(backends: &[(usize, SocketAddr)]) -> Result<Self, String> {
+        if backends.is_empty() {
+            return Err(
+                "GrpcRuntimeFilterDeploymentControl requires at least one backend".to_string(),
+            );
+        }
+        let mut clients = BTreeMap::new();
+        let mut endpoints = BTreeMap::new();
+        for (backend_idx, endpoint) in backends {
+            let participant = participant_id_for_backend(*backend_idx)
+                .map_err(|error| format!("invalid runtime filter backend id: {error}"))?;
+            if clients.contains_key(&participant) {
+                return Err(format!(
+                    "duplicate runtime filter participant {}",
+                    participant.get()
+                ));
+            }
+            clients.insert(
+                participant,
+                NovaRocksGrpcRemoteClient::connect_blocking(*endpoint)?,
+            );
+            endpoints.insert(participant, *endpoint);
+        }
+        Ok(Self { clients, endpoints })
+    }
+
+    fn client_and_endpoint(
+        &self,
+        participant: RuntimeFilterParticipantId,
+    ) -> Result<(&NovaRocksGrpcRemoteClient, SocketAddr), String> {
+        let endpoint = self.endpoints.get(&participant).copied().ok_or_else(|| {
+            format!(
+                "runtime filter participant {} is absent from the scheduler snapshot",
+                participant.get()
+            )
+        })?;
+        let client = self
+            .clients
+            .get(&participant)
+            .expect("client and endpoint maps have identical keys");
+        Ok((client, endpoint))
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeFilterDeploymentControlPort for GrpcRuntimeFilterDeploymentControl {
+    async fn install(
+        &self,
+        query_id: UniqueId,
+        lifecycle: RuntimeFilterQueryLifecycleOptions,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+        install: RuntimeFilterParticipantInstall,
+    ) -> Result<(), String> {
+        let (client, endpoint) = self.client_and_endpoint(participant)?;
+        let request =
+            encode_participant_install(query_id, lifecycle, &install).map_err(|error| {
+                format!(
+                    "runtime filter install encode failed for participant {} endpoint {}: {error}",
+                    participant.get(),
+                    endpoint
+                )
+            })?;
+        let response = client
+            .install_runtime_filter_deployment_async(request, deadline)
+            .await
+            .map_err(|error| {
+                format!(
+                    "runtime filter install RPC failed for participant {} endpoint {}: {error}",
+                    participant.get(),
+                    endpoint
+                )
+            })?;
+        validate_deployment_response(
+            "install",
+            participant,
+            endpoint,
+            response.status,
+            response.rejection.as_ref(),
+        )
+    }
+
+    async fn abort(
+        &self,
+        query_id: UniqueId,
+        epoch: DeploymentEpoch,
+        deadline: Duration,
+        participant: RuntimeFilterParticipantId,
+    ) -> Result<(), String> {
+        let (client, endpoint) = self.client_and_endpoint(participant)?;
+        let request = encode_abort_runtime_filter_deployment(query_id, epoch).map_err(|error| {
+            format!(
+                "runtime filter abort encode failed for participant {} endpoint {}: {error}",
+                participant.get(),
+                endpoint
+            )
+        })?;
+        let response = client
+            .abort_runtime_filter_deployment_async(request, deadline)
+            .await
+            .map_err(|error| {
+                format!(
+                    "runtime filter abort RPC failed for participant {} endpoint {}: {error}",
+                    participant.get(),
+                    endpoint
+                )
+            })?;
+        validate_deployment_response(
+            "abort",
+            participant,
+            endpoint,
+            response.status,
+            response.rejection.as_ref(),
+        )
+    }
+}
+
+fn validate_deployment_response(
+    operation: &str,
+    participant: RuntimeFilterParticipantId,
+    endpoint: SocketAddr,
+    raw_status: i32,
+    rejection: Option<&crate::proto::filter::RuntimeFilterDeploymentRejection>,
+) -> Result<(), String> {
+    use crate::proto::filter::{
+        RuntimeFilterDeploymentRejectionCode as RejectionCode,
+        RuntimeFilterDeploymentResponseStatus as ResponseStatus,
+    };
+
+    let context = || {
+        format!(
+            "runtime filter {operation} response for participant {} endpoint {}",
+            participant.get(),
+            endpoint
+        )
+    };
+    match ResponseStatus::try_from(raw_status) {
+        Ok(ResponseStatus::Applied | ResponseStatus::Idempotent) => {
+            if rejection.is_some() {
+                return Err(format!("{} carried a rejection on an ACK", context()));
+            }
+            Ok(())
+        }
+        Ok(ResponseStatus::Rejected) => {
+            let rejection =
+                rejection.ok_or_else(|| format!("{} omitted rejection details", context()))?;
+            let code = RejectionCode::try_from(rejection.code).map_err(|_| {
+                format!(
+                    "{} returned unknown rejection code {}",
+                    context(),
+                    rejection.code
+                )
+            })?;
+            if code == RejectionCode::Unspecified || rejection.reason.is_empty() {
+                return Err(format!("{} returned an invalid rejection", context()));
+            }
+            Err(format!(
+                "{} was rejected: code={code:?} reason={}",
+                context(),
+                rejection.reason
+            ))
+        }
+        Ok(ResponseStatus::Unspecified) => {
+            Err(format!("{} returned an unspecified status", context()))
+        }
+        Err(_) => Err(format!(
+            "{} returned unknown status {}",
+            context(),
+            raw_status
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RemoteDispatcher
@@ -311,6 +499,39 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn runtime_filter_control_snapshot_mapping_is_order_independent_and_keeps_backend_endpoint() {
+        let backend_zero = "127.0.0.1:19031".parse().unwrap();
+        let backend_nine = "127.0.0.1:19039".parse().unwrap();
+        let forward =
+            GrpcRuntimeFilterDeploymentControl::new(&[(0, backend_zero), (9, backend_nine)])
+                .expect("snapshot with backend zero is valid");
+        let reverse =
+            GrpcRuntimeFilterDeploymentControl::new(&[(9, backend_nine), (0, backend_zero)])
+                .expect("snapshot order does not change participant identities");
+
+        for control in [&forward, &reverse] {
+            assert_eq!(
+                control
+                    .client_and_endpoint(RuntimeFilterParticipantId::new(1))
+                    .unwrap()
+                    .1,
+                backend_zero
+            );
+            assert_eq!(
+                control
+                    .client_and_endpoint(RuntimeFilterParticipantId::new(10))
+                    .unwrap()
+                    .1,
+                backend_nine
+            );
+        }
+        assert_eq!(
+            forward.endpoints.keys().copied().collect::<Vec<_>>(),
+            reverse.endpoints.keys().copied().collect::<Vec<_>>()
+        );
     }
 
     #[derive(Clone)]

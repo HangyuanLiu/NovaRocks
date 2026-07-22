@@ -97,7 +97,11 @@ const CONSUMER_FRAGMENT: PlanFragmentId = PlanFragmentId::new(3);
 const INSTANCE_A: UniqueId = UniqueId { hi: 94, lo: 10 };
 const INSTANCE_B: UniqueId = UniqueId { hi: 94, lo: 20 };
 const CONSUMER_INSTANCE: UniqueId = UniqueId { hi: 94, lo: 30 };
-const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(0);
+const PARTICIPANT: RuntimeFilterParticipantId = RuntimeFilterParticipantId::new(1);
+
+fn fixture_backend_idx() -> usize {
+    usize::try_from(PARTICIPANT.get() - 1).expect("fixture participant fits backend identity")
+}
 
 struct ProducerFixture {
     binding: BindingId,
@@ -370,7 +374,7 @@ fn placement(
         fragment_id: fragment.get(),
         instance_index,
         finst_id: instance,
-        backend_idx: PARTICIPANT.get() as usize,
+        backend_idx: fixture_backend_idx(),
         endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
         scan_ranges: BTreeMap::new(),
         destinations: Vec::new(),
@@ -397,7 +401,7 @@ fn scheduling_plan(producers: &[ProducerFixture]) -> SchedulingPlan {
         root_fragment_id: CONSUMER_FRAGMENT.get(),
         by_fragment,
         root_finst_id: CONSUMER_INSTANCE,
-        root_backend_idx: PARTICIPANT.get() as usize,
+        root_backend_idx: fixture_backend_idx(),
     }
 }
 

@@ -153,7 +153,7 @@ mod tests {
             RuntimeFilterService::new_for_query(UniqueId { hi: 1, lo: 2 }, events.clone(), &parent);
         let empty = local_participant_install_for_test(RuntimeFilterInstallView::new(
             DeploymentEpoch::new(1),
-            RuntimeFilterParticipantId::new(0),
+            RuntimeFilterParticipantId::new(1),
             BTreeMap::new(),
         ));
         assert_eq!(

@@ -440,8 +440,9 @@ impl ExecutionCoordinator {
             dispatcher,
             report_endpoint,
             observer,
-            runtime_filter_policy_provider: _runtime_filter_policy_provider,
-            deployment_epoch_allocator: _deployment_epoch_allocator,
+            runtime_filter_policy_provider,
+            deployment_epoch_allocator,
+            runtime_filter_deployment_control,
         } = self.execution_ports;
         let scheduler = self.scheduler;
         // ---------------------------------------------------------------
@@ -482,6 +483,55 @@ impl ExecutionCoordinator {
         let plan = apply_scheduled_plan_test_drift(plan, scheduled_plan_test_drift);
         validate_artifact_fragment_sets(&prepared, &native_bundle, &plan)?;
         validate_scheduling_placements(&plan)?;
+
+        if let Some(deployment) =
+            crate::coordinator::runtime_filter_deployment::prepare_runtime_filter_deployment(
+                prepared.runtime_filter_graph(),
+                scheduler.live_backend_snapshot(),
+                runtime_filter_policy_provider.as_ref(),
+                &deployment_epoch_allocator,
+            )?
+        {
+            let compiled = crate::runtime_filter::deployment::compiler::compile(
+                prepared.runtime_filter_graph(),
+                &plan,
+                &edges,
+                scheduler.live_backend_snapshot(),
+                &deployment.policy.compiler,
+                deployment.epoch,
+            )
+            .map_err(|error| format!("runtime filter deployment compile failed: {error}"))?;
+            let installs =
+                crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension::new(
+                )
+                .participant_installs(&compiled)
+                .map_err(|error| {
+                    format!("runtime filter participant install projection failed: {error}")
+                })?;
+            let (delivery_expire, query_expire) =
+                crate::runtime::query_options::query_expire_durations(Some(
+                    query_options.as_runtime_options(),
+                ));
+            let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
+                delivery_expire,
+                query_expire,
+                transport_retry_interval: deployment.policy.transport.retry_interval,
+                transport_max_attempts: deployment.policy.transport.max_attempts,
+                transport_deadline: deployment.policy.transport.deadline,
+                transport_max_pending_entries: deployment.policy.transport.max_pending_entries,
+                transport_max_pending_bytes: deployment.policy.transport.max_pending_bytes,
+            };
+            crate::coordinator::runtime_filter_deployment::RuntimeFilterInstallBarrier::new(
+                runtime_filter_deployment_control,
+            )
+            .install_all_or_rollback(
+                query_id,
+                deployment.epoch,
+                lifecycle,
+                deployment.policy.install_rpc_deadline,
+                installs,
+            )?;
+        }
         let execution_root_fragment_id = plan.root_fragment_id;
         let mut native_fragments_by_id = native_bundle.into_fragments().collect::<BTreeMap<_, _>>();
 
@@ -2196,6 +2246,7 @@ mod native_contract_tests {
                 crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
                     .expect("report endpoint"),
                 Arc::new(CountingCoordinatorObserver::default()),
+                Arc::new(crate::coordinator::ports::RejectingTestRuntimeFilterDeploymentControl),
             ),
             scheduler,
             query_options,
@@ -3973,5 +4024,538 @@ mod native_contract_tests {
             ],
             "target fragment 4 has no placements",
         );
+    }
+
+    mod runtime_filter_deployment {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::mpsc::{SyncSender, sync_channel};
+        use std::time::Duration;
+
+        use arrow::datatypes::DataType;
+
+        use super::*;
+        use crate::coordinator::ports::{
+            RuntimeFilterDeploymentControlPort, RuntimeFilterDeploymentPolicyProvider,
+        };
+        use crate::coordinator::runtime_filter_deployment::RuntimeFilterInstallBarrier;
+        use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
+        use crate::runtime_filter::deployment::RuntimeFilterQueryDeploymentPolicy;
+        use crate::runtime_filter::model::contract::{
+            ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+            ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
+            PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
+            RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        };
+        use crate::runtime_filter::model::coverage::Coverage;
+        use crate::runtime_filter::model::graph::{
+            ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
+            ProducerRequirement, RuntimeFilterBindingRole, RuntimeFilterBindingSpec,
+            RuntimeFilterChannelSpec, RuntimeFilterGraph,
+        };
+        use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+        use crate::runtime_filter::port::install::{
+            RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+        };
+        use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+
+        type InstallGate = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
+        #[derive(Default)]
+        struct RecordingDeploymentControl {
+            install_results: Mutex<BTreeMap<u32, Result<(), String>>>,
+            abort_results: Mutex<BTreeMap<u32, Result<(), String>>>,
+            install_gates: Mutex<BTreeMap<u32, InstallGate>>,
+            install_calls: Mutex<Vec<u32>>,
+            abort_calls: Mutex<Vec<u32>>,
+            events: Arc<Mutex<Vec<String>>>,
+            install_started: Mutex<Option<SyncSender<u32>>>,
+        }
+
+        impl RecordingDeploymentControl {
+            fn with_install_result(
+                self: Arc<Self>,
+                participant: u32,
+                result: Result<(), String>,
+            ) -> Arc<Self> {
+                self.install_results
+                    .lock()
+                    .unwrap()
+                    .insert(participant, result);
+                self
+            }
+
+            fn with_abort_result(
+                self: Arc<Self>,
+                participant: u32,
+                result: Result<(), String>,
+            ) -> Arc<Self> {
+                self.abort_results
+                    .lock()
+                    .unwrap()
+                    .insert(participant, result);
+                self
+            }
+
+            fn gate_install(
+                &self,
+                participant: u32,
+            ) -> tokio::sync::oneshot::Sender<Result<(), String>> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.install_gates.lock().unwrap().insert(participant, rx);
+                tx
+            }
+
+            fn install_calls(&self) -> Vec<u32> {
+                self.install_calls.lock().unwrap().clone()
+            }
+
+            fn abort_calls(&self) -> Vec<u32> {
+                self.abort_calls.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeFilterDeploymentControlPort for RecordingDeploymentControl {
+            async fn install(
+                &self,
+                _query_id: UniqueId,
+                _lifecycle: RuntimeFilterQueryLifecycleOptions,
+                _deadline: Duration,
+                participant: RuntimeFilterParticipantId,
+                _install: RuntimeFilterParticipantInstall,
+            ) -> Result<(), String> {
+                let participant = participant.get();
+                self.events
+                    .as_ref()
+                    .lock()
+                    .unwrap()
+                    .push(format!("install:{participant}"));
+                self.install_calls.lock().unwrap().push(participant);
+                if let Some(started) = self.install_started.lock().unwrap().as_ref() {
+                    started.send(participant).expect("bounded start receiver");
+                }
+                let gate = self.install_gates.lock().unwrap().remove(&participant);
+                if let Some(gate) = gate {
+                    return gate.await.expect("install gate sender");
+                }
+                self.install_results
+                    .lock()
+                    .unwrap()
+                    .remove(&participant)
+                    .unwrap_or(Ok(()))
+            }
+
+            async fn abort(
+                &self,
+                _query_id: UniqueId,
+                _epoch: DeploymentEpoch,
+                _deadline: Duration,
+                participant: RuntimeFilterParticipantId,
+            ) -> Result<(), String> {
+                let participant = participant.get();
+                self.events
+                    .as_ref()
+                    .lock()
+                    .unwrap()
+                    .push(format!("abort:{participant}"));
+                self.abort_calls.lock().unwrap().push(participant);
+                self.abort_results
+                    .lock()
+                    .unwrap()
+                    .remove(&participant)
+                    .unwrap_or(Ok(()))
+            }
+        }
+
+        struct RecordingPolicyProvider {
+            inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider,
+            calls: AtomicUsize,
+            failure: Option<String>,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl RuntimeFilterDeploymentPolicyProvider for RecordingPolicyProvider {
+            fn policy_for(
+                &self,
+                graph: &RuntimeFilterGraph,
+                backends: &crate::coordinator::cluster::LiveBackendSnapshot,
+            ) -> Result<RuntimeFilterQueryDeploymentPolicy, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.events.lock().unwrap().push("compile".to_string());
+                if let Some(failure) = &self.failure {
+                    return Err(failure.clone());
+                }
+                self.inner.policy_for(graph, backends)
+            }
+        }
+
+        fn lifecycle() -> RuntimeFilterQueryLifecycleOptions {
+            RuntimeFilterQueryLifecycleOptions {
+                delivery_expire: Duration::from_secs(5),
+                query_expire: Duration::from_secs(30),
+                transport_retry_interval: Duration::from_millis(200),
+                transport_max_attempts: 3,
+                transport_deadline: Duration::from_secs(2),
+                transport_max_pending_entries: 1024,
+                transport_max_pending_bytes: 1 << 20,
+            }
+        }
+
+        fn participant_install(participant: u32) -> RuntimeFilterParticipantInstall {
+            let epoch = DeploymentEpoch::new(17);
+            let participant = RuntimeFilterParticipantId::new(participant);
+            RuntimeFilterParticipantInstall::new(
+                RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
+                RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
+                    .expect("empty test routing shard"),
+            )
+        }
+
+        fn membership_graph() -> RuntimeFilterGraph {
+            let channel_id = ChannelId::new(1);
+            let witness = CoverageWitnessId::new(1);
+            let location = PlanLocation {
+                fragment_id: PlanFragmentId::new(7),
+                node_id: PlanNodeId::new(70),
+            };
+            let expression = || TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(1)),
+                data_type: DataType::Int64,
+                nullable: false,
+            };
+            let mut graph = RuntimeFilterGraph::default();
+            graph
+                .insert_channel(RuntimeFilterChannelSpec {
+                    channel_id,
+                    logical_domain: RuntimeFilterLogicalDomain::Membership {
+                        value_type: DataType::Int64,
+                        null_semantics: NullSemantics::NeverMatches,
+                    },
+                    lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                    availability_coverage: Coverage::Leaf(witness),
+                    terminal_coverage: Coverage::Leaf(witness),
+                    reduction_requirement: ReductionRequirement::SetUnion,
+                    allowed_contribution_kinds: BTreeSet::from([
+                        ContributionKind::ValueDomainDelta,
+                        ContributionKind::ProducerClosed,
+                    ]),
+                    required_consumer_capabilities: BTreeSet::from([
+                        ArtifactCapability::Membership,
+                        ArtifactCapability::EmptyDomain,
+                    ]),
+                    policy: RuntimeFilterPolicyRequirement {
+                        max_contribution_bytes: 1024,
+                        max_artifact_bytes: 4096,
+                        deadline_ms: 2_000,
+                        max_retries: 2,
+                    },
+                })
+                .unwrap();
+            graph
+                .insert_binding(RuntimeFilterBindingSpec {
+                    binding_id: BindingId::new(1),
+                    channel_id,
+                    coverage_witness_id: Some(witness),
+                    location,
+                    expression: expression(),
+                    apply_point: ApplyPoint::NodeOutput,
+                    role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
+                        contribution_kinds: BTreeSet::from([
+                            ContributionKind::ValueDomainDelta,
+                            ContributionKind::ProducerClosed,
+                        ]),
+                        completion_requirement: CompletionRequirement::ProducerClosed,
+                        join_key_ordinal: 0,
+                    }),
+                })
+                .unwrap();
+            graph
+                .insert_binding(RuntimeFilterBindingSpec {
+                    binding_id: BindingId::new(2),
+                    channel_id,
+                    coverage_witness_id: None,
+                    location,
+                    expression: expression(),
+                    apply_point: ApplyPoint::NodeInput,
+                    role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
+                        capabilities: BTreeSet::from([
+                            ArtifactCapability::Membership,
+                            ArtifactCapability::EmptyDomain,
+                        ]),
+                        activation: ConsumerActivation::NonBlockingLive {
+                            late_apply: LateApplyGranularity::Batch,
+                        },
+                        target: ConsumerBindingTarget::DirectInput { input_ordinal: 0 },
+                    }),
+                })
+                .unwrap();
+            graph
+        }
+
+        fn execution_artifacts(
+            graph: RuntimeFilterGraph,
+        ) -> (PreparedFragmentSet, NativeFragmentBundle) {
+            let fragment = PlanFragment {
+                fragment_id: 7,
+                root: DistributedNode {
+                    node_id: 70,
+                    fragment_id: 7,
+                    tuple_ids: vec![70],
+                    nullable_tuple_ids: Vec::new(),
+                    limit: -1,
+                    runtime_filter_binding_ids: if graph.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![BindingId::new(1), BindingId::new(2)]
+                    },
+                    children: Vec::new(),
+                    stats: PhysicalPlanStats {
+                        output_row_count: 0.0,
+                        row_count_confidence: PlannerConfidence::Fallback,
+                        column_statistics: Default::default(),
+                        cost_estimate: None,
+                        broadcast_decision: None,
+                    },
+                    payload: DistributedNodeKind::Values(PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    }),
+                },
+                data_partition: DataPartition::unpartitioned(),
+                output_partition: DataPartition::unpartitioned(),
+                sink: DataSink::Result,
+                output_exprs: None,
+                output_columns: Vec::new(),
+                cte_id: None,
+                cte_exchange_nodes: Vec::new(),
+            };
+            let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
+                fragments: vec![fragment],
+                root_fragment_id: 7,
+                edges: Vec::new(),
+                runtime_filter_graph: graph,
+            };
+            let prepared = crate::coordinator::prepare::prepare_fragments(
+                &plan,
+                &crate::connector::ConnectorRegistry::new(),
+                None,
+            )
+            .expect("prepare runtime-filter execution artifact");
+            let native_bundle =
+                crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
+                    .expect("encode runtime-filter execution artifact");
+            (prepared, native_bundle)
+        }
+
+        fn scheduler() -> Arc<FragmentScheduler> {
+            Arc::new(FragmentScheduler::new_with_backend_ids(vec![(
+                0,
+                "127.0.0.1:19031".parse().unwrap(),
+            )]))
+        }
+
+        fn coordinator(
+            graph: RuntimeFilterGraph,
+            dispatcher: Arc<CapturingDispatcher>,
+            control: Arc<dyn RuntimeFilterDeploymentControlPort>,
+            policy_provider: Arc<dyn RuntimeFilterDeploymentPolicyProvider>,
+        ) -> ExecutionCoordinator {
+            let (prepared, native_bundle) = execution_artifacts(graph);
+            let mut ports = CoordinatorExecutionPorts::new(
+                dispatcher,
+                crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
+                Arc::new(CountingCoordinatorObserver::default()),
+                control,
+            );
+            ports.runtime_filter_policy_provider = policy_provider;
+            ExecutionCoordinator::new(prepared, native_bundle, ports, scheduler(), None)
+        }
+
+        fn native_policy(events: Arc<Mutex<Vec<String>>>) -> Arc<RecordingPolicyProvider> {
+            Arc::new(RecordingPolicyProvider {
+                inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider::new(2),
+                calls: AtomicUsize::new(0),
+                failure: None,
+                events,
+            })
+        }
+
+        #[test]
+        fn nonempty_graph_compiles_after_schedule_before_install() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let control = Arc::new(RecordingDeploymentControl {
+                events: events.clone(),
+                ..Default::default()
+            });
+            let dispatcher = CapturingDispatcher::new(None);
+            coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                control.clone(),
+                native_policy(events.clone()),
+            )
+            .execute_with_write_outcome()
+            .expect("compiled deployment installs before fragment submission");
+
+            assert_eq!(events.lock().unwrap().as_slice(), ["compile", "install:1"]);
+            assert_eq!(control.install_calls(), vec![1]);
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn fragment_submit_waits_for_every_install_ack() {
+            let (started_tx, started_rx) = sync_channel(2);
+            let control = Arc::new(RecordingDeploymentControl {
+                install_started: Mutex::new(Some(started_tx)),
+                ..Default::default()
+            });
+            let first = control.gate_install(1);
+            let second = control.gate_install(2);
+            let (submitted_tx, submitted_rx) = sync_channel(1);
+            let barrier_control = control.clone();
+            std::thread::spawn(move || {
+                let result = RuntimeFilterInstallBarrier::new(barrier_control)
+                    .install_all_or_rollback(
+                        UniqueId { hi: 1, lo: 2 },
+                        DeploymentEpoch::new(17),
+                        lifecycle(),
+                        Duration::from_secs(1),
+                        vec![
+                            (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                            (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                        ],
+                    );
+                submitted_tx.send(result).unwrap();
+            });
+
+            let mut started = BTreeSet::new();
+            started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            started.insert(started_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            assert_eq!(started, BTreeSet::from([1, 2]));
+            first.send(Ok(())).unwrap();
+            assert!(submitted_rx.try_recv().is_err());
+            second.send(Ok(())).unwrap();
+            assert!(
+                submitted_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn install_failure_submits_zero_fragments_and_aborts_acked_participants() {
+            let integrated_control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(1, Err("coordinator install refused".to_string()));
+            let dispatcher = CapturingDispatcher::new(None);
+            let integrated_error = coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                integrated_control,
+                native_policy(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .execute_with_write_outcome()
+            .expect_err("install failure must stop the real coordinator before submission");
+            assert!(
+                integrated_error.contains("coordinator install refused"),
+                "{integrated_error}"
+            );
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
+
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(2, Err("install refused".to_string()));
+            let submitted = AtomicUsize::new(0);
+            let error = RuntimeFilterInstallBarrier::new(control.clone())
+                .install_all_or_rollback(
+                    UniqueId { hi: 3, lo: 4 },
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    vec![
+                        (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                        (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                    ],
+                )
+                .map(|()| submitted.fetch_add(1, Ordering::SeqCst))
+                .unwrap_err();
+
+            assert!(error.contains("participant 2"), "{error}");
+            assert_eq!(submitted.load(Ordering::SeqCst), 0);
+            assert_eq!(control.abort_calls(), vec![1]);
+        }
+
+        #[test]
+        fn rollback_failure_preserves_primary_install_error_with_context() {
+            let control = Arc::new(RecordingDeploymentControl::default())
+                .with_install_result(2, Err("primary install failure at endpoint-b".to_string()))
+                .with_abort_result(1, Err("rollback failure at endpoint-a".to_string()));
+            let error = RuntimeFilterInstallBarrier::new(control)
+                .install_all_or_rollback(
+                    UniqueId { hi: 5, lo: 6 },
+                    DeploymentEpoch::new(17),
+                    lifecycle(),
+                    Duration::from_secs(1),
+                    vec![
+                        (RuntimeFilterParticipantId::new(1), participant_install(1)),
+                        (RuntimeFilterParticipantId::new(2), participant_install(2)),
+                    ],
+                )
+                .unwrap_err();
+
+            assert!(error.contains("participant 2"), "{error}");
+            assert!(
+                error.contains("primary install failure at endpoint-b"),
+                "{error}"
+            );
+            assert!(error.contains("rollback failures"), "{error}");
+            assert!(error.contains("participant 1"), "{error}");
+            assert!(error.contains("rollback failure at endpoint-a"), "{error}");
+        }
+
+        #[test]
+        fn empty_graph_sends_zero_install_rpc() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let policy = native_policy(events);
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let dispatcher = CapturingDispatcher::new(None);
+            coordinator(
+                RuntimeFilterGraph::default(),
+                dispatcher.clone(),
+                control.clone(),
+                policy.clone(),
+            )
+            .execute_with_write_outcome()
+            .expect("empty graph bypasses deployment");
+
+            assert_eq!(policy.calls.load(Ordering::SeqCst), 0);
+            assert!(control.install_calls().is_empty());
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn compile_failure_sends_zero_install_and_zero_submit() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let policy = Arc::new(RecordingPolicyProvider {
+                inner: crate::coordinator::runtime_filter_deployment::NativeRuntimeFilterDeploymentPolicyProvider::new(2),
+                calls: AtomicUsize::new(0),
+                failure: Some("compile phase rejected policy".to_string()),
+                events,
+            });
+            let control = Arc::new(RecordingDeploymentControl::default());
+            let dispatcher = CapturingDispatcher::new(None);
+            let error = coordinator(
+                membership_graph(),
+                dispatcher.clone(),
+                control.clone(),
+                policy,
+            )
+            .execute_with_write_outcome()
+            .expect_err("compile phase failure must stop deployment");
+
+            assert!(error.contains("compile phase rejected policy"), "{error}");
+            assert!(control.install_calls().is_empty());
+            assert_eq!(dispatcher.submit_count.load(Ordering::SeqCst), 0);
+        }
     }
 }

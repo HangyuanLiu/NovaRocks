@@ -2600,7 +2600,7 @@ mod tests {
             DeploymentEpoch::new(9),
         )
         .unwrap();
-        let participant = RuntimeFilterParticipantId::new(0);
+        let participant = RuntimeFilterParticipantId::new(1);
         let core_view = plan
             .install_views
             .remove(&participant)

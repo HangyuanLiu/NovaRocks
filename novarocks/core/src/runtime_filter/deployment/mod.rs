@@ -204,8 +204,10 @@ impl std::error::Error for DeploymentError {}
 pub(crate) fn participant_id_for_backend(
     backend_idx: usize,
 ) -> Result<RuntimeFilterParticipantId, DeploymentError> {
-    let participant = u32::try_from(backend_idx)
-        .map_err(|_| DeploymentError::BackendIdOutOfRange { backend_idx })?;
+    let participant = backend_idx
+        .checked_add(1)
+        .and_then(|participant| u32::try_from(participant).ok())
+        .ok_or(DeploymentError::BackendIdOutOfRange { backend_idx })?;
     Ok(RuntimeFilterParticipantId::new(participant))
 }
 
@@ -245,5 +247,18 @@ mod tests {
         assert!(rendered.contains("blocking"));
         assert!(rendered.contains("binding 2"));
         assert!(rendered.contains("channel 1"));
+    }
+
+    #[test]
+    fn backend_participant_identity_is_nonzero_and_overflow_checked() {
+        assert_eq!(
+            participant_id_for_backend(0).unwrap(),
+            RuntimeFilterParticipantId::new(1)
+        );
+        assert_eq!(
+            participant_id_for_backend(8).unwrap(),
+            RuntimeFilterParticipantId::new(9)
+        );
+        assert!(participant_id_for_backend(u32::MAX as usize).is_err());
     }
 }

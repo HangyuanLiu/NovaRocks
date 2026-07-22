@@ -333,13 +333,13 @@ mod tests {
         let e = DeploymentEpoch::new(epoch);
         let mut install_views = BTreeMap::new();
         let mut routing_shards = BTreeMap::new();
-        for p in [pid(0), pid(1)] {
+        for p in [pid(10), pid(1)] {
             install_views.insert(p, RuntimeFilterInstallView::new(e, p, BTreeMap::new()));
             routing_shards.insert(p, shard(e, p));
         }
         RuntimeFilterDeploymentPlan {
             epoch: e,
-            participants: BTreeSet::from([pid(0), pid(1)]),
+            participants: BTreeSet::from([pid(10), pid(1)]),
             install_views,
             routing_shards,
             role_graph: RoleGraph::default(),
@@ -350,14 +350,14 @@ mod tests {
         let e = DeploymentEpoch::new(epoch);
         let mut install_views = BTreeMap::new();
         let mut routing_shards = BTreeMap::new();
-        for p in [pid(0), pid(1)] {
+        for p in [pid(10), pid(1)] {
             install_views.insert(p, RuntimeFilterInstallView::new(e, p, BTreeMap::new()));
             routing_shards.insert(p, shard(e, p));
         }
         RuntimeFilterDeploymentPlan {
             epoch: e,
             // pid(2) is a live backend with no RF role; it must NOT be installed.
-            participants: BTreeSet::from([pid(0), pid(1), pid(2)]),
+            participants: BTreeSet::from([pid(10), pid(1), pid(2)]),
             install_views,
             routing_shards,
             role_graph: RoleGraph::default(),
@@ -386,14 +386,14 @@ mod tests {
             port.install(QUERY, plan.epoch, participant, install)
                 .unwrap();
         }
-        assert!(port.all_installed(&BTreeSet::from([pid(0), pid(1)])));
+        assert!(port.all_installed(&BTreeSet::from([pid(10), pid(1)])));
         assert!(!port.all_installed(&plan.participants)); // pid(2) never installed
     }
 
     #[test]
     fn participant_installs_reject_missing_routing_shard() {
         let mut plan = sample_plan(7);
-        plan.routing_shards.remove(&pid(0));
+        plan.routing_shards.remove(&pid(10));
 
         let err = RuntimeFilterDeploymentExtension::new()
             .participant_installs(&plan)
@@ -401,7 +401,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            DeploymentInstallError::MissingRoutingShard { participant: 0 }
+            DeploymentInstallError::MissingRoutingShard { participant: 10 }
         ));
     }
 
@@ -410,7 +410,7 @@ mod tests {
         let mut epoch_mismatch = sample_plan(7);
         epoch_mismatch
             .routing_shards
-            .insert(pid(0), shard(DeploymentEpoch::new(8), pid(0)));
+            .insert(pid(10), shard(DeploymentEpoch::new(8), pid(10)));
         let err = RuntimeFilterDeploymentExtension::new()
             .participant_installs(&epoch_mismatch)
             .unwrap_err();
@@ -422,7 +422,7 @@ mod tests {
         let mut participant_mismatch = sample_plan(7);
         participant_mismatch
             .routing_shards
-            .insert(pid(0), shard(DeploymentEpoch::new(7), pid(1)));
+            .insert(pid(10), shard(DeploymentEpoch::new(7), pid(1)));
         let err = RuntimeFilterDeploymentExtension::new()
             .participant_installs(&participant_mismatch)
             .unwrap_err();
@@ -489,10 +489,10 @@ mod tests {
     fn participant_installs_reject_malformed_view_before_missing_shard() {
         let mut plan = sample_plan(7);
         plan.install_views.insert(
-            pid(0),
+            pid(10),
             RuntimeFilterInstallView::new(plan.epoch, pid(9), BTreeMap::new()),
         );
-        plan.routing_shards.remove(&pid(0));
+        plan.routing_shards.remove(&pid(10));
 
         let err = RuntimeFilterDeploymentExtension::new()
             .participant_installs(&plan)
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn recording_port_conflicts_when_only_routing_shard_changes() {
         let epoch = DeploymentEpoch::new(7);
-        let participant = pid(0);
+        let participant = pid(10);
         let view = RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new());
         let port = RecordingInstallPort::default();
         port.install(
@@ -529,7 +529,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            DeploymentInstallError::ConflictingDeployment { participant: 0 }
+            DeploymentInstallError::ConflictingDeployment { participant: 10 }
         ));
     }
 
