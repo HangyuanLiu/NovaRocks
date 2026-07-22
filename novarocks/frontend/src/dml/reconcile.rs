@@ -114,10 +114,15 @@ pub fn operation_fact_from_finalize_failure(message: String) -> OperationFact {
 /// abort-fact mapping: known-uncommitted, retry the abort/cleanup when staged
 /// files exist.
 pub fn operation_fact_from_writer_abort(reason: String, has_staged: bool) -> OperationFact {
+    let cleanup_outcome = has_staged.then_some(IcebergCleanupOutcomeRecord {
+        attempted: false,
+        error_count: 0,
+        error_paths: Vec::new(),
+    });
     OperationFact {
         state: OperationState::FailedKnownUncommitted,
         commit_outcome: None,
-        cleanup_outcome: None,
+        cleanup_outcome,
         recovery_evidence: None,
         failure: Some(IcebergOperationFailureRecord {
             kind: IcebergOperationFailureKind::KnownUncommitted,
@@ -272,6 +277,11 @@ mod tests {
     fn writer_abort_with_staged_files_requests_retry_abort() {
         let fact = operation_fact_from_writer_abort("timeout".to_string(), true);
         assert_eq!(fact.state, OperationState::FailedKnownUncommitted);
+        let cleanup = fact
+            .cleanup_outcome
+            .as_ref()
+            .expect("staged files record a pending cleanup outcome");
+        assert!(!cleanup.attempted);
         assert_eq!(
             fact.failure.unwrap().next_action,
             IcebergOperationNextAction::RetryAbort
@@ -281,6 +291,7 @@ mod tests {
     #[test]
     fn writer_abort_without_staged_files_needs_no_action() {
         let fact = operation_fact_from_writer_abort("empty".to_string(), false);
+        assert!(fact.cleanup_outcome.is_none());
         assert_eq!(
             fact.failure.unwrap().next_action,
             IcebergOperationNextAction::None
