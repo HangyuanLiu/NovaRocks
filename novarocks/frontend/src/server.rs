@@ -17,11 +17,16 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks_state_store::StateStoreAppConfig;
 
-use crate::FrontendApplicationHost;
+use crate::{FrontendApplicationError, FrontendApplicationHost};
+
+type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Clone)]
 pub struct FrontendServerConfig {
@@ -31,35 +36,34 @@ pub struct FrontendServerConfig {
     pub local_exchange: bool,
 }
 
-pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), String> {
+pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(novarocks::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
         .build()
-        .map_err(|error| format!("build frontend Tokio runtime failed: {error}"))?;
+        .map_err(|error| {
+            FrontendApplicationError::server(format!(
+                "build frontend Tokio runtime failed: {error}"
+            ))
+        })?;
 
-    runtime.block_on(run_frontend_server_until_shutdown(config, async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("failed to listen for Ctrl-C: {error}");
-        }
-    }))
+    runtime.block_on(run_frontend_server_with_signal(
+        config,
+        tokio::signal::ctrl_c(),
+    ))
 }
 
 pub async fn run_frontend_server_until_shutdown<F>(
     config: FrontendServerConfig,
     shutdown: F,
-) -> Result<(), String>
+) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
 {
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
-        |state_store| async move {
-            FrontendApplicationHost::open(state_store)
-                .await
-                .map_err(|error| error.to_string())
-        },
+        |state_store| async move { FrontendApplicationHost::open(state_store).await },
         |config, shutdown| async move {
             novarocks::server::run_standalone_server_with_config_until_shutdown(
                 config.config,
@@ -69,8 +73,41 @@ where
                 shutdown,
             )
             .await
+            .map_err(|error| {
+                FrontendApplicationError::server(format!("standalone server failed: {error}"))
+            })
         },
-        |host| async move { host.shutdown().await.map_err(|error| error.to_string()) },
+        |host| async move { host.shutdown().await },
+    )
+    .await
+}
+
+async fn run_frontend_server_with_signal<S, E>(
+    config: FrontendServerConfig,
+    signal: S,
+) -> Result<(), FrontendApplicationError>
+where
+    S: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    run_frontend_server_with_signal_and_ports(
+        config,
+        signal,
+        FrontendApplicationHost::open,
+        |config, shutdown| async move {
+            novarocks::server::run_standalone_server_with_config_until_shutdown(
+                config.config,
+                config.config_path,
+                config.port_override,
+                config.local_exchange,
+                shutdown,
+            )
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::server(format!("standalone server failed: {error}"))
+            })
+        },
+        |host| async move { host.shutdown().await },
     )
     .await
 }
@@ -90,29 +127,138 @@ async fn run_frontend_server_until_shutdown_with_ports<
     open_host: OpenHost,
     serve: Serve,
     shutdown_host: ShutdownHost,
-) -> Result<(), String>
+) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
     OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
-    OpenHostFuture: Future<Output = Result<Host, String>>,
+    OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     Serve: FnOnce(FrontendServerConfig, F) -> ServeFuture,
-    ServeFuture: Future<Output = Result<(), String>>,
+    ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
-    ShutdownHostFuture: Future<Output = Result<(), String>>,
+    ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let host = open_host(config.config.state_store.clone()).await?;
     let server_result = serve(config, shutdown).await;
     let shutdown_result = shutdown_host(host).await;
 
+    combine_server_and_shutdown(server_result, shutdown_result)
+}
+
+async fn run_frontend_server_with_signal_and_ports<
+    S,
+    E,
+    Host,
+    OpenHost,
+    OpenHostFuture,
+    Serve,
+    ServeFuture,
+    ShutdownHost,
+    ShutdownHostFuture,
+>(
+    config: FrontendServerConfig,
+    signal: S,
+    open_host: OpenHost,
+    serve: Serve,
+    shutdown_host: ShutdownHost,
+) -> Result<(), FrontendApplicationError>
+where
+    S: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    OpenHost: FnOnce(Option<StateStoreAppConfig>) -> OpenHostFuture,
+    OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
+    Serve: FnOnce(FrontendServerConfig, ShutdownSignal) -> ServeFuture,
+    ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
+    ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
+    ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
+{
+    let host = open_host(config.config.state_store.clone()).await?;
+    let server_result = run_server_until_signal(config, signal, serve).await;
+    let shutdown_result = shutdown_host(host).await;
+
+    combine_server_and_shutdown(server_result, shutdown_result)
+}
+
+fn combine_server_and_shutdown(
+    server_result: Result<(), FrontendApplicationError>,
+    shutdown_result: Result<(), FrontendApplicationError>,
+) -> Result<(), FrontendApplicationError> {
     match (server_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(server_error), Ok(())) => Err(server_error),
-        (Ok(()), Err(shutdown_error)) => {
-            Err(format!("frontend host shutdown failed: {shutdown_error}"))
+        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(server_error), Err(shutdown_error)) => {
+            Err(server_error.with_cleanup_context(shutdown_error))
         }
-        (Err(server_error), Err(shutdown_error)) => Err(format!(
-            "{server_error}; frontend host shutdown failed: {shutdown_error}"
-        )),
+    }
+}
+
+async fn run_server_until_signal<S, E, Serve, ServeFuture>(
+    config: FrontendServerConfig,
+    signal: S,
+    serve: Serve,
+) -> Result<(), FrontendApplicationError>
+where
+    S: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    Serve: FnOnce(FrontendServerConfig, ShutdownSignal) -> ServeFuture,
+    ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
+{
+    let mut signal = Box::pin(signal);
+    let initial_signal = std::future::poll_fn(|context| match signal.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(None),
+        Poll::Ready(result) => Poll::Ready(Some(result)),
+    })
+    .await;
+
+    match initial_signal {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(error)) => {
+            return Err(FrontendApplicationError::server(format!(
+                "Ctrl-C listener initialization failed: {error}"
+            )));
+        }
+        None => {}
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let signal_result = Arc::new(Mutex::new(None));
+    let signal_result_for_task = Arc::clone(&signal_result);
+    let signal_task = tokio::spawn(async move {
+        let result = signal.await.map_err(|error| error.to_string());
+        *signal_result_for_task.lock().expect("signal result lock") = Some(result);
+        let _ = shutdown_tx.send(());
+    });
+
+    let server_result = serve(
+        config,
+        Box::pin(async move {
+            let _ = shutdown_rx.await;
+        }),
+    )
+    .await;
+
+    let completed_signal = signal_result.lock().expect("signal result lock").take();
+    let Some(signal_result) = completed_signal else {
+        signal_task.abort();
+        let _ = signal_task.await;
+        return server_result;
+    };
+
+    if let Err(error) = signal_task.await {
+        return match server_result {
+            Ok(()) => Err(FrontendApplicationError::server(format!(
+                "Ctrl-C listener task failed: {error}"
+            ))),
+            Err(server_error) => Err(server_error),
+        };
+    }
+
+    match (server_result, signal_result) {
+        (Err(server_error), _) => Err(server_error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(FrontendApplicationError::server(format!(
+            "Ctrl-C listener failed: {error}"
+        ))),
     }
 }
 
@@ -121,7 +267,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use super::{FrontendServerConfig, run_frontend_server_until_shutdown_with_ports};
+    use super::{
+        FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown,
+        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
+    };
+    use crate::{FrontendApplicationError, FrontendApplicationErrorKind};
 
     #[derive(Debug)]
     struct RecordingHostPort;
@@ -148,6 +298,25 @@ mod tests {
             port_override: None,
             local_exchange: false,
         }
+    }
+
+    #[test]
+    fn runner_exports_typed_application_errors() {
+        fn accepts_sync_runner(
+            _: fn(FrontendServerConfig) -> Result<(), FrontendApplicationError>,
+        ) {
+        }
+        fn accepts_async_runner<F>(_: F)
+        where
+            F: Future<Output = Result<(), FrontendApplicationError>>,
+        {
+        }
+
+        accepts_sync_runner(run_frontend_server);
+        accepts_async_runner(run_frontend_server_until_shutdown(
+            frontend_config(),
+            async {},
+        ));
     }
 
     #[tokio::test]
@@ -218,7 +387,7 @@ mod tests {
             frontend_config(),
             std::future::pending::<()>(),
             |_| async { Ok(RecordingHostPort) },
-            |_, _| async { Err("core startup failed".to_string()) },
+            |_, _| async { Err(FrontendApplicationError::server("core startup failed")) },
             move |_| async move {
                 shutdown_port.record("store_shutdown");
                 Ok(())
@@ -227,7 +396,8 @@ mod tests {
         .await
         .expect_err("core startup failure should be returned");
 
-        assert_eq!(error, "core startup failed");
+        assert_eq!(error.kind(), FrontendApplicationErrorKind::Server);
+        assert!(error.to_string().contains("core startup failed"));
         assert_eq!(
             events.lock().expect("events lock").as_slice(),
             ["store_shutdown"]
@@ -240,15 +410,18 @@ mod tests {
             frontend_config(),
             std::future::pending::<()>(),
             |_| async { Ok(RecordingHostPort) },
-            |_, _| async { Err("core server failed".to_string()) },
-            |_| async { Err("store shutdown failed".to_string()) },
+            |_, _| async { Err(FrontendApplicationError::server("core server failed")) },
+            |_| async { Err(FrontendApplicationError::server("store shutdown failed")) },
         )
         .await
         .expect_err("both failures should be returned");
 
-        assert_eq!(
-            error,
-            "core server failed; frontend host shutdown failed: store shutdown failed"
+        assert_eq!(error.kind(), FrontendApplicationErrorKind::Server);
+        assert!(error.to_string().contains("core server failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("cleanup failed: Server: store shutdown failed")
         );
     }
 
@@ -279,5 +452,39 @@ mod tests {
         .expect("preloaded config should reach the core port without a disk read");
 
         assert!(server_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_listener_failure_shuts_host_without_server_bind() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host_port = RecordingServerPort::new(Arc::clone(&events));
+        let server_port = RecordingServerPort::new(Arc::clone(&events));
+        let shutdown_port = RecordingServerPort::new(Arc::clone(&events));
+
+        let error = run_frontend_server_with_signal_and_ports(
+            frontend_config(),
+            async { Err::<(), _>("Ctrl-C registration failed") },
+            move |_| {
+                host_port.record("host_open");
+                async { Ok(RecordingHostPort) }
+            },
+            move |_, _| async move {
+                server_port.record("server_bind");
+                Ok(())
+            },
+            move |_| async move {
+                shutdown_port.record("store_shutdown");
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("Ctrl-C listener failure must be returned");
+
+        assert_eq!(error.kind(), FrontendApplicationErrorKind::Server);
+        assert!(error.to_string().contains("Ctrl-C registration failed"));
+        assert_eq!(
+            events.lock().expect("events lock").as_slice(),
+            ["host_open", "store_shutdown"]
+        );
     }
 }

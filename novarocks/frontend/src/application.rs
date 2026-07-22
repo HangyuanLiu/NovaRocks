@@ -29,6 +29,7 @@ pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     RuntimeOpen,
     StoreOpen,
+    Server,
     Shutdown,
 }
 
@@ -39,14 +40,18 @@ pub struct FrontendApplicationError {
 }
 
 impl FrontendApplicationError {
-    fn new(kind: FrontendApplicationErrorKind, error: impl fmt::Display) -> Self {
+    pub(crate) fn new(kind: FrontendApplicationErrorKind, error: impl fmt::Display) -> Self {
         Self {
             kind,
             message: error.to_string(),
         }
     }
 
-    fn with_cleanup_context(mut self, cleanup_error: StateStoreError) -> Self {
+    pub(crate) fn server(error: impl fmt::Display) -> Self {
+        Self::new(FrontendApplicationErrorKind::Server, error)
+    }
+
+    pub(crate) fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup_error}"));
         self
