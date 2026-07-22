@@ -26,7 +26,8 @@ use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
     ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
-    OrderKeyContract, SortDirection, TopKSummaryRequirement,
+    OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
+    TopKSummaryRequirement,
 };
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
@@ -409,6 +410,196 @@ fn digest32(binding_id: u32, field: &str, bytes: &[u8]) -> Result<[u8; 32], Stri
     ))
 }
 
+#[allow(dead_code)] // Shared with the install codec before its Task 4 handler call site lands.
+pub(in crate::protocol::native) fn decode_runtime_filter_logical_domain_and_reduction(
+    wire_type: Option<&crate::proto::common::TypeDesc>,
+    wire_contract: Option<&plan::RuntimeFilterContract>,
+    wire_reduction: Option<&plan::RuntimeFilterReductionContract>,
+    path: FieldPath,
+) -> Result<(RuntimeFilterLogicalDomain, ReductionRequirement), super::NativeFragmentDecodeError> {
+    let type_path = path.clone().field("value_type");
+    let wire_type = wire_type.ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            type_path.clone(),
+            "runtime filter deployment logical domain is missing value type",
+        )
+    })?;
+    let value_type = super::decode_type(wire_type)
+        .map_err(|error| super::NativeFragmentDecodeError::invalid_value(type_path, error))?;
+    let decoded_contract = decode_contract(
+        0,
+        &value_type,
+        wire_contract,
+        path.clone().field("contract"),
+    )?;
+    let decoded_reduction = decode_reduction(
+        0,
+        &decoded_contract,
+        wire_reduction,
+        path.field("reduction"),
+    )?;
+    let domain = match decoded_contract {
+        DecodedRuntimeFilterContract::Membership {
+            canonical_schema, ..
+        } => {
+            let schema = ArtifactMembershipSchema::view(&canonical_schema).map_err(|error| {
+                super::NativeFragmentDecodeError::invalid_value(
+                    FieldPath::root("runtime_filter_install")
+                        .field("logical_domain")
+                        .field("contract"),
+                    format!("invalid membership schema: {error:?}"),
+                )
+            })?;
+            RuntimeFilterLogicalDomain::Membership {
+                value_type,
+                null_semantics: schema.null_semantics(),
+            }
+        }
+        DecodedRuntimeFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            ..
+        } => RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
+            keys: keys
+                .iter()
+                .map(|key| OrderKeyContract {
+                    data_type: key.data_type().clone(),
+                    direction: key.direction(),
+                    null_order: key.null_order(),
+                })
+                .collect(),
+            inclusive: true,
+            comparator_digest: ComparatorDigest::new(comparator_digest),
+        }),
+    };
+    let reduction = match decoded_reduction {
+        DecodedRuntimeFilterReduction::SetUnion => ReductionRequirement::SetUnion,
+        DecodedRuntimeFilterReduction::TightenOrderedBound => {
+            ReductionRequirement::TightenOrderedBound
+        }
+        DecodedRuntimeFilterReduction::MergeTopKSummary { k, .. } => {
+            ReductionRequirement::MergeTopKSummary(
+                TopKSummaryRequirement::try_new(k.get()).expect("decoded TopK K is nonzero"),
+            )
+        }
+    };
+    Ok((domain, reduction))
+}
+
+pub(in crate::protocol::native) fn decode_runtime_filter_contribution_kind(
+    raw: i32,
+    path: FieldPath,
+) -> Result<ContributionKind, super::NativeFragmentDecodeError> {
+    match plan::RuntimeFilterContributionKind::try_from(raw) {
+        Ok(plan::RuntimeFilterContributionKind::ValueDomainDelta) => {
+            Ok(ContributionKind::ValueDomainDelta)
+        }
+        Ok(plan::RuntimeFilterContributionKind::FinalDomainShard) => {
+            Ok(ContributionKind::FinalDomainShard)
+        }
+        Ok(plan::RuntimeFilterContributionKind::OrderedBoundUpdate) => {
+            Ok(ContributionKind::OrderedBoundUpdate)
+        }
+        Ok(plan::RuntimeFilterContributionKind::TopkSummary) => Ok(ContributionKind::TopKSummary),
+        Ok(plan::RuntimeFilterContributionKind::ProducerClosed) => {
+            Ok(ContributionKind::ProducerClosed)
+        }
+        Ok(plan::RuntimeFilterContributionKind::Unspecified) | Err(_) => {
+            Err(super::NativeFragmentDecodeError::invalid_enum(
+                path,
+                format!("invalid runtime filter contribution kind={raw}"),
+            ))
+        }
+    }
+}
+
+pub(in crate::protocol::native) fn decode_runtime_filter_completion(
+    raw: i32,
+    path: FieldPath,
+) -> Result<CompletionRequirement, super::NativeFragmentDecodeError> {
+    match plan::RuntimeFilterCompletionRequirement::try_from(raw) {
+        Ok(plan::RuntimeFilterCompletionRequirement::ProducerClosed) => {
+            Ok(CompletionRequirement::ProducerClosed)
+        }
+        Ok(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen) => Ok(
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+        ),
+        Ok(plan::RuntimeFilterCompletionRequirement::Unspecified) | Err(_) => {
+            Err(super::NativeFragmentDecodeError::invalid_enum(
+                path,
+                format!("invalid runtime filter completion requirement={raw}"),
+            ))
+        }
+    }
+}
+
+pub(in crate::protocol::native) fn decode_runtime_filter_capability(
+    raw: i32,
+    path: FieldPath,
+) -> Result<ArtifactCapability, super::NativeFragmentDecodeError> {
+    match plan::RuntimeFilterArtifactCapability::try_from(raw) {
+        Ok(plan::RuntimeFilterArtifactCapability::Membership) => Ok(ArtifactCapability::Membership),
+        Ok(plan::RuntimeFilterArtifactCapability::OrderedRange) => {
+            Ok(ArtifactCapability::OrderedRange)
+        }
+        Ok(plan::RuntimeFilterArtifactCapability::EmptyDomain) => {
+            Ok(ArtifactCapability::EmptyDomain)
+        }
+        Ok(plan::RuntimeFilterArtifactCapability::Unspecified) | Err(_) => {
+            Err(super::NativeFragmentDecodeError::invalid_enum(
+                path,
+                format!("invalid runtime filter artifact capability={raw}"),
+            ))
+        }
+    }
+}
+
+pub(in crate::protocol::native) fn decode_runtime_filter_activation(
+    wire: Option<&plan::RuntimeFilterConsumerActivation>,
+    path: FieldPath,
+) -> Result<ConsumerActivation, super::NativeFragmentDecodeError> {
+    let wire = wire.ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone(),
+            "missing runtime filter consumer activation",
+        )
+    })?;
+    match wire.kind.as_ref().ok_or_else(|| {
+        super::NativeFragmentDecodeError::missing(
+            path.clone().field("kind"),
+            "missing runtime filter consumer activation kind",
+        )
+    })? {
+        plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => {
+            Ok(ConsumerActivation::BlockingSnapshot)
+        }
+        plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => {
+            Err(super::NativeFragmentDecodeError::invalid_value(
+                path.field("kind").field("blocking_snapshot"),
+                "runtime filter blocking activation marker must be true",
+            ))
+        }
+        plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => {
+            let late_apply = match plan::RuntimeFilterLateApplyGranularity::try_from(*raw) {
+                Ok(plan::RuntimeFilterLateApplyGranularity::Row) => LateApplyGranularity::Row,
+                Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => LateApplyGranularity::Batch,
+                Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => {
+                    LateApplyGranularity::RowGroup
+                }
+                Ok(plan::RuntimeFilterLateApplyGranularity::Split) => LateApplyGranularity::Split,
+                Ok(plan::RuntimeFilterLateApplyGranularity::File) => LateApplyGranularity::File,
+                Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => {
+                    return Err(super::NativeFragmentDecodeError::invalid_enum(
+                        path.field("kind").field("non_blocking_live"),
+                        format!("invalid runtime filter late-apply granularity={raw}"),
+                    ));
+                }
+            };
+            Ok(ConsumerActivation::NonBlockingLive { late_apply })
+        }
+    }
+}
+
 fn decode_contract(
     binding_id: u32,
     expression_type: &arrow::datatypes::DataType,
@@ -731,31 +922,7 @@ fn decode_role(
                     .clone()
                     .field("contribution_kinds")
                     .index(index);
-                let kind = match plan::RuntimeFilterContributionKind::try_from(raw) {
-                    Ok(plan::RuntimeFilterContributionKind::ValueDomainDelta) => {
-                        ContributionKind::ValueDomainDelta
-                    }
-                    Ok(plan::RuntimeFilterContributionKind::FinalDomainShard) => {
-                        ContributionKind::FinalDomainShard
-                    }
-                    Ok(plan::RuntimeFilterContributionKind::OrderedBoundUpdate) => {
-                        ContributionKind::OrderedBoundUpdate
-                    }
-                    Ok(plan::RuntimeFilterContributionKind::TopkSummary) => {
-                        ContributionKind::TopKSummary
-                    }
-                    Ok(plan::RuntimeFilterContributionKind::ProducerClosed) => {
-                        ContributionKind::ProducerClosed
-                    }
-                    Ok(plan::RuntimeFilterContributionKind::Unspecified) | Err(_) => {
-                        return Err(super::NativeFragmentDecodeError::invalid_enum(
-                            item_path,
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid contribution kind={raw}"
-                            ),
-                        ));
-                    }
-                };
+                let kind = decode_runtime_filter_contribution_kind(raw, item_path.clone())?;
                 if !contribution_kinds.insert(kind) {
                     return Err(super::NativeFragmentDecodeError::inconsistent(
                         item_path,
@@ -773,27 +940,10 @@ fn decode_role(
                     ),
                 ));
             }
-            let completion_requirement = match plan::RuntimeFilterCompletionRequirement::try_from(
+            let completion_requirement = decode_runtime_filter_completion(
                 producer.completion_requirement,
-            ) {
-                Ok(plan::RuntimeFilterCompletionRequirement::ProducerClosed) => {
-                    CompletionRequirement::ProducerClosed
-                }
-                Ok(plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen) => {
-                    CompletionRequirement::FencedFinalDomain(
-                        CompletionFenceKind::CommittedDomainFrozen,
-                    )
-                }
-                Ok(plan::RuntimeFilterCompletionRequirement::Unspecified) | Err(_) => {
-                    return Err(super::NativeFragmentDecodeError::invalid_enum(
-                        producer_path.field("completion_requirement"),
-                        format!(
-                            "native runtime-filter binding_id={binding_id} invalid completion requirement={}",
-                            producer.completion_requirement
-                        ),
-                    ));
-                }
-            };
+                producer_path.clone().field("completion_requirement"),
+            )?;
             let join_key_ordinal_path = producer_path.field("join_key_ordinal");
             let join_key_ordinal = usize::try_from(producer.join_key_ordinal.ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(
@@ -822,25 +972,7 @@ fn decode_role(
             let mut capabilities = BTreeSet::new();
             for (index, raw) in consumer.capabilities.iter().copied().enumerate() {
                 let item_path = consumer_path.clone().field("capabilities").index(index);
-                let capability = match plan::RuntimeFilterArtifactCapability::try_from(raw) {
-                    Ok(plan::RuntimeFilterArtifactCapability::Membership) => {
-                        ArtifactCapability::Membership
-                    }
-                    Ok(plan::RuntimeFilterArtifactCapability::OrderedRange) => {
-                        ArtifactCapability::OrderedRange
-                    }
-                    Ok(plan::RuntimeFilterArtifactCapability::EmptyDomain) => {
-                        ArtifactCapability::EmptyDomain
-                    }
-                    Ok(plan::RuntimeFilterArtifactCapability::Unspecified) | Err(_) => {
-                        return Err(super::NativeFragmentDecodeError::invalid_enum(
-                            item_path,
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid capability={raw}"
-                            ),
-                        ));
-                    }
-                };
+                let capability = decode_runtime_filter_capability(raw, item_path.clone())?;
                 if !capabilities.insert(capability) {
                     return Err(super::NativeFragmentDecodeError::inconsistent(
                         item_path,
@@ -858,29 +990,10 @@ fn decode_role(
                     ),
                 ));
             }
-            let activation_path = consumer_path.clone().field("activation");
-            let activation = consumer.activation.as_ref().ok_or_else(|| {
-                super::NativeFragmentDecodeError::missing(
-                    activation_path.clone(),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} missing consumer activation"
-                    ),
-                )
-            })?;
-            let activation_kind_path = activation_path.field("kind");
-            let activation = match activation.kind.as_ref()
-                .ok_or_else(|| super::NativeFragmentDecodeError::missing(activation_kind_path.clone(), format!("native runtime-filter binding_id={binding_id} missing consumer activation kind")))? {
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true) => ConsumerActivation::BlockingSnapshot,
-                plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(false) => return Err(super::NativeFragmentDecodeError::invalid_value(activation_kind_path.field("blocking_snapshot"), format!("native runtime-filter binding_id={binding_id} blocking activation marker must be true"))),
-                plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(raw) => ConsumerActivation::NonBlockingLive { late_apply: match plan::RuntimeFilterLateApplyGranularity::try_from(*raw) {
-                    Ok(plan::RuntimeFilterLateApplyGranularity::Row) => LateApplyGranularity::Row,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::Batch) => LateApplyGranularity::Batch,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::RowGroup) => LateApplyGranularity::RowGroup,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::Split) => LateApplyGranularity::Split,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::File) => LateApplyGranularity::File,
-                    Ok(plan::RuntimeFilterLateApplyGranularity::Unspecified) | Err(_) => return Err(super::NativeFragmentDecodeError::invalid_enum(activation_kind_path.field("non_blocking_live"), format!("native runtime-filter binding_id={binding_id} invalid late-apply granularity={raw}"))),
-                }},
-            };
+            let activation = decode_runtime_filter_activation(
+                consumer.activation.as_ref(),
+                consumer_path.clone().field("activation"),
+            )?;
             let target_path = consumer_path.field("target");
             let target = match consumer.target.as_ref().ok_or_else(|| {
                 super::NativeFragmentDecodeError::missing(

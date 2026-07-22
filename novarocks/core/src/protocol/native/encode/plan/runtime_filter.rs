@@ -27,7 +27,8 @@ use crate::protocol::native::type_mapping::encode_type;
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
     ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder, OrderContract,
-    OrderKeyContract, SortDirection, TopKSummaryRequirement,
+    OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
+    TopKSummaryRequirement,
 };
 use crate::runtime_filter::model::graph::ApplyPoint;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
@@ -156,6 +157,83 @@ fn encode_runtime_filter_contract(
         )?),
     };
     Ok(plan::RuntimeFilterContract { kind: Some(kind) })
+}
+
+#[allow(dead_code)] // Shared with the install codec before its Task 4/5 call sites land.
+pub(in crate::protocol::native) fn encode_runtime_filter_logical_domain(
+    domain: &RuntimeFilterLogicalDomain,
+) -> Result<(crate::proto::common::TypeDesc, plan::RuntimeFilterContract), String> {
+    use plan::runtime_filter_contract::Kind;
+
+    match domain {
+        RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } => {
+            let schema = ArtifactMembershipSchema::new(value_type, *null_semantics)
+                .map_err(|error| format!("invalid runtime filter membership domain: {error:?}"))?;
+            Ok((
+                encode_type(value_type)?,
+                plan::RuntimeFilterContract {
+                    kind: Some(Kind::Membership(encode_runtime_filter_membership_contract(
+                        0,
+                        schema.canonical_bytes(),
+                        schema.digest().bytes(),
+                    )?)),
+                },
+            ))
+        }
+        RuntimeFilterLogicalDomain::OrderedBound(order) => {
+            let canonical = RuntimeOrderContract::try_from_plan(order)
+                .map_err(|error| format!("invalid runtime filter ordered domain: {error:?}"))?;
+            let value_type = canonical
+                .keys()
+                .first()
+                .ok_or_else(|| "runtime filter ordered domain has no key".to_string())?
+                .data_type();
+            Ok((
+                encode_type(value_type)?,
+                plan::RuntimeFilterContract {
+                    kind: Some(Kind::Ordered(encode_runtime_filter_ordered_contract(
+                        0,
+                        canonical.keys(),
+                        canonical.plan_comparator_digest(),
+                        canonical.digest(),
+                    )?)),
+                },
+            ))
+        }
+    }
+}
+
+#[allow(dead_code)] // Shared with the install codec before its Task 4/5 call sites land.
+pub(in crate::protocol::native) fn encode_runtime_filter_reduction_requirement(
+    domain: &RuntimeFilterLogicalDomain,
+    reduction: ReductionRequirement,
+) -> Result<plan::RuntimeFilterReductionContract, String> {
+    use plan::runtime_filter_reduction_contract::Kind;
+
+    let kind = match reduction {
+        ReductionRequirement::SetUnion => Kind::SetUnion(true),
+        ReductionRequirement::TightenOrderedBound => Kind::TightenOrderedBound(true),
+        ReductionRequirement::MergeTopKSummary(requirement) => {
+            let RuntimeFilterLogicalDomain::OrderedBound(order) = domain else {
+                return Err("runtime filter TopK reduction requires ordered domain".to_string());
+            };
+            let canonical = RuntimeOrderContract::try_from_plan(order)
+                .map_err(|error| format!("invalid runtime filter ordered domain: {error:?}"))?;
+            let topk = RuntimeTopKSummaryContract::try_from_plan(order, requirement)
+                .map_err(|error| format!("invalid runtime filter TopK reduction: {error:?}"))?;
+            Kind::MergeTopkSummary(encode_runtime_filter_topk_reduction(
+                0,
+                canonical.keys(),
+                canonical.plan_comparator_digest(),
+                requirement.k(),
+                topk.digest(),
+            )?)
+        }
+    };
+    Ok(plan::RuntimeFilterReductionContract { kind: Some(kind) })
 }
 
 pub(super) fn encode_runtime_filter_ordered_contract(
@@ -311,7 +389,9 @@ pub(super) fn encode_runtime_filter_apply_point(value: ApplyPoint) -> i32 {
     }
 }
 
-pub(super) fn encode_runtime_filter_contribution_kind(value: ContributionKind) -> i32 {
+pub(in crate::protocol::native) fn encode_runtime_filter_contribution_kind(
+    value: ContributionKind,
+) -> i32 {
     match value {
         ContributionKind::ValueDomainDelta => {
             i32::from(plan::RuntimeFilterContributionKind::ValueDomainDelta)
@@ -331,7 +411,9 @@ pub(super) fn encode_runtime_filter_contribution_kind(value: ContributionKind) -
     }
 }
 
-pub(super) fn encode_runtime_filter_completion(value: CompletionRequirement) -> i32 {
+pub(in crate::protocol::native) fn encode_runtime_filter_completion(
+    value: CompletionRequirement,
+) -> i32 {
     match value {
         CompletionRequirement::ProducerClosed => {
             i32::from(plan::RuntimeFilterCompletionRequirement::ProducerClosed)
@@ -342,7 +424,9 @@ pub(super) fn encode_runtime_filter_completion(value: CompletionRequirement) -> 
     }
 }
 
-pub(super) fn encode_runtime_filter_capability(value: ArtifactCapability) -> i32 {
+pub(in crate::protocol::native) fn encode_runtime_filter_capability(
+    value: ArtifactCapability,
+) -> i32 {
     match value {
         ArtifactCapability::Membership => {
             i32::from(plan::RuntimeFilterArtifactCapability::Membership)
@@ -356,7 +440,7 @@ pub(super) fn encode_runtime_filter_capability(value: ArtifactCapability) -> i32
     }
 }
 
-pub(super) fn encode_runtime_filter_activation(
+pub(in crate::protocol::native) fn encode_runtime_filter_activation(
     value: ConsumerActivation,
 ) -> plan::RuntimeFilterConsumerActivation {
     use plan::runtime_filter_consumer_activation::Kind;

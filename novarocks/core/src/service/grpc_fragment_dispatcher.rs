@@ -377,6 +377,25 @@ mod tests {
             ))
         }
 
+        async fn install_runtime_filter_deployment(
+            &self,
+            _request: Request<proto::filter::InstallRuntimeFilterDeploymentRequest>,
+        ) -> Result<Response<proto::filter::InstallRuntimeFilterDeploymentResponse>, Status>
+        {
+            Err(Status::unimplemented(
+                "runtime filter deployment handler lands in RFD-6A Task 4",
+            ))
+        }
+
+        async fn abort_runtime_filter_deployment(
+            &self,
+            _request: Request<proto::filter::AbortRuntimeFilterDeploymentRequest>,
+        ) -> Result<Response<proto::filter::AbortRuntimeFilterDeploymentResponse>, Status> {
+            Err(Status::unimplemented(
+                "runtime filter deployment handler lands in RFD-6A Task 4",
+            ))
+        }
+
         async fn lookup(
             &self,
             _request: Request<LookupRequest>,

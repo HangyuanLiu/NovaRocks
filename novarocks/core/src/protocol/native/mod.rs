@@ -18,3 +18,5 @@
 pub(crate) mod decode;
 pub(crate) mod encode;
 pub(crate) mod type_mapping;
+#[allow(dead_code)] // Consumed by the Task 4 handler and Task 5 client adapters.
+mod runtime_filter_install;

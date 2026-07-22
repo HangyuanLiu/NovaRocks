@@ -32,6 +32,11 @@ use crate::sql::planner::distributed::{
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
 use runtime_filter::encode_runtime_filter_binding_table;
+pub(in crate::protocol::native) use runtime_filter::{
+    encode_runtime_filter_activation, encode_runtime_filter_capability,
+    encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
+    encode_runtime_filter_logical_domain, encode_runtime_filter_reduction_requirement,
+};
 
 mod output;
 mod relational;

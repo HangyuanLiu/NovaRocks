@@ -314,6 +314,26 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(response))
     }
 
+    async fn install_runtime_filter_deployment(
+        &self,
+        _request: tonic::Request<proto::filter::InstallRuntimeFilterDeploymentRequest>,
+    ) -> Result<tonic::Response<proto::filter::InstallRuntimeFilterDeploymentResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "runtime filter deployment handler lands in RFD-6A Task 4",
+        ))
+    }
+
+    async fn abort_runtime_filter_deployment(
+        &self,
+        _request: tonic::Request<proto::filter::AbortRuntimeFilterDeploymentRequest>,
+    ) -> Result<tonic::Response<proto::filter::AbortRuntimeFilterDeploymentResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "runtime filter deployment handler lands in RFD-6A Task 4",
+        ))
+    }
+
     async fn lookup(
         &self,
         request: tonic::Request<proto::filter::LookupRequest>,
