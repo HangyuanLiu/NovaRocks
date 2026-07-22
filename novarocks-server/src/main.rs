@@ -244,49 +244,78 @@ fn dispatch_standalone_role(
     role: novarocks::common::app_config::ClusterRole,
     cfg: novarocks::common::app_config::NovaRocksConfig,
     port_override: Option<u16>,
-    run_all_in_one: impl FnOnce(
+    run_frontend: impl FnOnce(
+        novarocks::common::app_config::NovaRocksConfig,
+        Option<u16>,
+        bool,
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    dispatch_standalone_role_with_backend(
+        role,
+        cfg,
+        port_override,
+        run_frontend,
+        run_standalone_be_role,
+    )
+}
+
+fn dispatch_standalone_role_with_backend(
+    role: novarocks::common::app_config::ClusterRole,
+    cfg: novarocks::common::app_config::NovaRocksConfig,
+    port_override: Option<u16>,
+    run_frontend: impl FnOnce(
+        novarocks::common::app_config::NovaRocksConfig,
+        Option<u16>,
+        bool,
+    ) -> anyhow::Result<()>,
+    run_backend: impl FnOnce(
         novarocks::common::app_config::NovaRocksConfig,
         Option<u16>,
     ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     match role {
-        novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
-        novarocks::common::app_config::ClusterRole::Fe => run_all_in_one(cfg, port_override),
-        novarocks::common::app_config::ClusterRole::Be => {
-            if let Some(warn) = be_role_start_warning(port_override) {
-                eprintln!("WARN: {warn}");
-            }
-            let host = cfg.server.host.clone();
-            let grpc_port = cfg.server.grpc_port;
-            let advertised = network::standalone_advertise_endpoint_for_config(&cfg)
-                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-            let advertised_addr = advertised_probe_addr(&advertised.host, advertised.port)
-                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-            let pid = std::process::id();
-            novarocks::common::app_config::install_preloaded_config(cfg);
-            // Spec (PR-4): standalone BE exposes NovaRocksGrpc
-            // (SubmitFragment/FetchResult/CancelFragment/Exchange) on grpc_port.
-            // FE cluster.backends must point to this port.
-            novarocks::start_grpc_exchange_server(&host, grpc_port).map_err(|e| {
-                anyhow::anyhow!(
-                    "role=be: failed to start NovaRocksGrpc server on {host}:{grpc_port}: {e}"
-                )
-            })?;
-            wait_for_tcp_ready(
-                advertised_addr,
-                Duration::from_secs(5),
-                "advertised endpoint",
-            )
-            .map_err(|e| anyhow::anyhow!("role=be: failed to reach advertised endpoint: {e}"))?;
-            println!(
-                "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={pid}",
-                advertised.host
-            );
-            let (_tx, rx) = std::sync::mpsc::channel::<()>();
-            rx.recv().ok();
-            Ok(())
+        novarocks::common::app_config::ClusterRole::AllInOne => {
+            run_frontend(cfg, port_override, true)
         }
+        novarocks::common::app_config::ClusterRole::Fe => run_frontend(cfg, port_override, false),
+        novarocks::common::app_config::ClusterRole::Be => run_backend(cfg, port_override),
     }
+}
+
+fn run_standalone_be_role(
+    cfg: novarocks::common::app_config::NovaRocksConfig,
+    port_override: Option<u16>,
+) -> anyhow::Result<()> {
+    if let Some(warn) = be_role_start_warning(port_override) {
+        eprintln!("WARN: {warn}");
+    }
+    let host = cfg.server.host.clone();
+    let grpc_port = cfg.server.grpc_port;
+    let advertised = network::standalone_advertise_endpoint_for_config(&cfg)
+        .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+    let advertised_addr = advertised_probe_addr(&advertised.host, advertised.port)
+        .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+    let pid = std::process::id();
+    novarocks::common::app_config::install_preloaded_config(cfg);
+    // Spec (PR-4): standalone BE exposes NovaRocksGrpc
+    // (SubmitFragment/FetchResult/CancelFragment/Exchange) on grpc_port.
+    // FE cluster.backends must point to this port.
+    novarocks::start_grpc_exchange_server(&host, grpc_port).map_err(|e| {
+        anyhow::anyhow!("role=be: failed to start NovaRocksGrpc server on {host}:{grpc_port}: {e}")
+    })?;
+    wait_for_tcp_ready(
+        advertised_addr,
+        Duration::from_secs(5),
+        "advertised endpoint",
+    )
+    .map_err(|e| anyhow::anyhow!("role=be: failed to reach advertised endpoint: {e}"))?;
+    println!(
+        "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={pid}",
+        advertised.host
+    );
+    let (_tx, rx) = std::sync::mpsc::channel::<()>();
+    rx.recv().ok();
+    Ok(())
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
@@ -303,20 +332,20 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
     novarocks_logging::init_with_level(&resolve_log_filter(&cfg));
     novarocks::server::configure_standalone_internal_rpc_transport();
 
-    // Spec (IW-4): role=fe must not execute local fragments, but it still
-    // exposes the coordinator report-capable NovaRocksGrpc endpoint.
-    // Use a role-specific server entry point so the closure below routes to
-    // the right variant without changing dispatch_standalone_role's signature.
-    let is_fe = role == novarocks::common::app_config::ClusterRole::Fe;
-    dispatch_standalone_role(role, cfg, cli.mysql_port, move |cfg, port| {
-        if is_fe {
-            novarocks::server::run_standalone_fe_server_with_config(cfg, resolved_config_path, port)
-                .map_err(|e| anyhow::anyhow!("{}", e))
-        } else {
-            novarocks::server::run_standalone_server_with_config(cfg, resolved_config_path, port)
-                .map_err(|e| anyhow::anyhow!("{}", e))
-        }
-    })
+    dispatch_standalone_role(
+        role,
+        cfg,
+        cli.mysql_port,
+        move |cfg, port, local_exchange| {
+            novarocks_frontend::run_frontend_server(novarocks_frontend::FrontendServerConfig {
+                config: cfg,
+                config_path: resolved_config_path,
+                port_override: port,
+                local_exchange,
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))
+        },
+    )
 }
 
 fn read_pid_file(pid_file: &str) -> Result<Option<u32>, String> {
@@ -1044,9 +1073,66 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        StandaloneServerCliArgs, dispatch_standalone_role, load_config_and_resolve_role,
-        parse_standalone_server_args, probe_all_backends, resolve_cluster_role, wait_for_tcp_ready,
+        StandaloneServerCliArgs, dispatch_standalone_role, dispatch_standalone_role_with_backend,
+        load_config_and_resolve_role, parse_standalone_server_args, probe_all_backends,
+        resolve_cluster_role, wait_for_tcp_ready,
     };
+
+    mod frontend_dispatch {
+        use super::dispatch_standalone_role_with_backend;
+
+        #[test]
+        fn fe_and_all_in_one_dispatch_use_frontend_runner() {
+            for (role, expected_local_exchange) in [
+                (novarocks::common::app_config::ClusterRole::Fe, false),
+                (novarocks::common::app_config::ClusterRole::AllInOne, true),
+            ] {
+                let frontend_called = std::cell::Cell::new(false);
+                let backend_called = std::cell::Cell::new(false);
+                dispatch_standalone_role_with_backend(
+                    role,
+                    novarocks::common::app_config::NovaRocksConfig::default(),
+                    None,
+                    |_, _, local_exchange| {
+                        frontend_called.set(true);
+                        assert_eq!(local_exchange, expected_local_exchange);
+                        Ok(())
+                    },
+                    |_, _| {
+                        backend_called.set(true);
+                        Ok(())
+                    },
+                )
+                .expect("frontend role dispatch should succeed");
+                assert!(frontend_called.get());
+                assert!(!backend_called.get());
+            }
+        }
+
+        #[test]
+        fn be_dispatch_does_not_open_frontend_host() {
+            let frontend_called = std::cell::Cell::new(false);
+            let backend_called = std::cell::Cell::new(false);
+
+            dispatch_standalone_role_with_backend(
+                novarocks::common::app_config::ClusterRole::Be,
+                novarocks::common::app_config::NovaRocksConfig::default(),
+                None,
+                |_, _, _| {
+                    frontend_called.set(true);
+                    Ok(())
+                },
+                |_, _| {
+                    backend_called.set(true);
+                    Ok(())
+                },
+            )
+            .expect("BE role dispatch should succeed");
+
+            assert!(!frontend_called.get());
+            assert!(backend_called.get());
+        }
+    }
 
     #[test]
     fn parse_standalone_server_args_accepts_port_and_config() {
@@ -1144,7 +1230,7 @@ mod tests {
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("role=fe may start without configured backends");
     }
@@ -1187,7 +1273,7 @@ mod tests {
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("fe with multiple reachable backends should enter coordinator path");
         drop(l1);
@@ -1209,7 +1295,7 @@ mod tests {
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
         )
         .expect("role=fe startup should not synchronously dial backends");
         drop(live);
@@ -1317,7 +1403,7 @@ backends = ["{backend_addr}"]
         let (cfg, role, _) =
             load_config_and_resolve_role(&cli).expect("load and resolve must succeed for valid fe");
         assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
-        dispatch_standalone_role(role, cfg, None, |_, _| Ok(()))
+        dispatch_standalone_role(role, cfg, None, |_, _, _| Ok(()))
             .expect("fe with reachable backend must enter coordinator path");
     }
 
@@ -1476,7 +1562,7 @@ backends = ["127.0.0.1:9070"]
             novarocks::common::app_config::ClusterRole::AllInOne,
             cfg,
             None,
-            |cfg, _port| {
+            |cfg, _port, _local_exchange| {
                 // The closure must receive the sentinel config (not a freshly
                 // defaulted one).
                 captured_port.set(

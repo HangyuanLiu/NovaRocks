@@ -17,7 +17,9 @@
 
 pub mod application;
 pub mod deployment;
+mod server;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
 };
+pub use server::{FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown};
