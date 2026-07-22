@@ -317,6 +317,9 @@ fn decode_kind(kind: i32) -> Result<RuntimeFilterEnvelopeKind, tonic::Status> {
         proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
             Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
         }
+        proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
+            Ok(RuntimeFilterEnvelopeKind::FinalArtifact)
+        }
     }
 }
 
@@ -338,6 +341,9 @@ fn encode_kind(kind: RuntimeFilterEnvelopeKind) -> proto::filter::RuntimeFilterE
         }
         RuntimeFilterEnvelopeKind::DegradedLogical => {
             proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical
+        }
+        RuntimeFilterEnvelopeKind::FinalArtifact => {
+            proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact
         }
     }
 }
@@ -606,6 +612,9 @@ mod tests {
             proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
                 (delivery_route(), b"artifact".to_vec(), None)
             }
+            proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
+                (delivery_route(), b"final-artifact".to_vec(), None)
+            }
             proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => (
                 contribution_route(),
                 Vec::new(),
@@ -653,6 +662,11 @@ mod tests {
                 proto::filter::RuntimeFilterEnvelopeKind::Artifact,
                 RuntimeFilterEnvelopeKind::Artifact,
                 b"artifact".as_slice(),
+            ),
+            (
+                proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                b"final-artifact".as_slice(),
             ),
             (
                 proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed,
@@ -710,6 +724,7 @@ mod tests {
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
                 }
                 RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
                 | RuntimeFilterEnvelopeKind::Unavailable
                 | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
                 | RuntimeFilterEnvelopeKind::DegradedLogical => {

@@ -1584,6 +1584,9 @@ fn encode_envelope_kind(kind: RuntimeFilterEnvelopeKind) -> i32 {
         RuntimeFilterEnvelopeKind::DegradedLogical => {
             filter::RuntimeFilterEnvelopeKind::DegradedLogical as i32
         }
+        RuntimeFilterEnvelopeKind::FinalArtifact => {
+            filter::RuntimeFilterEnvelopeKind::FinalArtifact as i32
+        }
     }
 }
 
@@ -1605,6 +1608,9 @@ fn decode_envelope_kind(raw: i32, path: FieldPath) -> CodecResult<RuntimeFilterE
         }
         Ok(filter::RuntimeFilterEnvelopeKind::DegradedLogical) => {
             Ok(RuntimeFilterEnvelopeKind::DegradedLogical)
+        }
+        Ok(filter::RuntimeFilterEnvelopeKind::FinalArtifact) => {
+            Ok(RuntimeFilterEnvelopeKind::FinalArtifact)
         }
         Ok(filter::RuntimeFilterEnvelopeKind::Unspecified) | Err(_) => Err(codec_error(
             path,
@@ -1796,6 +1802,7 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                 RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
             ]),
         );
         let core = membership_channel(
@@ -2199,6 +2206,7 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                 RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
             ]),
         );
         let core = ordered_topk_channel(channel_id.get(), producer.get());
@@ -2854,6 +2862,7 @@ mod tests {
             RuntimeFilterEnvelopeKind::Ack,
             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
             RuntimeFilterEnvelopeKind::DegradedLogical,
+            RuntimeFilterEnvelopeKind::FinalArtifact,
         ] {
             assert_eq!(
                 decode_envelope_kind(

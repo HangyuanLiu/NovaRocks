@@ -34,6 +34,7 @@ pub(crate) enum RuntimeFilterEnvelopeKind {
     Unavailable,
     CompletedWithoutArtifact,
     DegradedLogical,
+    FinalArtifact,
     /// Acknowledges either a `Contribution`-kind or `Delivery`-kind route identity.
     /// The acked route identity is the envelope's own top-level `route_identity`
     /// (see `RuntimeFilterEnvelope::route_identity`); an `Ack` envelope does not
@@ -416,6 +417,7 @@ impl RuntimeFilterEnvelope {
                 route_identity.as_contribution().is_some()
             }
             RuntimeFilterEnvelopeKind::Artifact
+            | RuntimeFilterEnvelopeKind::FinalArtifact
             | RuntimeFilterEnvelopeKind::Unavailable
             | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
             | RuntimeFilterEnvelopeKind::DegradedLogical => route_identity.as_delivery().is_some(),
@@ -428,6 +430,7 @@ impl RuntimeFilterEnvelope {
             kind,
             RuntimeFilterEnvelopeKind::Contribution
                 | RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
                 | RuntimeFilterEnvelopeKind::Unavailable
                 | RuntimeFilterEnvelopeKind::DegradedLogical
         );
@@ -646,6 +649,11 @@ mod tests {
                 &b"artifact"[..],
             ),
             (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                &b"final-artifact"[..],
+            ),
+            (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 contribution_route(),
                 &b""[..],
@@ -857,6 +865,12 @@ mod tests {
                 &b"payload"[..],
             ),
             (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                contribution_route(),
+                None,
+                &b"payload"[..],
+            ),
+            (
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 delivery_route(),
                 Some(ProducerOpenMetadata::try_new(24).unwrap()),
@@ -912,6 +926,12 @@ mod tests {
             ),
             (
                 RuntimeFilterEnvelopeKind::Artifact,
+                delivery_route(),
+                None,
+                &b""[..],
+            ),
+            (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
                 delivery_route(),
                 None,
                 &b""[..],
@@ -1003,6 +1023,11 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Artifact,
                 delivery_route(),
                 b"artifact".to_vec(),
+            ),
+            (
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                b"final-artifact".to_vec(),
             ),
             (
                 RuntimeFilterEnvelopeKind::Unavailable,
@@ -1254,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn trait_object_dispatch_preserves_all_five_real_envelopes_in_order() {
+    fn trait_object_dispatch_preserves_all_envelope_kinds_in_order() {
         let recording = Arc::new(RecordingIngress::default());
         let ingress: Arc<dyn RuntimeFilterEnvelopeIngress> = recording.clone();
         for envelope in [
@@ -1269,12 +1294,27 @@ mod tests {
                 b"artifact",
             ),
             envelope(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                delivery_route(),
+                b"final-artifact",
+            ),
+            envelope(
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 contribution_route(),
                 b"",
             ),
             envelope(
                 RuntimeFilterEnvelopeKind::Unavailable,
+                delivery_route(),
+                b"reason",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                delivery_route(),
+                b"",
+            ),
+            envelope(
+                RuntimeFilterEnvelopeKind::DegradedLogical,
                 delivery_route(),
                 b"reason",
             ),
@@ -1291,8 +1331,11 @@ mod tests {
             [
                 RuntimeFilterEnvelopeKind::Contribution,
                 RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
                 RuntimeFilterEnvelopeKind::ProducerClosed,
                 RuntimeFilterEnvelopeKind::Unavailable,
+                RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
+                RuntimeFilterEnvelopeKind::DegradedLogical,
                 RuntimeFilterEnvelopeKind::Ack,
             ]
         );

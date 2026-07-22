@@ -101,6 +101,7 @@ impl RuntimeFilterEnvelopeIngress for QueryScopedRuntimeFilterEnvelopeIngress {
                 ingress_result_for_producer_dispatch(service.dispatch_inbound_producer(envelope))
             }
             RuntimeFilterEnvelopeKind::Artifact
+            | RuntimeFilterEnvelopeKind::FinalArtifact
             | RuntimeFilterEnvelopeKind::Unavailable
             | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
             | RuntimeFilterEnvelopeKind::DegradedLogical => {
@@ -374,6 +375,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 )
                 .unwrap();

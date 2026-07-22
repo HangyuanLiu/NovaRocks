@@ -201,6 +201,7 @@ impl RoleRouter {
         if !matches!(
             kind,
             RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
                 | RuntimeFilterEnvelopeKind::Unavailable
                 | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
                 | RuntimeFilterEnvelopeKind::DegradedLogical

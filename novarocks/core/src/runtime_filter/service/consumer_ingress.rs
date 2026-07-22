@@ -18,10 +18,11 @@
 //! Inbound consumer-delivery ingress: the mirror dual of `inbound.rs`'s
 //! `dispatch_inbound_producer`.
 //!
-//! A remote `Artifact` / `Unavailable` envelope arriving at a consumer/relay
-//! participant is looked up to its live query, authorized and decoded against the
-//! consumer's install-owned `ConsumerArtifactProfile`, and delivered into the
-//! target subscription. The pipeline follows a fixed validation-before-delivery
+//! A remote artifact, final-artifact, unavailable, or typed terminal envelope arriving
+//! at a consumer/relay participant is looked up to its live query, authorized and
+//! decoded against the consumer's install-owned `ConsumerArtifactProfile`, and
+//! delivered into the target subscription. The pipeline follows a fixed
+//! validation-before-delivery
 //! order (route identity -> admission -> route authorization -> profile digest ->
 //! strict decode -> release lock -> deliver) so no partial state is ever exposed:
 //! any earlier failure rejects before the delivery and leaves the subscription
@@ -41,7 +42,7 @@ use crate::runtime_filter::port::subscription::{ArtifactDeliveryOutcome, LiveTer
 use crate::runtime_filter::port::transport::{RuntimeFilterEnvelope, RuntimeFilterEnvelopeKind};
 
 use super::RuntimeFilterService;
-use super::dedupe::{DeliveryAdmission, TombstoneVerdict};
+use super::dedupe::{DeliveredVersionKind, DeliveryAdmission, TombstoneVerdict};
 use super::registry::DispatchAdmission;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,7 +243,24 @@ impl RuntimeFilterService {
                 (
                     Some(ArtifactDeliveryOutcome::Published(bundle)),
                     None,
-                    Some(version),
+                    Some((version, DeliveredVersionKind::NonFinal)),
+                )
+            }
+            RuntimeFilterEnvelopeKind::FinalArtifact => {
+                let bundle = decode_artifact_bundle(
+                    envelope.payload(),
+                    envelope.schema_digest(),
+                    expectation,
+                    max_encoded,
+                    plan.retained_budget(),
+                    self.memory_account.clone(),
+                )
+                .map_err(map_codec_error)?;
+                let version = bundle.version();
+                (
+                    Some(ArtifactDeliveryOutcome::Published(bundle)),
+                    Some(LiveTerminal::Completed),
+                    Some((version, DeliveredVersionKind::FinalArtifact)),
                 )
             }
             RuntimeFilterEnvelopeKind::Unavailable => {
@@ -259,7 +277,7 @@ impl RuntimeFilterService {
                 (
                     Some(ArtifactDeliveryOutcome::Unavailable(reason)),
                     None,
-                    Some(LogicalVersion::new(0)),
+                    Some((LogicalVersion::new(0), DeliveredVersionKind::NonFinal)),
                 )
             }
             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
@@ -305,11 +323,13 @@ impl RuntimeFilterService {
             }
             DeliveryAdmission::ResourceLimit => return Err(resource_limit_error()),
         }
-        if let Some(version) = version {
-            match self
-                .dedupe
-                .admit_delivered_version(envelope.channel_id(), route_edge_id, version)
-            {
+        if let Some((version, kind)) = version {
+            match self.dedupe.admit_delivered_version(
+                envelope.channel_id(),
+                route_edge_id,
+                version,
+                kind,
+            ) {
                 DeliveryAdmission::Fresh => {}
                 DeliveryAdmission::Duplicate => {
                     return Ok(InboundConsumerDispatchOutcome::Duplicate);
@@ -686,6 +706,7 @@ mod tests {
                             RuntimeFilterEnvelopeKind::Unavailable,
                             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                             RuntimeFilterEnvelopeKind::DegradedLogical,
+                            RuntimeFilterEnvelopeKind::FinalArtifact,
                         ]),
                     )
                     .unwrap(),
@@ -732,6 +753,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 )
             })
@@ -755,6 +777,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 )
             })
@@ -1314,6 +1337,190 @@ mod tests {
     }
 
     #[test]
+    fn remote_consumer_only_final_artifact_sets_latest_and_completed_atomically() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+        let envelope = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                1,
+                digest,
+                payload.clone(),
+            )
+        };
+
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(envelope()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert!(matches!(
+            live.poll_after(None),
+            LivePollOutcome::Updated {
+                bundle: delivered,
+                terminal: Some(LiveTerminal::Completed),
+            } if delivered.canonical_digest() == bundle.canonical_digest()
+        ));
+    }
+
+    #[test]
+    fn same_version_artifact_then_final_artifact_upgrades_completed_once() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::Artifact,
+                    CHANNEL,
+                    EPOCH,
+                    RANGE_ROUTE,
+                    1,
+                    digest,
+                    payload.clone(),
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        let final_artifact = || {
+            delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                2,
+                digest,
+                payload.clone(),
+            )
+        };
+        assert_eq!(
+            service.dispatch_inbound_consumer(final_artifact()).unwrap(),
+            InboundConsumerDispatchOutcome::Accepted,
+            "the final envelope must merge completion into an existing version"
+        );
+        assert_eq!(
+            service.dispatch_inbound_consumer(final_artifact()).unwrap(),
+            InboundConsumerDispatchOutcome::Duplicate
+        );
+
+        let live = service
+            .subscribe(
+                BindingId::new(RANGE_CONSUMER_BINDING),
+                range_consumer_finst(),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert!(matches!(
+            live.poll_after(Some(bundle.version())),
+            LivePollOutcome::Idle {
+                latest_version: Some(version),
+                terminal: Some(LiveTerminal::Completed),
+            } if version == bundle.version()
+        ));
+    }
+
+    #[test]
+    fn final_artifact_rejects_profile_payload_and_route_contract_drift() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(ordered_channel()));
+        let profile = range_profile();
+        let bundle = range_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                1,
+                [0x5a; 32],
+                payload.clone(),
+            ))),
+            CodecContract,
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                RANGE_ROUTE,
+                2,
+                digest,
+                b"not-an-artifact-frame".to_vec(),
+            ))),
+            CodecContract,
+        );
+        assert_prefix(
+            &err(service.dispatch_inbound_consumer(delivery_env(
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+                CHANNEL,
+                EPOCH,
+                999,
+                3,
+                digest,
+                payload,
+            ))),
+            RouteContract,
+        );
+    }
+
+    #[test]
+    fn remote_final_artifact_keeps_blocking_snapshot_semantics() {
+        let service = service();
+        install_consumer_only(&service, without_local_producers(membership_channel(4096)));
+        let profile = membership_profile();
+        let bundle = membership_bundle(&profile);
+        let (digest, payload) = encode_bundle(&bundle, &profile);
+
+        assert_eq!(
+            service
+                .dispatch_inbound_consumer(delivery_env(
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
+                    CHANNEL,
+                    EPOCH,
+                    CONSUMER_ROUTE,
+                    1,
+                    digest,
+                    payload,
+                ))
+                .unwrap(),
+            InboundConsumerDispatchOutcome::Accepted
+        );
+        let ArtifactAcquireOutcome::Published(delivered) = service
+            .subscribe_blocking(BindingId::new(CONSUMER_BINDING), consumer_finst())
+            .unwrap()
+            .acquire(Duration::ZERO)
+        else {
+            panic!("final artifact must publish the blocking snapshot")
+        };
+        assert_eq!(delivered.canonical_digest(), bundle.canonical_digest());
+    }
+
+    #[test]
     fn remote_terminal_rejects_wrong_profile_and_malformed_reason() {
         let service = service();
         install_consumer_only(&service, without_local_producers(ordered_channel()));
@@ -1488,6 +1695,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 ),
                 (
@@ -1497,6 +1705,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 ),
             ]),

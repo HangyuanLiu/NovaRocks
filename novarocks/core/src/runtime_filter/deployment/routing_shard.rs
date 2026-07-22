@@ -813,6 +813,7 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                 RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
             ])
         );
         assert!(

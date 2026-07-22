@@ -2566,6 +2566,10 @@
             {
               "number": 7,
               "name": "RUNTIME_FILTER_ENVELOPE_KIND_DEGRADED_LOGICAL"
+            },
+            {
+              "number": 8,
+              "name": "RUNTIME_FILTER_ENVELOPE_KIND_FINAL_ARTIFACT"
             }
           ],
           "reserved_numbers": [],

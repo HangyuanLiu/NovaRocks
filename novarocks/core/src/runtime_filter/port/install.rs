@@ -520,6 +520,7 @@ pub(crate) fn local_participant_install_for_test(
                             RuntimeFilterEnvelopeKind::Unavailable,
                             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                             RuntimeFilterEnvelopeKind::DegradedLogical,
+                            RuntimeFilterEnvelopeKind::FinalArtifact,
                         ]),
                     )
                     .expect("test install view produces a valid consumer route");

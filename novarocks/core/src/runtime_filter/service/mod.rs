@@ -986,7 +986,7 @@ impl ActionDispatcher {
                                     digest: bundle.canonical_digest(),
                                 });
                             }
-                            Some(outcome)
+                            Some(outcome.clone())
                         }
                         PublishCommitOutcome::Stale => {
                             events
@@ -1013,12 +1013,39 @@ impl ActionDispatcher {
                             }
                         }
                     }
-                    if let Some(outcome) = delivery_outcome.as_ref() {
-                        remote_deliveries.push((
-                            work.group.profile().clone(),
-                            work.group.route_edges().to_vec(),
-                            outcome.clone(),
-                        ));
+                    let remote_outcome = if terminal == Some(LiveTerminal::Completed)
+                        && matches!(outcome, ArtifactDeliveryOutcome::Published(_))
+                    {
+                        // A completion must always cross the wire as one atomic final
+                        // artifact, including when the same version was published by an
+                        // earlier VisibleSnapshot and this materialization is idempotent.
+                        Some(&outcome)
+                    } else {
+                        delivery_outcome.as_ref()
+                    };
+                    if let Some(outcome) = remote_outcome {
+                        let envelope_kind = match outcome {
+                            ArtifactDeliveryOutcome::Published(_) => {
+                                Some(if terminal == Some(LiveTerminal::Completed) {
+                                    RuntimeFilterEnvelopeKind::FinalArtifact
+                                } else {
+                                    RuntimeFilterEnvelopeKind::Artifact
+                                })
+                            }
+                            ArtifactDeliveryOutcome::Unavailable(_) => {
+                                Some(RuntimeFilterEnvelopeKind::Unavailable)
+                            }
+                            ArtifactDeliveryOutcome::Unsupported(_)
+                            | ArtifactDeliveryOutcome::Cancelled => None,
+                        };
+                        if let Some(envelope_kind) = envelope_kind {
+                            remote_deliveries.push((
+                                work.group.profile().clone(),
+                                work.group.route_edges().to_vec(),
+                                outcome.clone(),
+                                envelope_kind,
+                            ));
+                        }
                     }
                     if !delivered_before_notify {
                         deliveries.push((
@@ -1042,6 +1069,7 @@ impl ActionDispatcher {
                             group.profile().clone(),
                             group.route_edges().to_vec(),
                             outcome,
+                            RuntimeFilterEnvelopeKind::Unavailable,
                         ));
                     }
                 }
@@ -1056,13 +1084,14 @@ impl ActionDispatcher {
                 .router()
                 .route_live(&route_edges, outcome.as_ref(), terminal);
         }
-        for (profile, route_edges, outcome) in remote_deliveries {
+        for (profile, route_edges, outcome, envelope_kind) in remote_deliveries {
             if let Err(delivery_error) = self.deliver_remote_artifact(
                 &installed,
                 channel_id,
                 &profile,
                 route_edges,
                 &outcome,
+                envelope_kind,
             ) {
                 error.get_or_insert_with(|| {
                     violation(
@@ -1173,14 +1202,17 @@ impl ActionDispatcher {
         profile: &ConsumerArtifactProfile,
         route_edge_ids: Vec<RouteEdgeId>,
         outcome: &ArtifactDeliveryOutcome,
+        envelope_kind: RuntimeFilterEnvelopeKind,
     ) -> Result<(), ArtifactDeliveryError> {
-        let envelope_kind = match outcome {
-            ArtifactDeliveryOutcome::Published(_) => RuntimeFilterEnvelopeKind::Artifact,
-            ArtifactDeliveryOutcome::Unavailable(_) => RuntimeFilterEnvelopeKind::Unavailable,
-            ArtifactDeliveryOutcome::Unsupported(_) | ArtifactDeliveryOutcome::Cancelled => {
-                return Err(ArtifactDeliveryError::UndeliverableOutcome);
+        match (outcome, envelope_kind) {
+            (
+                ArtifactDeliveryOutcome::Published(_),
+                RuntimeFilterEnvelopeKind::Artifact | RuntimeFilterEnvelopeKind::FinalArtifact,
+            )
+            | (ArtifactDeliveryOutcome::Unavailable(_), RuntimeFilterEnvelopeKind::Unavailable) => {
             }
-        };
+            _ => return Err(ArtifactDeliveryError::UndeliverableOutcome),
+        }
         let intent = RuntimeFilterDeliveryRouteIntent::new(
             installed.epoch(),
             channel_id,
@@ -2693,7 +2725,8 @@ mod tests {
     };
     use crate::runtime_filter::port::subscription::{
         ArtifactAcquireOutcome, ArtifactDelivery, ArtifactDeliveryOutcome,
-        BlockingSnapshotSubscription, SubscriptionKind, UnavailableReason,
+        BlockingSnapshotSubscription, LivePollOutcome, LiveTerminal, SubscriptionHandle,
+        SubscriptionKind, UnavailableReason,
     };
     use crate::runtime_filter::port::support::{
         ArtifactRetainedBudget, ArtifactScratchBudget, MemoryAccountError,
@@ -3488,6 +3521,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 )
                 .unwrap();
@@ -3546,14 +3580,29 @@ mod tests {
         consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
         max_concurrent_jobs: usize,
     ) -> RuntimeFilterChannelDeployment {
-        let base = deployment(1, 10, 30, 40, [10], [30], 100);
+        deployment_with_profiles_concurrency_and_activation(
+            consumers,
+            max_concurrent_jobs,
+            ConsumerActivation::BlockingSnapshot,
+        )
+    }
+
+    fn deployment_with_profiles_concurrency_and_activation(
+        consumers: impl IntoIterator<Item = (u32, u32, i64, ConsumerArtifactProfile)>,
+        max_concurrent_jobs: usize,
+        activation: ConsumerActivation,
+    ) -> RuntimeFilterChannelDeployment {
+        let base = match activation {
+            ConsumerActivation::BlockingSnapshot => deployment(1, 10, 30, 40, [10], [30], 100),
+            ConsumerActivation::NonBlockingLive { .. } => fenced_final_deployment(),
+        };
         let consumers = consumers
             .into_iter()
             .map(|(binding, route, instance, profile)| {
                 (
                     BindingId::new(binding),
                     ConsumerDeployment::with_profile(
-                        ConsumerActivation::BlockingSnapshot,
+                        activation,
                         BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,
@@ -8231,15 +8280,38 @@ mod tests {
         local_consumers: &[(u32, u32, i64)],
         remote_consumers: &[(u32, u32, u32, &str)],
     ) -> OutboundDeliveryRoutes {
+        install_outbound_delivery_aggregator_with_activation(
+            service,
+            local_consumers,
+            remote_consumers,
+            ConsumerActivation::BlockingSnapshot,
+        )
+    }
+
+    fn install_outbound_delivery_aggregator_with_activation(
+        service: &RuntimeFilterService,
+        local_consumers: &[(u32, u32, i64)],
+        remote_consumers: &[(u32, u32, u32, &str)],
+        activation: ConsumerActivation,
+    ) -> OutboundDeliveryRoutes {
         let epoch = DeploymentEpoch::new(9);
         let aggregator = RuntimeFilterParticipantId::new(3);
         let channel_id = ChannelId::new(1);
         let profile = service_outbound_delivery_profile();
 
-        let channel = deployment_with_profiles(
-            local_consumers
-                .iter()
-                .map(|(binding, route, instance)| (*binding, *route, *instance, profile.clone())),
+        let local_profiles = local_consumers
+            .iter()
+            .map(|(binding, route, instance)| (*binding, *route, *instance, profile.clone()))
+            .collect::<Vec<_>>();
+        let max_concurrent_jobs = local_profiles
+            .iter()
+            .map(|(_, _, _, profile)| profile.id())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let channel = deployment_with_profiles_concurrency_and_activation(
+            local_profiles,
+            max_concurrent_jobs,
+            activation,
         )
         .with_outbound_materialization_groups(BTreeMap::from([(
             profile.id(),
@@ -8307,6 +8379,7 @@ mod tests {
                     RuntimeFilterEnvelopeKind::Unavailable,
                     RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                     RuntimeFilterEnvelopeKind::DegradedLogical,
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
                 ]),
             )
             .unwrap();
@@ -8334,6 +8407,7 @@ mod tests {
                     RuntimeFilterEnvelopeKind::Unavailable,
                     RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                     RuntimeFilterEnvelopeKind::DegradedLogical,
+                    RuntimeFilterEnvelopeKind::FinalArtifact,
                 ]),
             )
             .unwrap();
@@ -8552,6 +8626,136 @@ mod tests {
             )
             .unwrap(),
             UnavailableReason::ProducerFailed
+        );
+    }
+
+    #[test]
+    fn route_and_prequeue_sends_final_artifact_atomically_with_loopback_parity() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator_with_activation(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+            ConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::Completed {
+                    order: 0,
+                    outcome: SubmitOutcome::Completed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let SubscriptionHandle::Live(loopback_subscription) = fixture
+            .service
+            .subscribe(
+                BindingId::new(20),
+                uid(200),
+                SubscriptionKind::NonBlockingLive,
+            )
+            .unwrap()
+        else {
+            panic!("completed loopback route must install a live subscription")
+        };
+        let LivePollOutcome::Updated {
+            bundle: loopback,
+            terminal: Some(LiveTerminal::Completed),
+        } = loopback_subscription.poll_after(None)
+        else {
+            panic!("completed loopback route must atomically publish and complete")
+        };
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 1, "completion is one atomic wire message");
+        let (edge, envelope) = &envelopes[0];
+        assert_eq!(*edge, routes.remote_edges[0]);
+        assert_eq!(envelope.kind(), RuntimeFilterEnvelopeKind::FinalArtifact);
+        let remote = decode_artifact_bundle(
+            envelope.payload(),
+            envelope.schema_digest(),
+            ArtifactDecodeExpectation::new(&routes.profile),
+            1 << 20,
+            Arc::new(ArtifactRetainedBudget::new(1 << 20)),
+            MemTrackerMemoryAccount::new_root_for_test("final-artifact-parity"),
+        )
+        .unwrap();
+        assert_eq!(remote.canonical_digest(), loopback.canonical_digest());
+    }
+
+    #[test]
+    fn visible_then_completed_sends_artifact_then_atomic_final_artifact() {
+        let fixture = fixture();
+        let routes = install_outbound_delivery_aggregator(
+            &fixture.service,
+            &[(20, 20, 200)],
+            &[(30, 30, 7, "10.0.0.7")],
+        );
+        let sink = Arc::new(RecordingRemoteSink::default());
+        fixture.service.set_remote_sink_for_test(sink.clone());
+        let snapshot = Arc::new(LogicalSnapshot::first(
+            routes.channel_id,
+            ReducedMembershipDomain::new(MembershipValues::int64([1]), false),
+            RetainedMemoryReservation::empty(),
+        ));
+
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::VisibleSnapshot {
+                    order: 0,
+                    outcome: SubmitOutcome::Published,
+                    version: snapshot.version(),
+                    snapshot: snapshot.clone(),
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+        fixture
+            .service
+            .dispatcher
+            .dispatch(
+                routes.channel_id,
+                ChannelAction::Completed {
+                    order: 1,
+                    outcome: SubmitOutcome::Completed,
+                    snapshot,
+                    events: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let envelopes = sink.envelopes();
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(
+            envelopes
+                .iter()
+                .map(|(_, envelope)| envelope.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
+            ],
+        );
+        assert_eq!(envelopes[0].1.payload(), envelopes[1].1.payload());
+        assert_eq!(
+            envelopes[0].1.schema_digest(),
+            envelopes[1].1.schema_digest()
         );
     }
 

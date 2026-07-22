@@ -2474,6 +2474,7 @@ mod tests {
                 RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                 RuntimeFilterEnvelopeKind::DegradedLogical,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
             ]),
         )
     }
@@ -2976,6 +2977,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 ),
                 inbound_to_consumer_with_kinds(
@@ -2989,6 +2991,7 @@ mod tests {
                         RuntimeFilterEnvelopeKind::Unavailable,
                         RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                         RuntimeFilterEnvelopeKind::DegradedLogical,
+                        RuntimeFilterEnvelopeKind::FinalArtifact,
                     ]),
                 ),
             ],

@@ -44,6 +44,7 @@ pub(crate) fn canonical_route_allowed_kinds(
         | (RuntimeFilterRouteRole::Aggregator, RuntimeFilterRouteRole::Consumer(_)) => {
             Some(BTreeSet::from([
                 RuntimeFilterEnvelopeKind::Artifact,
+                RuntimeFilterEnvelopeKind::FinalArtifact,
                 RuntimeFilterEnvelopeKind::Unavailable,
                 RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
                 RuntimeFilterEnvelopeKind::DegradedLogical,
@@ -368,6 +369,7 @@ impl RuntimeFilterDeliveryRouteIntent {
         if !matches!(
             envelope_kind,
             RuntimeFilterEnvelopeKind::Artifact
+                | RuntimeFilterEnvelopeKind::FinalArtifact
                 | RuntimeFilterEnvelopeKind::Unavailable
                 | RuntimeFilterEnvelopeKind::CompletedWithoutArtifact
                 | RuntimeFilterEnvelopeKind::DegradedLogical
@@ -882,6 +884,7 @@ mod tests {
             RuntimeFilterEnvelopeKind::Unavailable,
             RuntimeFilterEnvelopeKind::CompletedWithoutArtifact,
             RuntimeFilterEnvelopeKind::DegradedLogical,
+            RuntimeFilterEnvelopeKind::FinalArtifact,
         ]);
         assert_eq!(
             canonical_route_allowed_kinds(
